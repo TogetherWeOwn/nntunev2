@@ -2,25 +2,40 @@ name: deploy
 
 # Staging deploys + per-PR web previews (apps/web only).
 #
-# - Push to `main` deploys apps/web to its `staging` env.
+# - Push to `main` deploys apps/web to its `staging` env, then the
+#   `post-deploy-e2e` job calls e2e-staging.yml in the same run/revision.
+#   That call is the only path to the full-journey staging E2E: it
+#   `needs` `staging-web` with no always()/!cancelled(), so a skipped or
+#   failed deploy cannot produce a full-journey PASS.
 # - Pull requests get a live preview of apps/web (`wrangler preview`).
-# - Both paths need the provisioning card's secrets (CLOUDFLARE_API_TOKEN,
-#   CLOUDFLARE_ACCOUNT_ID). Until those land, the jobs skip via the `gate`
-#   job below (secrets cannot appear in a job-level `if`, so the gate maps
-#   the token to an output) — CI stays green and the first staging deploy
-#   succeeds once secrets land. Production deploys are intentionally not
-#   wired here (a later card adds the promotion gate).
-# - Worker staging deploys are intentionally NOT wired here yet: no Worker
-#   has a deployable entry point on main (api/ingest are logic crates;
-#   stream/mb do not exist yet). Each Worker card adds its entry,
-#   wrangler config and deploy job when it lands. When the API Worker
-#   deploy job lands, it must call
-#   workers/api/check_hyperdrive_cache.sh --config-id $HYPERDRIVE_ID_STAGING
-#   (and prod) with CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fail
-#   the deploy on non-zero exit (auth reads require a cache-disabled config).
-#   Real deploys MUST NOT pass --allow-skip (CI-only); the Worker also
-#   refuses to serve traffic without HYPERDRIVE_CACHING_DISABLED=1, set only
-#   after the gate passes for that env's Hyperdrive config.
+# - Both paths need the repo Actions secrets CLOUDFLARE_API_TOKEN and
+#   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
+#   When the token is absent, the jobs skip via the `gate` job below
+#   (secrets cannot appear in a job-level `if`, so the gate maps the
+#   token to an output) — CI stays green without deploying. Production
+#   deploys are intentionally not wired here (a later gated lane adds
+#   the promotion step; the staging evidence from this workflow is
+#   web-only, see docs/ops.md).
+# Backend Worker staging lane (api only; ingest/mb/stream/repair each add
+#   their own job as follow-ups). The `staging-api` job below deploys the
+#   api Worker to its `staging` env on push to `main` and passes the public
+#   `BUILD_SHA` var (`--var BUILD_SHA:${{ github.sha }}`, never a secret),
+#   so worker log records carry the 40-hex deploy SHA in `fields.build_sha`
+#   instead of `"unknown"` (`workers/api/src/worker_entry.rs`). The staging
+#   wrangler config is generated in the job from public repo variables and
+#   is never committed; secrets live only in Cloudflare (Worker secrets set
+#   with `wrangler secret put`) and CI secrets. Before deploying, the job
+#   calls `workers/api/check_hyperdrive_cache.sh --config-id
+#   $HYPERDRIVE_ID_STAGING` (the HYPERDRIVE_ID_* names are non-credential
+#   Actions variables, not secrets or database URLs) with
+#   CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID set and fails the deploy on
+#   non-zero exit (auth reads require a cache-disabled config; no
+#   --allow-skip in real deploys). The Worker also refuses to serve traffic
+#   without HYPERDRIVE_CACHING_DISABLED=1, set in the generated config only
+#   after the gate passes for that env's Hyperdrive config. Until the
+#   Operator wires the staging variables, the job skips with a notice (a
+#   skip is not deploy evidence). Production is never touched: the job has
+#   no production marker in code and deploys `--env staging` only.
 # - Public-repo note: fork PRs get no secrets, so preview skips there too.
 
 on:
@@ -33,9 +48,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+# No workflow-level concurrency here: it would hold the deploy group for
+# the whole run, now including up to ~40 min of post-deploy E2E, so queued
+# main pushes would be cancelled before ever deploying. The deploy jobs
+# serialize on their own job-level groups below and release them when the
+# deploy finishes; E2E serializes separately on the e2e-staging group.
 
 env:
   NODE_VERSION: "24"
@@ -65,6 +82,11 @@ jobs:
     name: staging-web
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level (not workflow-level) so the group releases when the deploy
+    # finishes instead of being held through the post-deploy E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -94,10 +116,228 @@ jobs:
           workingDirectory: apps/web
           command: deploy --env staging
 
+  # Api Worker staging lane (staging only; ingest/mb/stream/repair are
+  # follow-up jobs, each with its own evidence). Push to `main` only, gated
+  # on the same token gate as staging-web. Passes the public BUILD_SHA var
+  # so worker log records carry the deploy SHA (never a secret); secrets
+  # live in Cloudflare and are never written here. Fails closed on the
+  # Hyperdrive cache-disabled gate (no --allow-skip); skips with a notice
+  # until the Operator wires the staging variables (a skip is not evidence).
+  staging-api:
+    name: staging-api
+    needs: [gate]
+    if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Own deploy group (never shared with staging-web): GitHub allows one
+    # running plus one pending job per group, so sharing would let a push's
+    # own lanes cancel each other and leave web and api at different SHAs.
+    # Queued main pushes still deploy in order instead of racing wrangler.
+    concurrency:
+      group: ${{ github.workflow }}-staging-api-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      deployed: ${{ steps.deployment.outputs.deployed }}
+      outcome: ${{ steps.deployment.outputs.outcome }}
+      source_sha: ${{ steps.deployment.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float (same pin as ci.yml).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check api staging configuration
+        id: config
+        working-directory: workers/api
+        env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
+          API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${HYPERDRIVE_ID_STAGING:-}" ] || missing="$missing HYPERDRIVE_ID_STAGING"
+          [ -n "${API_RP_ID_STAGING:-}" ] || missing="$missing API_RP_ID_STAGING"
+          [ -n "${API_RP_ORIGIN_STAGING:-}" ] || missing="$missing API_RP_ORIGIN_STAGING"
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### staging-api skipped: staging not configured"
+              echo "Missing repository variables (names only):$missing"
+              echo "Wiring is Operator-owned; a skipped job is not deploy evidence."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Hyperdrive cache-disabled gate
+        id: hyperdrive
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ./check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"
+      - name: Generate staging wrangler.toml
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
+        env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
+          API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
+        run: |
+          set -euo pipefail
+          # The Worker refuses to start unless RP_ORIGIN is the canonical
+          # serialized https origin whose host is exactly RP_ID: fail the
+          # job here (names only) instead of deploying a worker that 500s.
+          python3 - <<'PY'
+          import os, tomllib, urllib.parse
+          rp_id = os.environ["API_RP_ID_STAGING"]
+          origin = os.environ["API_RP_ORIGIN_STAGING"]
+          parts = urllib.parse.urlsplit(origin)
+          assert parts.scheme == "https", "API_RP_ORIGIN_STAGING must be https"
+          assert parts.hostname == rp_id, "API_RP_ORIGIN_STAGING host must equal API_RP_ID_STAGING"
+          assert origin == f"https://{rp_id}", "API_RP_ORIGIN_STAGING must be the canonical serialized origin"
+          # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
+          # directly, bypassing binding-parity (which only reads the
+          # committed example). Fail unless it equals the committed staging
+          # inventory id for the api HYPERDRIVE binding (names only).
+          with open("../../.github/scripts/binding_manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          api = next(w for w in manifest["worker"] if w["name"] == "api")
+          expected = next(b for b in api["binding"] if b["binding"] == "HYPERDRIVE")["staging"]
+          assert os.environ["HYPERDRIVE_ID_STAGING"] == expected, \
+              "HYPERDRIVE_ID_STAGING must equal the api staging inventory id"
+          PY
+          # Generated, never committed: bindings + public vars only, no
+          # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
+          # the gate step above passed for this env's Hyperdrive config
+          # (runtime attestation; the Worker refuses traffic otherwise).
+          cat > wrangler.toml <<EOF
+          # GENERATED by deploy.yml staging-api from public repo variables.
+          # Do not edit or commit: secrets live in Cloudflare, ids in vars.
+          name = "nntune-api"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-10-01"
+
+          [build]
+          command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
+
+          [env.staging]
+          name = "nntune-api-staging"
+          [env.staging.vars]
+          RP_ID = "${API_RP_ID_STAGING}"
+          RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
+          SESSION_TTL_SECS = "86400"
+          HYPERDRIVE_CACHING_DISABLED = "1"
+
+          # Workers Logs persistence for the structured api records (the
+          # build_sha evidence is read there). Without this block the
+          # deployed Worker has observability=null and persists nothing.
+          [env.staging.observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [[env.staging.hyperdrive]]
+          binding = "HYPERDRIVE"
+          id = "${HYPERDRIVE_ID_STAGING}"
+          EOF
+      - name: Deploy api to staging
+        id: deploy
+        if: steps.config.outputs.configured == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          workingDirectory: workers/api
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
+      # Always report the executed step outcomes, including safe config skips
+      # and failures. A green job alone is not evidence of a deployed Worker.
+      - name: Record API deployment outcome
+        id: deployment
+        if: always()
+        env:
+          CONFIGURED: ${{ steps.config.outputs.configured }}
+          HYPERDRIVE_OUTCOME: ${{ steps.hyperdrive.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deployed=false
+          outcome=failed
+          source_sha=""
+          if [ "$JOB_STATUS" = cancelled ]; then
+            outcome=cancelled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
+            outcome=unconfigured
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && \
+               [ "$HYPERDRIVE_OUTCOME" = success ] && [ "$DEPLOY_OUTCOME" = success ]; then
+            deployed=true
+            outcome=deployed
+            source_sha="$SOURCE_SHA"
+          fi
+          {
+            echo "deployed=$deployed"
+            echo "outcome=$outcome"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### staging-api deployment outcome: $outcome"
+            echo "Worker: nntune-api-staging (env staging)"
+            echo "deployed=$deployed"
+            echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
+            echo "Deploy api to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$deployed" = true ]; then
+              echo "Source SHA: $source_sha"
+              echo "BUILD_SHA var: $source_sha"
+            fi
+            echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Post-deploy staging E2E (same run, same revision as the deploy above).
+  # No always()/!cancelled(): with the implicit success() gate, this job is
+  # skipped whenever `staging-web` is skipped (gate disabled / non-push) or
+  # fails, so it can never report a full-journey PASS without a successful
+  # deploy first. Secrets are passed explicitly (never `inherit`) and match
+  # exactly the names e2e-staging.yml reads. The promotion SHA (github.sha)
+  # is passed as expected_sha so the build-identity spec can prove the
+  # serving build is the promoted one — never a source checkout.
+  post-deploy-e2e:
+    name: post-deploy-e2e
+    needs: [staging-web]
+    if: ${{ github.event_name == 'push' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e-staging.yml
+    with:
+      post_deploy: true
+      expected_sha: ${{ github.sha }}
+    secrets:
+      STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+      SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+      SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
+      SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+      SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
+      SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+
   preview-web:
     name: preview-web
     needs: [gate]
     if: ${{ github.event_name == 'pull_request' && needs.gate.outputs.enabled == 'true' }}
+    # Job-level twin of staging-web above: per-PR serialization with
+    # cancel-in-progress on PRs, never held by the E2E tail.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

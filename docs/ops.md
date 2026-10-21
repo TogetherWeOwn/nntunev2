@@ -17,13 +17,17 @@ An authorized executor must satisfy the applicable approval/retention gates firs
 - Workers Paid + R2 Paid entitlements: confirmed by the host executor on
   2026-10-13; not independently billing-verified by the operator MCP token.
 
-### R2 buckets (core buckets created 2026-10-13; scratch details unverified)
+### R2 buckets (core buckets created 2026-10-13; scratch metadata verified 2026-10-17)
 
-The scratch-bucket names, seven-day lifecycle rule, provisioning status, and
-creation date are unverified by this documentation update; the repository has
-no independent provisioning receipt for them. Treat these details as reported
-inventory, not GET-verified Cloudflare state, until an authorized executor
-checks the bucket and lifecycle metadata.
+Read-only Cloudflare R2 metadata GETs on 2026-10-17 confirmed both reported
+scratch buckets exist and each has one enabled object-expiration rule:
+`expire-ingest-scratch-after-7-days`, prefix `ingest-scratch/`, age
+`604800` seconds (seven days), action `deleteObjectsTransition`. The staging
+and production bucket names match the inventory below. No lifecycle rule on
+either bucket expires objects outside that prefix. The observed archive-bucket
+lifecycle is only the enabled `Default Multipart Abort Rule`, age `604800`
+seconds, with no prefix condition; it aborts incomplete multipart uploads and
+does not expire stored objects.
 
 The provisioned layout is **one bucket per concern per environment**, not one
 shared bucket. Object key prefixes describe cache scope *within* those buckets;
@@ -36,17 +40,21 @@ integration prerequisites on sibling branches are:
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
-| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | Producer and consumer still use `nntune-ingest-jobs`; the commented DLQ field is valid but staging-specific (`nntunev2-ingest-dlq-staging`). Use `nntunev2-ingest-dlq-prod` in prod, and align producer/consumer queue names with the per-environment inventory below. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | The checked-in example still uses generic `nntune-ingest-jobs` and unsuffixed `nntune-ingest-dlq`, with its consumer commented out. Align producer/consumer queue names and the DLQ route to the per-environment inventory below before enabling a consumer. |
 | `workers/mb/wrangler.toml.example`, MB art cache | The `ART_CACHE` template names only `nntunev2-art-staging`; the prod deploy must override it with `nntunev2-art-prod` when the binding is activated. |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
 recheck actual bindings before deployment. This runbook does not change those
-branches or certify a deploy. Scratch storage is intended to be separate from archive buckets. The reported
-ingest scratch buckets are isolated by environment and are intended to expire
-objects under `ingest-scratch/` after seven days; do not use archive buckets as
-scratch storage. Provisioning and lifecycle settings are unverified as noted
-above.
+branches or certify a deploy. Scratch storage is separate from archive buckets.
+The two scratch buckets are isolated by environment, and their live lifecycle
+rules were verified on 2026-10-17 as described above. Read-only Worker metadata
+showed no active production NNTune Worker deployment; the active staging
+`nntune-web-staging` version has no R2 bindings, and no ingest Worker is
+currently deployed. Thus neither archive bucket is bound as scratch storage by
+a deployed NNTune Worker. This check inspects Worker configuration only; it did
+not enumerate bucket objects or rule out out-of-band S3/API clients. Do not use
+archive buckets as scratch storage.
 
 | Bucket | Env | Intended consumer |
 |---|---|---|
@@ -56,8 +64,8 @@ above.
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache |
 | `nntunev2-archive-staging` | staging | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
-| `nntunev2-ingest-scratch-staging` | staging | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
-| `nntunev2-ingest-scratch-prod` | prod | reported ingest repair scratch; `ingest-scratch/` 7-day expiry intended, unverified |
+| `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
+| `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -69,27 +77,74 @@ UNDO (decommissioning reference, not an instruction to execute):
 consumer removal and data-retention checks. Never delete cached/archive data as
 part of a documentation fix.
 
-### Queues (baseline ingest queues created 2026-10-13; DLQ details unverified)
+#### Audio-bucket R2 lifecycle and track-pointer TTL (reported 2026-10-19)
 
-The DLQ queue names and IDs below are reported inventory; their creation date and
-live existence are unverified by this documentation update. Confirm the names
-and IDs against Cloudflare before configuring dead-letter routing.
+Reported R2 lifecycle rules per audio bucket, from checked-in manifests plus
+prior observations in this runbook's R2 section above. The scratch 7-day
+`ingest-scratch/` rule and the archive `Default Multipart Abort Rule` recorded
+in `docs/ops.md` are the only live bucket-lifecycle observations in this
+runbook, so no live bucket-lifecycle GET is recorded here for either audio
+bucket:
 
-| Queue | ID | Env |
-|---|---|---|
-| `nntunev2-ingest-staging` | `c9e6afdea0ca487c8d20f799a052b045` | staging |
-| `nntunev2-ingest-prod` | `2bf7e1a0edd347c9aada2afbc0c24ae5` | prod |
-| `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ |
-| `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ |
+| Bucket | Reported R2 lifecycle rules |
+|---|---|
+| `nntunev2-audio-staging` | none reported — no object-expiry or multipart-abort rule recorded for this bucket in `docs/ops.md` or `docs/cache-policy.md`; `workers/stream/wrangler.toml:47-49` declares only the staging `AUDIO_CACHE` binding |
+| `nntunev2-audio-prod` | none reported — same evidence as staging; `workers/stream/wrangler.toml:34-36,59-61` declare only the prod `AUDIO_CACHE` bindings |
 
-The reported inventory lists these DLQ queues as provisioned and not connected
-to a consumer; live existence is unverified as noted above. Configure the
-consumer's dead-letter handling only when the ingest consumer is enabled.
-Cloudflare's default retention for DLQ messages is four days when there is no
-active consumer ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)). Queue message retention can be
-customized from 60 seconds to 14 days ([retention-period announcement](https://developers.cloudflare.com/changelog/post/2025-02-14-customize-queue-retention-period/)).
-The actual retention configured on these reported queues is unverified.
-Enable dead-letter routing only with a plan to process each DLQ.
+No `lifecycle` field appears in the checked-in Worker/app Wrangler manifests
+(`workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`,
+`workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml.example`,
+`workers/api/wrangler.toml.example`, `apps/web/wrangler.toml`) — lifecycle is
+Cloudflare-side, not a Wrangler field, per the audio bucket sources in
+`docs/cache-policy.md` — and the only `lifecycle` string in those manifests is
+the scratch-prefix cleanup comment at
+`workers/ingest/wrangler.toml.example:129`. "None reported" records the
+verified absence of any reported rule for these two audio buckets
+(`workers/stream/wrangler.toml:47-49,59-61`); it does not assert the live
+Cloudflare-side state, which remains unverified for the audio buckets.
+Physical-bucket and binding alignment stays with the owning lanes per the
+reconciliation table in `docs/ops.md` (R2 section above); this subsection
+records lifecycle status only and changes no bucket, binding, TTL, or header
+behavior.
+
+Timed `track/<id>` pointer freshness is application behavior, distinct from R2
+lifecycle per the TTL section of `docs/cache-policy.md`: entries serve fresh
+for `CACHE_FRESH_TTL_SECS = 300` (`workers/stream/src/cache.rs:33`), then
+stale for `CACHE_SWR_WINDOW_SECS = 3_600` (`workers/stream/src/cache.rs:38`)
+while owing background revalidation, then hard-miss past 3,900 s of age
+(`get_track_at` returns `None` past fresh + SWR at
+`workers/stream/src/cache.rs:250-258`, within
+`workers/stream/src/cache.rs:229-261`; `workers/stream/src/play.rs:502-527`
+falls through to the miss path and re-fetches upstream;
+`workers/stream/README.md:157-168` documents HIT, STALE, and MISS). Untimed
+`put_track` entries never go stale (`workers/stream/src/cache.rs:127-147`
+writes `stored_at_secs: None`, served fresh at
+`workers/stream/src/cache.rs:246-247`).
+
+### Queues (metadata GET-verified 2026-10-17)
+
+Read-only Cloudflare Queues API list/get and consumer-list responses on
+2026-10-17 confirmed the reported DLQ names and IDs. Both queues were created
+2026-10-16. The API reported `settings.message_retention_period = 345600`
+seconds (4 days) for each; this is the observed setting, not an assumption from
+the default. Cloudflare documents four days as the default DLQ retention when
+there is no active consumer ([DLQ documentation](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)); both API responses also reported zero consumers. A consumer-list GET for each queue returned an empty list.
+
+| Queue | ID | Env | Observed retention | Consumers |
+|---|---|---|---|---|
+| `nntunev2-ingest-staging` | `c9e6afdea0ca487c8d20f799a052b045` | staging | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-prod` | `2bf7e1a0edd347c9aada2afbc0c24ae5` | prod | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ | 345600 seconds (4 days) | 0 |
+| `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ | 345600 seconds (4 days) | 0 |
+
+**Routing discrepancy; stop before configuration changes.** The only checked-in
+ingest Wrangler configuration is `workers/ingest/wrangler.toml.example`. Its
+producer and commented consumer use `nntune-ingest-jobs`; its DLQ producer and
+commented `dead_letter_queue` use the unsuffixed `nntune-ingest-dlq`. The
+consumer block remains commented, and this example does not distinguish staging
+from production. These values do not match the environment-specific queue names
+in the table above. No queue or message was changed or consumed; do not enable
+or alter routing until the owning integration lane reconciles this discrepancy.
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
 consumer removal and pending-message checks.
@@ -219,8 +274,32 @@ this documentation update, nor evidence of separate compute/failure domains.
   write denial, and bidirectional cross-database CONNECT denial. The earlier
   seven-role `select 1` probe predates consolidation and is not current proof.
 - MB migrator/runtime/read-only roles were provisioned separately. The latest
-  app-isolation receipt does not prove MB read-only enforcement; verify MB grants
-  before application use. Never copy database URLs into this repo, issues, or logs.
+  app-isolation receipt does not prove MB read-only enforcement. On 2026-10-17,
+  this agent attempted to locate an authorized read-only SQL executor through the
+  Paperclip connection catalog; both searches timed out. No direct SQL session or
+  host-side verification receipt was available in this workspace. Accordingly,
+  **the MB app role's live grants remain unverified**; the older receipt's claim
+  that the MB binding uses a read-only role is host-reported only.
+- Exact checks still required against the MB database using the authorized
+  read-only verification path: establish the database/schema and effective role
+  identity without exposing connection details; run a representative `SELECT`
+  against a required mirror table; inspect effective table/schema privileges and
+  default privileges; and confirm representative `INSERT`/`UPDATE`/`DELETE`,
+  sequence-write, and schema/table DDL privileges are denied. A denial must be
+  established from the effective role's actual privilege result or a safely
+  rolled-back, non-mutating authorization check; do not attempt a write that
+  could change data. Sequence probes are not non-mutating: `nextval` consumes
+  values even when the surrounding transaction rolls back, so sequence-write
+  denial must come from privilege inspection (for example
+  `has_sequence_privilege`), never from a rolled-back `nextval` probe.
+  No check above was run here, so neither SELECT success nor
+  write/DDL denial is claimed.
+- Authorized follow-up: the Operator should use the existing secure host-side
+  read-only verification path to run and return the checks above, reporting only
+  date, environment/database and role labels, check expressions/categories, and
+  outcomes. Do not send or record URLs, passwords, tokens, hostnames, or personal
+  login identities; do not alter grants or roles. Update this evidence only from
+  that direct result, keeping host-reported statements clearly distinguished.
 
 ### Hyperdrive bindings
 
@@ -280,6 +359,15 @@ No resize, split, role change, branch recreation, deletion, or credential rotati
 is authorized here. Decommissioning would require consumer removal and the
 applicable data-retention gate before deleting configs, roles, or databases.
 
+## Cost basis
+
+Public list prices and cost-as-function-of-usage formulas for Workers,
+R2, KV, Queues, Analytics Engine and PlanetScale Postgres are in
+[`docs/cost-basis.md`](cost-basis.md) (checked 2026-10-17). The first
+measured staging bill (2026-10-13 → 2026-10-17) is recorded in section 10
+of that document; plug later staging volumes into the same formulas for
+updated estimates.
+
 ## Environments matrix
 
 Binding names are chosen in Worker configs; resource names must match this table.
@@ -289,10 +377,17 @@ Binding names are chosen in Worker configs; resource names must match this table
 | R2 audio / stream Worker | `nntunev2-audio-staging` | `nntunev2-audio-prod` |
 | R2 artwork / MB Worker | `nntunev2-art-staging` | `nntunev2-art-prod` |
 | R2 archive / reserved, no consumer | `nntunev2-archive-staging` | `nntunev2-archive-prod` |
-| Ingest scratch (reported; names and 7-day lifecycle unverified) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; intended 7 days) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; intended 7 days) |
+| Ingest scratch (bucket existence and 7-day lifecycle verified 2026-10-17) | `nntunev2-ingest-scratch-staging` (`ingest-scratch/`; 604800-second expiry) | `nntunev2-ingest-scratch-prod` (`ingest-scratch/`; 604800-second expiry) |
 | Ingest Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` |
-| Ingest DLQ / no active consumer (reported names/IDs; live existence and retention unverified) | `nntunev2-ingest-dlq-staging` (default 4-day retention while no active consumer) | `nntunev2-ingest-dlq-prod` (default 4-day retention while no active consumer) |
+| Ingest DLQ / no consumer observed (Cloudflare metadata GET 2026-10-17; 345600 seconds observed, matching documented 4-day default with no active consumer) | `nntunev2-ingest-dlq-staging` (`e7ab1d4b284f44f094c5fe62f9bf96a5`) | `nntunev2-ingest-dlq-prod` (`e9d0a9f5549249df9eebaa5c00951328`) |
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
+| Stream NNTP pool (DO class) | `NntpPool` | `NntpPool` |
+| Repair jobs (DO class) | `RepairContainer` | `RepairContainer` |
+| Stream meter (AE dataset) | `nntune_meter` | `nntune_meter` |
+| Ingest meter (AE dataset) | `nntune_ingest_meter` | `nntune_ingest_meter` |
+| Stream service (ingest `NNTP_POOL` cross-script target) | `nntune-stream-staging` | `nntune-stream` |
+| Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
+| MB service (ingest `MB_API` target; Wrangler default-suffixed, no per-env `name` committed) | `nntune-mb-staging` | `nntune-mb-production` |
 | Hostname | `v2-staging.nntune.com` (+ Access; deployment pending) | TBD at launch |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
@@ -324,8 +419,9 @@ tables above. Where a committed config still carries a stale name, the
 reconciliation table in the R2 section governs: align the config to this
 table, never the reverse. IDs below are non-credential binding metadata;
 no database URLs or secret values are recorded here. Non-storage bindings
-(Durable Object, Analytics Engine, Container service) are out of scope of
-this table.
+(Durable Object, Analytics Engine, service) are out of scope of
+this table; they are inventoried with per-environment values and committed
+config sources in the Non-storage bindings inventory below.
 
 | Worker (config source) | Binding | Type | staging | prod | ID / variable |
 |---|---|---|---|---|---|
@@ -339,38 +435,143 @@ this table.
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
 owning lanes, not here): `workers/ingest/wrangler.toml.example` still names
-`nntune-ingest-jobs` for the producer/consumer. Its commented DLQ example now
-uses the valid `dead_letter_queue` field inside `[[queues.consumers]]`, but
-remains staging-specific; prod must use `nntunev2-ingest-dlq-prod`. Align all
-names with the per-environment inventory before enabling the configs. Do not
-add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler rejects
-that shape, so it will not configure dead-letter routing.
+`nntune-ingest-jobs` for the producer and commented consumer, and the unsuffixed
+`nntune-ingest-dlq` for the DLQ producer and commented `dead_letter_queue`.
+Neither environment is represented by these values. Align producer, consumer,
+and DLQ names to the per-environment inventory before enabling the configs. Do
+not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
+rejects that shape, so it will not configure dead-letter routing.
+
+### Non-storage bindings inventory (DO, Analytics Engine, service)
+
+Every non-storage binding with its owning worker, per-environment value,
+and committed config source (file with line ranges; code constants where
+they pin the name). No secret values and no uncommitted IDs are recorded
+here: Analytics Engine datasets and service/DO names below are all
+committed in the cited Wrangler configs. The Environments matrix above
+carries the same per-environment values; this table adds the owning
+worker and the exact config source for each row.
+
+| Binding | Type | Owning worker | staging | prod | Committed config source |
+|---|---|---|---|---|---|
+| `NNTP_POOL` (class declaration) | Durable Object | `stream` | class `NntpPool` | class `NntpPool` | `workers/stream/wrangler.toml:22-24` (top-level), `:44-46` (staging), `:56-58` (production); migration tag `v1` `:26-28`; code `workers/stream/src/runtime.rs:44`, `workers/stream/src/routes.rs:14` |
+| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:105-112` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
+| `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
+| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:124-127`; code `workers/ingest/src/metering.rs:16-18` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:129-133` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:135-140` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
+| `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:122` |
+
+Notes, all referencing (not changing) owning-lane state:
+
+- The committed ingest example carries single (non-env-split) values for
+  its cross-script and service targets (`script_name = "nntune-stream"`,
+  `service = "nntune-repair"`, `service = "nntune-mb"`). Stream and repair
+  have explicit per-env `name` overrides committed in their configs, so
+  their per-environment resolution follows the target workers' committed
+  names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
+  only, none in `:28-39` or `:41-52`), so its per-environment values above
+  are the Wrangler default-suffixed names and ingest's single
+  `service = "nntune-mb"` needs the same env split. Wiring the env split is
+  owned by the integration lane, like the ingest queue-name drift recorded
+  in the R2 reconciliation table and the paragraph above.
+- The repair Worker is not yet deployed: its config header
+  (`workers/repair/wrangler.toml:11-13`) requires Cloudflare Containers on
+  the existing plan (no new spend) with deploy as a later operator action.
+  Until then the `REPAIR_CONTAINER` target names are reserved, not live —
+  and ingest cannot deploy with the committed example until the repair
+  target exists, because Cloudflare fails a deploy whose service-binding
+  target does not exist.
+- Deploy order is stream, mb, and repair (once Containers are enabled)
+  before ingest. Ingest reaches the per-user `NntpPool` object through the
+  cross-script `NNTP_POOL` binding (`workers/stream/wrangler.toml:4-8`),
+  and it declares unconditional `[[services]]` bindings to `nntune-repair`
+  and `nntune-mb` (`workers/ingest/wrangler.toml.example:129-140`; mb-first
+  is also stated at `:135-137`). Ingest cannot deploy with the committed
+  example until those service targets exist.
 
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
 
+### Production seed precondition (one-time)
+
+The production lane (`.github/workflows/deploy-production.yml`) promotes
+through the shared gradual-promote action, whose automatic-rollback target is
+the latest production deployment and which refuses unless that deployment is
+a single Worker version at 100%. There is currently no active production
+NNTune Worker deployment, so the very first promotion cannot satisfy that
+precondition on its own. Before the first promotion, an authorized executor
+must seed production once: make one full deploy of the web frontend to
+production (for example `wrangler deploy --env production` from the launch
+SHA, run from `apps/web`) with the launch custom domain (`PRODUCTION_DOMAIN`)
+attached, leaving a single 100% deployment. The lane enforces this before
+uploading anything: its seed step lists production deployments and refuses
+with these instructions when no single-version 100% deployment exists, so a
+first run fails with guidance instead of orphaning an uploaded version inside
+the promotion action. Re-dispatch the lane after seeding.
+
+### Production Worker secret-shape gate
+
+The production lane refuses any production vars beyond `name` in
+`[env.production]` before uploading a version. The gate step
+(`.github/workflows/deploy-production.yml:226-234`) runs
+`node ci/check-production-secrets-shape.mjs`, which enforces the offline
+policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
+no bindings and needs no secrets, so its production env table must carry
+only `name` (current state: `apps/web/wrangler.toml:22-23`). It runs in the
+`deploy-production` job after that job checks out the validated promotion
+SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
+(preflight checks out the dispatch tip,
+`.github/workflows/deploy-production.yml:77-79`). It is an offline
+shape check — no credentials, no network — that reads key names only and
+never reads or prints values
+(`ci/check-production-secrets-shape.mjs:6-7`).
+
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA, plus Paperclip Review 5/5 on that head (merge policy in
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
   a flake/quarantine decision with a card link, never dismissed.
+- [ ] Secret-shape gate: the promotion run's `Require production Worker
+  secret shape before upload` step passed on the promotion SHA
+  (`.github/workflows/deploy-production.yml:226-234` runs
+  `ci/check-production-secrets-shape.mjs`, which refuses any
+  `[env.production]` table beyond `name`). Same-checker CI coverage
+  (`.github/workflows/ci.yml:607-621`) is not promotion evidence on its
+  own; require the deploy-production job's pass on the exact head being
+  promoted.
 - [ ] Staging deploy evidence: record the successful push-triggered
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
-  workflow deploys `apps/web` only; it does not deploy stream, MB, API or
-  ingest Workers. The current `/api/health` returns only `{ok:true}`, with no
-  build identity, so neither a green deploy run nor a health response proves
-  which SHA is serving. Do not claim same-build evidence until a deployed-build
-  identity is exposed and compared with the promotion SHA. The deploy owner
-  replaces the placeholder `100::` record through a Workers custom domain.
-- [ ] Staging E2E: after `staging-web` completes, run `e2e-staging` by
-  `workflow_dispatch` or use a scheduled run that starts afterward; the
-  push-triggered E2E run can race the independent deploy. Record its run and
-  result, and do not call it same-build evidence until the staging build
-  identity is verified against the deploy SHA. Pre-configuration skips do
-  not count once staging is configured; the workflow fails closed without
-  both Access client credentials.
+  workflow deploys `apps/web` (`staging-web`) plus the api Worker staging
+  lane (`staging-api`, staging only); it does not deploy stream, MB, ingest
+  or repair Workers. `/api/health` returns exactly `{ok, version}` — the public
+  package version, never a build identifier
+  (`apps/web/src/routes/api/health/+server.ts`, pinned by
+  `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves
+  which SHA is serving. Deployed-build identity lives on the dedicated
+  surface `GET /api/build`, which returns exactly `{sha}`: the 40-char
+  lowercase hex head baked at build time (`BUILD_SHA`/`GITHUB_SHA` via the
+  `__BUILD_SHA__` define in `apps/web/vite.config.ts`), or the explicit
+  string `"unknown"` when the build carried no identity
+  (`apps/web/src/lib/build.ts`, `apps/web/src/routes/api/build/+server.ts`).
+  Claim same-build evidence only when staging `/api/build` returns the
+  promotion SHA itself (40-hex match; `"unknown"` is never evidence). The
+  deploy owner replaces the placeholder `100::` record through a Workers
+  custom domain.
+- [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
+  calls `e2e-staging.yml` (reusable workflow) only after the same run's
+  `staging-web` job succeeds (`needs`, no `always()`), so a skipped/failed
+  deploy cannot produce a full-journey PASS and no separate dispatch is
+  needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
+  synthetic monitoring only (the full-journey job is skipped there).
+  Record the deploy run and the `post-deploy-e2e` result, and call it
+  same-build evidence only when staging `GET /api/build` returns the
+  deploy SHA itself (a source SHA alone is not build identity; see the
+  box above).
+  Pre-configuration skips do not count once staging is configured; the
+  workflow fails closed without both Access client credentials.
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
   policy and the QA service-token policy still gate `v2-staging.nntune.com`.
   No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`
@@ -392,3 +593,60 @@ lane. Complete every box on the exact head being promoted.
   deploy Workers, which need their own rollback evidence. Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
+
+## Future Worker deploy lanes: required rollback evidence
+
+This section defines evidence only. It does not create a lane.
+
+**Current claim boundary.** `.github/workflows/deploy.yml` deploys
+`apps/web` (`staging-web` on push, `preview-web` on pull requests) plus the
+api Worker staging lane (`staging-api` on push, staging only, skipped until
+the Operator wires the staging variables). No other tracked workflow
+deploys the backend Workers under `workers/` (`ingest`, `stream`, `mb`,
+`repair`), and
+`.github/workflows/e2e-staging.yml` exercises the staging web URL, not a
+Worker deploy or rollback. Worker source and Wrangler configs existing in
+the repo are not deployment. Therefore **no backend-Worker deploy,
+rollback, activation, or staging acceptance is currently claimed**, for any
+Worker in any environment, until that Worker's lane exists and its gates
+pass on the exact head being promoted — for the api Worker that requires a
+`staging-api` job conclusion `success`, successful **executed** `Hyperdrive
+cache-disabled gate` and `Deploy api to staging` steps, and the job output
+`deployed=true` (`outcome=deployed`) on the promotion run. Its `source_sha`
+output must match the promotion SHA and the deploy's `BUILD_SHA` argument.
+A missing-config job can conclude `success` while reporting
+`deployed=false`, `outcome=unconfigured`, and an empty `source_sha`; it is
+not deploy evidence. The names-only deployment summary also reports failed
+or cancelled paths without attributing a deployed source SHA. This marker
+alone proves neither health, rollback nor full staging acceptance.
+The web checklist above is unchanged by this section and remains in
+force alongside the per-Worker evidence table below. The web frontend's
+production lane (`.github/workflows/deploy-production.yml`, disabled by
+default until the launch hostname decision:
+`.github/workflows/deploy-production.yml:6-9`) already exists and is not a
+future lane; its secret-shape gate is recorded in the staging checklist
+above, not in this evidence table.
+
+**Evidence a future Worker staging lane must retain**, per Worker and per
+environment, linked from that promotion's deploy record before rollback can
+be called accepted:
+
+| # | Retain | Acceptance bar |
+|---|---|---|
+| 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
+| 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2; a config-skipped `success` does not qualify. Record gate results by name and outcome only. |
+| 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
+| 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
+| 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
+
+A Worker rollback restores Worker code only. If the deploy being rolled
+back also changed bindings, Durable Object migrations, queue consumers or
+routing, database migrations, or stored data, the evidence is incomplete
+until it also states, for each such change, that the restored version is
+compatible with it or records that change's own rollback. Rollback is never
+a data restore.
+
+Evidence records contain names, version identifiers, commit SHAs, and run
+or health-check URLs only. Do not record account IDs, tokens, credentials,
+database URLs, environment values, or personal login identities in them.

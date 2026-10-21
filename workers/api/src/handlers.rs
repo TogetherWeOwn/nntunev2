@@ -34,6 +34,7 @@ use std::net::IpAddr;
 use std::pin::Pin;
 
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseStore,
@@ -52,6 +53,12 @@ use crate::webauthn;
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
+/// Admitted inline auth-mail send budget (client-visible auth-start contract:
+/// registration and known-user magic-start race the mail send against this
+/// deadline, then follow the ordinary ignored delivery-error path with the
+/// unchanged generic envelope). Drift must be a deliberate slice with README
+/// and caller updates, not a silent edit.
+pub const AUTH_MAIL_SEND_DEADLINE_SECS: u64 = 5;
 // Test-connection budget lives in one place: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
 // per `vault::TEST_CONNECTION_WINDOW_SECS`. No handler-level copy: the two
 // once disagreed (10 vs 5) with both test suites green.
@@ -74,6 +81,22 @@ const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
 const FINISH_LOOKUP_ATTEMPTS_PER_IP: u64 = 100;
 const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
+/// Bearer-lookup budgets (ADR 0010 DoS): a well-formed random `ntk_` token
+/// still costs an HMAC plus up to two Postgres lookups (one per pepper),
+/// so bearer attempts share one per-client pool keyed on the client /64
+/// (IPv6) or full address (IPv4) BEFORE any credential DB work — the same
+/// two-layer shape as the finish-route lookup budget above. Denial answers
+/// the same generic 401 as any other bearer failure (no throttle oracle).
+/// 300 per minute admits legitimate API polling while capping a single
+/// client's DB amplification; 3000 per hour bounds sustained floods while
+/// admitting NAT-shared bursts. Both slots are claimed as one all-or-none
+/// pair, so a burst-denied attempt burns neither budget. Per-credential
+/// rate limits and plan entitlements (ADR 0010) follow with the data
+/// routes; this pool only bounds unauthenticated lookup work.
+const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
+const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
+const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
+const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
 /// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
 /// while cutting distinct-email loops. Global capacity is reserved only for
 /// outbound mail, so exhaustion cannot block auth challenge issuance.
@@ -103,10 +126,15 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
 /// unexpired register challenges, vaults, sessions, unexpired magic links)
-/// must stay in sync with the `FakeStore` mirror.
+/// must stay in sync with the `FakeStore` mirror. Accounts with a
+/// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
+/// are owned by the deletion executor, and their `delete_operations`
+/// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
+/// (`FakeStore` mirrors this through `deleting_users`).
 pub fn reap_unverified_users_sql() -> String {
     format!(
         "DELETE FROM users WHERE created_at <= $1 \
+         AND deleting_at IS NULL \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
                          WHERE webauthn_credentials.user_id = users.id) \
@@ -157,6 +185,35 @@ pub struct Config {
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
     pub session_previous_secret: Option<Vec<u8>>,
+    /// Dedicated native-REST bearer keyring (ADR 0010): the HMAC pepper
+    /// bytes plus their version. `None` until the operator provisions
+    /// `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` (see the
+    /// Worker entry and `wrangler.toml.example`). Unprovisioned, issuance
+    /// endpoints fail closed per-request (generic 500) and bearer routes
+    /// fail closed (401); every other route keeps serving, so
+    /// provisioning the keyring is never a flag-day.
+    pub native_rest_pepper: Option<Vec<u8>>,
+    /// Version bound to [`Config::native_rest_pepper`]; stored per row and
+    /// looked up by exact version (composite `UNIQUE (pepper_version,
+    /// key_hmac)`, migration 0019).
+    pub native_rest_pepper_version: u32,
+    /// Rate-limit tunables for the auth-start burst and vault
+    /// test-connection budgets. `Config::new` uses the documented
+    /// defaults; the Worker entry overlays [vars] via
+    /// `RateLimitConfig::from_vars` + [`Config::with_rate_limits`].
+    pub rate_limits: crate::rate_limit::RateLimitConfig,
+    /// Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
+    /// false unless the operator explicitly sets the staging flag. The
+    /// constructor keeps it off so existing callers — and production
+    /// builds, which never set the flag — serve the seam path as a plain
+    /// 404. The Worker entry enables it via
+    /// [`Config::with_qa_code_seam`] + [`Config::with_qa_auth_token`].
+    pub qa_code_seam: bool,
+    /// Bearer expected on the seam route (`QA_AUTH_TOKEN` Worker secret).
+    /// `None` (the constructor default) fails the seam closed even when
+    /// the flag is on: with no expected value there is nothing to compare
+    /// against, so every seam request 404s.
+    pub qa_auth_token: Option<String>,
 }
 
 impl Config {
@@ -198,7 +255,63 @@ impl Config {
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
             session_previous_secret,
+            native_rest_pepper: None,
+            native_rest_pepper_version: 0,
+            rate_limits: crate::rate_limit::RateLimitConfig::default(),
+            qa_code_seam: false,
+            qa_auth_token: None,
         })
+    }
+
+    /// Overlay operator-configured rate limits (from [vars]); the
+    /// constructor keeps the documented defaults so existing callers
+    /// and tests need no change.
+    pub fn with_rate_limits(mut self, rate_limits: crate::rate_limit::RateLimitConfig) -> Self {
+        self.rate_limits = rate_limits;
+        self
+    }
+
+    /// Provision the native-REST bearer keyring. The Worker entry calls
+    /// this only after strict validation (unpadded-base64url decode plus
+    /// the 32-byte minimum, version parses as `u32`); a half-configured
+    /// keyring refuses to start there, so this setter never sees bad
+    /// input in production. Native tests pass synthetic peppers directly.
+    pub fn with_native_rest_pepper(mut self, pepper: Vec<u8>, version: u32) -> Self {
+        self.native_rest_pepper = Some(pepper);
+        self.native_rest_pepper_version = version;
+        self
+    }
+
+    /// Authorizing pepper set for bearer verification: exactly the
+    /// configured version, or empty when unprovisioned (empty fails
+    /// closed inside `authorize`). A rotation adds the previous entry
+    /// here without touching the handlers: dual-version lookup already
+    /// tries every listed version.
+    pub fn native_rest_peppers(&self) -> Vec<crate::native_rest::Pepper<'_>> {
+        self.native_rest_pepper
+            .as_deref()
+            .map(|bytes| crate::native_rest::Pepper {
+                version: self.native_rest_pepper_version,
+                bytes,
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Arm the staging-only emailed-code retrieval seam. The constructor
+    /// keeps it off so production builds serve the seam path as a plain
+    /// 404; only an explicit staging flag enables capture + retrieval.
+    pub fn with_qa_code_seam(mut self, enabled: bool) -> Self {
+        self.qa_code_seam = enabled;
+        self
+    }
+
+    /// Stage the bearer the seam route expects (`QA_AUTH_TOKEN`). Without
+    /// it the seam stays fail-closed even when armed: there is no expected
+    /// value to compare against, so every seam request 404s.
+    pub fn with_qa_auth_token(mut self, token: &str) -> Self {
+        self.qa_auth_token = Some(token.to_string());
+        self
     }
 
     /// Signing/verification keys for this worker: rotation (the primary
@@ -246,6 +359,14 @@ pub struct UserRecord {
 /// account) rejects before any verification or claim.
 pub const PURPOSE_REGISTER: &str = "register";
 pub const PURPOSE_LOGIN: &str = "login";
+pub const PURPOSE_REAUTH: &str = "reauth";
+
+/// Counter stored for a new credential, whatever the attestation said.
+/// `none` attestation is unauthenticated, so its enrollment counter is
+/// attacker-chosen: persisting `u32::MAX` would make every later
+/// (strictly-increasing) assertion fail. The first assertion's signed
+/// counter becomes the baseline; counterless authenticators stay at 0.
+const ENROLLMENT_SIGN_COUNT: u32 = 0;
 
 #[derive(Debug, Clone)]
 pub struct ChallengeRow {
@@ -260,6 +381,50 @@ pub struct VaultRow {
     pub blob: VaultBlob,
     pub indexer_configured: bool,
     pub updated_at: u64,
+}
+
+/// Stored native REST credential (ADR 0010, migration 0019): the core
+/// [`crate::native_rest::NativeRestRecord`] (HMAC-only, never the secret)
+/// plus HTTP-layer metadata. `Clone`; manual `Debug` reuses the record's
+/// redacted form and names the label, but never the client IP or any key
+/// material — diagnostics name names, never values or addresses.
+#[derive(Clone)]
+pub struct NativeCredentialRow {
+    pub record: crate::native_rest::NativeRestRecord,
+    pub label: String,
+    pub created_from_ip: String,
+    pub last_used_at: Option<u64>,
+}
+
+impl std::fmt::Debug for NativeCredentialRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeCredentialRow")
+            .field("record", &self.record)
+            .field("label", &self.label)
+            .field("last_used_at", &self.last_used_at)
+            .finish()
+    }
+}
+
+/// One durable rate-limit budget: `limit` slots for
+/// `(scope_key, action)` per `window_secs`. See
+/// [`Store::reserve_rate_limit_pair`].
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitBudget<'a> {
+    pub scope_key: &'a str,
+    pub action: &'a str,
+    pub limit: u64,
+    pub window_secs: u64,
+}
+
+/// Outcome of [`Store::reserve_rate_limit_pair`]. The denial variants
+/// name WHICH budget refused so callers can report that budget's
+/// window (a burst denial must not carry the hourly `Retry-After`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairAdmission {
+    Allowed,
+    DeniedFirst,
+    DeniedSecond,
 }
 
 /// Persistence over migration-0002 tables. Implementations must use
@@ -311,6 +476,37 @@ pub trait Store {
         &self,
         token_hash: &str,
     ) -> impl Future<Output = Result<Option<MagicLinkRecord>, StoreError>>;
+    /// Staging-only emailed-code outbox (migration 0018): remember the raw
+    /// issued token for a synthetic mailbox, replacing any earlier row for
+    /// it. Default no-op keeps out-of-tree `Store` impls compiling;
+    /// production and the test fake override it. Called only when the seam
+    /// flag is armed and the recipient is an `example.test` mailbox, and
+    /// only after the magic row itself was stored — capture can never
+    /// break issuance (callers ignore its result).
+    fn record_qa_issued_code(
+        &self,
+        email: &str,
+        token: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (email, token, now);
+            Ok(())
+        }
+    }
+    /// Latest captured token for a synthetic mailbox, if any. Default
+    /// `Ok(None)` keeps out-of-tree `Store` impls compiling (their seam
+    /// reads 404); production and the test fake override it. Read-only:
+    /// implementations must not create users, challenges, or magic rows.
+    fn qa_issued_code(
+        &self,
+        email: &str,
+    ) -> impl Future<Output = Result<Option<QaIssuedCode>, StoreError>> {
+        async move {
+            let _ = email;
+            Ok(None)
+        }
+    }
     /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
     /// Expired slots may be reused; concurrent calls must never exceed the cap.
     fn reserve_rate_limit(
@@ -321,6 +517,51 @@ pub trait Store {
         now: u64,
         window_secs: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Reserve one slot from EACH of two budgets as a single admission
+    /// decision: an allowed attempt consumes both, a denied attempt
+    /// consumes NEITHER. The two budgets must be distinct
+    /// `(scope_key, action)` pairs. Sequential single reserves would let an
+    /// account that exhausted its own budget keep burning the shared
+    /// per-IP budget (locking out other accounts behind the same
+    /// address) on requests that never proceed. Production and the
+    /// test fake override this with a truly all-or-none claim; the
+    /// default keeps out-of-tree `Store` impls compiling with the
+    /// weaker sequential semantics.
+    fn reserve_rate_limit_pair(
+        &self,
+        first: RateLimitBudget<'_>,
+        second: RateLimitBudget<'_>,
+        now: u64,
+    ) -> impl Future<Output = Result<PairAdmission, StoreError>> {
+        async move {
+            if !self
+                .reserve_rate_limit(
+                    first.scope_key,
+                    first.action,
+                    first.limit,
+                    now,
+                    first.window_secs,
+                )
+                .await?
+            {
+                return Ok(PairAdmission::DeniedFirst);
+            }
+            if self
+                .reserve_rate_limit(
+                    second.scope_key,
+                    second.action,
+                    second.limit,
+                    now,
+                    second.window_secs,
+                )
+                .await?
+            {
+                Ok(PairAdmission::Allowed)
+            } else {
+                Ok(PairAdmission::DeniedSecond)
+            }
+        }
+    }
     /// Remove challenges that can no longer be redeemed.
     fn prune_expired_challenges(&self, now: u64) -> impl Future<Output = Result<(), StoreError>>;
     /// Reap abandoned signups while preserving the current/resumed user,
@@ -375,7 +616,33 @@ pub trait Store {
         new_counter: u32,
         new_expires_at: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Atomically claim the old session for reauthentication and insert its
+    /// replacement. A false result means the conditional revoke lost a race;
+    /// errors must leave both rows unchanged.
+    fn replace_session_after_reauthentication(
+        &self,
+        _replacement: &session::ReauthenticatedSession,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn revoke_session(&self, id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Conditional single-session revoke matching
+    /// [`session::SessionRevokeClaim::Single`]: `UPDATE ... WHERE id = $1
+    /// AND user_id = $2 AND revoked = FALSE`. Returns true iff exactly one
+    /// row transitioned, so concurrent logouts cannot double-count. The
+    /// default preserves legacy behavior for out-of-tree impls by delegating
+    /// to [`Store::revoke_session`]; production and updated fakes override
+    /// with the conditional write.
+    fn revoke_single_session(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            self.revoke_session(id).await.map(|_| true)
+        }
+    }
     fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
     fn vault_by_user(
         &self,
@@ -387,11 +654,91 @@ pub trait Store {
         row: &VaultRow,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Whether the user's account is fenced for deletion
+    /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
+    /// it only to classify a fenced write's failure as the typed 409
+    /// instead of the generic storage error; it is never the fence
+    /// itself (production writes carry the fence in-statement).
+    /// Default `Ok(false)` keeps out-of-tree `Store` impls compiling;
+    /// production and the test fake override it.
+    fn account_deleting(&self, _user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
+    /// Persist a freshly issued native REST credential row (migration
+    /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
+    /// never report a mint it did not durably record; production and the
+    /// test fake override it.
+    fn insert_native_credential(
+        &self,
+        _row: &NativeCredentialRow,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every credential row owned by `user_id`, for the
+    /// session-authenticated listing (never carries secret material: the
+    /// row holds the HMAC only). Fail-closed default is empty; production
+    /// and the test fake override it.
+    fn native_credentials_for_user(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<NativeCredentialRow>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Bearer lookup by the composite identity `(pepper_version,
+    /// key_hmac)`: the gate HMACs the presented secret under each listed
+    /// pepper and looks the digest up here. Fail-closed default is
+    /// absent; production and the test fake override it.
+    fn native_credential_by_hmac(
+        &self,
+        _pepper_version: u32,
+        _key_hmac: &str,
+    ) -> impl Future<Output = Result<Option<NativeCredentialRow>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Owner-scoped single revoke: marks the row `revoked_at = now` when
+    /// it belongs to `user_id` and is still live (sticky — an
+    /// already-revoked row keeps its original timestamp), and reports
+    /// whether such a row exists at all (unknown or foreign ids report
+    /// `false`, which the handler answers 404). Fail-closed default is
+    /// `false`; production and the test fake override it.
+    fn revoke_native_credential(
+        &self,
+        _id: &str,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Ok(false) }
+    }
+    /// Bulk revoke for the recovery/revoke-all path (ADR 0010: the
+    /// session-compromise response revokes every unrevoked row alongside
+    /// the sessions): transitions each live row for `user_id`, stamps the
+    /// transition with the store's wall-clock `now`, and returns how many
+    /// transitioned. An empty user id revokes nothing. Fail-closed
+    /// default is `0`; production and the test fake override it.
+    fn revoke_all_native_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Ok(0) }
+    }
+    /// Best-effort successful-use accounting (`last_used_at`): called by
+    /// the bearer gate after authorization, its outcome never changes the
+    /// decision (like `audit`). Default no-op keeps out-of-tree `Store`
+    /// impls compiling; production and the test fake override it.
+    fn record_native_credential_use(
+        &self,
+        _id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Ok(()) }
+    }
 }
 
 /// Magic-link delivery. The token is passed only to the mailer; it must
-/// never be logged by implementations.
+/// never be logged by implementations. Dropping the returned future must
+/// cancel the underlying I/O, not just stop polling it.
 pub trait Mailer {
     fn send_magic_link(
         &self,
@@ -400,21 +747,71 @@ pub trait Mailer {
     ) -> impl Future<Output = Result<(), StoreError>>;
 }
 
+// Only the admitted send is timed: issuance and staging capture have already
+// completed. A timeout follows the ordinary ignored delivery-error path.
+pub(crate) async fn deliver_mail_with_deadline(
+    send: impl Future<Output = Result<(), StoreError>>,
+) -> Result<(), StoreError> {
+    let duration = std::time::Duration::from_secs(AUTH_MAIL_SEND_DEADLINE_SECS);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut send = std::pin::pin!(send);
+    std::future::poll_fn(|cx| {
+        // Worker Delay arms on first poll, so poll it before starting I/O.
+        // Expiry wins if both become ready together; there is no late retry.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(StoreError));
+        }
+        send.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the public response is built.
+}
+
 /// Bounded outbound probe for `test connection`. Implementations dial
-/// ONLY addresses from `target` (never re-resolve `target.host()`),
+/// ONLY addresses from `target` (never re-resolve `target.host()`), at
+/// exactly `target.port()` (the allowlisted port the target was vetted
+/// for — callers pass no port, so a substitute can never be smuggled in),
 /// keep the hostname for TLS SNI/certificate checks where the runtime
 /// supports it, apply the per-address and total `vault` timeout constants,
 /// attempt no more than `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a
 /// bare boolean — banners/errors never leave the dialer.
 pub trait Dialer {
-    fn probe(&self, target: &ValidatedTarget, port: u16, tls: bool) -> impl Future<Output = bool>;
+    fn probe(&self, target: &ValidatedTarget, tls: bool) -> impl Future<Output = bool>;
 }
 
 /// Async DNS for handler-time resolution (the sync core guard consumes
 /// the result via a static adapter, so exactly the resolved set is what
-/// gets vetted and dialed).
+/// gets vetted and dialed). The caller bounds the ENTIRE resolution using
+/// `vault::RESOLUTION_TIMEOUT_MS`, separately from the socket budgets.
+/// Implementations must cancel underlying I/O when their future is dropped;
+/// dropping a Rust future alone does not abort a JavaScript fetch/body.
 pub trait AsyncDns {
     fn resolve<'a>(&'a self, host: &'a str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + 'a>>;
+}
+
+pub(crate) async fn resolve_bounded(dns: &impl AsyncDns, host: &str) -> Vec<IpAddr> {
+    let duration = std::time::Duration::from_millis(vault::RESOLUTION_TIMEOUT_MS);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(duration);
+
+    let mut deadline = std::pin::pin!(deadline);
+    let mut resolution = dns.resolve(host);
+    std::future::poll_fn(|cx| {
+        // Expiry wins even if answers become ready in the same poll. Never
+        // return a partial family: all answers must reach the core SSRF guard.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Vec::new());
+        }
+        resolution.as_mut().poll(cx)
+    })
+    .await
+    // Both losing futures drop before the caller can validate or dial.
 }
 
 struct StaticDns {
@@ -437,6 +834,10 @@ pub struct Request {
     pub cookie: Option<String>,
     /// Raw `Origin` header value, if any.
     pub origin: Option<String>,
+    /// Raw `Authorization` header value, if any. Carried so the
+    /// staging-only QA seam can check its bearer; no other handler reads
+    /// it (account authentication rides the session cookie).
+    pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -445,6 +846,8 @@ pub struct Response {
     pub status: u16,
     pub body: String,
     pub set_cookie: Option<String>,
+    /// `Retry-After` seconds for a 429; the entry renders the header.
+    pub retry_after: Option<u64>,
 }
 
 fn json_response(status: u16, body: serde_json::Value) -> Response {
@@ -452,6 +855,7 @@ fn json_response(status: u16, body: serde_json::Value) -> Response {
         status,
         body: body.to_string(),
         set_cookie: None,
+        retry_after: None,
     }
 }
 
@@ -466,8 +870,34 @@ fn generic_vault() -> Response {
     json_response(400, serde_json::json!({"error": "vault unavailable"}))
 }
 
+/// The typed account-deletion fence refusal (ADR 0002 rule 3): HTTP 409
+/// with the registered `account_deleting` envelope. The blocking
+/// operation id and retry hint join this body with the deletion routes,
+/// which own the operation lookup.
+fn account_deleting_response() -> Response {
+    let error = crate::api_error::ApiError::account_deleting("account is being deleted");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
+}
+
+/// Fail-closed secure-randomness response: the existing 503
+/// `service_unavailable` envelope (retryable, sealed public text).
+fn unavailable() -> Response {
+    let error = crate::api_error::ApiError::service_unavailable("service unavailable");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
 }
 
 fn session_error_response(error: session::SessionError) -> Response {
@@ -479,13 +909,69 @@ fn session_error_response(error: session::SessionError) -> Response {
                 status: error.status,
                 body: error.body_json(),
                 set_cookie: None,
+                retry_after: None,
             }
         }
     }
 }
 
-fn invalid_request() -> Response {
-    json_response(400, serde_json::json!({"error": "invalid request"}))
+pub(crate) fn invalid_request() -> Response {
+    let error = crate::api_error::ApiError::invalid_request("invalid request");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+// --- Staging-only QA code seam ----------------------------------------------------------
+//
+// `POST /api/test-codes` returns the issued signup code for an
+// `example.test` mailbox without minting an account, so the staging E2E can
+// drive the real `/signup` form to the BYOP wizard. Armed ONLY by the
+// explicit staging flag (`Config::qa_code_seam`, from `QA_CODE_SEAM`) plus
+// the staged bearer (`Config::qa_auth_token`, from the `QA_AUTH_TOKEN`
+// secret); every other posture answers the seam path with the same plain
+// 404 as an unknown route. See `docs/security/threat-model.md`.
+
+/// Seam path, served by the API Worker on staging. The E2E contract pins
+/// the same path (`testCodes` in `e2e/helpers/contract.ts`); a rename must
+/// change both sides together.
+pub const QA_TEST_CODES_PATH: &str = "/api/test-codes";
+
+/// True iff the address is a synthetic test mailbox: exactly one `@` and
+/// the reserved `example.test` domain (RFC 2606, never routable), matched
+/// case-insensitively. Subdomains and suffix lookalikes
+/// (`example.test.evil.com`) do not match.
+fn is_example_test_mailbox(email: &str) -> bool {
+    let mut parts = email.trim().split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) if !local.is_empty() => {
+            domain.eq_ignore_ascii_case("example.test")
+        }
+        _ => false,
+    }
+}
+
+/// Constant-time bearer comparison for the seam route. Length mismatch
+/// rejects without comparing (only the length leaks, never content).
+fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
+    match presented {
+        Some(candidate) => {
+            let a = candidate.as_bytes();
+            let b = expected.as_bytes();
+            a.len() == b.len() && a.ct_eq(b).into()
+        }
+        None => false,
+    }
+}
+
+/// One captured issuance for a synthetic mailbox (migration 0018).
+#[derive(Debug, Clone)]
+pub struct QaIssuedCode {
+    pub token: String,
+    pub issued_at: u64,
 }
 
 pub struct Ctx<'a, S, M, D, N>
@@ -506,10 +992,14 @@ where
 
 // --- Helpers ---------------------------------------------------------------------------
 
-fn random_id(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    getrandom::fill(&mut buf).expect("secure randomness unavailable");
-    b64url_encode(&buf)
+/// Random opaque id of `N` entropy bytes (unpadded base64url). Fail-closed:
+/// secure-randomness failure propagates [`crate::random::CryptoError`]
+/// (HTTP 503 `service_unavailable`) so the caller fails the request closed.
+/// The success path is byte-identical: the same `N` entropy bytes through
+/// the same `b64url_encode`.
+fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
+    let bytes = crate::random::secure_random_bytes::<N>()?;
+    Ok(b64url_encode(&bytes))
 }
 
 /// Deterministic stand-in ids for auth-start response shapes: stable
@@ -578,12 +1068,23 @@ fn rate_limit_ip_key(source_ip: &str) -> String {
     }
 }
 
-/// Uniform per-IP throttle response: fixed 429 body independent of the
+/// Uniform per-IP throttle response: the standard `rate_limited` error
+/// envelope (`docs/api-errors.md`) with a fixed message independent of the
 /// request email, because the budget is keyed only on the client prefix.
 /// Callers must not return email-derived stand-ins on this path (that would
 /// be an account-existence oracle across the denial boundary).
-fn throttled() -> Response {
-    json_response(429, serde_json::json!({"error":"rate_limited"}))
+/// `retry_after_secs` is the budget window: slot expiries are staggered, so
+/// the next slot frees no later than one full window out.
+fn throttled(retry_after_secs: u64) -> Response {
+    let error = crate::api_error::ApiError::rate_limited("too many requests");
+    let mut resp = Response {
+        status: crate::rate_limit::RATE_LIMIT_STATUS,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    };
+    resp.retry_after = Some(retry_after_secs);
+    resp
 }
 
 /// Register/login challenge inserts allowed per account per hour.
@@ -658,7 +1159,10 @@ where
             self.now,
             self.cfg.session_ttl_secs,
         )
-        .map_err(|_| internal())?;
+        .map_err(|e| match e {
+            session::SessionError::RandomnessUnavailable => unavailable(),
+            _ => internal(),
+        })?;
         let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
             .map_err(|_| internal())?;
         self.store
@@ -711,23 +1215,72 @@ where
         Ok((claims, token))
     }
 
+    /// Authenticate a privilege-changing request and require a fresh session.
+    /// Ordinary authentication remains valid for non-privileged operations.
+    async fn authenticate_privileged(
+        &self,
+        req: &Request,
+    ) -> Result<(SessionClaims, String), Response> {
+        match req.origin.as_deref() {
+            Some(origin) if origin == self.cfg.origin => {}
+            _ => return Err(generic_auth()),
+        }
+        let token = session_cookie_value(req).ok_or_else(generic_auth)?;
+        let keys = self.cfg.session_keys();
+        let claims =
+            session::verify_session_dual(&keys, &token, self.now).map_err(|_| generic_auth())?;
+        let record = self
+            .store
+            .session_by_id(&claims.session_id)
+            .await
+            .map_err(|_| internal())?
+            .ok_or_else(generic_auth)?;
+        let claims = session::require_fresh_session(&keys, &token, self.now, &record)
+            .map_err(session_error_response)?;
+        Ok((claims, token))
+    }
+
     /// Per-IP admission shared by register, login and magic start routes.
     /// The global budget is reserved only for outbound mail, so exhaustion
     /// cannot prevent users from obtaining an authentication challenge.
     /// The scope key is the client /64 (IPv6) or full address (IPv4), so
     /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
-    /// the full `source_ip`.
-    async fn admit_auth_start(&self) -> bool {
-        self.store
-            .reserve_rate_limit(
-                &rate_limit_ip_key(&self.source_ip),
-                "auth.start_ip",
-                AUTH_STARTS_PER_IP_PER_HOUR,
+    /// the full `source_ip`. Denial is `Err(retry_after_secs)` carrying
+    /// the DENIED budget's window, so a burst denial back-off hint is
+    /// the burst window, never the hourly one.
+    async fn admit_auth_start(&self) -> Result<(), u64> {
+        // Hourly budget AND the configured short-window burst budget
+        // (`AUTH_RATE_LIMIT_*`, default 10/60s), claimed as one
+        // all-or-none decision: a burst-denied start must not burn an
+        // hourly slot, and vice versa.
+        let ip_key = rate_limit_ip_key(&self.source_ip);
+        match self
+            .store
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "auth.start_ip",
+                    limit: AUTH_STARTS_PER_IP_PER_HOUR,
+                    window_secs: AUTH_START_WINDOW_SECS,
+                },
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "auth.start_ip_burst",
+                    limit: u64::from(self.cfg.rate_limits.auth_max_attempts),
+                    window_secs: self.cfg.rate_limits.auth_window_secs,
+                },
                 self.now,
-                AUTH_START_WINDOW_SECS,
             )
             .await
-            .unwrap_or(false)
+        {
+            Ok(PairAdmission::Allowed) => Ok(()),
+            Ok(PairAdmission::DeniedFirst) => Err(AUTH_START_WINDOW_SECS),
+            Ok(PairAdmission::DeniedSecond) => Err(self.cfg.rate_limits.auth_window_secs),
+            // Store failure fails closed with the longer window: the
+            // denying budget is unknown, and understating the wait
+            // would invite a hot retry loop against a sick store.
+            Err(_) => Err(AUTH_START_WINDOW_SECS),
+        }
     }
 
     async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
@@ -762,6 +1315,10 @@ where
         if !mail_global_ok {
             // Alert without including request/user data; this signals fleet-wide
             // outbound-mail pressure while keeping auth starts available.
+            // Still a plain console line: emitting it through the structured
+            // logger needs the request trace threaded through `Request`
+            // first (follow-up slice), and a fresh ID here would break
+            // correlation, so it stays as-is until then.
             #[cfg(target_arch = "wasm32")]
             worker::console_log!("api global mail budget exhausted");
             return;
@@ -781,15 +1338,31 @@ where
         if !admitted {
             return;
         }
-        let (token, record) = auth::issue_magic_link(user_id, email, self.now);
+        // Fail closed on randomness: mint nothing, send nothing. The
+        // caller already returned the identical admitted 200, so skipping
+        // issuance here preserves the no-oracle shape.
+        let Ok((token, record)) = auth::issue_magic_link(user_id, email, self.now) else {
+            return;
+        };
         if self.store.insert_magic(&record).await.is_ok() {
-            let _ = self.mailer.send_magic_link(email, &token).await;
+            // Staging-only code seam: remember the raw token for synthetic
+            // mailboxes so `POST /api/test-codes` can return the issued
+            // code. Best-effort and capture-only — a failed capture must
+            // never break issuance or delivery, and non-synthetic mailboxes
+            // never reach the outbox.
+            if self.cfg.qa_code_seam && is_example_test_mailbox(email) {
+                let _ = self
+                    .store
+                    .record_qa_issued_code(email, &token, self.now)
+                    .await;
+            }
+            let _ = deliver_mail_with_deadline(self.mailer.send_magic_link(email, &token)).await;
         }
     }
 
     async fn resolve_all(&self, host: &str) -> StaticDns {
         StaticDns {
-            addresses: self.dns.resolve(host).await,
+            addresses: resolve_bounded(self.dns, host).await,
         }
     }
 }
@@ -870,6 +1443,7 @@ where
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
     let shape = |user_id: String| {
@@ -884,8 +1458,8 @@ where
     };
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
-    if !ctx.admit_auth_start().await {
-        return throttled();
+    if let Err(retry_after) = ctx.admit_auth_start().await {
+        return throttled(retry_after);
     }
     let existing = match ctx.store.user_by_email(&email).await {
         Ok(user) => user,
@@ -930,8 +1504,14 @@ where
             }
         }
         None => {
+            // Fail closed on randomness: no id means no user row, no
+            // challenge insert, no mail. A 503 (not a stand-in 200) is
+            // correct here — the request minted nothing.
+            let Ok(user_id) = random_id::<16>() else {
+                return unavailable();
+            };
             let user = UserRecord {
-                id: random_id(16),
+                id: user_id,
                 email: email.clone(),
                 created_at: ctx.now,
             };
@@ -1217,7 +1797,7 @@ where
         cred_id_b64url: body.credential_id.clone(),
         user_id: user_id.clone(),
         public_key: credential.public_key_cose.clone(),
-        sign_count: credential.sign_count,
+        sign_count: ENROLLMENT_SIGN_COUNT,
         registered_at: ctx.now,
     };
     match ctx.store.insert_credential(&stored).await {
@@ -1248,12 +1828,13 @@ where
     let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
     {
         Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
     // Per-IP admission before maintenance or lookup: unknown emails would
     // otherwise mint unbounded unbound challenge rows. Denial returns the
     // same fixed-shape 200 with an unstored challenge.
-    if !ctx.admit_auth_start().await {
+    if ctx.admit_auth_start().await.is_err() {
         return json_response(
             200,
             serde_json::json!({
@@ -1295,6 +1876,56 @@ where
                 user.as_ref().map(|user| user.id.as_str()),
                 PURPOSE_LOGIN,
             )
+            .await
+            .is_err()
+    {
+        return internal();
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "challenge": challenge.id,
+            "allow_credentials": [],
+            "rp_id": ctx.cfg.rp_id,
+        }),
+    )
+}
+
+async fn session_reauth_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let challenge = match auth::new_registration_challenge(&ctx.cfg.rp_id, &ctx.cfg.origin, ctx.now)
+    {
+        Ok(challenge) => challenge,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+        Err(_) => return internal(),
+    };
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &claims.user_id,
+            "auth.reauth_start",
+            AUTH_STARTS_PER_HOUR,
+            ctx.now,
+            AUTH_START_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
+    if ctx.store.prune_expired_challenges(ctx.now).await.is_err()
+        || ctx
+            .store
+            .insert_challenge(&challenge, Some(&claims.user_id), PURPOSE_REAUTH)
             .await
             .is_err()
     {
@@ -1424,6 +2055,147 @@ where
     }
 }
 
+async fn session_reauth_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, old_token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<LoginFinishBody>(req) else {
+        return generic_auth();
+    };
+    if !valid_challenge_id(&body.challenge) {
+        return generic_auth();
+    }
+    let lookup_admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &rate_limit_ip_key(&ctx.source_ip),
+            "auth.reauth_finish_ip",
+            FINISH_LOOKUP_ATTEMPTS_PER_IP,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !lookup_admitted {
+        return generic_auth();
+    }
+    let row = match ctx.store.challenge_by_id(&body.challenge).await {
+        Ok(Some(row))
+            if row.purpose == PURPOSE_REAUTH
+                && row.user_id.as_deref() == Some(claims.user_id.as_str()) =>
+        {
+            row
+        }
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let (Ok(authenticator_data), Ok(client_data_json), Ok(signature)) = (
+        b64url_decode(&body.authenticator_data),
+        b64url_decode(&body.client_data_json),
+        b64url_decode(&body.signature),
+    ) else {
+        return generic_auth();
+    };
+    let admitted = ctx
+        .store
+        .reserve_rate_limit(
+            &body.challenge,
+            "auth.reauth_finish",
+            LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE,
+            ctx.now,
+            FINISH_ATTEMPT_WINDOW_SECS,
+        )
+        .await
+        .unwrap_or(false);
+    if !admitted {
+        return generic_auth();
+    }
+    let credential = match ctx.store.credential_by_id(&body.credential_id).await {
+        Ok(Some(credential)) if credential.user_id == claims.user_id => credential,
+        Ok(_) => return generic_auth(),
+        Err(_) => return internal(),
+    };
+    let new_sign_count = match webauthn::verify_assertion(
+        &credential.public_key,
+        credential.sign_count,
+        &authenticator_data,
+        &client_data_json,
+        &signature,
+        &ctx.cfg.expect(&row.challenge.id),
+    ) {
+        Ok(count) => count,
+        Err(_) => return generic_auth(),
+    };
+    if auth::consume_challenge_atomically(
+        row.challenge,
+        &ctx.cfg.rp_id,
+        &ctx.cfg.origin,
+        ctx.now,
+        ctx.store,
+    )
+    .await
+    .is_err()
+    {
+        return generic_auth();
+    }
+    match ctx
+        .store
+        .advance_sign_count(
+            &credential.cred_id_b64url,
+            credential.sign_count,
+            new_sign_count,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    let keys = ctx.cfg.session_keys();
+    let replacement = match session::reauthenticate_session(
+        &keys,
+        &old_token,
+        ctx.now,
+        &SessionRecord {
+            id: claims.session_id.clone(),
+            user_id: claims.user_id.clone(),
+            created_at: claims.created_at,
+            expires_at: claims.expires_at,
+            rotation_counter: claims.rotation_counter,
+            revoked: false,
+        },
+        &credential.user_id,
+        ctx.cfg.session_ttl_secs,
+    ) {
+        Ok(replacement) => replacement,
+        Err(error) => return session_error_response(error),
+    };
+    match ctx
+        .store
+        .replace_session_after_reauthentication(&replacement)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
+    }
+    ctx.audit(&claims.user_id, "auth.reauthenticate", true)
+        .await;
+    let mut response = json_response(200, serde_json::json!({"ok": true}));
+    response.set_cookie = Some(session::set_cookie_header(
+        &replacement.token,
+        replacement.new_record.expires_at.saturating_sub(ctx.now),
+    ));
+    response
+}
+
 async fn magic_start<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -1442,7 +2214,7 @@ where
     // identical response (the mail-budget denial inside
     // `send_magic_link_if_allowed` likewise sends nothing and stores no
     // magic row on the same shape).
-    if !ctx.admit_auth_start().await {
+    if ctx.admit_auth_start().await.is_err() {
         return json_response(200, serde_json::json!({"ok": true}));
     }
     // Identical response whether or not the account exists or the atomic
@@ -1598,9 +2370,25 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    if ctx.store.revoke_session(&claims.session_id).await.is_err() {
-        return internal();
+    // Conditional revoke: concurrent logouts of the same session race here
+    // after both authenticating on the pre-revoke snapshot. Only the winner
+    // transitions the row and audits; the loser still clears its (now dead)
+    // cookie but writes no second `session.logout` row.
+    match ctx
+        .store
+        .revoke_single_session(&claims.session_id, &claims.user_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut resp = json_response(200, serde_json::json!({"ok": true}));
+            resp.set_cookie = Some(session::clear_cookie_header());
+            return resp;
+        }
+        Err(_) => return internal(),
     }
+    ctx.audit(&claims.user_id, session::LOGOUT_AUDIT_ACTION, true)
+        .await;
     let mut resp = json_response(200, serde_json::json!({"ok": true}));
     resp.set_cookie = Some(session::clear_cookie_header());
     resp
@@ -1617,6 +2405,22 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // ADR 0010 session-compromise response: the same event revokes every
+    // unrevoked native REST credential alongside the sessions. Native
+    // credentials go first: if the session sweep then fails, the caller
+    // keeps a valid session and can retry, while already-revoked bearer
+    // keys fail closed. The reverse order would strand live bearer keys
+    // behind dead sessions with no retry path. The two sweeps are
+    // separate store calls (no cross-table transaction), so a failure
+    // between them returns 500 and the caller retries the whole event.
+    let revoked_native = match ctx
+        .store
+        .revoke_all_native_credentials(&claims.user_id, ctx.now)
+        .await
+    {
+        Ok(revoked) => revoked,
+        Err(_) => return internal(),
+    };
     if ctx
         .store
         .revoke_all_sessions(&claims.user_id)
@@ -1626,6 +2430,10 @@ where
         return internal();
     }
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
+    if revoked_native > 0 {
+        ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
+            .await;
+    }
     let mut resp = json_response(200, serde_json::json!({"ok": true}));
     resp.set_cookie = Some(session::clear_cookie_header());
     resp
@@ -1671,7 +2479,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -1718,6 +2526,7 @@ where
         &plaintext,
     ) {
         Ok(blob) => blob,
+        Err(vault::VaultError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return generic_vault(),
     };
     let row = VaultRow {
@@ -1726,6 +2535,12 @@ where
         updated_at: ctx.now,
     };
     if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
+        // A fenced upsert (account being deleted) is the typed 409,
+        // never the generic vault failure; anything else stays generic
+        // so a probe failure cannot leak a new shape.
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
         return generic_vault();
     }
     ctx.audit(&claims.user_id, audit_action, true).await;
@@ -1739,7 +2554,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -1764,19 +2579,42 @@ where
     // Every failure below collapses to the same boolean (never a banner,
     // host verdict or vault-existence signal).
     let fail = || json_response(200, serde_json::json!({"ok": false}));
-    // One shared budget with the documenting module: `vault::TEST_CONNECTION_MAX_ATTEMPTS`
-    // per `vault::TEST_CONNECTION_WINDOW_SECS`, reserved atomically before any lookup or dial.
-    let admitted = ctx
-        .store
-        .reserve_rate_limit(
-            &claims.user_id,
-            "vault.test",
-            u64::from(vault::TEST_CONNECTION_MAX_ATTEMPTS),
-            ctx.now,
-            vault::TEST_CONNECTION_WINDOW_SECS,
-        )
-        .await
-        .unwrap_or(false);
+    // Dual budget (per-IP AND per-account; roadmap R6): the limits come
+    // from `ctx.cfg.rate_limits` (`VAULT_TEST_*_RATE_LIMIT_*` [vars]
+    // overlaid by the Worker entry), whose per-account default IS
+    // `vault::TEST_CONNECTION_MAX_ATTEMPTS` per
+    // `vault::TEST_CONNECTION_WINDOW_SECS` — one source, see
+    // rate_limit.rs. The per-IP budget has its own larger default
+    // (5x the account cap): NAT-shared addresses serve many accounts,
+    // so one account's allowed probes must not consume the whole IP
+    // budget and lock out its neighbours. Both slots are claimed as
+    // one all-or-none pair before any lookup or dial, so one host
+    // cannot burn probes across accounts, one account cannot burn
+    // them across hosts, and a denied attempt consumes neither
+    // budget. Denial keeps the same boolean collapse as every other
+    // failure on this route (never a 429 oracle here).
+    let limits = ctx.cfg.rate_limits;
+    let ip_key = rate_limit_ip_key(&ctx.source_ip);
+    let admitted = matches!(
+        ctx.store
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "vault.test_ip",
+                    limit: u64::from(limits.vault_test_ip_max_attempts),
+                    window_secs: limits.vault_test_window_secs,
+                },
+                RateLimitBudget {
+                    scope_key: &claims.user_id,
+                    action: "vault.test",
+                    limit: u64::from(limits.vault_test_max_attempts),
+                    window_secs: limits.vault_test_window_secs,
+                },
+                ctx.now,
+            )
+            .await,
+        Ok(PairAdmission::Allowed)
+    );
     if !admitted {
         return fail();
     }
@@ -1809,13 +2647,20 @@ where
     };
     // The attempt slot is reserved before any potentially slow lookup or
     // dial, so concurrent requests cannot pass a count-then-act check.
+    // Fail closed on randomness before the lease: no token means no lease
+    // is acquired and no dial runs — the request ends 503, never a
+    // boolean that pretends the test ran.
+    let lease_token = match random_id::<16>() {
+        Ok(token) => token,
+        Err(_) => return unavailable(),
+    };
     let result = async {
         // Resolve all records immediately before the dial and hand the
         // dialer only the vetted, bounded address set.
         let dns = ctx.resolve_all(&provider.host).await;
         let target: ValidatedTarget = match provider.validate(&dns) {
             Ok(target) => target,
-            Err(_) => return false,
+            Err(_) => return Some(false),
         };
         // A candidate that would not save fails the test instead of
         // testing half a config (the stored path was validated at save).
@@ -1825,14 +2670,13 @@ where
                 .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
             {
                 Some(host) => host,
-                None => return false,
+                None => return Some(false),
             };
             let indexer_dns = ctx.resolve_all(&host).await;
             if indexer.validate(&indexer_dns).is_err() {
-                return false;
+                return Some(false);
             }
         }
-        let lease_token = random_id(16);
         let lease_acquired = ctx
             .store
             .acquire_test_connection_lease(
@@ -1843,19 +2687,491 @@ where
             )
             .await
             .unwrap_or(false);
+        // A denied lease is `None` (fenced or contended, told apart
+        // below); every other failure stays the collapsed boolean.
         if !lease_acquired {
-            return false;
+            return None;
         }
-        let ok = ctx.dialer.probe(&target, provider.port, provider.tls).await;
+        let ok = ctx.dialer.probe(&target, provider.tls).await;
         let _ = ctx
             .store
             .release_test_connection_lease(&claims.user_id, &lease_token)
             .await;
-        ok
+        Some(ok)
     }
     .await;
+    // A fenced lease (account being deleted) is the typed 409, never the
+    // boolean collapse: the lease is the fenced writer on this route
+    // (ADR 0002 rule 3), matching `vault_put`.
+    let Some(result) = result else {
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
+        // Lease contention (slots exhausted): same boolean as every other
+        // failure on this route, never a distinct shape.
+        ctx.audit(&claims.user_id, "vault.test", false).await;
+        return json_response(200, serde_json::json!({"ok": false}));
+    };
     ctx.audit(&claims.user_id, "vault.test", result).await;
     json_response(200, serde_json::json!({"ok": result}))
+}
+
+// --- Native REST credentials (ADR 0010) ------------------------------------------------------
+//
+// Session-authenticated issuance surface only: `POST /v1/credentials`
+// (fresh session, 600 s privilege gate — the step-up for this credential
+// class), `GET /v1/credentials` (ordinary session), `DELETE
+// /v1/credentials/{id}` (fresh session: revocation is privilege-changing).
+// The route map marks all three `SessionOnly`, so bearer keys can never
+// reach them; the `Authorization` header is ignored here exactly like
+// cookies are ignored on bearer routes. The plaintext secret is rendered
+// into the mint response once and never stored, listed, logged, or
+// audited — audit rows carry the credential id only.
+
+/// Mint request: human label for listing, exact ADR scope strings, and a
+/// TTL in seconds (clamped fail-safe to the 365-day cap at issue, so even
+/// `u64::MAX` can never mint a forever key).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialsMintBody {
+    label: Option<String>,
+    scopes: Vec<String>,
+    ttl_secs: u64,
+}
+
+/// Listing label: trimmed, at most 64 chars (mirrors the migration 0019
+/// `CHECK`), no control characters. Empty means "no label". `None`
+/// rejects the request.
+fn normalize_credential_label(raw: Option<&str>) -> Option<String> {
+    let label = raw.unwrap_or("").trim();
+    if label.len() > 64 || label.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(label.to_string())
+}
+
+fn validation_failed(message: &str) -> Response {
+    let error = crate::api_error::ApiError::validation_failed(message);
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn credential_unauthorized() -> Response {
+    // Generic by construction: never says which check failed, never any
+    // secret material. Same outcome class as the core `CredentialError`.
+    let error = crate::api_error::ApiError::by_code("unauthorized", "invalid credential");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn scope_forbidden() -> Response {
+    // Names the outcome only: authenticated, wrong scope.
+    let error = crate::api_error::ApiError::by_code("forbidden", "insufficient scope");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn not_found() -> Response {
+    let error = crate::api_error::ApiError::not_found("not found");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+async fn credentials_mint<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Issuance-time freshness IS the step-up (ADR 0010): a stale session
+    // is denied with the registered `reauth_required` response before any
+    // key material exists. The origin pin inside `authenticate_privileged`
+    // is the CSRF guard for this mutation.
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<CredentialsMintBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(label) = normalize_credential_label(body.label.as_deref()) else {
+        return validation_failed("invalid label");
+    };
+    // Zero TTL would mint a credential already expired at issuance
+    // (`expires_at == now`) while still returning a one-time secret (ADR
+    // 0010 requires meaningful expiry): reject before any row, audit entry,
+    // or secret exists.
+    if body.ttl_secs == 0 {
+        return validation_failed("invalid ttl");
+    }
+    // Exact scope strings only: unknown, cross-surface (`"subsonic"`),
+    // case or whitespace variants reject — the allowlist never trims or
+    // folds.
+    let mut scopes = Vec::with_capacity(body.scopes.len());
+    for name in &body.scopes {
+        match crate::native_rest::Scope::parse(name) {
+            Some(scope) => scopes.push(scope),
+            None => return validation_failed("unknown scope"),
+        }
+    }
+    // Raw length past the defined vocabulary can only be duplicates (only
+    // `ALL_SCOPES.len()` distinct scopes exist): reject before any row,
+    // audit entry, or secret exists, so an arbitrarily long duplicate list
+    // can never mint.
+    if scopes.len() > crate::native_rest::ALL_SCOPES.len() {
+        return validation_failed("too many scopes");
+    }
+    // Duplicates within the cap collapse to first-seen order, so the 201
+    // body and the stored row carry the same deduplicated set.
+    {
+        let mut deduped = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            if !deduped.contains(&scope) {
+                deduped.push(scope);
+            }
+        }
+        scopes = deduped;
+    }
+    // Unprovisioned keyring fails closed per-request (generic 500, never
+    // which secret is missing): without a pepper there is nothing to HMAC
+    // with, so no credential may be minted.
+    let peppers = ctx.cfg.native_rest_peppers();
+    let Some(pepper) = peppers.first() else {
+        return internal();
+    };
+    // The only mint failure is unavailable randomness: fail closed 503.
+    // No credential row is persisted and no secret is rendered.
+    let issued = match crate::native_rest::issue_credential(
+        &claims.user_id,
+        &scopes,
+        body.ttl_secs,
+        ctx.now,
+        pepper,
+    ) {
+        Ok(issued) => issued,
+        Err(_) => return unavailable(),
+    };
+    let id = issued.record.id.clone();
+    let row = NativeCredentialRow {
+        record: issued.record,
+        label,
+        created_from_ip: ctx.source_ip.clone(),
+        last_used_at: None,
+    };
+    if ctx.store.insert_native_credential(&row).await.is_err() {
+        // A fenced insert (account being deleted) is the typed 409,
+        // never the generic 500; anything else stays generic so a probe
+        // failure cannot leak a new shape. Mirrors `vault_put` (ADR 0002
+        // rule 3): the production statement only lands while the owner's
+        // `deleting_at` is NULL, so a fresh session during the 24 h grace
+        // cannot mint a new long-lived bearer path behind the marker.
+        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+            return account_deleting_response();
+        }
+        return internal();
+    }
+    // Audit names the id only — never the secret, the HMAC, or the IP.
+    ctx.audit(
+        &claims.user_id,
+        &format!("native_credential_created:{id}"),
+        true,
+    )
+    .await;
+    // The one and only time the plaintext exists outside the client's
+    // hands: this 201 body. Nothing below stores, logs, or re-renders it.
+    Response {
+        status: 201,
+        body: serde_json::json!({
+            "id": id,
+            "secret": issued.display_once,
+            "key_prefix": row.record.key_prefix,
+            "scopes": scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "expires_at": row.record.expires_at,
+        })
+        .to_string(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+/// One listed credential: routing and lifecycle facts only. There is no
+/// `secret` (or HMAC) key on this shape by construction — a serializer
+/// cannot leak what the struct does not carry.
+fn listed_credential(row: &NativeCredentialRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.record.id,
+        "label": row.label,
+        "key_prefix": row.record.key_prefix,
+        "scopes": row.record.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "created_at": row.record.created_at,
+        "expires_at": row.record.expires_at,
+        "revoked_at": row.record.revoked_at,
+        "last_used_at": row.last_used_at,
+    })
+}
+
+async fn credentials_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.native_credentials_for_user(&claims.user_id).await {
+        Ok(rows) => json_response(
+            200,
+            serde_json::json!({
+                "credentials": rows.iter().map(listed_credential).collect::<Vec<_>>(),
+            }),
+        ),
+        Err(_) => internal(),
+    }
+}
+
+async fn credentials_revoke<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Fresh session like issuance: revocation is privilege-changing, and
+    // the origin pin is the CSRF guard.
+    let (claims, _token) = match ctx.authenticate_privileged(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Single-segment id only: deeper shapes are not credential ids and
+    // stay 404, so no id parser can be tricked by a path.
+    let id = req.path.strip_prefix("/v1/credentials/").unwrap_or("");
+    if id.is_empty() || id.contains('/') {
+        return not_found();
+    }
+    match ctx
+        .store
+        .revoke_native_credential(id, &claims.user_id, ctx.now)
+        .await
+    {
+        // Owner-scoped and sticky: unknown or foreign ids report `false`
+        // and answer the same 404 (no existence oracle across users).
+        // Revoking an already-revoked row still answers `ok: true`
+        // (idempotent), keeping the original timestamp in the store.
+        Ok(true) => {
+            ctx.audit(
+                &claims.user_id,
+                &format!("native_credential_revoked:{id}"),
+                true,
+            )
+            .await;
+            json_response(200, serde_json::json!({"ok": true}))
+        }
+        Ok(false) => not_found(),
+        Err(_) => internal(),
+    }
+}
+
+/// Bearer gate for `RouteDecision::Bearer` routes: header-only,
+/// cookie-blind. The `Authorization` header is the ONLY input — no
+/// session cookie is consulted here (no session-cookie fallback), and
+/// there is intentionally no query-string credential reader (query
+/// strings land in logs).
+///
+/// Gates run in order: header shape, display-form shape, per-IP lookup
+/// budget, then the HMAC/DB lookup. A malformed shape fails before any
+/// HMAC or database work (unauthenticated bearer routes were plain 404s
+/// with no DB work before this credential class, so junk tokens must not
+/// buy Postgres connections). The lookup budget is claimed before the
+/// first query and its denial collapses to the same generic 401 (no
+/// throttle oracle), mirroring the finish-route lookup budget.
+///
+/// Failures map exactly like the core: unknown/tampered/revoked/expired
+/// (or an unprovisioned keyring) is the generic 401; a valid credential
+/// lacking the route's scope is the names-only 403. Successful use
+/// records `last_used_at` best-effort — its outcome never changes the
+/// decision, like audit writes.
+async fn authorize_bearer<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    authorization: Option<&str>,
+    required: crate::native_rest::Scope,
+) -> Result<NativeCredentialRow, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::native_rest::{
+        authorize, credential_hmac, extract_bearer_key, is_plausible_credential_shape,
+        CredentialError,
+    };
+    let token = match extract_bearer_key(authorization) {
+        Ok(token) => token,
+        Err(_) => return Err(credential_unauthorized()),
+    };
+    // Shape before HMAC/DB: random Authorization values cost no crypto
+    // beyond the parse and no store work at all.
+    if !is_plausible_credential_shape(token) {
+        return Err(credential_unauthorized());
+    }
+    // Per-IP lookup budget BEFORE any credential DB work: a flood of
+    // well-formed random `ntk_` tokens shares one pool (client /64 or
+    // full address), claimed as one all-or-none pair so a burst-denied
+    // attempt burns neither budget. Denial is the generic 401.
+    let ip_key = rate_limit_ip_key(&ctx.source_ip);
+    let admitted = matches!(
+        ctx.store
+            .reserve_rate_limit_pair(
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "native_rest.bearer_lookup_ip_min",
+                    limit: BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+                    window_secs: BEARER_LOOKUP_WINDOW_SECS,
+                },
+                RateLimitBudget {
+                    scope_key: &ip_key,
+                    action: "native_rest.bearer_lookup_ip_hour",
+                    limit: BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR,
+                    window_secs: BEARER_LOOKUP_HOUR_WINDOW_SECS,
+                },
+                ctx.now,
+            )
+            .await,
+        Ok(PairAdmission::Allowed)
+    );
+    if !admitted {
+        return Err(credential_unauthorized());
+    }
+    let peppers = ctx.cfg.native_rest_peppers();
+    // Dual-pepper lookup: the presented secret is HMACed under each listed
+    // version and looked up by the composite identity, so a transitioning
+    // record authorizes while both versions are listed.
+    let mut found = None;
+    for pepper in &peppers {
+        let hmac = credential_hmac(token, pepper.bytes);
+        match ctx
+            .store
+            .native_credential_by_hmac(pepper.version, &hmac)
+            .await
+        {
+            Ok(Some(row)) => {
+                found = Some(row);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => return Err(credential_unauthorized()),
+        }
+    }
+    let Some(row) = found else {
+        return Err(credential_unauthorized());
+    };
+    // The credential IS the identity on bearer routes: the owner check
+    // runs against the row's own owner, and every downstream path
+    // re-checks ownership (defense in depth, ADR 0010 §6).
+    match authorize(
+        &row.record,
+        token,
+        required,
+        ctx.now,
+        &row.record.user_id,
+        &peppers,
+    ) {
+        Ok(()) => {}
+        Err(CredentialError::Unauthenticated) => return Err(credential_unauthorized()),
+        Err(CredentialError::Forbidden) => return Err(scope_forbidden()),
+        // Unreachable: `authorize` is pure verification and never mints.
+        // Fail closed 503 if that ever changes.
+        Err(CredentialError::RandomnessUnavailable) => return Err(unavailable()),
+    }
+    let _ = ctx
+        .store
+        .record_native_credential_use(&row.record.id, ctx.now)
+        .await;
+    Ok(row)
+}
+
+/// Staging-only emailed-code retrieval seam (`POST /api/test-codes`).
+/// Returns the issued code for an `example.test` mailbox without minting
+/// an account (read-only: no users, challenges, or magic rows are created
+/// here). Gates run in order — flag armed plus bearer staged (else the
+/// plain unknown-route 404, so the seam's existence is not enumerable
+/// from its posture), then the `Authorization: Bearer <QA_AUTH_TOKEN>`
+/// header present and constant-time equal (else a names-only 401; the
+/// bearer is a secret request header rather than an ambient credential,
+/// so no `Origin` pin is needed as a cross-site forgery cannot present
+/// it), then a well-formed `example.test` mailbox and a captured
+/// unexpired code (else 404). Every failure names only the gate, never
+/// the mailbox, the token, or which check refused.
+async fn qa_test_codes<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let not_found = || {
+        let error = crate::api_error::ApiError::not_found("not found");
+        Response {
+            status: error.status,
+            body: error.body_json(),
+            set_cookie: None,
+            retry_after: None,
+        }
+    };
+    let Some(expected) = ctx
+        .cfg
+        .qa_auth_token
+        .as_deref()
+        .filter(|_| ctx.cfg.qa_code_seam)
+    else {
+        return not_found();
+    };
+    let presented = req
+        .authorization
+        .as_deref()
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !qa_bearer_ok(presented, expected) {
+        return json_response(401, serde_json::json!({"error": "unauthorized"}));
+    }
+    let Some(body) = parse_body::<EmailBody>(req) else {
+        return not_found();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return not_found();
+    };
+    if !is_example_test_mailbox(&email) {
+        return not_found();
+    }
+    let stored = match ctx.store.qa_issued_code(&email).await {
+        Ok(stored) => stored,
+        Err(_) => return internal(),
+    };
+    match stored {
+        Some(code) if code.issued_at.saturating_add(auth::MAGIC_LINK_TTL_SECS) > ctx.now => {
+            json_response(200, serde_json::json!({"magic_token": code.token}))
+        }
+        _ => not_found(),
+    }
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
@@ -1863,7 +3179,10 @@ where
 /// Every path the router serves. The Worker answers `OPTIONS` on exactly
 /// these paths with an empty 204 (the entry renders credentialed CORS
 /// headers only for an exact `Origin` match); anything else 404s, so a
-/// preflight never maps the API surface.
+/// preflight never maps the API surface. The staging-only
+/// `POST /api/test-codes` seam is deliberately absent: its POST arm matches
+/// independently, and listing it here would answer `OPTIONS` with 204 in
+/// every posture — making the seam enumerable from production.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -1872,6 +3191,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/auth/passkey/register/finish"
             | "/v1/auth/passkey/login/start"
             | "/v1/auth/passkey/login/finish"
+            | "/v1/session/reauthenticate/start"
+            | "/v1/session/reauthenticate/finish"
             | "/v1/auth/magic/start"
             | "/v1/auth/magic/finish"
             | "/v1/session/refresh"
@@ -1880,22 +3201,33 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | "/v1/credentials"
     )
 }
 
 /// Empty 204 for a preflight against a known path. Carries no ACA headers
 /// itself: the entry appends them exactly when the request `Origin` equals
-/// the configured origin (never reflected, never `*`).
-fn preflight_response() -> Response {
+/// the configured origin (never reflected, never `*`). `pub(crate)` so the
+/// entry's render test pins the real preflight shape instead of rebuilding it.
+pub(crate) fn preflight_response() -> Response {
     Response {
         status: 204,
         body: String::new(),
         set_cookie: None,
+        retry_after: None,
     }
 }
 
 /// Route one request. Unknown routes are a plain 404; known routes map
 /// every domain failure through their surface's single generic body.
+/// A PRESENTED bearer token is authenticated here off `req.authorization`
+/// and never rescued by a session cookie (no session-cookie fallback for
+/// a presented credential); a request with NO `Authorization` header skips
+/// the bearer gate and falls through to the dispatch below, so session
+/// cookie holders see no behavior change (ADR 0010). Data routes for the
+/// bearer scopes do not exist yet, so both an authorized bearer and a
+/// cookie-only caller land on the 404 below — default-deny holds until
+/// those routes land with their session-or-bearer dispatch.
 pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -1906,12 +3238,28 @@ where
     if req.body.len() > MAX_BODY_BYTES {
         return invalid_request();
     }
+    if let crate::native_rest::RouteDecision::Bearer(required) =
+        crate::native_rest::scope_for_operation(&req.method, &req.path)
+    {
+        // Only a presented Authorization header enters the bearer gate:
+        // header-absent callers (session cookies, anonymous) fall through
+        // to the dispatch below (plain 404 until the data routes land).
+        // A presented-but-invalid bearer still fails closed here and is
+        // never rescued by a cookie.
+        if req.authorization.is_some() {
+            if let Err(resp) = authorize_bearer(ctx, req.authorization.as_deref(), required).await {
+                return resp;
+            }
+        }
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => json_response(200, serde_json::json!({"ok": true})),
         ("POST", "/v1/auth/passkey/register/start") => register_start(ctx, req).await,
         ("POST", "/v1/auth/passkey/register/finish") => register_finish(ctx, req).await,
         ("POST", "/v1/auth/passkey/login/start") => login_start(ctx, req).await,
         ("POST", "/v1/auth/passkey/login/finish") => login_finish(ctx, req).await,
+        ("POST", "/v1/session/reauthenticate/start") => session_reauth_start(ctx, req).await,
+        ("POST", "/v1/session/reauthenticate/finish") => session_reauth_finish(ctx, req).await,
         ("POST", "/v1/auth/magic/start") => magic_start(ctx, req).await,
         ("POST", "/v1/auth/magic/finish") => magic_finish(ctx, req).await,
         ("POST", "/v1/session/refresh") => session_refresh(ctx, req).await,
@@ -1923,8 +3271,28 @@ where
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
             vault_test_connection(ctx, req).await
         }
-        ("OPTIONS", path) if is_known_path(path) => preflight_response(),
-        _ => json_response(404, serde_json::json!({"error": "not found"})),
+        ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
+        ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
+        ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
+        // Single-segment credential ids only; deeper shapes 404 inside
+        // the handler. The OPTIONS prefix below keeps browser preflights
+        // working for these dynamic paths (exact-path `is_known_path`
+        // cannot name them).
+        ("DELETE", path) if path.starts_with("/v1/credentials/") => {
+            credentials_revoke(ctx, req).await
+        }
+        // The revoke id is dynamic, so its preflight cannot be an exact
+        // `is_known_path` entry: match the same single-segment shape the
+        // handler serves (deeper shapes stay 404 on preflight too).
+        ("OPTIONS", path)
+            if is_known_path(path)
+                || path
+                    .strip_prefix("/v1/credentials/")
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
+            preflight_response()
+        }
+        _ => not_found(),
     }
 }
 
@@ -2005,6 +3373,11 @@ mod tests {
     }
 
     fn cfg() -> Config {
+        // The hourly per-IP budget pins predate the configured burst
+        // budget: raise the burst to the durable-store cap so the
+        // hourly cap stays the binding constraint in those loops. The
+        // burst at its documented default is pinned separately by
+        // `auth_start_burst_budget_binds_before_hourly`.
         Config::new(
             "example.com",
             ORIGIN,
@@ -2017,6 +3390,10 @@ mod tests {
             None,
         )
         .unwrap()
+        .with_rate_limits(crate::rate_limit::RateLimitConfig {
+            auth_max_attempts: 100,
+            ..crate::rate_limit::RateLimitConfig::default()
+        })
     }
 
     #[derive(Default)]
@@ -2025,8 +3402,12 @@ mod tests {
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
         magic: RefCell<HashMap<String, MagicLinkRecord>>,
+        /// Staging-only code-seam outbox: latest raw token per synthetic
+        /// mailbox (mirrors the migration 0018 table).
+        qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
+        native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
@@ -2036,6 +3417,17 @@ mod tests {
         orphan_user_after_next_challenge: RefCell<Option<String>>,
         challenge_reads: RefCell<usize>,
         rate_limit_slot_probes: RefCell<usize>,
+        /// Bearer-gate pins: every `reserve_rate_limit_pair` call and every
+        /// `native_credential_by_hmac` lookup. The shape gate must return
+        /// before either is touched, so a malformed token leaves both at
+        /// zero while a well-formed unknown key increments both.
+        rate_limit_pair_calls: RefCell<usize>,
+        native_credential_lookups: RefCell<usize>,
+        fail_reauth_revocation: RefCell<bool>,
+        fail_reauth_insert: RefCell<bool>,
+        /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
+        /// fenced writers refuse them, mirroring the production SQL.
+        deleting_users: RefCell<std::collections::HashSet<String>>,
     }
 
     impl Store for FakeStore {
@@ -2143,9 +3535,11 @@ mod tests {
             }
         }
         async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
-            self.magic
-                .borrow_mut()
-                .insert(record.token_hash.clone(), record.clone());
+            let mut magic = self.magic.borrow_mut();
+            magic.retain(|_, row| {
+                row.user_id != record.user_id || row.expires_at > record.issued_at
+            });
+            magic.insert(record.token_hash.clone(), record.clone());
             Ok(())
         }
         async fn magic_by_hash(
@@ -2153,6 +3547,24 @@ mod tests {
             token_hash: &str,
         ) -> Result<Option<MagicLinkRecord>, StoreError> {
             Ok(self.magic.borrow().get(token_hash).cloned())
+        }
+        async fn record_qa_issued_code(
+            &self,
+            email: &str,
+            token: &str,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            self.qa_codes.borrow_mut().insert(
+                email.to_string(),
+                QaIssuedCode {
+                    token: token.to_string(),
+                    issued_at: now,
+                },
+            );
+            Ok(())
+        }
+        async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
+            Ok(self.qa_codes.borrow().get(email).cloned())
         }
         async fn reserve_rate_limit(
             &self,
@@ -2190,6 +3602,71 @@ mod tests {
                 }
             }
             Ok(false)
+        }
+        async fn reserve_rate_limit_pair(
+            &self,
+            first: RateLimitBudget<'_>,
+            second: RateLimitBudget<'_>,
+            now: u64,
+        ) -> Result<PairAdmission, StoreError> {
+            *self.rate_limit_pair_calls.borrow_mut() += 1;
+            // All-or-none under the single slot-map borrow: count and
+            // locate a free slot in BOTH budgets first, insert only
+            // when both admit.
+            if first.limit == 0 || first.window_secs == 0 {
+                return Ok(PairAdmission::DeniedFirst);
+            }
+            if second.limit == 0 || second.window_secs == 0 {
+                return Ok(PairAdmission::DeniedSecond);
+            }
+            let mut slots = self.rate_limit_slots.borrow_mut();
+            slots.retain(|_, expires| *expires > now);
+            let free_slot = |budget: &RateLimitBudget<'_>,
+                             slots: &std::collections::HashMap<(String, String, u32), u64>|
+             -> Option<u32> {
+                let active = slots
+                    .iter()
+                    .filter(|((scope, act, _), expires)| {
+                        scope == budget.scope_key && act == budget.action && **expires > now
+                    })
+                    .count() as u64;
+                if active >= budget.limit {
+                    return None;
+                }
+                (0..budget.limit).find_map(|slot| {
+                    let slot = u32::try_from(slot).ok()?;
+                    let key = (
+                        budget.scope_key.to_string(),
+                        budget.action.to_string(),
+                        slot,
+                    );
+                    (!slots.contains_key(&key)).then_some(slot)
+                })
+            };
+            let (first_slot, second_slot) = (free_slot(&first, &slots), free_slot(&second, &slots));
+            let (first_slot, second_slot) = match (first_slot, second_slot) {
+                (Some(first_slot), Some(second_slot)) => (first_slot, second_slot),
+                (None, _) => return Ok(PairAdmission::DeniedFirst),
+                (_, None) => return Ok(PairAdmission::DeniedSecond),
+            };
+            *self.rate_limit_slot_probes.borrow_mut() += 2;
+            slots.insert(
+                (
+                    first.scope_key.to_string(),
+                    first.action.to_string(),
+                    first_slot,
+                ),
+                now.saturating_add(first.window_secs),
+            );
+            slots.insert(
+                (
+                    second.scope_key.to_string(),
+                    second.action.to_string(),
+                    second_slot,
+                ),
+                now.saturating_add(second.window_secs),
+            );
+            Ok(PairAdmission::Allowed)
         }
         async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
             self.challenges
@@ -2233,8 +3710,10 @@ mod tests {
                 .filter(|record| record.expires_at > now)
                 .map(|record| record.user_id.clone())
                 .collect();
+            let deleting_users = self.deleting_users.borrow();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
+                    || deleting_users.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
                     || vault_owners.contains(&user.id)
@@ -2251,6 +3730,11 @@ mod tests {
             lease_secs: u64,
             max_concurrency: u32,
         ) -> Result<bool, StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account acquires no new lease rows.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
             let expires_at = NOW.saturating_add(lease_secs);
             let mut leases = self.test_connection_leases.borrow_mut();
             leases.retain(|_, (_, expires)| *expires > NOW);
@@ -2305,11 +3789,51 @@ mod tests {
                 _ => Ok(false),
             }
         }
+        async fn replace_session_after_reauthentication(
+            &self,
+            replacement: &session::ReauthenticatedSession,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_reauth_revocation.borrow() {
+                return Ok(false);
+            }
+            let mut sessions = self.sessions.borrow_mut();
+            let old_id = &replacement.revoked_session_id;
+            let Some(old) = sessions.get(old_id) else {
+                return Ok(false);
+            };
+            if old.user_id != replacement.revoked_user_id
+                || u64::from(old.rotation_counter) != replacement.revoked_rotation_counter
+                || old.revoked
+                || sessions.contains_key(&replacement.new_record.id)
+            {
+                return Ok(false);
+            }
+            sessions.get_mut(old_id).expect("row checked").revoked = true;
+            if *self.fail_reauth_insert.borrow() {
+                sessions.get_mut(old_id).expect("row checked").revoked = false;
+                return Err(StoreError);
+            }
+            sessions.insert(
+                replacement.new_record.id.clone(),
+                replacement.new_record.clone(),
+            );
+            Ok(true)
+        }
         async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
             if let Some(row) = self.sessions.borrow_mut().get_mut(id) {
                 row.revoked = true;
             }
             Ok(())
+        }
+        async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            match sessions.get_mut(id) {
+                Some(row) if row.user_id == user_id && !row.revoked => {
+                    row.revoked = true;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
         async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
             for row in self.sessions.borrow_mut().values_mut() {
@@ -2319,14 +3843,120 @@ mod tests {
             }
             Ok(())
         }
+        async fn insert_native_credential(
+            &self,
+            row: &NativeCredentialRow,
+        ) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's insert writes nothing and fails (ADR 0002 rule 3).
+            if self.deleting_users.borrow().contains(&row.record.user_id) {
+                return Err(StoreError);
+            }
+            let mut rows = self.native_credentials.borrow_mut();
+            // Mirror the migration 0019 composite UNIQUE: neither the id
+            // nor the (pepper_version, key_hmac) identity may repeat.
+            if rows.contains_key(&row.record.id)
+                || rows.values().any(|existing| {
+                    existing.record.pepper_version == row.record.pepper_version
+                        && existing.record.key_hmac == row.record.key_hmac
+                })
+            {
+                return Err(StoreError);
+            }
+            rows.insert(row.record.id.clone(), row.clone());
+            Ok(())
+        }
+        async fn native_credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<NativeCredentialRow>, StoreError> {
+            let mut rows: Vec<NativeCredentialRow> = self
+                .native_credentials
+                .borrow()
+                .values()
+                .filter(|row| row.record.user_id == user_id)
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (a.record.created_at, &a.record.id).cmp(&(b.record.created_at, &b.record.id))
+            });
+            Ok(rows)
+        }
+        async fn native_credential_by_hmac(
+            &self,
+            pepper_version: u32,
+            key_hmac: &str,
+        ) -> Result<Option<NativeCredentialRow>, StoreError> {
+            *self.native_credential_lookups.borrow_mut() += 1;
+            Ok(self
+                .native_credentials
+                .borrow()
+                .values()
+                .find(|row| {
+                    row.record.pepper_version == pepper_version && row.record.key_hmac == key_hmac
+                })
+                .cloned())
+        }
+        async fn revoke_native_credential(
+            &self,
+            id: &str,
+            user_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            let mut rows = self.native_credentials.borrow_mut();
+            match rows.get_mut(id) {
+                // Owner-scoped and sticky: a foreign id reports absence,
+                // an already-revoked row keeps its original timestamp.
+                Some(row) if row.record.user_id == user_id => {
+                    if row.record.revoked_at.is_none() {
+                        row.record.revoked_at = Some(now);
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn revoke_all_native_credentials(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<u64, StoreError> {
+            // Mirror the production statement: empty user revokes nothing
+            // (an upstream bug must never become a mass revocation).
+            if user_id.is_empty() {
+                return Ok(0);
+            }
+            let mut revoked = 0;
+            for row in self.native_credentials.borrow_mut().values_mut() {
+                if row.record.user_id == user_id && row.record.revoked_at.is_none() {
+                    row.record.revoked_at = Some(now);
+                    revoked += 1;
+                }
+            }
+            Ok(revoked)
+        }
+        async fn record_native_credential_use(&self, id: &str, now: u64) -> Result<(), StoreError> {
+            if let Some(row) = self.native_credentials.borrow_mut().get_mut(id) {
+                row.last_used_at = Some(now);
+            }
+            Ok(())
+        }
         async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
             Ok(self.vaults.borrow().get(user_id).cloned())
         }
         async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's upsert writes nothing and fails.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Err(StoreError);
+            }
             self.vaults
                 .borrow_mut()
                 .insert(user_id.to_string(), row.clone());
             Ok(())
+        }
+        async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.deleting_users.borrow().contains(user_id))
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
@@ -2409,7 +4039,7 @@ mod tests {
     }
 
     impl Dialer for FakeDialer {
-        async fn probe(&self, target: &ValidatedTarget, _port: u16, _tls: bool) -> bool {
+        async fn probe(&self, target: &ValidatedTarget, _tls: bool) -> bool {
             self.seen.borrow_mut().push(target.addresses().to_vec());
             self.ok
         }
@@ -2490,6 +4120,7 @@ mod tests {
                 path: path.to_string(),
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
+                authorization: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&ctx, &req))
@@ -2508,7 +4139,53 @@ mod tests {
                 path: path.to_string(),
                 cookie,
                 origin: origin.map(str::to_string),
+                authorization: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+
+        fn call_full_with_ip(
+            &self,
+            source_ip: &str,
+            method: &str,
+            path: &str,
+            body: Option<String>,
+            cookie: Option<String>,
+            origin: Option<&str>,
+        ) -> Response {
+            let ctx = Ctx {
+                cfg: &self.config,
+                store: &self.store,
+                mailer: &self.mailer,
+                dialer: &self.dialer,
+                dns: &self.dns,
+                now: NOW,
+                source_ip: source_ip.to_string(),
+            };
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie,
+                origin: origin.map(str::to_string),
+                authorization: None,
+                body: body.map(|b| b.into_bytes()).unwrap_or_default(),
+            };
+            block_on(handle(&ctx, &req))
+        }
+
+        /// Bearer-route call with an explicit `Authorization` header value
+        /// and no session cookie: the shape the header-only transport
+        /// requires. Pass `origin: None` unless the case needs otherwise —
+        /// bearer routes never read it.
+        fn call_bearer(&self, method: &str, path: &str, authorization: Option<String>) -> Response {
+            let req = Request {
+                method: method.to_string(),
+                path: path.to_string(),
+                cookie: None,
+                origin: None,
+                authorization,
+                body: Vec::new(),
             };
             block_on(handle(&self.ctx(), &req))
         }
@@ -2543,6 +4220,265 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         cookie_of(&resp)
+    }
+
+    const QA_TOKEN: &str = "test-qa-bearer-token";
+
+    fn qa_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_qa_code_seam(true).with_qa_auth_token(QA_TOKEN);
+        h
+    }
+
+    impl Harness {
+        fn call_seam(&self, body: serde_json::Value, bearer: Option<&str>) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: QA_TEST_CODES_PATH.to_string(),
+                cookie: None,
+                origin: None,
+                authorization: bearer.map(|token| format!("Bearer {token}")),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    #[test]
+    fn qa_mailbox_gate_matches_only_the_reserved_test_domain() {
+        assert!(is_example_test_mailbox(
+            "e2e-wizard+20261017-000001@example.test"
+        ));
+        assert!(is_example_test_mailbox("A@EXAMPLE.TEST"));
+        assert!(is_example_test_mailbox("  a@example.test  "));
+        assert!(!is_example_test_mailbox("a@example.com"));
+        assert!(!is_example_test_mailbox("a@example.test.evil.com"));
+        assert!(!is_example_test_mailbox("a@evil-example.test"));
+        assert!(!is_example_test_mailbox("a@example.test@evil.com"));
+        assert!(!is_example_test_mailbox("@example.test"));
+        assert!(!is_example_test_mailbox("not-an-email"));
+        assert!(!is_example_test_mailbox(""));
+        // Trailing-dot FQDN form is conservatively rejected.
+        assert!(!is_example_test_mailbox("a@example.test."));
+    }
+
+    #[test]
+    fn qa_bearer_compare_accepts_only_the_exact_secret() {
+        assert!(qa_bearer_ok(Some(QA_TOKEN), QA_TOKEN));
+        assert!(!qa_bearer_ok(None, QA_TOKEN));
+        assert!(!qa_bearer_ok(Some(""), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("wrong-token"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("test-qa-bearer-toke"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("test-qa-bearer-token!"), QA_TOKEN));
+        assert!(!qa_bearer_ok(Some("TEST-QA-BEARER-TOKEN"), QA_TOKEN));
+    }
+
+    #[test]
+    fn qa_seam_absent_without_the_staging_flag() {
+        // Production posture: the constructor default serves the seam
+        // path as a plain 404 — indistinguishable from an unknown route —
+        // even for a well-formed synthetic mailbox.
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            QA_TEST_CODES_PATH,
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        let unknown = h.call(
+            "POST",
+            "/api/no-such-seam",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_eq!(unknown.status, 404);
+        assert_eq!(unknown.body, resp.body);
+        // The seam path is not enumerable: `OPTIONS` on it answers the
+        // same 404 as an unknown path, with or without an `Origin`
+        // (the e2e seam client never sends a CORS preflight).
+        let pre = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, Some(ORIGIN));
+        assert_eq!(pre.status, 404);
+        assert_eq!(
+            pre.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        let pre_unknown = h.call_full("OPTIONS", "/api/no-such-seam", None, None, Some(ORIGIN));
+        assert_eq!(pre_unknown.status, 404);
+        assert_eq!(pre_unknown.body, pre.body);
+        let pre_no_origin = h.call_full("OPTIONS", QA_TEST_CODES_PATH, None, None, None);
+        assert_eq!(pre_no_origin.status, 404);
+    }
+
+    #[test]
+    fn qa_seam_fail_closed_without_a_staged_bearer() {
+        // Flag armed but no QA_AUTH_TOKEN staged: there is nothing to
+        // compare against, so every request 404s — arming the flag alone
+        // never opens the seam.
+        let mut h = harness();
+        h.config = cfg().with_qa_code_seam(true);
+        let resp = h.call_seam(
+            serde_json::json!({"email": "a@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+    }
+
+    #[test]
+    fn qa_seam_rejects_a_bad_bearer_without_detail() {
+        let h = qa_harness();
+        for bearer in [None, Some(""), Some("wrong-token")] {
+            let resp = h.call_seam(serde_json::json!({"email": "a@example.test"}), bearer);
+            assert_eq!(resp.status, 401);
+            assert_eq!(resp.body, r#"{"error":"unauthorized"}"#);
+        }
+        // A non-Bearer scheme is not a bearer either.
+        let req = Request {
+            method: "POST".to_string(),
+            path: QA_TEST_CODES_PATH.to_string(),
+            cookie: None,
+            origin: None,
+            authorization: Some(format!("Token {QA_TOKEN}")),
+            body: serde_json::json!({"email": "a@example.test"})
+                .to_string()
+                .into_bytes(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, 401);
+        assert_eq!(resp.body, r#"{"error":"unauthorized"}"#);
+    }
+
+    #[test]
+    fn qa_seam_rejects_real_mailboxes_and_captures_nothing_for_them() {
+        let h = qa_harness();
+        // Even a mailbox with a live issuance behind it: the seam only
+        // ever answers example.test.
+        seed_user(&h, "u-real", "a@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(h.mailer.sent.borrow().len(), 1);
+        let resp = h.call_seam(
+            serde_json::json!({"email": "a@example.com"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        assert!(h.store.qa_codes.borrow().is_empty());
+    }
+
+    #[test]
+    fn qa_seam_misses_without_an_issuance() {
+        let h = qa_harness();
+        let resp = h.call_seam(
+            serde_json::json!({"email": "fresh@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        // Malformed bodies and non-mailboxes miss the same indistinct way.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"email": "not-an-email"}),
+            serde_json::json!({"email": 1}),
+            serde_json::json!({"email": "a@example.test", "extra": true}),
+        ] {
+            let resp = h.call_seam(body, Some(QA_TOKEN));
+            assert_eq!(resp.status, 404);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
+            );
+        }
+    }
+
+    #[test]
+    fn qa_seam_returns_the_issued_code_and_never_mints() {
+        let h = qa_harness();
+        // The real issuance path: the signup form's register/start mails
+        // the inbox-proof code for the synthetic mailbox.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "e2e-wizard@example.test"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let mailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let users_before = h.store.users.borrow().len();
+        let magic_before = h.store.magic.borrow().len();
+        // The seam returns exactly the mailed token...
+        let resp = h.call_seam(
+            serde_json::json!({"email": "e2e-wizard@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let code: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            code.get("magic_token"),
+            Some(&serde_json::Value::String(mailed.clone()))
+        );
+        // ...without minting anything itself: retrieval is read-only.
+        assert_eq!(h.store.users.borrow().len(), users_before);
+        assert_eq!(h.store.magic.borrow().len(), magic_before);
+        // ...and the returned code is the live credential: the same token
+        // redeems the magic finish, proving the seam hands back a genuinely
+        // issued code rather than a lookalike.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": mailed}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    #[test]
+    fn qa_seam_refuses_an_expired_code() {
+        let h = qa_harness();
+        block_on(h.store.record_qa_issued_code(
+            "stale@example.test",
+            "stale-token",
+            NOW.saturating_sub(auth::MAGIC_LINK_TTL_SECS + 1),
+        ))
+        .unwrap();
+        let resp = h.call_seam(
+            serde_json::json!({"email": "stale@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+    }
+
+    #[test]
+    fn qa_capture_skips_real_mailboxes_at_issuance() {
+        // Belt-and-braces beside the retrieval-side domain pin: issuance
+        // for a real mailbox writes no outbox row in the first place.
+        let h = qa_harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "real@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!h.mailer.sent.borrow().is_empty());
+        assert!(h.store.qa_codes.borrow().is_empty());
     }
 
     #[test]
@@ -2820,6 +4756,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
+            authorization: None,
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
@@ -2874,7 +4811,7 @@ mod tests {
                 Ok(if set.insert(key) { 1 } else { 0 })
             }
         }
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         let store = Arc::new(ClaimStore {
             claimed: Mutex::new(HashSet::new()),
         });
@@ -3008,6 +4945,7 @@ mod tests {
             path: "/v1/vault".to_string(),
             cookie: Some(cookie_a.clone()),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: put_body.to_string().into_bytes(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -3020,6 +4958,812 @@ mod tests {
             "{}",
             resp.body
         );
+    }
+
+    #[test]
+    fn vault_put_for_a_deleting_account_is_the_typed_409_and_writes_nothing() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Normal write first: fence open, the save lands.
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Deletion scheduled: the same save is the typed fence refusal,
+        // never the generic 400, and the stored row is not replaced.
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        // Reads still work during grace (cancel must stay possible),
+        // and the pre-fence row is what they see.
+        let resp = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"provider_configured\":true"),
+            "{}",
+            resp.body
+        );
+    }
+
+    #[test]
+    fn test_connection_for_a_deleting_account_is_the_typed_409() {
+        // ADR 0002 rule 3: the test-connection lease is a fenced writer, so
+        // a deleting account gets the typed 409 (like `vault_put`), never
+        // the collapsed `{"ok": false}` of an unreachable provider.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let candidate = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Fence open: the route answers its boolean (the fake dialer is up).
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test",
+            Some(candidate.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        // Deletion scheduled: the fenced lease is the typed refusal.
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/vault/test",
+            Some(candidate.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+    }
+
+    #[test]
+    fn vault_mutations_require_fresh_session_but_reads_do_not() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+
+        let fresh_put = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(fresh_put.status, 200, "{}", fresh_put.body);
+
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_put_req = Request {
+            method: "PUT".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            authorization: None,
+            body: put_body.to_string().into_bytes(),
+        };
+        let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
+        assert_eq!(stale_put.status, 401);
+        assert_eq!(
+            stale_put.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+
+        let stale_get_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: None,
+            authorization: None,
+            body: Vec::new(),
+        };
+        let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
+        assert_eq!(stale_get.status, 200, "{}", stale_get.body);
+
+        let stale_delete_req = Request {
+            method: "DELETE".to_string(),
+            path: "/v1/vault".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            authorization: None,
+            body: Vec::new(),
+        };
+        let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
+        assert_eq!(stale_delete.status, 401);
+        assert_eq!(
+            stale_delete.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        assert!(h.store.vaults.borrow().contains_key("u1"));
+    }
+
+    // --- Native REST credentials (ADR 0010) -------------------------------------
+
+    fn peppered_cfg() -> Config {
+        cfg().with_native_rest_pepper(vec![7u8; 32], 1)
+    }
+
+    fn peppered_harness() -> Harness {
+        let mut h = harness();
+        h.config = peppered_cfg();
+        h
+    }
+
+    fn mint_call(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/credentials",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn mint_secret(body: &serde_json::Value) -> String {
+        body["secret"]
+            .as_str()
+            .expect("mint returns secret")
+            .to_string()
+    }
+
+    fn mint_id(body: &serde_json::Value) -> String {
+        body["id"].as_str().expect("mint returns id").to_string()
+    }
+
+    #[test]
+    fn credentials_mint_list_revoke_round_trip() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let id = mint_id(&minted);
+        let secret = mint_secret(&minted);
+        assert!(
+            secret.starts_with("ntk_"),
+            "display form carries the class prefix"
+        );
+        assert_eq!(
+            minted["key_prefix"],
+            secret[..crate::native_rest::CREDENTIAL_PREFIX.len()
+                + crate::native_rest::KEY_PREFIX_LEN]
+                .to_string()
+        );
+        assert_eq!(minted["scopes"], serde_json::json!(["library:read"]));
+        assert_eq!(minted["expires_at"], NOW + 3600);
+
+        // Stored HMAC-only: the row verifies against the secret but never
+        // contains it, and the audit row names the id (never key material).
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.id, id);
+        assert_eq!(rows[0].label, "cli");
+        assert_eq!(rows[0].created_from_ip, "198.51.100.9");
+        assert_ne!(rows[0].record.key_hmac, secret);
+        assert_eq!(
+            rows[0].record.key_hmac,
+            crate::native_rest::credential_hmac(&secret, &[7u8; 32])
+        );
+        assert!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .any(|e| e.action == format!("native_credential_created:{id}")),
+            "issuance audits the credential id"
+        );
+
+        // Listing carries routing facts with no `secret` key anywhere.
+        let list = h.call_full("GET", "/v1/credentials", None, Some(cookie.clone()), None);
+        assert_eq!(list.status, 200, "{}", list.body);
+        assert!(!list.body.contains(&secret));
+        assert!(!list.body.contains(&rows[0].record.key_hmac));
+        let listed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(listed["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["credentials"][0]["id"], id);
+        assert_eq!(
+            listed["credentials"][0]["revoked_at"],
+            serde_json::Value::Null
+        );
+
+        // Revoke is immediate and sticky-idempotent: twice still `ok: true`.
+        for _ in 0..2 {
+            let revoke = h.call_full(
+                "DELETE",
+                &format!("/v1/credentials/{id}"),
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(revoke.status, 200, "{}", revoke.body);
+            assert_eq!(revoke.body, r#"{"ok":true}"#);
+        }
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows[0].record.revoked_at.is_some());
+        let list = h.call_full("GET", "/v1/credentials", None, Some(cookie), None);
+        let listed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert!(listed["credentials"][0]["revoked_at"].is_number());
+    }
+
+    #[test]
+    fn credentials_mint_and_revoke_require_fresh_session_but_list_does_not() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+
+        // Fresh issuance works (pins the 201 for the stale contrast below).
+        let fresh = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(fresh.status, 201, "{}", fresh.body);
+        let id = mint_id(&serde_json::from_str::<serde_json::Value>(&fresh.body).unwrap());
+
+        // Stale sessions are denied the step-up with the CISO-approved
+        // `reauth_required` response before any key material exists — and
+        // mint nothing.
+        let stale_mint_req = Request {
+            method: "POST".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            authorization: None,
+            body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
+                .to_string()
+                .into_bytes(),
+        };
+        let stale_mint = block_on(handle(&stale_ctx, &stale_mint_req));
+        assert_eq!(stale_mint.status, 401);
+        assert_eq!(
+            stale_mint.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1, "stale issuance must mint nothing");
+
+        // Stale revocation is denied the same way; ordinary listing still
+        // serves on the stale-but-valid session.
+        let stale_revoke_req = Request {
+            method: "DELETE".to_string(),
+            path: format!("/v1/credentials/{id}"),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            authorization: None,
+            body: Vec::new(),
+        };
+        let stale_revoke = block_on(handle(&stale_ctx, &stale_revoke_req));
+        assert_eq!(stale_revoke.status, 401);
+        assert_eq!(
+            stale_revoke.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        let stale_list_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: Some(cookie),
+            origin: None,
+            authorization: None,
+            body: Vec::new(),
+        };
+        let stale_list = block_on(handle(&stale_ctx, &stale_list_req));
+        assert_eq!(stale_list.status, 200, "{}", stale_list.body);
+    }
+
+    #[test]
+    fn credentials_mint_rejects_unknown_scopes_and_bad_labels() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+
+        // Cross-surface, case, and whitespace variants are not scopes.
+        for scopes in [
+            serde_json::json!(["subsonic"]),
+            serde_json::json!(["Library:Read"]),
+            serde_json::json!(["library:read "]),
+            serde_json::json!(["library:read", "admin"]),
+        ] {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 60}),
+            );
+            assert_eq!(resp.status, 422, "scopes={scopes}: {}", resp.body);
+            assert!(
+                resp.body.contains("\"code\":\"validation_failed\""),
+                "{}",
+                resp.body
+            );
+        }
+        // Unknown wire keys, over-long labels, and control characters fail
+        // the same way (deny_unknown_fields + the 64-char CHECK mirror).
+        for body in [
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 60, "extra": 1}),
+            serde_json::json!({"label": "l".repeat(65), "scopes": ["library:read"], "ttl_secs": 60}),
+            serde_json::json!({"label": "cli\ninjected", "scopes": ["library:read"], "ttl_secs": 60}),
+            serde_json::json!({"label": "cli", "scopes": ["library:read"]}),
+        ] {
+            let resp = mint_call(&h, &cookie, body);
+            assert_eq!(resp.status, 422, "{}", resp.body);
+        }
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows.is_empty(), "rejected mints store nothing");
+
+        // The empty scope set is issuable (least-privilege floor) and the
+        // TTL clamps fail-safe to the 365-day cap, even for `u64::MAX`.
+        let bare = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": [], "ttl_secs": 60}),
+        );
+        assert_eq!(bare.status, 201, "{}", bare.body);
+        let capped = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": u64::MAX}),
+        );
+        assert_eq!(capped.status, 201, "{}", capped.body);
+        let capped_body: serde_json::Value = serde_json::from_str(&capped.body).unwrap();
+        assert_eq!(
+            capped_body["expires_at"],
+            NOW + crate::native_rest::MAX_CREDENTIAL_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn credentials_mint_fails_closed_without_a_provisioned_keyring() {
+        // The default test config provisions no pepper: issuance must fail
+        // closed (generic 500, never which secret is missing) while every
+        // other route keeps serving.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 500);
+        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        let vault = h.call_full("GET", "/v1/vault", None, Some(cookie), None);
+        assert_eq!(vault.status, 200, "unrelated routes keep serving");
+    }
+
+    #[test]
+    fn credentials_revoke_is_owner_scoped_and_shape_checked() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie_a,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let id = mint_id(&serde_json::from_str(&minted.body).unwrap());
+
+        // Another user's id, an unknown id, an empty id, and a nested path
+        // are all the same 404 — no oracle distinguishes them.
+        for (cookie, path) in [
+            (cookie_b.clone(), format!("/v1/credentials/{id}")),
+            (cookie_a.clone(), "/v1/credentials/cred_missing".to_string()),
+            (cookie_a.clone(), "/v1/credentials/".to_string()),
+            (cookie_a.clone(), "/v1/credentials/a/b".to_string()),
+        ] {
+            let resp = h.call_full("DELETE", &path, None, Some(cookie), Some(ORIGIN));
+            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+        }
+        // The victim row is untouched by the foreign probe.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows[0].record.revoked_at, None);
+    }
+
+    #[test]
+    fn bearer_gate_enforces_scope_without_session_fallback() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let mint = |scopes: serde_json::Value| {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 3600}),
+            );
+            assert_eq!(resp.status, 201, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            mint_secret(&body)
+        };
+        let library_secret = mint(serde_json::json!(["library:read"]));
+        let stream_secret = mint(serde_json::json!(["stream:read"]));
+
+        // In-scope bearer passes the gate (and then 404s: data routes do
+        // not exist yet, so default-deny holds). The 404 still proves the
+        // gate ran — `last_used_at` is recorded.
+        let ok = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer {library_secret}")),
+        );
+        assert_eq!(ok.status, 404, "{}", ok.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(
+            rows.iter().any(|r| r.last_used_at == Some(NOW)),
+            "successful bearer use records last_used_at"
+        );
+
+        // Wrong scope is the names-only 403, never the 401 (which would
+        // claim the credential itself was bad).
+        let forbidden = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {stream_secret}")));
+        assert_eq!(forbidden.status, 403);
+        assert_eq!(
+            forbidden.body,
+            r#"{"code":"forbidden","message":"insufficient scope","retryable":false}"#
+        );
+
+        // Presented-but-invalid bearers are the generic 401 — including
+        // malformed shapes (rejected before any HMAC/DB work) and a
+        // well-formed unknown key (fails closed after the lookup).
+        for header in [
+            Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+            Some("Bearer".to_string()),
+            Some("Basic abc123".to_string()),
+            Some("__Host-nntune-session=abc123".to_string()),
+        ] {
+            let resp = h.call_bearer("GET", "/v1/search", header);
+            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+            );
+        }
+
+        // No Authorization header skips the bearer gate entirely (ADR 0010:
+        // session-cookie holders see no behavior change). With no data
+        // routes yet this is the plain 404 — the same posture as before
+        // this credential class existed — never a 401.
+        let missing = h.call_bearer("GET", "/v1/search", None);
+        assert_eq!(missing.status, 404, "{}", missing.body);
+
+        // A valid session cookie with no bearer header likewise falls
+        // through to the dispatch (plain 404 until the data routes land
+        // with their session-or-bearer dispatch), never the bearer 401.
+        let cookie_only = h.call_full(
+            "GET",
+            "/v1/search",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(cookie_only.status, 404, "{}", cookie_only.body);
+        assert_eq!(
+            cookie_only.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+
+        // A presented bearer is never rescued by a session cookie: a valid
+        // cookie plus an invalid bearer is still the bearer 401.
+        let no_rescue = Request {
+            method: "GET".to_string(),
+            path: "/v1/search".to_string(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some("Bearer ntk_definitely-not-a-key".to_string()),
+            body: Vec::new(),
+        };
+        let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
+        assert_eq!(no_rescue.status, 401, "{}", no_rescue.body);
+
+        // And a valid bearer can never mint: issuance stays session-only.
+        let bearer_mint_req = Request {
+            method: "POST".to_string(),
+            path: "/v1/credentials".to_string(),
+            cookie: None,
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some(format!("Bearer {library_secret}")),
+            body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
+                .to_string()
+                .into_bytes(),
+        };
+        let bearer_mint = block_on(handle(&h.ctx(), &bearer_mint_req));
+        assert_eq!(bearer_mint.status, 401, "{}", bearer_mint.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 2, "bearer mint attempt stores nothing");
+    }
+
+    #[test]
+    fn malformed_bearer_shape_costs_no_store_work() {
+        // ADR 0010 DoS pin: the shape gate must run BEFORE the per-IP
+        // budget claim and the HMAC/DB lookup. A malformed token answers
+        // the generic 401 with zero `reserve_rate_limit_pair` calls and
+        // zero `native_credential_by_hmac` lookups; a well-formed unknown
+        // key reaches both and still fails closed. Short-circuiting the
+        // `is_plausible_credential_shape` guard must fail here (both
+        // counters would move on the malformed leg).
+        let h = peppered_harness();
+        let pair_calls = || *h.store.rate_limit_pair_calls.borrow();
+        let lookups = || *h.store.native_credential_lookups.borrow();
+        let (base_pairs, base_lookups) = (pair_calls(), lookups());
+        // Each malformed shape: generic 401, no store work at all.
+        for header in [
+            Some("Bearer ntk_short".to_string()),
+            Some(format!("Bearer ntk_{}", "0".repeat(42))),
+            Some(format!("Bearer ntk_{}", "0".repeat(44))),
+            Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
+        ] {
+            let resp = h.call_bearer("GET", "/v1/search", header);
+            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(
+                resp.body,
+                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+            );
+        }
+        assert_eq!(
+            pair_calls(),
+            base_pairs,
+            "malformed shapes must not claim the lookup budget"
+        );
+        assert_eq!(
+            lookups(),
+            base_lookups,
+            "malformed shapes must not reach the credential lookup"
+        );
+        // A well-formed unknown key passes the gate and pays for the
+        // lookup before failing closed — proving the counters observe the
+        // gate rather than the harness.
+        let unknown = h.call_bearer(
+            "GET",
+            "/v1/search",
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+        );
+        assert_eq!(unknown.status, 401, "{}", unknown.body);
+        assert!(
+            pair_calls() > base_pairs,
+            "a well-formed key must claim the lookup budget"
+        );
+        assert!(
+            lookups() > base_lookups,
+            "a well-formed key must reach the credential lookup"
+        );
+    }
+
+    #[test]
+    fn bearer_lookup_budget_denial_collapses_to_the_generic_401() {
+        // ADR 0010 DoS: a flood of well-formed random `ntk_` tokens shares
+        // one per-IP pool claimed before any credential DB work. Exhausting
+        // it denies with the SAME generic 401 as an unknown key (no
+        // throttle oracle), and even a valid credential is denied while
+        // the budget is exhausted.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+
+        // A valid bearer passes before exhaustion (404: gate passed, no
+        // data routes yet).
+        let ok = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {secret}")));
+        assert_eq!(ok.status, 404, "{}", ok.body);
+
+        // Exhaust the per-minute pool directly (same key/action the gate
+        // claims). The passing call above already holds one slot, so fill
+        // the remaining limit - 1.
+        let ip_key = rate_limit_ip_key("198.51.100.9");
+        for _ in 0..(BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN - 1) {
+            let admitted = block_on(h.store.reserve_rate_limit(
+                &ip_key,
+                "native_rest.bearer_lookup_ip_min",
+                BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+                NOW,
+                BEARER_LOOKUP_WINDOW_SECS,
+            ))
+            .unwrap();
+            assert!(admitted);
+        }
+
+        // Now even the valid credential is denied — with the generic 401,
+        // never a 429 or any other shape.
+        let denied = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {secret}")));
+        assert_eq!(denied.status, 401, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+        );
+    }
+
+    #[test]
+    fn credentials_mint_for_a_deleting_account_is_the_typed_409() {
+        // ADR 0002 rule 3: issuance is a fenced writer like `vault_put`, so
+        // a fresh session during the 24 h deletion grace cannot mint a new
+        // long-lived bearer path behind the marker.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let first = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(first.status, 201, "{}", first.body);
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let fenced = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(fenced.status, 409, "{}", fenced.body);
+        assert_eq!(
+            fenced.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows.len(), 1, "fenced mint stores nothing");
+    }
+
+    #[test]
+    fn session_revoke_all_revokes_native_credentials_too() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for scopes in [["library:read"], ["stream:read"]] {
+            let resp = mint_call(
+                &h,
+                &cookie,
+                serde_json::json!({"scopes": scopes, "ttl_secs": 3600}),
+            );
+            assert_eq!(resp.status, 201, "{}", resp.body);
+        }
+        // One row pre-revoked: the sweep transitions only the live one.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        block_on(
+            h.store
+                .revoke_native_credential(&rows[0].record.id, "u1", NOW),
+        )
+        .unwrap();
+
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert!(rows.iter().all(|r| r.record.revoked_at.is_some()));
+        assert!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .any(|e| e.action == "native_credentials_revoked_all"),
+            "bulk revocation audits without key material"
+        );
+
+        // A second sweep is a quiet no-op (still 200, nothing new).
+        let cookie2 = magic_login(&h, "a@example.com");
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie2),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    #[test]
+    fn credential_diagnostics_carry_no_secret_ip_or_hmac() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"label": "cli", "scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let secret = mint_secret(&minted);
+        // The mint body shows the secret exactly once, by design — and
+        // nothing else sensitive travels with it.
+        assert_eq!(resp.body.matches(&secret).count(), 1);
+        assert!(!resp.body.contains("key_hmac"));
+
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        let debug = format!("{:?}", rows[0]);
+        assert!(debug.contains(&rows[0].record.id), "Debug names the id");
+        assert!(debug.contains("cli"), "Debug names the label");
+        for needle in [
+            secret.as_str(),
+            secret.trim_start_matches("ntk_"),
+            rows[0].record.key_hmac.as_str(),
+            "198.51.100.9",
+        ] {
+            assert!(!debug.contains(needle), "diagnostic leaked {needle:?}");
+        }
+    }
+
+    #[test]
+    fn credentials_preflight_covers_the_dynamic_revoke_path() {
+        let h = peppered_harness();
+        for path in ["/v1/credentials", "/v1/credentials/cred_1"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "{path}");
+            assert!(resp.body.is_empty(), "{path}");
+        }
+        // Nested shapes are not credential ids: preflight stays 404 there.
+        let resp = h.call_full("OPTIONS", "/v1/credentials/a/b", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
     }
 
     #[test]
@@ -3129,11 +5873,14 @@ mod tests {
         cose
     }
     fn fx_none_attestation(cred_id: &[u8], cose: &[u8]) -> Vec<u8> {
+        fx_none_attestation_with_count(cred_id, cose, 1)
+    }
+    fn fx_none_attestation_with_count(cred_id: &[u8], cose: &[u8], sign_count: u32) -> Vec<u8> {
         use sha2::Digest;
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
-        auth.extend_from_slice(&1u32.to_be_bytes());
+        auth.push(0x45);
+        auth.extend_from_slice(&sign_count.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
         auth.extend_from_slice(cred_id);
@@ -3153,6 +5900,262 @@ mod tests {
             r#"{{"type":"{}","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
             type_, challenge, ORIGIN
         )
+    }
+
+    fn fx_reauth_assertion(
+        challenge: &str,
+        credential_id: &[u8],
+        secret: u8,
+        sign_count: u32,
+    ) -> serde_json::Value {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth_data.push(0x05); // User presence and user verification are required.
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        let client_data = fx_client_json("webauthn.get", challenge);
+        let mut message = auth_data.clone();
+        message.extend_from_slice(&sha2::Sha256::digest(client_data.as_bytes()));
+        let signing_key = SigningKey::from_slice(&[secret; 32]).unwrap();
+        let signature: EsSignature = signing_key.sign(&message);
+        serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64url_encode(credential_id),
+            "authenticator_data": b64url_encode(&auth_data),
+            "client_data_json": b64url_encode(client_data.as_bytes()),
+            "signature": b64url_encode(signature.to_der().as_bytes()),
+        })
+    }
+
+    fn start_reauthentication(h: &Harness, cookie: &str) -> String {
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/start",
+            None,
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        body["challenge"].as_str().unwrap().to_string()
+    }
+
+    fn add_test_passkey(h: &Harness, user_id: &str, credential_id: &[u8], secret: u8) {
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(credential_id),
+            user_id: user_id.to_string(),
+            public_key: fx_es256_cose(secret),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn passkey_reauthentication_replaces_only_the_authenticated_session() {
+        let h = harness();
+        seed_user(&h, "reauth-user", "reauth@example.com");
+        let old_cookie = magic_login(&h, "reauth@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        let credential_id = b"reauth-credential";
+        add_test_passkey(&h, &old_claims.user_id, credential_id, 73);
+
+        let challenge = start_reauthentication(&h, &old_cookie);
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/finish",
+            Some(fx_reauth_assertion(&challenge, credential_id, 73, 1).to_string()),
+            Some(old_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        let replacement_cookie = cookie_of(&response);
+        let replacement_token = replacement_cookie.split_once('=').unwrap().1;
+        let replacement_claims =
+            session::verify_session(&h.config.session_secret, replacement_token, NOW).unwrap();
+        assert_ne!(replacement_claims.session_id, old_record.id);
+        assert_eq!(replacement_claims.user_id, old_record.user_id);
+        let sessions = h.store.sessions.borrow();
+        assert!(sessions.get(&old_record.id).unwrap().revoked);
+        assert!(session::verify_stored_session(
+            &h.config.session_keys(),
+            replacement_token,
+            NOW,
+            sessions.get(&replacement_claims.session_id).unwrap(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reauthentication_rejects_a_credential_for_another_account() {
+        let h = harness();
+        seed_user(&h, "reauth-owner", "reauth-owner@example.com");
+        let old_cookie = magic_login(&h, "reauth-owner@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        seed_user(&h, "other-account", "other@example.com");
+        let credential_id = b"other-account-credential";
+        add_test_passkey(&h, "other-account", credential_id, 74);
+
+        let challenge = start_reauthentication(&h, &old_cookie);
+        let response = h.call_full(
+            "POST",
+            "/v1/session/reauthenticate/finish",
+            Some(fx_reauth_assertion(&challenge, credential_id, 74, 1).to_string()),
+            Some(old_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 401);
+        assert!(response.set_cookie.is_none());
+        assert!(
+            !h.store
+                .sessions
+                .borrow()
+                .get(&old_record.id)
+                .unwrap()
+                .revoked
+        );
+        assert!(
+            !h.store
+                .challenges
+                .borrow()
+                .get(&challenge)
+                .unwrap()
+                .challenge
+                .consumed
+        );
+    }
+
+    #[test]
+    fn atomic_reauthentication_race_and_failures_leave_no_partial_replacement() {
+        let h = harness();
+        seed_user(&h, "atomic-reauth", "atomic-reauth@example.com");
+        let old_cookie = magic_login(&h, "atomic-reauth@example.com");
+        let old_token = old_cookie.split_once('=').unwrap().1;
+        let old_claims = session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+        let old_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&old_claims.session_id)
+            .unwrap()
+            .clone();
+        let keys = h.config.session_keys();
+        let prepared = session::reauthenticate_session(
+            &keys,
+            old_token,
+            NOW + 1200,
+            &old_record,
+            &old_claims.user_id,
+            h.config.session_ttl_secs,
+        )
+        .unwrap();
+        assert!(block_on(h.store.replace_session_after_reauthentication(&prepared)).unwrap());
+        let loser = session::reauthenticate_session(
+            &keys,
+            old_token,
+            NOW + 1200,
+            &old_record,
+            &old_claims.user_id,
+            h.config.session_ttl_secs,
+        )
+        .unwrap();
+        assert!(!block_on(h.store.replace_session_after_reauthentication(&loser)).unwrap());
+        assert_eq!(h.store.sessions.borrow().len(), 2);
+
+        for fail_insert in [false, true] {
+            let h = harness();
+            seed_user(&h, "rollback-reauth", "rollback-reauth@example.com");
+            let old_cookie = magic_login(&h, "rollback-reauth@example.com");
+            let old_token = old_cookie.split_once('=').unwrap().1;
+            let old_claims =
+                session::verify_session(&h.config.session_secret, old_token, NOW).unwrap();
+            let old_record = h
+                .store
+                .sessions
+                .borrow()
+                .get(&old_claims.session_id)
+                .unwrap()
+                .clone();
+            let credential_id = b"rollback-credential";
+            add_test_passkey(&h, &old_claims.user_id, credential_id, 75);
+            if fail_insert {
+                *h.store.fail_reauth_insert.borrow_mut() = true;
+            } else {
+                *h.store.fail_reauth_revocation.borrow_mut() = true;
+            }
+            let challenge = start_reauthentication(&h, &old_cookie);
+            let response = h.call_full(
+                "POST",
+                "/v1/session/reauthenticate/finish",
+                Some(fx_reauth_assertion(&challenge, credential_id, 75, 1).to_string()),
+                Some(old_cookie),
+                Some(ORIGIN),
+            );
+            assert!(response.status >= 400);
+            assert!(response.set_cookie.is_none());
+            let sessions = h.store.sessions.borrow();
+            assert_eq!(sessions.len(), 1, "failed replacement must insert no row");
+            assert!(!sessions.get(&old_record.id).unwrap().revoked);
+        }
+    }
+
+    #[test]
+    fn ordinary_magic_login_does_not_revoke_existing_sessions() {
+        let h = harness();
+        seed_user(&h, "ordinary-login", "ordinary-login@example.com");
+        let existing_cookie = magic_login(&h, "ordinary-login@example.com");
+        let existing_token = existing_cookie.split_once('=').unwrap().1;
+        let existing_claims =
+            session::verify_session(&h.config.session_secret, existing_token, NOW).unwrap();
+        let existing_record = h
+            .store
+            .sessions
+            .borrow()
+            .get(&existing_claims.session_id)
+            .unwrap()
+            .clone();
+
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "ordinary-login@example.com"}),
+        );
+        assert_eq!(start.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let finish = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": token}).to_string()),
+            Some(existing_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(finish.status, 200, "{}", finish.body);
+        assert!(
+            !h.store
+                .sessions
+                .borrow()
+                .get(&existing_record.id)
+                .unwrap()
+                .revoked
+        );
     }
 
     #[test]
@@ -3220,7 +6223,7 @@ mod tests {
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x41);
+        auth.push(0x45);
         auth.extend_from_slice(&1u32.to_be_bytes());
         auth.extend_from_slice(&[0u8; 16]);
         auth.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
@@ -3270,7 +6273,7 @@ mod tests {
         assert_eq!(start["allow_credentials"], serde_json::json!([]));
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
-        auth.push(0x01);
+        auth.push(0x05);
         auth.extend_from_slice(&2u32.to_be_bytes());
         let cd_get = format!(
             r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
@@ -3291,6 +6294,101 @@ mod tests {
         // Replaying the same assertion/challenge fails generically.
         let resp = h.call("POST", "/v1/auth/passkey/login/finish", finish);
         assert_eq!(resp.status, 401);
+    }
+
+    /// The database CHECK (migration 0008) must list exactly the purposes
+    /// the handlers mint. Adding a purpose constant without updating the
+    /// migration would make every such insert fail at runtime.
+    #[test]
+    fn purpose_constants_match_the_migration_check() {
+        let sql = include_str!("../../../migrations/0008_auth_challenge_purpose_guard.sql");
+        let expected = format!("CHECK (purpose IN ('', '{PURPOSE_REGISTER}', '{PURPOSE_LOGIN}'))");
+        assert!(
+            sql.contains(&expected),
+            "0008 CHECK must be exactly: {expected}"
+        );
+    }
+
+    /// `none` attestation is unauthenticated, so
+    /// the enrollment counter is attacker-chosen: a crafted attestation
+    /// carrying `u32::MAX` used to be stored verbatim and then rejected
+    /// every legitimate assertion (strict-increase rule) forever. The
+    /// enrollment counter must never be persisted; the first assertion's
+    /// signed counter establishes the baseline.
+    #[test]
+    fn register_ignores_attestation_supplied_sign_count() {
+        use p256::ecdsa::{signature::Signer, Signature as EsSignature, SigningKey};
+        use sha2::Digest;
+
+        let h = harness();
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let magic_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+
+        let cred_id = b"pinned-counter-cred";
+        let att = fx_none_attestation_with_count(cred_id, &fx_es256_cose(11), u32::MAX);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": magic_token,
+                "invite_code": null,
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+
+        let user = block_on(h.store.user_by_email("pinned@example.com"))
+            .unwrap()
+            .unwrap();
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].sign_count, 0,
+            "attestation-supplied counter must not be stored"
+        );
+
+        // A legitimate first assertion (counter 1) still logs in.
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            serde_json::json!({"email": "pinned@example.com"}),
+        );
+        let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let mut auth = Vec::new();
+        auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
+        auth.push(0x05);
+        auth.extend_from_slice(&1u32.to_be_bytes());
+        let cd_get = fx_client_json("webauthn.get", &challenge);
+        let mut msg = auth.clone();
+        msg.extend_from_slice(&sha2::Sha256::digest(cd_get.as_bytes()));
+        let sig: EsSignature = SigningKey::from_slice(&[11u8; 32]).unwrap().sign(&msg);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "authenticator_data": b64url_encode(&auth),
+                "client_data_json": b64url_encode(cd_get.as_bytes()),
+                "signature": b64url_encode(sig.to_der().as_bytes()),
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let creds = block_on(h.store.credentials_for_user(&user.id)).unwrap();
+        assert_eq!(creds[0].sign_count, 1);
     }
 
     #[test]
@@ -3364,7 +6462,8 @@ mod tests {
                 .insert_challenge(&challenge, Some("victim"), PURPOSE_LOGIN),
         )
         .unwrap();
-        let (token, record) = auth::issue_magic_link("victim", "victim@example.com", NOW);
+        let (token, record) =
+            auth::issue_magic_link("victim", "victim@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
 
         let attacker_cred = b"attacker-cred";
@@ -3625,6 +6724,7 @@ mod tests {
             path: path.to_string(),
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: Vec::new(),
         };
         block_on(handle(&ctx, &req))
@@ -3802,7 +6902,11 @@ mod tests {
                 assert!(body["user_id"].is_string(), "iteration {i}: {}", resp.body);
             } else {
                 assert_eq!(resp.status, 429, "iteration {i}: {}", resp.body);
-                assert_eq!(resp.body, r#"{"error":"rate_limited"}"#, "iteration {i}");
+                assert_eq!(
+                    resp.body,
+                    crate::api_error::ApiError::rate_limited("too many requests").body_json(),
+                    "iteration {i}"
+                );
             }
         }
         assert_eq!(
@@ -3870,11 +6974,129 @@ mod tests {
         );
         assert_eq!(taken_denied.status, 429, "{}", taken_denied.body);
         assert_eq!(fresh_denied.status, 429, "{}", fresh_denied.body);
+        // This harness raises the burst cap (see `cfg()`), so the
+        // HOURLY budget is the denier here and Retry-After must report
+        // its window — the mirror of the burst-denial pin in
+        // `auth_start_burst_budget_binds_before_hourly`.
+        assert_eq!(taken_denied.retry_after, Some(AUTH_START_WINDOW_SECS));
+        assert_eq!(fresh_denied.retry_after, Some(AUTH_START_WINDOW_SECS));
         assert_eq!(
             taken_denied.body, fresh_denied.body,
             "throttled bodies must be identical across emails"
         );
-        assert_eq!(taken_denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            taken_denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
+    }
+
+    #[test]
+    fn auth_start_burst_budget_binds_before_hourly() {
+        // The configured burst (documented default 10/60s from
+        // `RateLimitConfig`) is live on the auth-start path: the 11th
+        // start inside the window is denied long before the hourly
+        // per-IP budget (30) would bind. `cfg()` raises the burst for
+        // the hourly pins, so restore the default here.
+        let mut h = harness();
+        h.config.rate_limits = crate::rate_limit::RateLimitConfig::default();
+        let burst = h.config.rate_limits.auth_max_attempts as usize;
+        assert!((burst as u64) < AUTH_STARTS_PER_IP_PER_HOUR);
+        for i in 0..burst {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("burst{i}@example.com")}),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+        }
+        let denied = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "burst-over@example.com"}),
+        );
+        assert_eq!(denied.status, 429, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
+        // Handler-level Retry-After pin: a BURST denial reports the
+        // burst window (60s default), not the hourly window — clients
+        // must not back off for an hour over a one-minute budget. The
+        // hourly-denial case reports AUTH_START_WINDOW_SECS and is
+        // pinned in `register_start_ip_throttle_is_email_independent`
+        // (where cfg() raises the burst so the hourly cap binds).
+        assert_eq!(
+            denied.retry_after,
+            Some(h.config.rate_limits.auth_window_secs)
+        );
+        assert_ne!(denied.retry_after, Some(AUTH_START_WINDOW_SECS));
+        assert_eq!(
+            h.store.users.borrow().len(),
+            burst,
+            "no user row past the burst budget"
+        );
+    }
+
+    #[test]
+    fn rate_limit_pair_denial_consumes_neither_budget() {
+        // All-or-none pin for the dual claim: with the second budget
+        // exhausted, denied pair claims must leave the first budget
+        // fully intact (a sequential reserve would burn one first
+        // slot per denial).
+        let store = FakeStore::default();
+        let first = RateLimitBudget {
+            scope_key: "ip-scope",
+            action: "pair.first",
+            limit: 2,
+            window_secs: 60,
+        };
+        let second = RateLimitBudget {
+            scope_key: "account-scope",
+            action: "pair.second",
+            limit: 1,
+            window_secs: 60,
+        };
+        // Exhaust the second budget on its own.
+        assert!(block_on(store.reserve_rate_limit(
+            second.scope_key,
+            second.action,
+            second.limit,
+            NOW,
+            second.window_secs
+        ))
+        .unwrap());
+        for _ in 0..3 {
+            assert_eq!(
+                block_on(store.reserve_rate_limit_pair(first, second, NOW)).unwrap(),
+                PairAdmission::DeniedSecond,
+                "the exhausted second budget must be named as the denier"
+            );
+        }
+        // Both first-budget slots are still available to single claims.
+        assert!(block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
+        assert!(block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
+        assert!(!block_on(store.reserve_rate_limit(
+            first.scope_key,
+            first.action,
+            first.limit,
+            NOW,
+            first.window_secs
+        ))
+        .unwrap());
     }
 
     #[test]
@@ -4055,7 +7277,10 @@ mod tests {
             "second address in the same /64 must hit the shared budget: {}",
             denied.body
         );
-        assert_eq!(denied.body, r#"{"error":"rate_limited"}"#);
+        assert_eq!(
+            denied.body,
+            crate::api_error::ApiError::rate_limited("too many requests").body_json()
+        );
         let other = h.call_with_ip(
             ip_other,
             "POST",
@@ -4073,17 +7298,44 @@ mod tests {
     fn ipv6_slash64_wiring_pins_all_rate_limit_scopes() {
         // All-sites wiring pin: every per-IP scope must key on
         // `rate_limit_ip_key`, not the raw `source_ip`. The behavioral test
-        // above covers `auth.start_ip` only; the other five scopes revert to
+        // above covers `auth.start_ip` only; the other scopes revert to
         // raw IP with all handler tests green (the harness default
         // `198.51.100.9` makes key == raw), so this shape test observes all
-        // six call sites directly at compile time. Comments are stripped
-        // first so prose mentioning a scope cannot satisfy its pin.
-        let code = strip_line_comments(include_str!("handlers.rs"));
+        // call sites directly at compile time. Slice ONLY the pre-test
+        // production source first: the unquoted `let ip_key = ...` needles
+        // below appear verbatim in this test's own string literals, so
+        // searching the whole file would match the test itself and pass
+        // even with a call site reverted to the raw address. Comments are
+        // stripped next so prose mentioning a scope cannot satisfy its pin.
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let code = strip_line_comments(production);
         let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `admit_auth_start` claims its two budgets as a pair keyed on
+        // one shared `ip_key`; pin both the derivation and the scopes.
+        assert!(
+            norm.contains("let ip_key = rate_limit_ip_key(&self.source_ip);"),
+            "auth-start pair key must derive from rate_limit_ip_key, not raw source_ip",
+        );
+        assert!(
+            norm.contains("let ip_key = rate_limit_ip_key(&ctx.source_ip);"),
+            "vault-test pair key must derive from rate_limit_ip_key, not raw source_ip",
+        );
         for (scope, keyed) in [
             (
                 "auth.start_ip",
-                "&rate_limit_ip_key(&self.source_ip), \"auth.start_ip\",",
+                "scope_key: &ip_key, action: \"auth.start_ip\",",
+            ),
+            (
+                "auth.start_ip_burst",
+                "scope_key: &ip_key, action: \"auth.start_ip_burst\",",
+            ),
+            (
+                "vault.test_ip",
+                "scope_key: &ip_key, action: \"vault.test_ip\",",
             ),
             (
                 "auth.mail_ip",
@@ -4164,6 +7416,58 @@ mod tests {
             h.store.magic.borrow().len(),
             MAIL_PER_IP_PER_HOUR as usize,
             "no magic row stored past the per-IP mail cap"
+        );
+    }
+
+    #[test]
+    fn expired_magic_links_are_pruned_per_user_on_issue() {
+        // Live accounts are never reaped, so a victim's expired links must not
+        // accumulate: each issuance drops only that user's expired rows.
+        // Fixtures distinguish both predicates: pruning by user alone would
+        // drop `live_unexpired`, pruning all expired rows would drop
+        // `expired_other`, and not pruning would leave the 50 spaced rows.
+        let h = harness();
+        let spacing = auth::MAGIC_LINK_TTL_SECS + 1;
+        let (_, expired_other) =
+            auth::issue_magic_link("other", "other@example.com", NOW).expect("issue");
+        block_on(h.store.insert_magic(&expired_other)).unwrap();
+        let mut first_live_hash = String::new();
+        for i in 0..50u64 {
+            let (_, record) = auth::issue_magic_link("live", "live@example.com", NOW + i * spacing)
+                .expect("issue");
+            if i == 0 {
+                first_live_hash.clone_from(&record.token_hash);
+            }
+            block_on(h.store.insert_magic(&record)).unwrap();
+        }
+        let (_, live_unexpired) =
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing).expect("issue");
+        block_on(h.store.insert_magic(&live_unexpired)).unwrap();
+        let (_, newest_live) =
+            auth::issue_magic_link("live", "live@example.com", NOW + 50 * spacing + 1)
+                .expect("issue");
+        block_on(h.store.insert_magic(&newest_live)).unwrap();
+        let rows = h.store.magic.borrow();
+        assert_eq!(
+            rows.values().filter(|r| r.user_id == "live").count(),
+            2,
+            "only unexpired live links survive issuance"
+        );
+        assert!(
+            !rows.contains_key(&first_live_hash),
+            "the issuing user's expired link is pruned"
+        );
+        assert!(
+            rows.contains_key(&live_unexpired.token_hash),
+            "the issuing user's unexpired link is retained"
+        );
+        assert!(
+            rows.contains_key(&newest_live.token_hash),
+            "the newest live link is inserted"
+        );
+        assert!(
+            rows.contains_key(&expired_other.token_hash),
+            "another user's expired link is untouched"
         );
     }
 
@@ -4277,6 +7581,7 @@ mod tests {
         for (id, email) in [
             ("resumed", "resume@example.com"),
             ("active", "active@example.com"),
+            ("deleting", "deleting@example.com"),
             ("abandoned", "abandoned@example.com"),
         ] {
             block_on(h.store.insert_user(&UserRecord {
@@ -4296,6 +7601,10 @@ mod tests {
                 .insert_challenge(&finishing_challenge, Some("active"), PURPOSE_REGISTER),
         )
         .unwrap();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("deleting".to_string());
 
         let resp = h.call(
             "POST",
@@ -4307,6 +7616,9 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("active@example.com"))
+            .unwrap()
+            .is_some());
+        assert!(block_on(h.store.user_by_email("deleting@example.com"))
             .unwrap()
             .is_some());
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
@@ -4327,6 +7639,11 @@ mod tests {
         assert!(
             sql.contains("users.id <> $2"),
             "reap must preserve the current user"
+        );
+        assert!(
+            sql.contains("deleting_at IS NULL"),
+            "reap must never delete an account already scheduled for \
+             deletion (its delete_operations RESTRICT FK owns it)"
         );
         assert!(sql.contains("auth_challenges.purpose = 'register'"));
         assert!(sql.contains("auth_challenges.expires_at > $3"));
@@ -4389,7 +7706,7 @@ mod tests {
             .unwrap();
         }
         let (_, magic_only_record) =
-            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW);
+            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&magic_only_record)).unwrap();
         block_on(h.store.insert_session(&SessionRecord {
             id: "sess-magic-only".to_string(),
@@ -4414,7 +7731,8 @@ mod tests {
                 updated_at: NOW,
             },
         );
-        let (_, inbox_record) = auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW);
+        let (_, inbox_record) =
+            auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
         let resp = h.call(
             "POST",
@@ -4714,6 +8032,176 @@ mod tests {
     }
 
     #[test]
+    fn vault_test_ip_budget_blocks_other_account_at_handler() {
+        // Per-IP gate isolated at the handler, NAT-sized: the per-IP
+        // cap sits ABOVE the per-account cap, so account A exhausting
+        // its own budget must NOT lock out neighbour B on the same
+        // address (first probe still admitted). Only once enough
+        // accounts together exhaust the larger per-IP budget is a
+        // fresh account denied on its FIRST probe with the usual
+        // boolean collapse and no dial. Shrinking the IP cap back to
+        // the account cap fails the neighbour probe; removing the
+        // handler's admission check fails the final denial.
+        let h = harness();
+        let account_cap = h.config.rate_limits.vault_test_max_attempts;
+        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
+        assert!(
+            ip_cap > account_cap,
+            "per-IP cap must exceed the per-account cap"
+        );
+        assert_eq!(
+            ip_cap % account_cap,
+            0,
+            "test arithmetic assumes whole account budgets fill the IP budget"
+        );
+        let fillers = (ip_cap / account_cap) as usize;
+        // fillers accounts to exhaust the IP budget, plus one victim.
+        let mut cookies = Vec::new();
+        for i in 0..=fillers {
+            let user_id = format!("u{i}");
+            let email = format!("nat{i}@example.com");
+            seed_user(&h, &user_id, &email);
+            let cookie = magic_login(&h, &email);
+            put_test_vault(&h, &cookie);
+            cookies.push(cookie);
+        }
+        let probe = |cookie: &str| {
+            h.call_full(
+                "POST",
+                "/v1/vault/test-connection",
+                None,
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+
+        // A exhausts its own per-account budget...
+        for i in 0..account_cap {
+            assert_eq!(probe(&cookies[0]).body, r#"{"ok":true}"#, "probe {i} by A");
+        }
+        // ...and neighbour B's first probe is still admitted: one
+        // account alone cannot consume the NAT-shared IP budget.
+        assert_eq!(
+            probe(&cookies[1]).body,
+            r#"{"ok":true}"#,
+            "neighbour behind the same IP must not be locked out by A alone"
+        );
+        // Fill the remaining per-IP slots across the other accounts.
+        let mut dialled = usize::try_from(account_cap).unwrap() + 1;
+        for (idx, cookie) in cookies.iter().enumerate().take(fillers).skip(1) {
+            let probes = if idx == 1 {
+                // B already used one of its account slots above.
+                account_cap - 1
+            } else {
+                account_cap
+            };
+            for i in 0..probes {
+                assert_eq!(probe(cookie).body, r#"{"ok":true}"#, "probe {i} by u{idx}");
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, ip_cap as usize);
+        let dials = h.dialer.seen.borrow().len();
+        assert_eq!(dials, ip_cap as usize);
+
+        // The victim's per-account budget is untouched, but the shared
+        // per-IP budget is exhausted: denied before any dial.
+        let resp = probe(&cookies[fillers]);
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            dials,
+            "per-IP denial must happen before any dial"
+        );
+    }
+
+    #[test]
+    fn vault_test_ipv6_slash64_shares_ip_budget_at_handler() {
+        // Handler wiring pin for the vault per-IP key: probes spread
+        // across two addresses in one IPv6 /64 must share the single
+        // `vault.test_ip` budget through the real `vault_test_connection`
+        // handler. Each address alone stays well under the per-IP cap,
+        // so keying on the raw `source_ip` (instead of
+        // `rate_limit_ip_key`) would admit the victim's first probe and
+        // fail here — while the IPv4 harness default, where key == raw,
+        // keeps every other vault test green. A different /64 keeps its
+        // own budget.
+        let h = harness();
+        let account_cap = h.config.rate_limits.vault_test_max_attempts;
+        let ip_cap = h.config.rate_limits.vault_test_ip_max_attempts;
+        assert_eq!(
+            ip_cap % account_cap,
+            0,
+            "test arithmetic assumes whole account budgets fill the IP budget"
+        );
+        let fillers = (ip_cap / account_cap) as usize;
+        let ip_a = "2001:db8:abcd:12::1";
+        let ip_b = "2001:db8:abcd:12::9";
+        let ip_other = "2001:db8:abcd:13::1";
+        // fillers accounts to exhaust the shared /64 budget, plus one victim.
+        let mut cookies = Vec::new();
+        for i in 0..=fillers {
+            let user_id = format!("v6u{i}");
+            let email = format!("v6nat{i}@example.com");
+            seed_user(&h, &user_id, &email);
+            let cookie = magic_login(&h, &email);
+            put_test_vault(&h, &cookie);
+            cookies.push(cookie);
+        }
+        let probe = |cookie: &str, ip: &str| {
+            h.call_full_with_ip(
+                ip,
+                "POST",
+                "/v1/vault/test-connection",
+                None,
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+
+        // Fill the per-IP budget, alternating the two addresses in the
+        // /64 so neither raw address ever reaches the cap on its own.
+        let mut dialled = 0usize;
+        for (idx, cookie) in cookies.iter().enumerate().take(fillers) {
+            for i in 0..account_cap {
+                let ip = if dialled.is_multiple_of(2) {
+                    ip_a
+                } else {
+                    ip_b
+                };
+                assert_eq!(
+                    probe(cookie, ip).body,
+                    r#"{"ok":true}"#,
+                    "probe {i} by v6u{idx} from {ip}"
+                );
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, ip_cap as usize);
+        let dials = h.dialer.seen.borrow().len();
+        assert_eq!(dials, ip_cap as usize);
+
+        // The victim's per-account budget is untouched, but the /64's
+        // shared per-IP budget is exhausted: denied before any dial.
+        let resp = probe(&cookies[fillers], ip_b);
+        assert_eq!(resp.body, r#"{"ok":false}"#);
+        assert_eq!(
+            h.dialer.seen.borrow().len(),
+            dials,
+            "shared-/64 denial must happen before any dial"
+        );
+
+        // A different /64 keeps its own budget: the same victim is
+        // admitted from there (the denial above consumed neither budget).
+        let resp = probe(&cookies[fillers], ip_other);
+        assert_eq!(
+            resp.body, r#"{"ok":true}"#,
+            "a different /64 must keep its own budget"
+        );
+        assert_eq!(h.dialer.seen.borrow().len(), dials + 1);
+    }
+
+    #[test]
     fn previous_secret_authenticates_only_inside_rotation_window() {
         // Runbook §4: the Worker honors a staged previous secret only as
         // part of a recorded rotation, through the dual path. A pre-cutover
@@ -4792,6 +8280,7 @@ mod tests {
                 path: "/v1/vault".to_string(),
                 cookie: Some(cookie.clone()),
                 origin: None,
+                authorization: None,
                 body: Vec::new(),
             };
             block_on(handle(&ctx, &req))
@@ -4813,6 +8302,7 @@ mod tests {
             path: "/v1/session/refresh".to_string(),
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
+            authorization: None,
             body: Vec::new(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -4879,7 +8369,7 @@ mod tests {
                     .insert_challenge(&challenge, Some(user_id), PURPOSE_REGISTER),
             )
             .unwrap();
-            let (token, record) = auth::issue_magic_link(user_id, email, NOW);
+            let (token, record) = auth::issue_magic_link(user_id, email, NOW).expect("issue");
             block_on(h.store.insert_magic(&record)).unwrap();
             let att = fx_none_attestation(cred_id, &fx_es256_cose(77));
             h.call(
@@ -4960,7 +8450,7 @@ mod tests {
                 .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
         )
         .unwrap();
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
         let cred_id = b"budget-cred";
         let att = fx_none_attestation(cred_id, &fx_es256_cose(61));
@@ -5005,7 +8495,7 @@ mod tests {
                 .insert_challenge(&challenge2, Some("u1"), PURPOSE_REGISTER),
         )
         .unwrap();
-        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token2, record2) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record2)).unwrap();
         let client_json2 = fx_client_json("webauthn.create", &challenge_id2);
         let resp = h.call(
@@ -5106,7 +8596,7 @@ mod tests {
         // the login-CSRF pin) so rejections prove the budget, not the pin.
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
-        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW);
+        let (token, record) = auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&record)).unwrap();
         for i in 0..MAGIC_FINISH_ATTEMPTS_PER_IP {
             let resp = h.call(
@@ -5242,6 +8732,93 @@ mod tests {
     }
 
     #[test]
+    fn probe_dials_the_validated_target_port() {
+        // `Dialer::probe` takes no caller-supplied port, so the
+        // only port any dialer can reach is `target.port()` — vetted by
+        // `ProviderConfig::validate` against the NNTP allowlist. A
+        // recording dialer over both allowlisted ports must observe
+        // exactly the validated port (with the provider's own `tls` flag).
+        struct PortDialer {
+            seen: RefCell<Vec<(u16, bool)>>,
+        }
+
+        impl Dialer for PortDialer {
+            async fn probe(&self, target: &ValidatedTarget, tls: bool) -> bool {
+                self.seen.borrow_mut().push((target.port(), tls));
+                true
+            }
+        }
+
+        for (port, tls) in [(119u16, true), (563u16, true)] {
+            let config = ProviderConfig {
+                host: "news.example.com".to_string(),
+                port,
+                tls,
+                username: "synthetic-user".to_string(),
+                password: "synthetic-pass".to_string(),
+                max_connections: 4,
+                allow_insecure_plaintext: false,
+            };
+            let dns = StaticDns {
+                addresses: vec!["93.184.216.34".parse().unwrap()],
+            };
+            let target = config.validate(&dns).expect("allowlisted port validates");
+            assert_eq!(target.port(), port);
+            let dialer = PortDialer {
+                seen: RefCell::new(Vec::new()),
+            };
+            assert!(block_on(dialer.probe(&target, tls)));
+            assert_eq!(
+                dialer.seen.borrow().as_slice(),
+                [(port, tls)],
+                "dialed port must equal the validated target port"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_takes_no_caller_supplied_port() {
+        // Shape pin: the trait, the handler call site, and
+        // the production dialer must never carry a caller-supplied port
+        // again — a reintroduced `port: u16` parameter would let a caller
+        // smuggle a substitute past the validated target. Slice ONLY the
+        // pre-test production source first: this test's own `PortDialer`
+        // above uses the two-argument shape, so searching the whole file
+        // would match the test itself. Comments are stripped next so prose
+        // mentioning a port cannot satisfy the pins.
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let code = strip_line_comments(production);
+        let norm = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            norm.contains("fn probe(&self, target: &ValidatedTarget, tls: bool)"),
+            "Dialer::probe must take only (target, tls) — no caller-supplied port",
+        );
+        assert!(
+            !norm.contains("port: u16"),
+            "handler production code must not carry a caller-supplied port anywhere",
+        );
+        assert!(
+            norm.contains("ctx.dialer.probe(&target, provider.tls).await"),
+            "handler must probe with the validated target only (plus its own tls flag)",
+        );
+        let entry = include_str!("worker_entry.rs");
+        let entry_code = strip_line_comments(entry);
+        let entry_norm = entry_code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            entry_norm.contains("async fn probe(&self, target: &ValidatedTarget, tls: bool)"),
+            "SocketDialer::probe must take only (target, tls)",
+        );
+        assert!(
+            entry_norm.contains("let port = target.port();"),
+            "SocketDialer must dial the validated target's own port",
+        );
+    }
+
+    #[test]
     fn api_web_contract_fixture_routes_are_served() {
         // The canonical web/Worker contract fixture: every route the web
         // client may call must be served (never 404), with or without a
@@ -5288,7 +8865,7 @@ mod tests {
                 "register-finish" | "register-finish-invite" => {
                     serde_json::from_value::<RegisterFinishBody>(wire.clone()).map(|_| ())
                 }
-                "login-finish" => {
+                "login-finish" | "session-reauthenticate-finish" => {
                     serde_json::from_value::<LoginFinishBody>(wire.clone()).map(|_| ())
                 }
                 "magic-finish" => {
@@ -5310,8 +8887,274 @@ mod tests {
             pinned += 1;
         }
         assert_eq!(
-            pinned, 9,
+            pinned, 10,
             "every body-bearing route (incl. the invite variant) is pinned"
         );
+    }
+
+    #[test]
+    fn auth_mail_send_deadline_is_five_seconds_both_directions() {
+        // Deadline-value pin: the README promises at most five seconds, but the
+        // acceptance suite only bounds it by a 30s watchdog, so 100ms (mail
+        // never delivers) and 12s (documented bound drifts) both stayed green.
+        // Pin the literal and the elapsed behavior here, in builder-owned unit
+        // code — the acceptance file is untouched.
+        assert_eq!(
+            AUTH_MAIL_SEND_DEADLINE_SECS, 5,
+            "auth-mail send deadline must stay exactly 5s; a new budget needs \
+             README + caller updates plus this pin"
+        );
+
+        fn drive<F: Future>(mut future: F) -> F::Output {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            // SAFETY: test-only poll loop; the future is stack-owned and never
+            // moved after pinning.
+            let mut future = unsafe { std::pin::Pin::new_unchecked(&mut future) };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                    return output;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "mail deadline helper still pending past its test ceiling"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // Permanently pending send must settle at ~5s, not immediately and not
+        // at the watchdog: catches both 100ms and 12s drift.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(std::future::pending()));
+        assert!(outcome.is_err(), "pending mail must time out, not succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "pending send finished in {elapsed:?}; the 5s deadline must actually wait"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "pending send took {elapsed:?}; the documented at-most-5s bound must hold"
+        );
+
+        // Fast sends must not wait for the deadline.
+        let started = std::time::Instant::now();
+        let outcome = drive(deliver_mail_with_deadline(async { Ok(()) }));
+        assert!(outcome.is_ok(), "fast success must pass through");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast send must not wait for the deadline"
+        );
+    }
+
+    // --- 404 not_found envelope (acceptance; Builder must not edit) -------
+    //
+    // Every served 404 must be the canonical error envelope
+    // `{code: "not_found", message, retryable: false}` — exactly those
+    // three keys, no legacy `error` key — so clients can branch on `code`
+    // instead of matching prose. The three served sites are pinned
+    // separately because each can regress alone: the shared `not_found()`
+    // helper (reached here via credential revoke), the QA-seam guard, and
+    // the router catch-all. The sites must also stay byte-indistinguishable
+    // from one another: a distinct per-site body is an existence oracle.
+
+    fn assert_not_found_envelope(status: u16, body: &str, site: &str) {
+        assert_eq!(status, 404, "{site}: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("{site}: 404 body is not JSON ({e}): {body}"));
+        let obj = parsed
+            .as_object()
+            .unwrap_or_else(|| panic!("{site}: 404 body is not a JSON object: {body}"));
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["code", "message", "retryable"],
+            "{site}: 404 body must be exactly the envelope keys, got: {body}"
+        );
+        assert_eq!(
+            parsed["code"], "not_found",
+            "{site}: envelope code must be not_found, got: {body}"
+        );
+        assert_eq!(
+            parsed["retryable"], false,
+            "{site}: not_found must be non-retryable, got: {body}"
+        );
+        let message = parsed["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{site}: envelope message must be a string: {body}"));
+        assert!(
+            !message.is_empty(),
+            "{site}: envelope message must not be empty: {body}"
+        );
+    }
+
+    #[test]
+    fn not_found_envelope_shape_matches_the_api_error_registry() {
+        // Control: the canonical constructor already produces the exact
+        // shape the served sites must converge on. Green before and after
+        // the build; if this fails, the registry itself drifted and the
+        // acceptance expectation must be revisited, not the sites.
+        let err = crate::api_error::ApiError::not_found("not found");
+        assert_eq!(
+            (err.code, err.status, err.retryable),
+            ("not_found", 404, false)
+        );
+        assert_not_found_envelope(err.status, &err.body_json(), "ApiError::not_found");
+    }
+
+    #[test]
+    fn not_found_envelope_on_the_router_catch_all() {
+        let h = harness();
+        let post = h.call(
+            "POST",
+            "/api/no-such-route-canary",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(post.status, &post.body, "catch-all POST");
+        assert!(
+            !post.body.contains("no-such-route-canary"),
+            "catch-all 404 must not echo the probed path: {}",
+            post.body
+        );
+        let pre = h.call_full(
+            "OPTIONS",
+            "/api/no-such-route-canary",
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(pre.status, &pre.body, "catch-all OPTIONS");
+        assert_eq!(
+            pre.body, post.body,
+            "catch-all bodies must not vary by method"
+        );
+    }
+
+    #[test]
+    fn not_found_envelope_on_the_qa_seam_guard() {
+        // Armed seam, valid bearer, no issuance behind the mailbox: a miss.
+        let h = qa_harness();
+        let miss = h.call_seam(
+            serde_json::json!({"email": "fresh-canary@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(miss.status, &miss.body, "qa seam miss");
+        assert!(
+            !miss.body.contains("fresh-canary"),
+            "qa seam 404 must not echo the probed mailbox: {}",
+            miss.body
+        );
+        // Malformed seam bodies miss the same enveloped way.
+        for body in [serde_json::json!({}), serde_json::json!({"email": 1})] {
+            let resp = h.call_seam(body, Some(QA_TOKEN));
+            assert_not_found_envelope(resp.status, &resp.body, "qa seam malformed body");
+            assert_eq!(resp.body, miss.body);
+        }
+        // Flag armed with no staged bearer: fail closed, same envelope.
+        let mut unarmed = harness();
+        unarmed.config = cfg().with_qa_code_seam(true);
+        let closed = unarmed.call_seam(
+            serde_json::json!({"email": "a@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(closed.status, &closed.body, "qa seam fail-closed");
+        assert_eq!(closed.body, miss.body);
+        // Production posture (seam off): the guard still answers, enveloped.
+        let off = harness().call(
+            "POST",
+            QA_TEST_CODES_PATH,
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(off.status, &off.body, "qa seam disabled");
+        assert_eq!(off.body, miss.body);
+    }
+
+    #[test]
+    fn not_found_envelope_on_credential_revoke_misses() {
+        // The shared not_found() helper, served via DELETE /v1/credentials/:id.
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie_a = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie_a,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let id = mint_id(&serde_json::from_str(&minted.body).unwrap());
+
+        // Another user's id and an unknown id: the same enveloped 404, and
+        // neither body leaks the probed id.
+        let foreign = h.call_full(
+            "DELETE",
+            &format!("/v1/credentials/{id}"),
+            None,
+            Some(cookie_b),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(foreign.status, &foreign.body, "revoke foreign id");
+        assert!(
+            !foreign.body.contains(&id),
+            "revoke 404 must not echo the probed id: {}",
+            foreign.body
+        );
+        let unknown = h.call_full(
+            "DELETE",
+            "/v1/credentials/cred_missing_canary",
+            None,
+            Some(cookie_a),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(unknown.status, &unknown.body, "revoke unknown id");
+        assert!(
+            !unknown.body.contains("cred_missing_canary"),
+            "revoke 404 must not echo the probed id: {}",
+            unknown.body
+        );
+        assert_eq!(
+            foreign.body, unknown.body,
+            "foreign and unknown revoke misses must be indistinguishable"
+        );
+        // The victim row is untouched by the foreign probe.
+        let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
+        assert_eq!(rows[0].record.revoked_at, None);
+    }
+
+    #[test]
+    fn not_found_envelope_is_indistinguishable_across_all_three_sites() {
+        // One body per served site; all three must be byte-identical so no
+        // site can be fingerprinted (and route/mailbox/row existence cannot
+        // be read out of which 404 answered).
+        let h = qa_harness();
+        let catch_all = h.call(
+            "POST",
+            "/api/no-such-route-canary",
+            serde_json::json!({"email": "a@example.test"}),
+        );
+        assert_not_found_envelope(catch_all.status, &catch_all.body, "catch-all");
+        let seam = h.call_seam(
+            serde_json::json!({"email": "fresh@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_not_found_envelope(seam.status, &seam.body, "qa seam");
+        assert_eq!(seam.body, catch_all.body, "qa seam vs catch-all");
+
+        let hp = peppered_harness();
+        seed_user(&hp, "u1", "a@example.com");
+        let cookie = magic_login(&hp, "a@example.com");
+        let revoke = hp.call_full(
+            "DELETE",
+            "/v1/credentials/cred_missing_canary",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_not_found_envelope(revoke.status, &revoke.body, "revoke");
+        assert_eq!(revoke.body, catch_all.body, "revoke vs catch-all");
     }
 }

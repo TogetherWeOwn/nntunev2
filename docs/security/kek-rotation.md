@@ -45,10 +45,11 @@ AAD(payload)  = "v1|vault|<user_id>"              (payload_aad)
 
 ## 2. Schema (PlanetScale Postgres via Hyperdrive)
 
-Merged reality (`migrations/0002_auth_vault.sql`): the table is
-`provider_vaults`, blobs are base64 `TEXT` (Worker-friendly — no binary
-column binding through Hyperdrive), and the rotation columns land in a
-follow-up migration (gate items §8):
+Merged reality (`migrations/0002_auth_vault.sql` +
+`migrations/0015_kek_rotation.sql`): the table is `provider_vaults`,
+blobs are base64 `TEXT` (Worker-friendly — no binary column binding
+through Hyperdrive), and migration 0015 adds the rotation marker and
+version index:
 
 ```sql
 CREATE TABLE IF NOT EXISTS provider_vaults (
@@ -59,11 +60,12 @@ CREATE TABLE IF NOT EXISTS provider_vaults (
   payload_nonce      TEXT NOT NULL,      -- base64 12-byte GCM nonce for the payload
   payload            TEXT NOT NULL,      -- base64 credentials encrypted under DEK
   indexer_configured BOOLEAN NOT NULL DEFAULT FALSE,
-  updated_at         BIGINT NOT NULL
+  updated_at         BIGINT NOT NULL,
+  rewrapped_at       BIGINT NULL       -- migration 0015: NULL = never re-wrapped
 );
--- Follow-up migration (gate item): rewrapped_at + version index.
--- ALTER TABLE provider_vaults ADD COLUMN rewrapped_at BIGINT NULL;
--- CREATE INDEX idx_vault_kek_version ON provider_vaults (kek_version);
+-- Migration 0015 (landed): rewrapped_at + version index.
+-- ALTER TABLE provider_vaults ADD COLUMN IF NOT EXISTS rewrapped_at BIGINT NULL;
+-- CREATE INDEX IF NOT EXISTS idx_vault_kek_version ON provider_vaults (kek_version);
 ```
 
 Rules:
@@ -73,9 +75,11 @@ Rules:
 - Nonces are unique per encryption (CSPRNG). Never reused, never logged.
 - Parameterized queries only. No plaintext credential column, now or as a
   migration backfill — migrations carry ciphertext only.
-- Until the follow-up migration lands, re-wrap passes track progress in
-  `rotation_runs` (§6) and use `updated_at` as the last-touch signal;
-  `rewrapped_at` becomes authoritative once the column exists.
+- Since migration 0015, `rewrapped_at` is the authoritative re-wrap
+  marker: the §6 conditional UPDATE sets it (with `updated_at`) on every
+  re-wrap, and `NULL` means the row has never been re-wrapped. Re-wrap
+  passes still track pass-level progress in `rotation_runs` (§6);
+  `updated_at` alone is no longer used as the re-wrap signal.
 
 ## 3. KEK provisioning and versioning
 
@@ -187,7 +191,8 @@ Invariants (CISO gate checks these on the vault PR):
 
 Runner: Cloudflare Workflow (cron) or Queue consumer in `workers/api`
 (Rust). Paginated, idempotent, resumable — serverless-safe (no
-in-memory cursors).
+in-memory cursors). No live re-wrap runner is implemented yet (§8);
+this section is the normative contract a future runner must follow.
 
 ```sql
 -- claim a batch (cursor = last user_id, never OFFSET on a hot table)
@@ -202,16 +207,48 @@ Per row:
 1. `DEK = decrypt(KEK[row.kek_version], dek_wrapped)` (version-pinned §4).
 2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, dek_aad(user, current), DEK)`
    via `vault::rewrap_dek` (never rebuild AAD by hand).
-3. Conditional write (optimistic concurrency — safe under retries):
+3. Conditional write — a compare-and-swap on the captured envelope,
+   not on user/version alone. A vault PUT replaces the whole envelope
+   (fresh DEK and payload) at the same KEK version, so a version-only
+   guard would still match the replacement row and a re-wrap computed
+   from the captured envelope would install its old DEK over the newer
+   payload, leaving that payload undecryptable. The claim SELECT above
+   already captures `dek_wrapped` and `dek_wrapped_nonce`; bind those
+   captured values (`$captured_wrapped`, `$captured_wrapped_nonce`)
+   alongside the user and the captured version (`$old`):
    ```sql
    UPDATE provider_vaults
       SET kek_version = $new, dek_wrapped = $w,
-          dek_wrapped_nonce = $n, updated_at = $now
-          -- plus rewrapped_at = $now once the follow-up migration (§2) lands
-    WHERE user_id = $u AND kek_version = $old;
+          dek_wrapped_nonce = $n, updated_at = $now,
+          rewrapped_at = $now
+    WHERE user_id = $u AND kek_version = $old
+      AND dek_wrapped = $captured_wrapped
+      AND dek_wrapped_nonce = $captured_wrapped_nonce;
    ```
-4. On failure: count, continue (per-row errors never abort the pass;
+   Exactly one affected row is success: it rewrites only the wrap
+   fields, so `payload` and `payload_nonce` are preserved untouched.
+   **Zero affected rows is a lost claim, never successful progress**
+   and never a reason to retry the same write unconditionally: the
+   stored envelope is no longer the captured one (a same-version PUT
+   or another re-wrap got there first), the stale re-wrap is
+   discarded, and the row is reloaded and — if it still needs
+   re-wrapping — retried against the current envelope within the
+   bounded pass (§6 job properties). A lost claim is not counted in
+   `rows_done`; overwriting the newer envelope with the stale result
+   is forbidden.
+4. On failure (a per-row error, as distinct from a lost claim above):
+   count, continue (per-row errors never abort the pass;
    poison rows surface in the dead-letter metric, never with key bytes).
+
+Inspect migration and re-wrap progress by KEK version with this count-only
+query; it reports no user identifiers or ciphertext:
+
+```sql
+SELECT kek_version, COUNT(*) AS row_count
+  FROM provider_vaults
+ GROUP BY kek_version
+ ORDER BY kek_version;
+```
 
 Job properties:
 
@@ -226,6 +263,34 @@ Job properties:
 - Dry-run mode (`limit N, no writes`) for staging rehearsal.
 
 ## 7. Runbook (operator copy-paste)
+
+> **NOT EXECUTABLE — design only. Do not run the steps below in an
+> incident.** The re-wrap job (§6 runner: no Cloudflare Workflow/Queue
+> consumer is implemented, §8) and the versioned KEK map (a
+> `kek_by_version` selector over `VAULT_KEK_V<N>` per-version secrets +
+> `VAULT_KEK_CURRENT` write-version var, plus the `rotation_runs`
+> progress table — none of which exist in Worker code or migrations)
+> have not landed: the Worker reads only `VAULT_KEK_BASE64` +
+> `VAULT_KEK_VERSION` (`workers/api/src/worker_entry.rs`). Until those
+> land, routine KEK rotation cannot be executed. On suspected or
+> confirmed KEK exposure, report it through GitHub's private
+> vulnerability reporting (see `SECURITY.md`); §10 is design-only and
+> has no runner. Today's executable containment is: replace
+> `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single KEK so
+> rows pinned to the exposed version fail closed, treat all vaulted
+> credentials as exposed, and force credential re-entry — never the
+> steps below (the §10 per-row re-key needs the versioned KEK map +
+> runner that have not landed).
+
+### Rotation executability today (Worker code as merged)
+
+| Rotation | Executable today? | Worker env vars (grep proof) |
+|---|---|---|
+| Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
+| Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
+| KEK (routine re-wrap, §§5–6 below) | ❌ No — re-wrap job and versioned KEK map not implemented | `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION` read in `worker_entry.rs`; `VAULT_KEK_V<N>`, `VAULT_KEK_CURRENT`, and `rotation_runs` appear nowhere in code or migrations (**not implemented**) |
+| KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | same as above |
+| Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
 
 Preconditions: staging bake ≥24h on the new version; backup verified
 (ciphertext restores); two operators aware (one executes, one can flip
@@ -284,7 +349,10 @@ core) already shows:
 Follow-up gate items (the vault/HTTP slice PR may not merge until the
 CISO gate verifies each at its exact head):
 
-- [ ] Follow-up migration: `rewrapped_at` + `kek_version` index (§2).
+- [x] Follow-up migration: `rewrapped_at` + `kek_version` index (§2)
+      — `migrations/0015_kek_rotation.sql`; the §6 re-wrap UPDATE sets
+      `rewrapped_at`, and per-version progress counts are documented
+      in §6.
 - [ ] `kek_by_version` selector over provisioned versions so mixed-version
       rows decrypt during phases 1–2; first rotation cuts over to
       `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` (§3).
@@ -306,7 +374,15 @@ CISO gate verifies each at its exact head):
   the job has production history).
 - Cross-environment replication (explicitly forbidden — see §3).
 
-## 10. Compromise rotation (incident response)
+## 10. Compromise rotation (incident response) — DESIGN ONLY, no runner
+
+> **DESIGN ONLY — no runner.** Steps 1–2 below need the versioned KEK
+> map (`VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`) and the re-wrap runner,
+> neither of which exists in Worker code or migrations. On suspected or
+> confirmed exposure, report through GitHub's private vulnerability
+> reporting (see `SECURITY.md`) and apply today's executable
+> containment from §7 (fresh single KEK so exposed-version rows fail
+> closed, treat vaulted credentials as exposed, force re-entry).
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps
@@ -316,14 +392,19 @@ Instead:
 
 1. Provision KEK[M] (fresh version, one environment at a time) and flip
    `VAULT_KEK_CURRENT=M` so no new row touches the exposed version.
-2. Per row, in ONE conditional UPDATE keyed on (`user_id`,
-   `kek_version`, `updated_at`): decrypt the payload with the OLD DEK,
+2. Per row, in ONE conditional UPDATE guarded by the same
+   captured-envelope compare-and-swap as §6 (`user_id`, captured
+   `kek_version`, captured `dek_wrapped` and `dek_wrapped_nonce` —
+   never a timestamp-only guard): decrypt the payload with the OLD DEK,
    generate a NEW random DEK, re-encrypt the payload under the new DEK,
    wrap the new DEK under KEK[M] with `dek_aad(user, M)` (via
    `vault::encrypt_vault`, never hand-built AAD), bump
-   `kek_version` to M. Retry-safe via the same claim-and-conditional-write
-   pattern as §6 (a concurrent vault update changes `updated_at` and
-   loses the race on purpose — it is re-driven, never overwritten).
+   `kek_version` to M. Zero affected rows is a lost claim as in §6:
+   a concurrent vault update replaced the captured envelope (possibly
+   at the same KEK version and within the same `updated_at` tick), so
+   the stale re-key is discarded, the row is reloaded and re-driven
+   against the current envelope, and the newer envelope is never
+   overwritten.
 3. Treat provider and indexer credentials in ANY pre-rotation snapshot,
    backup, replica, or branch as EXPOSED: affected users re-enter (or
    rotate at the provider/indexer) their credentials; the old rows are

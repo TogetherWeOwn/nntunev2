@@ -1,0 +1,10 @@
+{
+    "_note": "Authoritative provisioning source for the host pool at /paperclip/.cache/nntunev2-bounded. The host Operator copies this file to <pool>/policy.json, fills in the two *_receipt fields with the quota/coverage evidence, and creates slot-0..slot-N each holding target/, scratch/ and lock. The receipts below are placeholders, never quota evidence.",
+    "version": 1,
+    "slots": 2,
+    "slot_budget_bytes": 6442450944,
+    "min_available_bytes": 10737418240,
+    "hard_limit_bytes": 17179869184,
+    "quota_receipt": "OPERATOR FILLS AT PROVISIONING: filesystem-quota evidence for the 16 GiB aggregate bound",
+    "scratch_coverage_receipt": "OPERATOR FILLS AT PROVISIONING: evidence that slot scratch inherits the same pool quota"
+}

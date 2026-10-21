@@ -23,6 +23,10 @@ export interface Plan {
 	maxLibraryTracks: number;
 	ingestJobsDay: number;
 	cachePriority: CachePriority;
+	/** Display-only cache budget in bytes (integer, GiB-denominated). Not enforcement. */
+	cacheBytesBudget: number;
+	/** Display-only cache retention in days. Not enforcement. */
+	cacheRetentionDays: number;
 	blurb: string;
 }
 
@@ -36,6 +40,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 1000,
 		ingestJobsDay: 5,
 		cachePriority: 'low',
+		cacheBytesBudget: 2_147_483_648,
+		cacheRetentionDays: 7,
 		blurb: '14-day trial. Bring your own Usenet provider.'
 	},
 	{
@@ -47,6 +53,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 25000,
 		ingestJobsDay: 25,
 		cachePriority: 'standard',
+		cacheBytesBudget: 21_474_836_480,
+		cacheRetentionDays: 30,
 		blurb: 'Base paid tier for everyday listening.'
 	},
 	{
@@ -58,6 +66,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 100000,
 		ingestJobsDay: 100,
 		cachePriority: 'high',
+		cacheBytesBudget: 107_374_182_400,
+		cacheRetentionDays: 90,
 		blurb: '5x usage for heavy listeners and big libraries.'
 	},
 	{
@@ -69,6 +79,8 @@ export const PLANS: Plan[] = [
 		maxLibraryTracks: 500000,
 		ingestJobsDay: 400,
 		cachePriority: 'highest',
+		cacheBytesBudget: 429_496_729_600,
+		cacheRetentionDays: 90,
 		blurb: '20x usage for households and collectors.'
 	}
 ];
@@ -95,9 +107,31 @@ export function formatPricePerMonth(plan: Plan): string {
 	return `$${plan.priceCents / 100}/mo`;
 }
 
+/**
+ * Exposed accessible name for a paid plan's pricing-table button. The name
+ * always carries the plan, so assistive tech can tell the tiers apart even
+ * though the visible label stays a shared "Choose" / "Starting…".
+ */
+export function planButtonName(plan: Plan, pendingPlanId: string | null): string {
+	return pendingPlanId === plan.id ? `Starting ${plan.name}…` : `Choose ${plan.name}`;
+}
+
 /** Stream cap in seconds (plans table stores hours). */
 export function streamCapSeconds(plan: Plan): number {
 	return plan.streamHoursMonth * 3600;
+}
+
+/** Bytes in one GiB; cache budgets are GiB-denominated display metadata. */
+export const GIB_BYTES = 1_073_741_824;
+
+/** Readable cache budget for the pricing table (e.g. "20 GiB"). Display-only. */
+export function formatCacheBudget(plan: Plan): string {
+	return `${plan.cacheBytesBudget / GIB_BYTES} GiB`;
+}
+
+/** Readable cache retention for the pricing table (e.g. "30 days"). Display-only. */
+export function formatCacheRetention(plan: Plan): string {
+	return `${plan.cacheRetentionDays} days`;
 }
 
 /**
@@ -107,6 +141,8 @@ export function streamCapSeconds(plan: Plan): number {
 export interface SubscriptionRef {
 	planId: string;
 	status: string;
+	/** Trial deadline (ADR 0004); null/omitted cannot confirm a trial. */
+	trialEndsAt?: string | null;
 	/** End of the past-due grace window (ADR 0002 rule 4); null/omitted when none. */
 	graceUntil?: string | null;
 }
@@ -121,7 +157,12 @@ export interface EffectivePlan {
 	planUnknown: boolean;
 }
 
-const ENTITLED_STATUSES = new Set(['active', 'trialing']);
+/** A trial is confirmed for display only before a known deadline (ADR 0004). */
+function inTrialWindow(subscription: SubscriptionRef, now: Date): boolean {
+	if (subscription.status !== 'trialing') return false;
+	if (!subscription.trialEndsAt) return false;
+	return new Date(subscription.trialEndsAt).getTime() > now.getTime();
+}
 
 /**
  * True while a past-due subscription is still inside its grace window
@@ -136,10 +177,10 @@ function inGraceWindow(subscription: SubscriptionRef, now: Date): boolean {
 }
 
 /**
- * Effective plan per ADR 0004: the subscription's plan while it grants
- * entitlement (`active`/`trialing`, plus `past_due` inside its grace
- * window per ADR 0002 rule 4) and names a known tier; the free trial
- * row otherwise. Never invents a paid tier for an unknown state.
+ * Display plan per ADR 0004: a known paid tier while active, a known
+ * trial tier strictly before its deadline, or `past_due` inside its grace
+ * window per ADR 0002 rule 4; the unconfirmed free-trial row otherwise.
+ * This does not enforce access: the server remains authoritative.
  */
 export function resolveEffectivePlan(
 	subscription: SubscriptionRef | null,
@@ -149,7 +190,9 @@ export function resolveEffectivePlan(
 	if (
 		subscription &&
 		plan &&
-		(ENTITLED_STATUSES.has(subscription.status) || inGraceWindow(subscription, now))
+		((subscription.status === 'active' && plan.id !== 'free') ||
+			inTrialWindow(subscription, now) ||
+			inGraceWindow(subscription, now))
 	) {
 		return { plan, planUnknown: false };
 	}

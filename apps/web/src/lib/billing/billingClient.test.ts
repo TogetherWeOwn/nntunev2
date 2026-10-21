@@ -32,6 +32,30 @@ describe('billingClient redirects', () => {
 		);
 	});
 
+	it('rejects scheme-without-authority URLs that parse to an allowlisted host', async () => {
+		// `new URL('https:checkout.stripe.com/...')` reports the allowlisted host,
+		// but assigning that string to location.href resolves against the app
+		// origin — so it must reject before any redirect assignment happens.
+		const fetchFn = vi.fn(async () => ok({ url: 'https:checkout.stripe.com/c/pay_1' }));
+		const location = { href: 'https://app.example/pricing' };
+		const attempt = (async () => {
+			location.href = await startCheckout('plus', fetchFn as typeof fetch);
+		})();
+		const failure: unknown = await attempt.then(
+			() => location.href,
+			(e: unknown) => e
+		);
+		expect(failure).toBeInstanceOf(BillingApiError);
+		expect((failure as BillingApiError).retryable).toBe(false);
+		expect((failure as BillingApiError).message).toContain('Invalid checkout URL');
+		expect(location.href).toBe('https://app.example/pricing');
+	});
+
+	it('rejects scheme-without-authority portal URLs', async () => {
+		const fetchFn = vi.fn(async () => ok({ url: 'https:billing.stripe.com/p/session_1' }));
+		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('Invalid portal URL');
+	});
+
 	it('returns the portal url', async () => {
 		const fetchFn = vi.fn(async () => ok({ url: 'https://billing.stripe.com/p/session_1' }));
 		await expect(openPortal(fetchFn as typeof fetch)).resolves.toBe(

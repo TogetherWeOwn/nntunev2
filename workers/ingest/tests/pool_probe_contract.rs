@@ -11,6 +11,7 @@ fn request() -> ProbeRequest {
             "segment-a@synthetic.invalid".to_owned(),
             "segment-b@synthetic.invalid".to_owned(),
         ],
+        segment_bytes: vec![None, None],
     }
 }
 
@@ -57,6 +58,46 @@ fn provider_error_reply_retries_without_a_healthy_outcome() {
         Err(PoolProbeError::Retry {
             after_secs: DEFAULT_RETRY_SECS,
         })
+    );
+}
+
+#[test]
+fn unauthorized_and_forbidden_replies_are_rejected_not_retried() {
+    let req = request();
+
+    // A 401/403 is the pool refusing this caller, not a transient
+    // provider state: redelivering the same message would only repeat
+    // the refusal, so the outcome is `Rejected` whatever body or
+    // retry hint accompanies the status.
+    for (status, retry_after, body) in [
+        (401, None, r#"{"error":"unauthorized"}"#),
+        (403, None, r#"{"error":"forbidden"}"#),
+        (401, None, ""),
+        (403, None, "forbidden"),
+        (401, Some("17"), r#"{"error":"unauthorized"}"#),
+        (403, Some("17"), r#"{"error":"forbidden"}"#),
+    ] {
+        assert_eq!(
+            classify_reply(&req, status, retry_after, body),
+            Err(PoolProbeError::Rejected),
+            "status {status} with body {body:?} must be rejected, not retried"
+        );
+    }
+}
+
+#[test]
+fn provider_unavailable_reply_with_hint_still_retries_with_the_hint() {
+    let req = request();
+
+    // Control: the 401/403 rejection must not swallow transient
+    // unavailability — a 503 still retries, honouring its hint.
+    assert_eq!(
+        classify_reply(&req, 503, Some("17"), r#"{"error":"provider_unavailable"}"#),
+        Err(PoolProbeError::Retry { after_secs: 17 })
+    );
+    assert_eq!(
+        classify_reply(&req, 503, Some("23"), r#"{"error":"busy"}"#),
+        Err(PoolProbeError::Retry { after_secs: 23 })
     );
 }
 

@@ -10,10 +10,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_archive_bindings import ManifestError, archive_bindings, main
+from check_archive_bindings import ManifestError, _bucket_names, archive_bindings, main
 
 CLEAN_MANIFEST = """\
 name = "nntune-stream"
@@ -383,6 +384,37 @@ def test_invalid_env_table_fails_closed():
     _assert_rejected(repo, "invalid env table")
 
 
+def test_string_r2_buckets_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = "oops"\n'})
+    _assert_rejected(repo, "invalid r2_buckets table")
+
+
+def test_non_dict_toml_document_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.tomllib.loads",
+        return_value=["not", "a", "dict"],
+    ):
+        _assert_rejected(repo, "invalid TOML document")
+
+
+def test_integer_env_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": "env = 42\n"})
+    _assert_rejected(repo, "invalid env table")
+
+
+def test_string_env_entry_fails_closed():
+    repo = _repo_with(
+        {"workers/stream/wrangler.toml": 'env = { production = "oops" }\n'}
+    )
+    _assert_rejected(repo, "invalid env entry")
+
+
+def test_string_r2_buckets_entry_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = ["oops"]\n'})
+    _assert_rejected(repo, "invalid r2_buckets entry")
+
+
 def test_non_utf8_unrelated_path_does_not_break_scan():
     repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
     bad_path = os.fsencode(repo) + b"/workers/\xff-not-a-config.txt"
@@ -390,6 +422,108 @@ def test_non_utf8_unrelated_path_does_not_break_scan():
         unrelated.write(b"ordinary tracked file")
     subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
     assert archive_bindings(repo) == []
+
+
+def test_non_git_directory_fails_listing_closed():
+    tmp = Path(tempfile.mkdtemp())
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    stream = tmp / "workers" / "stream"
+    stream.mkdir(parents=True)
+    (stream / "wrangler.toml").write_text(CLEAN_MANIFEST)
+    _assert_rejected(tmp, "cannot list tracked repository files")
+
+
+def test_failing_git_binary_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=OSError("git binary missing"),
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_git_nonzero_exit_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    failure = subprocess.CalledProcessError(128, ["git", "ls-files", "-z"])
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=failure,
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_malformed_tracked_paths_fail_decode_closed():
+    # os.fsdecode uses surrogateescape on Linux so real undecodable bytes
+    # never raise there (see test_non_utf8_unrelated_path_does_not_break_scan);
+    # pin the defensive decode-failure diagnostic by failing the decode step
+    # for the malformed entry only, with a real `git ls-files -z` byte stream.
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    bad_stdout = b"workers/stream/wrangler.toml\x00workers/\xff-bad.txt\x00"
+    real_fsdecode = os.fsdecode
+
+    def _fail_bad_entry(entry):
+        if b"\xff" in bytes(entry):
+            raise UnicodeDecodeError("utf-8", bytes(entry), 8, 9, "invalid start byte")
+        return real_fsdecode(entry)
+
+    with (
+        mock.patch(
+            "check_archive_bindings.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["git", "ls-files", "-z"], 0, stdout=bad_stdout, stderr=""
+            ),
+        ),
+        mock.patch(
+            "check_archive_bindings.os.fsdecode",
+            side_effect=_fail_bad_entry,
+        ),
+    ):
+        try:
+            archive_bindings(repo)
+        except ManifestError as exc:
+            assert "cannot decode tracked repository paths" in str(exc), (
+                f"unexpected error: {exc!r}"
+            )
+            assert exc.__cause__ is not None, "decode failure must chain its cause"
+            assert isinstance(exc.__cause__, UnicodeDecodeError), (
+                f"unexpected cause: {exc.__cause__!r}"
+            )
+        else:
+            raise AssertionError("expected malformed tracked paths to fail")
+
+
+def test_manifest_directory_fails_read_closed():
+    # A directory can never survive the is_file() candidate filter in
+    # archive_bindings, so pin the read failure at the _bucket_names level.
+    tmp = Path(tempfile.mkdtemp())
+    manifest_dir = tmp / "wrangler.toml"
+    manifest_dir.mkdir()
+    try:
+        _bucket_names(manifest_dir)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert str(manifest_dir) in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected directory manifest to fail")
+
+
+def test_invalid_utf8_manifest_fails_read_closed():
+    tmp = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    manifest = tmp / "workers" / "stream" / "wrangler.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_bytes(b"\xff\xfe\x00not-utf8 \x80\x81")
+    subprocess.run(["git", "-C", str(tmp), "add", "--all"], check=True)
+    try:
+        archive_bindings(tmp)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert "wrangler.toml" in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected invalid-UTF8 manifest to fail")
 
 
 def test_current_repo_manifests_pass():
@@ -433,6 +567,17 @@ if __name__ == "__main__":
     test_wrangler_named_document_is_not_treated_as_a_manifest()
     test_array_environment_table_fails_closed()
     test_invalid_env_table_fails_closed()
+    test_string_r2_buckets_table_fails_closed()
+    test_non_dict_toml_document_fails_closed()
+    test_integer_env_table_fails_closed()
+    test_string_env_entry_fails_closed()
+    test_string_r2_buckets_entry_fails_closed()
     test_non_utf8_unrelated_path_does_not_break_scan()
+    test_non_git_directory_fails_listing_closed()
+    test_failing_git_binary_fails_listing_closed()
+    test_git_nonzero_exit_fails_listing_closed()
+    test_malformed_tracked_paths_fail_decode_closed()
+    test_manifest_directory_fails_read_closed()
+    test_invalid_utf8_manifest_fails_read_closed()
     test_current_repo_manifests_pass()
     print("check_archive_bindings: all tests passed")

@@ -10,13 +10,15 @@
 //!   non-auth command is an out-of-sequence protocol error, not stale
 //!   credentials, and stays a generic [`Error::NntpReply`].
 //! - `502` — no permission → [`Error::NoPermission`] (never a re-auth
-//!   signal). Reply text from the `AUTHINFO` exchange is redacted at
+//!   signal). Reply text from the `AUTHINFO` exchange — including a
+//!   malformed reply line that never parses to a code — is redacted at
 //!   construction: it is attacker-influenced and may reflect credentials.
 //!
 //! NNTP is lock-step ordered, so pipelining is simply writing several
 //! commands before reading their replies in order ([`NntpClient::fetch_many`]
 //! batches `ARTICLE` this way, chunked by `max_pipelined`).
 
+use std::fmt;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -24,7 +26,11 @@ use crate::transport::{BufferedTransport, Transport};
 
 /// Connection settings. `timeout` is enforced per transport operation by the
 /// [`Transport`] implementation (see its contract).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is manual, not derived: `username`/`password` are credential
+/// material and must never reach logs or error bodies, so `{:?}` (ordinary
+/// and pretty) renders only their presence, as `Some("<redacted>")`.
+#[derive(Clone)]
 pub struct NntpConfig {
     /// Server hostname (TLS SNI + certificate name when `tls` is set).
     pub host: String,
@@ -32,6 +38,15 @@ pub struct NntpConfig {
     pub port: u16,
     /// Use implicit TLS from the first byte (NNTPS).
     pub tls: bool,
+    /// Explicit opt-in to dial without TLS, mirroring the vault's
+    /// `allow_insecure_plaintext` acknowledgment (the user accepted the
+    /// cleartext warning at save time). Default `false`.
+    ///
+    /// The pinned transport gate still enforces the NNTP port allowlist for
+    /// acknowledged-plaintext configs; only the TLS requirement is lifted.
+    /// Paths that never carry a vault acknowledgment (NZB fetch) leave this
+    /// `false` and stay TLS-only.
+    pub allow_insecure_plaintext: bool,
     /// AUTHINFO username. `None` means unauthenticated access.
     pub username: Option<String>,
     /// AUTHINFO password. Required when `username` is set.
@@ -45,12 +60,31 @@ pub struct NntpConfig {
     pub max_article_bytes: usize,
 }
 
+impl fmt::Debug for NntpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted: only presence is shown, never the credential value
+        // (populated, empty-string, or absent alike).
+        f.debug_struct("NntpConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("allow_insecure_plaintext", &self.allow_insecure_plaintext)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .field("max_pipelined", &self.max_pipelined)
+            .field("max_article_bytes", &self.max_article_bytes)
+            .finish()
+    }
+}
+
 impl Default for NntpConfig {
     fn default() -> Self {
         NntpConfig {
             host: String::new(),
             port: 563,
             tls: true,
+            allow_insecure_plaintext: false,
             username: None,
             password: None,
             timeout: Duration::from_secs(20),
@@ -76,12 +110,44 @@ fn parse_reply(line: &[u8]) -> Result<Reply> {
             String::from_utf8_lossy(line)
         )));
     }
+    // The three digits must be followed by end-of-line or a space before
+    // the reply text. A fourth digit or attached suffix (`2000`, `281x`)
+    // is a different, malformed frame — never truncate it to a 3-digit
+    // code. The diagnostic is generic: the reply line is untrusted and
+    // must not be echoed.
+    match line.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => {
+            return Err(Error::Malformed(
+                "NNTP reply code is not followed by a space or end of line".into(),
+            ))
+        }
+    }
     let code = std::str::from_utf8(&line[..3])
         .map_err(|_| Error::Malformed("NNTP reply code is not UTF-8".into()))?
         .parse()
         .map_err(|_| Error::Malformed("NNTP reply code out of range".into()))?;
     let text = String::from_utf8_lossy(line.get(4..).unwrap_or(b"")).into_owned();
     Ok(Reply { code, text })
+}
+
+/// Validates a caller-supplied NNTP command argument (message-id or group
+/// name) before it reaches the wire. Message-ids are framed as `<id>` and
+/// group names are a bare token, so `<`, `>`, whitespace or control
+/// characters would break out of the framing (`STAT <a> ARTICLE <b>`, an
+/// injected second command line via CRLF). Rejects with [`Error::Malformed`]
+/// before any byte is written. The diagnostic is generic: the argument may
+/// carry control characters that must not reach logs verbatim.
+fn validate_argument(arg: &str) -> Result<()> {
+    if arg
+        .chars()
+        .any(|c| c == '<' || c == '>' || c.is_whitespace() || c.is_control())
+    {
+        return Err(Error::Malformed(
+            "NNTP command argument contains a delimiter-escaping character".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Summary returned by `GROUP`.
@@ -116,9 +182,10 @@ pub struct NntpClient<T: Transport> {
 
 impl<T: Transport> NntpClient<T> {
     /// Runs the opening handshake on an already-connected transport:
-    /// greeting (`200`/`201`), `MODE READER` (best-effort: failure is
-    /// tolerated because some servers reject it post-auth), and `AUTHINFO`
-    /// when the config carries credentials.
+    /// greeting (`200`/`201`), `MODE READER` (any well-formed reply code
+    /// is tolerated because some servers reject it pre-auth, but a broken
+    /// exchange fails setup), and `AUTHINFO` when the config carries
+    /// credentials.
     pub async fn connect(transport: T, config: &NntpConfig) -> Result<Self> {
         if config.max_pipelined == 0 {
             return Err(Error::Malformed(
@@ -147,9 +214,13 @@ impl<T: Transport> NntpClient<T> {
                 })
             }
         }
-        // Best-effort: servers that require auth first answer 482 here, and
-        // the AUTHINFO exchange below resolves it.
-        let _ = client.command("MODE READER").await;
+        // Best-effort on the reply code only: servers that require auth
+        // first answer 482 here, and the AUTHINFO exchange below resolves
+        // it, so any well-formed reply is tolerated. A broken exchange
+        // (write/read error, EOF, malformed reply) leaves the session
+        // state unknown and fails setup instead of handing back an
+        // unusable client.
+        let _ = client.command("MODE READER").await?;
         if let Some(username) = &config.username {
             let password = config
                 .password
@@ -176,6 +247,7 @@ impl<T: Transport> NntpClient<T> {
     /// `STAT <message-id>`: returns the article number. `430` becomes
     /// [`Error::ArticleNotFound`].
     pub async fn stat(&mut self, message_id: &str) -> Result<u64> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("STAT <{message_id}>")).await?;
         match reply.code {
             223 => reply
@@ -193,6 +265,7 @@ impl<T: Transport> NntpClient<T> {
     /// `ARTICLE <message-id>`: appends the raw article (headers + body) to
     /// `out`. `430` becomes [`Error::ArticleNotFound`].
     pub async fn article_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("ARTICLE <{message_id}>")).await?;
         match reply.code {
             220 => self.transport.read_dot_block(out).await.map_err(Error::Io),
@@ -202,6 +275,7 @@ impl<T: Transport> NntpClient<T> {
 
     /// `BODY <message-id>`: appends just the body to `out`.
     pub async fn body_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
+        validate_argument(message_id)?;
         let reply = self.command(&format!("BODY <{message_id}>")).await?;
         match reply.code {
             222 => self.transport.read_dot_block(out).await.map_err(Error::Io),
@@ -211,6 +285,7 @@ impl<T: Transport> NntpClient<T> {
 
     /// `GROUP <name>`: selects a group and returns its counters.
     pub async fn group(&mut self, name: &str) -> Result<GroupInfo> {
+        validate_argument(name)?;
         let reply = self.command(&format!("GROUP {name}")).await?;
         match reply.code {
             211 => {
@@ -242,11 +317,20 @@ impl<T: Transport> NntpClient<T> {
 
     /// Pipelined `ARTICLE` fetch: writes up to `max_pipelined` commands
     /// back-to-back (NNTP replies arrive in command order), then reads each
-    /// reply + dot-block in turn. On any error, the batch is discarded and
-    /// the client becomes unusable: later pipelined replies may still be on
-    /// the wire. Reconnect before retrying; never reuse `into_inner()` after
-    /// a failed batch. A per-article `430` returns [`Error::ArticleNotFound`].
+    /// reply + dot-block in turn. On any error after the first byte is
+    /// written, the batch is discarded and the client becomes unusable:
+    /// later pipelined replies may still be on the wire. Reconnect before
+    /// retrying; never reuse `into_inner()` after a failed batch. A
+    /// pre-write argument refusal ([`Error::Malformed`]) writes nothing
+    /// and leaves the connection usable. A per-article `430` returns
+    /// [`Error::ArticleNotFound`].
     pub async fn fetch_many(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
+        // Pre-write refusal must not poison the connection: nothing is on
+        // the wire yet, so return before entering the invalidating path.
+        // (`fetch_many_inner` re-validates as defence in depth.)
+        for id in message_ids {
+            validate_argument(id)?;
+        }
         let result = self.fetch_many_inner(message_ids).await;
         if result.is_err() {
             self.transport.invalidate();
@@ -255,6 +339,12 @@ impl<T: Transport> NntpClient<T> {
     }
 
     async fn fetch_many_inner(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
+        // Validate the whole batch before writing: commands are written
+        // ahead of their replies, so a late escaping id must not leave a
+        // valid prefix on the wire with unread replies outstanding.
+        for id in message_ids {
+            validate_argument(id)?;
+        }
         let mut out = Vec::with_capacity(message_ids.len());
         for chunk in message_ids.chunks(self.max_pipelined()) {
             for id in chunk {
@@ -292,11 +382,19 @@ impl<T: Transport> NntpClient<T> {
     async fn auth(&mut self, username: &str, password: &str) -> Result<()> {
         // Every reply inside the AUTHINFO exchange is mapped through
         // `auth_reply_error`, which drops the server text before it can
-        // reach logs or error bodies (see module docs).
-        let user_reply = self.command(&format!("AUTHINFO USER {username}")).await?;
+        // reach logs or error bodies (see module docs). A reply that is
+        // not a parseable 3-digit code never reaches that mapping —
+        // `parse_reply` fails first and its `Malformed` payload echoes
+        // the raw line — so both commands go through `auth_command`,
+        // which replaces that payload with a fixed redacted message.
+        let user_reply = self
+            .auth_command(&format!("AUTHINFO USER {username}"))
+            .await?;
         match user_reply.code {
             381 => {
-                let pass_reply = self.command(&format!("AUTHINFO PASS {password}")).await?;
+                let pass_reply = self
+                    .auth_command(&format!("AUTHINFO PASS {password}"))
+                    .await?;
                 match pass_reply.code {
                     281 => Ok(()),
                     code => Err(auth_reply_error(code, pass_reply.text)),
@@ -305,6 +403,21 @@ impl<T: Transport> NntpClient<T> {
             281 => Ok(()),
             code => Err(auth_reply_error(code, user_reply.text)),
         }
+    }
+
+    /// [`NntpClient::command`] for the `AUTHINFO` exchange: a malformed
+    /// reply line stays [`Error::Malformed`], exactly as for other
+    /// commands, but its payload — the reflected server line, which may
+    /// carry the credentials just sent — is replaced with a fixed
+    /// redacted message. Transport I/O (including timeouts) is
+    /// untouched: it carries no reply text.
+    async fn auth_command(&mut self, cmd: &str) -> Result<Reply> {
+        self.command(cmd).await.map_err(|err| match err {
+            Error::Malformed(_) => {
+                Error::Malformed("NNTP reply to AUTHINFO is not a 3-digit code: <redacted>".into())
+            }
+            other => other,
+        })
     }
 
     async fn command(&mut self, cmd: &str) -> Result<Reply> {

@@ -23,7 +23,17 @@ pub struct CodeSpec {
 /// Codes this worker may emit. Must match `docs/api-errors.md`.
 pub const REGISTRY: &[CodeSpec] = &[
     CodeSpec {
+        code: "invalid_request",
+        status: 400,
+        retryable: false,
+    },
+    CodeSpec {
         code: "unauthorized",
+        status: 401,
+        retryable: false,
+    },
+    CodeSpec {
+        code: "reauth_required",
         status: 401,
         retryable: false,
     },
@@ -45,6 +55,11 @@ pub const REGISTRY: &[CodeSpec] = &[
     CodeSpec {
         code: "not_found",
         status: 404,
+        retryable: false,
+    },
+    CodeSpec {
+        code: "account_deleting",
+        status: 409,
         retryable: false,
     },
     CodeSpec {
@@ -124,6 +139,9 @@ impl ApiError {
         }
     }
 
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::by_code("invalid_request", message)
+    }
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::by_code("unauthorized", message)
     }
@@ -138,6 +156,9 @@ impl ApiError {
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::by_code("not_found", message)
+    }
+    pub fn account_deleting(message: impl Into<String>) -> Self {
+        Self::by_code("account_deleting", message)
     }
     pub fn validation_failed(message: impl Into<String>) -> Self {
         Self::by_code("validation_failed", message)
@@ -166,7 +187,9 @@ impl From<LibraryError> for ApiError {
             LibraryError::Unauthorized => Self::unauthorized(e.to_string()),
             LibraryError::Forbidden => Self::forbidden(e.to_string()),
             LibraryError::NotFound => Self::not_found(e.to_string()),
+            LibraryError::AccountDeleting => Self::account_deleting(e.to_string()),
             LibraryError::Invalid => Self::validation_failed(e.to_string()),
+            LibraryError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -179,6 +202,7 @@ impl From<AuthError> for ApiError {
         match e {
             AuthError::Invalid => Self::unauthorized(e.to_string()),
             AuthError::Misconfigured => Self::internal_error(e.to_string()),
+            AuthError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -187,9 +211,11 @@ impl From<SessionError> for ApiError {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Invalid => Self::unauthorized(e.to_string()),
+            SessionError::ReauthRequired => Self::by_code(e.code(), e.to_string()),
             SessionError::Misconfigured | SessionError::Storage { .. } => {
                 Self::internal_error(e.to_string())
             }
+            SessionError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -201,6 +227,7 @@ impl From<VaultError> for ApiError {
             VaultError::CorruptStoredData | VaultError::Crypto => {
                 Self::internal_error(e.to_string())
             }
+            VaultError::RandomnessUnavailable => Self::service_unavailable(e.to_string()),
         }
     }
 }
@@ -246,6 +273,17 @@ mod tests {
             ),
             ("validation_failed", 422)
         );
+        // The deletion fence is a stable, non-retryable 409 with its own
+        // code: clients must not see it as a retryable 5xx or a 404.
+        let deleting = ApiError::from(LibraryError::AccountDeleting);
+        assert_eq!(
+            (deleting.code, deleting.status, deleting.retryable),
+            ("account_deleting", 409, false)
+        );
+        assert_eq!(
+            body(&deleting),
+            serde_json::json!({"code":"account_deleting","message":"account is being deleted","retryable":false})
+        );
         assert_eq!(ApiError::from(AuthError::Invalid).code, "unauthorized");
         let auth_config = ApiError::from(AuthError::Misconfigured);
         assert_eq!(
@@ -253,6 +291,15 @@ mod tests {
             ("internal_error", 500)
         );
         assert_eq!(ApiError::from(SessionError::Invalid).code, "unauthorized");
+        let reauth_required = ApiError::from(SessionError::ReauthRequired);
+        assert_eq!(
+            (
+                reauth_required.code,
+                reauth_required.status,
+                reauth_required.retryable
+            ),
+            ("reauth_required", 401, false)
+        );
         let session_config = ApiError::from(SessionError::Misconfigured);
         assert_eq!(
             (session_config.code, session_config.status),

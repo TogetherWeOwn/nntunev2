@@ -246,6 +246,7 @@ fn input<'a>(
     up_next: Option<&'a str>,
 ) -> PlayInput<'a> {
     PlayInput {
+        trace_id: None,
         token,
         track_id,
         range,

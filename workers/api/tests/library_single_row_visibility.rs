@@ -486,8 +486,8 @@ fn owner_intents_carry_the_caller_as_owner() {
 
 #[test]
 fn public_ids_are_opaque_and_unique() {
-    let first = library::new_public_id();
-    let second = library::new_public_id();
+    let first = library::new_public_id().expect("issue");
+    let second = library::new_public_id().expect("issue");
     assert!(!first.is_empty());
     assert_ne!(first, second, "ids must be random, never sequential");
     assert!(first.len() >= 22, "128-bit ids stay unguessable");

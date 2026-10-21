@@ -173,6 +173,7 @@ fn run(
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some(range),
@@ -299,6 +300,7 @@ fn covering_seek_running_to_end_of_track_serves_every_byte() {
     let mut meter = MemoryMeter::default();
     let token = grant::issue("user-1", "track-a", EXP_UNIX, SECRET);
     let inp = PlayInput {
+        trace_id: None,
         token: &token,
         track_id: "track-a",
         range: Some("bytes=25000-"),

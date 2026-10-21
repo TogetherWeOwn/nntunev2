@@ -13,14 +13,22 @@ pub enum YencError {
     BadEscape,
     /// Missing/inconsistent `=ypart` placement on a multipart article.
     BadPart,
+    /// Duplicate or out-of-order `=ybegin`/`=ypart`/`=yend` framing: one
+    /// article has exactly one framing sequence, and a later record must
+    /// not replace already-accepted size, placement, or checksum state.
+    BadFraming,
     SizeMismatch {
         expected: u64,
-        actual: usize,
+        actual: u64,
     },
     CrcMismatch {
         expected: u32,
         actual: u32,
     },
+    /// The covering checksum tag is present but its value is empty, non-hex,
+    /// non-UTF-8, or out of `u32` range. An absent tag stays optional; a
+    /// present malformed one is never treated as absent.
+    BadChecksum,
 }
 
 /// IEEE CRC-32 over `data` (bitwise; no table needed at this size).
@@ -145,34 +153,62 @@ pub fn decode(text: &[u8]) -> Result<Vec<u8>, YencError> {
 
 /// Decode a yEnc article (single- or multipart) and report its placement.
 ///
-/// - Single-part: size from `=yend`, `crc32=` (when present) over the data.
+/// - Single-part: size from `=yend`, `crc32=` (when present) over the data,
+///   with `pcrc32=` as the compatible fallback when `crc32=` is absent.
 /// - Multipart: `=ypart begin= end=` gives the placement and must agree with
 ///   the payload length; `pcrc32=` (when present) covers the part. A
 ///   `crc32=` on a part is the whole-file CRC and is *not* checked here.
+///
+/// Checksums are optional when absent, but a present covering checksum with
+/// malformed syntax (empty, non-hex, non-UTF-8, or out of `u32` range) is
+/// rejected with [`YencError::BadChecksum`] rather than treated as omitted,
+/// and never falls through to a different checksum field.
 pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     let mut out = Vec::new();
     let mut in_body = false;
     let mut seen_begin = false;
     let mut seen_trailer = false;
+    // A non-empty body line has been decoded; `=ypart` is only valid before it.
+    let mut seen_body = false;
     let mut file_size: Option<u64> = None;
     let mut multipart = false;
     let mut part_range: Option<(u64, u64)> = None;
     let mut yend_size: Option<u64> = None;
-    let mut crc: Option<u32> = None;
-    let mut pcrc: Option<u32> = None;
+    // `None` = tag absent (optional); `Some(Err(_))` = tag present but
+    // malformed. Collapsing both into `None` would skip CRC validation.
+    let mut crc: Option<Result<u32, YencError>> = None;
+    let mut pcrc: Option<Result<u32, YencError>> = None;
     for raw_line in text.split(|&b| b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.starts_with(b"=ybegin") {
+            if seen_begin {
+                return Err(YencError::BadFraming);
+            }
             in_body = true;
             seen_begin = true;
             // Byte-based: the line carries `name=<poster bytes>`, which is
             // often Latin-1/CP1252 and not UTF-8. The numeric tags precede it
-            // and are pure ASCII, so parse them from bytes.
-            file_size = tag_u64(line, b"size");
-            multipart = tag_u64(line, b"part").is_some();
+            // and are pure ASCII, so parse them from bytes. Only the prefix
+            // before `name=` is control fields: everything from `name=` on
+            // is filename text, which may contain spaces and tag-looking
+            // tokens (`part=1`, `size=999`, ...) that must not change the
+            // single/multipart interpretation or satisfy missing metadata.
+            let fields = before_filename(line);
+            file_size = tag_u64(fields, b"size");
+            // A present but non-numeric `part=` in the real control fields
+            // is malformed multipart metadata, not a single-part article:
+            // only an absent `part=` means single-part.
+            let part = tag_u64(fields, b"part");
+            if part.is_none() && tag_value(fields, b"part").is_some() {
+                return Err(YencError::BadPart);
+            }
+            multipart = part.is_some();
             continue;
         }
         if line.starts_with(b"=ypart") {
+            if !seen_begin || seen_trailer || seen_body || part_range.is_some() {
+                return Err(YencError::BadFraming);
+            }
             part_range = match (tag_u64(line, b"begin"), tag_u64(line, b"end")) {
                 (Some(b), Some(e)) if b >= 1 && e >= b => Some((b, e)),
                 _ => return Err(YencError::BadPart),
@@ -180,6 +216,9 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
             continue;
         }
         if line.starts_with(b"=yend") {
+            if !seen_begin || seen_trailer {
+                return Err(YencError::BadFraming);
+            }
             in_body = false;
             seen_trailer = true;
             yend_size = tag_u64(line, b"size");
@@ -190,6 +229,7 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         if !in_body || line.is_empty() {
             continue;
         }
+        seen_body = true;
         let mut i = 0;
         while i < line.len() {
             if line[i] == b'=' {
@@ -210,10 +250,10 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
     if !seen_begin || !seen_trailer {
         return Err(YencError::Truncated);
     }
-    if yend_size as usize != out.len() {
+    if yend_size != out.len() as u64 {
         return Err(YencError::SizeMismatch {
             expected: yend_size,
-            actual: out.len(),
+            actual: out.len() as u64,
         });
     }
     let offset = if multipart {
@@ -223,17 +263,23 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         }
         begin - 1
     } else {
-        if file_size as usize != out.len() {
+        if file_size != out.len() as u64 {
             return Err(YencError::SizeMismatch {
                 expected: file_size,
-                actual: out.len(),
+                actual: out.len() as u64,
             });
         }
         0
     };
-    // Single-part: `crc32` covers the data. Multipart: only `pcrc32` does.
+    // Single-part: `crc32` covers the data (with `pcrc32` only as the
+    // fallback when `crc32` is absent). Multipart: only `pcrc32` does; a
+    // `crc32` there is the whole-file CRC and is ignored here. Selecting via
+    // `Option<Result<_>>` keeps a present-but-malformed selected field as
+    // `Some(Err(_))`, so it cannot fall through to the other field or to
+    // the omitted-checksum path.
     let covering = if multipart { pcrc } else { crc.or(pcrc) };
     if let Some(expected) = covering {
+        let expected = expected?;
         let actual = crc32(&out);
         if actual != expected {
             return Err(YencError::CrcMismatch { expected, actual });
@@ -245,6 +291,24 @@ pub fn decode_part(text: &[u8]) -> Result<Decoded, YencError> {
         offset,
         multipart,
     })
+}
+
+/// The prefix of a `=ybegin` line before the `name=` field. The filename
+/// runs from `name=` to end-of-line and may contain spaces, tabs, and
+/// tag-looking tokens, so control tags are read only from this prefix.
+/// Returns the whole line when there is no `name=` field.
+fn before_filename(line: &[u8]) -> &[u8] {
+    let mut pos = 0;
+    while pos < line.len() {
+        if line[pos..].starts_with(b"name=") {
+            return &line[..pos];
+        }
+        match line[pos..].iter().position(|&b| b == b' ' || b == b'\t') {
+            Some(sep) => pos += sep + 1,
+            None => break,
+        }
+    }
+    line
 }
 
 /// Value of the ASCII `key=` tag on a yEnc header line, parsed from bytes so
@@ -265,8 +329,19 @@ fn tag_u64(line: &[u8], key: &[u8]) -> Option<u64> {
         .ok()
 }
 
-fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<u32> {
-    u32::from_str_radix(std::str::from_utf8(tag_value(line, key)?).ok()?, 16).ok()
+/// Parse a hex `u32` tag strictly enough to tell absence from malformed
+/// presence: `None` only when the tag is absent, `Some(Err(BadChecksum))`
+/// when it is present but empty, non-hex, non-UTF-8, or out of `u32` range.
+fn tag_hex_u32(line: &[u8], key: &[u8]) -> Option<Result<u32, YencError>> {
+    let raw = tag_value(line, key)?;
+    // Pure ASCII hex digits only: rejects non-UTF-8 and empty values, and
+    // also the leading `+` that `from_str_radix` would otherwise accept.
+    // The radix parse then only fails on `u32` overflow.
+    if raw.is_empty() || !raw.iter().all(u8::is_ascii_hexdigit) {
+        return Some(Err(YencError::BadChecksum));
+    }
+    let text = std::str::from_utf8(raw).map_err(|_| YencError::BadChecksum);
+    Some(text.and_then(|t| u32::from_str_radix(t, 16).map_err(|_| YencError::BadChecksum)))
 }
 
 #[cfg(test)]
@@ -443,6 +518,30 @@ mod tests {
         let got = decode_part(&latin1).expect("latin-1 name must decode");
         assert_eq!(got.data, data);
         assert_eq!((got.file_size, got.offset, got.multipart), (1500, 0, true));
+    }
+
+    #[test]
+    fn malformed_real_part_value_is_bad_part_even_when_size_matches() {
+        // A present-but-non-numeric `part=` in the real control fields must
+        // not silently downgrade the article to single-part. The declared
+        // size matches the payload, so only the malformed `part=` can fail.
+        let data = b"tiny synthetic payload".to_vec();
+        let mut text = part(
+            &data,
+            PartSpec {
+                file_size: data.len() as u64,
+                part: 1,
+                total: 1,
+                offset: 0,
+                file_crc: None,
+            },
+        );
+        let at = text
+            .windows(b"part=1".len())
+            .position(|w| w == b"part=1")
+            .expect("ybegin part tag present");
+        text[at + b"part=".len()] = b'x';
+        assert_eq!(decode_part(&text), Err(YencError::BadPart));
     }
 
     #[test]

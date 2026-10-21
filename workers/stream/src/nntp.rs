@@ -3,11 +3,18 @@
 //! Durable Object runs one fetch at a time per connection.
 //!
 //! Article bodies are raw bytes (yEnc is binary); callers get the
-//! dot-unstuffed bytes with `\n` line separators.
+//! dot-unstuffed bytes with `\n` line separators. Core's 16 KiB wire-line
+//! ceiling includes CRLF and stuffing; its 64 MiB article ceiling applies here
+//! to the native adapter's unstuffed LF output (core retains CRLF). Oversize
+//! input is refused, never truncated, and the connection cannot be reused.
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+use nntune_core::nntp::NntpConfig;
+use nntune_core::pinned_transport::{validate_nntp_endpoint, TransportRejection};
+use nntune_core::transport::{MAX_ARTICLE_BYTES, MAX_LINE_BYTES};
 
 /// Documented worker/API error code for stale provider credentials (S7).
 /// Shared verbatim with `nntune-core` and `workers/api`: the web app renders
@@ -31,44 +38,104 @@ pub enum NntpError {
     /// article — but the connection itself is stale and is dropped, never
     /// parked warm for reuse. Carries no credential material.
     AuthExpired,
+    /// One article exceeded `MAX_ARTICLE_BYTES` (counted on the
+    /// dot-unstuffed, LF-joined body). This is content-local — one oversize
+    /// article says nothing about provider health, exactly like a missing
+    /// article — so it must not quarantine the pool (see
+    /// [`NntpError::is_provider_failure`]). The connection itself is
+    /// desynchronized (the refusal lands mid-dot-block) and is dropped,
+    /// never parked warm for reuse.
+    ArticleTooLarge,
     /// The segment id failed RFC 5536 validation and was never sent.
     InvalidMessageId(String),
+    /// The pinned NNTP endpoint policy refused a non-loopback dial on an
+    /// off-allowlist port before any TCP dial. A local policy verdict, not
+    /// provider ill-health — the provider was never contacted — so it must
+    /// not quarantine the pool (see [`NntpError::is_provider_failure`]).
+    /// Carries the offending port (addressing only, no credentials) and
+    /// reports the same stable `transport_port_not_allowed` code the
+    /// pool path emits via [`TransportRejection::PortNotAllowed`].
+    PortNotAllowed(u16),
 }
 
 impl NntpError {
     /// True when the provider (or the connection to it) is unhealthy, as
-    /// opposed to one article being gone (`430`/`423`), stale credentials
-    /// (`480`/`481` → re-auth prompt, not an outage), or one id being
-    /// malformed, which say nothing about the provider and must not
-    /// quarantine the user's pool.
+    /// opposed to one article being gone (`430`/`423`), one article being
+    /// oversize (article cap), stale credentials (`480`/`481` → re-auth
+    /// prompt, not an outage), one id being malformed, or a local
+    /// endpoint-policy refusal that never contacted the provider, which say
+    /// nothing about the provider and must not quarantine the user's pool.
     pub fn is_provider_failure(&self) -> bool {
         !matches!(
             self,
-            NntpError::NoSuchArticle(_) | NntpError::AuthExpired | NntpError::InvalidMessageId(_)
+            NntpError::NoSuchArticle(_)
+                | NntpError::AuthExpired
+                | NntpError::ArticleTooLarge
+                | NntpError::InvalidMessageId(_)
+                | NntpError::PortNotAllowed(_)
         )
     }
 
-    /// Stable worker/API code for this failure. Only [`NntpError::AuthExpired`]
-    /// maps to [`PROVIDER_AUTH_EXPIRED_CODE`].
+    /// Stable worker/API code for this failure.
+    /// [`NntpError::AuthExpired`] maps to [`PROVIDER_AUTH_EXPIRED_CODE`];
+    /// [`NntpError::PortNotAllowed`] reuses the pinned-transport code by
+    /// construction, so the native dial and the pool path cannot drift.
     pub fn code(&self) -> &'static str {
         match self {
             NntpError::AuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            NntpError::PortNotAllowed(port) => TransportRejection::PortNotAllowed(*port).code(),
             _ => "request_failed",
         }
     }
 }
 
+/// Parse a three-ASCII-digit NNTP status token with permitted
+/// separator/framing: the first three bytes must be ASCII digits and the
+/// fourth byte must be end-of-line or a single space before reply text.
+/// `2000`, `2220`, `4800` and friends merely start with a known code and
+/// are malformed frames, never truncated to their prefix. Returns `None`
+/// for a malformed frame; callers map that to a bounded generic
+/// [`NntpError::UnexpectedResponse`] without echoing the untrusted line.
+fn parse_status_code(line: &str) -> Option<u16> {
+    let stripped = line.trim_end_matches(['\r', '\n']);
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match bytes.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => return None,
+    }
+    let code = u16::from(bytes[0] - b'0') * 100
+        + u16::from(bytes[1] - b'0') * 10
+        + u16::from(bytes[2] - b'0');
+    Some(code)
+}
+
 /// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
-/// on the wire inside `BODY <…>`: RFC 5536 msg-id characters only, so a
-/// hostile NZB cannot smuggle CR/LF (extra NNTP commands) or desynchronize
-/// the pooled connection.
+/// on the wire inside `BODY <…>`: RFC 5536 msg-id shape (bracketless form),
+/// so a hostile NZB cannot smuggle CR/LF (extra NNTP commands) or
+/// desynchronize the pooled connection.
+///
+/// Rules (mirrors `workers/ingest` `validate_message_id` at its own
+/// 250-byte adapter ceiling): 1..=250 bytes, printable ASCII (`0x21..=0x7E`)
+/// only, no `<`/`>`, exactly one `@` with non-empty local and domain sides.
 pub fn valid_message_id(mid: &str) -> bool {
     const MAX_LEN: usize = 250;
-    !mid.is_empty()
-        && mid.len() <= MAX_LEN
-        && !mid
-            .bytes()
-            .any(|b| matches!(b, b'\r' | b'\n' | b'\0' | b' ' | b'\t' | b'<' | b'>'))
+    if mid.is_empty() || mid.len() > MAX_LEN {
+        return false;
+    }
+    if !mid.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
+    if mid.contains('<') || mid.contains('>') {
+        return false;
+    }
+    let mut parts = mid.split('@');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(local), Some(domain), None) if !local.is_empty() && !domain.is_empty()
+    )
 }
 
 impl From<std::io::Error> for NntpError {
@@ -107,6 +174,7 @@ impl NntpDeadline {
 pub struct NntpClient {
     reader: BufReader<std::net::TcpStream>,
     read_timeout: Duration,
+    usable: bool,
 }
 
 impl NntpClient {
@@ -118,6 +186,9 @@ impl NntpClient {
     /// Open a provider connection with per-upstream timeouts and consume the
     /// greeting. The connect, greeting and first article can share one deadline
     /// so a stale warm connection cannot multiply the segment budget on retry.
+    /// A non-loopback dial on an off-allowlist port is refused with the
+    /// shared `transport_port_not_allowed` code before any TCP dial;
+    /// loopback keeps the ephemeral-port harness contract.
     pub fn connect_with_timeouts(
         addr: &SocketAddr,
         timeouts: UpstreamTimeouts,
@@ -131,6 +202,38 @@ impl NntpClient {
         timeouts: UpstreamTimeouts,
         deadline: &NntpDeadline,
     ) -> Result<Self, NntpError> {
+        // Pinned NNTP endpoint policy: provider (non-loopback) dials fail
+        // closed through the shared core gate before any TCP dial, so an
+        // off-allowlist port is refused without a connection attempt.
+        // Loopback is the local harness (every synthetic-NNTP fixture dials
+        // 127.0.0.1 on an ephemeral port) and stays exempt. This seam
+        // carries only a SocketAddr — no TLS/acknowledgment input — so the
+        // synthetic config asserts TLS: the vault acknowledgment lifts only
+        // TLS, never the port list, and a TLS-first refusal here would mask
+        // the port code this seam must surface.
+        if !addr.ip().is_loopback() {
+            let config = NntpConfig {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                tls: true,
+                allow_insecure_plaintext: false,
+                username: None,
+                password: None,
+                timeout: timeouts.connect,
+                max_pipelined: 1,
+                max_article_bytes: MAX_ARTICLE_BYTES,
+            };
+            // Typed gate: the port refusal keeps its `TransportRejection`
+            // identity so callers match the variant, never the message text.
+            // The synthetic config asserts TLS, so only the port arm fires
+            // here; any other rejection stays a generic I/O failure.
+            if let Err(rejection) = validate_nntp_endpoint(&config) {
+                return Err(match rejection {
+                    TransportRejection::PortNotAllowed(port) => NntpError::PortNotAllowed(port),
+                    other => NntpError::Io(other.to_string()),
+                });
+            }
+        }
         let connect_timeout = timeouts.connect.min(deadline.remaining()?);
         if connect_timeout.is_zero() {
             return Err(
@@ -143,14 +246,19 @@ impl NntpClient {
         let mut client = Self {
             reader: BufReader::new(stream),
             read_timeout: timeouts.read,
+            usable: true,
         };
         let greeting = client.read_line_with_deadline(deadline)?;
-        if greeting.starts_with("200") || greeting.starts_with("201") {
-            Ok(client)
-        } else {
-            Err(NntpError::UnexpectedResponse(
-                greeting.trim_end().to_string(),
-            ))
+        match parse_status_code(&greeting) {
+            Some(200) | Some(201) => Ok(client),
+            Some(code) => Err(NntpError::UnexpectedResponse(format!(
+                "unexpected NNTP greeting code {code}"
+            ))),
+            // Generic and bounded: the greeting line is untrusted and must
+            // not be echoed, and a malformed prefix must never connect.
+            None => Err(NntpError::UnexpectedResponse(
+                "malformed NNTP greeting".into(),
+            )),
         }
     }
 
@@ -161,7 +269,7 @@ impl NntpClient {
         expected_peer: &SocketAddr,
         read_timeout: Duration,
     ) -> io::Result<bool> {
-        if self.reader.get_ref().peer_addr()? != *expected_peer {
+        if !self.usable || self.reader.get_ref().peer_addr()? != *expected_peer {
             return Ok(false);
         }
         self.reader.get_ref().set_read_timeout(Some(read_timeout))?;
@@ -186,6 +294,29 @@ impl NntpClient {
         message_id: &str,
         deadline: &NntpDeadline,
     ) -> Result<Vec<u8>, NntpError> {
+        if !self.usable {
+            return Err(NntpError::UnexpectedResponse(
+                "NNTP connection unusable".into(),
+            ));
+        }
+        let result = self.read_article(message_id, deadline);
+        if matches!(
+            &result,
+            Err(error) if !matches!(error, NntpError::NoSuchArticle(_) | NntpError::InvalidMessageId(_))
+        ) {
+            // A partial reply cannot be drained safely within the byte/deadline
+            // budget. Never issue another command on this desynchronized stream.
+            self.usable = false;
+            let _ = self.reader.get_ref().shutdown(std::net::Shutdown::Both);
+        }
+        result
+    }
+
+    fn read_article(
+        &mut self,
+        message_id: &str,
+        deadline: &NntpDeadline,
+    ) -> Result<Vec<u8>, NntpError> {
         let mid = message_id.trim().trim_matches(|c| c == '<' || c == '>');
         if !valid_message_id(mid) {
             return Err(NntpError::InvalidMessageId(message_id.to_string()));
@@ -198,38 +329,60 @@ impl NntpClient {
         self.reader.get_mut().write_all(cmd.as_bytes())?;
         self.reader.get_mut().flush()?;
         let status = self.read_line_with_deadline(deadline)?;
-        if status.starts_with("222") {
-            let mut body = Vec::new();
-            loop {
-                let mut line = Vec::new();
-                self.read_until_with_deadline(b'\n', &mut line, deadline)?;
-                if line.is_empty() {
-                    return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+        match parse_status_code(&status) {
+            Some(222) => {
+                let mut body = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    self.read_until_with_deadline(b'\n', &mut line, deadline)?;
+                    if line.is_empty() {
+                        return Err(NntpError::UnexpectedResponse("eof inside article".into()));
+                    }
+                    if line.ends_with(b"\n") {
+                        line.pop();
+                    }
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                    if line == b"." {
+                        break;
+                    }
+                    let data = unstuff(&line);
+                    // Native output normalizes CRLF to LF. Count the retained
+                    // unstuffed bytes plus that LF, not wire bytes or the final dot.
+                    if data.len() + 1 > MAX_ARTICLE_BYTES - body.len() {
+                        return Err(NntpError::ArticleTooLarge);
+                    }
+                    // Vec's default doubling could reserve beyond the article
+                    // ceiling even while its length fits. Clamp requested growth.
+                    let needed = body.len() + data.len() + 1;
+                    if needed > body.capacity() {
+                        let capacity = needed
+                            .max(body.capacity().saturating_mul(2))
+                            .min(MAX_ARTICLE_BYTES);
+                        body.reserve_exact(capacity - body.len());
+                    }
+                    body.extend_from_slice(data);
+                    body.push(b'\n');
                 }
-                if line.ends_with(b"\n") {
-                    line.pop();
-                }
-                if line.ends_with(b"\r") {
-                    line.pop();
-                }
-                if line == b"." {
-                    break;
-                }
-                body.extend_from_slice(unstuff(&line));
-                body.push(b'\n');
+                Ok(body)
             }
-            Ok(body)
-        } else if status.starts_with("480") || status.starts_with("481") {
-            // Session no longer authenticated (480, the standard BODY
-            // reply) or credentials rejected (481): re-auth signal, never
-            // a missing article. 482 here is out-of-sequence and stays a
-            // generic protocol error below. No credential material is
-            // retained: the status line is dropped.
-            Err(NntpError::AuthExpired)
-        } else if status.starts_with("430") || status.starts_with("423") {
-            Err(NntpError::NoSuchArticle(message_id.to_string()))
-        } else {
-            Err(NntpError::UnexpectedResponse(status.trim_end().to_string()))
+            Some(480) | Some(481) => {
+                // Session no longer authenticated (480, the standard BODY
+                // reply) or credentials rejected (481): re-auth signal, never
+                // a missing article. 482 here is out-of-sequence and stays a
+                // generic protocol error below. No credential material is
+                // retained: the status line is dropped.
+                Err(NntpError::AuthExpired)
+            }
+            Some(430) | Some(423) => Err(NntpError::NoSuchArticle(message_id.to_string())),
+            Some(code) => Err(NntpError::UnexpectedResponse(format!(
+                "unexpected NNTP reply code {code}"
+            ))),
+            // Generic and bounded: the status line is untrusted and must not
+            // be echoed. A malformed prefix never continues a body read and
+            // never prompts credential re-entry.
+            None => Err(NntpError::UnexpectedResponse("malformed NNTP reply".into())),
         }
     }
 
@@ -260,6 +413,14 @@ impl NntpClient {
                 .position(|byte| *byte == delimiter)
                 .map_or(available.len(), |index| index + 1);
             let terminated = available[count - 1] == delimiter;
+            // Count framing/stuffing bytes too, and refuse before retaining
+            // any chunk that would cross the cap, even without a delimiter.
+            if count > MAX_LINE_BYTES.saturating_sub(output.len()) {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "NNTP line exceeds byte limit",
+                ));
+            }
             output.extend_from_slice(&available[..count]);
             self.reader.consume(count);
             read += count;
@@ -313,8 +474,16 @@ mod tests {
     fn only_a_missing_article_is_not_a_provider_failure() {
         assert!(!NntpError::NoSuchArticle("m".into()).is_provider_failure());
         assert!(!NntpError::AuthExpired.is_provider_failure());
+        assert!(!NntpError::ArticleTooLarge.is_provider_failure());
         assert_eq!(NntpError::AuthExpired.code(), PROVIDER_AUTH_EXPIRED_CODE);
         assert!(!NntpError::InvalidMessageId("x".into()).is_provider_failure());
+        // A port refusal never contacted the provider and carries the
+        // pinned-transport code by construction, not `request_failed`.
+        assert!(!NntpError::PortNotAllowed(80).is_provider_failure());
+        assert_eq!(
+            NntpError::PortNotAllowed(80).code(),
+            TransportRejection::PortNotAllowed(80).code()
+        );
         assert!(NntpError::Io("reset".into()).is_provider_failure());
         assert!(NntpError::UnexpectedResponse("502".into()).is_provider_failure());
     }
@@ -331,6 +500,15 @@ mod tests {
         assert!(!valid_message_id("a<b@c"));
         assert!(!valid_message_id(&"a".repeat(251)));
         assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
+        // Shape rules (mirrors ingest `validate_message_id`): exactly one
+        // `@` with non-empty sides, printable ASCII only.
+        assert!(!valid_message_id("not-an-id"));
+        assert!(!valid_message_id("a@b@c"));
+        assert!(!valid_message_id("@synthetic.test"));
+        assert!(!valid_message_id("local@"));
+        assert!(!valid_message_id("s\u{e9}g@synthetic.test"));
+        assert!(!valid_message_id("a\u{1}b@synthetic.test"));
+        assert!(!valid_message_id("a\u{7f}b@synthetic.test"));
     }
 
     #[test]

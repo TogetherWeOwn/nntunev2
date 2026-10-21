@@ -25,7 +25,13 @@ client ── play(token, range?) ──▶ stream Worker
      the multipart write into the cache, hand the connection back warm.
      abort(): client left — return the connection, cache nothing.
   5. prefetch the next track while the pool has a spare slot (prefetch.rs)
-  6. every step emits metering events (meter.rs)
+  6. every step emits metering events to the `Meter` interface
+     (`workers/stream/src/meter.rs`; hit/miss/finalize/abort paths in
+     `workers/stream/src/play.rs`) — emitted events only, not deployed
+     billing: the production sink is required-not-implemented under
+     F-DEL-01 (`docs/security/threat-model.md` §9 row, §12 detail; owner
+     mapping in the threat-model card thread, never pasted here). See
+     “Metering reconciliation” below; §12 trust assumptions apply unchanged.
 ```
 
 Pool semantics (`pool.rs`):
@@ -36,12 +42,15 @@ Pool semantics (`pool.rs`):
   healthy connection again. Two uncached tracks in a row cost one dial
   (asserted against the synthetic server's own connection count). A warm
   connection the provider closed is redialed once, transparently.
-- Lanes are enforced at acquire time: `Playback` may use every slot;
-  `Prefetch` and `Ingest` always leave one slot free for playback (so with a
-  cap of 1 they never run). Waiter ordering across async tasks arrives with
+- Lanes are enforced at acquire time (`Pool::reserve`, `Pool::try_acquire`):
+  `Playback` may use every slot; `Prefetch` and `Ingest` leave one slot free
+  for playback (so with a cap of 1 they never run outside the half-open probe
+  below, which admits one `Playback` or `Ingest` acquire with no reservation).
+  Waiter ordering across async tasks arrives with
   the Durable Object entry point; the reservation is what guarantees
   playback priority today.
 - Only connection-level failures (I/O, protocol errors, read timeouts)
+  (`NntpError::is_provider_failure`; settled per lease in `settle`)
   count toward the circuit breaker; a gone article (`430`/`423`) or a corrupt
   segment fails that one play (`ArticleMissing` / `Decode`) and returns the
   healthy connection. Breaker values are documented below.
@@ -157,6 +166,14 @@ behaviour.
   play path re-fetches upstream. Cache writes are stamped with the play
   time on `finalize`, so the SWR clock runs from when the bytes were
   fetched.
+- Capacity (`src/cache.rs`): `MAX_CONTENT_CACHE_BYTES = 64 MiB` caps the
+  distinct blob bytes a default `ContentCache` holds (a blob shared by
+  several tracks counts once). An over-cap insert evicts track entries
+  oldest-first in last-write order until the cache is back at or under
+  the cap — exactly at the cap evicts nothing — and never evicts the
+  just-written entry, which serves alone when it exceeds the cap by
+  itself. Capacity evictions increment `eviction_count` (the probe the
+  observability path reports); time-expiry prunes are not evictions.
 - Headers: every play carries `Cache-Status: HIT|MISS|STALE` and
   `Age: <seconds-since-write>` (see `PlayResponse::cache_headers`).
 
@@ -253,6 +270,7 @@ ingest consumer ── NNTP_POOL stub (id_from_name(user_id)) ── POST /probe
 |---|---|---|---|
 | 200 | | outcome | check partition, fold into the tally |
 | 400 / 413 | `bad_request` / `too_large` | envelope refused | contract bug, no retry |
+| 401 / 403 | | pool refused this caller (ingest-side fail-closed; the wire never emits these today) | `Rejected` on `/probe` and `/body`, no redelivery, `Retry-After` ignored |
 | 503 | `busy` | ingest lane full or pool quarantined; `Retry-After` set | redeliver |
 | 503 | `provider_unavailable` | provider settings not loaded | redeliver |
 | 502 | `provider_error` | connection, auth or protocol failure; pool quarantined | redeliver |
@@ -309,10 +327,14 @@ and `reconcile` does not currently emit to Analytics Engine or call
 `ReconcileMismatch::log_line`.
 
 - Idempotency key: `derive_play_idempotency_key(user_id, track_id,
-  play_id)` returns `play:{user}:{track}:{play}`. It rejects empty fields,
-  unsafe log/key characters, and fields longer than 128 bytes for user IDs
-  or 512 bytes for track and play IDs. Redelivery derives the same key; a
-  genuine second listen carries a different `play_id`.
+  play_id)` returns `play:{user}:{track}:{play}`. Each field must contain only
+  ASCII alphanumerics, hyphen, or underscore (`[A-Za-z0-9_-]`); colons are
+  structural delimiters only. It rejects empty fields, punctuation/Unicode
+  outside that alphabet, and fields longer than 128 bytes for user IDs or
+  512 bytes for track and play IDs, before constructing a `CompletePlay`.
+  Identities are never rewritten. Accepted keys match the API ledger's
+  persisted alphabet. Redelivery derives the same key; a genuine second
+  listen carries a different `play_id`.
 - Dedup rule: `UsageLedger::record` converges exact redeliveries to one
   in-memory entry — first write wins, mismatch is flagged, never silently
   adjusted. A redelivery that disagrees on user, track, or bytes, or a play
@@ -347,6 +369,18 @@ and `reconcile` does not currently emit to Analytics Engine or call
   fetch→decode→decrypt→fan-out shape. Production content keys arrive via
   the BYOP vault with the ingest-owned envelope (sibling cards); swap the
   marked lines, keep the flow.
-- Planned metering sinks: Analytics Engine dataset `nntune_meter` and a
-  Hyperdrive usage-ledger table. Neither sink is wired by the portable-core
-  reconciliation model described above.
+- Planned metering sinks: Analytics Engine dataset `nntune_meter` (point
+  shape in `src/meter.rs`: blobs `[kind, user_id, track_id]`, doubles
+  `[bytes, seconds]`) and the Hyperdrive per-play table
+  (`migrations/0020_stream_play_ledger.sql`, `stream_play_ledger` — not the
+  ADR daily `usage_ledger`; row intents and statements owned by
+  the api worker's `src/ledger.rs`, with the same `play:` key derivation and
+  select+classify replay flow, fenced through the play owner's `users` row).
+  Neither sink is wired by the portable-core
+  reconciliation model described above. Every event carries stream seconds
+  at the nominal 48 000 bytes/s rate. Billing folds per play, never across
+  plays: the worker folds that play's bytes only (its own `served` counter
+  into `CompletePlay.bytes`) and derives seconds from that play's total —
+  per-event seconds each round up, so summing them overcounts split windows,
+  and summing one `(user, track)` pair across play ids would bill one play
+  for another's listen.

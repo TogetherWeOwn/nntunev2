@@ -5,6 +5,7 @@ import {
 	isTrialPlan,
 	listPlans,
 	nextPlan,
+	planButtonName,
 	resolveEffectivePlan,
 	streamCapSeconds
 } from './plans';
@@ -46,6 +47,22 @@ describe('plan matrix', () => {
 	});
 });
 
+describe('planButtonName', () => {
+	it('names each paid plan distinctly when idle', () => {
+		const names = listPlans()
+			.filter((p) => p.id !== 'free')
+			.map((p) => planButtonName(p, null));
+		expect(names).toEqual(['Choose Plus', 'Choose Pro 5x', 'Choose Pro 20x']);
+		expect(new Set(names).size).toBe(names.length);
+	});
+
+	it('keeps the pending plan distinct from the idle ones', () => {
+		expect(planButtonName(getPlan('plus')!, 'plus')).toBe('Starting Plus…');
+		expect(planButtonName(getPlan('pro-5x')!, 'plus')).toBe('Choose Pro 5x');
+		expect(planButtonName(getPlan('pro-20x')!, 'pro-20x')).toBe('Starting Pro 20x…');
+	});
+});
+
 describe('resolveEffectivePlan', () => {
 	it('uses the subscription plan when active', () => {
 		expect(resolveEffectivePlan({ planId: 'plus', status: 'active' })).toEqual({
@@ -55,7 +72,11 @@ describe('resolveEffectivePlan', () => {
 	});
 
 	it('uses the subscription plan while trialing', () => {
-		const r = resolveEffectivePlan({ planId: 'pro-5x', status: 'trialing' });
+		const now = new Date('2026-10-15T12:00:00Z');
+		const r = resolveEffectivePlan(
+			{ planId: 'pro-5x', status: 'trialing', trialEndsAt: '2026-10-20T00:00:00Z' },
+			now
+		);
 		expect(r.plan.id).toBe('pro-5x');
 		expect(r.planUnknown).toBe(false);
 	});

@@ -73,6 +73,25 @@ describe('validateProviderConfig', () => {
 		}
 	});
 
+	it('pins the exact provider port diagnostic string', () => {
+		expect(validateProviderConfig({ ...good, port: 80 })).toContain('Port must be 119 or 563.');
+		expect(validateProviderConfig({ ...good, port: 119 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, port: 563 })).toEqual([]);
+	});
+
+	it('pins the exact connections diagnostic string', () => {
+		// Sensitivity: the 0/1 and 50/51 boundary pairs catch an off-by-one in
+		// MAX_CONNECTIONS_LIMIT (50); either side going clean/rejected flips this test.
+		expect(validateProviderConfig({ ...good, maxConnections: 0 })).toContain(
+			'Connections must be between 1 and 50.'
+		);
+		expect(validateProviderConfig({ ...good, maxConnections: 51 })).toContain(
+			'Connections must be between 1 and 50.'
+		);
+		expect(validateProviderConfig({ ...good, maxConnections: 1 })).toEqual([]);
+		expect(validateProviderConfig({ ...good, maxConnections: 50 })).toEqual([]);
+	});
+
 	it('requires an explicit acknowledgement for plaintext auth', () => {
 		expect(
 			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: false }).length
@@ -83,6 +102,42 @@ describe('validateProviderConfig', () => {
 		expect(
 			validateProviderConfig({ ...good, tls: true, allowInsecurePlaintext: false })
 		).toEqual([]);
+	});
+
+	it('pins the exact provider hostname and TLS acknowledgement copy', () => {
+		const HOSTNAME_ONLY = 'Enter a hostname only, without scheme or path.';
+		const NOT_ALLOWED = 'That IP address is not allowed; use your provider hostname.';
+		const LITERAL_IP = 'Use your provider hostname, not a literal IP address.';
+		const INVALID = 'That hostname does not look valid.';
+		const CLEARTEXT =
+			'Disabling TLS sends your password in cleartext. Tick the acknowledgement to continue without TLS.';
+
+		// Scheme/path input shows the hostname-only copy.
+		for (const host of ['https://news.example.com/', 'news.example.com/x']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(
+				HOSTNAME_ONLY
+			);
+		}
+
+		// Blocked IPs (one v4, one v6) show the not-allowed copy.
+		for (const host of ['10.1.2.3', '::1']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(
+				NOT_ALLOWED
+			);
+		}
+
+		// Public numeric literal shows the literal-IP copy.
+		expect(validateProviderConfig({ ...good, host: '8.8.8.8' })).toContain(LITERAL_IP);
+
+		// Malformed hostnames show the invalid copy.
+		for (const host of ['not_a_host', 'news..example.com']) {
+			expect(validateProviderConfig({ ...good, host }), `host copy: ${host}`).toContain(INVALID);
+		}
+
+		// TLS-off without acknowledgement shows the cleartext copy.
+		expect(
+			validateProviderConfig({ ...good, tls: false, allowInsecurePlaintext: false })
+		).toContain(CLEARTEXT);
 	});
 
 	it('requires a username and a password', () => {
@@ -131,5 +186,82 @@ describe('validateIndexerUrl', () => {
 		]) {
 			expect(validateIndexerUrl(url, 'indexer-key'), `url rejected: ${url}`).not.toBeNull();
 		}
+	});
+
+	it('rejects credentials and fragments in the indexer URL', () => {
+		const KEY = 'indexer-key';
+		const MESSAGE = 'Put the API key in the key field, not the URL';
+		for (const url of [
+			'https://user@index.example.com/api',
+			'https://user:pass@index.example.com/api',
+			'https://:pass@index.example.com/api',
+			'https://@index.example.com/api',
+			'https://index.example.com/api#section',
+			'https://index.example.com/api#',
+			'https://index.example.com/api?t=search',
+			'https://index.example.com/api?apikey=secret123',
+			'https://index.example.com/api?'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).toBe(MESSAGE);
+		}
+	});
+
+	it('rejects scheme-form and whitespace URLs the fetch builder rejects', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'HTTPS://index.example.com/api',
+			'Https://index.example.com/api',
+			'https:/index.example.com/api',
+			'https:index.example.com/api',
+			'https:///index.example.com/api',
+			'https:\\\\index.example.com/api',
+			'https://index.example.com/a pi',
+			'https://index.example.com/a\tpi',
+			'https://index.example.com/a\u0085pi'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url rejected: ${url}`).not.toBeNull();
+		}
+		expect(validateIndexerUrl('HTTPS://index.example.com/api', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('https:///index.example.com/api', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+		expect(validateIndexerUrl('https://index.example.com/a pi', KEY)).toBe(
+			'That indexer URL does not look valid.'
+		);
+	});
+
+	it('accepts plain https URLs with the default port and paths', () => {
+		const KEY = 'indexer-key';
+		for (const url of [
+			'https://index.example.com/api',
+			'https://index.example.com:443/api/v1'
+		]) {
+			expect(validateIndexerUrl(url, KEY), `url accepted: ${url}`).toBeNull();
+		}
+	});
+
+	it('pins the exact indexer diagnostic strings', () => {
+		const URL = 'https://index.example.com/api';
+		const KEY = 'indexer-key';
+		expect(validateIndexerUrl('', 'orphaned-key')).toBe(
+			'Clear the indexer key or enter an indexer URL.'
+		);
+		expect(validateIndexerUrl('not-a-url', KEY)).toBe('That indexer URL does not look valid.');
+		expect(validateIndexerUrl('http://index.example.com/api', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('ftp://index.example.com/', KEY)).toBe(
+			'Indexer URLs must use https.'
+		);
+		expect(validateIndexerUrl('https://localhost:8080/', KEY)).toBe(
+			'That indexer address is not allowed; use a public host.'
+		);
+		expect(validateIndexerUrl(URL, '')).toBe('Enter your indexer API key.');
+		expect(validateIndexerUrl(URL, 'k'.repeat(1025))).toBe(
+			'Indexer API key must be at most 1024 UTF-8 bytes.'
+		);
+		expect(validateIndexerUrl(URL, 'k'.repeat(1024))).toBeNull();
 	});
 });

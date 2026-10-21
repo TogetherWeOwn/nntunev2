@@ -4,6 +4,19 @@ name = "nntune-mb"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[vars]
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the deploy lane (for example
+# `--var BUILD_SHA:$GITHUB_SHA`). No workflow wires it for the mb Worker
+# yet (backend Worker deploys are intentionally not wired; see
+# `.github/workflows/deploy.yml`), so until the future mb deploy job adds
+# it every mb line renders the explicit string "unknown".
+# Workers log it as the `build_sha` field on every record; an absent or
+# invalid value renders as "unknown" (never a missing key, never
+# fail-closed), which means the lane did not supply it. Leave unset for
+# local dev.
+# BUILD_SHA = "unknown"
+
 # [[hyperdrive]]
 # binding = "MB_DB"
 # id = "<HYPERDRIVE_ID_FOR_nntunev2-mb>"

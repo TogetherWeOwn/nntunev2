@@ -25,13 +25,18 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
+use nntune_ssrf_guard::ip_is_forbidden;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Dial timeout for `test connection` (ms).
+/// Overall DNS resolution timeout per host (ms), including A + AAAA
+/// response headers and bodies. Expiry discards all answers before dialing.
+/// Separate from, and prior to, the unchanged socket budgets below.
+pub const RESOLUTION_TIMEOUT_MS: u64 = 5_000;
+/// Per-address socket dial timeout for `test connection` (ms), after DNS.
 pub const DIAL_TIMEOUT_MS: u64 = 5_000;
-/// Total timeout for `test connection` (ms).
+/// Total socket-attempt timeout for `test connection` (ms), after DNS.
 pub const TOTAL_TIMEOUT_MS: u64 = 15_000;
 /// Per-user concurrent `test connection` cap.
 pub const MAX_TEST_CONCURRENCY: u32 = 2;
@@ -97,12 +102,21 @@ pub enum VaultError {
     /// Malformed persisted ciphertext or metadata: server-side stored data is corrupt.
     CorruptStoredData,
     Crypto,
+    /// Secure randomness unavailable while minting a DEK or nonce: HTTP 503
+    /// `service_unavailable`. Never a panic, fallback, or reused nonce/DEK.
+    RandomnessUnavailable,
 }
 
 impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Generic: never echo hosts, secrets, or crypto details.
         write!(f, "vault unavailable")
+    }
+}
+
+impl From<crate::random::CryptoError> for VaultError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        VaultError::RandomnessUnavailable
     }
 }
 
@@ -193,38 +207,9 @@ fn host_shape_ok(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-fn v4_is_forbidden(o: &[u8; 4]) -> bool {
-    let v4 = Ipv4Addr::from(*o);
-    v4.is_loopback()         // 127/8
-        || v4.is_multicast() // 224.0.0.0/4
-        || v4.is_link_local() // 169.254/16
-        || v4.is_private() // 10/8, 172.16/12, 192.168/16
-        || v4.is_broadcast()
-        || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
-        || o[0] == 0 // 0.0.0.0/8 ("this network")
-        || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64/10 carrier-grade NAT
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 (IETF protocol assignments)
-        || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmarking
-        || o[0] >= 240 // 240.0.0.0/4 reserved + 255.255.255.255 broadcast
-}
-
-fn ip_is_forbidden(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_is_forbidden(&v4.octets()),
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            // Only native global unicast (2000::/3). This excludes NAT64,
-            // mapped/translated/compatible IPv4, site-local and discard.
-            // Also reject transition and special-use space inside that range
-            // rather than trusting a translator's embedded IPv4 destination.
-            (s[0] & 0xE000) != 0x2000
-                || s[0] == 0x2002 // 6to4 (2002::/16)
-                || (s[0] == 0x2001 && s[1] < 0x0200) // IETF special-use, incl. Teredo/ORCHID
-                || (s[0] == 0x2001 && s[1] == 0x0DB8) // documentation
-                || (s[0] == 0x3FFF && (s[1] & 0xF000) == 0) // documentation (3fff::/20)
-        }
-    }
-}
+// Address guard is single-owned by `nntune_ssrf_guard::ip_is_forbidden`
+// (imported above); semantics are pinned by that crate plus the shared
+// vector reuse in `tests/security_regressions.rs`. Do not fork it here.
 
 /// Vetted destination for one immediate outbound connection. Do not store
 /// this across requests: validate again at dial/fetch time, connect only to
@@ -378,6 +363,70 @@ impl IndexerConfig {
         if parsed.scheme() != "https" {
             return Err(VaultError::Invalid);
         }
+        // Saved indexer URLs carry no credentials (the API key travels
+        // separately) and userinfo disguises the real host
+        // (`host@evil` parses host as `evil`), so refuse any of it.
+        // The url crate reports empty userinfo (`@host`, `:@host`) as
+        // username `""` with password `None`, invisible to the accessors,
+        // so also refuse a raw `@` in the authority segment, mirroring
+        // the fetch-time guards (`validate_indexer_url`, `check_base_url`).
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(VaultError::Invalid);
+        }
+        // The url crate strips ASCII tab/newline and treats backslashes as
+        // slashes for https, so obfuscated shapes (`https:` + newline +
+        // `//@host`, `https:\\@host`, single-slash `https:/@host`) parse
+        // with empty userinfo while carrying a raw `@`. The fetch-time
+        // guards reject whitespace and require a literal `https://`
+        // prefix, so mirror them: refuse raw whitespace/backslash and
+        // fail closed when `://` is absent, otherwise the config saves
+        // here and is rejected on every fetch.
+        if self.url.chars().any(|c| c.is_whitespace() || c == '\\') {
+            return Err(VaultError::Invalid);
+        }
+        let Some(scheme_end) = self.url.find("://") else {
+            return Err(VaultError::Invalid);
+        };
+        // `find` locates the FIRST literal `://`, which a decoy planted in
+        // the path or query can shift (`https:@host/api://x`): the scan
+        // would then examine the text after the decoy while the real `@`
+        // sits before it. Both fetch-time guards anchor on the scheme
+        // (`split_authority` requires the text before `://` to equal
+        // `https`; `check_base_url` requires a literal `https://` prefix),
+        // so mirror them: anything else fails closed here instead of
+        // saving a config every fetch rejects.
+        if &self.url[..scheme_end] != "https" {
+            return Err(VaultError::Invalid);
+        };
+        let after = &self.url[scheme_end + 3..];
+        let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+        // The url crate skips any number of slashes after the scheme for
+        // https, so extra-slash shapes (`https:///@host`, `https:///host`)
+        // parse with a real host while the raw authority above is empty and
+        // its `@` is never seen. Both fetch-time guards reject an empty
+        // computed authority (`split_authority`, `check_base_url`), so
+        // mirror them: an empty authority saves here and is rejected on
+        // every fetch.
+        if authority.is_empty() {
+            return Err(VaultError::Invalid);
+        }
+        if authority.contains('@') {
+            return Err(VaultError::Invalid);
+        }
+        // Only the HTTPS default may be addressed: an explicit non-443
+        // port is an alternate-service probe. `port()` yields `None` for
+        // both the default and an explicit `:443` (default-port
+        // normalization), so both still validate.
+        if let Some(port) = parsed.port() {
+            if port != 443 {
+                return Err(VaultError::Invalid);
+            }
+        }
+        // A fragment is never sent to a server; in a stored base URL it
+        // is smuggled data or a copy-paste error.
+        if parsed.fragment().is_some() {
+            return Err(VaultError::Invalid);
+        }
         let host = parsed
             .host_str()
             .filter(|h| !h.is_empty())
@@ -481,10 +530,8 @@ pub struct VaultBlob {
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct Dek([u8; 32]);
 
-fn random_nonce() -> [u8; 12] {
-    let mut n = [0u8; 12];
-    getrandom::fill(&mut n).expect("secure randomness unavailable");
-    n
+fn random_nonce() -> Result<[u8; 12], VaultError> {
+    Ok(crate::random::secure_random_bytes::<12>()?)
 }
 
 // Unpadded-base64url lives in one place: [`crate::b64`] over the `base64`
@@ -500,20 +547,24 @@ fn payload_aad(user_id: &str) -> String {
 }
 
 /// Encrypt `plaintext` (serialized provider+indexer secrets) for `user_id`.
+///
+/// Fail-closed: secure-randomness failure (DEK or either nonce) returns
+/// [`VaultError::RandomnessUnavailable`] (HTTP 503). The success path is
+/// byte-identical: the same 32 DEK bytes and 12-byte nonces through the
+/// same AES-256-GCM + [`crate::b64::encode`] shapes.
 pub fn encrypt_vault(
     kek: &[u8; 32],
     kek_version: u32,
     user_id: &str,
     plaintext: &[u8],
 ) -> Result<VaultBlob, VaultError> {
-    let mut dek_bytes = [0u8; 32];
-    getrandom::fill(&mut dek_bytes).expect("secure randomness unavailable");
+    let mut dek_bytes = crate::random::secure_random_bytes::<32>()?;
     let dek = Dek(dek_bytes);
     dek_bytes.zeroize();
 
     // Wrap the DEK with the KEK (AAD binds user + KEK version).
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = random_nonce();
+    let wrap_nonce = random_nonce()?;
     let wrapped = kek_cipher
         .encrypt(
             &Nonce::from(wrap_nonce),
@@ -526,7 +577,7 @@ pub fn encrypt_vault(
 
     // Encrypt the payload with the DEK (AAD binds user).
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce = random_nonce();
+    let payload_nonce = random_nonce()?;
     let payload = dek_cipher
         .encrypt(
             &Nonce::from(payload_nonce),
@@ -631,7 +682,7 @@ pub fn rewrap_dek(
 
     // Re-wrap with the new KEK (new AAD: new version).
     let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
-    let new_nonce = random_nonce();
+    let new_nonce = random_nonce()?;
     let wrap_result = new_cipher.encrypt(
         &Nonce::from(new_nonce),
         Payload {
@@ -812,6 +863,24 @@ pub struct AuditEvent {
     pub at: u64,
 }
 
+/// Placeholder for the audit `source_ip` when the client address is
+/// missing or not a literal IP address.
+pub const UNKNOWN_SOURCE_IP: &str = "unknown";
+
+/// Normalize a client address (the `cf-connecting-ip` header) to its
+/// canonical IP literal, or [`UNKNOWN_SOURCE_IP`] when absent or not
+/// exactly one IP address. The value is request-header data that is stored
+/// in `audit_log.source_ip` and used in rate-limit keys, so anything with
+/// control characters, separators, markup or oversize collapses to
+/// `unknown` instead of being persisted. Parsing is strict (no trimming,
+/// no zone ids, no lists), and the canonical form is what is stored, so one
+/// address always maps to one string. Idempotent.
+pub fn sanitize_source_ip(raw: Option<&str>) -> String {
+    raw.and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| UNKNOWN_SOURCE_IP.to_string())
+}
+
 /// Audit log event. By construction there is no field for secret material:
 /// callers pass ids and results only. `now` is Unix epoch seconds — the
 /// audit row's ordering depends on it, so it is a required parameter.
@@ -820,7 +889,7 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
         user_id: user_id.to_string(),
         action: action.to_string(),
         ok,
-        source_ip: source_ip.to_string(),
+        source_ip: sanitize_source_ip(Some(source_ip)),
         at: now,
     }
 }
@@ -828,6 +897,70 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = VaultError::RandomnessUnavailable;
+        // Sealed display carries no crypto internals.
+        assert_eq!(err.to_string(), "vault unavailable");
+        let api = crate::api_error::ApiError::from(err);
+        assert_eq!(
+            (api.code, api.status, api.retryable),
+            ("service_unavailable", 503, true)
+        );
+        assert_eq!(api.message, "service unavailable");
+        assert_eq!(
+            VaultError::from(crate::random::CryptoError::RandomnessUnavailable),
+            VaultError::RandomnessUnavailable
+        );
+    }
+
+    /// `cf-connecting-ip` is request-header data
+    /// that lands in `audit_log.source_ip`. Anything that is not a literal
+    /// IP address (control characters, separators, markup, oversize) must
+    /// collapse to `unknown` so a log/CSV/HTML consumer never sees it.
+    #[test]
+    fn source_ip_sanitizer_keeps_only_canonical_ip_literals() {
+        assert_eq!(sanitize_source_ip(Some("198.51.100.9")), "198.51.100.9");
+        assert_eq!(sanitize_source_ip(Some("2001:db8::1")), "2001:db8::1");
+        // Canonicalized: same address, same stored string (stable rate keys).
+        assert_eq!(
+            sanitize_source_ip(Some("2001:DB8:0:0:0:0:0:1")),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            sanitize_source_ip(Some("::ffff:198.51.100.9")),
+            "::ffff:198.51.100.9"
+        );
+        let hostile = [
+            "198.51.100.9\nFORGED ok=true",
+            "198.51.100.9\r\n",
+            "198.51.100.9\0",
+            "198.51.100.9, 203.0.113.1",
+            " 198.51.100.9",
+            "198.51.100.9 ",
+            "fe80::1%eth0",
+            "999.1.1.1",
+            "<script>alert(1)</script>",
+            "'; DROP TABLE audit_log;--",
+            "\u{202e}198.51.100.9",
+            "",
+            "unknown",
+        ];
+        for raw in hostile {
+            assert_eq!(sanitize_source_ip(Some(raw)), "unknown", "{raw:?}");
+        }
+        assert_eq!(sanitize_source_ip(Some(&"1".repeat(4096))), "unknown");
+        assert_eq!(sanitize_source_ip(None), "unknown");
+    }
+
+    #[test]
+    fn audit_event_never_stores_a_hostile_source_ip() {
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7\nINJECTED", 7);
+        assert_eq!(ev.source_ip, "unknown");
+        let ev = audit_event("u1", "vault.update", true, "203.0.113.7", 7);
+        assert_eq!(ev.source_ip, "203.0.113.7");
+    }
 
     struct EmptyDns;
     impl DnsResolver for EmptyDns {

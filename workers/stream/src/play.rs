@@ -43,10 +43,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use nntune_core::pinned_transport::TransportRejection;
+
 use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
-use crate::meter::{Meter, MeterEvent, MeterKind};
+use crate::meter::{stream_seconds_for_bytes, Meter, MeterEvent, MeterKind};
 use crate::nntp::{valid_message_id, NntpClient, NntpDeadline, NntpError, UpstreamTimeouts};
 use crate::observability::{CacheObserveEvent, CacheStatus as ObserveStatus};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
@@ -86,6 +88,21 @@ pub enum PlayError {
     InvalidSegment(String),
     /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
+    /// One article exceeded the article byte cap: only this fetch is
+    /// refused, with the corrupt-content envelope and a `SizeRefused` meter
+    /// signal. The provider is healthy so the pool is never quarantined;
+    /// the desynchronized connection is dropped. Carries the segment id for
+    /// debugging; it never reaches the wire (see [`PlayError::api_error`]).
+    ArticleTooLarge(String),
+    /// The pinned NNTP endpoint policy refused the play's provider dial on
+    /// an off-allowlist port before any TCP dial. A local policy verdict,
+    /// not provider ill-health — the provider was never contacted — so the
+    /// pool is never quarantined and no provider-error meter fires (like
+    /// [`PlayError::ProviderAuthExpired`); redialing the same endpoint can
+    /// never succeed, so the envelope is non-retryable. Carries the
+    /// offending port (addressing only); it never reaches the wire (see
+    /// [`PlayError::api_error`]).
+    TransportPortNotAllowed(u16),
     /// A segment could not be decoded (corrupt or mis-placed yEnc part).
     Decode(YencError),
 }
@@ -106,7 +123,8 @@ impl PlayError {
             PlayError::ArticleMissing(_) => ApiError::not_found(),
             PlayError::InvalidSegment(_) => ApiError::invalid_request(),
             PlayError::Upstream(_) => ApiError::upstream_unavailable(),
-            PlayError::Decode(_) => ApiError::corrupt_content(),
+            PlayError::TransportPortNotAllowed(_) => ApiError::transport_port_not_allowed(),
+            PlayError::ArticleTooLarge(_) | PlayError::Decode(_) => ApiError::corrupt_content(),
         }
     }
 
@@ -125,7 +143,8 @@ impl PlayError {
     /// HTTP status for the Worker shim: an open breaker is `503` (with
     /// [`PlayError::retry_after_header`]); an exhausted pool is `429`
     /// (`rate_limited`); auth, range, missing-article, and invalid-segment
-    /// failures use their shared-envelope statuses; provider failures are `502`.
+    /// failures use their shared-envelope statuses; provider failures and
+    /// the endpoint-policy port refusal are `502`.
     pub fn http_status(&self) -> u16 {
         match self {
             PlayError::Unauthorized(_) | PlayError::ProviderAuthExpired => 401,
@@ -135,7 +154,10 @@ impl PlayError {
             PlayError::PoolQuarantined { .. } => 503,
             PlayError::ArticleMissing(_) => 404,
             PlayError::InvalidSegment(_) => 400,
-            PlayError::Upstream(_) | PlayError::Decode(_) => 502,
+            PlayError::Upstream(_)
+            | PlayError::ArticleTooLarge(_)
+            | PlayError::TransportPortNotAllowed(_)
+            | PlayError::Decode(_) => 502,
         }
     }
 
@@ -152,10 +174,15 @@ impl PlayError {
         }
     }
 
-    /// Stable worker/API code for stale provider credentials.
+    /// Stable worker/API code for stale provider credentials and the
+    /// endpoint-policy port refusal (which reuses the pinned-transport code
+    /// by construction, so the play path and the pool path cannot drift).
     pub fn code(&self) -> &'static str {
         match self {
             PlayError::ProviderAuthExpired => PROVIDER_AUTH_EXPIRED_CODE,
+            PlayError::TransportPortNotAllowed(port) => {
+                TransportRejection::PortNotAllowed(*port).code()
+            }
             _ => "request_failed",
         }
     }
@@ -193,6 +220,12 @@ pub struct PlayInput<'a> {
     pub now_unix: u64,
     /// Next track in the queue, for prefetch.
     pub up_next: Option<&'a str>,
+    /// Optional inbound `x-trace-id` for log correlation. Accepted only when
+    /// it is 32 lowercase hex chars; anything else is dropped (never trusted
+    /// or logged) and the play runs untraced. Never affects authorization,
+    /// pooling, caching, or metering decisions — and never enters the
+    /// Analytics Engine row.
+    pub trace_id: Option<&'a str>,
 }
 
 /// A servable play: status line, headers and a chunk stream.
@@ -220,6 +253,10 @@ pub struct PlayResponse {
     /// reader.
     pub needs_revalidate: bool,
     pub stream: PlayStream,
+    /// Normalized request trace for log correlation (`None` when the play
+    /// carried no valid trace). The transport stamps this ID in every
+    /// six-key log line for the play; it never enters the AE row.
+    pub trace_id: Option<String>,
 }
 
 impl PlayResponse {
@@ -270,6 +307,10 @@ pub struct PlayStream {
     pos: u64,
     end: u64,
     served: u64,
+    /// Normalized request trace for log correlation. Carried alongside the
+    /// lease so `finalize`/`abort`/`Drop` meter the same play's bytes under
+    /// the same trace; never enters the AE row.
+    trace_id: Option<String>,
     /// `None` once `finalize`/`abort` consumed the stream (or it was dropped).
     source: Option<Source>,
     /// Pool-level orphan queue: `Drop` pushes an [`OrphanedPlay`] here when
@@ -284,13 +325,14 @@ impl Drop for PlayStream {
         // discarded with `live` (its buffered position is untrustworthy, so
         // it is never re-parked warm). Served bytes ride the pool-level
         // orphan queue so the pool owner can still meter them — for `Live`
-        // and `Cached` alike.
+        // and `Cached` alike. The trace rides along for log correlation.
         if self.source.take().is_some() && self.served > 0 {
             if let Ok(mut orphaned) = self.orphans.lock() {
                 orphaned.push(OrphanedPlay {
                     user_id: self.user_id.clone(),
                     track_id: self.track_id.clone(),
                     bytes: self.served,
+                    trace_id: self.trace_id.clone(),
                 });
             }
         }
@@ -321,8 +363,14 @@ struct Live {
     /// `PlayInput::now_unix` at play time: the cache write stamped on
     /// `finalize`, so the SWR clock runs from when the bytes were fetched.
     started_at: u64,
-    /// File size declared by the first fetched segment.
+    /// File size for the play: the first fetched segment's declared size,
+    /// or the ranges total when a disagreeing segment 0 was refetched and
+    /// segment 1 corroborated the ranges over a self-inconsistent provider.
     total: u64,
+    /// Segment prefetched while resolving a disagreeing segment 0 (the
+    /// corroborating segment 1): the next `load` for its index ingests it
+    /// instead of fetching it a second time.
+    prefetched: Option<(usize, Decoded)>,
     /// The most recently decoded segment, shared with `pending` (no copy).
     buf: Arc<[u8]>,
     buf_start: u64,
@@ -465,6 +513,10 @@ fn play_authorized(
     user: &str,
     timeouts: UpstreamTimeouts,
 ) -> Result<PlayResponse, PlayError> {
+    // Normalize first: an invalid trace is dropped before pool, cache, or
+    // meter can observe it. The trace never affects those decisions; it only
+    // rides along for log correlation.
+    let trace_id = crate::trace::normalize_trace_id(input.trace_id);
     flush_orphaned(pool, meter);
     meter.emit(ev(MeterKind::PlayStart, user, input.track_id, 0));
 
@@ -489,6 +541,7 @@ fn play_authorized(
             input.track_id,
             Source::Cached(full),
             pool.orphan_sink(),
+            trace_id,
         ));
     }
 
@@ -535,6 +588,18 @@ fn play_authorized(
             ))
         }
     };
+    // Corroborated first-segment agreement: segment 0 alone cannot tell a
+    // lying provider `size=` (ranges win) from lying NZB ranges (provider
+    // wins) — offset and length agree either way. A covering `!= 0`
+    // disagreement refetches the different segment 0 and keeps its declared
+    // size, as before. A `== 0` disagreement refetches the same article
+    // (the discard-and-prefix-walk) and breaks the tie with segment 1: only
+    // when segment 1 corroborates the ranges total against a
+    // self-inconsistent provider does the ranges total define the 206
+    // window; otherwise the provider total stands, so wrong ranges can
+    // never make a playable track unplayable. Single-segment plays keep the
+    // legacy adopt (no second article exists to corroborate).
+    let mut prefetched: Option<(usize, Decoded)> = None;
     if let Some(r) = ranges {
         let agrees = first.file_size == r[r.len() - 1].1
             && first.offset == r[first_seg].0
@@ -576,6 +641,83 @@ fn play_authorized(
                     ));
                 }
             }
+        } else if !agrees && first_seg == 0 && input.segments.len() > 1 {
+            // Same-article refetch, then corroborate with segment 1 on the
+            // same connection. A tie-break failure keeps the legacy provider
+            // path so the later walk surfaces it exactly as before.
+            match fetch_segment(&mut client, &input.segments[0]) {
+                Ok(decoded) => {
+                    first = decoded;
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[0]);
+                    let keep = if failure.1 == Conn::KeepWarm {
+                        Some(client)
+                    } else {
+                        None
+                    };
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        keep,
+                        failure,
+                        user,
+                        input.track_id,
+                    ));
+                }
+                Err(SegmentError::Decode(e)) => {
+                    return Err(settle(
+                        pool,
+                        meter,
+                        lease,
+                        Some(client),
+                        (PlayError::Decode(e), Conn::KeepWarm),
+                        user,
+                        input.track_id,
+                    ));
+                }
+            }
+            let ranges_total = r[r.len() - 1].1;
+            match fetch_segment(&mut client, &input.segments[1]) {
+                Ok(second) => {
+                    let first_size = first.file_size;
+                    if second.file_size == ranges_total && first_size != ranges_total {
+                        // Segment 1 corroborates the ranges against a
+                        // self-inconsistent provider: ground truth wins and the
+                        // lying `size=` never defines the window.
+                        first.file_size = ranges_total;
+                    }
+                    if second.file_size == ranges_total || second.file_size == first_size {
+                        // Worth one save: the walk consumes this instead of a
+                        // second fetch of segment 1.
+                        prefetched = Some((1, second));
+                    }
+                    // Else all three sizes disagree: drop it and let the walk
+                    // refetch segment 1 on the provider total as before.
+                }
+                Err(SegmentError::Nntp(e)) => {
+                    let failure = nntp_failure(e, &input.segments[1]);
+                    if failure.1 != Conn::KeepWarm {
+                        return Err(settle(
+                            pool,
+                            meter,
+                            lease,
+                            None,
+                            failure,
+                            user,
+                            input.track_id,
+                        ));
+                    }
+                    // Article-local failure: the client is still framed, so
+                    // fall through and let the walk refetch segment 1.
+                }
+                Err(SegmentError::Decode(_)) => {
+                    // Undecodable bytes leave the connection framed; fall
+                    // through and let the walk refetch segment 1.
+                }
+            }
+            first_seg = 0;
         }
     }
     if redialed {
@@ -608,6 +750,7 @@ fn play_authorized(
         cipher_key: input.cipher_key,
         started_at: input.now_unix,
         total: first.file_size,
+        prefetched,
         buf: Arc::from([]),
         buf_start: 0,
         pending: BTreeMap::new(),
@@ -644,6 +787,7 @@ fn play_authorized(
         input.track_id,
         Source::Live(Box::new(live)),
         pool.orphan_sink(),
+        trace_id,
     ))
 }
 
@@ -769,12 +913,22 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
         // Stale auth: drop the connection (it is no longer authenticated)
         // without quarantining or metering a provider outage.
         NntpError::AuthExpired => Conn::Drop,
+        // Oversize article: the connection desynchronized mid-dot-block so
+        // it is dropped, but the provider is healthy so the pool is never
+        // quarantined (unlike a true provider failure).
+        NntpError::ArticleTooLarge => Conn::Drop,
+        // Endpoint-policy refusal: no dial happened, so there is nothing to
+        // park warm; the provider was never contacted, so the pool is never
+        // quarantined and no provider-error meter fires.
+        NntpError::PortNotAllowed(_) => Conn::Drop,
         ref other if other.is_provider_failure() => Conn::ProviderFailure,
         _ => Conn::KeepWarm,
     };
     let err = match e {
         NntpError::NoSuchArticle(_) => PlayError::ArticleMissing(message_id.to_string()),
         NntpError::AuthExpired => PlayError::ProviderAuthExpired,
+        NntpError::ArticleTooLarge => PlayError::ArticleTooLarge(message_id.to_string()),
+        NntpError::PortNotAllowed(port) => PlayError::TransportPortNotAllowed(port),
         NntpError::InvalidMessageId(id) => PlayError::InvalidSegment(id),
         other => PlayError::Upstream(format!("{other:?}")),
     };
@@ -783,7 +937,13 @@ fn nntp_failure(e: NntpError, message_id: &str) -> Failure {
 
 /// Return the lease (and the connection, if still healthy) and account for
 /// the failure: only provider-level trouble quarantines the pool; a stale
-/// auth session is dropped without either.
+/// auth session is dropped without either. Local port-policy refusals do not
+/// record provider recovery. Terminal content failures
+/// (`ArticleMissing`/`Decode`) emit their meter-only signal here — one event
+/// per terminal play — on every `settle` path (first-segment `play()` errors
+/// and later-segment `finalize` errors alike). Background fill work never
+/// reaches `settle` (it finalizes `Ok`), so non-terminal fill failures stay
+/// silent.
 fn settle(
     pool: &mut StreamPool,
     meter: &mut dyn Meter,
@@ -794,6 +954,15 @@ fn settle(
     track: &str,
 ) -> PlayError {
     let lane = lease.lane;
+    match &err {
+        PlayError::ArticleMissing(_) => {
+            meter.emit(ev(MeterKind::ArticleMissing, user, track, 0));
+        }
+        PlayError::Decode(_) => {
+            meter.emit(ev(MeterKind::DecodeFailed, user, track, 0));
+        }
+        _ => {}
+    }
     if conn == Conn::ProviderFailure {
         let was_quarantined = pool.quarantined();
         pool.record_provider_error_for(lease.id);
@@ -807,8 +976,17 @@ fn settle(
                 crate::pool::CIRCUIT_OPEN_MS,
             ));
         }
-    } else if pool.record_non_provider_result_for(lease.id) {
-        meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+    } else if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+        // A port-policy refusal never reached the provider, so it must not
+        // settle a half-open probe as successful provider contact.
+        // One oversize article refuses only its fetch: signal it without
+        // touching the breaker (no `ProviderError`, no quarantine entry).
+        if matches!(err, PlayError::ArticleTooLarge(_)) {
+            meter.emit(ev(MeterKind::SizeRefused, user, track, 0));
+        }
+        if pool.record_non_provider_result_for(lease.id) {
+            meter.emit(ev_pool(MeterKind::QuarantineExited, user, track, lane, 0));
+        }
     }
     pool.release(lease, if conn == Conn::KeepWarm { client } else { None });
     err
@@ -863,7 +1041,7 @@ impl Live {
             return Err((
                 PlayError::Decode(YencError::SizeMismatch {
                     expected: self.total,
-                    actual: self.staged_bytes as usize,
+                    actual: self.staged_bytes,
                 }),
                 Conn::KeepWarm,
             ));
@@ -871,8 +1049,21 @@ impl Live {
         Ok(())
     }
 
-    /// Fetch + ingest segment `idx`, wherever it sits in the file.
+    /// Fetch + ingest segment `idx`, wherever it sits in the file. A segment
+    /// prefetched during disagreement resolution is ingested without a
+    /// second fetch; anything else goes to the wire as before.
     fn load(&mut self, idx: usize) -> Result<(), Failure> {
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|(pidx, _)| *pidx == idx)
+        {
+            let (_, decoded) = self.prefetched.take().expect("prefetch checked");
+            // The prefetch happened before `Live` was built; the epoch
+            // recorded at construction already bounds it.
+            self.ingest(idx, decoded)?;
+            return Ok(());
+        }
         let mid = self.segments[idx].clone();
         let fetch_epoch = self.provider_error_epoch.load(Ordering::Acquire);
         match fetch_segment(&mut self.client, &mid) {
@@ -960,6 +1151,7 @@ fn respond(
     track: &str,
     source: Source,
     orphans: Arc<Mutex<Vec<OrphanedPlay>>>,
+    trace_id: Option<String>,
 ) -> PlayResponse {
     let (cache_status, age_secs) = match serve {
         Some(serve) => (serve.cache_status(), serve.age_secs()),
@@ -978,6 +1170,7 @@ fn respond(
         content_range,
         body_len: end - start,
         cache_hit,
+        trace_id: trace_id.clone(),
         cache_status,
         age_secs,
         needs_revalidate,
@@ -988,6 +1181,7 @@ fn respond(
             pos: start,
             end,
             served: 0,
+            trace_id,
             source: Some(source),
             orphans,
         },
@@ -1000,6 +1194,7 @@ fn ev(kind: MeterKind, user: &str, track: &str, bytes: u64) -> MeterEvent {
         user_id: user.to_string(),
         track_id: track.to_string(),
         bytes,
+        seconds: stream_seconds_for_bytes(bytes),
         lane: None,
         backoff_ms: 0,
     }
@@ -1031,6 +1226,14 @@ impl PlayStream {
     /// True on the miss path (chunks feed a staged multipart upload).
     pub fn is_writeback(&self) -> bool {
         matches!(self.source, Some(Source::Live(_)))
+    }
+
+    /// Normalized request trace for log correlation (`None` when the play
+    /// carried no valid trace). The transport stamps this ID in the six-key
+    /// log envelope; it never enters the Analytics Engine row.
+    #[must_use]
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
     }
 
     /// Bytes served to the client so far.
@@ -1066,8 +1269,14 @@ impl PlayStream {
 
     /// Finish the play: meter the bytes served, and on a miss pull any
     /// segments the client's range skipped, complete the staged write into
-    /// `cache` and return the connection to `pool`. Errors (a gone article,
-    /// a bad segment, a dead connection) leave the cache untouched.
+    /// `cache` and return the connection to `pool`. Serve-phase errors (a
+    /// gone article, a bad segment, a dead connection before the client got
+    /// its bytes) keep the exact `settle` behavior and leave the cache
+    /// untouched. Post-range fill errors — the client already has its full
+    /// `206` and `error()` is `None` — are background work: they return
+    /// `Ok`, never quarantine the breaker, never cache a partial track, and
+    /// drop a desynchronized (provider-failure) connection instead of
+    /// parking it warm.
     pub fn finalize(
         mut self,
         pool: &mut StreamPool,
@@ -1075,16 +1284,28 @@ impl PlayStream {
         meter: &mut dyn Meter,
     ) -> Result<(), PlayError> {
         flush_orphaned(pool, meter);
-        meter.emit(ev(
-            MeterKind::BytesServed,
-            &self.user_id,
-            &self.track_id,
-            self.served,
-        ));
+        if self.served > 0 {
+            meter.emit(ev(
+                MeterKind::BytesServed,
+                &self.user_id,
+                &self.track_id,
+                self.served,
+            ));
+        }
         let mut live = match self.source.take() {
             Some(Source::Live(live)) => live,
             _ => return Ok(()),
         };
+        // Whether serving itself already failed before the fill runs. The
+        // iterator records serve-phase failures on `live.failed`; the fill
+        // loop below only runs when that is still `None`, so any failure it
+        // raises is background work, never a serve failure. Only a
+        // fully-drained play (`pos >= end`, the client has its full `206`)
+        // gets the background-fill treatment — an unread (`served == 0`) or
+        // partially-drained stream keeps the exact `settle` behavior, so the
+        // existing `stale_auth_midstream` finalize expectation holds.
+        let serve_failed = live.failed.is_some();
+        let fully_served = self.pos >= self.end;
         // Fetch whatever serving skipped — segments past the client's
         // range, plus the prefix a covering fetch jumped over — in file
         // order, so staging flushes the whole track into the upload.
@@ -1122,6 +1343,40 @@ impl PlayStream {
                 cache.put_track_at(&self.track_id, upload.complete(), started_at);
                 Ok(())
             }
+            // Background fill failure on a fully-served, error-free play: the
+            // client already has its full `206`, so this is meter-only. Never
+            // touch the breaker (no `record_provider_error_for`, no
+            // `QuarantineEntered`) and never cache the partial track. A
+            // provider-failure connection timed out mid-BODY and is
+            // desynchronized, so it is dropped rather than parked warm; any
+            // other connection reuses `settle`'s warm/drop decision without
+            // its breaker accounting.
+            Some((err, conn)) if !serve_failed && fully_served => {
+                let live = *live;
+                if conn == Conn::ProviderFailure {
+                    meter.emit(ev(
+                        MeterKind::ProviderError,
+                        &self.user_id,
+                        &self.track_id,
+                        0,
+                    ));
+                }
+                // Background-fill refusal of one over-cap article: the client
+                // already has its `206`, so this is meter-only — one
+                // `SizeRefused`, never a breaker signal (mirrors `settle`).
+                if matches!(err, PlayError::ArticleTooLarge(_)) {
+                    meter.emit(ev(MeterKind::SizeRefused, &self.user_id, &self.track_id, 0));
+                }
+                pool.release(
+                    live.lease,
+                    if conn == Conn::KeepWarm {
+                        Some(live.client)
+                    } else {
+                        None
+                    },
+                );
+                Ok(())
+            }
             Some(failure) => {
                 let live = *live;
                 let (client, lease) = (live.client, live.lease);
@@ -1150,6 +1405,7 @@ impl PlayStream {
                 user_id: self.user_id.clone(),
                 track_id: self.track_id.clone(),
                 bytes: self.served,
+                trace_id: self.trace_id.clone(),
             });
         }
         if let Some(Source::Live(live)) = source {
@@ -1159,8 +1415,11 @@ impl PlayStream {
             let conn = live.failed.as_ref().map(|(_, conn)| *conn);
             if conn == Some(Conn::ProviderFailure) {
                 pool.record_provider_error_for(live.lease.id);
-            } else if conn.is_some() {
-                pool.record_non_provider_result_for(live.lease.id);
+            } else if let Some((err, _)) = &live.failed {
+                // Local port refusals prove nothing about provider recovery.
+                if !matches!(err, PlayError::TransportPortNotAllowed(_)) {
+                    pool.record_non_provider_result_for(live.lease.id);
+                }
             } else if live.last_success_epoch == Some(pool.provider_error_epoch()) {
                 // Clean abort: the first segment served fine and no later
                 // fetch failed, so clear a closed-state failure streak unless
@@ -1182,19 +1441,33 @@ impl Iterator for PlayStream {
         }
         let chunk = match self.source.as_mut() {
             Some(Source::Cached(bytes)) => {
-                let to = (self.pos as usize + CHUNK).min(self.end as usize);
-                bytes[self.pos as usize..to].to_vec()
+                // Offsets stay `u64` until the final bounded index: narrowing
+                // `pos`/`end` to `usize` first would truncate multi-GiB file
+                // offsets on 32-bit targets before the clamp.
+                let buf_len = bytes.len() as u64;
+                let start_u64 = self.pos.min(self.end).min(buf_len);
+                let end_u64 = self.end.min(buf_len).max(start_u64);
+                let take = (end_u64 - start_u64).min(CHUNK as u64);
+                let from = start_u64 as usize;
+                let to = (start_u64 + take) as usize;
+                bytes[from..to].to_vec()
             }
             Some(Source::Live(live)) => loop {
                 if live.failed.is_some() {
                     return None;
                 }
-                let buf_end = live.buf_start + live.buf.len() as u64;
+                let buf_len = live.buf.len() as u64;
+                let buf_end = live.buf_start + buf_len;
                 if self.pos >= live.buf_start && self.pos < buf_end {
-                    let from = (self.pos - live.buf_start) as usize;
-                    let to = (from + CHUNK)
-                        .min(live.buf.len())
-                        .min((self.end - live.buf_start) as usize);
+                    // Differences stay `u64` and clamp against the in-memory
+                    // buffer length in `u64`; only the bounded locals become
+                    // `usize` slice indices.
+                    let from_u64 = self.pos - live.buf_start;
+                    let avail = buf_len - from_u64;
+                    let remaining = self.end.saturating_sub(self.pos).min(avail);
+                    let take = remaining.min(CHUNK as u64);
+                    let from = from_u64 as usize;
+                    let to = (from_u64 + take) as usize;
                     break live.buf[from..to].to_vec();
                 }
                 if live.next_seg >= live.segments.len() {
@@ -1325,6 +1598,7 @@ mod tests {
         segments: &'a [String],
     ) -> PlayInput<'a> {
         PlayInput {
+            trace_id: None,
             token,
             track_id,
             range: None,
@@ -1387,6 +1661,12 @@ mod tests {
                 true,
             ),
             (
+                PlayError::ArticleTooLarge("big-seg0@synthetic.test".into()),
+                "corrupt_content",
+                502,
+                false,
+            ),
+            (
                 PlayError::Decode(YencError::Truncated),
                 "corrupt_content",
                 502,
@@ -1434,6 +1714,7 @@ mod tests {
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
+            trace_id: None,
         };
         assert!(matches!(
             play(&mut pool, &mut cache, &mut meter, secret, &input),
@@ -1481,6 +1762,7 @@ mod tests {
         pool.release(lease, Some(warm_client));
         let segments = vec!["missing@synthetic.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: "unused by first-segment fetch",
             track_id: "track",
             range: None,
@@ -1542,6 +1824,87 @@ mod tests {
     }
 
     #[test]
+    fn port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let mut pool = StreamPool::new(2);
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let epoch = pool.provider_error_epoch();
+        let mut meter = crate::meter::MemoryMeter::default();
+
+        let error = settle(
+            &mut pool,
+            &mut meter,
+            probe,
+            None,
+            nntp_failure(NntpError::PortNotAllowed(8119), "segment"),
+            "u",
+            "track",
+        );
+
+        assert_eq!(error, PlayError::TransportPortNotAllowed(8119));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        assert!(
+            meter.events.is_empty(),
+            "a refusal is not provider recovery"
+        );
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+    }
+
+    #[test]
+    fn aborted_port_refusal_leaves_a_half_open_probe_unresolved() {
+        use crate::pool::{CircuitState, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_OPEN_MS};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
+        let address = listener.local_addr().expect("provider address");
+        let (_, article) = test_article();
+        let server = serve_article(listener, article, false);
+        let secret = b"s";
+        let token = grant::issue("u", "track", GRANT_EXP_UNIX, secret);
+        let segments = vec!["segment@synthetic.test".to_string()];
+        let mut pool = StreamPool::new(2);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let input = test_input(&token, "track", address, &segments);
+        let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input)
+            .expect("initial segment fetched");
+        // A successful first segment settles its probe immediately. Give the
+        // abort fixture a fresh, unresolved probe after that provider contact.
+        for _ in 0..CIRCUIT_FAILURE_THRESHOLD {
+            pool.record_provider_error();
+        }
+        pool.advance(CIRCUIT_OPEN_MS);
+        let epoch = pool.provider_error_epoch();
+        let probe = pool.try_acquire(Lane::Playback).expect("probe admitted");
+        let Some(Source::Live(live)) = response.stream.source.as_mut() else {
+            panic!("cache miss must hold a live lease");
+        };
+        let previous = std::mem::replace(&mut live.lease, probe);
+        pool.release(previous, None);
+        live.failed = Some(nntp_failure(NntpError::PortNotAllowed(8119), "segment"));
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        response.stream.abort(&mut pool);
+
+        assert_eq!(pool.circuit_state(), CircuitState::HalfOpen);
+        assert_eq!(pool.provider_error_epoch(), epoch);
+        assert_eq!(pool.in_use(), 0);
+        assert_eq!(pool.idle(), 0);
+        let next = pool.try_acquire(Lane::Playback).expect("probe slot freed");
+        assert!(pool.try_acquire(Lane::Playback).is_err());
+        pool.release(next, None);
+        server.join().expect("provider thread");
+    }
+
+    #[test]
     fn open_breaker_maps_to_503_with_retry_after() {
         let err = PlayError::PoolQuarantined {
             retry_after_ms: 30_000,
@@ -1580,6 +1943,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1632,6 +1996,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: Some("bytes=2-5"),
@@ -1657,7 +2022,7 @@ mod tests {
 
     #[test]
     fn only_the_first_stale_serve_claims_the_revalidation() {
-        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS};
+        use crate::cache::{CacheStatus, CACHE_FRESH_TTL_SECS, REVALIDATE_CLAIM_TTL_SECS};
 
         let secret = b"s";
         let now_unix = 1_000 + CACHE_FRESH_TTL_SECS + 1;
@@ -1670,6 +2035,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1691,6 +2057,32 @@ mod tests {
         assert!(
             !second.needs_revalidate,
             "later stale readers must not each trigger a refresh"
+        );
+
+        // The claim carries the serving time, not a constant: past the
+        // claim TTL the abandoned claim expires and a later stale serve
+        // re-claims. If play passed a fixed time, this serve would see
+        // the first claim as still owned and report no revalidation.
+        let later_unix = now_unix + REVALIDATE_CLAIM_TTL_SECS;
+        let later_token = grant::issue("u", "track-swr", later_unix + 60, secret);
+        let later_input = PlayInput {
+            trace_id: None,
+            token: &later_token,
+            track_id: "track-swr",
+            range: None,
+            server_addr: addr,
+            segments: &[],
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: later_unix,
+            up_next: None,
+        };
+        let reclaim =
+            play(&mut pool, &mut cache, &mut meter, secret, &later_input).expect("stale serves");
+        assert_eq!(reclaim.cache_status, CacheStatus::Stale);
+        assert!(
+            reclaim.needs_revalidate,
+            "past the claim TTL a stale serve must re-claim the revalidation"
         );
 
         // The revalidation rewrite landing releases the claim and the entry
@@ -1715,6 +2107,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1754,6 +2147,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -1830,6 +2224,7 @@ mod tests {
         let mut meter = crate::meter::MemoryMeter::default();
         let segments = ["t1-seg0@unit.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-t1",
             range: None,
@@ -1890,6 +2285,7 @@ mod tests {
             let mut meter = crate::meter::MemoryMeter::default();
             let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
             let input = PlayInput {
+                trace_id: None,
                 token,
                 track_id: "t",
                 range: None,
@@ -2225,6 +2621,7 @@ mod tests {
             cipher_key: 0,
             now_unix: 1,
             up_next: None,
+            trace_id: None,
         };
         let mut response = play(&mut pool, &mut cache, &mut meter, secret, &input).unwrap();
         assert!(response.cache_hit);
@@ -2258,6 +2655,7 @@ mod tests {
         let mut meter = crate::meter::MemoryMeter::default();
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-swr",
             range: None,
@@ -2305,6 +2703,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
         let segments = vec!["a-seg0@synthetic.test".to_string()];
         let input = PlayInput {
+            trace_id: None,
             token: &token,
             track_id: "track-a",
             range: None,
@@ -2391,6 +2790,22 @@ mod tests {
     }
 
     #[test]
+    fn emitted_events_carry_seconds_derived_from_bytes() {
+        // The ledger row later derives seconds from the same byte count, so
+        // every event built here must already agree with the formula.
+        for bytes in [0, 1, 47_999, 48_000, 48_001, 100_000] {
+            let event = ev(MeterKind::BytesServed, "u", "t", bytes);
+            assert_eq!(
+                event.seconds,
+                crate::meter::stream_seconds_for_bytes(bytes),
+                "bytes {bytes}"
+            );
+        }
+        let idle = ev(MeterKind::PlayStart, "u", "t", 0);
+        assert_eq!((idle.bytes, idle.seconds), (0, 0));
+    }
+
+    #[test]
     fn ranges_validate_only_in_covering_shape() {
         let good = [(0, 10), (10, 25), (25, 30)];
         assert_eq!(valid_ranges(Some(&good), 3), Some(&good[..]));
@@ -2411,5 +2826,311 @@ mod tests {
         assert_eq!(covering_segment(&ranges, 9), 0);
         assert_eq!(covering_segment(&ranges, 10), 1);
         assert_eq!(covering_segment(&ranges, 29), 2);
+    }
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    fn traced_input<'a>(
+        token: &'a str,
+        track_id: &'a str,
+        addr: SocketAddr,
+        segments: &'a [String],
+        trace_id: Option<&'a str>,
+    ) -> PlayInput<'a> {
+        PlayInput {
+            token,
+            track_id,
+            range: None,
+            server_addr: addr,
+            segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+            trace_id,
+        }
+    }
+
+    #[test]
+    fn trace_id_threads_through_the_cache_hit_path() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], Some(TRACE));
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        assert!(resp.cache_hit);
+        assert_eq!(resp.trace_id.as_deref(), Some(TRACE));
+        assert_eq!(resp.stream.trace_id(), Some(TRACE));
+        // AE rows are unchanged: no trace field, legacy event set intact.
+        assert!(meter.has_kind(MeterKind::PlayStart));
+        assert!(meter.has_kind(MeterKind::CacheHit));
+        let row = &meter.events[0];
+        assert_eq!(row.user_id, "u");
+        assert_eq!(row.track_id, "track-a");
+        assert_eq!(row.bytes, 0);
+    }
+
+    #[test]
+    fn invalid_trace_is_dropped_never_logged() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        for bad in [
+            Some("too-short"),
+            Some("9F3A4C2E1B5D4F6A8C7E9D0B1A2F4E6C"),
+            Some("Bearer abc123"),
+        ] {
+            let input = traced_input(&token, "track-a", addr, &[], bad);
+            let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+            assert_eq!(resp.trace_id, None, "invalid trace must not survive");
+            assert_eq!(resp.stream.trace_id(), None);
+            // The invalid value never reaches a renderable envelope.
+            assert!(
+                crate::trace::normalize_trace_id(bad).is_none(),
+                "invalid trace must not normalize"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_trace_runs_untraced() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![1, 2, 3, 4]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], None);
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        assert_eq!(resp.trace_id, None);
+        assert_eq!(resp.stream.trace_id(), None);
+    }
+
+    #[test]
+    fn aborted_hit_stream_keeps_its_trace_in_the_orphan() {
+        let secret = b"s";
+        let token = grant::issue("u", "track-a", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        cache.put_track("track-a", vec![0u8; 40_000]);
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        let input = traced_input(&token, "track-a", addr, &[], Some(TRACE));
+        let resp = play(&mut pool, &mut cache, &mut meter, secret, &input).expect("hit play");
+        let mut stream = resp.stream;
+        assert!(stream.next().is_some(), "serve at least one chunk");
+        stream.abort(&mut pool);
+        let orphaned = pool.take_orphaned();
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].track_id, "track-a");
+        assert_eq!(orphaned[0].trace_id.as_deref(), Some(TRACE));
+        assert!(orphaned[0].bytes > 0);
+    }
+
+    #[test]
+    fn trace_never_changes_authorization_or_pool_decisions() {
+        // Same rejected grant with and without a trace: identical outcome,
+        // and a rejected play never touches the pool.
+        let secret = b"s";
+        let mut pool = Pool::new(1);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let addr: SocketAddr = "127.0.0.1:119".parse().unwrap();
+        for trace in [None, Some(TRACE)] {
+            let input = traced_input("not-a-token", "t", addr, &[], trace);
+            assert!(matches!(
+                play(&mut pool, &mut cache, &mut meter, secret, &input),
+                Err(PlayError::Unauthorized(GrantError::Malformed))
+            ));
+        }
+        assert_eq!(pool.connects(), 0);
+    }
+
+    #[test]
+    fn background_fill_over_cap_refusal_meters_size_refused_without_quarantine() {
+        use nntune_core::transport::MAX_ARTICLE_BYTES;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Two-segment track (total 200): segment 0 is a small valid yEnc
+        // part covering bytes 0-99; segment 1 is served as a finite over-cap
+        // dot-block (never decoded — refused during the article read). A
+        // `bytes=0-99` play is fully served from segment 0, so the over-cap
+        // is first hit by `finalize`'s post-range background fill, which must
+        // stay `Ok` and meter exactly one `SizeRefused` (never a breaker
+        // signal) per the `SizeRefused` once-per-refusal contract.
+        const SEG0_LEN: usize = 100;
+        const TOTAL: u64 = 200;
+        const LINE: usize = 8192;
+        let mut plain0 = Vec::with_capacity(SEG0_LEN);
+        for i in 0..SEG0_LEN {
+            plain0.push(((i * 7919 + 7) % 256) as u8);
+        }
+        let article0 = yenc::encode_part(
+            &plain0,
+            "fill-cap.flac",
+            yenc::PartSpec {
+                file_size: TOTAL,
+                part: 1,
+                total: 2,
+                offset: 0,
+                file_crc: None,
+            },
+        );
+        let segments = vec![
+            "fill-cap-seg0@unit.test".to_string(),
+            "fill-cap-seg1@unit.test".to_string(),
+        ];
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let bodies_srv = Arc::clone(&bodies);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fill-cap stub");
+        let addr = listener.local_addr().expect("fill-cap addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fill-cap accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fill-cap"));
+            let mut writer = stream;
+            writer
+                .write_all(b"200 fill-cap stub ready\r\n")
+                .expect("greeting");
+            for _ in 0..2 {
+                let mut command = String::new();
+                if reader.read_line(&mut command).expect("BODY line") == 0 {
+                    break;
+                }
+                bodies_srv.fetch_add(1, Ordering::SeqCst);
+                if command.contains("fill-cap-seg0") {
+                    writer
+                        .write_all(b"222 0 <fill-cap-seg0@unit.test> follows\r\n")
+                        .expect("222 seg0");
+                    for raw_line in article0.split(|&b| b == b'\n') {
+                        let text_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                        if text_line.first() == Some(&b'.') {
+                            let _ = writer.write_all(b".");
+                        }
+                        if writer.write_all(text_line).is_err() {
+                            break;
+                        }
+                        if writer.write_all(b"\r\n").is_err() {
+                            break;
+                        }
+                    }
+                    if writer.write_all(b".\r\n").is_err() {
+                        break;
+                    }
+                } else {
+                    // Finite over-cap dot-block: `LINE`-byte lines until the
+                    // client-side counted size passes the article cap.
+                    if writer
+                        .write_all(b"222 0 <fill-cap-seg1@unit.test> follows\r\n")
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let counted_per_line = LINE + 1;
+                    let lines = MAX_ARTICLE_BYTES / counted_per_line + 2;
+                    let chunk = vec![b'A'; LINE];
+                    for _ in 0..lines {
+                        if writer.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        if writer.write_all(b"\r\n").is_err() {
+                            break;
+                        }
+                    }
+                    let _ = writer.write_all(b".\r\n");
+                    break;
+                }
+            }
+        });
+
+        let secret = b"s";
+        let token = grant::issue("u", "track-fill-cap-over", 1 + grant::MAX_GRANT_TTL, secret);
+        let mut pool = Pool::new(4);
+        let mut cache = ContentCache::new();
+        let mut meter = crate::meter::MemoryMeter::default();
+        let input = PlayInput {
+            trace_id: None,
+            token: &token,
+            track_id: "track-fill-cap-over",
+            range: Some("bytes=0-99"),
+            server_addr: addr,
+            segments: &segments,
+            segment_ranges: None,
+            cipher_key: 0,
+            now_unix: 1,
+            up_next: None,
+        };
+        let resp =
+            play(&mut pool, &mut cache, &mut meter, secret, &input).expect("range play must start");
+        assert_eq!(resp.status, 206);
+        let mut body = Vec::new();
+        let mut stream = resp.stream;
+        for chunk in stream.by_ref() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, plain0, "client got its full range from segment 0");
+        assert!(
+            stream.error().is_none(),
+            "serving completed without error; got {:?}",
+            stream.error()
+        );
+        assert_eq!(
+            bodies.load(Ordering::SeqCst),
+            1,
+            "only the covering segment was fetched to serve; fill has not run yet"
+        );
+
+        let result = stream.finalize(&mut pool, &mut cache, &mut meter);
+        assert_eq!(
+            result,
+            Ok(()),
+            "a fill-phase over-cap refusal must not fail a fully-served play"
+        );
+        assert!(
+            bodies.load(Ordering::SeqCst) >= 2,
+            "finalize must still attempt the post-range fill"
+        );
+        let refused = meter
+            .events
+            .iter()
+            .filter(|e| e.kind == MeterKind::SizeRefused)
+            .count();
+        assert_eq!(refused, 1, "exactly one SizeRefused per refusal");
+        assert!(
+            !meter.has_kind(MeterKind::ProviderError),
+            "an over-cap refusal is never a provider error"
+        );
+        assert!(
+            !meter.has_kind(MeterKind::QuarantineEntered),
+            "background fill must not touch the breaker"
+        );
+        assert!(!pool.quarantined(), "pool stays reusable");
+        assert_eq!(pool.in_use(), 0, "the lease is returned");
+        assert_eq!(
+            pool.idle(),
+            0,
+            "a connection desynchronized mid-dot-block is dropped, never parked warm"
+        );
+        assert!(
+            cache.get_track("track-fill-cap-over").is_none(),
+            "an incomplete fill must not cache a partial track"
+        );
+        let served: u64 = meter
+            .events
+            .iter()
+            .filter(|e| e.kind == MeterKind::BytesServed)
+            .map(|e| e.bytes)
+            .sum();
+        assert_eq!(served, 100, "the served bytes are still metered");
+        server.join().expect("fill-cap stub served");
     }
 }

@@ -65,6 +65,7 @@ fn meter_stays_an_append_only_fact_log_under_redelivery() {
         user_id: "user-1".to_string(),
         track_id: "track-9".to_string(),
         bytes: 40_000,
+        seconds: 1,
         lane: None,
         backoff_ms: 0,
     };
@@ -93,6 +94,7 @@ fn meter_event_order_and_kinds_are_unchanged_by_the_new_variant() {
             user_id: "user-1".to_string(),
             track_id: "track-9".to_string(),
             bytes: 7,
+            seconds: 1,
             lane: None,
             backoff_ms: 0,
         });

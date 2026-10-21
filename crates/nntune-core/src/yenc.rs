@@ -321,6 +321,31 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
 ///
 /// Returns the number of decoded bytes. Errors are [`Error::Malformed`] or
 /// [`Error::CrcMismatch`].
+///
+/// Trailer validation in this entry point (both the single-part and
+/// multi-part paths) distinguishes an *absent* `=yend size=` — which stays
+/// optional, as before — from a *present* one: a present value must be a
+/// valid non-negative decimal equal to the decoded payload length, and an
+/// empty, non-numeric, negative, or out-of-range value is rejected as
+/// [`Error::Malformed`] rather than treated as an omission. The `=yend`
+/// line carries only ASCII `key=value` tokens, so a trailer that is not
+/// valid UTF-8 is likewise rejected instead of letting the size and CRC
+/// lookups silently miss every key.
+///
+/// The `=ybegin` line is the one place a poster-supplied filename appears,
+/// and legacy postings carry it in Latin-1/CP1252 or other non-UTF-8 bytes.
+/// Its ASCII control fields are therefore read from raw bytes, and only
+/// from the tokens before the trailing `name=` field: filename bytes are
+/// never decoded, transcoded, or reinterpreted as control tags. The
+/// `=ypart` and `=yend` lines carry no filename and keep the strict UTF-8
+/// parsing above.
+///
+/// Checksum validation follows the same scoping: a multipart article is
+/// validated against its part checksum (`pcrc32=`) only — a whole-file
+/// `crc32=` covers bytes this article does not contain and is never
+/// compared against the decoded part alone, so a multipart article with
+/// only the whole-file checksum still decodes. Checksums stay optional,
+/// and a present but malformed applicable checksum is rejected.
 pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usize> {
     let mut lines = split_lines(article);
 
@@ -334,7 +359,7 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
         }
     };
 
-    let declared_size = header_int(begin_line, "size=")
+    let declared_size = begin_header_int(begin_line, "size=")
         .filter(|&v| v >= 0)
         .ok_or_else(|| malformed(message_id, "=ybegin missing or invalid size="))?;
     // A part= label in second position marks a multi-part article, where
@@ -447,7 +472,25 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
             &format!("decoded {written} bytes, header declared size={declared_size}"),
         ));
     }
-    if let Some(trailer_size) = header_int(trailer, "size=") {
+    // `header_value` yields `None` for a non-UTF-8 line just as it does for
+    // an absent key, so one stray non-UTF-8 byte in the trailer would
+    // silently skip both the size and CRC checks below. The trailer holds
+    // only ASCII `key=value` tokens (no filename), so reject it outright.
+    if std::str::from_utf8(trailer).is_err() {
+        return Err(malformed(message_id, "=yend line is not valid UTF-8"));
+    }
+    if let Some(trailer_size_text) = header_value(trailer, "size=") {
+        // A present trailer size is not optional metadata: only its
+        // *absence* may skip this check. `header_int` would collapse a
+        // parse failure (empty, non-numeric, or overflowing value) to
+        // `None` and silently skip validation, so parse the raw token
+        // here and reject anything that is not a non-negative decimal.
+        let Some(trailer_size) = trailer_size_text.parse::<i64>().ok().filter(|&v| v >= 0) else {
+            return Err(malformed(
+                message_id,
+                "=yend declared size= is not a valid non-negative integer",
+            ));
+        };
         if trailer_size != written as i64 {
             return Err(malformed(
                 message_id,
@@ -455,9 +498,20 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
             ));
         }
     }
-    if let Some(crc_text) =
-        header_value(trailer, "pcrc32=").or_else(|| header_value(trailer, "crc32="))
-    {
+    // Checksum scope: `pcrc32=` covers this decoded part, while `crc32=`
+    // covers the whole file. For a multipart article only the part checksum
+    // can be compared against the bytes decoded here; a whole-file `crc32=`
+    // must never be used as if it were the part checksum (and stays
+    // unverified until reassembly, which is out of scope for this decoder).
+    // For a single-part article part == whole file, so either field applies,
+    // with `crc32=` precedence (matching the stream decoder): `crc32=` is
+    // selected when present, `pcrc32=` only when `crc32=` is absent.
+    let crc_text = if multipart {
+        header_value(trailer, "pcrc32=")
+    } else {
+        header_value(trailer, "crc32=").or_else(|| header_value(trailer, "pcrc32="))
+    };
+    if let Some(crc_text) = crc_text {
         match u32::from_str_radix(crc_text, 16) {
             Ok(want) => {
                 let got = hash.finalize();
@@ -548,6 +602,28 @@ fn split_lines(mut rest: &[u8]) -> impl Iterator<Item = (&[u8], bool)> + '_ {
 
 fn header_int(line: &[u8], key: &str) -> Option<i64> {
     header_value(line, key)?.parse().ok()
+}
+
+/// Byte-oriented counterpart of [`header_int`] for the `=ybegin` line only.
+///
+/// The filename after `name=` is the last field on that line and may carry
+/// legacy Latin-1/CP1252 (or otherwise non-UTF-8) bytes, so UTF-8 decoding
+/// the whole line would lose the valid ASCII control fields before it.
+/// Tokens are scanned as raw bytes and the scan stops at the `name=` token:
+/// everything from there on is filename bytes, never control fields, even
+/// when it contains tag-looking ASCII. The matched value itself must still
+/// be a plain UTF-8 decimal, so numeric validation is exactly as strict as
+/// [`header_int`].
+fn begin_header_int(line: &[u8], key: &str) -> Option<i64> {
+    for token in line.split(|&b| b == b' ' || b == b'\t') {
+        if token.starts_with(b"name=") {
+            return None;
+        }
+        if let Some(value) = token.strip_prefix(key.as_bytes()) {
+            return std::str::from_utf8(value).ok()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn header_value<'a>(line: &'a [u8], key: &str) -> Option<&'a str> {

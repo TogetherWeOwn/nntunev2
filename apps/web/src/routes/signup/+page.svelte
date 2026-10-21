@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import { ApiClient, ApiError, type RegisterStartResponse } from '#lib/api/client.js';
@@ -10,6 +11,11 @@
 	} from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	// Teardown is permanent even when a transport or authenticator ignores abort.
+	const attempt = new AbortController();
+	onDestroy(() => attempt.abort());
+	let emailInput = $state<HTMLInputElement>();
+	let codeInput = $state<HTMLInputElement>();
 
 	let email = $state('');
 	let magicCode = $state('');
@@ -21,6 +27,7 @@
 		| 'code-sent'
 		| 'finishing'
 		| 'code-error'
+		| 'dismissed'
 		| 'created'
 		| 'unsupported'
 		| 'error'
@@ -32,7 +39,12 @@
 
 	async function startAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (status === 'working' || status === 'finishing' || email.trim().length === 0) return;
+		if (
+			attempt.signal.aborted ||
+			status === 'working' ||
+			status === 'finishing' ||
+			email.trim().length === 0
+		) return;
 		if (!passkeysSupported) {
 			status = 'unsupported';
 			return;
@@ -42,9 +54,15 @@
 			// The API answers the same shape for every email (never an
 			// existence oracle) and mails an inbox-proof code when the
 			// address can still enroll.
-			pending = await client.registerStart(email.trim());
+			const options = await client.registerStart(email.trim(), attempt.signal);
+			if (attempt.signal.aborted) return;
+			pending = options;
 			status = 'code-sent';
+			await tick();
+			if (attempt.signal.aborted) return;
+			codeInput?.focus();
 		} catch (error) {
+			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
 				status = 'idle';
 				return;
@@ -54,7 +72,20 @@
 		}
 	}
 
-	function startOver() {
+	/**
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable authenticator. No
+	 * finish call was sent, so the code and challenge are unconsumed
+	 * (their expiry still applies). Server (`ApiError`) paths never
+	 * carry these names.
+	 */
+	function isPasskeyDismissal(error: unknown): boolean {
+		const name = (error as { name?: unknown } | null)?.name;
+		return name === 'NotAllowedError' || name === 'AbortError';
+	}
+
+	async function startOver() {
+		if (attempt.signal.aborted || status === 'working' || status === 'finishing') return;
 		// Back to the email step with a clean slate: the recovery path
 		// when a failure after the single-use claims (expired challenge,
 		// duplicate credential) means this attempt can never succeed.
@@ -62,21 +93,31 @@
 		magicCode = '';
 		inviteCode = '';
 		status = 'idle';
+		await tick();
+		if (attempt.signal.aborted) return;
+		emailInput?.focus();
 	}
 
 	async function finishAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (pending === null || status === 'finishing' || magicCode.trim().length === 0) return;
+		if (
+			attempt.signal.aborted ||
+			pending === null ||
+			status === 'finishing' ||
+			magicCode.trim().length === 0
+		) return;
 		status = 'finishing';
 		try {
 			// The server returns only {challenge, user_id, rp_id}; the full
 			// creation options are assembled client-side (see
 			// toRegistrationOptions).
 			const credential = await navigator.credentials.create({
+				signal: attempt.signal,
 				publicKey: toCreationOptions(
 					toRegistrationOptions(pending.challenge, pending.user_id, pending.rp_id, email.trim())
 				)
 			});
+			if (attempt.signal.aborted) return;
 			if (!(credential instanceof PublicKeyCredential)) {
 				throw new Error('no public-key credential');
 			}
@@ -94,22 +135,33 @@
 			}
 			// Exact finish shape (the API rejects unknown fields): the
 			// emailed code proves inbox control before the key enrolls.
-			await client.registerFinish({
-				challenge: pending.challenge,
-				credentialId,
-				attestationObject,
-				clientDataJson: clientDataJSON,
-				magicToken: magicCode.trim(),
-				...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
-			});
+			await client.registerFinish(
+				{
+					challenge: pending.challenge,
+					credentialId,
+					attestationObject,
+					clientDataJson: clientDataJSON,
+					magicToken: magicCode.trim(),
+					...(inviteCode.trim().length > 0 ? { inviteCode: inviteCode.trim() } : {})
+				},
+				attempt.signal
+			);
+			if (attempt.signal.aborted) return;
 			invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
 			window.location.href = '/onboarding/byop';
 		} catch (error) {
+			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
 				// Keep the retryable code form and single-use challenge available.
 				status = 'code-sent';
+				return;
+			}
+			if (isPasskeyDismissal(error)) {
+				// Interrupted before any finish call: keep the typed code
+				// and the pending challenge so the user retries in place.
+				status = 'dismissed';
 				return;
 			}
 			// Generic: account creation never says which step failed. Stay
@@ -132,18 +184,27 @@
 		Create your account with a passkey — no password to phish or leak. Then connect your own
 		Usenet provider in the next step.
 	</p>
-	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'created'}
+	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'dismissed' || status === 'created'}
 		<form onsubmit={finishAccount}>
-			<p role="status">
+			<p id="signup-code-guidance" role="status">
 				We emailed a sign-in link and a code to {email.trim()} — enter the code here to
 				prove the address is yours, then touch your security key when asked. (Don't use
 				the link for this step; it signs you in instead.)
 			</p>
+			{#if status === 'dismissed'}
+				<p id="signup-dismissal" role="alert">
+					Passkey creation didn't complete. Possible reasons: You dismissed the passkey prompt,
+					it timed out, or no authenticator was available. Your code is still valid until it
+					expires. Try again when you're ready.
+				</p>
+			{/if}
 			{#if status === 'code-error'}
-				<p role="alert">
+				<p id="signup-code-error" role="alert">
 					That didn't work — re-enter the code (and invite code, if you have one) from the
 					email and try again. If it keeps failing, start over to get a fresh code.
 				</p>
+			{/if}
+			{#if status === 'code-sent' || status === 'dismissed' || status === 'code-error'}
 				<button class="nt-button nt-button--ghost" type="button" onclick={startOver}>
 					Start over
 				</button>
@@ -155,6 +216,9 @@
 					name="magic_code"
 					required
 					autocomplete="one-time-code"
+					bind:this={codeInput}
+					aria-invalid={status === 'code-error'}
+					aria-describedby={`signup-code-guidance${status === 'code-error' ? ' signup-code-error' : status === 'dismissed' ? ' signup-dismissal' : ''}`}
 					bind:value={magicCode}
 					disabled={status === 'finishing'}
 				/>
@@ -165,6 +229,7 @@
 					type="text"
 					name="invite_code"
 					autocomplete="off"
+					aria-describedby={status === 'code-error' ? 'signup-code-error' : undefined}
 					bind:value={inviteCode}
 					disabled={status === 'finishing'}
 				/>
@@ -183,6 +248,9 @@
 					name="email"
 					required
 					autocomplete="email"
+					bind:this={emailInput}
+					aria-invalid={status === 'error'}
+					aria-describedby={status === 'error' ? 'signup-email-error' : undefined}
 					bind:value={email}
 					disabled={status === 'working'}
 				/>
@@ -197,13 +265,17 @@
 			</button>
 		</form>
 	{/if}
-	{#if status === 'unsupported'}
+	{#if status === 'working'}
+		<p role="status">Sending your email code…</p>
+	{:else if status === 'finishing'}
+		<p role="status">Creating your passkey and finishing account setup…</p>
+	{:else if status === 'unsupported'}
 		<p role="status">
 			This browser does not support passkeys. <a href="/login">Sign in with an email link</a>
 			instead.
 		</p>
 	{:else if status === 'error'}
-		<p data-testid="signup-error" role="alert">Something went wrong. Try again.</p>
+		<p id="signup-email-error" data-testid="signup-error" role="alert">Something went wrong. Try again.</p>
 	{:else if status === 'created'}
 		<p role="status">Account created — taking you to provider setup…</p>
 	{/if}

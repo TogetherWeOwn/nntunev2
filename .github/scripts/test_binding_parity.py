@@ -19,8 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from binding_parity import (
     ParityError,
     check,
+    extract_bindings,
     extract_commented_bindings,
+    load_manifest,
     main,
+    parse_config,
     parse_ops_inventory,
 )
 
@@ -453,6 +456,43 @@ class TestDriftCases(unittest.TestCase):
                     )
                 )
 
+    def test_mapped_jsonc_config_cli_exits_two_with_exact_message(self):
+        # Pins the fail-closed CLI arm for mapped non-TOML configs:
+        # parse_config rejects wrangler.jsonc (binding_parity.py:309-310),
+        # main() maps ParityError to exit 2 with a single
+        # ::error::binding-parity: annotation (binding_parity.py:814-816),
+        # never exit 1 and never a traceback. Mini-repo fixtures carry only
+        # synthetic fx- resource ids and the exact-output assertion proves
+        # none of them leaks into the failure line (sensitivity).
+        manifest = MANIFEST.replace("wrangler.toml", "wrangler.jsonc")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(
+                tmp,
+                wrangler='{"name":"demo"}',
+                manifest=manifest,
+                config_name="wrangler.jsonc",
+            )
+            config = root / "workers" / "demo" / "wrangler.jsonc"
+            with self.assertRaisesRegex(
+                ParityError,
+                r"unsupported wrangler config format; TOML is required",
+            ) as raised:
+                run_check(root)
+            self.assertEqual(
+                f"{config}: unsupported wrangler config format; TOML is required",
+                str(raised.exception),
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertEqual(
+                f"::error::binding-parity: {config}: "
+                "unsupported wrangler config format; TOML is required\n",
+                output.getvalue(),
+            )
+            self.assertNotIn("Traceback", output.getvalue())
+            self.assertNotIn("fx-", output.getvalue())
+
     def test_duplicate_environment_aliases_fail_closed(self):
         wrangler = MATCHING_WRANGLER + "\n[env.prod]\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -590,6 +630,57 @@ reason = "fixture: value fix owned elsewhere"
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ParityError):
                 run_check(make_repo(tmp, wrangler=wrangler))
+
+    def test_duplicate_r2_binding_diagnostic_pins_message(self):
+        # Two [[r2_buckets]] sharing binding DATA must fail closed with the
+        # exact duplicate-binding diagnostic (binding_parity.py:140-143).
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-a"\n'
+            '[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-b"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(
+                ParityError, r"duplicate binding 'DATA' \(r2\)"
+            ):
+                run_check(root)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(2, main(["--root", str(root)]))
+            self.assertIn("duplicate binding 'DATA' (r2)", output.getvalue())
+            self.assertIn("::error::binding-parity:", output.getvalue())
+            self.assertNotIn("Traceback", output.getvalue())
+
+    def test_same_binding_name_across_types_passes(self):
+        # The duplicate key is (type, binding): same name across different
+        # types must not raise (no false positive).
+        out = extract_bindings(
+            {
+                "r2_buckets": [{"binding": "DATA", "bucket_name": "fx-a"}],
+                "kv_namespaces": [{"binding": "DATA", "id": "fx-kv"}],
+            }
+        )
+        self.assertIn(("r2", "DATA"), out)
+        self.assertIn(("kv", "DATA"), out)
+        wrangler = MATCHING_WRANGLER + (
+            '\n[[env.staging.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-a"\n'
+            '[[env.staging.kv_namespaces]]\nbinding = "DATA"\nid = "fx-kv"\n'
+            '[[env.production.r2_buckets]]\nbinding = "DATA"\n'
+            'bucket_name = "fx-b"\n'
+            '[[env.production.kv_namespaces]]\nbinding = "DATA"\n'
+            'id = "fx-kv-prod"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            effective, _, _ = parse_config(config)
+            self.assertIn(("r2", "DATA"), effective["staging"])
+            self.assertIn(("kv", "DATA"), effective["staging"])
+            self.assertIn(("r2", "DATA"), effective["prod"])
+            self.assertIn(("kv", "DATA"), effective["prod"])
 
     def test_unknown_binding_table_is_flagged_not_ignored(self):
         wrangler = MATCHING_WRANGLER + (
@@ -794,6 +885,224 @@ prod = "fx-jobs"
             self.assertIn("::error::binding-parity:", output.getvalue())
             self.assertNotIn("Traceback", output.getvalue())
 
+    def assert_queues_shape_fails_closed(self, wrangler, pattern):
+        # Fail-closed pin for the queues not-a-table family
+        # (binding_parity.py:158-170): exit 2 with the exact diagnostic on
+        # the ::error::binding-parity: annotation, never exit 1 and never
+        # an uncaught traceback. Synthetic fixture ids must never leak.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, pattern):
+                run_check(root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_queues_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.queues] is malformed, not absent: it must
+        # fail closed instead of being silently ignored.
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nqueues = "oops"\n', 1
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues: not a table"
+        )
+
+    def test_queues_consumer_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A queues.consumers list entry that is not a table is malformed,
+        # not absent: it must fail closed.
+        wrangler = MATCHING_WRANGLER + (
+            "\n[env.staging.queues]\nconsumers = [\"oops\"]\n"
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues\.consumers: entry is not a table"
+        )
+
+    def test_queues_consumer_entry_without_queue_fails_closed_with_exit_two(self):
+        # A consumer entry with an empty queue names no queue: it must fail
+        # closed with the entry-without-queue diagnostic (a missing key hits
+        # the adjacent 'queue' must be a string arm instead).
+        wrangler = MATCHING_WRANGLER + (
+            "\n[env.staging.queues]\n"
+            "[[env.staging.queues.consumers]]\nqueue = \"\"\n"
+        )
+        self.assert_queues_shape_fails_closed(
+            wrangler, r"queues\.consumers: entry without 'queue'"
+        )
+
+    def assert_binding_table_fails_closed(self, wrangler, pattern, absent=()):
+        # Fail-closed pin for the binding-table not-a-table family
+        # (binding_parity.py:137,181,197,202): exit 2 with the exact diagnostic on
+        # the ::error::binding-parity: annotation, never exit 1 and never
+        # an uncaught traceback. Synthetic fixture ids must never leak.
+        # `absent` holds sibling-family patterns that must NOT match, proving
+        # each diagnostic is sensitive to its own arm only.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            with self.assertRaisesRegex(ParityError, pattern) as ctx:
+                run_check(root)
+            for other in absent:
+                self.assertNotRegex(str(ctx.exception), other)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            for other in absent:
+                self.assertNotRegex(combined, other)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_env_staging_level_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table env.staging level is malformed, not absent: it must fail
+        # closed with the table-level diagnostic via main()
+        # (binding_parity.py:137).
+        head, _, _ = MATCHING_WRANGLER.partition("[env.staging]")
+        _, _, prod_tail = MATCHING_WRANGLER.partition("[env.production]")
+        wrangler = head + '[env]\nstaging = "oops"\n[env.production]' + prod_tail
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"wrangler table level is not a table",
+            absent=[
+                r"durable_objects: not a table",
+                r"unsafe: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_durable_objects_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.durable_objects] is malformed, not absent:
+        # it must fail closed instead of being silently ignored
+        # (binding_parity.py:181).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\ndurable_objects = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"durable_objects: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"unsafe: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_unsafe_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.unsafe] is malformed, not absent: it must
+        # fail closed instead of being silently ignored (binding_parity.py:197).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nunsafe = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"unsafe: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"durable_objects: not a table",
+                r"logfwdr: not a table",
+            ],
+        )
+
+    def test_logfwdr_not_a_table_fails_closed_with_exit_two(self):
+        # Non-table [env.staging.logfwdr] is malformed, not absent: it must
+        # fail closed instead of being silently ignored (binding_parity.py:202).
+        wrangler = MATCHING_WRANGLER.replace(
+            "[env.staging]\n", '[env.staging]\nlogfwdr = "oops"\n', 1
+        )
+        self.assert_binding_table_fails_closed(
+            wrangler,
+            r"logfwdr: not a table",
+            absent=[
+                r"wrangler table level is not a table",
+                r"durable_objects: not a table",
+                r"unsafe: not a table",
+            ],
+        )
+
+    def assert_per_entry_not_a_table_fails_closed(self, table, type_name):
+        # Fail-closed pin for the per-entry not-a-table arm
+        # (binding_parity.py:98-100): a binding-list entry that is not a
+        # table is malformed, not absent: it must fail closed instead of
+        # being silently ignored. Exit 2 with the exact diagnostic on the
+        # ::error::binding-parity: annotation, never exit 1 and never an
+        # uncaught traceback. The exact-output assertion proves
+        # sensitivity: rewording the message flips the pin. Synthetic
+        # fixture ids must never leak.
+        wrangler = (
+            'name = "demo"\nmain = "shim.mjs"\n'
+            'compatibility_date = "2026-10-01"\n\n'
+            "[env.staging]\n"
+            f'{table} = ["oops"]\n\n'
+            "[env.production]\n"
+            '[[env.production.r2_buckets]]\nbinding = "AUDIO_CACHE"\n'
+            'bucket_name = "fx-audio-prod"\n'
+            '[[env.production.hyperdrive]]\nbinding = "DB"\n'
+            'id = "fx-hd-prod"\n'
+        )
+        pattern = (
+            rf"{re.escape(table)}: entry is not a table "
+            rf"\({re.escape(type_name)}\)"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp, wrangler=wrangler)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            with self.assertRaisesRegex(ParityError, pattern):
+                run_check(root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                code = main(["--root", str(root)])
+            self.assertEqual(2, code)
+            self.assertNotEqual(1, code)
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("::error::binding-parity:", stdout.getvalue())
+            self.assertRegex(combined, pattern)
+            self.assertEqual(
+                f"::error::binding-parity: {config}: {table}: "
+                f"entry is not a table ({type_name})\n",
+                stdout.getvalue(),
+            )
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("fx-", combined)
+
+    def test_r2_buckets_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table r2_buckets list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed("r2_buckets", "r2")
+
+    def test_kv_namespaces_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table kv_namespaces list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed("kv_namespaces", "kv")
+
+    def test_hyperdrive_entry_not_a_table_fails_closed_with_exit_two(self):
+        # A non-table hyperdrive list entry is malformed, not absent: it
+        # must fail closed with the per-entry diagnostic
+        # (binding_parity.py:98-100).
+        self.assert_per_entry_not_a_table_fails_closed(
+            "hyperdrive", "hyperdrive"
+        )
+
     def test_non_string_binding_fails_closed_with_exit_two(self):
         wrangler = MATCHING_WRANGLER.replace(
             "[[env.staging.hyperdrive]]",
@@ -920,6 +1229,89 @@ prod = "fx-jobs"
                 run_check(root)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(2, main(["--root", str(root)]))
+
+
+class TestUnreadableInputs(unittest.TestCase):
+    """Pin fail-closed exits for unreadable/invalid-UTF8 inputs.
+
+    Covers binding_parity.py parse_config (config read), load_manifest
+    (manifest read) and check (ops inventory read): OSError (directory
+    stand-ins) and UnicodeDecodeError (invalid-UTF8 byte fixtures) must
+    raise ParityError naming the file and exit 2 via main, with no
+    traceback on stdout.
+    """
+
+    def assert_check_fails_closed_with_exit_two(self, root, pattern):
+        with self.assertRaisesRegex(ParityError, pattern):
+            run_check(root)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(2, main(["--root", str(root)]))
+        self.assertIn("::error::binding-parity:", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_invalid_utf8_wrangler_config_names_config_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            config = root / "workers" / "demo" / "wrangler.toml"
+            config.write_bytes(b'name = "demo"\n\xff\xfe not utf-8\n')
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"wrangler\.toml.*cannot parse wrangler config"
+            )
+
+    def test_wrangler_config_directory_names_config(self):
+        # check() reports a directory at the mapped config path as missing
+        # (is_file guard), so pin the parse_config OSError branch directly:
+        # a directory named wrangler.toml raises IsADirectoryError (OSError).
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "wrangler.toml"
+            config_dir.mkdir()
+            with self.assertRaisesRegex(
+                ParityError, r"wrangler\.toml.*cannot parse wrangler config"
+            ):
+                parse_config(config_dir)
+
+    def test_invalid_utf8_manifest_names_manifest_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            manifest = root / ".github" / "scripts" / "binding_manifest.toml"
+            manifest.write_bytes(b'[[worker]]\nname = "\xff\xfe"\n')
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"binding_manifest\.toml.*cannot parse manifest"
+            )
+
+    def test_directory_as_manifest_names_manifest_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            manifest = root / ".github" / "scripts" / "binding_manifest.toml"
+            manifest.unlink()
+            manifest.mkdir()
+            with self.assertRaisesRegex(
+                ParityError, r"binding_manifest\.toml.*cannot parse manifest"
+            ):
+                load_manifest(manifest)
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"binding_manifest\.toml.*cannot parse manifest"
+            )
+
+    def test_invalid_utf8_ops_inventory_names_inventory_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            ops = root / "docs" / "ops.md"
+            ops.write_bytes(b"# ops\n\xff\xfe not utf-8\n")
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"ops\.md.*cannot read inventory"
+            )
+
+    def test_directory_as_ops_inventory_names_inventory_and_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_repo(tmp)
+            ops = root / "docs" / "ops.md"
+            ops.unlink()
+            ops.mkdir()
+            self.assert_check_fails_closed_with_exit_two(
+                root, r"ops\.md.*cannot read inventory"
+            )
 
 
 if __name__ == "__main__":

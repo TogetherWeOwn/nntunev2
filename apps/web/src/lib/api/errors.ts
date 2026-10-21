@@ -1,6 +1,8 @@
 /**
  * Shared parsing for the workers' structured error envelope
- * (`{code, message, retryable}`, registered in `docs/api-errors.md`).
+ * (`{code, message, retryable}`, registered in `docs/api-errors.md`),
+ * plus the one client-local code below that the web clients emit
+ * themselves and never receive from a worker.
  *
  * Unknown codes fall back to the documented generic (`request_failed`
  * client-side) while keeping the server `message` for display. Legacy
@@ -11,11 +13,15 @@
 /** Every code in the `docs/api-errors.md` registry. */
 export const KNOWN_ERROR_CODES = new Set([
 	'unauthorized',
+	'reauth_required',
 	'provider_auth_expired',
 	'plan_limit_exceeded',
 	'forbidden',
 	'not_found',
+	'conflict',
+	'account_deleting',
 	'invalid_request',
+	'MB_SEARCH_EMPTY_QUERY',
 	'payload_too_large',
 	'range_not_satisfiable',
 	'validation_failed',
@@ -24,8 +30,24 @@ export const KNOWN_ERROR_CODES = new Set([
 	'corrupt_content',
 	'upstream_unavailable',
 	'upstream_circuit_open',
+	'transport_port_not_allowed',
 	'service_unavailable'
 ]);
+
+/**
+ * Client-local codes the web app emits itself and never receives from a
+ * worker: `request_timeout` from `ApiClient.timeoutError()` (and the same
+ * code from `billingClient.requestJson`'s deadline) at status 504,
+ * retryable, never a paywall or auth classification.
+ *
+ * Intentionally NOT in `docs/api-errors.md` nor `KNOWN_ERROR_CODES`:
+ * no worker emits it, so there is no owning worker and no `Adding a
+ * code` worker-registry entry to keep in drift. `parseErrorBody`
+ * round-trips these codes with the same retryable rule as registered
+ * codes (explicit boolean wins, otherwise the status policy, which is
+ * retryable at 504); every other code keeps its existing behavior.
+ */
+export const CLIENT_LOCAL_ERROR_CODES = new Set(['request_timeout']);
 
 export interface ParsedApiError {
 	code: string;
@@ -40,6 +62,7 @@ export function codeFromStatus(status: number): string {
 	if (status === 402) return 'plan_limit_exceeded';
 	if (status === 403) return 'forbidden';
 	if (status === 404) return 'not_found';
+	if (status === 409) return 'conflict';
 	if (status === 413) return 'payload_too_large';
 	if (status === 416) return 'range_not_satisfiable';
 	if (status === 422) return 'validation_failed';
@@ -79,7 +102,10 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 			};
 		}
 	}
-	if (typeof record.code === 'string' && KNOWN_ERROR_CODES.has(record.code)) {
+	if (
+		typeof record.code === 'string' &&
+		(KNOWN_ERROR_CODES.has(record.code) || CLIENT_LOCAL_ERROR_CODES.has(record.code))
+	) {
 		return {
 			code: record.code,
 			message,
@@ -96,13 +122,4 @@ export function parseErrorBody(body: unknown, status: number): ParsedApiError {
 	}
 	// Legacy body without a code: derive category and retry policy from status.
 	return { code: fallback.code, message, retryable: fallback.retryable };
-}
-
-/** Read and parse an error `Response` body exactly once. */
-export async function parseErrorResponse(response: Response): Promise<ParsedApiError> {
-	try {
-		return parseErrorBody(await response.json(), response.status);
-	} catch {
-		return parseErrorBody(null, response.status);
-	}
 }

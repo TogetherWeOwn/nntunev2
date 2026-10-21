@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
@@ -6,10 +7,16 @@
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	// Teardown is permanent even when a transport or authenticator ignores abort.
+	const attempt = new AbortController();
+	onDestroy(() => attempt.abort());
+	let emailInput = $state<HTMLInputElement>();
 
 	let email = $state('');
 	let status = $state<'idle' | 'sending' | 'sent' | 'error'>('idle');
-	let passkeyStatus = $state<'idle' | 'working' | 'unsupported' | 'error'>('idle');
+	let passkeyStatus = $state<
+		'idle' | 'working' | 'unsupported' | 'dismissed' | 'error' | 'email-required'
+	>('idle');
 
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
@@ -17,20 +24,37 @@
 
 	async function sendMagicLink(event: SubmitEvent) {
 		event.preventDefault();
-		if (status === 'sending') return;
+		if (attempt.signal.aborted || status === 'sending') return;
 		status = 'sending';
 		try {
-			await client.requestMagicLink(email.trim());
+			await client.requestMagicLink(email.trim(), attempt.signal);
+			if (attempt.signal.aborted) return;
 			// Generic either way: the API never reveals which emails exist.
 			status = 'sent';
 		} catch (error) {
+			if (attempt.signal.aborted) return;
 			status = error instanceof ApiError && error.paywall ? 'idle' : 'error';
 		}
 	}
 
+	/**
+	 * Retryable ceremony interruption: `NotAllowedError` / `AbortError`
+	 * can mean dismissal, timeout, or an unavailable passkey. The name
+	 * alone cannot identify the cause. Server (`ApiError`) paths never
+	 * carry these names, so login stays non-enumerating.
+	 */
+	function isPasskeyDismissal(error: unknown): boolean {
+		const name = (error as { name?: unknown } | null)?.name;
+		return name === 'NotAllowedError' || name === 'AbortError';
+	}
+
 	async function signInWithPasskey() {
-		if (passkeyStatus === 'working' || email.trim().length === 0) {
-			passkeyStatus = 'error';
+		if (passkeyStatus === 'working') return;
+		if (attempt.signal.aborted) return;
+		const attemptedEmail = email.trim();
+		if (!emailInput?.reportValidity() || attemptedEmail.length === 0) {
+			passkeyStatus = attemptedEmail.length === 0 ? 'email-required' : 'idle';
+			emailInput?.focus();
 			return;
 		}
 		if (!passkeysSupported) {
@@ -42,14 +66,17 @@
 			// Email-first login: the API answers the same shape for known
 			// and unknown addresses (never an oracle) with an empty
 			// allow-list, and the browser offers any local credential.
-			const options = await client.loginStart(email.trim());
+			const options = await client.loginStart(attemptedEmail, attempt.signal);
+			if (attempt.signal.aborted) return;
 			const assertion = await navigator.credentials.get({
+				signal: attempt.signal,
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
 					rpId: options.rp_id,
 					allowCredentials: []
 				})
 			});
+			if (attempt.signal.aborted) return;
 			if (!(assertion instanceof PublicKeyCredential)) {
 				throw new Error('no public-key credential');
 			}
@@ -68,19 +95,34 @@
 				throw new Error('credential missing assertion fields');
 			}
 			// Exact finish shape (the API rejects unknown fields).
-			await client.loginFinish({
-				challenge: options.challenge,
-				credentialId,
-				authenticatorData,
-				clientDataJson: clientDataJSON,
-				signature
-			});
-			stashSignedInEmail(email.trim());
+			await client.loginFinish(
+				{
+					challenge: options.challenge,
+					credentialId,
+					authenticatorData,
+					clientDataJson: clientDataJSON,
+					signature
+				},
+				attempt.signal
+			);
+			if (attempt.signal.aborted) return;
+			stashSignedInEmail(attemptedEmail);
 			invalidateLibraryCache();
 			window.location.href = '/onboarding/provider';
 		} catch (error) {
+			if (attempt.signal.aborted) return;
+			if (error instanceof ApiError && error.paywall) {
+				passkeyStatus = 'idle';
+				return;
+			}
+			if (isPasskeyDismissal(error)) {
+				// Interrupted ceremony: same possible causes for every
+				// address, so login stays non-enumerating.
+				passkeyStatus = 'dismissed';
+				return;
+			}
 			// Generic: login errors stay non-enumerating, like the API.
-			passkeyStatus = error instanceof ApiError && error.paywall ? 'idle' : 'error';
+			passkeyStatus = 'error';
 		}
 	}
 </script>
@@ -96,11 +138,25 @@
 	<section aria-labelledby="passkey-heading">
 		<h2 id="passkey-heading">Passkey</h2>
 		<p>Enter your email below, then use your passkey.</p>
-		<button class="nt-button" type="button" onclick={signInWithPasskey}>
+		<button
+			class="nt-button"
+			type="button"
+			onclick={signInWithPasskey}
+			disabled={passkeyStatus === 'working'}
+		>
 			Sign in with passkey
 		</button>
-		{#if passkeyStatus === 'unsupported'}
+		{#if passkeyStatus === 'working'}
+			<p role="status">Signing in with your passkey…</p>
+		{:else if passkeyStatus === 'email-required'}
+			<p role="status">Enter your email to continue with passkey sign-in.</p>
+		{:else if passkeyStatus === 'unsupported'}
 			<p role="status">This browser does not support passkeys — use an email link instead.</p>
+		{:else if passkeyStatus === 'dismissed'}
+			<p role="alert">
+				Passkey sign-in didn't complete. Possible reasons: You dismissed the passkey prompt,
+				it timed out, or no usable passkey was available. Try again or use an email link.
+			</p>
 		{:else if passkeyStatus === 'error'}
 			<p role="alert">Sign-in failed. Try again or use an email link.</p>
 		{/if}
@@ -116,8 +172,9 @@
 					name="email"
 					required
 					autocomplete="email"
+					bind:this={emailInput}
 					bind:value={email}
-					disabled={status === 'sending'}
+					disabled={status === 'sending' || passkeyStatus === 'working'}
 				/>
 			</label>
 			<button class="nt-button nt-button--ghost" type="submit" disabled={status === 'sending'}>

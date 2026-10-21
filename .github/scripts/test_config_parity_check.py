@@ -9,11 +9,16 @@ fails with exit 1. Run from the repo root:
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config_parity_check import U64_MAX, check_value, validate_env
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github" / "scripts" / "config_parity_check.py"
@@ -30,7 +35,7 @@ def run_check(staging, prod, schema=SCHEMA):
         text=True,
         cwd=str(ROOT),
     )
-    return proc.returncode, proc.stdout
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def load_schema():
@@ -43,28 +48,28 @@ def write_json(path, obj):
 
 class ParityCheckTests(unittest.TestCase):
     def test_shipped_staging_vs_prod_is_green(self):
-        code, out = run_check(ROOT / "config" / "prod.json", ROOT / "config" / "prod.json")
+        code, out, _ = run_check(ROOT / "config" / "prod.json", ROOT / "config" / "prod.json")
         self.assertEqual(code, 0, out)
-        code, out = run_check(STAGING, ROOT / "config" / "prod.json")
+        code, out, _ = run_check(STAGING, ROOT / "config" / "prod.json")
         self.assertEqual(code, 0, out)
         self.assertIn("OK", out)
 
     def test_matching_fixtures_are_green(self):
-        code, out = run_check(STAGING, FIXTURES / "match-prod.json")
+        code, out, _ = run_check(STAGING, FIXTURES / "match-prod.json")
         self.assertEqual(code, 0, out)
 
     def test_differing_values_stay_green(self):
         # Values may differ per environment; only keys and types must match.
-        code, out = run_check(STAGING, FIXTURES / "values-differ-prod.json")
+        code, out, _ = run_check(STAGING, FIXTURES / "values-differ-prod.json")
         self.assertEqual(code, 0, out)
 
     def test_missing_required_key_fails(self):
-        code, out = run_check(STAGING, FIXTURES / "drift-missing-key.json")
+        code, out, _ = run_check(STAGING, FIXTURES / "drift-missing-key.json")
         self.assertEqual(code, 1, out)
         self.assertIn("missing required key", out)
 
     def test_type_mismatch_fails(self):
-        code, out = run_check(FIXTURES / "drift-type-mismatch.json", FIXTURES / "match-prod.json")
+        code, out, _ = run_check(FIXTURES / "drift-type-mismatch.json", FIXTURES / "match-prod.json")
         self.assertEqual(code, 1, out)
         self.assertIn("session.ttl_secs", out)
 
@@ -72,7 +77,7 @@ class ParityCheckTests(unittest.TestCase):
         # Both sides carry the SAME wrong type (string where u64 belongs),
         # so the staging-vs-prod type-diff fallback cannot see it: only the
         # per-side schema validation catches this. Pins check_value.
-        code, out = run_check(
+        code, out, _ = run_check(
             FIXTURES / "drift-type-mismatch.json",
             FIXTURES / "drift-type-mismatch.json",
         )
@@ -80,7 +85,7 @@ class ParityCheckTests(unittest.TestCase):
         self.assertIn("expected u64", out)
 
     def test_undeclared_key_fails(self):
-        code, out = run_check(FIXTURES / "drift-extra-key.json", FIXTURES / "match-prod.json")
+        code, out, _ = run_check(FIXTURES / "drift-extra-key.json", FIXTURES / "match-prod.json")
         self.assertEqual(code, 1, out)
         self.assertIn("undeclared key", out)
 
@@ -103,7 +108,7 @@ class ParityCheckTests(unittest.TestCase):
             write_json(schema_path, schema)
             write_json(staging_path, staging)
             write_json(prod_path, prod)
-            code, out = run_check(staging_path, prod_path, schema=schema_path)
+            code, out, _ = run_check(staging_path, prod_path, schema=schema_path)
         self.assertEqual(code, 1, out)
         self.assertIn("parity: key mb.search_limit", out)
 
@@ -119,7 +124,7 @@ class ParityCheckTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as tmp:
                     schema_path = Path(tmp) / "schema.json"
                     write_json(schema_path, schema)
-                    code, out = run_check(STAGING, ROOT / "config" / "prod.json",
+                    code, out, _ = run_check(STAGING, ROOT / "config" / "prod.json",
                                           schema=schema_path)
                 self.assertEqual(code, 1, out)
                 self.assertIn("schema_version must be 1", out)
@@ -129,7 +134,7 @@ class ParityCheckTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 schema_path = Path(tmp) / "schema.json"
                 write_json(schema_path, schema)
-                code, out = run_check(STAGING, ROOT / "config" / "prod.json",
+                code, out, _ = run_check(STAGING, ROOT / "config" / "prod.json",
                                       schema=schema_path)
             self.assertEqual(code, 1, out)
             self.assertIn("default", out)
@@ -139,7 +144,7 @@ class ParityCheckTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 schema_path = Path(tmp) / "schema.json"
                 write_json(schema_path, schema)
-                code, out = run_check(STAGING, ROOT / "config" / "prod.json",
+                code, out, _ = run_check(STAGING, ROOT / "config" / "prod.json",
                                       schema=schema_path)
             self.assertEqual(code, 1, out)
             self.assertIn("env_var", out)
@@ -166,18 +171,117 @@ class ParityCheckTests(unittest.TestCase):
             write_json(schema_path, schema)
             write_json(staging_path, staging)
             write_json(prod_path, prod)
-            code, out = run_check(staging_path, prod_path, schema=schema_path)
+            code, out, _ = run_check(staging_path, prod_path, schema=schema_path)
             self.assertEqual(code, 0, out)
 
             staging["test.bool_flag"] = 1
             write_json(staging_path, staging)
-            code, out = run_check(staging_path, prod_path, schema=schema_path)
+            code, out, _ = run_check(staging_path, prod_path, schema=schema_path)
         self.assertEqual(code, 1, out)
         self.assertIn("expected bool, got int", out)
 
+    def test_check_value_verdict_table(self):
+        # Direct-call pin for every check_value arm (config_parity_check.py:
+        # 96-111): each case asserts the exact error string or None, so a
+        # weakened validator cannot stay green.
+        cases = [
+            ("u64 bool is not a u64", "k", "u64", True,
+             "k: expected u64, got bool"),
+            ("u64 negative is out of range", "k", "u64", -1,
+             "k: u64 out of range"),
+            ("u64 2**64 is out of range", "k", "u64", 2**64,
+             "k: u64 out of range"),
+            ("u64 float is not a u64", "k", "u64", 1.5,
+             "k: expected u64, got float"),
+            ("u64 zero is valid", "k", "u64", 0, None),
+            ("u64 max is valid", "k", "u64", U64_MAX, None),
+            ("empty string is empty", "k", "string", "",
+             "k: required string is empty"),
+            ("blank string is empty", "k", "string", "  ",
+             "k: required string is empty"),
+            ("string int is not a string", "k", "string", 5,
+             "k: expected string, got int"),
+            ("non-empty string is valid", "k", "string", "ok", None),
+            ("bogus type is unknown", "k", "bogus", "x",
+             "k: unknown declared type 'bogus'"),
+        ]
+        for label, key, declared, value, want in cases:
+            with self.subTest(label):
+                self.assertEqual(want, check_value(key, declared, value))
+
+    def test_list_root_fixture_reports_object_error(self):
+        # Direct-call pin for validate_env's non-dict root arm: a JSON array
+        # root reports the exact object error, never a traceback or pass.
+        self.assertEqual(
+            ["staging: fixture root must be a JSON object"],
+            validate_env("staging", [], {}),
+        )
+
+    def test_empty_required_string_cli_fails_naming_key(self):
+        # CLI wiring: a staging fixture with an empty required string
+        # (auth.rp_id) exits 1 and names the key. Tmp-dir JSON only; the
+        # shipped config/ fixtures stay read-only.
+        staging = json.loads(STAGING.read_text(encoding="utf-8"))
+        staging["auth.rp_id"] = ""
+        prod = json.loads((ROOT / "config" / "prod.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            staging_path = Path(tmp) / "staging.json"
+            prod_path = Path(tmp) / "prod.json"
+            write_json(staging_path, staging)
+            write_json(prod_path, prod)
+            code, out, _ = run_check(staging_path, prod_path)
+        self.assertEqual(code, 1, out)
+        self.assertIn("auth.rp_id", out)
+        self.assertIn("required string is empty", out)
+
     def test_missing_file_is_input_error(self):
-        code, _ = run_check(STAGING, FIXTURES / "does-not-exist.json")
+        code, _, _ = run_check(STAGING, FIXTURES / "does-not-exist.json")
         self.assertEqual(code, 2)
+
+    def test_malformed_staging_json_is_input_error(self):
+        # Truncated staging JSON must exit 2 with an input error naming the
+        # file, never a traceback or a pass. Tmp-dir fixture only; the
+        # shipped config/ fixtures stay read-only.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_staging = Path(tmp) / "staging.json"
+            bad_staging.write_text('{"schema_version": 1, "keys": {', encoding="utf-8")
+            code, out, err = run_check(bad_staging, ROOT / "config" / "prod.json")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("config-parity: input error:", err)
+        self.assertIn("staging file is not valid JSON", err)
+        self.assertIn(str(bad_staging), err)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_malformed_prod_json_names_prod_file(self):
+        # Same malformed-input pin for the prod side: the diagnostic must
+        # carry the prod label and prod path, not the staging one.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_prod = Path(tmp) / "prod.json"
+            bad_prod.write_text('{"mb.search_limit": 10,', encoding="utf-8")
+            code, out, err = run_check(STAGING, bad_prod)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("config-parity: input error:", err)
+        self.assertIn("prod file is not valid JSON", err)
+        self.assertIn(str(bad_prod), err)
+        self.assertNotIn("staging file is not valid JSON", err)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_directory_schema_path_is_input_error(self):
+        # A directory cannot be JSON-loaded (IsADirectoryError is an
+        # OSError): portable stand-in for an unreadable schema file that
+        # works even when running as root (chmod 0 would still be
+        # readable). Must exit 2 with an input error, never a traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            schema_dir = Path(tmp) / "schema-dir"
+            schema_dir.mkdir()
+            code, out, err = run_check(
+                STAGING, ROOT / "config" / "prod.json", schema=schema_dir
+            )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("config-parity: input error:", err)
+        self.assertIn("schema file unreadable", err)
+        self.assertIn(str(schema_dir), err)
+        self.assertNotIn("Traceback", out + err)
 
 
 if __name__ == "__main__":

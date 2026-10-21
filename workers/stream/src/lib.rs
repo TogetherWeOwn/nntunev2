@@ -25,6 +25,8 @@
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //! - [`probe`]: ingest segment-availability probe (`STAT` on the ingest
 //!   lane), served by the `NntpPool` Durable Object.
+//! - [`body`]: ingest article-body fetch (`BODY`, one segment per call on
+//!   the ingest lane), served by the same Durable Object.
 //! - `stampede` (native only, compiled out on wasm32): singleflight
 //!   stampede-guard primitive (one upstream fetch per concurrent segment)
 //!   with waiter-timeout re-election. Not yet wired into the play path.
@@ -37,6 +39,7 @@
 //! and `cargo test` never link the Workers runtime.
 
 pub mod api_error;
+pub mod body;
 pub mod cache;
 pub mod grant;
 pub mod meter;
@@ -48,6 +51,7 @@ pub mod prefetch;
 pub mod probe;
 pub mod range;
 pub mod routes;
+pub mod trace;
 pub mod yenc;
 
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown

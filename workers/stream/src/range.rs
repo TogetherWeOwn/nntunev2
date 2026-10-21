@@ -35,12 +35,26 @@ pub enum RangeOutcome {
     Unsatisfiable,
 }
 
+/// Parse an all-digit numeral: nonempty ASCII digits only. Bare
+/// `str::parse::<u64>()` would also accept a leading `+`, and trimming
+/// would wash whitespace, so the digit check comes first; overflow still
+/// fails the trailing `parse`.
+fn parse_digits(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Parse `header` (the value of the `Range` header, if any) for a body of
 /// `len` bytes.
 pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
     let spec = match header {
         Some(h) => match h.trim().strip_prefix("bytes=") {
-            Some(s) => s.trim(),
+            // The outer trim is HTTP outer-whitespace only; the numerals
+            // themselves are taken verbatim so interior whitespace (or a
+            // leading `+`) falls back to `Full` below.
+            Some(s) => s,
             None => return RangeOutcome::Full,
         },
         None => return RangeOutcome::Full,
@@ -50,21 +64,19 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
         return RangeOutcome::Full;
     }
     let (start_s, end_s) = match spec.split_once('-') {
-        Some(pair) => (pair.0.trim(), pair.1.trim()),
+        Some(pair) => pair,
         None => return RangeOutcome::Full,
     };
     if start_s.is_empty() {
         // Suffix range: the last N bytes.
-        let n: u64 = match end_s.parse() {
-            Ok(n) => n,
-            Err(_) => return RangeOutcome::Full,
+        let n: u64 = match parse_digits(end_s) {
+            Some(n) => n,
+            None => return RangeOutcome::Full,
         };
         if len == 0 || n == 0 {
-            return if len == 0 {
-                RangeOutcome::Unsatisfiable
-            } else {
-                RangeOutcome::Full
-            };
+            // A zero-length suffix (`bytes=-0`) requests no bytes, so it is
+            // unsatisfiable on any body, not a full-body delivery.
+            return RangeOutcome::Unsatisfiable;
         }
         let n = n.min(len);
         RangeOutcome::Partial(ByteRange {
@@ -72,9 +84,9 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
             end: len - 1,
         })
     } else {
-        let start: u64 = match start_s.parse() {
-            Ok(s) => s,
-            Err(_) => return RangeOutcome::Full,
+        let start: u64 = match parse_digits(start_s) {
+            Some(s) => s,
+            None => return RangeOutcome::Full,
         };
         if end_s.is_empty() {
             if start >= len {
@@ -85,9 +97,9 @@ pub fn parse(header: Option<&str>, len: u64) -> RangeOutcome {
                 end: len - 1,
             })
         } else {
-            let end: u64 = match end_s.parse() {
-                Ok(e) => e,
-                Err(_) => return RangeOutcome::Full,
+            let end: u64 = match parse_digits(end_s) {
+                Some(e) => e,
+                None => return RangeOutcome::Full,
             };
             if start > end {
                 return RangeOutcome::Full;
@@ -174,5 +186,58 @@ mod tests {
     fn content_range_header_value() {
         let range = ByteRange { start: 10, end: 99 };
         assert_eq!(content_range_value(range, 100), "bytes 10-99/100");
+    }
+
+    #[test]
+    fn non_digit_numerals_fall_back_to_full_body() {
+        // `u64::from_str` accepts a leading `+`, and the old trims washed
+        // surrounding whitespace: both must resolve to `Full`, never
+        // `Partial` (and never panic).
+        assert_eq!(parse(Some("bytes=+0-9"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes=0-+9"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes= 0-9"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes=0 -9"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes=0- 9"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes=-+5"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes=- 5"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes= -5"), 100), RangeOutcome::Full);
+        // Empty numerals were and stay `Full`.
+        assert_eq!(parse(Some("bytes=-"), 100), RangeOutcome::Full);
+        assert_eq!(parse(Some("bytes="), 100), RangeOutcome::Full);
+    }
+
+    #[test]
+    fn digit_only_shapes_keep_partial_delivery() {
+        assert_eq!(
+            parse(Some("bytes=0-9"), 100),
+            RangeOutcome::Partial(ByteRange { start: 0, end: 9 })
+        );
+        assert_eq!(
+            parse(Some("bytes=007-009"), 100),
+            RangeOutcome::Partial(ByteRange { start: 7, end: 9 })
+        );
+        assert_eq!(
+            parse(Some("bytes=-5"), 100),
+            RangeOutcome::Partial(ByteRange { start: 95, end: 99 })
+        );
+        // Outer header whitespace is still the HTTP layer's, not a numeral.
+        assert_eq!(
+            parse(Some("  bytes=0-9  "), 100),
+            RangeOutcome::Partial(ByteRange { start: 0, end: 9 })
+        );
+    }
+
+    #[test]
+    fn range_numerals_require_a_digit_predicate_pin() {
+        const SRC: &str = include_str!("range.rs");
+        // Only the production section: the needle literal below lives in
+        // this test module, so searching the whole file would self-match.
+        let prod = SRC.split("#[cfg(test)]").next().unwrap_or(SRC);
+        assert!(
+            prod.contains("is_ascii_digit"),
+            "range.rs must gate numerals on an ASCII-digit predicate: bare \
+             `str::parse::<u64>()` accepts a leading `+`, so a revert to it \
+             would silently re-admit `bytes=+0-9` as partial"
+        );
     }
 }

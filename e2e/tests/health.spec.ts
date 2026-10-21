@@ -1,7 +1,13 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { API, TESTIDS } from '../helpers/contract.js';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
-import { apiGet, applyAccountToPage } from '../helpers/accounts.js';
+import {
+  accessHeaders,
+  assertAccessWall,
+  assertNoAccessWall,
+  stagingBaseUrl,
+} from '../helpers/access.js';
+import { anonymousApiGet, anonymousGet, apiGet, applyAccountToPage } from '../helpers/accounts.js';
+import { assertPromotionReady } from '../helpers/readiness.js';
 
 // Fast synthetic smoke: runs post-deploy AND on a schedule. Must stay under
 // ~2 minutes total — the deep journey lives in the other specs.
@@ -50,29 +56,55 @@ test.describe('staging synthetic smoke', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  test('GET /api/ready reports readiness shape (200, or 503 with Retry-After)', async ({
-    request,
-  }) => {
+  test('GET /api/ready is promotion-ready (200 JSON {ok:true} only)', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'ready');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // apiGet fetches with maxRedirects: 0 so a staging 302 never carries the
+    // Access pair to another origin (see helpers/accounts.ts).
     const res = await apiGet(request, `${baseURL}${API.ready}`, accessHeaders(), 'ready');
     const bodyText = await res.text().catch(() => '');
-    assertNoAccessWall(
-      { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${API.ready}` },
-      'ready',
-    );
-    // Contract drift: the merged app has no /api/ready route yet, so staging
-    // answers 404 until the backend slice lands. Tolerate 404 as "not yet
-    // implemented" (documented in e2e/README.md); any other status must match
-    // the readiness shape so the check still pins the contract once shipped.
-    if (res.status() === 404) return;
-    expect([200, 503], `ready body: ${bodyText.slice(0, 500)}`).toContain(res.status());
-    if (res.status() === 503) {
-      expect(res.headers()['retry-after'] !== undefined).toBe(true);
+    const readyProbe = {
+      status: res.status(),
+      headers: res.headers(),
+      bodyText,
+      url: `${baseURL}${API.ready}`,
+    };
+    assertNoAccessWall(readyProbe, 'ready');
+    // Promotion readiness is strict: only 200 JSON {ok:true} passes. A 404
+    // (route missing), a 503 (well-formed or not), an HTML 200, malformed
+    // JSON or {ok:false} must fail this smoke — never green it. The shared
+    // helper is pinned offline by tests/readiness.spec.ts.
+    assertPromotionReady(readyProbe, 'ready');
+  });
+
+  // Anonymous denial (the other side of the authorized checks above, which
+  // stay unchanged): a request with no Access headers or credentials, in an
+  // isolated request context, must be denied BY Access. An application
+  // ok:true answer here means anonymous traffic reached the app — a failure,
+  // not a pass. The probe helper attaches no headers regardless of the
+  // configured pair, and the assertion requires Access-specific markers,
+  // so an ordinary app error cannot masquerade as enforcement.
+  test('GET /api/health without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'health-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
     }
+    const probe = await anonymousApiGet(`${baseURL}${API.health}`, 'health-anonymous');
+    assertAccessWall(probe, 'health-anonymous');
+  });
+
+  test('GET /api/ready without Access credentials is denied by Access', async () => {
+    const baseURL = stagingBaseUrl('skip', 'ready-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    const probe = await anonymousApiGet(`${baseURL}${API.ready}`, 'ready-anonymous');
+    assertAccessWall(probe, 'ready-anonymous');
   });
 
   test('GET / serves the app shell behind Access', async ({ page }) => {
@@ -110,6 +142,38 @@ test.describe('staging synthetic smoke', () => {
         page.getByRole('heading', { level: 1 }),
         'neither data-testid="app-root" nor the NNTune landing heading rendered',
       ).toContainText('NNTune', { timeout: 15_000 });
+    }
+  });
+
+  test('anonymous GET / (no credentials) is denied by Access, not served the app shell', async () => {
+    const baseURL = stagingBaseUrl('skip', 'access-anonymous');
+    if (!baseURL) {
+      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Isolated request context: fresh cookie jar, no storageState, no
+    // context-level headers. The Access pair deliberately never enters this
+    // context — anonymousGet takes no headers and reads no env, and fetches
+    // with maxRedirects: 0 so an Access-login 302 is classified, not
+    // followed. The credentialed control is the test above (same origin,
+    // same path, Access pair attached): 200 + app shell there, wall here.
+    const anonymous = await playwrightRequest.newContext();
+    try {
+      const res = await anonymousGet(anonymous, `${baseURL}/`);
+      // Body is read only to feed the wall predicate; it is never put in an
+      // assertion message or log (anonymous responses must not be emitted).
+      const bodyText = await res.text().catch(() => '');
+      const probe = { status: res.status(), headers: res.headers(), bodyText, url: baseURL };
+      await res.dispose().catch(() => {});
+      assertAccessWall(probe, 'access-anonymous');
+      // Not the app shell: a wall status is never the shell's 200. Named
+      // with the status only — no body, headers or URL in the message.
+      expect(
+        probe.status,
+        'anonymous app-shell request returned 200 instead of an Access denial',
+      ).not.toBe(200);
+    } finally {
+      await anonymous.dispose();
     }
   });
 });

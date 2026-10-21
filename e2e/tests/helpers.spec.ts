@@ -3,18 +3,25 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   accessHeaders,
+  assertAccessWall,
   assertNoAccessWall,
+  isAccessWall,
   isStagingOrigin,
   readApiBody,
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
-import { extractPlanMeta, extractUsageBytes } from '../helpers/contract.js';
+import { assertPlanLimitHeaders, assertPlanLimitRefusal, extractLibraryItems, extractLimitCode, extractPlanMeta, extractRecordingMbids, extractUpgradeCta, extractUsageBytes, isMbid, secretLeak } from '../helpers/contract.js';
 import {
+  anonymousApiGet,
+  anonymousGet,
+  annotateSignupPath,
   apiGet,
+  apiOptions,
   apiPost,
   applyAccountToPage,
   requireApiAccount,
+  signupPathLabel,
   tryMintTestAccount,
 } from '../helpers/accounts.js';
 
@@ -127,12 +134,45 @@ test.describe('assertNoAccessWall', () => {
         {
           status: 403,
           headers: { 'cf-mitigated': 'challenge' },
-          bodyText: '<title>Access | Cloudflare</title>',
+          bodyText: '<title>Access | Cloudflare Access</title>',
           url: 'https://staging.example/api/health',
         },
         'health',
       ),
     ).toThrow(/Access wall/);
+  });
+
+  test('403 wall error never echoes the probe URL (host, path, query, fragment)', () => {
+    const url =
+      'https://sentinel-staging-host.example/sentinel-wall-path?token=sentinel-wall-query#sentinel-wall-frag';
+    let message = '';
+    try {
+      assertNoAccessWall(
+        {
+          status: 403,
+          headers: { 'cf-mitigated': 'challenge' },
+          bodyText: '<title>Access | Cloudflare Access</title>',
+          url,
+        },
+        'health',
+      );
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('health');
+    expect(message).toMatch(/Access wall/);
+    expect(message).toContain('403');
+    expect(message).toContain('CF_ACCESS_CLIENT_ID');
+    expect(message).toContain('CF_ACCESS_CLIENT_SECRET');
+    for (const sentinel of [
+      url,
+      'sentinel-staging-host.example',
+      'sentinel-wall-path',
+      'sentinel-wall-query',
+      'sentinel-wall-frag',
+    ]) {
+      expect(message, `Access-wall diagnostic leaked "${sentinel}"`).not.toContain(sentinel);
+    }
   });
 
   test('passes a normal app response through', () => {
@@ -192,6 +232,282 @@ test.describe('assertNoAccessWall', () => {
   });
 });
 
+test.describe('isAccessWall / assertAccessWall (anonymous denial)', () => {
+  const wall403 = {
+    status: 403,
+    headers: { 'cf-mitigated': 'challenge' },
+    bodyText: '<title>Access | Cloudflare Access</title>',
+    url: 'https://staging.example/api/health',
+  };
+  const wall302 = {
+    status: 302,
+    headers: { location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login' },
+    bodyText: '',
+    url: 'https://staging.example/api/ready',
+  };
+
+  test('recognises Access-specific denials (403 wall and Access-login 302)', () => {
+    expect(isAccessWall(wall403)).toBe(true);
+    expect(isAccessWall(wall302)).toBe(true);
+    expect(() => assertAccessWall(wall403, 'health-anonymous')).not.toThrow();
+    expect(() => assertAccessWall(wall302, 'ready-anonymous')).not.toThrow();
+  });
+
+  test('an app ok:true answer without Access is a failure, reported without echoing url or body', () => {
+    const probe = {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyText: '{"ok":true,"note":"sentinel-body"}',
+      url: 'https://sentinel-staging-host.example/sentinel-path?token=sentinel-query#sentinel-frag',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    let message = '';
+    try {
+      assertAccessWall(probe, 'health-anonymous');
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('health-anonymous');
+    expect(message).toContain('200');
+    expect(message).toMatch(/expected Cloudflare Access denial/);
+    for (const sentinel of [
+      probe.url,
+      'sentinel-staging-host.example',
+      'sentinel-path',
+      'sentinel-query',
+      'sentinel-frag',
+      'sentinel-body',
+    ]) {
+      expect(message, `anonymous-denial diagnostic leaked "${sentinel}"`).not.toContain(sentinel);
+    }
+  });
+
+  test('a plain app 403 without markers is NOT Access-specific denial', () => {
+    expect(() =>
+      assertAccessWall(
+        {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+          bodyText: '{"error":"plan_limit_exceeded"}',
+          url: 'https://staging.example/api/health',
+        },
+        'health-anonymous',
+      ),
+    ).toThrow(/expected Cloudflare Access denial/);
+  });
+
+  test('a generic Cloudflare challenge without Access markers is NOT an Access denial', () => {
+    // Regression pin: `cf-mitigated` / `cf_clearance` are generic
+    // edge-challenge markers, not Access-specific. A 403 carrying only
+    // them must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'cf-mitigated': 'challenge' },
+      bodyText: '<title>Just a moment...</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('an app 403 whose header VALUE mentions Access is NOT an Access denial', () => {
+    // Regression pin: markers match header names only. An ordinary app 403
+    // echoing `CF-Access-Client-Id` in a header value (e.g. CORS
+    // allow-headers) must not pass as proof of Access enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'access-control-allow-headers': 'CF-Access-Client-Id' },
+      bodyText: '{"error":"forbidden"}',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('a generic 403 title without an Access marker is NOT an Access denial', () => {
+    // Regression pin: a generic `<title>Access denied...` page proves
+    // nothing about Cloudflare Access. Only an explicit `Cloudflare
+    // Access` marker passes as proof of enforcement.
+    const probe = {
+      status: 403,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<title>Access denied | example.com</title>',
+      url: 'https://staging.example/api/health',
+    };
+    expect(isAccessWall(probe)).toBe(false);
+    expect(() => assertAccessWall(probe, 'health-anonymous')).toThrow(
+      /expected Cloudflare Access denial/,
+    );
+  });
+
+  test('a plain app 302 without markers is NOT Access-specific denial', () => {
+    expect(() =>
+      assertAccessWall(
+        {
+          status: 302,
+          headers: { location: '/login' },
+          bodyText: '',
+          url: 'https://staging.example/api/ready',
+        },
+        'ready-anonymous',
+      ),
+    ).toThrow(/expected Cloudflare Access denial/);
+  });
+  test('isAccessWall agrees with assertNoAccessWall on the shared fixtures', () => {
+    // Cross-predicate pin from main #188: the same fixtures must read as the
+    // wall under both directions of the check, using the hardened
+    // header-names-only predicate (generic edge markers alone never count).
+    const appShell200 = {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+      bodyText: '<html><h1>sentinel-app-shell-heading</h1></html>',
+      url: 'https://staging.example/',
+    };
+    for (const probe of [wall302, wall403]) {
+      expect(isAccessWall(probe)).toBe(true);
+      expect(() => assertNoAccessWall(probe, 'agree')).toThrow(/Access wall/);
+    }
+    expect(isAccessWall(appShell200)).toBe(false);
+    expect(() => assertNoAccessWall(appShell200, 'agree')).not.toThrow();
+  });
+});
+
+test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
+  test('sends no Access/bearer/cookie headers and returns wall probes unfollowed', async () => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+    const hits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      hits.push({ ...req.headers });
+      if (req.url === '/walled') {
+        res.writeHead(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' });
+        res.end('<title>Access | Cloudflare Access</title>');
+        return;
+      }
+      if (req.url === '/redir-access') {
+        res.writeHead(302, {
+          location: 'https://example.cloudflareaccess.com/cdn-cgi/access/login',
+        });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const port = await listen(staging);
+    const origin = `http://127.0.0.1:${port}`;
+
+    try {
+      // Even with a complete pair and seam token in the environment, the
+      // anonymous probe must attach none of them.
+      await withEnvAsync(
+        { ...dummyAccessPair, QA_AUTH_TOKEN: 'dummy-qa-token-anon-probe' },
+        async () => {
+          const walled = await anonymousApiGet(`${origin}/walled`, 'health-anonymous');
+          expect(walled.status).toBe(403);
+          expect(() => assertAccessWall(walled, 'health-anonymous')).not.toThrow();
+
+          // Returned as the 302 itself: a followed Access login could not
+          // surface as this probe.
+          const redir = await anonymousApiGet(`${origin}/redir-access`, 'ready-anonymous');
+          expect(redir.status).toBe(302);
+          expect(() => assertAccessWall(redir, 'ready-anonymous')).not.toThrow();
+
+          const ok = await anonymousApiGet(`${origin}/ok`, 'health-anonymous');
+          expect(ok.status).toBe(200);
+          expect(() => assertAccessWall(ok, 'health-anonymous')).toThrow(
+            /expected Cloudflare Access denial/,
+          );
+        },
+      );
+
+      expect(hits).toHaveLength(3);
+      for (const headers of hits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+        expect(headers.cookie).toBeUndefined();
+      }
+      const dumped = JSON.stringify(hits);
+      expect(dumped).not.toContain('dummy-client-id');
+      expect(dumped).not.toContain('dummy-client-secret');
+      expect(dumped).not.toContain('dummy-qa-token-anon-probe');
+    } finally {
+      await close(staging).catch(() => {});
+    }
+  });
+});
+
+
+test.describe('anonymousGet (no credentials, no follow)', () => {
+  // The anonymous probe must send NO header material even when the QA Access
+  // pair is present in the environment, and must return a 3xx as-is (never
+  // follow it) so the caller can classify the wall response itself.
+  test('sends no Access/Authorization/Cookie headers and returns the 302 unfollowed', async ({
+    request,
+  }) => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+    const foreignHits: Array<Record<string, string | string[] | undefined>> = [];
+    const foreign = createServer((req: IncomingMessage, res) => {
+      foreignHits.push({ ...req.headers });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const foreignOrigin = `http://127.0.0.1:${await listen(foreign)}`;
+
+    const stagingHits: Array<Record<string, string | string[] | undefined>> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      stagingHits.push({ ...req.headers });
+      if (req.url === '/redir') {
+        res.writeHead(302, { location: `${foreignOrigin}/landed` });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html>shell</html>');
+    });
+    const stagingOrigin = `http://127.0.0.1:${await listen(staging)}`;
+
+    try {
+      await withEnvAsync(dummyAccessPair, async () => {
+        const res = await anonymousGet(request, `${stagingOrigin}/redir`);
+        expect(res.status(), 'anonymousGet must return the 3xx, not follow or throw').toBe(302);
+        const ok = await anonymousGet(request, `${stagingOrigin}/`);
+        expect(ok.status()).toBe(200);
+      });
+      expect(foreignHits, 'anonymous probe followed a redirect to a foreign origin').toHaveLength(0);
+      expect(stagingHits).toHaveLength(2);
+      for (const headers of stagingHits) {
+        expect(headers['cf-access-client-id']).toBeUndefined();
+        expect(headers['cf-access-client-secret']).toBeUndefined();
+        expect(headers.authorization).toBeUndefined();
+        expect(headers.cookie).toBeUndefined();
+      }
+      const dumped = JSON.stringify(stagingHits);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_ID);
+      expect(dumped).not.toContain(dummyAccessPair.CF_ACCESS_CLIENT_SECRET);
+    } finally {
+      await close(staging).catch(() => {});
+      await close(foreign).catch(() => {});
+    }
+  });
+});
+
 test.describe('readApiBody', () => {
   test('returns the body text for a clean response', async () => {
     const body = await readApiBody(
@@ -212,7 +528,7 @@ test.describe('readApiBody', () => {
         {
           status: () => 403,
           headers: () => ({ 'cf-mitigated': 'challenge' }),
-          text: async () => '<title>Access | Cloudflare</title>',
+          text: async () => '<title>Access | Cloudflare Access</title>',
         },
         'https://staging.example/api/library',
         'range',
@@ -434,12 +750,12 @@ test.describe('applyAccountToPage redirect scope (browser)', () => {
   });
 });
 
-test.describe('apiGet/apiPost redirect scope (no-follow)', () => {
+test.describe('apiGet/apiPost/apiOptions redirect scope (no-follow)', () => {
   // API repro for the redirect leak: Playwright's APIRequestContext follows
   // redirects by default and forwards custom headers to the target. apiGet/
-  // apiPost fetch with maxRedirects: 0 so a staging 302 to another origin is
-  // returned as-is (foreign origin receives zero requests) and the 3xx fails
-  // by name instead of a bare status mismatch.
+  // apiPost/apiOptions fetch with maxRedirects: 0 so a staging 302 to another
+  // origin is returned as-is (foreign origin receives zero requests) and the
+  // 3xx fails by name instead of a bare status mismatch.
   test('credentialed 302 to a foreign origin is not followed and fails by name', async ({
     request,
   }) => {
@@ -509,6 +825,17 @@ test.describe('apiGet/apiPost redirect scope (no-follow)', () => {
         0,
       );
 
+      // OPTIONS 302 (the preflight path) behaves the same: apiOptions is the
+      // only no-follow OPTIONS wrapper, so it gets its own executed leg —
+      // removing its maxRedirects: 0 must fail here, not ride on apiGet's.
+      await expect(
+        apiOptions(request, `${stagingOrigin}/redir`, credentialed, 'probe'),
+        'apiOptions followed a cross-origin 302 with credentials instead of failing',
+      ).rejects.toThrow(/unexpected redirect.*HTTP 302/);
+      expect(foreignHits, 'foreign origin received a credentialed follow-up to OPTIONS 302').toHaveLength(
+        0,
+      );
+
       // No credential value reached the foreign origin in any form.
       expect(JSON.stringify(foreignHits)).not.toContain(markerSecret);
       expect(JSON.stringify(foreignHits)).not.toContain(markerSession);
@@ -535,9 +862,13 @@ test.describe('requireApiAccount', () => {
     });
   });
 
-  test('passes on the seam token alone', () => {
+  // Updated expectation (account-identity contract, tests/account-identity.spec.ts):
+  // the generic QA seam token is setup-only and must NOT satisfy the
+  // account-identity guard — account-specific assertions need the minted
+  // account's own nonblank session.
+  test('throws on the seam token alone (QA token cannot satisfy the guard)', () => {
     withEnv({ QA_AUTH_TOKEN: 'dummy-qa-token' }, () => {
-      expect(() => requireApiAccount(null, 'meter')).not.toThrow();
+      expect(() => requireApiAccount(null, 'meter')).toThrow(/\[meter\]/);
     });
   });
 });
@@ -596,11 +927,29 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
       await expect(
         tryMintTestAccount(
           fakeRequest(
-            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title>'),
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
           ),
           base,
         ),
       ).rejects.toThrow(/Access wall/);
+    });
+  });
+
+  test('walled seam error never echoes the staging host', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      let message = '';
+      try {
+        await tryMintTestAccount(
+          fakeRequest(
+            async () => fakeResponse(403, { 'cf-mitigated': 'challenge' }, '<title>Access</title><p>Cloudflare Access</p>'),
+          ),
+          'https://sentinel-staging-host.example',
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toMatch(/Access wall/);
+      expect(message).not.toContain('sentinel-staging-host.example');
     });
   });
 
@@ -627,5 +976,470 @@ test.describe('tryMintTestAccount fail-closed seam', () => {
         ),
       ).resolves.toEqual({ email: 'a@b', session: 't', viaApi: true });
     });
+  });
+});
+
+test.describe('signup path evidence label', () => {
+  const base = 'https://staging.example';
+  const seamEnv = {
+    STAGING_BASE_URL: base,
+    QA_AUTH_TOKEN: 'dummy-qa-token',
+    ...dummyAccessPair,
+  };
+  const permitted = ['public-ui-signup', 'api-minted-account'];
+
+  test('seam-minted account is labelled api-minted-account, leaking no account data', async () => {
+    await withEnvAsync(seamEnv, async () => {
+      const minted = await tryMintTestAccount(
+        {
+          post: async () => ({
+            status: () => 200,
+            headers: () => ({}),
+            text: async () =>
+              '{"email":"sentinel-email@example.test","session":"sentinel-session-value"}',
+          }),
+        } as unknown as APIRequestContext,
+        base,
+      );
+      const target = { annotations: [] as Array<{ type: string; description?: string }> };
+      const label = annotateSignupPath(target, minted);
+      expect(label).toBe('api-minted-account');
+      expect(target.annotations).toEqual([{ type: 'signup-path', description: 'api-minted-account' }]);
+      const dumped = JSON.stringify(target.annotations);
+      expect(dumped).not.toContain('sentinel-email@example.test');
+      expect(dumped).not.toContain('sentinel-session-value');
+      expect(dumped).not.toContain('dummy-qa-token');
+    });
+  });
+
+  test('unconfigured seam (UI signup fallback) is labelled public-ui-signup', async () => {
+    await withEnvAsync({ QA_AUTH_TOKEN: undefined }, async () => {
+      const minted = await tryMintTestAccount(
+        {
+          post: async () => {
+            throw new Error('must not be called without a token');
+          },
+        } as unknown as APIRequestContext,
+        base,
+      );
+      expect(minted).toBeNull();
+      const target = { annotations: [] as Array<{ type: string; description?: string }> };
+      expect(annotateSignupPath(target, minted)).toBe('public-ui-signup');
+      expect(target.annotations).toEqual([{ type: 'signup-path', description: 'public-ui-signup' }]);
+    });
+  });
+
+  test('label is always one of the two bounded values and carries no fixture data', () => {
+    const fixtures = [
+      null,
+      { email: 'sentinel-ui@example.test', viaApi: false },
+      { email: 'sentinel-api@example.test', session: 'sentinel-s2', viaApi: true },
+      { email: 'sentinel-api@example.test', viaApi: true },
+    ] as const;
+    for (const fixture of fixtures) {
+      const label = signupPathLabel(fixture);
+      expect(permitted).toContain(label);
+      expect(label).not.toContain('sentinel');
+      expect(label).not.toContain('@');
+    }
+    expect(signupPathLabel({ email: 'sentinel-ui@example.test', viaApi: false })).toBe(
+      'public-ui-signup',
+    );
+    expect(signupPathLabel({ email: 'sentinel-api@example.test', viaApi: true })).toBe(
+      'api-minted-account',
+    );
+  });
+});
+
+test.describe('redirect location-state diagnostics (value-free)', () => {
+  // Pins the malformed/present notes from locationNote via a fake request
+  // context: a regression collapsing malformed into present (or dropping
+  // the whitespace/control guard) must fail here, and neither state may
+  // echo the header value.
+  const fakeRedirect = (location?: string): APIRequestContext =>
+    ({
+      get: async () => ({
+        status: () => 302,
+        headers: () => (location === undefined ? {} : { location }),
+      }),
+    }) as unknown as APIRequestContext;
+
+  const redirectMessage = async (location?: string): Promise<string> => {
+    try {
+      await apiGet(fakeRedirect(location), 'https://staging.example/probe', {}, 'probe');
+    } catch (error) {
+      return (error as Error).message;
+    }
+    throw new Error('expected the credentialed redirect to throw, but it resolved');
+  };
+
+  test('malformed Location is reported as malformed, value not echoed', async () => {
+    const malformed = ':://sentinel-malformed-loc not a url ?q=sentinel-malformed-query';
+    const message = await redirectMessage(malformed);
+    expect(message).toMatch(/unexpected redirect/i);
+    expect(message).toContain('302');
+    expect(message).toMatch(/malformed/i);
+    expect(message).not.toMatch(/location present/i);
+    expect(message).not.toContain('sentinel-malformed-loc');
+    expect(message).not.toContain('sentinel-malformed-query');
+    expect(message).not.toContain(malformed);
+  });
+
+  test('whitespace-bearing Location is malformed even though URL parsing would tolerate it', async () => {
+    // `new URL('/landed path', base)` percent-encodes and succeeds, so only
+    // the whitespace/control guard classifies this as malformed.
+    const message = await redirectMessage('/landed path?next=sentinel-space-query');
+    expect(message).toMatch(/malformed/i);
+    expect(message).not.toMatch(/location present/i);
+    expect(message).not.toContain('sentinel-space-query');
+    expect(message).not.toContain('landed path');
+  });
+
+  test('well-formed Location is reported as present, value not echoed', async () => {
+    const message = await redirectMessage(
+      'https://foreign.example/sentinel-loc-path?next=sentinel-loc-query#sentinel-loc-frag',
+    );
+    expect(message).toMatch(/unexpected redirect/i);
+    expect(message).toContain('302');
+    expect(message).toMatch(/location present/i);
+    expect(message).not.toMatch(/malformed/i);
+    expect(message).not.toContain('foreign.example');
+    expect(message).not.toContain('sentinel-loc-path');
+    expect(message).not.toContain('sentinel-loc-query');
+    expect(message).not.toContain('sentinel-loc-frag');
+  });
+
+  test('relative Location is present, not malformed', async () => {
+    const message = await redirectMessage('/library?next=sentinel-rel-query');
+    expect(message).toMatch(/location present/i);
+    expect(message).not.toMatch(/malformed/i);
+    expect(message).not.toContain('sentinel-rel-query');
+  });
+});
+
+test.describe('isMbid', () => {
+  test('accepts canonical lowercase and uppercase hex', () => {
+    expect(isMbid('f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f')).toBe(true);
+    expect(isMbid('F5C2D4B1-3A7E-4D1C-9E2F-0A1B2C3D4E5F')).toBe(true);
+  });
+
+  test('rejects non-MBID shapes', () => {
+    for (const bad of [
+      '',
+      'not-an-mbid',
+      'f5c2d4b1-3a7e-4d1c-9e2f',
+      'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5g',
+      'f5c2d4b13a7e4d1c9e2f0a1b2c3d4e5f',
+      42,
+      null,
+    ]) {
+      expect(isMbid(bad)).toBe(false);
+    }
+  });
+});
+
+test.describe('extractLibraryItems', () => {
+  test('reads a bare array', () => {
+    expect(extractLibraryItems('[{"id":"a"},{"id":"b","title":"T"}]')).toEqual([
+      { id: 'a' },
+      { id: 'b', title: 'T' },
+    ]);
+  });
+
+  test('reads the { items: [...] } shape', () => {
+    expect(extractLibraryItems('{"items":[{"id":"a"}]}')).toEqual([{ id: 'a' }]);
+  });
+
+  test('drops rows without a string id', () => {
+    expect(extractLibraryItems('[{"id":"a"},{},{"id":42}]')).toEqual([{ id: 'a' }]);
+  });
+
+  test('throws by name on non-JSON and reshaped payloads', () => {
+    expect(() => extractLibraryItems('not json')).toThrow(/\[library\]/);
+    expect(() => extractLibraryItems('{"tracks":[]}')).toThrow(/tracks/);
+  });
+});
+
+test.describe('extractRecordingMbids', () => {
+  const MBID = 'f5c2d4b1-3a7e-4d1c-9e2f-0a1b2c3d4e5f';
+
+  test('reads the canonical field', () => {
+    expect(extractRecordingMbids({ id: 't', recording_mbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('reads the camelCase alias', () => {
+    expect(extractRecordingMbids({ id: 't', recordingMbids: [MBID] })).toEqual([MBID]);
+  });
+
+  test('names the actual keys when the field is absent', () => {
+    expect(() => extractRecordingMbids({ id: 't', title: 'x' })).toThrow(/title/);
+  });
+
+  test('an empty list fails naming the release state', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: [] })).toThrow(
+      /no release_mbid/,
+    );
+    expect(() =>
+      extractRecordingMbids({ id: 't', release_mbid: 'r', recording_mbids: [] }),
+    ).toThrow(/release_mbid r/);
+  });
+
+  test('a non-array and malformed entries fail by name', () => {
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: 'x' })).toThrow(/array/);
+    expect(() => extractRecordingMbids({ id: 't', recording_mbids: ['zzz'] })).toThrow(
+      /recording_mbids\[0\]/,
+    );
+    expect(() => extractRecordingMbids(null)).toThrow(/object/);
+  });
+});
+
+test.describe('plan-limit refusal verdict (offline pins)', () => {
+  const clean402 = {
+    status: 402,
+    headers: { 'x-plan-limit': '100', 'x-plan-reset': '3600' },
+    bodyText: JSON.stringify({
+      code: 'plan_limit_exceeded',
+      message: 'plan limit reached',
+      retryable: false,
+      upgrade_url: '/pricing',
+    }),
+  };
+  const secrets = [
+    { name: 'account email', value: 'capped+sentinel@example.test' },
+    { name: 'account session', value: 'sentinel-session-capped' },
+  ];
+
+  test('a canonical 402 refusal passes', () => {
+    expect(() =>
+      assertPlanLimitRefusal({ ...clean402, secrets, context: 'plan-limit-stream' }),
+    ).not.toThrow();
+  });
+
+  test('a 429 with retry-after + limit header passes', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'retry-after': '45' },
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).not.toThrow();
+  });
+
+  test('a non-limit status fails naming expected vs actual', () => {
+    expect(() =>
+      assertPlanLimitRefusal({ ...clean402, status: 206, secrets, context: 'plan-limit-stream' }),
+    ).toThrow(/expected a plan-limit status \(402\/429\), got HTTP 206/);
+  });
+
+  test('missing headers fail naming the received names', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        headers: { 'content-type': 'application/json' },
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/missing .*limit header.*got headers: content-type/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        headers: { 'x-plan-limit': '100' },
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/reset\/retry header.*got headers: x-plan-limit/);
+  });
+
+  test('extractLimitCode reads the envelope and legacy shapes', () => {
+    expect(
+      extractLimitCode(JSON.stringify({ code: 'plan_limit_exceeded' }), 'plan-limit-stream'),
+    ).toBe('plan_limit_exceeded');
+    expect(extractLimitCode('{"error":"rate_limited"}', 'plan-limit-stream')).toBe('rate_limited');
+    expect(
+      extractLimitCode('{"error":{"code":"plan_limit_exceeded"}}', 'plan-limit-stream'),
+    ).toBe('plan_limit_exceeded');
+  });
+
+  test('extractLimitCode names the keys on drift', () => {
+    expect(() =>
+      extractLimitCode(JSON.stringify({ status: 'limited' }), 'plan-limit-stream'),
+    ).toThrow(/\[plan-limit-stream\][\s\S]*status/);
+    expect(() => extractLimitCode('not json', 'plan-limit-stream')).toThrow(/not JSON/);
+  });
+
+  test('a status-inconsistent retryable flag fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/retryable flag disagrees/);
+  });
+
+  test('extractUpgradeCta accepts a key or a /pricing value', () => {
+    expect(extractUpgradeCta({ code: 'x', upgrade_url: '/pricing' }, 'c')).toBe("key 'upgrade_url'");
+    expect(extractUpgradeCta({ code: 'x', note: 'see /pricing to continue' }, 'c')).toMatch(
+      /value/,
+    );
+  });
+
+  test('prose without the /pricing route is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', note: 'Upgrade now' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+  });
+
+  test('a matching key with a non-route value is not a CTA pointer', () => {
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_available: false }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() => extractUpgradeCta({ code: 'x', upgrade_url: '' }, 'c')).toThrow(
+      /no upgrade CTA pointer/,
+    );
+    expect(() =>
+      extractUpgradeCta({ code: 'x', upgrade_url: 'Upgrade now, no route' }, 'c'),
+    ).toThrow(/no upgrade CTA pointer/);
+  });
+
+  test('a nested /pricing route behind a matching key still counts', () => {
+    expect(extractUpgradeCta({ code: 'x', cta: { href: '/pricing' } }, 'c')).toMatch(/cta/);
+  });
+
+  test('a body without the CTA pointer fails naming its keys', () => {
+    expect(() =>
+      extractUpgradeCta({ code: 'plan_limit_exceeded', message: 'nope' }, 'plan-limit-stream'),
+    ).toThrow(/\[plan-limit-stream\][\s\S]*code, message/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({ code: 'plan_limit_exceeded', retryable: false }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/no upgrade CTA pointer/);
+  });
+
+  test('secretLeak names the secret, never its value', () => {
+    const body = JSON.stringify({ code: 'x', detail: 'for capped+sentinel@example.test' });
+    const leak = secretLeak(body, secrets, 'plan-limit-stream');
+    expect(leak).toMatch(/account email/);
+    expect(leak).not.toContain('capped+sentinel@example.test');
+    const keyed = secretLeak(JSON.stringify({ token: 'abc' }), [], 'plan-limit-stream');
+    expect(keyed).toMatch(/credential-shaped key 'token'/);
+    expect(secretLeak(clean402.bodyText, secrets, 'plan-limit-stream')).toBeNull();
+  });
+
+  test('a leaking refusal body fails the verdict', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          retryable: false,
+          upgrade_url: '/pricing',
+          session: 'sentinel-session-capped',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/leaks the account session/);
+  });
+
+  test('assertPlanLimitHeaders tolerates header-name variants', () => {
+    expect(() =>
+      assertPlanLimitHeaders(
+        { 'RateLimit-Limit': '10', 'RateLimit-Reset': '60' },
+        'plan-limit-stream',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertPlanLimitHeaders({ 'X-Plan-Limit': '', 'Retry-After': '5' }, 'plan-limit-stream'),
+    ).toThrow(/present but empty/);
+  });
+
+  test('a 429 without retry-after fails even with another reset header', () => {
+    expect(() =>
+      assertPlanLimitHeaders(
+        { 'x-plan-limit': '50', 'x-plan-reset': '45' },
+        'plan-limit-ingest',
+        429,
+      ),
+    ).toThrow(/retry-after/);
+    expect(() =>
+      assertPlanLimitHeaders({ 'x-plan-limit': '50', 'retry-after': '' }, 'plan-limit-ingest', 429),
+    ).toThrow(/retry-after|present but empty/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'ratelimit-reset': '45' },
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/retry-after/);
+  });
+
+  test('a status-inconsistent limit code fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'rate_limited',
+          message: 'too many requests',
+          retryable: false,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/code 'rate_limited' disagrees with the status/);
+    expect(() =>
+      assertPlanLimitRefusal({
+        status: 429,
+        headers: { 'ratelimit-limit': '50', 'retry-after': '45' },
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          retryable: true,
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-ingest',
+      }),
+    ).toThrow(/code 'plan_limit_exceeded' disagrees with the status/);
+  });
+
+  test('a missing retryable flag fails', () => {
+    expect(() =>
+      assertPlanLimitRefusal({
+        ...clean402,
+        bodyText: JSON.stringify({
+          code: 'plan_limit_exceeded',
+          message: 'plan limit reached',
+          upgrade_url: '/pricing',
+        }),
+        secrets,
+        context: 'plan-limit-stream',
+      }),
+    ).toThrow(/retryable flag disagrees/);
   });
 });

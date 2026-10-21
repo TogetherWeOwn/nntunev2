@@ -5,13 +5,25 @@ import {
 	fetchUsage,
 	type SubscriptionDTO
 } from '#lib/billing/billingClient.js';
-import { resolveEffectivePlan } from '#lib/billing/plans.js';
+import { getPlan, resolveEffectivePlan } from '#lib/billing/plans.js';
 import { evaluateUsage, type LimitStatus, type UsageSnapshot } from '#lib/billing/usage.js';
 
 export type UsageDTO = UsageSnapshot & { period: string };
 
-/** Subscription states whose entitlement has lapsed: portal, never checkout. */
-const LAPSED = new Set(['past_due', 'canceled', 'expired', 'incomplete']);
+/**
+ * Stored subscription states without entitlement (ADR 0002 data-model,
+ * ADR 0005 billing table): portal, never checkout. `unpaid`/`paused` keep
+ * the reserved slot and `incomplete_expired` has released it, but all
+ * three still owe the portal — never a second subscription.
+ */
+const LAPSED = new Set([
+	'past_due',
+	'canceled',
+	'unpaid',
+	'paused',
+	'incomplete',
+	'incomplete_expired'
+]);
 
 interface LoadOutcome<T> {
 	value: T | null;
@@ -40,7 +52,8 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
  * against caps only when the plan is confirmed — otherwise no usage alert
  * or upgrade button is rendered, because the caps being compared against
  * would be the wrong plan's. Lapsed subscriptions (past_due / canceled /
- * expired / incomplete) resolve to the billing portal, never to a new
+ * unpaid / paused / incomplete / incomplete_expired) resolve to the
+ * billing portal, never to a new
  * checkout, so a paying user can neither be downgraded nor double-subscribed.
  * A 401 is reported as signed-out, not as an outage. No secrets here —
  * session cookie only.
@@ -54,8 +67,11 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
 export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
-	const sub = await loadOne(() => fetchSubscription(fetch));
-	const use = await loadOne(() => fetchUsage(fetch));
+	// Independent reads share one deadline window; loadOne keeps failures isolated.
+	const [sub, use] = await Promise.all([
+		loadOne(() => fetchSubscription(fetch)),
+		loadOne(() => fetchUsage(fetch))
+	]);
 
 	// A 404 on the subscription is a failure, not "no record yet": signup
 	// always writes a trialing row (ADR 0002 rule 4), so a missing record
@@ -91,11 +107,16 @@ export const load: PageLoad = async ({ fetch }) => {
 	} else {
 		if (subFailed)
 			notices.push('Could not load your subscription — showing trial defaults.');
-		else if (planUnknown && subscription)
+		else if (planUnknown && subscription) {
+			const unconfirmedTrial =
+				subscription.status === 'trialing' ||
+				(subscription.status === 'active' && subscription.planId === 'free');
 			notices.push(
-				`Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
+				unconfirmedTrial
+					? 'Your trial has ended or could not be confirmed — manage billing to confirm your plan; showing trial defaults.'
+					: `Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
 			);
-		else if (manageBillingOnly && subscription)
+		} else if (manageBillingOnly && subscription)
 			// Only reachable for in-grace past_due: every other lapsed state
 			// is planUnknown, and only past_due has a grace window. The plan
 			// is confirmed so no other notice renders, yet the failed payment
@@ -106,8 +127,11 @@ export const load: PageLoad = async ({ fetch }) => {
 		if (usageFailed) notices.push('Could not load usage.');
 	}
 
+	// Keep a known stored billing tier for portal-only states without granting
+	// entitlement or scoring usage against that tier.
+	const billingPlan = manageBillingOnly && subscription ? getPlan(subscription.planId) : undefined;
 	return {
-		planId: plan.id,
+		planId: billingPlan?.id ?? plan.id,
 		planUnknown,
 		signedOut,
 		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),

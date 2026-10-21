@@ -5,31 +5,68 @@
 		clearSnapshot,
 		invalidateLibraryCache,
 		LIBRARY_AUTH_TRANSITION_KEY,
-		loadSnapshot,
-		saveSnapshot,
 		staleLabel,
-		toLibraryItems,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { resolveStreamUrl } from '#lib/library/stream-url.js';
+	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import {
+		addTrack,
+		clearQueue,
+		createQueue,
+		currentTrack as queueCurrentTrack,
+		nextTrack,
+		selectTrack as selectQueueIndex,
+		type QueueState
+	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
-	let authenticatedThisLoad = false;
-	let inMemorySnapshot: ReturnType<typeof saveSnapshot> | null = null;
-	let activeRequest: AbortController | null = null;
-	let requestGeneration = 0;
+	let requiresSignIn = $state(false);
+	let queue: QueueState = $state(createQueue([]));
 
-	const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
+	const refresher = createLibraryRefresher({
+		sessionStorage: () => browserStorage('session'),
+		invalidateLibraryCache,
+		onStateChange: (state) => {
+			items = state.items;
+			staleAt = state.staleAt;
+			loading = state.loading;
+			loadError = state.loadError;
+			libraryUnavailable = state.libraryUnavailable;
+			requiresSignIn = state.requiresSignIn;
+			// The queue is per-account: drop tracks the new library no longer
+			// contains, so a 401/403/404 or auth transition cannot leak the
+			// previous account's queue into the next session's Retry. The
+			// current track stays current when it survives the refresh.
+			if (queue.tracks.length > 0) {
+				const ids = new Set(state.items.map((track) => track.id));
+				const kept = queue.tracks.filter((track) => ids.has(track.id));
+				if (kept.length !== queue.tracks.length) {
+					const currentId = queueCurrentTrack(queue)?.id ?? null;
+					const rebuilt = createQueue(kept);
+					const index =
+						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
+					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+				}
+			}
+		}
+	});
 
 	// e2e contract hooks (e2e/helpers/contract.ts TESTIDS) owned by sibling
-	// slices: usage metering, plan-limit enforcement and the player land with
-	// the venture slices that own them. Placeholders below keep the hooks
+	// slices: usage metering and plan-limit enforcement land with the
+	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
-	const currentTrack: { id: string; title: string } | null = null;
+	// Queue metadata alone is not playable media: the player renders only
+	// when resolveStreamUrl finds a real (non-blank) stream URL.
+	const currentTrack = $derived(queueCurrentTrack(queue));
+	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
+	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -42,92 +79,29 @@
 		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 	}
 
-	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
-		if (activeRequest) return;
-		const generation = ++requestGeneration;
-		loading = true;
-		loadError = null;
-		libraryUnavailable = false;
-		const controller = new AbortController();
-		activeRequest = controller;
-		let timeoutId: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timeoutId = setTimeout(() => {
-				controller.abort();
-				reject(new Error('library request timed out'));
-			}, LIBRARY_REQUEST_TIMEOUT_MS);
+	function selectTrack(id: string): void {
+		const item = items.find((track) => track.id === id);
+		if (!item) return;
+		// No stream URL until the streaming slice: playback wiring is out of
+		// scope, so the queue carries library display fields only. addTrack
+		// dedupes, so re-selecting a queued row is a no-op.
+		queue = addTrack(queue, {
+			id: item.id,
+			title: displayTitle(item),
+			artist: displayArtist(item) ?? '',
+			streamUrl: ''
 		});
+	}
 
-		try {
-			const response = await Promise.race([
-				fetchFn('/api/library', { credentials: 'include', signal: controller.signal }),
-				timeout
-			]);
-			if (generation !== requestGeneration) return;
-			if (response.status === 404) {
-				// The list endpoint has not landed yet. Do not treat a 404 as
-				// session verification or expose a previously saved snapshot.
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				items = [];
-				staleAt = null;
-				libraryUnavailable = true;
-				return;
-			}
-			if (response.status === 401 || response.status === 403) {
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				invalidateLibraryCache();
-				items = [];
-				staleAt = null;
-				loadError = 'You are signed out or do not have access to this library.';
-				return;
-			}
-			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const payload = await Promise.race([response.json(), timeout]);
-			if (generation !== requestGeneration) return;
-			const fresh = toLibraryItems(payload);
-			if (fresh === null) throw new Error('library response has an invalid shape');
-			authenticatedThisLoad = true;
-			items = fresh;
-			staleAt = null;
-			const persistedSnapshot = saveSnapshot(browserStorage('session'), fresh);
-			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
-		} catch {
-			if (generation !== requestGeneration) return;
-			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad
-				? (inMemorySnapshot ?? loadSnapshot(browserStorage('session')))
-				: null;
-			if (snapshot) {
-				items = snapshot.items;
-				staleAt = snapshot.savedAt;
-			} else {
-				items = [];
-				staleAt = null;
-				loadError = 'Library is not reachable right now.';
-			}
-		} finally {
-			if (timeoutId !== undefined) clearTimeout(timeoutId);
-			if (activeRequest === controller) {
-				activeRequest = null;
-				if (generation === requestGeneration) loading = false;
-			}
-		}
+	function refresh(): Promise<void> {
+		return refresher.refresh();
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
-		requestGeneration += 1;
-		activeRequest?.abort();
-		activeRequest = null;
-		authenticatedThisLoad = false;
-		inMemorySnapshot = null;
-		clearSnapshot(browserStorage('session'));
-		items = [];
-		staleAt = null;
-		loadError = 'Your session changed. Sign in again to see this library.';
-		loading = false;
+		// Clear the queue at the auth boundary even before the refresher's
+		// state lands; the onStateChange reconcile above is the backstop.
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) queue = clearQueue(queue);
+		refresher.handleAuthTransition(event);
 	}
 
 	onMount(() => {
@@ -136,8 +110,7 @@
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
-			requestGeneration += 1;
-			activeRequest?.abort();
+			refresher.dispose();
 			window.removeEventListener('storage', handleAuthTransition);
 		};
 	});
@@ -155,6 +128,9 @@
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
 		<p role="alert">{loadError}</p>
+		{#if requiresSignIn}
+			<a class="nt-button" href="/login">Sign in</a>
+		{/if}
 		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
 	{:else}
 		{#if staleAt}
@@ -169,14 +145,24 @@
 		{:else}
 			<ul data-testid="library-list">
 				{#each items as track (track.id)}
-					<li data-testid="library-item" data-id={track.id}>
-						{displayTitle(track)}
-						{#if displayArtist(track)}
-							<span> — {displayArtist(track)}</span>
-						{/if}
+					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+						<button
+							type="button"
+							class="nt-library-row"
+							aria-label={queuedIds.has(track.id)
+								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+								: undefined}
+							onclick={() => selectTrack(track.id)}
+						>
+							{displayTitle(track)}
+							{#if displayArtist(track)}
+								<span> — {displayArtist(track)}</span>
+							{/if}
+						</button>
 					</li>
 				{/each}
-				</ul>
+			</ul>
+			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
@@ -190,7 +176,7 @@
 	<section aria-label="Usage">
 		<h2>Usage</h2>
 		<p data-testid="usage-meter">
-			Usage metering lands with the usage-meter slice — no streamed bytes recorded yet.
+			Usage information is not available yet.
 		</p>
 	</section>
 
@@ -200,10 +186,27 @@
 		</p>
 	{/if}
 
-	{#if currentTrack}
+	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
-			<audio data-testid="audio-player" controls src=""></audio>
+			<audio data-testid="audio-player" controls src={streamUrl}></audio>
 		</section>
 	{/if}
 </main>
+
+<style>
+	.nt-library-item {
+		padding: 0;
+	}
+	.nt-library-row {
+		display: block;
+		width: 100%;
+		text-align: left;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+</style>

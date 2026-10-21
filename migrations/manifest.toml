@@ -32,3 +32,68 @@ sha256 = "6d222588102fbff8bd5096a42e669722262ba84014fc5865bfbf3b8c19894245"
 file = "0007_auth_challenge_user_fk.sql"
 target = "app"
 sha256 = "ce0350f7d08a251bbfab9a817d1c4c3dc72a7484cb2379869c5e6c11a0fb6791"
+
+[[migration]]
+file = "0008_auth_challenge_purpose_guard.sql"
+target = "app"
+sha256 = "35508144971de4bdf9919e28a6979963053fa7eb76956df1fd6e98dac004b595"
+
+[[migration]]
+file = "0009_metered_admission.sql"
+target = "app"
+sha256 = "e1f5d25c97c2eeb1e292a7761d34f9aaaed43133ddfb536e609a32f8e322f8d8"
+
+[[migration]]
+file = "0010_metered_admission_claim.sql"
+target = "app"
+sha256 = "007c434790b5d1433dd0e7f3787409afc9e802092b87aad86d7cd47d8dc87184"
+
+[[migration]]
+file = "0011_metered_admission_claim_epoch.sql"
+target = "app"
+sha256 = "50b645b72156218e83ce272c3fdfc97250df422563a2be0d30ad1ecfc72dea02"
+
+[[migration]]
+file = "0012_metered_admission_replay_window.sql"
+target = "app"
+sha256 = "6962f20adab4a64672f7c9a870d0e9e606ba8dc638a5b656e8720b0900134a4a"
+
+[[migration]]
+file = "0013_auth_challenge_reauth_purpose.sql"
+target = "app"
+sha256 = "848df4805ac18bc1312689f033c86e90417bd9d53bdbfbb0950813b00e9f0d64"
+
+[[migration]]
+file = "0014_mb_import_resume_dlq.sql"
+target = "mirror"
+sha256 = "8385253fbddb464361f30678cfb8464b7c3d73f7ae5614f0eced870876dcef88"
+
+[[migration]]
+file = "0015_kek_rotation.sql"
+target = "app"
+sha256 = "c12d9f869611df9d5a4203ba96089aea41c88e3c1e85714dfdcff2e9cf474529"
+
+[[migration]]
+file = "0016_mb_track.sql"
+target = "mirror"
+sha256 = "4e984b85eb9d62a498402dc2ddf9474ac8297fe988b22cbfc1434bd8c7cbdbaa"
+
+[[migration]]
+file = "0017_mb_replication_packet_ledger.sql"
+target = "mirror"
+sha256 = "62ceb24df9c5ea7032fc3cf4e48e5e10f87d909639fa469ed79b4dfcd92009d6"
+
+[[migration]]
+file = "0018_qa_issued_codes.sql"
+target = "app"
+sha256 = "f87059e056224631b17463fd99d63cefb060f499c3e41738258e0e43a7244c68"
+
+[[migration]]
+file = "0019_native_rest_credentials.sql"
+target = "app"
+sha256 = "0784422be11365318a5c9bf8e66bda1f0f7e233d836a9e809182e28d87da4b56"
+
+[[migration]]
+file = "0020_stream_play_ledger.sql"
+target = "app"
+sha256 = "cd67e713c0da150acdcfa43a635a587818aaf6b8db4e7102040985291b6f8b4d"

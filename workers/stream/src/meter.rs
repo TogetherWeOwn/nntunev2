@@ -8,12 +8,20 @@
 //!   the same key; a genuine second listen carries a different `play_id`
 //!   and bills separately.
 //! - [`UsageLedger`] is the portable-core model of the Hyperdrive
-//!   usage-ledger table, which in production must key
+//!   `stream_play_ledger` table (`migrations/0020_stream_play_ledger.sql`,
+//!   NOT the ADR daily `usage_ledger`), which in production must key
 //!   `UNIQUE(idempotency_key)` exactly as the ingest library upsert
 //!   converges `ON CONFLICT (idempotency_key)`. [`UsageLedger::record`]
 //!   converges exact redeliveries to one entry, first write wins, and
 //!   reports [`RecordOutcome::Conflict`] instead of converging when a
 //!   redelivery disagrees or the key does not bind its identity fields.
+//!   The production sink is an account-owned writer, so it must also
+//!   carry the ADR 0002 rule 3 deletion fence: [`LEDGER_WRITE_FENCE_SQL`]
+//!   is the in-statement fence its INSERT must select through, and
+//!   [`UsageLedger::record_fenced`] is the portable-core mirror (a
+//!   fenced play reports [`RecordOutcome::AccountDeleting`] and appends
+//!   nothing, so a play can never repopulate a deleting account's
+//!   ledger/play-event rows).
 //! - [`reconcile`] compares each distinct metered play against the ledger
 //!   and flags (never silently adjusts) every mismatch with one
 //!   [`MeterKind::ReconcileMismatch`] event and a single-line log
@@ -29,6 +37,25 @@ pub const RECONCILE_MISMATCH_METRIC: &str = "play_reconcile_mismatch";
 
 use crate::pool::Lane;
 
+/// Analytics Engine binding name: must match `[analytics_engine_datasets]`
+/// in `workers/stream/wrangler.toml`.
+pub const METER_DATASET_BINDING: &str = "METER";
+/// Analytics Engine dataset receiving stream usage events.
+pub const METER_DATASET: &str = "nntune_meter";
+
+/// Nominal bytes per stream second: served bytes map to stream seconds at
+/// this rate (roughly 384 kbit/s lossless-ish audio). This is a metering
+/// primitive, not a bitrate claim about any track: it lets byte counts and
+/// second counts stay mutually derivable without a per-track bitrate lookup.
+/// The ledger side derives seconds from bytes with this same rate.
+pub const STREAM_BYTES_PER_SEC: u64 = 48_000;
+
+/// Stream seconds attributed to `bytes` served, rounding any partial second
+/// up: a started second counts. Zero bytes attribute zero seconds.
+pub fn stream_seconds_for_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(STREAM_BYTES_PER_SEC)
+}
+
 /// What happened, in billing-relevant order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeterKind {
@@ -38,6 +65,10 @@ pub enum MeterKind {
     BytesServed,
     PrefetchEnqueued,
     ProviderError,
+    /// One article exceeded the article byte cap and only that fetch was
+    /// refused: the provider is healthy, the pool is never quarantined, and
+    /// the desynchronized connection is dropped. Emitted once per refusal.
+    SizeRefused,
     /// A play was rejected because its grant had expired
     /// (`GrantError::Expired`). Carries the requested track and the granted
     /// user only; never secret or token material.
@@ -58,10 +89,41 @@ pub enum MeterKind {
     /// A pooled connection the provider silently closed was transparently
     /// redialed (no backoff, no quarantine).
     WarmRedial,
+    /// A play terminated because a segment article is gone (`430`/`423`,
+    /// [`crate::play::PlayError::ArticleMissing`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    ArticleMissing,
+    /// A play terminated because a segment could not be decoded
+    /// ([`crate::play::PlayError::Decode`]). Terminal content signal:
+    /// the track fails, the pool is fine. Non-serving (`bytes = 0`).
+    DecodeFailed,
     /// A flagged reconciliation mismatch. Non-serving: its [`MeterEvent`]
     /// always carries `bytes = 0`; the flagged counts stay on the
     /// [`ReconcileMismatch`] record returned by [`reconcile`].
     ReconcileMismatch,
+}
+
+/// Stable Analytics Engine blob for a [`MeterKind`]. Distinct kinds never
+/// share a slug.
+pub fn kind_slug(kind: MeterKind) -> &'static str {
+    match kind {
+        MeterKind::PlayStart => "play_start",
+        MeterKind::CacheHit => "cache_hit",
+        MeterKind::CacheMiss => "cache_miss",
+        MeterKind::BytesServed => "bytes_served",
+        MeterKind::PrefetchEnqueued => "prefetch_enqueued",
+        MeterKind::ProviderError => "provider_error",
+        MeterKind::SizeRefused => "size_refused",
+        MeterKind::GrantRejectedExpired => "grant_rejected_expired",
+        MeterKind::GrantRejectedExcessiveExpiry => "grant_rejected_excessive_expiry",
+        MeterKind::GrantRejectedWrongTrack => "grant_rejected_wrong_track",
+        MeterKind::QuarantineEntered => "quarantine_entered",
+        MeterKind::QuarantineExited => "quarantine_exited",
+        MeterKind::WarmRedial => "warm_redial",
+        MeterKind::ArticleMissing => "article_missing",
+        MeterKind::DecodeFailed => "decode_failed",
+        MeterKind::ReconcileMismatch => "play_reconcile_mismatch",
+    }
 }
 
 /// One billable-or-debuggable fact about a play.
@@ -72,6 +134,9 @@ pub struct MeterEvent {
     pub track_id: String,
     /// Bytes served to the client (0 for non-serving events).
     pub bytes: u64,
+    /// Stream seconds attributed ([`stream_seconds_for_bytes`]); 0 for
+    /// non-serving events.
+    pub seconds: u64,
     /// Pool lane of the call a pool-health event belongs to; `None` for
     /// events unrelated to pool state.
     pub lane: Option<Lane>,
@@ -105,33 +170,31 @@ impl MemoryMeter {
 fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
-        && !field.contains(':')
-        && !field.contains('=')
-        && !field
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Derive the idempotency key for one play: `play:{user}:{track}:{play}`.
 ///
 /// Mirrors the `ingest:{user}:{sha}:{ref}` vocabulary of
-/// `derive_idempotency_key` in the ingest Worker. Rejects (Err, no panic)
-/// any field that is empty, over its byte limit, or contains `:`, `=`,
-/// whitespace, or control characters, so keys remain unambiguous and safe
-/// to emit as single-line structured logs.
+/// `derive_idempotency_key` in the ingest Worker. Each field must be non-empty,
+/// within its byte limit, and contain only ASCII alphanumerics, `-`, or `_`,
+/// matching the persisted ledger key alphabet. Rejects invalid fields (Err,
+/// no panic), without rewriting identities; `:` is only a structural delimiter.
 pub fn derive_play_idempotency_key(
     user_id: &str,
     track_id: &str,
     play_id: &str,
 ) -> Result<String, &'static str> {
     if !is_valid_key_field(user_id, 128) {
-        return Err("user id must be 1-128 bytes without ':', '=', whitespace, or controls");
+        return Err("user id must be 1-128 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(track_id, 512) {
-        return Err("track id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("track id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     if !is_valid_key_field(play_id, 512) {
-        return Err("play id must be 1-512 bytes without ':', '=', whitespace, or controls");
+        return Err("play id must be 1-512 bytes of ASCII alphanumerics, '-', or '_'");
     }
     Ok(format!("play:{user_id}:{track_id}:{play_id}"))
 }
@@ -179,6 +242,11 @@ pub struct LedgerEntry {
 pub enum RecordOutcome {
     Recorded,
     Duplicate,
+    /// The play's account is being deleted (`users.deleting_at` is set),
+    /// so the fenced ledger write was refused and nothing was appended
+    /// (ADR 0002 rule 3). Only [`UsageLedger::record_fenced`] reports
+    /// this; the stable wire/job code is `account_deleting`.
+    AccountDeleting,
     /// The play was not converged: either its idempotency key does not
     /// bind its `(user_id, track_id)` identity fields (the key must be
     /// exactly `play:{user_id}:{track_id}:{play_id}` with valid fields),
@@ -212,10 +280,28 @@ fn key_binds_identity(play: &CompletePlay) -> bool {
     }
 }
 
-/// Portable-core model of the Hyperdrive usage-ledger table.
+/// The account-deletion fence the production ledger INSERT must select
+/// its row through (ADR 0002 rule 3): bind the play owner's user id to
+/// `$1`; the derived `writer_fence` row exists only while that account's
+/// `deleting_at IS NULL`, and the `FOR SHARE` lock is held until the
+/// INSERT commits, so the scheduling `UPDATE users` either waits for
+/// the play-event/ledger write or fences it. A fenced INSERT affects 0
+/// rows and must be classified as `account_deleting`, never retried
+/// behind the delete. Zero rows is ambiguous under `DO NOTHING`, though:
+/// a duplicate redelivery with an open fence also affects 0 rows. The
+/// production sink must converge with `DO UPDATE` (like the ingest
+/// library upsert) or probe the fence first, so healthy duplicates never
+/// read as `account_deleting`.
+pub const LEDGER_WRITE_FENCE_SQL: &str =
+    "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
+
+/// Portable-core model of the Hyperdrive `stream_play_ledger` table.
 ///
 /// Production must key `UNIQUE(idempotency_key)` exactly as the ingest
-/// library upsert converges `ON CONFLICT (idempotency_key)`.
+/// library upsert converges `ON CONFLICT (idempotency_key)`. A zero-row
+/// `DO NOTHING` insert is ambiguous: the api Worker's
+/// `ledger_select_by_key_statement` + `classify_replay` separate exact
+/// redeliveries (`Duplicate`) from conflicting payloads (`Conflict`).
 #[derive(Default, Debug)]
 pub struct UsageLedger {
     entries: Vec<LedgerEntry>,
@@ -256,6 +342,23 @@ impl UsageLedger {
             bytes: play.bytes,
         });
         RecordOutcome::Recorded
+    }
+
+    /// Record a complete play through the account-deletion fence.
+    ///
+    /// `account_deleting` is the fence state the production sink obtains
+    /// from [`LEDGER_WRITE_FENCE_SQL`] in the same statement as its
+    /// INSERT (`true` when the fence row is absent because
+    /// `users.deleting_at` is set). A fenced play is refused before any
+    /// identity/dedup work and appends nothing — the mirror of the
+    /// production INSERT affecting 0 rows — so neither a first play nor
+    /// a redelivery can repopulate the ledger behind the marker. With
+    /// the fence open this is exactly [`UsageLedger::record`].
+    pub fn record_fenced(&mut self, play: &CompletePlay, account_deleting: bool) -> RecordOutcome {
+        if account_deleting {
+            return RecordOutcome::AccountDeleting;
+        }
+        self.record(play)
     }
 
     /// Ledger rows in first-record order.
@@ -390,6 +493,7 @@ pub fn reconcile(
             user_id: play.user_id.clone(),
             track_id: play.track_id.clone(),
             bytes: 0,
+            seconds: 0,
             lane: None,
             backoff_ms: 0,
         });
@@ -434,6 +538,33 @@ pub fn reconcile(
     }
 }
 
+/// One Analytics Engine point: blobs carry identity, doubles carry
+/// magnitude, the index is the billed user. `doubles` holds
+/// `[bytes, seconds]`; both stay exactly representable for every realistic
+/// play (magnitudes far below 2^53).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalyticsPoint {
+    pub dataset: &'static str,
+    pub index: String,
+    pub blobs: [String; 3],
+    pub doubles: [f64; 2],
+}
+
+/// Build the [`AnalyticsPoint`] for one event. Blobs are
+/// `[kind, user_id, track_id]`; the index is the user.
+pub fn analytics_point(event: &MeterEvent) -> AnalyticsPoint {
+    AnalyticsPoint {
+        dataset: METER_DATASET,
+        index: event.user_id.clone(),
+        blobs: [
+            kind_slug(event.kind).to_string(),
+            event.user_id.clone(),
+            event.track_id.clone(),
+        ],
+        doubles: [event.bytes as f64, event.seconds as f64],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +578,7 @@ mod tests {
                 user_id: "u".to_string(),
                 track_id: "t".to_string(),
                 bytes: 7,
+                seconds: stream_seconds_for_bytes(7),
                 lane: None,
                 backoff_ms: 0,
             });
@@ -549,6 +681,44 @@ mod tests {
     }
 
     #[test]
+    fn fenced_record_refuses_deleting_accounts_and_records_normal_plays() {
+        let play = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let mut ledger = UsageLedger::default();
+        // Fence open: identical to record, including dedup convergence.
+        assert_eq!(ledger.record_fenced(&play, false), RecordOutcome::Recorded);
+        assert_eq!(ledger.record_fenced(&play, false), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 1);
+        // Fence closed: a later play for a new key appends nothing and
+        // does not disturb the entry recorded before scheduling.
+        let later = CompletePlay::new("user-1", "track-9", "play-8", 40_000).unwrap();
+        assert_eq!(
+            ledger.record_fenced(&later, true),
+            RecordOutcome::AccountDeleting
+        );
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 40_000);
+        // A fenced redelivery is refused as deleting, never converged
+        // as a duplicate: the fence runs before identity/dedup.
+        assert_eq!(
+            ledger.record_fenced(&play, true),
+            RecordOutcome::AccountDeleting
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn ledger_write_fence_sql_locks_only_a_non_deleting_owner_row() {
+        assert_eq!(
+            LEDGER_WRITE_FENCE_SQL,
+            "(SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+        );
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("FOR UPDATE"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("NOWAIT"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("SKIP LOCKED"));
+        assert!(!LEDGER_WRITE_FENCE_SQL.contains("IS NOT NULL"));
+    }
+
+    #[test]
     fn reconcile_flags_a_conflicting_redelivery_in_the_same_batch() {
         // Same identity fields, different bytes: the derived keys match,
         // so the second play is a conflicting redelivery of the first.
@@ -595,9 +765,9 @@ mod tests {
         let key = derive_play_idempotency_key(&user, &track, &play_id).unwrap();
         assert_eq!(key, format!("play:{user}:{track}:{play_id}"));
 
-        // The limits count bytes, not chars: 64 two-byte chars are exactly
-        // 128 bytes, 65 are 130.
-        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_ok());
+        // Non-ASCII identities are refused even at the byte limit:
+        // 64 two-byte chars are exactly 128 bytes, 65 are 130.
+        assert!(derive_play_idempotency_key(&"\u{e9}".repeat(64), "t", "p").is_err());
         assert!(derive_play_idempotency_key(&"\u{e9}".repeat(65), "t", "p").is_err());
 
         // The ledger accepts exact-limit fields too, so its identity re-check
@@ -733,5 +903,220 @@ mod tests {
         assert!(line.contains("user_id=user%20with%20space"));
         assert!(line.contains("track_id=track%3Dvalue"));
         assert!(line.ends_with("metered_bytes=40 ledger_bytes=40"));
+    }
+
+    #[test]
+    fn dataset_names_match_wrangler() {
+        assert_eq!(METER_DATASET_BINDING, "METER");
+        assert_eq!(METER_DATASET, "nntune_meter");
+    }
+
+    #[test]
+    fn nominal_rate_is_pinned() {
+        // Literal pin (not in terms of the constant): changing the rate
+        // re-bills every historical byte count, so it must be deliberate.
+        assert_eq!(STREAM_BYTES_PER_SEC, 48_000);
+    }
+
+    #[test]
+    fn seconds_vectors() {
+        assert_eq!(stream_seconds_for_bytes(0), 0);
+        assert_eq!(stream_seconds_for_bytes(1), 1);
+        assert_eq!(stream_seconds_for_bytes(47_999), 1);
+        assert_eq!(stream_seconds_for_bytes(48_000), 1);
+        assert_eq!(stream_seconds_for_bytes(48_001), 2);
+        assert_eq!(stream_seconds_for_bytes(96_000), 2);
+        assert_eq!(stream_seconds_for_bytes(96_001), 3);
+        // No overflow at the top: div_ceil never adds before dividing.
+        // u64::MAX = 18_446_744_073_709_551_615 = 48_000 * 384_307_168_202_282
+        // + 41_615, so the ceiling is one past the quotient.
+        assert_eq!(stream_seconds_for_bytes(u64::MAX), 384_307_168_202_283);
+    }
+
+    #[test]
+    fn kind_slugs_are_distinct_snake_case() {
+        let slugs = [
+            kind_slug(MeterKind::PlayStart),
+            kind_slug(MeterKind::CacheHit),
+            kind_slug(MeterKind::CacheMiss),
+            kind_slug(MeterKind::BytesServed),
+            kind_slug(MeterKind::PrefetchEnqueued),
+            kind_slug(MeterKind::ProviderError),
+            kind_slug(MeterKind::SizeRefused),
+            kind_slug(MeterKind::GrantRejectedExpired),
+            kind_slug(MeterKind::GrantRejectedExcessiveExpiry),
+            kind_slug(MeterKind::GrantRejectedWrongTrack),
+            kind_slug(MeterKind::QuarantineEntered),
+            kind_slug(MeterKind::QuarantineExited),
+            kind_slug(MeterKind::WarmRedial),
+            kind_slug(MeterKind::ArticleMissing),
+            kind_slug(MeterKind::DecodeFailed),
+            kind_slug(MeterKind::ReconcileMismatch),
+        ];
+        assert_eq!(
+            slugs,
+            [
+                "play_start",
+                "cache_hit",
+                "cache_miss",
+                "bytes_served",
+                "prefetch_enqueued",
+                "provider_error",
+                "size_refused",
+                "grant_rejected_expired",
+                "grant_rejected_excessive_expiry",
+                "grant_rejected_wrong_track",
+                "quarantine_entered",
+                "quarantine_exited",
+                "warm_redial",
+                "article_missing",
+                "decode_failed",
+                "play_reconcile_mismatch"
+            ]
+        );
+        let mut distinct = slugs.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), slugs.len());
+    }
+
+    #[test]
+    fn analytics_point_carries_identity_in_blobs_and_magnitude_in_doubles() {
+        let event = MeterEvent {
+            kind: MeterKind::BytesServed,
+            user_id: "user-1".to_string(),
+            track_id: "track-9".to_string(),
+            bytes: 100_000,
+            seconds: stream_seconds_for_bytes(100_000),
+            lane: None,
+            backoff_ms: 0,
+        };
+        let point = analytics_point(&event);
+        assert_eq!(point.dataset, "nntune_meter");
+        assert_eq!(point.index, "user-1");
+        assert_eq!(
+            point.blobs,
+            [
+                "bytes_served".to_string(),
+                "user-1".to_string(),
+                "track-9".to_string()
+            ]
+        );
+        assert_eq!(point.doubles, [100_000.0, 3.0]);
+    }
+
+    #[test]
+    fn two_plays_on_one_track_bill_independently() {
+        // There is no cross-play (user, track) fold: each play carries its
+        // own byte total (`CompletePlay.bytes`, fed from the play's own
+        // `served` counter), and the ledger converges per idempotency key.
+        // Summing both plays' bytes into play-7's row would bill play-7 for
+        // both listens and bill (or conflict) play-8 on top.
+        let play_7 = CompletePlay::new("user-1", "track-9", "play-7", 40_000).unwrap();
+        let play_8 = CompletePlay::new("user-1", "track-9", "play-8", 75_000).unwrap();
+        assert_ne!(play_7.idempotency_key, play_8.idempotency_key);
+        let mut ledger = UsageLedger::default();
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Recorded);
+        assert_eq!(ledger.record(&play_8), RecordOutcome::Recorded);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_7.idempotency_key).map(|e| e.bytes),
+            Some(40_000),
+            "play-7 bills only its own bytes, never the cross-play sum"
+        );
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
+        assert_eq!(ledger.total_bytes_for_user("user-1"), 115_000);
+        // A redelivery of play-7 converges to play-7 alone and leaves
+        // play-8 untouched.
+        assert_eq!(ledger.record(&play_7), RecordOutcome::Duplicate);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            ledger.get(&play_8.idempotency_key).map(|e| e.bytes),
+            Some(75_000)
+        );
+    }
+
+    // Deterministic stand-in for a property-test RNG (this crate stays
+    // dependency-free): xorshift64* over a fixed seed.
+    fn rng_next(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    #[test]
+    fn seconds_are_the_ceiling_monotone_and_split_bounded() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        for i in 0usize..5_000 {
+            let bytes = if i.is_multiple_of(7) {
+                // Edge strata near multiples of the rate.
+                48_000 * (rng_next(&mut state) % 5) + rng_next(&mut state) % 3
+            } else {
+                rng_next(&mut state) % 20_000_000
+            };
+            let seconds = stream_seconds_for_bytes(bytes);
+            // Ceiling: the attributed seconds cover the bytes, and one fewer
+            // second would not (for any positive byte count).
+            assert!(seconds * STREAM_BYTES_PER_SEC >= bytes, "bytes {bytes}");
+            if bytes > 0 {
+                assert!(
+                    seconds
+                        .saturating_sub(1)
+                        .saturating_mul(STREAM_BYTES_PER_SEC)
+                        < bytes,
+                    "bytes {bytes}"
+                );
+            } else {
+                assert_eq!(seconds, 0);
+            }
+        }
+        let mut sorted: Vec<u64> = {
+            let mut s = 0xABCDu64;
+            (0..2_000).map(|_| rng_next(&mut s) % 50_000_000).collect()
+        };
+        sorted.sort_unstable();
+        let mut last = 0u64;
+        for bytes in sorted {
+            let seconds = stream_seconds_for_bytes(bytes);
+            assert!(seconds >= last, "monotone at {bytes}");
+            last = seconds;
+        }
+        // Split bound: serving a..b in two events attributes at most one
+        // extra second versus serving a+b at once, never fewer.
+        let mut s2 = 0x99u64;
+        for _ in 0..2_000 {
+            let a = rng_next(&mut s2) % 5_000_000;
+            let b = rng_next(&mut s2) % 5_000_000;
+            let whole = stream_seconds_for_bytes(a.saturating_add(b));
+            let split = stream_seconds_for_bytes(a).saturating_add(stream_seconds_for_bytes(b));
+            assert!(split >= whole, "split {a}+{b}");
+            assert!(split <= whole.saturating_add(1), "split {a}+{b}");
+        }
+    }
+
+    #[test]
+    fn doubles_stay_exact_for_realistic_plays() {
+        // Every byte count a real play can serve is far below 2^53, so the
+        // Analytics Engine doubles round-trip exactly.
+        let mut state = 42u64;
+        for _ in 0..1_000 {
+            let bytes = rng_next(&mut state) % 10_737_418_240;
+            let event = MeterEvent {
+                kind: MeterKind::BytesServed,
+                user_id: "u".to_string(),
+                track_id: "t".to_string(),
+                bytes,
+                seconds: stream_seconds_for_bytes(bytes),
+                lane: None,
+                backoff_ms: 0,
+            };
+            let point = analytics_point(&event);
+            assert_eq!(point.doubles[0] as u64, bytes);
+            assert_eq!(point.doubles[1] as u64, event.seconds);
+        }
     }
 }

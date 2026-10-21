@@ -10,8 +10,8 @@ types must match, so changing a value never fails this check but adding
 a key without updating the schema always does.
 
 Exit codes: 0 = parity holds; 1 = drift found (including an invalid
-schema); 2 = unusable input (missing file, bad JSON: the check itself
-never ran).
+schema); 2 = unusable input (missing file, bad JSON, or a duplicate
+JSON member name in any input: the check itself never ran).
 
 Usage:
   python3 .github/scripts/config_parity_check.py \
@@ -28,6 +28,44 @@ U64_MAX = 2**64 - 1
 
 TYPES = ("u64", "bool", "string")
 
+# Cap on member-name characters shown in a duplicate diagnostic; the
+# name is escaped before display and member values are never shown.
+MEMBER_NAME_DISPLAY_MAX = 32
+
+
+class DuplicateMemberError(ValueError):
+    """A JSON object repeated a member name (compared after decoding)."""
+
+    def __init__(self, member_name):
+        # Keep the exception text free of the name itself; load_json
+        # renders it escaped and length-bounded via display_member_name.
+        super().__init__("duplicate JSON member name")
+        self.member_name = member_name
+
+
+def object_without_duplicates(pairs):
+    """object_pairs_hook: build a dict, rejecting repeated member names.
+
+    The decoder calls this for every JSON object at any depth (including
+    objects nested in arrays), with member names already decoded, so an
+    escape-encoded repeat (e.g. ``\\u005f`` for ``_``) counts as a
+    duplicate too. Ordinary json.load would silently keep the last value.
+    """
+    obj = {}
+    for name, value in pairs:
+        if name in obj:
+            raise DuplicateMemberError(name)
+        obj[name] = value
+    return obj
+
+
+def display_member_name(name):
+    """Render a member name for a diagnostic: escaped and bounded."""
+    shown = json.dumps(name[:MEMBER_NAME_DISPLAY_MAX], ensure_ascii=True)
+    if len(name) > MEMBER_NAME_DISPLAY_MAX:
+        shown += "..."
+    return shown
+
 
 def fail_input(message):
     """Report an unusable input (exit 2): the check itself never ran."""
@@ -38,7 +76,12 @@ def fail_input(message):
 def load_json(path, label):
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh), None
+            return json.load(fh, object_pairs_hook=object_without_duplicates), None
+    except DuplicateMemberError as exc:
+        return None, (
+            f"{label} file contains a duplicate JSON member name "
+            f"{display_member_name(exc.member_name)}: {path}"
+        )
     except FileNotFoundError:
         return None, f"{label} file not found: {path}"
     except json.JSONDecodeError as exc:

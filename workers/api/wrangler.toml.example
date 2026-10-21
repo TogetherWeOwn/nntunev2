@@ -5,7 +5,9 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
 [build]
-command = "cargo install -q worker-build --locked && worker-build --release"
+# `--locked` (after `--`, forwarded to `cargo build`) builds exactly the
+# committed, audited workers/api/Cargo.lock and fails if it is stale.
+command = "cargo install -q worker-build --locked && worker-build --release -- --locked"
 
 [vars]
 # Public, non-secret config only. RP_ORIGIN must be the canonical
@@ -14,9 +16,37 @@ command = "cargo install -q worker-build --locked && worker-build --release"
 RP_ID = "example.com"
 RP_ORIGIN = "https://example.com"
 SESSION_TTL_SECS = "86400"
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the `staging-api` lane in
+# `.github/workflows/deploy.yml`
+# (`deploy --env staging --var BUILD_SHA:${{ github.sha }}`). Until that
+# lane runs configured (staging variables wired, deploy succeeded), every
+# api line renders the explicit string "unknown".
+# Workers log it as the `build_sha` field on every record; an absent or
+# invalid value renders as "unknown" (never a missing key, never
+# fail-closed), which means the lane did not supply it. Leave unset for
+# local dev.
+# BUILD_SHA = "unknown"
 # INVITES_REQUIRED = "true"
 # ALLOW_LOOPBACK_DEV = "true"          # local dev only, never staging/prod
 # EMAIL_WEBHOOK_URL = "https://<mail-provider-webhook>"  # magic-link delivery
+# Staging-only emailed-code retrieval seam (POST /api/test-codes, returns
+# the issued code for example.test mailboxes without minting; see
+# docs/security/threat-model.md). Staging env ONLY — never set on prod:
+# QA_CODE_SEAM = "1" arms capture + retrieval, and QA_AUTH_TOKEN (secret,
+# below) authenticates retrieval. Either missing answers the seam path
+# with the plain unknown-route 404.
+# QA_CODE_SEAM = "1"
+# Rate-limit defaults live in src/rate_limit.rs (documented there: auth
+# 10/60s, vault test-connection 5/60s per account and 25/60s per IP,
+# single-sourced with src/vault.rs). The Worker entry reads these
+# [vars] overrides at startup via RateLimitConfig::from_vars (invalid
+# values fall back to the defaults; a max over 100 clamps to 100, the
+# durable slot store's cap):
+# AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_SECS /
+# VAULT_TEST_RATE_LIMIT_MAX / VAULT_TEST_RATE_LIMIT_WINDOW_SECS /
+# VAULT_TEST_IP_RATE_LIMIT_MAX. Unset, the IP cap defaults to 5x the
+# configured VAULT_TEST_RATE_LIMIT_MAX (clamped to 100).
 
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
@@ -44,11 +74,25 @@ SESSION_TTL_SECS = "86400"
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
 
+# Workers Logs persistence for the structured api records (the build_sha
+# evidence is read there). Without this block the deployed Worker has
+# observability=null and persists nothing. The `staging-api` lane in
+# `.github/workflows/deploy.yml` generates this block into its staging
+# wrangler config (generated, never committed); this example is the
+# hand-deploy reference, so mirror the block here and uncomment it for a
+# hand staging deploy (`wrangler deploy --env staging`):
+# [env.staging.observability]
+# enabled = true
+# head_sampling_rate = 1
+
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with
 # `nntune_api::b64::decode` — padded std base64 is rejected):
-#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (versioned; rotate via rewrap job)
+#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (single live
+#                                 version; routine rotation via the rewrap job
+#                                 is NOT implemented — see
+#                                 docs/security/kek-rotation.md §7 banner)
 #   VAULT_KEK_VERSION             integer version matching the KEK
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
@@ -62,4 +106,28 @@ SESSION_TTL_SECS = "86400"
 #                                 never two live minting secrets.
 #   SESSION_SECRET_ROTATION         "1" only for the deploy(s) covering a
 #                                 recorded rotation window; unset otherwise.
+#   NATIVE_REST_PEPPER_BASE64       HMAC pepper for scoped native REST bearer
+#                                 credentials (ADR 0010, migration 0019),
+#                                 32+ bytes unpadded base64url. Dedicated
+#                                 keyring, separate from the planned
+#                                 SUBSONIC_INDEX_PEPPER Subsonic keyring
+#                                 (not wired in the Worker) so either surface
+#                                 rotates without forcing the other. BOTH
+#                                 pepper vars set, or neither:
+#                                 unset, issuance endpoints fail closed
+#                                 per-request and bearer routes 401 while
+#                                 every other route keeps serving; half-set
+#                                 refuses to start (fail closed).
+#   NATIVE_REST_PEPPER_VERSION      integer version bound to the pepper above
+#                                 (stored per row; lookup is by the exact
+#                                 composite (pepper_version, key_hmac)).
+#                                 The Worker holds exactly one pair — no
+#                                 dual-pepper window — so pepper rotation
+#                                 currently means reissuing credentials (see
+#                                 ADR 0010 implementation status).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
+#   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
+#                                 seam only). High-entropy; same value as the
+#                                 e2e-staging QA_AUTH_TOKEN secret. Staged only
+#                                 together with QA_CODE_SEAM=1 (staging env);
+#                                 never on prod.
