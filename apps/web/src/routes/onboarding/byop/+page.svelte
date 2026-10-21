@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { readSignedInEmail } from '#lib/signed-in-email.js';
+	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
+	import { clearSignedInEmail, readSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 	import {
 		ApiClient,
@@ -27,8 +29,19 @@
 	// these provider credentials will be saved to, shown before anything
 	// is typed.
 	let signedInEmail = $state<string | null>(null);
+	// Fail-closed restart latch: set synchronously on a local or delivered
+	// auth transition and never cleared on this mount. Recovery is explicit
+	// user navigation/sign-in followed by a fresh mount; no replayed draft,
+	// pending intent or automatic save.
+	let resetRequired = $state(false);
 	onMount(() => {
 		signedInEmail = readSignedInEmail();
+		window.addEventListener('storage', handleStorageTransition);
+		const unsubscribeLocal = subscribeLocalAuthTransition(handleAuthTransitionReset);
+		return () => {
+			window.removeEventListener('storage', handleStorageTransition);
+			unsubscribeLocal();
+		};
 	});
 
 	let step = $state<1 | 2 | 3>(1);
@@ -62,12 +75,58 @@
 	// an operation that is still awaiting a response or a passkey ceremony.
 	let busy = $state(false);
 	let disposed = false;
+	// Page-owned cancellation: every test/save/reauth request and the passkey
+	// ceremony run under these controllers so reset and unmount fence work
+	// the transport itself ignores. Aborting sends nothing new.
+	let requestController: AbortController | null = null;
+	let ceremonyController: AbortController | null = null;
+
+	function abortOwnedWork(): void {
+		requestController?.abort();
+		requestController = null;
+		ceremonyController?.abort();
+		ceremonyController = null;
+	}
 
 	onDestroy(() => {
 		disposed = true;
+		abortOwnedWork();
 		invalidateTest();
 		busy = false;
 	});
+
+	/**
+	 * Fail-closed reset for a local or delivered auth transition. Enters the
+	 * restart-required state synchronously, then clears identity display,
+	 * typed secrets, tested state and recovery UI and fences pending
+	 * test/save/passkey/reauth continuations and stale submits. Makes zero
+	 * API calls, never rebroadcasts, never navigates; idempotent so double
+	 * delivery settles safely.
+	 */
+	function handleAuthTransitionReset(): void {
+		if (disposed) return;
+		resetRequired = true;
+		abortOwnedWork();
+		invalidateTest();
+		signedInEmail = null;
+		clearSignedInEmail();
+		host = '';
+		port = 563;
+		tls = true;
+		allowInsecurePlaintext = false;
+		username = '';
+		password = '';
+		maxConnections = 4;
+		indexerUrl = '';
+		indexerApiKey = '';
+		step = 1;
+		errors = {};
+		busy = false;
+	}
+
+	function handleStorageTransition(event: StorageEvent): void {
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) handleAuthTransitionReset();
+	}
 
 	// Keep the wire payload honest: a TLS connection never carries the
 	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
@@ -94,7 +153,11 @@
 	}
 
 	function isCurrentTest(runId: number, inputKey: string) {
-		return !disposed && runId === testRunId && inputKey === currentTestKey();
+		return !disposed && !resetRequired && runId === testRunId && inputKey === currentTestKey();
+	}
+
+	function isCurrentRun(runId: number) {
+		return !disposed && !resetRequired && runId === testRunId;
 	}
 
 	function invalidateTest() {
@@ -159,7 +222,7 @@
 	}
 
 	async function runTest() {
-		if (disposed || busy || saveState === 'saved') return;
+		if (disposed || resetRequired || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
 		const providerErrors = validateProviderFields(providerInput());
@@ -173,6 +236,9 @@
 
 		busy = true;
 		const runId = ++testRunId;
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
 		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
@@ -180,9 +246,13 @@
 		try {
 			const result: ProviderTestResult = await client.testProviderConnection(input, () => {
 				// Only an explicit Retry may repeat this UI action, and never
-				// after navigation, changed input, or a newer test run.
-				if (isCurrentTest(runId, inputKey) && step === 3) void runTest();
-			});
+				// after navigation, reset, changed input, or a newer test run.
+				// The retained closure holds only the run id — non-secret
+				// local operation identity, never the secret-bearing draft:
+				// any input edit invalidates the run, and the repeated run
+				// re-reads the current inputs.
+				if (isCurrentRun(runId) && step === 3) void runTest();
+			}, requestSignal);
 			if (!isCurrentTest(runId, inputKey)) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
@@ -243,7 +313,7 @@
 	}
 
 	async function reauthenticateAndSave() {
-		if (disposed || busy || saveState === 'saved' || !saveReauthRequired) return;
+		if (disposed || resetRequired || busy || saveState === 'saved' || !saveReauthRequired) return;
 		const runId = testRunId;
 		const inputKey = currentTestKey();
 		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
@@ -253,15 +323,22 @@
 		}
 		busy = true;
 		reauthState = 'working';
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
+		ceremonyController?.abort();
+		ceremonyController = new AbortController();
+		const ceremonySignal = ceremonyController.signal;
 		try {
-			const options = await client.reauthenticateStart();
+			const options = await client.reauthenticateStart(requestSignal);
 			if (!isCurrentTest(runId, inputKey)) return;
 			const assertion = await navigator.credentials.get({
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
 					rpId: options.rp_id,
 					allowCredentials: []
-				})
+				}),
+				signal: ceremonySignal
 			});
 			if (!isCurrentTest(runId, inputKey)) return;
 			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
@@ -284,7 +361,7 @@
 				authenticatorData,
 				clientDataJson,
 				signature
-			});
+			}, requestSignal);
 			if (!isCurrentTest(runId, inputKey) || testedConfigKey !== inputKey) return;
 		} catch (error) {
 			if (!isCurrentTest(runId, inputKey)) return;
@@ -312,7 +389,7 @@
 	}
 
 	async function save() {
-		if (disposed || busy || saveState === 'saved') return;
+		if (disposed || resetRequired || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
 		if (testState !== 'ok' || testedConfigKey !== inputKey) {
@@ -322,11 +399,14 @@
 
 		busy = true;
 		const runId = testRunId;
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
 		saveReauthRequired = false;
 		reauthState = 'idle';
 		saveState = 'saving';
 		try {
-			await client.saveProviderConfig(input);
+			await client.saveProviderConfig(input, requestSignal);
 			if (isCurrentTest(runId, inputKey)) {
 				saveState = 'saved';
 				window.location.href = '/library';
@@ -356,6 +436,13 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
+	{#if resetRequired}
+		<p role="alert">
+			This setup was reset after an authentication change. Sign in and start setup again;
+			re-enter and retest your credentials. Requests already submitted may still complete.
+			<a href="/login">Sign in</a>
+		</p>
+	{/if}
 	{#if signedInEmail !== null}
 		<p role="status">
 			Signed in as <strong>{signedInEmail}</strong> — the provider details you save go to
@@ -475,7 +562,7 @@
 				type="button"
 				onclick={runTest}
 					data-testid="byop-test-connection"
-				disabled={busy || saveState === 'saved'}
+				disabled={busy || saveState === 'saved' || resetRequired}
 			>
 				{testState === 'testing' ? 'Testing…' : 'Test connection'}
 			</button>
@@ -486,7 +573,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={busy || saveState === 'saved'}
+					disabled={busy || saveState === 'saved' || resetRequired}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -520,7 +607,7 @@
 								}}
 							/>
 						</label>
-						<button class="nt-button" type="button" onclick={runTest} disabled={busy}>Test again</button>
+						<button class="nt-button" type="button" onclick={runTest} disabled={busy || resetRequired}>Test again</button>
 					</div>
 				{:else}
 					<p data-testid="byop-status" role="alert">{testDetail}</p>
@@ -535,7 +622,7 @@
 						class="nt-button"
 						type="button"
 						onclick={reauthenticateAndSave}
-						disabled={busy}
+						disabled={busy || resetRequired}
 					>
 						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
 					</button>

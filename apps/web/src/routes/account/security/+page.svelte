@@ -3,6 +3,7 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import type { PageProps } from './$types';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { notifyLocalAuthTransition } from '#lib/auth-transition.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 
@@ -14,12 +15,22 @@
 		alive = false;
 	});
 
-	function redirectToLogin() {
-		if (!alive) return;
-		// Crossing an auth boundary: drop this tab's library snapshots and
-		// broadcast the transition so other open tabs stop showing them.
+	/**
+	 * A qualifying security result crosses the auth boundary whether this
+	 * route is live or abandoned: drop this tab's library snapshots and
+	 * identity label, broadcast the transition so other open tabs stop
+	 * showing them, and notify mounted same-window consumers. Never
+	 * navigates and never throws; every UI/navigation continuation below
+	 * stays behind its own liveness guard.
+	 */
+	function crossAuthBoundary() {
 		invalidateLibraryCache();
 		clearSignedInEmail();
+		notifyLocalAuthTransition();
+	}
+
+	function redirectToLogin() {
+		if (!alive) return;
 		window.location.href = '/login';
 	}
 
@@ -35,17 +46,22 @@
 		try {
 			await client.logout();
 		} catch (error) {
-			if (!alive) return;
 			if (error instanceof ApiError && error.status === 401) {
+				// Qualifying 401: this session is confirmed gone. Cross the
+				// boundary even when abandoned; navigation stays live-only.
+				crossAuthBoundary();
 				redirectToLogin();
 				return;
 			}
+			if (!alive) return;
 			actionError = 'Could not sign out. Please try again.';
 			busy = null;
 			return;
 		} finally {
 			if (!alive) busy = null;
 		}
+		// Fulfilled success is qualifying live or abandoned.
+		crossAuthBoundary();
 		redirectToLogin();
 	}
 
@@ -57,28 +73,33 @@
 		try {
 			await client.revokeAllSessions();
 		} catch (error) {
-			if (!alive) return;
 			if (error instanceof ApiError && error.status === 401) {
 				// A 401 means this request was rejected before any session
 				// was revoked, so staying here with an explicit message keeps
 				// the failure distinguishable from a successful revocation
 				// (which navigates to /login with no message). The local
 				// session is confirmed gone, so local library snapshots
-				// still cross the auth boundary and are invalidated here.
+				// still cross the auth boundary and are invalidated here —
+				// even when abandoned, but then with no message or redirect.
 				invalidateLibraryCache();
 				clearSignedInEmail();
+				notifyLocalAuthTransition();
+				if (!alive) return;
 				actionError =
 					'Your session expired before other devices were signed out. Sign in again and repeat Sign out everywhere.';
 				revokeIncomplete = true;
 				busy = null;
 				return;
 			}
+			if (!alive) return;
 			actionError = 'Could not confirm sign out everywhere. Please try again.';
 			busy = null;
 			return;
 		} finally {
 			if (!alive) busy = null;
 		}
+		// Fulfilled success is qualifying live or abandoned.
+		crossAuthBoundary();
 		redirectToLogin();
 	}
 </script>

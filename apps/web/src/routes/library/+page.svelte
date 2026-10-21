@@ -8,8 +8,10 @@
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
+	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import {
 		addTrack,
@@ -98,19 +100,31 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		// Clear the queue at the auth boundary even before the refresher's
-		// state lands; the onStateChange reconcile above is the backstop.
-		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) queue = clearQueue(queue);
+		// Clear the queue and this tab's identity label at the auth boundary
+		// even before the refresher's state lands; the onStateChange
+		// reconcile above is the backstop for the queue.
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
+			queue = clearQueue(queue);
+			clearSignedInEmail();
+		}
 		refresher.handleAuthTransition(event);
+	}
+
+	function handleLocalAuthTransition(): void {
+		queue = clearQueue(queue);
+		clearSignedInEmail();
+		refresher.handleLocalAuthTransition();
 	}
 
 	onMount(() => {
 		window.addEventListener('storage', handleAuthTransition);
+		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
 			refresher.dispose();
+			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
 		};
 	});
