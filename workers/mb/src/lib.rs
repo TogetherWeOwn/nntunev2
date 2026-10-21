@@ -451,21 +451,23 @@ fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
 }
 
+/// Predicate form of the width helpers, shared by the lookup and
+/// recordings validators.
+type WidthCheck = fn(&serde_json::Number) -> bool;
+
 /// Cached integers must fit the fresh DTO's Rust width: `Release.year`
 /// and `Recording::{track_no, medium_no}` serialize `Option<i16>`, while
 /// `Recording::duration_ms` serializes `Option<i32>`. Anything outside the
 /// signed range — huge `u64`, extreme `i64`, fractions — is a miss. There
 /// is no positivity rule: negative and zero values the DTOs can emit stay
 /// hits.
-/// Predicate form of the width helpers, shared by the lookup and
-/// recordings validators.
-type WidthCheck = fn(&serde_json::Number) -> bool;
-
 fn number_fits_i16(n: &serde_json::Number) -> bool {
     n.as_i64()
         .is_some_and(|v| v >= i64::from(i16::MIN) && v <= i64::from(i16::MAX))
 }
 
+/// Same cached/fresh width contract at the `i32` width
+/// (`Recording::duration_ms`).
 fn number_fits_i32(n: &serde_json::Number) -> bool {
     n.as_i64()
         .is_some_and(|v| v >= i64::from(i32::MIN) && v <= i64::from(i32::MAX))
