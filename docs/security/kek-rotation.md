@@ -89,10 +89,10 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
 - Legacy single-key mode (slice 1, still supported): one KEK per
   environment — `VAULT_KEK_BASE64` (32 random bytes, unpadded base64url,
   43 chars, decodes via `nntune_api::b64::decode`) plus
-  `VAULT_KEK_VERSION` (the integer version stamped on every row). Until
-  the first rotation the single key IS version 1. Active if and only if
+  `VAULT_KEK_VERSION` (the integer version stamped on every row; call it
+  `L`). Active if and only if
   `VAULT_KEK_CURRENT` is unset; per-version secrets are ignored in this
-  mode, so staging `V1` ahead of cutover never changes serving.
+  mode, so staging `V<L>` ahead of cutover never changes serving.
 - Versioned mode: `VAULT_KEK_CURRENT` (a **non-secret** config var,
   e.g. `VAULT_KEK_CURRENT=2` in wrangler `vars`, not `secrets`,
   replacing `VAULT_KEK_VERSION` at cutover) names the write version,
@@ -100,15 +100,19 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
   other provisioned per-version secret is a retained prior for
   mixed-version reads. Legacy vars are ignored in this mode.
 
-- At first rotation, the current key is re-provisioned as a **separate
-  per-version Worker secret**: `VAULT_KEK_V1` (same bytes as the slice-1
-  key), then `VAULT_KEK_V2`, … — each 32 random bytes, unpadded-base64url
+- At first cutover, the live legacy key is re-provisioned as a **separate
+  per-version Worker secret**: `VAULT_KEK_V<L>` (same bytes as the legacy
+  `VAULT_KEK_BASE64`, where `L` is the env's live legacy
+  `VAULT_KEK_VERSION`), then `VAULT_KEK_V<L+1>`, … for later rotations —
+  each 32 random bytes, unpadded-base64url
   at rest (`openssl rand 32 | basenc --base64url | tr -d '='`, 43 chars,
   decodes via `nntune_api::b64::decode`; generated inside the private
   operator secrets store, provisioned via `wrangler secret put` or the
-  dashboard). Cutover is one deploy setting `V1` + `VAULT_KEK_CURRENT=1`
+  dashboard). Cutover is one deploy setting `V<L>` + `VAULT_KEK_CURRENT=<L>`
   alongside the legacy pair; the legacy `VAULT_KEK_BASE64` /
-  `VAULT_KEK_VERSION` are deleted once V1 reads green.
+  `VAULT_KEK_VERSION` are deleted once V<L> reads green. Never assume
+  `L=1`: an env whose legacy version is not 1 must cut over at its own
+  live version, or every pre-existing row goes unreadable post-cutover.
 - Discovery window: the `Env` API offers no key listing, so the Worker
   probes `VAULT_KEK_V<N>` for N in `CURRENT ± 8`
   (`KEK_VERSION_WINDOW`); anything outside stays unprovisioned, and

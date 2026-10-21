@@ -158,6 +158,12 @@ forward-only (§4).
    implemented, so confirming the restored rows' versions are
    provisioned — re-provisioning a retired version's secret from the
    operator store when the discovery window covers it — is executable.
+   That re-provisioning requires the serving Worker in versioned mode
+   (`VAULT_KEK_CURRENT` + `VAULT_KEK_V<N>` secrets: legacy single-key
+   mode serves exactly one version and cannot take a retired second one)
+   with the retired version inside the `CURRENT ± 8` discovery window;
+   outside the window the Worker never probes that secret and the rows
+   stay fail-closed unreadable.
    The re-wrap runner and the `rotation_runs` progress table are still
    **not implemented** (`docs/security/kek-rotation.md` §7 banner, §8
    gate items): a restore that needs rows re-wrapped forward (rather
