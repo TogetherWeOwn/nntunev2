@@ -10,10 +10,17 @@
 #   author ends with " - Topic"  -> audio_track
 #   anything else / oEmbed miss -> skipped (counted, not stored)
 #
+# RETIRED (host research 2026-10-21): VEVO/"- Topic" substring matching is
+# banned as a selection method. This script fails closed until rewritten
+# to the OMV/ATV method in SOURCES.md; the body below is kept for
+# harvest-reference only.
 # Usage: ./build.sh [output.json]   (default: day1.json next to this script)
 # Requires: bash 4+, curl, jq. Re-run to refresh; entries carry
 # verified_at + source. Exits non-zero unless both classes reach 50.
 set -euo pipefail
+
+echo "build.sh: retired — substring selection is banned (see SOURCES.md); refusing to write a corpus" >&2
+exit 75
 
 OUT="${1:-$(dirname "$0")/day1.json}"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"

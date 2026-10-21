@@ -20,10 +20,12 @@ Owner 2026-10-21 update (scope + proxy rules for this spike):
   anywhere; spike dev tooling reads it from local-only config.
 - Scope is official music videos only (externally curated/verified);
   for audio, prefer the official track at the best available quality.
-  The current corpus classes (VEVO uploads + `- Topic` auto-tracks) are
-  the standing proxy for "official" until the host posts the
-  official-media selection research — the corpus is re-cut if that
-  research requires different selection criteria.
+  The host's official-media selection research (2026-10-21) replaced
+  the VEVO/`- Topic` standing proxy — see Official-media selection.
+  Note: the host cited `ops/analysis/official-media-20261021/REPORT.md`
+  but that path is not in the repo at this head; the rules below are
+  implemented from the research comment text and are reconciled with
+  the report when it lands.
 
 ## GO/NO-GO gate
 
@@ -38,6 +40,42 @@ The verdict function is `evaluate_gate` in `workers/youtube/src/gate.rs`
 (rate `<= 0.05` is GO; zero fetches fail closed). Secondary metric:
 extraction-OK rate per client/IP, because finding P1 shows extraction
 itself is egress-reputation sensitive.
+
+## Official-media selection (host research 2026-10-21)
+
+Key each recording by MBID + ISRC. Resolve the ISRC first to the
+canonical artist, title and duration. Search YouTube Music `songs` and
+`videos`, keeping only `musicVideoType` **OMV** (official music video)
+and **ATV** (the official audio track), read from
+`watchEndpointMusicConfig.musicVideoType`:
+
+- Gate by a `channelId` allowlist plus the official-artist/verified
+  badges. NEVER "Vevo"/"Topic" substring matching — the Day-1
+  `day1.json` corpus was built on that proxy and is superseded pending
+  a re-cut (see `workers/youtube/corpus/SOURCES.md`); `build.sh` fails
+  closed until it is rewritten to this method.
+- Prefer the ATV's `/next` **counterpart** as the OMV — YouTube's own
+  same-recording link — after OMV re-verification. Otherwise take the
+  top OMV passing duration (≈±5 s vs the canonical duration) and
+  denylist checks.
+- MusicBrainz video-recording links and Wikidata P1651 count only after
+  a liveness check plus OMV re-verification. IMVDb (key required, beta)
+  is a candidate source and is always re-verified.
+- Audio: the exact-recording ATV at the best available Opus, discovered
+  via the extractor (expect itag 251 for non-premium). Never take audio
+  from the OMV. YouTube never beats NNTP FLAC; use it only where FLAC
+  is missing.
+
+The pure decision logic lives in `workers/youtube/src/select.rs`
+(type parse, allowlist/badge/duration/denylist gate, counterpart
+preference, ATV-only Opus choice, cache keys). The YTM search + `/next`
+I/O lands with the runtime-entry slice; the corpus re-cut runs from
+egress that is not bot-walled (Worker egress or the resi dev path).
+
+Caching: MBID→selection about 30 days (`yt:sel:{mbid}:{isrc}`),
+videoId→metadata about 7 days (`yt:meta:{video_id}`). Revalidate on
+MusicBrainz edits or dead IDs. Measure the hit and escape rate per
+layer before tightening the gates.
 
 ## Client: VISIONOS first
 

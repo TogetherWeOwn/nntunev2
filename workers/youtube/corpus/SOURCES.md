@@ -2,36 +2,49 @@
 
 `day1.json` holds 100 videos: 50 `label_music` + 50 `audio_track`.
 
-Scope note (owner 2026-10-21): the spike covers official music videos
-only (externally curated/verified), preferring the official track at
-the best available quality for audio. VEVO authorship + `- Topic`
-auto-tracks are the standing proxy for "official" until the host posts
-the official-media selection research; re-run `build.sh` with new
-selection criteria if that research requires it.
+**Status: superseded pending re-cut (host research 2026-10-21).** This
+file was built on VEVO-authorship + `- Topic` substring matching, which
+the host's official-media selection research explicitly bans (NEVER
+"Vevo"/"Topic" substring matching). Do not use it for gate numbers.
+It stays in the tree as the harvested-ID pool only until the re-cut
+lands; entries that pass the new verification may be kept, the rest go.
 
-## Method (`build.sh`)
+## Selection method (current)
 
-1. Phase 1: harvest candidate video IDs from server-rendered YouTube
-   search HTML (several music queries per class) plus a small seed
-   list of known-good label videos.
-2. Phase 2 (only if `audio_track` is short): bootstrap from the
-   related-video rails of already-found Topic watch pages — search
-   relevance buries Topic uploads, while related rails run ~45%
-   Topic. Capped at 15 watch-page fetches.
-3. Verify + classify each candidate through oEmbed (no key, cacheable):
-   - author contains `VEVO` → `label_music` (VEVO = label-owned upload)
-   - author ends with ` - Topic` → `audio_track` (auto-generated track)
-   - anything else, or an oEmbed miss → skipped (counted, not stored)
-4. Keep the first 50 per class, sorted by category + video ID.
+Per `docs/youtube-backend-spike.md` (Official-media selection):
 
-Every entry carries `title`, `author`, `verified_at` (UTC date) and
-`source`. Re-run `build.sh` to refresh; it exits non-zero unless both
-classes reach 50.
+1. Key each recording by MBID + ISRC; resolve the ISRC first to the
+   canonical artist, title and duration.
+2. Search YouTube Music `songs` and `videos`; keep only
+   `musicVideoType` OMV/ATV from
+   `watchEndpointMusicConfig.musicVideoType`.
+3. Gate by `channelId` allowlist + official-artist/verified badges.
+4. Prefer the ATV's `/next` counterpart as the OMV (re-verified);
+   else the top OMV passing duration (≈±5 s) and denylist checks.
+5. MB video links / Wikidata P1651 only after liveness + OMV
+   re-verification; IMVDb candidates always re-verified.
+6. Audio from the exact-recording ATV at the best Opus (expect itag
+   251), never from the OMV.
+
+The re-cut runs from egress that is not bot-walled (Worker egress via
+the runtime-entry slice, or the resi dev path) — dev-box egress sees
+`LOGIN_REQUIRED` even for non-label videos (spec finding P1), so the
+re-cut cannot run from here. `build.sh` fails closed until it is
+rewritten to this method.
+
+## Retired method (substring proxy, banned)
+
+The previous `build.sh` harvested IDs from server-rendered search HTML
+plus seeds, bootstrapped Topic tracks from related-video rails, and
+classified through oEmbed (`VEVO` in author → `label_music`, author
+ending ` - Topic` → `audio_track`). That proxy is retired; the script
+body is kept for harvest-reference only and refuses to write a corpus.
 
 ## Stability
 
 Video IDs are stable until an upload is deleted, privated or
-region-restricted. The measurement run re-verifies membership (oEmbed
-200 + same class) before using the corpus, and records any drift in the
-spec's Day-1 readout. Corpus membership is about *identity* (label vs
-Topic); playability is what the spike measures.
+region-restricted. The measurement run re-verifies membership (OMV/ATV
+type + allowlist + badges + liveness) before using the corpus, and
+records any drift in the spec's Day-1 readout. Corpus membership is
+about *identity* (official OMV vs ATV); playability is what the spike
+measures.
