@@ -4,7 +4,9 @@
 //! values and a concatenation property test.
 
 use nntune_core::error::Error;
-use nntune_core::par2::{crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder};
+use nntune_core::par2::{
+    crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder, MAX_PAR2_FILES,
+};
 
 const BLOCK_SIZE: u64 = 256;
 const FILENAME: &str = "track.flac";
@@ -318,6 +320,59 @@ fn verify_and_precheck_reject_extra_block_crcs_without_panicking() {
     assert!(
         matches!(err, Error::Malformed(_)),
         "verify and precheck must agree, got: {err}"
+    );
+}
+
+/// Invalid metadata dead-letters even when the candidate bytes are also
+/// damaged: a count-mismatched set plus truncated bytes must be Malformed
+/// (like precheck), never Par2Unhealthy.
+#[test]
+fn verify_reports_invalid_metadata_before_damaged_bytes() {
+    let mut crcs = block_crcs(&file_bytes());
+    crcs.push(0xdead_beef);
+    let f = fixture_with_crcs(crcs, BLOCK_SIZE);
+    let set = RecoverySet::parse(&f.set_bytes).expect("over-long IFSC parses");
+    let err = set.verify(FILENAME, &f.data[..999]).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "metadata-first: want Malformed, got: {err}"
+    );
+}
+
+/// FileDesc and IFSC identities share one file cap: per-path digest gates
+/// alone would admit MAX_PAR2_FILES of each with disjoint IDs, doubling the
+/// documented bound mid-stream. The union gate must refuse the packet that
+/// would open file MAX_PAR2_FILES + 1.
+#[test]
+fn disjoint_filedesc_and_ifsc_identities_share_one_file_cap() {
+    let set_id = [0x42; 16];
+    let mut builder = RecoverySetBuilder::new();
+    for i in 0..MAX_PAR2_FILES {
+        let name = format!("track-{i}.flac");
+        let first16k = [0x11; 16];
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&first16k);
+        seed.extend_from_slice(&1000u64.to_le_bytes());
+        seed.extend_from_slice(name.as_bytes());
+        let file_id = md5::compute(&seed).0;
+        let mut body = Vec::new();
+        body.extend_from_slice(&file_id);
+        body.extend_from_slice(&[0x22; 16]); // whole md5 (unchecked at parse)
+        body.extend_from_slice(&first16k);
+        body.extend_from_slice(&1000u64.to_le_bytes());
+        body.extend_from_slice(name.as_bytes());
+        builder
+            .add_stream(&packet(&set_id, &ptype(b"FileDesc"), &body))
+            .expect("descriptions within cap must be accepted");
+    }
+    let mut ifsc = vec![0x99; 16]; // disjoint from every derived File ID
+    ifsc.extend_from_slice(&[0u8; 20]);
+    let err = builder
+        .add_stream(&packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc))
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "union cap: want Malformed, got: {err}"
     );
 }
 

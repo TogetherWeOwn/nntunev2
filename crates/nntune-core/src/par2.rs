@@ -32,9 +32,13 @@
 //!   size, empty checksums, checksum-count mismatch) to `Malformed`, so either
 //!   path dead-letters the same sets.
 //! - [`Error::Par2Unhealthy`] (from `verify`) or `Ok(false)` (from `precheck`)
-//!   means the *candidate bytes* disagree with valid metadata: wrong length,
-//!   a whole-file MD5 mismatch, or a per-block CRC32 mismatch. That is damage
-//!   the repair binary may fix, never a reason to distrust the set.
+//!   means the *candidate bytes* disagree with valid metadata: a wrong
+//!   length, whole-file MD5 mismatch, or per-block CRC32 mismatch in
+//!   `verify`; a per-block CRC32 disagreement in `precheck`. (A `precheck`
+//!   segment list whose lengths do not even sum to the file length is
+//!   `Malformed`: the segments contradict the metadata before any comparison
+//!   runs.) Candidate damage is what the repair binary may fix, never a
+//!   reason to distrust the set.
 //!
 //! Every bound below is enforced on the untrusted value *before* any
 //! narrowing or slicing, identically on 64-bit and wasm32: packet lengths
@@ -66,10 +70,13 @@ pub const MAX_BLOCK_SIZE: u64 = 256 << 20;
 /// Largest number of distinct source files a builder retains per set. Every
 /// file-identity map (`files`, `members`, `filenames`, and both per-file
 /// digest maps) holds at most this many entries; the Main membership list is
-/// refused past it, and further unique FileDesc/IFSC packets fail closed as
-/// malformed. Real sets describe a handful of files (Usenet posts: one to a
-/// few dozen), so 4096 is two orders of magnitude of headroom while bounding
-/// the retained metadata to a few megabytes worst case.
+/// refused past it, and any FileDesc/IFSC packet that would open a further
+/// file fails closed as malformed. (The gate is on the shared `files` map,
+/// not on each per-path digest map, so disjoint FileDesc and IFSC identities
+/// cannot double the bound mid-stream.) Real sets describe a handful of
+/// files (Usenet posts: one to a few dozen), so 4096 is two orders of
+/// magnitude of headroom while bounding the retained metadata to a few
+/// megabytes worst case.
 pub const MAX_PAR2_FILES: usize = 4_096;
 
 /// Largest number of distinct recovery-slice exponents a builder retains.
@@ -386,22 +393,9 @@ impl RecoverySet {
 
     fn verify_file(&self, file: &RecoveryFile, data: &[u8]) -> Result<()> {
         let name = &file.filename;
-        if data.len() as u64 != file.length {
-            return Err(Error::Par2Unhealthy {
-                filename: name.to_string(),
-                detail: format!(
-                    "size {} differs from recovery-set length {}",
-                    data.len(),
-                    file.length
-                ),
-            });
-        }
-        if md5::compute(data).0 != file.whole_md5 {
-            return Err(Error::Par2Unhealthy {
-                filename: name.to_string(),
-                detail: "whole-file MD5 mismatch".into(),
-            });
-        }
+        // Metadata validity first: an invalid set dead-letters even when the
+        // candidate bytes are also damaged, so `verify` agrees with
+        // `precheck` (which orders the same way) on every invalid set.
         if self.block_size == 0 {
             // `parse` never produces this (Main requires a non-zero slice
             // size), but a hand-built set could — and `div_ceil` below would
@@ -427,6 +421,22 @@ impl RecoverySet {
                 file.length,
                 bs
             )));
+        }
+        if data.len() as u64 != file.length {
+            return Err(Error::Par2Unhealthy {
+                filename: name.to_string(),
+                detail: format!(
+                    "size {} differs from recovery-set length {}",
+                    data.len(),
+                    file.length
+                ),
+            });
+        }
+        if md5::compute(data).0 != file.whole_md5 {
+            return Err(Error::Par2Unhealthy {
+                filename: name.to_string(),
+                detail: "whole-file MD5 mismatch".into(),
+            });
         }
         for (i, &want) in file.block_crc32s.iter().enumerate() {
             // u64 arithmetic throughout: `block_size` is parse-capped, and
@@ -668,9 +678,11 @@ fn parse_filedesc_body(
         }
         return Ok(());
     }
-    if digests.len() >= MAX_PAR2_FILES {
+    // Union gate on the shared `files` map: per-path digest counts would let
+    // disjoint FileDesc and IFSC identities double the bound mid-stream.
+    if !set.files.contains_key(&file_id) && set.files.len() >= MAX_PAR2_FILES {
         return Err(malformed(format!(
-            "recovery set carries more than {MAX_PAR2_FILES} unique file descriptions"
+            "recovery set carries more than {MAX_PAR2_FILES} unique files"
         )));
     }
     digests.insert(file_id, digest);
@@ -718,9 +730,10 @@ fn parse_ifsc_body(
         }
         return Ok(());
     }
-    if digests.len() >= MAX_PAR2_FILES {
+    // Same union gate as the FileDesc path (see above).
+    if !set.files.contains_key(&file_id) && set.files.len() >= MAX_PAR2_FILES {
         return Err(malformed(format!(
-            "recovery set carries more than {MAX_PAR2_FILES} unique IFSC entries"
+            "recovery set carries more than {MAX_PAR2_FILES} unique files"
         )));
     }
     digests.insert(file_id, digest);
