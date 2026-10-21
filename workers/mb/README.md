@@ -34,14 +34,16 @@ a well-formed MBID with no row and unknown routes are `404`
 Every Hyperdrive connect and every repository query runs under its own
 1500 ms deadline (`DB_OPERATION_DEADLINE_MS`, covering the 600 ms search
 SLO with headroom for a cold start); a timeout stays the generic `500`,
-never a 404, and each failed repository call emits one staged
+never a 404. Connect also sets `statement_timeout` to the same budget,
+so a timed-out query is aborted server-side instead of holding its
+pooled backend connection. Each failed repository call emits one staged
 `mb.db.failed` log line (`stage` of `connect`/`query`/`decode`/`timeout`
 plus build identity — no SQL, parameters, driver text or user input) so
 operators can tell a hung connect from a failed query.
 (Sources: `workers/mb/src/api_error.rs:17-41,66-110`;
-`docs/api-errors.md:74-83`; unknown-route handler `lib.rs:1695-1711`;
+`docs/api-errors.md:74-83`; unknown-route handler `lib.rs:1707-1723`;
 deadline + staged-failure seam `lib.rs:674-728`; staged emission
-`lib.rs:1278-1292,1335-1416`.)
+`lib.rs:1278-1292,1347-1428`.)
 Lookup success is the flat entity fields plus `"kind"`;
 search success is `{"q", "type", "limit", "offset", "results": [{"mbid", "name"|"title",
 "score"}]}`; release results also carry `artist_mbid`/`artist_name`

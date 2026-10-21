@@ -688,8 +688,8 @@ pub const DB_OPERATION_DEADLINE_MS: u64 = 1_500;
 /// operation, so it is armed before dispatch and expiry wins a tie; a
 /// finished operation returns at once (the deadline is released, never
 /// awaited) and an expired one fails as [`RepoStage::Timeout`]. Both
-/// futures are dropped on completion, so an abandoned operation is
-/// dropped, never detached.
+/// futures are dropped on completion; dropping the waiter stops the wait,
+/// not the server work, so `connect` also sets `statement_timeout`.
 pub async fn with_db_deadline<T>(
     budget: std::time::Duration,
     op: impl std::future::Future<Output = Result<T, RepoError>>,
@@ -1303,32 +1303,44 @@ mod http_layer {
                 .connection_string()
                 .parse()
                 .map_err(|_| RepoError::new(RepoStage::Connect))?;
-            let raw = async {
-                config
-                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-                    .await
-                    .map_err(|_| RepoError::new(RepoStage::Connect))
-            };
-            // A timeout keeps its own stage; a refused connect stays Connect.
-            let (client, connection) = with_db_deadline(Self::db_budget(), raw).await?;
             let trace_id = self.trace_id.clone();
             // Build identity rides the detached line too (mirrors the api
             // worker): the deploy lane's public BUILD_SHA var, or explicit
             // "unknown" when unwired.
             let build_sha = build_sha_from_env(&self.env);
-            wasm_bindgen_futures::spawn_local(async move {
-                // Detail stays out of logs: driver errors can carry
-                // host/role strings that are not needed to triage.
-                if connection.await.is_err() {
-                    emit(
-                        Level::Error,
-                        &trace_id,
-                        "mb.db.connect_failed",
-                        serde_json::json!({"stage": "connect", "build_sha": build_sha}),
-                    );
-                }
-            });
-            Ok(client)
+            let raw = async {
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Detail stays out of logs: driver errors can carry
+                    // host/role strings that are not needed to triage.
+                    if connection.await.is_err() {
+                        emit(
+                            Level::Error,
+                            &trace_id,
+                            "mb.db.connect_failed",
+                            serde_json::json!({"stage": "connect", "build_sha": build_sha}),
+                        );
+                    }
+                });
+                // Dropping the waiter does not cancel the server query:
+                // the driver keeps paging for a hung-up receiver, so a
+                // timed-out query would keep running and hold its pooled
+                // backend connection. Cap execution where the server
+                // enforces it (mirrors the api worker's connect setup).
+                client
+                    .batch_execute(&format!(
+                        "SET statement_timeout = {}",
+                        DB_OPERATION_DEADLINE_MS
+                    ))
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                Ok(client)
+            };
+            // A timeout keeps its own stage; a refused connect stays Connect.
+            with_db_deadline(Self::db_budget(), raw).await
         }
     }
 
