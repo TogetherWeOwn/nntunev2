@@ -306,15 +306,19 @@ fn verify_and_precheck_reject_extra_block_crcs_without_panicking() {
     let set = RecoverySet::parse(&f.set_bytes).expect("over-long IFSC parses");
     let err = set.verify(FILENAME, &f.data).unwrap_err();
     assert!(
-        matches!(err, Error::Par2Unhealthy { .. }),
-        "want Par2Unhealthy, got: {err}"
+        matches!(err, Error::Malformed(_)),
+        "want Malformed, got: {err}"
     );
     let cuts = [0usize, 500, 1000];
     let segments: Vec<(u32, u64)> = cuts
         .windows(2)
         .map(|w| (crc32fast::hash(&f.data[w[0]..w[1]]), (w[1] - w[0]) as u64))
         .collect();
-    assert!(set.precheck(FILENAME, &segments).is_err());
+    let err = set.precheck(FILENAME, &segments).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "verify and precheck must agree, got: {err}"
+    );
 }
 
 /// Same for FEWER checksums than required: 3 instead of 4.
@@ -363,7 +367,7 @@ fn verify_accepts_healthy_and_rejects_damaged() {
     assert!(err.to_string().contains("length"), "got: {err}");
 
     let err = set.verify("nope.flac", &f.data).unwrap_err();
-    assert!(matches!(err, Error::Par2Unhealthy { .. }), "got: {err}");
+    assert!(matches!(err, Error::Malformed(_)), "got: {err}");
 }
 
 // --- Precheck + crc32_combine ------------------------------------------------
