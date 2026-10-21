@@ -54,6 +54,26 @@ test('readiness endpoint reports ok when ready', async ({ request }) => {
 	await expect(response.json()).resolves.toEqual({ ok: true });
 });
 
+test('security.txt is served at the canonical RFC 9116 path', async ({ request }) => {
+	// URL-level pin: the whole value of this endpoint is its canonical
+	// location, so assert the route resolves here, not just that GET works.
+	const response = await request.get('/.well-known/security.txt');
+
+	expect(response.status()).toBe(200);
+	expect(response.headers()['content-type']).toMatch(/^text\/plain(?:;|$)/);
+	const body = await response.text();
+	expect(body).toContain(
+		'Contact: https://github.com/TogetherWeOwn/nntunev2/security/advisories/new'
+	);
+
+	const expiresLine = body.split('\n').find((line) => line.startsWith('Expires: '));
+	expect(expiresLine).toBeDefined();
+	const parsed = Date.parse(expiresLine!.slice('Expires: '.length));
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	expect(parsed).toBeGreaterThan(Date.now() + 180 * DAY_MS);
+	expect(parsed).toBeLessThanOrEqual(Date.now() + 366 * DAY_MS);
+});
+
 /**
  * E2E contract-hook coverage (TESTIDS in e2e/helpers/contract.ts, 20 hooks).
  * The static companion (apps/web/src/lib/contract.test.ts) pins that each
