@@ -224,6 +224,8 @@ jobs:
           persist-credentials: false
       - name: Run the bounded-pool offline suite
         run: python3 scripts/test_cargo_cache.py
+      - name: Run the pool capacity acceptance suite
+        run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy
         run: |
           python3 - <<'EOF'
