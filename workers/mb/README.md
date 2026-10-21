@@ -88,14 +88,14 @@ Hyperdrive-only reads `lib.rs:719-798`.)
   (`nntunev2-art-staging` / `nntunev2-art-prod`, `docs/ops.md` inventory;
   key form `art/{hh}/{hh}/{sha}-{size}` per `docs/cache-policy.md:17` and
   the `caa_url_for_art` helper doc example `art/ab/cd/<sha>-500`
-  `lib.rs:81-88`; ADR 0003 shows only the base hash layout without the
-  `art/` prefix and `-{size}` suffix). Public release `caa_url`
+  `lib.rs:81-88`; ADR 0003 shows `art/{hh}/{hh}/{sha}` without the
+  `-{size}` suffix, original only at launch). Public release `caa_url`
   generation remains deferred until bucket bindings and public hosts are
   activated; this worker never proxies full images inline.
   (Sources: buckets `workers/mb/src/lib.rs:61-65`;
   `workers/mb/wrangler.toml.example:21-26,38-52`;
   `docs/ops.md:63-64,330,373`;
-  `docs/adr/0003-cache-scope.md:37-42`; JSON-only routes `lib.rs:1035-1062`.)
+  `docs/adr/0003-cache-scope.md:38-44`; JSON-only routes `lib.rs:1035-1062`.)
 
 ## p95 methodology (acceptance input)
 
