@@ -84,11 +84,12 @@ Hyperdrive-only reads `lib.rs:719-798`.)
   `i16`, `duration_ms` is `i32`): out-of-range, huge unsigned and
   fractional values miss on lookups and on every release-recordings row.
   Release search hits must carry string `artist_mbid`/`artist_name` when
-  present and non-null. There is no positivity rule and no
-  required-optional rule: negative values, zero, null, absent optionals,
-  uppercase UUIDs and extra fields stay hits, and artist/recording hits
-  never require release fields. A healthy fresh result replaces the
-  rejected body; a DB miss/error stays non-cacheable.
+  present and non-null. There is no positivity rule: negative values,
+  zero, null, uppercase UUIDs and extra fields stay hits, and
+  artist/recording hits never require release fields. Absent optionals
+  stay hits on release-recordings rows and release-search artist fields;
+  lookups still require every always-emitted key present. A healthy fresh
+  result replaces the rejected body; a DB miss/error stays non-cacheable.
 - Release responses currently preserve the stored `caa_url` unchanged, so
   lookup cache keys remain environment-independent. When public R2 hosts are
   activated and URLs become environment-specific, include the environment in
