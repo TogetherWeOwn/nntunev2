@@ -85,6 +85,24 @@ SESSION_TTL_SECS = "86400"
 # enabled = true
 # head_sampling_rate = 1
 
+# Same-host staging routes. The `staging-api` lane in
+# `.github/workflows/deploy.yml` generates these into its staging config
+# from API_RP_ID_STAGING (validated a bare canonical hostname there);
+# this example is the hand-deploy reference, so mirror the block here and
+# uncomment it for a hand staging deploy (`wrangler deploy --env
+# staging`). The api Worker serves /v1/* plus the staging-only
+# /api/test-codes seam on the staging host; the web Worker owns the
+# catch-all (`staging.nntune.com/*` in apps/web/wrangler.toml), and the
+# most specific route wins. Same host by design: the session cookie is
+# SameSite=Lax, so the frontend and the API must be same-site over
+# HTTPS — a workers.dev API URL would break credentialed calls.
+# [[env.staging.routes]]
+# pattern = "staging.nntune.com/v1/*"
+# zone_name = "nntune.com"
+# [[env.staging.routes]]
+# pattern = "staging.nntune.com/api/test-codes"
+# zone_name = "nntune.com"
+
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with

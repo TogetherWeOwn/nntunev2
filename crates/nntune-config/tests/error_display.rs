@@ -81,11 +81,11 @@ fn invalid_type_rendering_never_echoes_the_submitted_value() {
     let mut kv = HashMap::new();
     kv.insert(
         "auth.rp_id".to_string(),
-        "v2-staging.nntune.com".to_string(),
+        "staging.nntune.com".to_string(),
     );
     kv.insert(
         "auth.rp_origin".to_string(),
-        "https://v2-staging.nntune.com".to_string(),
+        "https://staging.nntune.com".to_string(),
     );
     kv.insert("session.ttl_secs".to_string(), submitted.to_string());
     let err = Config::load(&kv).expect_err("secret-looking u64 must fail");

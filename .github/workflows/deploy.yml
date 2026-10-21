@@ -118,11 +118,14 @@ jobs:
 
   # Api Worker staging lane (staging only; ingest/mb/stream/repair are
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
-  # on the same token gate as staging-web. Passes the public BUILD_SHA var
-  # so worker log records carry the deploy SHA (never a secret); secrets
-  # live in Cloudflare and are never written here. Fails closed on the
-  # Hyperdrive cache-disabled gate (no --allow-skip); skips with a notice
-  # until the Operator wires the staging variables (a skip is not evidence).
+  # on the same token gate as staging-web. Serves the staging host on
+  # /v1/* plus the staging-only /api/test-codes seam (routes derived from
+  # API_RP_ID_STAGING); the web Worker owns the catch-all. Passes the
+  # public BUILD_SHA var so worker log records carry the deploy SHA (never
+  # a secret); secrets live only in Cloudflare and are never written here.
+  # Fails closed on the Hyperdrive cache-disabled gate (no --allow-skip);
+  # skips with a notice until the Operator wires the staging variables (a
+  # skip is not evidence).
   staging-api:
     name: staging-api
     needs: [gate]
@@ -195,13 +198,15 @@ jobs:
           # serialized https origin whose host is exactly RP_ID: fail the
           # job here (names only) instead of deploying a worker that 500s.
           python3 - <<'PY'
-          import os, tomllib, urllib.parse
+          import os, re, tomllib, urllib.parse
           rp_id = os.environ["API_RP_ID_STAGING"]
           origin = os.environ["API_RP_ORIGIN_STAGING"]
           parts = urllib.parse.urlsplit(origin)
           assert parts.scheme == "https", "API_RP_ORIGIN_STAGING must be https"
           assert parts.hostname == rp_id, "API_RP_ORIGIN_STAGING host must equal API_RP_ID_STAGING"
           assert origin == f"https://{rp_id}", "API_RP_ORIGIN_STAGING must be the canonical serialized origin"
+          assert re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", rp_id or ""), \
+              "API_RP_ID_STAGING must be a bare lowercase hostname (route host)"
           # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
           # directly, bypassing binding-parity (which only reads the
           # committed example). Fail unless it equals the committed staging
@@ -229,6 +234,20 @@ jobs:
 
           [env.staging]
           name = "nntune-api-staging"
+
+          # Same-host split: this Worker serves /v1/* plus the staging-only
+          # /api/test-codes seam on the staging host, while the web Worker
+          # owns the catch-all (see apps/web/wrangler.toml); the most
+          # specific route wins. Route hosts derive from API_RP_ID_STAGING
+          # (asserted a bare canonical hostname above), so the RP pair and
+          # the serving host cannot drift apart.
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/v1/*"
+          zone_name = "nntune.com"
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/api/test-codes"
+          zone_name = "nntune.com"
+
           [env.staging.vars]
           RP_ID = "${API_RP_ID_STAGING}"
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
