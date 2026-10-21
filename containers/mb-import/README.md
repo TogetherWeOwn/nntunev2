@@ -7,7 +7,7 @@ Container image for the two batch jobs behind `nntunev2-mb`
 
 | Job | Trigger | Script | SLO |
 |---|---|---|---|
-| Initial import | manual Container run | `import.sh <curated-dir>` (`mbdump-<table>.tsv`; missing input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity tables, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same MBID in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) before replication or `replicate.sh` keeps refusing packets. (Sources: `import.sh:79-83` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:98-121` (all-file and sequence admission); `:206-207` (SHA-256 `dump_id` + cursor insert); `:208-316` (alias-aware whole-file dupe refusal); `:317-330` (cursor read/ahead/complete); `:385-394` (per-chunk dupe check); `:502-519` (one-transaction chunk); `:531-551` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
+| Initial import | manual Container run | `import.sh <curated-dir>` (`mbdump-<table>.tsv`; missing input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity tables, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same MBID in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) before replication or `replicate.sh` keeps refusing packets. (Sources: `import.sh:79-83` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:98-121` (all-file and sequence admission); `:206-207` (SHA-256 `dump_id` + cursor insert); `:208-340` (alias-aware whole-file dupe refusal); `:341-354` (cursor read/ahead/complete); `:409-418` (per-chunk dupe check); `:526-544` (one-transaction chunk); `:555-575` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
 | Replication | hourly schedule (Container / Workflow cron) | `replicate.sh` with `PACKET_SEQ` + `PACKET_URL` | **lag < 2 h** SLO (each packet applied within 2 h of publication); per-packet evidence is `mb_replication_packet.lag_secs`, not the aggregate snapshot — `mb_import_state.lag_seconds` is written only by the pending apply step. Packets must arrive in sequence (`PACKET_SEQ = last_packet + 1`), and until the apply step lands the script exits non-zero without touching state. (Sources: `docs/adr/0007-mb-mirror.md:24-26` (hourly schedule, SLO); `replicate.sh:2-9` (SLO + pending apply), `:16-19,36-44` (integer + sequence gate), `:46-51` (exit 2, no state write); `migrations/0017_mb_replication_packet_ledger.sql`; `workers/mb/README.md:74-81` (SLO evidence); `migrations/0001_mb_mirror.sql:57-65` (state columns).) |
 
 ## Initial dump ETL
@@ -53,7 +53,7 @@ Optional `DUMP_SEQ` must contain only ASCII decimal digits and fit PostgreSQL
 before a bounded range check, so arbitrarily long digit strings cannot wrap
 Bash arithmetic. Invalid input is refused before writes. Unset or empty leaves
 replication state alone; zero, equal and older sequences never seed backwards.
-A valid forward sequence seeds only after every table finishes (`import.sh:540-551`).
+A valid forward sequence seeds only after every table finishes (`import.sh:564-575`).
 
 The ETL's positional mapping follows the official
 [MusicBrainz `CreateTables.sql`](https://github.com/metabrainz/musicbrainz-server/blob/master/admin/sql/CreateTables.sql)
@@ -86,7 +86,7 @@ field order; use an extract from the matching schema revision. Derivations:
   validator's normalized IDs while the DLQ keeps the exact original dump
   bytes. (Sources: `etl.py:261-304`
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
-  `import.sh:408-412` (track FK specs);
+  `import.sh:432-436` (track FK specs);
   `crates/mb-import-validate/src/lib.rs:286-290` (`Position` check).)
 - Every row gets the single supplied `DUMP_TS`; no row-specific time is created.
   Missing inputs, wrong field counts, and non-empty entity input that projects
@@ -119,7 +119,7 @@ a release/recording/track row whose parent was poisoned or never loaded
 chunk. (Sources: `crates/mb-import-validate/src/lib.rs:67-81` (reason
 codes), `:315-381` (`bad_escape` rule);
 `crates/mb-import-validate/src/main.rs:128-135` (`invalid_encoding` on
-non-UTF-8 bytes); `import.sh:407-412,413-482`
+non-UTF-8 bytes); `import.sh:431-436,437-506`
 (FK orphan split); `migrations/0014_mb_import_resume_dlq.sql`;
 `migrations/0001_mb_mirror.sql:57-65`.)
 
@@ -201,7 +201,7 @@ replacement row landed in the DLQ (poison or FK orphan) also loses its
 old row, leaving a visible gap rather than a stale recording. No
 data-destroying migrations in this path; 0014/0016 swap constraints in
 place (cursor PK, DLQ unique, `table_name` checks). (Sources: `import.sh:176-196`
-(prune, DLQ gap), `:498-501` (final-chunk atomicity), `:506-508` (forward-only
+(prune, DLQ gap), `:522-525` (final-chunk atomicity), `:530-532` (forward-only
 guard); `test-import.sh:427-445` (older dump leaves rows alone);
 `migrations/0016_mb_track.sql:38-43` (check swaps);
 `migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps).)

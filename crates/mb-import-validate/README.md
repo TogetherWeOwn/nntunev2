@@ -7,7 +7,7 @@ routes it to the dead-letter table. It never touches the database:
 `containers/mb-import/import.sh` drives it as the `mb-validate` binary.
 
 (Sources: scope `src/lib.rs:1-7`; driven by `import.sh`
-`containers/mb-import/import.sh:78,361`.)
+`containers/mb-import/import.sh:78,385`.)
 
 Container-job prose (chunking, cursor, upsert, prune, resume) lives with the
 job itself; this README pins only this crate's API and the `mb-validate`
@@ -84,7 +84,7 @@ on the decoded value (`src/lib.rs:197-297`).
   — `""` fails for timestamptz and numerics — and abort the chunk
   transaction; the staging table carries no column defaults
   (`CREATE TEMP TABLE stage (LIKE mb_${table})`,
-  `containers/mb-import/import.sh:504`), so no `now()` stamping occurs);
+  `containers/mb-import/import.sh:528`), so no `now()` stamping occurs);
   an empty NOT NULL text column
   passes through as `""` (`src/lib.rs:222-239`).
 
@@ -95,7 +95,7 @@ verbatim into the dead-letter table (`src/lib.rs:67-81`):
 `negative_position`, `invalid_encoding`. `invalid_encoding` is produced only
 by the binary for non-UTF8 input bytes (`src/main.rs:123-138`); the
 `fk_missing_*` reasons are produced only by `import.sh`'s orphan split, not
-by this crate (`containers/mb-import/import.sh:407-482`).
+by this crate (`containers/mb-import/import.sh:431-506`).
 
 ## Normalization and `line_no` (`\N` + append rule, pinned to source)
 
@@ -148,7 +148,7 @@ reason codes as their literal twins. Text columns accept the same escape
 vocabulary but pass the token through untouched. The importer's
 whole-file and per-chunk duplicate checks decode and canonicalize keys
 the same way before comparing, so aliases cannot evade refusal
-(`containers/mb-import/import.sh:208-316,385-394`).
+(`containers/mb-import/import.sh:208-340,409-418`).
 
 ## `mb-validate` binary role
 
@@ -162,7 +162,7 @@ Two modes; poison rows are expected data and never change the exit code
   `reason \t line_no \t escaped-raw` poison rows, then prints exactly
   `valid=<n> poison=<m>` (`src/main.rs:144-161,173`). `import.sh` parses
   that summary, recounts both files against it, and refuses on any
-  disagreement (`containers/mb-import/import.sh:361-384`). Every output
+  disagreement (`containers/mb-import/import.sh:385-408`). Every output
   write and flush is checked: a short write (disk full, closed pipe) exits
   2 instead of printing counts the cursor would advance on
   (`src/main.rs:119-172`).
@@ -170,11 +170,11 @@ Two modes; poison rows are expected data and never change the exit code
   `mb-validate --plan --completed <n> --total <n> --size <n>` prints the
   1-based inclusive chunk ranges still pending after the resume cursor, one
   `start-end` per line (`src/main.rs:8-9,45-56`, ranges
-  `src/lib.rs:158-173`). `--size 0` is a usage error; a closed downstream
+  `src/lib.rs:165-180`). `--size 0` is a usage error; a closed downstream
   (BrokenPipe) is a clean shutdown (`src/main.rs:49-72`).
 - **Exit codes:** 0 success, 2 usage or I/O error (`src/main.rs:11`); any
   validator exit other than 0 keeps the cursor pinned
-  (`containers/mb-import/import.sh:361-366`).
+  (`containers/mb-import/import.sh:385-390`).
 - **Line splitting:** input splits on LF only, matching how Postgres reads
   the same file; one trailing newline ends the last line and is not an
   extra empty line, while an empty file yields zero lines

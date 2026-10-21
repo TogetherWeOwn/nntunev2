@@ -271,17 +271,37 @@ def uuid_key(token):
     if any(c not in "0123456789abcdefABCDEF" for p in parts for c in p):
         return None
     return token.lower()
-def int_key(token):
+def position_key(token):
+    """Canonical medium/track position, or None when it cannot validate.
+
+    Mirrors FieldKind::Position (non-negative i16): the validator poisons
+    anything else, and poison rows never reach the table, so only loadable
+    positions participate in duplicate detection. Keep in step with the
+    schema if the position type ever widens.
+    """
     digits = token[1:] if token[:1] in ("+", "-") else token
     if not digits or any(c not in "0123456789" for c in digits):
         return None
     try:
-        return str(int(token))
+        n = int(token)
     except ValueError:
         return None
-keys = []
+    if n < 0 or n > 32767:
+        return None
+    return str(n)
+batch = []
+def flush():
+    if batch:
+        sys.stdout.write("".join(key + "\n" for key in batch))
+        batch.clear()
 with open(path, "rb") as f:
-    for raw in f.read().split(b"\n"):
+    # Stream line by line with bounded batches: multi-million-line dumps
+    # must never sit wholly in memory beside their decoded key list.
+    for raw in f:
+        # One trailing newline ends the line; it is not key content (awk
+        # reads the same way), while a missing one still yields the tail.
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
         if table == "track":
             fields = raw.split(b"\t")
             if len(fields) < 4:
@@ -291,19 +311,23 @@ with open(path, "rb") as f:
             number = decode(fields[3])
             if release is None or medium is None or number is None:
                 continue
-            medium = int_key(medium)
-            number = int_key(number)
-            if medium is None or number is None:
+            release = uuid_key(release)
+            medium = position_key(medium)
+            number = position_key(number)
+            if release is None or medium is None or number is None:
                 continue
-            keys.append(release.lower() + "/" + medium + "/" + number)
+            batch.append(release + "/" + medium + "/" + number)
         else:
             first = decode(raw.split(b"\t", 1)[0])
             if first is None:
                 continue
             key = uuid_key(first)
-            if key is not None:
-                keys.append(key)
-sys.stdout.write("".join(key + "\n" for key in keys))
+            if key is None:
+                continue
+            batch.append(key)
+        if len(batch) >= 8192:
+            flush()
+flush()
 EOF
     echo "import: duplicate-key pre-check failed for $table ($tsv)" >&2
     exit 1
