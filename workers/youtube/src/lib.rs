@@ -13,6 +13,8 @@
 //!   fetch) for the gate measurement.
 //! - [`gate`]: the GO/NO-GO verdict (byte-fetch failure rate from Worker
 //!   egress, threshold 5%) and the JSONL measurement record.
+//! - [`select`]: official-media selection (OMV/ATV gating, duration match,
+//!   ATV-only audio choice, cache keys/TTLs).
 //!
 //! This crate is pure portable logic: no network, no Worker bindings.
 //! Native builds and `cargo test` never link the Workers runtime. The
@@ -23,3 +25,4 @@ pub mod client;
 pub mod gate;
 pub mod player;
 pub mod probe;
+pub mod select;

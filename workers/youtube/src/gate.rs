@@ -40,13 +40,16 @@ pub fn evaluate_gate(failures: u64, total: u64) -> GateVerdict {
     }
 }
 
-/// Day-1 corpus class of a measured video.
+/// Day-1 corpus class of a measured video. Classes are OMV/ATV
+/// membership proven by `musicVideoType` plus the allowlist/badge gate
+/// (see [`crate::select`]); the serialized names stay stable for the
+/// JSONL measurement record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoCategory {
-    /// Major-label official music video (VEVO author).
+    /// Official music video (`musicVideoType` OMV).
     LabelMusic,
-    /// Auto-generated `"Artist - Topic"` audio track.
+    /// Official audio track (`musicVideoType` ATV).
     AudioTrack,
 }
 
