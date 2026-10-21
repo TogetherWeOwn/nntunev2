@@ -9,6 +9,11 @@
 //! call site with the exact trace expression in scope there; the
 //! size-refused terminal emit must keep its `> 0` guard; and returned
 //! error strings must never be built from an error value via `to_string()`.
+//! Round 2 hardens the pins themselves: the `{}` sink shape is allow-listed
+//! by exact spelling, file, and crate-wide count (a second sink-shaped line
+//! anywhere is a violation), and multi-event functions pin their event
+//! source order (swapping two names inside one function keeps every count
+//! at 1 but flips an adjacent pair).
 //!
 //! This file is intentionally separate from the protected acceptance
 //! file: it strengthens the same claims without touching Test Author tests.
@@ -154,6 +159,17 @@ fn compact(source: &str) -> String {
     source.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Byte start of a look-behind window of `len` bytes ending at `end`,
+/// aligned up to a char boundary so slicing never panics on multibyte
+/// text (em-dashes in comments) above the call.
+fn window_start(slice: &str, end: usize, len: usize) -> usize {
+    let mut start = end.saturating_sub(len);
+    while !slice.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
 /// Collect the `emit(` call(s) in `slice` carrying `event`, balanced-paren
 /// matched so the whole call (level, trace, name, fields) is pinned at once.
 fn emit_calls_with<'a>(slice: &'a str, event: &str) -> Vec<&'a str> {
@@ -211,13 +227,26 @@ pub async fn main() {
 
 #[test]
 fn no_raw_console_anywhere_in_production() {
-    // Same sink rule as the paired acceptance file: the only permitted
-    // console emission is the structured `console_log!("{}", …)` shape used
-    // by the emitter itself. `src/repair.rs` is excluded: a separate slice
-    // owns that file.
+    // The only permitted console emissions in production are the two
+    // structured-sink lines, pinned by exact spelling and file: `emit()`
+    // in lib.rs renders the six-key record; the verify helper renders the
+    // size-refused line. Exempting the `{}` shape alone lets a raw
+    // `console_log!("{}", req.path())` pass anywhere (e.g. in `main()`),
+    // so any other console line — including a second sink-shaped line —
+    // is a violation, and the crate-wide sink count is pinned at 2.
+    // `src/repair.rs` is excluded: a separate slice owns that file.
+    const LIB_SINK: &str = "console_log!(\"{}\", record.to_json_line());";
+    const VERIFY_SINK: &str = "worker::console_log!(\"{}\", line);";
+    const CONSOLE_MACROS: &[&str] = &[
+        "console_log!",
+        "console_error!",
+        "console_warn!",
+        "console_debug!",
+    ];
     let src_dir = manifest_dir().join("src");
     let mut violations: Vec<String> = Vec::new();
     let mut scanned = 0usize;
+    let mut sinks = 0usize;
     let entries = std::fs::read_dir(&src_dir).expect("src directory must be readable");
     for entry in entries {
         let path = entry.expect("src entry must be readable").path();
@@ -236,11 +265,16 @@ fn no_raw_console_anywhere_in_production() {
         let stripped = production(&format!("src/{name}"));
         for line in stripped.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || !line.contains("console_log!") {
+            if trimmed.starts_with("//") || !CONSOLE_MACROS.iter().any(|m| line.contains(m)) {
                 continue;
             }
-            if !line.contains("console_log!(\"{}\"") {
-                violations.push(format!("src/{name}: {}", line.trim()));
+            let shape = line.trim();
+            let allowed = (name == "lib.rs" && shape == LIB_SINK)
+                || (name == "verify.rs" && shape == VERIFY_SINK);
+            if allowed {
+                sinks += 1;
+            } else {
+                violations.push(format!("src/{name}: {shape}"));
             }
         }
     }
@@ -250,6 +284,11 @@ fn no_raw_console_anywhere_in_production() {
     assert!(
         production("src/lib.rs").contains("pub async fn main"),
         "lib.rs main() (after the test modules) must be part of the scan"
+    );
+    assert_eq!(
+        sinks, 2,
+        "exactly the two structured sinks (lib.rs emit, verify helper) \
+         may write to the console; a copy elsewhere must fail"
     );
     assert!(
         violations.is_empty(),
@@ -502,6 +541,121 @@ fn migrated_events_fire_from_their_own_call_site_with_its_trace() {
 }
 
 // ---------------------------------------------------------------------------
+// Round 2: two event names inside one multi-event function can still be
+// swapped undetected: every per-function count stays 1 when both sites
+// share the function, the trace argument, and identical fields (e.g. the
+// write/put pair in `store_upload_payload`). The source order of the
+// pinned events per function closes it: any swap flips an adjacent pair.
+// Single-event functions need no entry: count == 1 already pins them.
+// ---------------------------------------------------------------------------
+
+/// (file, enclosing fn, pinned events in source order).
+const ORDER_PINS: &[(&str, &str, &[&str])] = &[
+    (
+        "src/lib.rs",
+        "try_enqueue",
+        &[
+            "ingest.queue.enqueue_failed",
+            "ingest.queue.binding_missing",
+        ],
+    ),
+    (
+        "src/lib.rs",
+        "try_meter",
+        &["ingest.meter.binding_missing", "ingest.meter.write_failed"],
+    ),
+    (
+        "src/lib.rs",
+        "library_db_client",
+        &[
+            "ingest.library_db.binding_missing",
+            "ingest.library_db.connection_failed",
+        ],
+    ),
+    (
+        "src/lib.rs",
+        "ensure_admission_checkpoint",
+        &[
+            "ingest.admission_checkpoint.read_failed",
+            "ingest.admission_checkpoint.write_failed",
+            "ingest.admission_checkpoint.redrive_enqueue_failed",
+        ],
+    ),
+    (
+        "src/lib.rs",
+        "store_upload_payload",
+        &[
+            "ingest.payload.write_failed",
+            "ingest.payload.put_failed",
+            "ingest.payload.binding_missing",
+        ],
+    ),
+    (
+        "src/queue_consumer.rs",
+        "load_upload_parse",
+        &[
+            "ingest.payload.read_failed",
+            "ingest.payload.binding_missing",
+        ],
+    ),
+    (
+        "src/queue_consumer.rs",
+        "run_verifying",
+        &[
+            "ingest.verify_progress.read_failed",
+            "ingest.scratch.binding_missing",
+            "ingest.verify_progress.write_failed",
+            "ingest.verify.size_refused_terminal",
+        ],
+    ),
+    (
+        "src/queue_consumer.rs",
+        "send_continuation",
+        &[
+            "ingest.continuation.enqueue_failed",
+            "ingest.continuation.binding_missing",
+        ],
+    ),
+    (
+        "src/queue_consumer.rs",
+        "send_to_dlq",
+        &["ingest.dlq.send_failed", "ingest.dlq.binding_missing"],
+    ),
+];
+
+#[test]
+fn multi_event_functions_keep_their_source_order() {
+    let lib = production("src/lib.rs");
+    let consumer = production("src/queue_consumer.rs");
+    for (rel, func, expected) in ORDER_PINS {
+        let source = if *rel == "src/lib.rs" {
+            &lib
+        } else {
+            &consumer
+        };
+        let slice = site_slice(source, func);
+        let mut offsets = Vec::with_capacity(expected.len());
+        for event in expected.iter() {
+            let calls = emit_calls_with(slice, event);
+            assert_eq!(
+                calls.len(),
+                1,
+                "{rel}::{func} must emit {event} exactly once"
+            );
+            offsets.push(calls[0].as_ptr() as usize - slice.as_ptr() as usize);
+        }
+        for (pair, offs) in expected.windows(2).zip(offsets.windows(2)) {
+            assert!(
+                offs[0] < offs[1],
+                "{rel}::{func} must emit {} before {} (swapping the two names must fail)",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Finding 3: the size-refused terminal emit fires exactly for a terminal
 // size refusal (guarded by `*size_refused_blocks > 0` in the Unrecoverable
 // arm), never for a zero-refusal outcome.
@@ -524,7 +678,7 @@ fn size_refused_terminal_keeps_its_positive_refusal_guard() {
     );
     // The guard precedes the call: inverting `> 0` to `== 0` must fail.
     let call_start = slice.find(calls[0]).expect("call must sit in its slice");
-    let guard_window = compact(&slice[call_start.saturating_sub(900)..call_start]);
+    let guard_window = compact(&slice[window_start(slice, call_start, 900)..call_start]);
     assert!(
         guard_window.contains("VerifyOutcome::Unrecoverable"),
         "the terminal emit must sit in the Unrecoverable arm"
@@ -533,7 +687,7 @@ fn size_refused_terminal_keeps_its_positive_refusal_guard() {
         guard_window.contains("*size_refused_blocks>0"),
         "the terminal emit must keep its positive-refusal guard \
          (inverting to == 0 must fail): …{}",
-        &guard_window[guard_window.len().saturating_sub(160)..]
+        &guard_window[window_start(&guard_window, guard_window.len(), 160)..]
     );
 }
 
