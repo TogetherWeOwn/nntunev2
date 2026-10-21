@@ -1598,6 +1598,10 @@ chown-revoke-prefixed-punct-glob-split-logsave	1	RUN 'log''save' /tmp/log * root
 chown-revoke-prefixed-punct-glob-split-x86-64	1	RUN 'x86''_64' * root /scratch
 chown-revoke-prefixed-punct-glob-path-x86-64	1	RUN /usr/bin/x86_64 ????? root /scratch
 chown-revoke-prefixed-punct-glob-env-logsave	1	RUN env logsave /tmp/log * root /scratch
+chown-revoke-prefixed-punct-glob-x86-64-nested-unset	1	RUN x86_64 env -u FOO * root /scratch
+chown-revoke-prefixed-punct-glob-i386-nested-unset	1	RUN i386 env -u FOO * root /scratch
+chown-revoke-prefixed-punct-glob-logsave-nested-unset	1	RUN logsave /tmp/log env -u FOO * root /scratch
+chown-revoke-prefixed-punct-glob-taskset-nested-unset	1	RUN taskset -c 0 env -u FOO * root /scratch
 chown-revoke-joined-glob-direct-star	1	RUN './'*oo root /scratch
 chown-revoke-joined-glob-direct-qmark	1	RUN './f'?o root /scratch
 chown-revoke-joined-glob-direct-short	1	RUN './'*o root /scratch
