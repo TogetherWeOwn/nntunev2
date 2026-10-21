@@ -245,6 +245,7 @@ fn fast_failure_keeps_its_own_stage_and_returns_promptly() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // const range pin folds to true under clippy; allow keeps the SLO failure messages
 fn production_default_budget_is_finite_and_covers_the_search_slo() {
     // Documented SLOs: lookup <50ms hit / <250ms miss, search <600ms.
     // The per-operation default must leave a legitimate in-SLO query
