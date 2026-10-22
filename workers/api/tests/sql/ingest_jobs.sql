@@ -103,11 +103,18 @@ BEGIN
     END IF;
 
     -- Unknown statuses are rejected by the CHECK backstop even if a
-    -- caller skipped validate_transition_status.
+    -- caller skipped validate_transition_status. The target row must be
+    -- pre-terminal: the predicate skips terminal rows, so testing against
+    -- a settled row would match nothing and the sentinel RAISE below
+    -- would fire instead of the CHECK.
+    INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status)
+    VALUES ('job_01ingestjobs0006', 'user-ij-1',
+            'ingest:user-ij-1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:upload',
+            1700000000, 'queued');
     BEGIN
         UPDATE ingest_jobs SET status = 'started'
         FROM (SELECT id FROM users WHERE id = 'user-ij-1' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-        WHERE ingest_jobs.id = 'job_01ingestjobs0002' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
+        WHERE ingest_jobs.id = 'job_01ingestjobs0006' AND ingest_jobs.user_id = 'user-ij-1' AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running');
         RAISE EXCEPTION 'CHECK accepted an unknown ingest status on transition';
     EXCEPTION WHEN check_violation THEN
         NULL;
