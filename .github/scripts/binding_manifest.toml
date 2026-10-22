@@ -139,6 +139,25 @@ config = "apps/web/wrangler.toml"
 binding = "ASSETS"
 type = "assets"
 
+[[worker]]
+name = "youtube"
+config = "workers/youtube/wrangler.toml.example"
+
+# Nothing provisioned yet (no staging/prod counterparts in docs/ops.md):
+# presence + staging/prod parity only, until the staging deploy slice lands
+# the KV namespaces and the ops inventory rows.
+[[worker.binding]]
+binding = "YT_EXTRACT"
+type = "durable_object"
+
+[[worker.binding]]
+binding = "YT_CONFIG"
+type = "kv"
+
+[[worker.binding]]
+binding = "YT_PLAYER_CACHE"
+type = "kv"
+
 # --- Pre-existing value drift (fix owned by the docs/ops.md ---
 # --- reconciliation work; delete each entry when its value lands) ---
 

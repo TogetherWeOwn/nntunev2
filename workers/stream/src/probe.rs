@@ -45,7 +45,7 @@ pub struct PoolProvider {
 /// Most message-ids per probe call (the ingest batch size).
 pub const MAX_PROBE_SEGMENTS: usize = 500;
 
-/// Largest accepted probe body: 500 ids of up to 512 bytes, each id
+/// Largest accepted probe body: 500 ids of up to 250 bytes, each id
 /// JSON-escaped at worst to double length, plus the envelope fields.
 pub const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 
@@ -160,21 +160,12 @@ impl From<Result<ProbeOutcome, ProbeError>> for ProbeReply {
     }
 }
 
-/// Strict message-id check, identical to ingest's `validate_message_id`
-/// (RFC 5536 `msg-id`, bracketless): 1..=512 bytes of printable ASCII, no
-/// `<`/`>`, exactly one `@` with non-empty sides.
+/// Strict message-id check: the shared segment-identity rule
+/// ([`nntune_core::segment_identity::valid_segment_id`], documented once
+/// there), identical to ingest's `validate_message_id` by construction —
+/// both delegate to the same function, so the two sides cannot drift.
 pub fn valid_probe_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 512 {
-        return false;
-    }
-    if !id.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return false;
-    }
-    if id.contains('<') || id.contains('>') {
-        return false;
-    }
-    let mut parts = id.split('@');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), None) if !a.is_empty() && !b.is_empty())
+    nntune_core::segment_identity::valid_segment_id(id)
 }
 
 /// Parse and validate one probe body for the pool owned by `pool_user`.
@@ -431,6 +422,10 @@ mod tests {
         assert!(valid_probe_id("seg-one@synthetic.invalid"));
         assert!(!valid_probe_id(""));
         assert!(!valid_probe_id(&"a".repeat(513)));
+        // The shared wire ceiling, pinned with well-shaped ids: 250 passes,
+        // 251 fails (a wire-refused id must fail here, before any lease).
+        assert!(valid_probe_id(&format!("{}@b", "a".repeat(248))));
+        assert!(!valid_probe_id(&format!("{}@b", "a".repeat(249))));
         assert!(!valid_probe_id("has space@synthetic.invalid"));
         assert!(!valid_probe_id(
             "x@y>\r\nAUTHINFO USER attacker\r\nQUIT\r\n<z"
@@ -493,8 +488,9 @@ mod tests {
 
     #[test]
     fn worst_case_valid_batch_fits_the_body_cap() {
-        // 500 ids of 512 bytes made of `"`, which JSON doubles to `\"`.
-        let id = format!("{}@{}", "\"".repeat(255), "\"".repeat(256));
+        // 500 ids of 250 bytes made of `"`, which JSON doubles to `\"`.
+        let id = format!("{}@{}", "\"".repeat(124), "\"".repeat(125));
+        assert_eq!(id.len(), 250);
         assert!(valid_probe_id(&id));
         let ids = vec![id.as_str(); MAX_PROBE_SEGMENTS];
         let json = body("u".repeat(MAX_USER_ID_LEN).as_str(), &ids);

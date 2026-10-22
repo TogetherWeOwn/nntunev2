@@ -50,10 +50,10 @@ class FormatBytesTests(unittest.TestCase):
 
 
 class WorkerTableTests(unittest.TestCase):
-    def test_covers_all_five_workers(self):
+    def test_covers_all_six_workers(self):
         self.assertEqual(
             [spec["worker"] for spec in WORKERS],
-            ["api", "ingest", "mb", "repair", "stream"],
+            ["api", "ingest", "mb", "repair", "stream", "youtube"],
         )
 
     def test_wasm_names(self):
@@ -62,7 +62,9 @@ class WorkerTableTests(unittest.TestCase):
 
     def test_audited_workers_build_locked(self):
         locked = [spec["worker"] for spec in WORKERS if spec.get("locked")]
-        self.assertEqual(locked, ["api", "ingest", "mb", "repair", "stream"])
+        self.assertEqual(
+            locked, ["api", "ingest", "mb", "repair", "stream", "youtube"]
+        )
 
     def test_repair_builds_locked_with_committed_lockfile(self):
         repair = next(s for s in WORKERS if s["worker"] == "repair")
@@ -75,6 +77,13 @@ class WorkerTableTests(unittest.TestCase):
         self.assertIn("nntune-stream", args)
         self.assertIn("--locked", args)
 
+    def test_cargo_args_youtube_uses_package_locked(self):
+        youtube = next(s for s in WORKERS if s["worker"] == "youtube")
+        args = cargo_args(youtube)
+        self.assertIn("-p", args)
+        self.assertIn("nntune-youtube", args)
+        self.assertIn("--locked", args)
+
     def test_cargo_args_api_uses_manifest_locked(self):
         api = next(s for s in WORKERS if s["worker"] == "api")
         args = cargo_args(api)
@@ -85,6 +94,7 @@ class WorkerTableTests(unittest.TestCase):
     def test_wasm_path_layout(self):
         api = next(s for s in WORKERS if s["worker"] == "api")
         stream = next(s for s in WORKERS if s["worker"] == "stream")
+        youtube = next(s for s in WORKERS if s["worker"] == "youtube")
         root = Path("/repo")
         self.assertEqual(
             wasm_path(root, api),
@@ -93,6 +103,10 @@ class WorkerTableTests(unittest.TestCase):
         self.assertEqual(
             wasm_path(root, stream),
             Path("/repo/target") / TARGET / "release/nntune_stream.wasm",
+        )
+        self.assertEqual(
+            wasm_path(root, youtube),
+            Path("/repo/target") / TARGET / "release/nntune_youtube.wasm",
         )
 
 

@@ -37,6 +37,8 @@ export interface LibraryRefresher {
 	readonly state: LibraryRefreshState;
 	refresh: (fetchFn?: typeof fetch) => Promise<void>;
 	handleAuthTransition: (event: Pick<StorageEvent, 'key'>) => void;
+	/** Same reset as a delivered transition, for same-window dispatch. */
+	handleLocalAuthTransition: () => void;
 	dispose: () => void;
 }
 
@@ -298,8 +300,13 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		}
 	}
 
-	function handleAuthTransition(event: Pick<StorageEvent, 'key'>): void {
-		if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
+	/**
+	 * Shared local/delivered-transition reset: fence in-flight work (a late
+	 * response can neither repopulate the view nor overwrite the replacement
+	 * status), drop snapshots and memory, and enter the sign-in-required
+	 * presentation. Never requests, rebroadcasts, navigates or retries.
+	 */
+	function applyAuthTransition(): void {
 		requestGeneration += 1;
 		activeRequest?.abort();
 		activeRequest = null;
@@ -314,10 +321,19 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		notify();
 	}
 
+	function handleAuthTransition(event: Pick<StorageEvent, 'key'>): void {
+		if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
+		applyAuthTransition();
+	}
+
+	function handleLocalAuthTransition(): void {
+		applyAuthTransition();
+	}
+
 	function dispose(): void {
 		requestGeneration += 1;
 		activeRequest?.abort();
 	}
 
-	return { state, refresh, handleAuthTransition, dispose };
+	return { state, refresh, handleAuthTransition, handleLocalAuthTransition, dispose };
 }

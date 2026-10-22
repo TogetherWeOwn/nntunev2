@@ -17,4 +17,5 @@ crates/*/
 !crates/nntune-test-nntp/
 workers/*
 !workers/stream/
+!workers/youtube/
 *.md

@@ -14,6 +14,9 @@
 //! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
 //! - [`par2`]: PAR2 recovery-set parsing and verification. Repair is
 //!   native-only (it shells out to `par2cmdline-turbo` in a Container).
+//! - [`segment_identity`]: the one shared segment message-id rule (250-byte
+//!   wire ceiling, bare shape, no normalization) enforced identically by
+//!   ingest intake, the probe/body envelopes, play, and the wire adapters.
 //! - [`transcode`]: the `opus-64` profile contract (pinned ffmpeg argv,
 //!   Ogg serial normaliser, content-addressed artifact keys) shared by
 //!   the ingest dispatcher and the transcode Container.
@@ -28,6 +31,7 @@ pub mod nntp;
 pub mod nzb;
 pub mod par2;
 pub mod pinned_transport;
+pub mod segment_identity;
 pub mod transcode;
 pub mod transport;
 pub mod transports;

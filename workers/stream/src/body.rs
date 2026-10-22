@@ -31,7 +31,7 @@ use crate::probe::{
     provider_failed, valid_probe_id, ProbeError, LANE_FULL_RETRY_MS, MAX_USER_ID_LEN,
 };
 
-/// Largest accepted body-request envelope: one id of up to 512 bytes,
+/// Largest accepted body-request envelope: one id of up to 250 bytes,
 /// JSON-escaped at worst to double length, plus the envelope fields.
 pub const MAX_BODY_REQUEST_BYTES: usize = 64 * 1024;
 

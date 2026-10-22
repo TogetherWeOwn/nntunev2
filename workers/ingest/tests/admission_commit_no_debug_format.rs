@@ -1,26 +1,14 @@
-//! Builder-owned supplemental pin: no Debug-format specifier and no raw-error
-//! interpolation on the admission-ledger commit path.
+//! Supplemental privacy guard for structured admission commit and upsert events.
 //!
-//! The acceptance pin in `admission_commit_sqlstate_acceptance.rs` bans the
-//! literal `"{:?}"` spelling; captured (`{e:?}`) and alternate (`{:#?}`,
-//! `{e:#?}`) Debug spellings slip that ban while leaking the same server
-//! message/detail/hint via `tokio_postgres::Error`'s Debug render. Its raw
-//! Display list (`{e}`, `{error}`, `, e)`, ...) likewise misses multi-line
-//! positional args (`, e` followed by a newline, not `)`) and empty-spec
-//! captures (`{e:}`), which render the server message via Display. This file
-//! closes both gaps in the commit context (the `mark_queued` body plus any
-//! one-level helper it calls, sliced from production pre-`#[cfg(test)]`
-//! source so test literals cannot satisfy it).
+//! Inspect emit invocations, not just the retired console macros: JSON fields
+//! can leak raw errors via Display, Debug, to_string(), or direct serialization.
+//! Commit context includes one-level production helpers so extracting the
+//! formatting into a helper cannot hide it. Synthetic negative fixtures cover
+//! captured/positional formatting and prove these predicates are non-vacuous.
 //!
-//! Detection parses `{...}` placeholders inside string literals (normal and
-//! raw) rather than banning substrings: a placeholder whose spec — the text
-//! after `:` — ends with `?` (allowing whitespace before `}`, which rustc
-//! accepts) is a Debug render, whatever fill/align/width/precision/`#`/hex
-//! params precede the `?`. Scoping to literals keeps Rust's `?` operator
-//! (`bar()?\n}`) and `{{`/`}}` escapes from tripping the pin.
-//!
-//! Slicing helpers below mirror the acceptance file's scoping; the
-//! Test-Author file itself is intentionally untouched.
+//! Debug detection parses placeholders in normal/raw string literals. Specs
+//! ending in `?` cover alternate, width, precision and hex forms. Literal
+//! scoping excludes Rust's `?` operator, comments and escaped `{{`/`}}` braces.
 
 fn production(source: &str) -> &str {
     source
@@ -66,9 +54,8 @@ fn fn_body(source: &str, name: &str) -> Option<String> {
     None
 }
 
-/// `mark_queued` plus the body of any one-level helper it calls that is
-/// defined in production `lib.rs`/`library.rs` (mirrors the acceptance
-/// file's commit context exactly).
+/// `mark_queued` plus any one-level helpers it calls in production
+/// `lib.rs`/`library.rs`. The whole method is covered to catch added raw logs.
 fn commit_context() -> String {
     let body = mark_queued_body();
     let mut context = body.to_string();
@@ -288,33 +275,68 @@ fn debug_placeholder(body: &str) -> Option<&str> {
     None
 }
 
-#[test]
-fn commit_context_uses_no_debug_format_specifier() {
-    let context = commit_context();
-    let mut offenders = Vec::new();
-    for body in string_literal_bodies(&context) {
-        if let Some(placeholder) = debug_placeholder(body) {
-            offenders.push(format!("`{placeholder}` in {body:?}"));
-        }
+fn assert_no_debug_format(context: &str) {
+    for body in string_literal_bodies(context) {
+        assert!(
+            debug_placeholder(body).is_none(),
+            "failure path must not Debug-format server details: {body}"
+        );
     }
-    assert!(
-        offenders.is_empty(),
-        "commit failure path must not use the Debug format specifier \
-         (`{{:?}}`, `{{e:?}}`, `{{:#?}}`, `{{e:#?}}`, param variants like \
-         `{{e:x?}}`/`{{e:10?}}`, and whitespace-padded forms like \
-         `{{e:x? }}` — all render the server message/detail via \
-         tokio_postgres::Error Debug) — found:\n{}\nin:\n{context}",
-        offenders.join("\n")
-    );
 }
 
-/// Statement text of each `console_log!` in `context`, sliced like the
-/// acceptance file (from the macro to the first `");`).
-fn console_log_statements(context: &str) -> Vec<&str> {
-    context
-        .match_indices("console_log!")
-        .map(|(i, _)| context[i..].split(");").next().unwrap_or(&context[i..]))
-        .collect()
+#[test]
+fn failure_contexts_use_no_debug_format_specifier() {
+    assert_no_debug_format(&commit_context());
+    assert_no_debug_format(&upsert_context());
+}
+
+/// Complete emit/legacy-console invocations, including nested format! args.
+/// Count parentheses outside literals; `);` inside a string or nested call
+/// must not truncate a statement before a leaking positional argument.
+fn log_statements(context: &str) -> Vec<&str> {
+    let literals = string_literal_bodies(context);
+    let mut out = Vec::new();
+    for name in [
+        "emit(",
+        "console_log!(",
+        "console_error!(",
+        "format!(",
+        "format_args!(",
+    ] {
+        for (start, _) in context.match_indices(name) {
+            let open = start + name.len() - 1;
+            let mut depth = 0usize;
+            for (offset, ch) in context[open..].char_indices() {
+                let i = open + offset;
+                let in_literal = literals.iter().any(|body| {
+                    let body_start = body.as_ptr() as usize - context.as_ptr() as usize;
+                    (body_start..body_start + body.len()).contains(&i)
+                });
+                if in_literal {
+                    continue;
+                }
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(&context[start..=i]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn upsert_context() -> String {
+    let consumer = production(include_str!("../src/queue_consumer.rs"));
+    let edge_impl = consumer
+        .split_once("impl MatchWriteRuntime for EdgeMatchWrite<'_>")
+        .expect("edge upsert impl must exist")
+        .1;
+    fn_body(edge_impl, "upsert").expect("edge upsert body must exist")
 }
 
 /// `statement` with every `admission_commit_sqlstate(&e)` / `(&error)` call
@@ -328,7 +350,7 @@ fn scrub_sqlstate_calls(statement: &str) -> String {
     while let Some(i) = rest.find(HELPER) {
         out.push_str(&rest[..i]);
         let after = &rest[i + HELPER.len()..];
-        match sqlstate_call_len(after) {
+        match sqlstate_call_len(after).filter(|_| !prev_is_ident(rest.as_bytes(), i)) {
             Some(len) => {
                 out.push(' ');
                 rest = &after[len..];
@@ -397,26 +419,141 @@ fn raw_error_tokens(statement: &str) -> Vec<&str> {
         .collect()
 }
 
+fn assert_no_raw_error(context: &str) {
+    assert_no_debug_format(context);
+    let compact: String = context.chars().filter(|c| !c.is_whitespace()).collect();
+    for leak in [".message()", ".detail()", ".hint()"] {
+        assert!(
+            !compact.contains(leak),
+            "server detail accessor {leak}: {context}"
+        );
+    }
+    for raw in ["e.to_string()", "error.to_string()"] {
+        assert!(
+            !compact
+                .match_indices(raw)
+                .any(|(i, _)| !prev_is_ident(compact.as_bytes(), i)),
+            "helper must not Display-format the raw error: {context}"
+        );
+    }
+    let statements = log_statements(context);
+    assert!(
+        !statements.is_empty(),
+        "privacy guard must inspect a real log invocation"
+    );
+    for statement in statements {
+        let scrubbed = scrub_sqlstate_calls(statement);
+        assert!(
+            raw_error_tokens(&scrubbed).is_empty(),
+            "log must not capture, format or serialize the raw error: {statement}"
+        );
+    }
+}
+
 #[test]
-fn commit_log_never_interpolates_the_raw_error() {
-    let context = commit_context();
-    let mut offenders = Vec::new();
-    for stmt in console_log_statements(&context) {
-        let scrubbed = scrub_sqlstate_calls(stmt);
-        let tokens = raw_error_tokens(&scrubbed);
-        if !tokens.is_empty() {
-            offenders.push(format!(
-                "{} in scrubbed statement:\n{scrubbed}",
-                tokens.join(", ")
-            ));
+fn failure_logs_never_interpolate_the_raw_error() {
+    for (context, event) in [
+        (commit_context(), "ingest.admission.commit_failed"),
+        (upsert_context(), "ingest.library.upsert_failed"),
+    ] {
+        assert!(
+            log_statements(&context)
+                .iter()
+                .any(|stmt| stmt.starts_with("emit(") && stmt.contains(event)),
+            "privacy guard must inspect the structured {event} invocation"
+        );
+        assert_no_raw_error(&context);
+    }
+}
+
+#[test]
+fn structured_emit_guards_reject_captured_and_positional_error_mutants() {
+    for event in [
+        "ingest.admission.commit_failed",
+        "ingest.library.upsert_failed",
+    ] {
+        for value in [
+            "format!(\"{e:?}\")",
+            "format!(\"{error:#?}\")",
+            "format!(\"{:?}\", e)",
+            "format!(\"{:#?}\", error)",
+            "format!(\"{error:x?}\")",
+            "format!(\"{e:10? }\")",
+            "format!(r#\"{error:#?}\"#)",
+            "format!(\"{e}\")",
+            "format!(\"{error:}\")",
+            "format!(\"{}\",\n e\n)",
+            "format!(\"{0}\", error)",
+            "format!(r#\"{e}\"#)",
+            "format!(\"benign ); {}\", e)",
+            "e.to_string()",
+            "error.to_string()",
+            "e",
+            "error",
+            "error.as_db_error().unwrap().message()",
+            "error.as_db_error().unwrap().detail()",
+            "error.as_db_error().unwrap().hint()",
+        ] {
+            let mutant = format!(
+                "emit(Level::Error, trace_id, {event:?}, serde_json::json!({{\"build_sha\": build_sha, \"sqlstate\": {value}}}));"
+            );
+            assert!(
+                std::panic::catch_unwind(|| assert_no_raw_error(&mutant)).is_err(),
+                "privacy guard accepted leaked error: {mutant}"
+            );
         }
     }
-    assert!(
-        offenders.is_empty(),
-        "commit failure log must not interpolate the raw error binding — \
-         Display (`{{}}` with `e`, `{{e}}`, `{{e:}}`) renders the server \
-         message just like Debug; only `admission_commit_sqlstate(&e)` may \
-         use it — found:\n{}\nin:\n{context}",
-        offenders.join("\n")
-    );
+}
+
+#[test]
+fn structured_emit_guards_accept_only_sanitized_error_uses() {
+    let commit = r#"emit(Level::Error, trace_id, "ingest.admission.commit_failed",
+        serde_json::json!({"build_sha": build_sha, "sqlstate": admission_commit_sqlstate(&e)}));"#;
+    let upsert = r#"crate::emit(nntune_logging::Level::Error, trace_id, "ingest.library.upsert_failed",
+        serde_json::json!({"build_sha": build_sha, "sqlstate": sqlstate.unwrap_or("none")}));"#;
+    assert_eq!(log_statements(commit).len(), 1);
+    assert_eq!(log_statements(upsert).len(), 1);
+    assert_no_raw_error(commit);
+    assert_no_raw_error(upsert);
+    assert_no_debug_format(r#"bar()?; let literal = "{{error:?}}"; let raw = r"{{e:#?}}";"#);
+    assert!(std::panic::catch_unwind(|| assert_no_raw_error("no log invocation")).is_err());
+}
+
+#[test]
+fn structured_emit_guard_cannot_scrub_a_second_raw_error_argument() {
+    let mutant = r#"emit(Level::Error, trace_id, "ingest.admission.commit_failed",
+        serde_json::json!({"build_sha": build_sha,
+            "sqlstate": admission_commit_sqlstate(&e), "extra": format!("{e}")}));"#;
+    assert!(std::panic::catch_unwind(|| assert_no_raw_error(mutant)).is_err());
+    let disguised_helper = mutant
+        .replace(
+            "admission_commit_sqlstate",
+            "unsafe_admission_commit_sqlstate",
+        )
+        .replace(", \"extra\": format!(\"{e}\")", "");
+    assert!(std::panic::catch_unwind(|| assert_no_raw_error(&disguised_helper)).is_err());
+    for rendering in [
+        "format!(\"{error:#?}\")",
+        "format!(\"{error}\")",
+        "format!(\"{}\", error)",
+        "error.to_string()",
+    ] {
+        let helper_leak = format!(
+            r#"emit(Level::Error, trace_id, "ingest.admission.commit_failed",
+            serde_json::json!({{"sqlstate": admission_commit_sqlstate(&e)}}));
+            fn admission_commit_sqlstate(error: &Error) -> String {{ {rendering} }}"#
+        );
+        assert!(std::panic::catch_unwind(|| assert_no_raw_error(&helper_leak)).is_err());
+    }
+}
+
+#[test]
+fn legacy_console_leaks_are_still_rejected() {
+    for mutant in [
+        r#"console_log!("{}", e);"#,
+        r#"console_error!("{error}");"#,
+        r#"console_log!("{e:#?}");"#,
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_no_raw_error(mutant)).is_err());
+    }
 }

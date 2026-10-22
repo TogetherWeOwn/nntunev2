@@ -4,14 +4,15 @@
 //! any `BODY` command is serialized to the socket.
 //!
 //! Contract under test (public seam only: `NntpClient::article`):
-//! - printable ASCII only, exactly one `@`, both sides nonempty, after the
-//!   adapter's existing outer-trim and `<>` bracket stripping, under its
-//!   existing 250-byte ceiling;
+//! - the shared segment-identity rule, validated byte-for-byte as given:
+//!   printable ASCII only, exactly one `@`, both sides nonempty, under the
+//!   250-byte ceiling, with no trim or `<>` bracket stripping — a padded
+//!   or bracketed spelling is refused, never normalized into acceptance;
 //! - every violation returns `Err(InvalidMessageId)` echoing the caller's
 //!   id while the server observes zero post-greeting bytes;
 //! - a violation is local input, never a provider failure, so it cannot
 //!   quarantine the pool (`is_provider_failure() == false`);
-//! - well-shaped bracketed/unbracketed ids keep normal handling.
+//! - bare well-shaped ids keep normal handling.
 //!
 //! Bounded loopback fixtures only; no external network.
 
@@ -194,32 +195,36 @@ fn well_shaped_ids_retain_normal_handling() {
         "scripted 430 must surface as NoSuchArticle, got {outcome:?}"
     );
 
-    // Bracketed form strips to the same wire command; 222 path returns body.
+    // Bare well-shaped id, 222 path: returns the dot-unstuffed body.
     let (outcome, command) = fetch_with_scripted_reply(
-        "<good-seg0@synthetic.test>",
+        "good-seg0@synthetic.test",
         b"222 article follows\r\nHello\r\n.\r\n",
     );
     assert_eq!(
         command, "BODY <good-seg0@synthetic.test>\r\n",
-        "bracketed id must strip to the same BODY command"
+        "bare id must reach the wire as a single BODY command"
     );
     assert_eq!(
         outcome.expect("222 must fetch"),
         b"Hello\n",
         "well-shaped control must complete normal body handling"
     );
+}
 
-    // Outer trim around a bracketed well-shaped id is legitimate handling.
-    let (outcome, command) =
-        fetch_with_scripted_reply("  <good-seg1@synthetic.test>  ", b"430 no such article\r\n");
-    assert_eq!(
-        command, "BODY <good-seg1@synthetic.test>\r\n",
-        "outer-trimmed bracketed id must strip to the same BODY command"
-    );
-    assert!(
-        matches!(outcome, Err(NntpError::NoSuchArticle(_))),
-        "scripted 430 must surface as NoSuchArticle, got {outcome:?}"
-    );
+#[test]
+fn padded_and_bracketed_spellings_are_rejected_without_normalization() {
+    // Well-shaped once stripped, but the shared rule never strips: every
+    // spelling is refused before any wire write.
+    let refused: &[&str] = &[
+        "<good-seg0@synthetic.test>",
+        "  <good-seg1@synthetic.test>  ",
+        " good-seg0@synthetic.test",
+        "good-seg0@synthetic.test ",
+        "\tgood-seg0@synthetic.test",
+    ];
+    for id in refused {
+        assert_rejected_before_wire_write(id);
+    }
 }
 
 #[test]

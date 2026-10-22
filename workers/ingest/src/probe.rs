@@ -58,21 +58,13 @@ pub struct ProbeOutcome {
 /// to real CR/LF in a conforming parser), hence the check runs both at the
 /// parse cross-check and here at the envelope.
 ///
-/// Rules (RFC 5536 `msg-id`, bracketless form — the protocol layer adds
-/// `<…>`): 1..=512 bytes, printable ASCII (`0x21..=0x7E`) only, no `<`/`>`,
-/// exactly one `@` with non-empty sides.
+/// This is the shared segment-identity rule
+/// ([`nntune_core::segment_identity::valid_segment_id`], documented once
+/// there): the 250-byte wire ceiling, bare printable shape, no
+/// normalization. One rule, so an id refused at the wire is refused here
+/// before any pool lease.
 pub fn validate_message_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 512 {
-        return false;
-    }
-    if !id.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return false;
-    }
-    if id.contains('<') || id.contains('>') {
-        return false;
-    }
-    let mut parts = id.split('@');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), None) if !a.is_empty() && !b.is_empty())
+    nntune_core::segment_identity::valid_segment_id(id)
 }
 
 /// Build one probe envelope from the job and its parsed segment list.
@@ -287,6 +279,10 @@ mod tests {
         assert!(validate_message_id("seg-one@synthetic.invalid"));
         assert!(!validate_message_id(""));
         assert!(!validate_message_id(&"a".repeat(513)));
+        // The shared wire ceiling, pinned with well-shaped ids: 250 passes,
+        // 251 fails (a wire-refused id must fail here, before any lease).
+        assert!(validate_message_id(&format!("{}@b", "a".repeat(248))));
+        assert!(!validate_message_id(&format!("{}@b", "a".repeat(249))));
         assert!(!validate_message_id("has space@synthetic.invalid"));
         assert!(!validate_message_id(
             "x@y>\r\nAUTHINFO USER attacker\r\nQUIT\r\n<z"

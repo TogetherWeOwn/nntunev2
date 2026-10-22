@@ -223,6 +223,37 @@
       "id": "vault-test-connection-legacy",
       "method": "POST",
       "path": "/v1/vault/test-connection"
+    },
+    {
+      "id": "credentials-mint",
+      "method": "POST",
+      "path": "/v1/credentials",
+      "web": "mintCredential",
+      "input": {
+        "label": "synthetic cli",
+        "scopes": ["library:read"],
+        "ttlSecs": 3600
+      },
+      "wire": {
+        "label": "synthetic cli",
+        "scopes": ["library:read"],
+        "ttl_secs": 3600
+      }
+    },
+    {
+      "id": "credentials-list",
+      "method": "GET",
+      "path": "/v1/credentials",
+      "web": "listCredentials"
+    },
+    {
+      "id": "credentials-revoke",
+      "method": "DELETE",
+      "path": "/v1/credentials/synthetic-cred-id",
+      "web": "revokeCredential",
+      "input": {
+        "id": "synthetic-cred-id"
+      }
     }
   ]
 }

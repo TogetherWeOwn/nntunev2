@@ -52,9 +52,9 @@
       <group>alt.binaries.nntune.test</group>
     </groups>
     <segments>
-      <segment bytes="575" number="1">&lt;multi-660-part1-of-3@nntune.test&gt;</segment>
-      <segment bytes="575" number="2">&lt;multi-660-part2-of-3@nntune.test&gt;</segment>
-      <segment bytes="574" number="3">&lt;multi-660-part3-of-3@nntune.test&gt;</segment>
+      <segment bytes="575" number="1">multi-660-part1-of-3@nntune.test</segment>
+      <segment bytes="575" number="2">multi-660-part2-of-3@nntune.test</segment>
+      <segment bytes="574" number="3">multi-660-part3-of-3@nntune.test</segment>
     </segments>
   </file>
   <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-440 [01/01] - &quot;sine-440.wav&quot; yEnc (1/1)">
@@ -62,7 +62,7 @@
       <group>alt.binaries.nntune.test</group>
     </groups>
     <segments>
-      <segment bytes="1004" number="1">&lt;single-yenc-001@nntune.test&gt;</segment>
+      <segment bytes="1004" number="1">single-yenc-001@nntune.test</segment>
     </segments>
   </file>
 </nzb>
