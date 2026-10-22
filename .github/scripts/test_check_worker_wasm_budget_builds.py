@@ -96,6 +96,16 @@ EXPECTED_ALL_ARGV = [
         "nntune-stream",
         "--locked",
     ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "nntune-youtube",
+        "--locked",
+    ],
 ]
 
 TINY_WASM = b"\x00asm" + b"\x00" * 64
@@ -257,7 +267,7 @@ class MainExitTests(unittest.TestCase):
             self.assertIn("FAIL", output)
             self.assertIn("api", output)
 
-    def test_main_returns_0_when_all_five_pass(self):
+    def test_main_returns_0_when_all_six_pass(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:

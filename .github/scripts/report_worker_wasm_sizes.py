@@ -47,14 +47,14 @@ from pathlib import Path
 TARGET = "wasm32-unknown-unknown"
 
 # Per-Worker cargo timeout, in seconds. A hung build must not take the whole
-# report down: five Workers x 300 s = 25 min worst case, inside the CI job's
-# 30-minute timeout. Timeouts become ``error`` rows so collect_rows() keeps
+# report down: six Workers x 300 s = 30 min worst case, inside the CI job's
+# 35-minute timeout. Timeouts become ``error`` rows so collect_rows() keeps
 # measuring the remaining Workers.
 BUILD_TIMEOUT_SECONDS = 300
 
 # One entry per Worker. ``kind`` selects how the crate is addressed:
-# standalone crates (own Cargo.toml, own target dir) vs the stream crate
-# (workspace member, repo-root target dir). Only the api crate has a
+# standalone crates (own Cargo.toml, own target dir) vs the stream/youtube
+# crates (workspace members, repo-root target dir). Only the api crate has a
 # committed, audited Cargo.lock, so only it builds with ``--locked`` --
 # matching the required CI lanes for each crate.
 WORKERS = (
@@ -97,6 +97,14 @@ WORKERS = (
         "locked": False,
         "target_dir": "target",
         "wasm": "nntune_stream.wasm",
+    },
+    {
+        "worker": "youtube",
+        "kind": "package",
+        "package": "nntune-youtube",
+        "locked": False,
+        "target_dir": "target",
+        "wasm": "nntune_youtube.wasm",
     },
 )
 
