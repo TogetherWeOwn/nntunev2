@@ -43,7 +43,7 @@ Each example is one JSON log line; timestamps and trace IDs are static fixture v
 
 ## Verification (verified 2026-10-19)
 
-Cross-checked against main on 2026-10-19; line numbers are that revision. This section records evidence only and changes no emitter, schema, matcher, or binding behavior.
+Cross-checked against main on 2026-10-19; line numbers are that revision except the `api` entry below, whose complete set of entry-point anchors was rechecked at `474868983` on 2026-10-22. This section records evidence only and changes no emitter, schema, matcher, or binding behavior.
 
 Adoption claims:
 

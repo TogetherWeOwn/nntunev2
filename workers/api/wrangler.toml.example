@@ -119,10 +119,12 @@ SESSION_TTL_SECS = "86400"
 #                                 VAULT_KEK_V1, VAULT_KEK_V2, ... — each 32
 #                                 random bytes, unpadded base64url. The
 #                                 Worker reads versions CURRENT±8; anything
-#                                 outside stays unprovisioned. At first
-#                                 rotation re-provision the current key as
-#                                 V1, then delete the legacy pair once V1
-#                                 reads green. See
+#                                 outside stays unprovisioned. At initial
+#                                 cutover copy the legacy key bytes to
+#                                 VAULT_KEK_V<L> and set VAULT_KEK_CURRENT=<L>,
+#                                 where L is the live VAULT_KEK_VERSION.
+#                                 Keep the legacy pair until V<L> reads green;
+#                                 rotate to a new version separately. See
 #                                 docs/security/kek-rotation.md §3.
 #   VAULT_KEK_CURRENT             [vars, NOT a secret] integer write version
 #                                 selecting VAULT_KEK_V<CURRENT> for new

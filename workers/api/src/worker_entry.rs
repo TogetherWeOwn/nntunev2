@@ -86,12 +86,12 @@ fn decode_kek(raw: &str) -> Option<[u8; 32]> {
 ///   KEK_VERSION_WINDOW` becomes a retained prior (present-but-invalid
 ///   fails startup; absent is simply unprovisioned). Legacy
 ///   `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` are ignored: the cutover
-///   deploy provisions `V1` + `CURRENT=1` while legacy is still set,
-///   and legacy is deleted only once V1 reads green.
+///   reuses the legacy key as `VAULT_KEK_V<L>` + `VAULT_KEK_CURRENT=<L>`,
+///   where L is live `VAULT_KEK_VERSION`; delete legacy only after V<L> reads green.
 /// - `VAULT_KEK_CURRENT` absent: legacy single-key mode —
 ///   `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`, both required, no
 ///   priors. Per-version secrets are ignored here, so provisioning
-///   `V1` ahead of the cutover deploy never changes serving behavior.
+///   `V<L>` ahead of the cutover deploy never changes serving behavior.
 ///
 /// A present-but-unparsable `VAULT_KEK_CURRENT` fails startup rather
 /// than silently falling back to legacy: the operator asked for a

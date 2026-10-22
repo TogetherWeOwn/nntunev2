@@ -119,13 +119,17 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
   reads for it fail closed per-row like any unknown version. The
   ceremony's live set (`{N-1, N}` steady state, `{N, N+1}` pre-staged)
   always fits inside.
-- The Worker build **reads** every provisioned version (current +
-  retained priors, ≤3 retained — the `Config::kek_by_version` selector
-  in `workers/api/src/handlers.rs` over the provisioned set, so rows at
-  mixed versions decrypt during phases 1–2) but **writes only**
-  `VAULT_KEK_CURRENT`. A half-provisioned versioned config (missing or
-  invalid current key, unparsable `CURRENT`, invalid retained prior)
-  refuses to start rather than serving the wrong write version.
+- The Worker build **reads** every provisioned version within the
+  `CURRENT ± 8` discovery window (current + up to 16 retained priors;
+  fewer near the `u32` bounds) through `Config::kek_by_version` in
+  `workers/api/src/handlers.rs`, so rows at mixed versions decrypt
+  during phases 1–2, but **writes only** `VAULT_KEK_CURRENT`. There is
+  no separate three-prior runtime cap. Retirement still requires the
+  row-count and backup/PITR-horizon proof in §5 invariant 3; moving a
+  version outside the window is not a substitute for that proof.
+  A half-provisioned versioned config (missing or invalid current key,
+  unparsable `CURRENT`, invalid retained prior) refuses to start rather
+  than serving the wrong write version.
 - Staging and production have **independent key sets generated
   independently** — never copy a KEK value between environments, never
   reuse a version number scheme as a shared secret. A rotation ceremony
