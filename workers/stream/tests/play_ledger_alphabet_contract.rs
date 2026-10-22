@@ -16,6 +16,25 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::process::Command;
 
+/// Removes the native contract harness scratch dir when the test finishes.
+///
+/// Armed before any fallible harness step while holding the `harness.lock`
+/// file open, so every exit path (success, assertion failure, early panic)
+/// unwinds through the guard and removes the whole scratch dir with the
+/// lock still held. Without this the generated `Cargo.toml`/`alphabet.rs`
+/// survive inside the slot target and the pool classifier refuses the slot
+/// permanently.
+struct ScratchGuard {
+    path: std::path::PathBuf,
+    _lock: Option<fs::File>,
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[test]
 fn play_ledger_alphabet_contract() {
     let stream = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -28,8 +47,19 @@ fn play_ledger_alphabet_contract() {
     let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("play-ledger-alphabet-{:016x}", workspace.finish()));
     fs::create_dir_all(&scratch).expect("create native contract harness");
+    // Arm cleanup before any further fallible step: lock failure, harness
+    // failure, and assertion panics all unwind through this guard.
+    let mut harness_guard = ScratchGuard {
+        path: scratch.clone(),
+        _lock: None,
+    };
     let harness_lock = fs::File::create(scratch.join("harness.lock")).expect("open harness lock");
     harness_lock.lock().expect("lock native contract harness");
+    // A previous holder removes the whole scratch dir when it finishes, so
+    // re-create it after acquiring the lock: this waiter may have created
+    // the directory and opened the lock file before that removal.
+    fs::create_dir_all(&scratch).expect("recreate native contract harness");
+    harness_guard._lock = Some(harness_lock);
     let manifest = format!(
         "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
          [workspace]\n\
@@ -57,6 +87,10 @@ fn play_ledger_alphabet_contract() {
         .args(["test", "--locked", "--manifest-path"])
         .arg(scratch.join("Cargo.toml"))
         // Do not compete for the outer Cargo invocation's target lock.
+        // (Under the bounded pool this flag loses to the inherited
+        // CARGO_BUILD_BUILD_DIR, so the inner build shares the outer
+        // target as ordinary Cargo output; either way the guard below
+        // removes the veto-triggering scratch files.)
         .arg("--target-dir")
         .arg(scratch.join("target"))
         .args(["--test", "alphabet", "--", "--nocapture"])
@@ -67,6 +101,33 @@ fn play_ledger_alphabet_contract() {
         "native stream/API contract failed (compile errors are not RED):\n{}\n{}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn scratch_guard_removes_harness_dir_on_panic() {
+    // Regression probe for the pool-bricking scratch leak: the guard must
+    // remove veto-triggering material (a generated `.rs` file) even when
+    // the harness panics. The probe dir is process-scoped so concurrent
+    // runs sharing a target directory cannot collide; a stale dir from a
+    // killed run is removed before probing.
+    let probe = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("play-ledger-guard-probe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&probe);
+    fs::create_dir_all(&probe).expect("create guard probe dir");
+    fs::write(probe.join("alphabet.rs"), "// probe source\n").expect("write probe source");
+    let lock = fs::File::create(probe.join("harness.lock")).expect("open probe lock");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ScratchGuard {
+            path: probe.clone(),
+            _lock: Some(lock),
+        };
+        panic!("probe panic");
+    }));
+    assert!(outcome.is_err(), "probe closure must panic");
+    assert!(
+        !probe.exists(),
+        "guard must remove the harness dir on panic"
     );
 }
 
