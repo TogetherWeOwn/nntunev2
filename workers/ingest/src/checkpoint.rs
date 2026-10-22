@@ -58,6 +58,10 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         // redelivered Queue bodies are immutable, so the message copy
         // must never be read back over this field.
         provider_id: msg.provider_id.clone(),
+        // Transcode inputs record at the first verify `Complete`; the
+        // cursor starts at the first input.
+        transcode_inputs: Vec::new(),
+        transcode_next: 0,
     }
 }
 
