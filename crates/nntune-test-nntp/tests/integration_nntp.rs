@@ -378,7 +378,7 @@ async fn nzb_fixtures_match_served_ids() {
         // is the bare shared-rule identity; brackets are added here only to
         // match the corpus keys.
         let mut rest = text.as_str();
-        while let Some(seg) = rest.find("<segment") {
+        while let Some(seg) = rest.find("<segment ") {
             rest = &rest[seg..];
             let bytes_start = rest.find("bytes=\"").expect("segment bytes=");
             let bytes_rest = &rest[bytes_start + 7..];
