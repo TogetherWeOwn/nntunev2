@@ -1,4 +1,9 @@
+#![allow(dead_code)]
 //! Shared live-server harness for the container integration tests.
+//!
+//! Each integration target compiles this module separately and uses a
+//! different subset, so unused helpers are allowed here instead of
+//! per-target.
 
 use std::fs;
 use std::io::{Read, Write};
