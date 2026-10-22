@@ -48,6 +48,94 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Half-width of the versioned-KEK discovery window around
+/// `VAULT_KEK_CURRENT` (see [`kek_set_from_lookup`]). The Worker's `Env`
+/// offers no key listing, so provisioned `VAULT_KEK_V<N>` secrets are
+/// discovered by probing version names; the rotation ceremony's live set
+/// (`{N-1, N}` steady state, `{N, N+1}` pre-staged — `kek-rotation.md`
+/// §5) fits with wide margin, and anything outside the window simply
+/// stays unprovisioned (reads for it fail closed per-row, like any
+/// unknown version).
+const KEK_VERSION_WINDOW: u32 = 8;
+
+/// Parsed vault KEK set: the current write key plus the retained priors
+/// for mixed-version reads. Built by [`kek_set_from_lookup`], consumed
+/// once by `config_from_env`.
+struct KekSet {
+    kek: [u8; 32],
+    version: u32,
+    priors: Vec<(u32, [u8; 32])>,
+}
+
+/// Strict KEK decode: unpadded base64url (`crate::b64`, F-HARD-01)
+/// plus the exact 32-byte length. One helper so legacy and versioned
+/// paths cannot drift apart.
+fn decode_kek(raw: &str) -> Option<[u8; 32]> {
+    crate::b64::decode(raw).ok()?.try_into().ok()
+}
+
+/// Pure vault-KEK provisioning decision over the env lookup, so native
+/// tests drive the exact function `config_from_env` calls. Two
+/// exclusive modes (`docs/security/kek-rotation.md` §3):
+///
+/// - `VAULT_KEK_CURRENT` present (non-empty): versioned mode. The
+///   current write key is `VAULT_KEK_V{current}` (required — missing or
+///   invalid fails startup, even when legacy vars are also present, so
+///   a half-cutover never serves the wrong write version), and every
+///   other present `VAULT_KEK_V<N>` inside `current ±
+///   KEK_VERSION_WINDOW` becomes a retained prior (present-but-invalid
+///   fails startup; absent is simply unprovisioned). Legacy
+///   `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` are ignored: the cutover
+///   reuses the legacy key as `VAULT_KEK_V<L>` + `VAULT_KEK_CURRENT=<L>`,
+///   where L is live `VAULT_KEK_VERSION`; delete legacy only after V<L> reads green.
+/// - `VAULT_KEK_CURRENT` absent: legacy single-key mode —
+///   `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`, both required, no
+///   priors. Per-version secrets are ignored here, so provisioning
+///   `V<L>` ahead of the cutover deploy never changes serving behavior.
+///
+/// A present-but-unparsable `VAULT_KEK_CURRENT` fails startup rather
+/// than silently falling back to legacy: the operator asked for a
+/// versioned cutover, and serving legacy writes would split-brain the
+/// version the ceremony believes is current.
+fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
+    if let Some(current_raw) = get("VAULT_KEK_CURRENT").filter(|s| !s.is_empty()) {
+        let current: u32 = current_raw.parse().ok()?;
+        let kek = get(&format!("VAULT_KEK_V{current}")).and_then(|raw| decode_kek(&raw))?;
+        let mut priors = Vec::new();
+        let low = current.saturating_sub(KEK_VERSION_WINDOW);
+        let high = current.saturating_add(KEK_VERSION_WINDOW);
+        // Nested (not let-chained): this crate is edition 2021, where
+        // `if a && let ...` does not compile.
+        let mut version = low;
+        loop {
+            if version != current {
+                if let Some(raw) = get(&format!("VAULT_KEK_V{version}")) {
+                    priors.push((version, decode_kek(&raw)?));
+                }
+            }
+            if version == high {
+                break;
+            }
+            version = version.saturating_add(1);
+        }
+        return Some(KekSet {
+            kek,
+            version: current,
+            priors,
+        });
+    }
+    let kek = get("VAULT_KEK_BASE64").and_then(|raw| decode_kek(&raw))?;
+    let version: u32 = get("VAULT_KEK_VERSION")
+        .filter(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    Some(KekSet {
+        kek,
+        version,
+        priors: Vec::new(),
+    })
+}
+
 fn config_from_env(env: &Env) -> Option<Config> {
     // Runtime fail-closed gate for the Hyperdrive caching finding: auth
     // reads are plain SELECTs through the HYPERDRIVE binding, so a
@@ -65,9 +153,11 @@ fn config_from_env(env: &Env) -> Option<Config> {
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
     // padded std-base64 input is rejected, matching the template contract.
     let session_secret = crate::b64::decode(&env_string(env, "SESSION_SECRET_BASE64")?).ok()?;
-    let kek_bytes = crate::b64::decode(&env_string(env, "VAULT_KEK_BASE64")?).ok()?;
-    let kek: [u8; 32] = kek_bytes.try_into().ok()?;
-    let kek_version: u32 = env_string(env, "VAULT_KEK_VERSION")?.parse().ok()?;
+    // Vault KEK set: legacy `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`
+    // single-key mode, or the versioned `VAULT_KEK_V<N>` +
+    // `VAULT_KEK_CURRENT` map — the pure `kek_set_from_lookup` decides,
+    // and any half-provisioned versioned config refuses to start here.
+    let kek_set = kek_set_from_lookup(|name| env_string(env, name))?;
     let session_ttl_secs: u64 = env_string(env, "SESSION_TTL_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(crate::session::MAX_SESSION_SECS);
@@ -94,14 +184,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         &rp_id,
         &origin,
         session_secret,
-        kek,
-        kek_version,
+        kek_set.kek,
+        kek_set.version,
         session_ttl_secs,
         truthy("INVITES_REQUIRED"),
         truthy("ALLOW_LOOPBACK_DEV"),
         session_previous_secret,
     )
-    .ok()?;
+    .ok()?
+    .with_prior_keks(kek_set.priors);
     // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
     // armed ONLY by the explicit staging flag, and usable only with the
     // staged QA bearer. Both default off/absent, so production serves the
@@ -2822,6 +2913,196 @@ mod tests {
             Err(())
         );
         assert_eq!(staged_previous_secret(Some(String::new()), true), Err(()));
+    }
+
+    fn kek_vars(pairs: &[(&str, String)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect()
+    }
+
+    fn kek_lookup(vars: &HashMap<String, String>) -> impl Fn(&str) -> Option<String> + '_ {
+        |name: &str| vars.get(name).cloned()
+    }
+
+    fn kek_b64(byte: u8) -> String {
+        crate::b64::encode(&[byte; 32])
+    }
+
+    #[test]
+    fn kek_set_legacy_single_key_mode_is_preserved() {
+        // No VAULT_KEK_CURRENT: exactly the pre-versioned behavior —
+        // VAULT_KEK_BASE64 + VAULT_KEK_VERSION, both required, no priors.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("legacy config parses");
+        assert_eq!(set.kek, [9u8; 32]);
+        assert_eq!(set.version, 41);
+        assert!(set.priors.is_empty());
+        for missing in ["VAULT_KEK_BASE64", "VAULT_KEK_VERSION"] {
+            let mut vars = vars.clone();
+            vars.remove(missing);
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "legacy mode without {missing} must refuse to start"
+            );
+        }
+    }
+
+    #[test]
+    fn kek_set_legacy_mode_ignores_versioned_vars() {
+        // Provisioning V1 ahead of the cutover deploy must not change
+        // serving behavior while VAULT_KEK_CURRENT is still unset.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+            ("VAULT_KEK_V1", kek_b64(1)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("legacy config parses");
+        assert_eq!(set.kek, [9u8; 32]);
+        assert_eq!(set.version, 41);
+        assert!(set.priors.is_empty());
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_selects_current_and_priors() {
+        // VAULT_KEK_CURRENT=2: writes select V2, V1 is a retained prior,
+        // and legacy vars are ignored (cutover deploy still has them set).
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V1", kek_b64(1)),
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("versioned config parses");
+        assert_eq!(set.kek, [2u8; 32]);
+        assert_eq!(set.version, 2);
+        assert_eq!(set.priors, vec![(1, [1u8; 32])]);
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_reads_prestaged_future_version() {
+        // Ceremony phase 1: V3 is pre-staged while writes stay at 2 — the
+        // Worker reads N+1 but still writes N.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V3", kek_b64(3)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("pre-staged config parses");
+        assert_eq!(set.kek, [2u8; 32]);
+        assert_eq!(set.version, 2);
+        assert_eq!(set.priors, vec![(3, [3u8; 32])]);
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_fails_closed() {
+        let legacy = vec![
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ];
+        // Missing current key: a half-cutover never serves legacy writes.
+        let mut vars = kek_vars(&legacy);
+        vars.insert("VAULT_KEK_CURRENT".to_string(), "2".to_string());
+        vars.insert("VAULT_KEK_V1".to_string(), kek_b64(1));
+        assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Present-but-unparsable CURRENT: the operator asked for a
+        // cutover, so silently serving legacy would split-brain the
+        // ceremony's current version.
+        let mut vars = kek_vars(&legacy);
+        vars.insert("VAULT_KEK_CURRENT".to_string(), "two".to_string());
+        assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Present-but-invalid priors fail startup, never serve half-keyed.
+        for bad in [
+            "!!!not-base64!!!".to_string(),
+            // Padded std-base64 is rejected like every other secret codec.
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            // Short keys can neither wrap nor unwrap.
+            crate::b64::encode(&[1u8; 16]),
+        ] {
+            let vars = kek_vars(&[
+                ("VAULT_KEK_CURRENT", "2".to_string()),
+                ("VAULT_KEK_V2", kek_b64(2)),
+                ("VAULT_KEK_V1", bad),
+            ]);
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "invalid retained prior must refuse to start"
+            );
+        }
+    }
+
+    #[test]
+    fn kek_set_discovery_window_bounds() {
+        // CURRENT=20: the window is 12..=28 — boundary versions provision,
+        // anything outside stays unprovisioned (reads for it fail closed
+        // per-row, like any unknown version).
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "20".to_string()),
+            ("VAULT_KEK_V20", kek_b64(20)),
+            ("VAULT_KEK_V12", kek_b64(12)),
+            ("VAULT_KEK_V11", kek_b64(11)),
+            ("VAULT_KEK_V28", kek_b64(28)),
+            ("VAULT_KEK_V29", kek_b64(29)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("window config parses");
+        assert_eq!(set.version, 20);
+        let versions: Vec<u32> = set.priors.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions, vec![12, 28]);
+        assert_eq!(
+            KEK_VERSION_WINDOW,
+            20 - 12,
+            "pin the window the boundary test assumes"
+        );
+    }
+
+    #[test]
+    fn kek_set_discovery_window_saturates_at_zero() {
+        // CURRENT=2: the low edge saturates instead of wrapping — V0
+        // provisions when present.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V0", kek_b64(0)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("saturating config parses");
+        assert_eq!(set.priors, vec![(0, [0u8; 32])]);
+    }
+
+    #[test]
+    fn config_from_env_provisions_the_kek_set() {
+        // `config_from_env` needs a wasm Env, so pin its KEK wiring the
+        // same way the keyring matrix pins its call site: slice ONLY the
+        // fn body out of the pre-test source, so this test's own
+        // literals cannot satisfy the assertions.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("kek_set_from_lookup(|name| env_string(env, name))"),
+            "config_from_env must build the KEK set from env"
+        );
+        assert!(
+            body.contains(".with_prior_keks(kek_set.priors)"),
+            "config_from_env must provision the retained priors on the Config"
+        );
+        assert!(
+            body.contains("kek_set.kek") && body.contains("kek_set.version"),
+            "Config::new must take the selected current key and version"
+        );
     }
 
     #[test]

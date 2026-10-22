@@ -110,11 +110,28 @@ SESSION_TTL_SECS = "86400"
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with
 # `nntune_api::b64::decode` — padded std base64 is rejected):
-#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (single live
-#                                 version; routine rotation via the rewrap job
-#                                 is NOT implemented — see
-#                                 docs/security/kek-rotation.md §7 banner)
-#   VAULT_KEK_VERSION             integer version matching the KEK
+#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (legacy
+#                                 single-key mode; ignored once
+#                                 VAULT_KEK_CURRENT is set)
+#   VAULT_KEK_VERSION             integer version matching the KEK (legacy
+#                                 mode only)
+#   VAULT_KEK_V<N>                per-version KEK secrets (versioned mode):
+#                                 VAULT_KEK_V1, VAULT_KEK_V2, ... — each 32
+#                                 random bytes, unpadded base64url. The
+#                                 Worker reads versions CURRENT±8; anything
+#                                 outside stays unprovisioned. At initial
+#                                 cutover copy the legacy key bytes to
+#                                 VAULT_KEK_V<L> and set VAULT_KEK_CURRENT=<L>,
+#                                 where L is the live VAULT_KEK_VERSION.
+#                                 Keep the legacy pair until V<L> reads green;
+#                                 rotate to a new version separately. See
+#                                 docs/security/kek-rotation.md §3.
+#   VAULT_KEK_CURRENT             [vars, NOT a secret] integer write version
+#                                 selecting VAULT_KEK_V<CURRENT> for new
+#                                 rows; reads serve every provisioned
+#                                 version. Unset = legacy single-key mode.
+#                                 Routine rotation's rewrap job is NOT
+#                                 implemented (kek-rotation.md §7 banner).
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
 #                                 during a rotation window, deleted at its end.

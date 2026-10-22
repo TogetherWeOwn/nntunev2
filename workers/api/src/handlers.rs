@@ -179,6 +179,14 @@ pub struct Config {
     pub session_secret: Vec<u8>,
     pub kek: [u8; 32],
     pub kek_version: u32,
+    /// Retained prior KEKs for mixed-version reads: `(version, key)` pairs
+    /// from the `VAULT_KEK_V<N>` per-version secrets. Order is irrelevant —
+    /// lookup is by exact version, and the current key always wins over a
+    /// retained entry for the same version (see [`Config::kek_by_version`]).
+    /// Empty in legacy single-key mode, where [`Config::new`] leaves it
+    /// untouched. Provisioned only by [`Config::with_prior_keks`]; the
+    /// Worker entry builds it from env, never from request input.
+    pub prior_keks: Vec<(u32, [u8; 32])>,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
     /// Verify-only previous session HMAC secret: `Some` only inside a
@@ -253,6 +261,7 @@ impl Config {
             session_secret,
             kek,
             kek_version,
+            prior_keks: Vec::new(),
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
             session_previous_secret,
@@ -262,6 +271,40 @@ impl Config {
             qa_code_seam: false,
             qa_auth_token: None,
         })
+    }
+
+    /// Provision retained prior KEKs for mixed-version reads during a
+    /// rotation window (`docs/security/kek-rotation.md` §3): each
+    /// `(version, key)` pair comes from one `VAULT_KEK_V<N>` per-version
+    /// secret. The constructor leaves the set empty (legacy single-key
+    /// mode), so existing callers need no change; the Worker entry calls
+    /// this only after strict validation (unpadded-base64url decode plus
+    /// the 32-byte length, version parses as `u32`), like the native
+    /// keyring setter below. A retained entry for the current version
+    /// can never shadow the write key: [`Config::kek_by_version`]
+    /// checks the current key first.
+    pub fn with_prior_keks(mut self, prior_keks: Vec<(u32, [u8; 32])>) -> Self {
+        self.prior_keks = prior_keks;
+        self
+    }
+
+    /// Version-pinned KEK selector: exactly one candidate for `version` —
+    /// the current key when `version` is the configured write version,
+    /// else the retained prior for that version, else `None`. There is no
+    /// fallback loop and no fallthrough to another version's key: callers
+    /// map `None` (and any downstream AEAD failure) to the same generic
+    /// vault error, so an unknown version is indistinguishable from a bad
+    /// tag or a missing row. The current key wins over a same-version
+    /// retained entry by construction (checked first), so a stale prior
+    /// can neither shadow writes nor resurrect retired reads.
+    pub fn kek_by_version(&self, version: u32) -> Option<&[u8; 32]> {
+        if version == self.kek_version {
+            return Some(&self.kek);
+        }
+        self.prior_keks
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, key)| key)
     }
 
     /// Overlay operator-configured rate limits (from [vars]); the
@@ -2520,8 +2563,17 @@ where
         Ok(bytes) => bytes,
         Err(_) => return generic_vault(),
     };
+    // Encrypt through the selected current write version only: the
+    // selector resolves the configured current key (which always wins
+    // over a same-version retained entry), never a prior. `None` is
+    // unreachable by construction — the current version always selects
+    // the current key — and fails closed like every other vault error.
+    let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
+        Some(kek) => kek,
+        None => return generic_vault(),
+    };
     let blob = match vault::encrypt_vault(
-        &ctx.cfg.kek,
+        current_kek,
         ctx.cfg.kek_version,
         &claims.user_id,
         &plaintext,
@@ -2633,8 +2685,15 @@ where
             Ok(Some(row)) => row,
             _ => return fail(),
         };
-        match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
-            .ok()
+        // Version-pinned decrypt: exactly one candidate — the key for the
+        // stored row's own version. An unprovisioned version selects
+        // nothing (no fallback to the current key, no trying every key)
+        // and collapses into the same boolean as a bad tag or a missing
+        // row, so unknown versions are not an oracle.
+        match ctx
+            .cfg
+            .kek_by_version(row.blob.kek_version)
+            .and_then(|kek| vault::decrypt_vault(kek, &claims.user_id, &row.blob).ok())
             .and_then(|bytes| serde_json::from_slice::<VaultPayload>(&bytes).ok())
         {
             Some(payload) => (payload.provider, payload.indexer),
