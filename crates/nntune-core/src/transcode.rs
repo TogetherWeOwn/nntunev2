@@ -261,6 +261,31 @@ pub fn artifact_r2_key(artifact_sha256_hex: &str) -> Result<String, KeyError> {
     Ok(format!("audio/{}/{}/{}", &sha[0..2], &sha[2..4], sha))
 }
 
+/// Staged transcode input object name: `{index:04}-{sha256(file_name)}`
+/// (69 chars), exactly the verify-staged name
+/// (`VerifyProgress::file_key`) the front reads back from
+/// `{scratch_prefix}in/`. The index keeps two files that share a name
+/// from sharing one staged object; the name hash keeps hostile NZB
+/// bytes out of key space entirely.
+///
+/// Shared by the ingest dispatch, the transcode front contract and the
+/// Container staging path so the three can never disagree on what an
+/// input key looks like. The bare 64-hex core-contract shape is NOT
+/// accepted: no producer stages it, and accepting two shapes would let
+/// a forged key address bytes the job never staged.
+pub fn validate_transcode_input_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.len() != 69 || bytes[4] != b'-' {
+        return false;
+    }
+    if !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    bytes[5..]
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +510,25 @@ mod tests {
             artifact_r2_key(&non_hex),
             Err(KeyError::NonHex { offset: 7 })
         );
+    }
+
+    #[test]
+    fn transcode_input_key_shape_is_indexed_staged_name() {
+        let hex = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        // Exactly what verify stages: `{index:04}-{sha256(file_name)}`.
+        assert!(validate_transcode_input_key(&format!("0007-{hex}")));
+        assert!(validate_transcode_input_key(&format!("1023-{hex}")));
+        // Bare object keys, wrong shapes, traversal and hostile bytes fail.
+        assert!(!validate_transcode_input_key(hex));
+        assert!(!validate_transcode_input_key("7-9d70"));
+        assert!(!validate_transcode_input_key(&format!("0007_{hex}")));
+        assert!(!validate_transcode_input_key(&format!(
+            "0007-{}",
+            hex.to_ascii_uppercase()
+        )));
+        assert!(!validate_transcode_input_key(&format!("0007-{hex}/")));
+        assert!(!validate_transcode_input_key("../0007-x"));
+        assert!(!validate_transcode_input_key(""));
+        assert!(!validate_transcode_input_key(&format!("0007-{hex}x")));
     }
 }
