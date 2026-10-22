@@ -484,9 +484,10 @@ impl MappedLoaderError {
 }
 
 /// True for the echoable request-ID shape: 36 bytes of lowercase hex with
-/// dashes at 8/13/18/23 and the version nibble `4`. Anything else —
-/// including uppercase, wrong versions and overlong inputs — takes the
-/// caller-supplied fresh ID instead, never echoing caller bytes.
+/// dashes at 8/13/18/23, the version nibble `4` and a UUIDv4 variant nibble
+/// (`8`/`9`/`a`/`b`). Anything else — including uppercase, wrong versions,
+/// wrong variants and overlong inputs — takes the caller-supplied fresh ID
+/// instead, never echoing caller bytes.
 fn request_id_ok(id: &str) -> bool {
     let bytes = id.as_bytes();
     if bytes.len() != 36 {
@@ -496,6 +497,9 @@ fn request_id_ok(id: &str) -> bool {
         return false;
     }
     if bytes[14] != b'4' {
+        return false;
+    }
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
         return false;
     }
     bytes
