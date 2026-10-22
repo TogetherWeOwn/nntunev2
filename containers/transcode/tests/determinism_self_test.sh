@@ -42,7 +42,12 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 curl -fsS "http://127.0.0.1:${PORT}/health" | grep -q '"ok":true' || fail "/health never ready"
-docker exec "$NAME" ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libopus' \
+# Capture to EOF before matching: grep -q on a pipe can close early and
+# make a healthy docker/ffmpeg producer fail under pipefail. Keep the
+# command's exit status distinct from the capability check.
+docker exec "$NAME" ffmpeg -hide_banner -encoders > "$tmp/encoders.txt" 2> "$tmp/encoders.err" \
+  || fail "image ffmpeg encoder listing failed"
+grep -Eq '^[[:space:]]*A[^[:space:]]{5}[[:space:]]+libopus[[:space:]]' "$tmp/encoders.txt" \
   || fail "image ffmpeg has no libopus encoder"
 pass "image ffmpeg carries libopus"
 
@@ -94,13 +99,46 @@ reply_sha_b="$(python3 -c "import json; print(json.load(open('$tmp/reply-b.json'
 [ "$reply_sha_b" = "$sha_b" ] || fail "reply hash $reply_sha_b != fetched bytes $sha_b"
 pass "two stagings, identical bytes+hash ($sha_a)"
 
-# 3. ffprobe validity: Ogg Opus 64k profile.
-probe="$(docker exec "$NAME" ffprobe -v error -show_entries stream=codec_name,sample_rate,channels,bit_rate -of csv=p=0 "/scratch/selftest01/t/${staging_a}/out/artifact.ogg")" \
+# 3. ffprobe validity: keyed fields, not CSV field-order assumptions.
+# Ogg Opus commonly has no stream bit_rate. Measure encoded packet bytes
+# over packet duration instead (excludes container overhead); also verify
+# both timelines cover our known five-second fixture, not a truncated file.
+docker exec "$NAME" ffprobe -v error -show_packets \
+  -show_entries stream=codec_name,sample_rate,channels:format=format_name,duration:packet=size,duration_time \
+  -of json "/scratch/selftest01/t/${staging_a}/out/artifact.ogg" > "$tmp/probe.json" \
   || fail "ffprobe failed"
-echo "$probe" | grep -q '^opus,48000,2,' || fail "profile mismatch: $probe"
-bitrate="$(echo "$probe" | cut -d, -f4)"
-[ "$bitrate" -ge 60000 ] && [ "$bitrate" -le 70000 ] \
-  || fail "bitrate $bitrate outside the 64k envelope (probe: $probe)"
-pass "ffprobe-valid opus-64 ($probe)"
+python3 - "$tmp/probe.json" <<'PYEOF' || fail "profile mismatch (ffprobe packet/stream evidence)"
+import json, math, sys
+
+with open(sys.argv[1]) as handle:
+    probe = json.load(handle)
+streams = probe['streams']
+if len(streams) != 1:
+    raise ValueError('expected exactly one audio stream')
+stream = streams[0]
+if (stream['codec_name'], int(stream['sample_rate']), stream['channels']) != ('opus', 48000, 2):
+    raise ValueError(f'not stereo 48k Opus: {stream}')
+fmt = probe['format']
+duration = float(fmt['duration'])
+if fmt['format_name'] != 'ogg' or not math.isfinite(duration) or not 4.9 <= duration <= 5.1:
+    raise ValueError(f'not a five-second Ogg artifact: {fmt}')
+packets = probe['packets']
+if not packets:
+    raise ValueError('no encoded packet evidence')
+byte_count, packet_seconds = 0, 0.0
+for packet in packets:
+    size, seconds = int(packet['size']), float(packet['duration_time'])
+    if size <= 0 or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f'invalid packet evidence: {packet}')
+    byte_count += size
+    packet_seconds += seconds
+if not 4.9 <= packet_seconds <= 5.1:
+    raise ValueError(f'packet timeline truncated or extended: {packet_seconds}')
+bitrate = byte_count * 8 / packet_seconds
+if not 60000 <= bitrate <= 70000:
+    raise ValueError(f'packet bitrate {bitrate:.0f} outside the 64k envelope')
+print(f'Opus, 48000 Hz, stereo, Ogg, {duration:.4f}s, packet bitrate {bitrate:.0f} bit/s')
+PYEOF
+pass "ffprobe-valid opus-64"
 
 echo "self-test: all assertions passed"

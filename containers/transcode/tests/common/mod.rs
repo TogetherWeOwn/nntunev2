@@ -122,6 +122,16 @@ impl Harness {
             .count()
     }
 
+    /// A bounded connection for tests that deliberately leave the write
+    /// side open or half-close it to signal a truncated request.
+    pub fn connect(&self) -> TcpStream {
+        let stream = TcpStream::connect(&self.addr).unwrap();
+        let timeout = Some(std::time::Duration::from_secs(2));
+        stream.set_read_timeout(timeout).unwrap();
+        stream.set_write_timeout(timeout).unwrap();
+        stream
+    }
+
     pub fn raw(&self, head: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(&self.addr).unwrap();
         stream.write_all(head.as_bytes()).unwrap();
