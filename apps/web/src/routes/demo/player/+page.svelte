@@ -6,6 +6,14 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import Artwork from '#lib/player/Artwork.svelte';
+	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import {
+		applyGainToNode,
+		loadLevelingEnabled,
+		resolveTrackLinearGain,
+		saveLevelingEnabled,
+		type LevelingTags
+	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
@@ -26,6 +34,17 @@
 
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
+
+	/**
+	 * Fixture ReplayGain tags for the demo tracks: synthetic metadata for
+	 * synthetic audio (no backend). Peaks keep the clipping guard inert by
+	 * construction, so the gain node pins leveling, not limiting.
+	 */
+	const DEMO_LEVELING_TAGS: Readonly<Record<string, LevelingTags>> = {
+		'demo-track': { trackGainDb: '-3.00 dB', trackPeak: 0.42 },
+		'second-signal': { trackGainDb: '+4.00 dB', trackPeak: 0.3 },
+		'third-light': { trackGainDb: '-1.50 dB', trackPeak: 0.48 }
+	};
 
 	type TransportState = 'selected' | 'loading' | 'playing' | 'paused' | 'error' | 'ended' | 'empty';
 	let status = $state<TransportState>('selected');
@@ -52,6 +71,66 @@
 			status = 'playing';
 		}
 	});
+
+	// Loudness leveling: the toggle persists across reloads (default ON) and
+	// each track's fixture tags resolve to a gain-node multiplier.
+	let levelingEnabled = $state(true);
+	let levelingLinear = $state(1);
+	let levelingCtx: AudioContext | null = null;
+	let levelingSource: MediaElementAudioSourceNode | null = null;
+	let levelingGain: GainNode | null = null;
+	let wiredEl: HTMLAudioElement | null = null;
+
+	function safeStorage(): Storage | null {
+		try {
+			return localStorage;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * One AudioContext per page; each keyed `<audio>` element gets its own
+	 * MediaElementSource (an element can only be captured once). Leveling
+	 * failure never breaks playback: unwired elements play at natural volume.
+	 */
+	function ensureLevelingGraph(): GainNode | null {
+		try {
+			if (typeof AudioContext === 'undefined' || !audioEl) return null;
+			if (wiredEl !== audioEl) {
+				levelingSource?.disconnect();
+				levelingGain?.disconnect();
+				levelingCtx ??= new AudioContext();
+				levelingSource = levelingCtx.createMediaElementSource(audioEl);
+				levelingGain = levelingCtx.createGain();
+				levelingSource.connect(levelingGain);
+				levelingGain.connect(levelingCtx.destination);
+				wiredEl = audioEl;
+			}
+			return levelingGain;
+		} catch {
+			return null;
+		}
+	}
+
+	function applyLeveling(): void {
+		const tags = (current && DEMO_LEVELING_TAGS[current.id]) ?? {};
+		const linear = resolveTrackLinearGain(tags, { enabled: levelingEnabled });
+		levelingLinear = linear;
+		const node = ensureLevelingGraph();
+		if (node) {
+			applyGainToNode(node, linear);
+			void levelingCtx?.resume().catch(() => {
+				// Autoplay policy can keep the context suspended until a user
+				// gesture; the gain is already set for when it resumes.
+			});
+		}
+	}
+
+	function setLevelingEnabled(enabled: boolean): void {
+		levelingEnabled = enabled;
+		saveLevelingEnabled(safeStorage(), enabled);
+	}
 
 	function playCurrent(reload = false): void {
 		if (!current) return;
@@ -176,6 +255,12 @@
 		}
 	});
 
+	// Leveling follows the current track, the toggle, and the wired element
+	// (the keyed `<audio>` is recreated per source, so a track change rewires).
+	$effect(() => {
+		applyLeveling();
+	});
+
 	/**
 	 * Run by the smoke test: fire 10 rapid Range seeks through one
 	 * controller (each aborts its predecessor), then one proving seek.
@@ -203,6 +288,16 @@
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
+		levelingEnabled = loadLevelingEnabled(safeStorage());
+		(
+			window as unknown as {
+				__levelingProbe?: () => { enabled: boolean; trackId: string | null; linear: number };
+			}
+		).__levelingProbe = () => ({
+			enabled: levelingEnabled,
+			trackId: current?.id ?? null,
+			linear: levelingLinear
+		});
 		try {
 			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
 		} catch {
@@ -283,6 +378,7 @@
 		<button type="button" data-testid="player-next" onclick={goNext} disabled={!current}>
 			Next
 		</button>
+		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
 	</div>
 
 	<section data-testid="queue-panel" aria-label="Playback queue">

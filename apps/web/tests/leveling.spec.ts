@@ -1,0 +1,98 @@
+import { expect, test, type Page } from '@playwright/test';
+
+/**
+ * Loudness leveling over the demo player, mocked at the gain node: the page
+ * exposes `__levelingProbe` (enabled/track/linear) so the specs assert the
+ * resolved gain per fixture track without measuring real audio output.
+ */
+
+interface LevelingProbe {
+	enabled: boolean;
+	trackId: string | null;
+	linear: number;
+}
+
+const STORAGE_KEY = 'nntune.leveling.enabled';
+
+const EXPECTED_LINEAR: Record<string, number> = {
+	'demo-track': Math.pow(10, -3 / 20),
+	'second-signal': Math.pow(10, 4 / 20),
+	'third-light': Math.pow(10, -1.5 / 20)
+};
+
+async function levelingProbe(page: Page): Promise<LevelingProbe> {
+	return page.evaluate(() => {
+		const probe = (window as unknown as { __levelingProbe?: () => LevelingProbe })
+			.__levelingProbe;
+		if (!probe) throw new Error('leveling probe missing');
+		return probe();
+	});
+}
+
+/** Poll until the probe reports the track with its leveled gain. */
+async function expectLeveled(page: Page, trackId: string): Promise<void> {
+	const expected = EXPECTED_LINEAR[trackId] as number;
+	await expect
+		.poll(async () => {
+			const probe = await levelingProbe(page);
+			return probe.trackId === trackId && Math.abs(probe.linear - expected) < 1e-9;
+		})
+		.toBe(true);
+}
+
+test('leveling defaults to on with per-fixture leveled gains', async ({ page }) => {
+	await page.goto('/demo/player');
+
+	const toggle = page.getByTestId('leveling-toggle');
+	await expect(toggle).toBeVisible();
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+	await expectLeveled(page, 'demo-track');
+
+	await page.getByTestId('player-next').click();
+	await expectLeveled(page, 'second-signal');
+
+	await page.getByTestId('player-next').click();
+	await expectLeveled(page, 'third-light');
+
+	// Leveling is active, not unity: fixture gains differ per track.
+	const gains = Object.values(EXPECTED_LINEAR);
+	expect(Math.max(...gains) - Math.min(...gains)).toBeGreaterThan(0.5);
+});
+
+test('disabling the toggle drives unity gain and persists across reload', async ({ page }) => {
+	await page.goto('/demo/player');
+
+	const toggle = page.getByTestId('leveling-toggle');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+	await toggle.click();
+	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+	await expect.poll(async () => (await levelingProbe(page)).linear).toBe(1);
+
+	await expect
+		.poll(async () => page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY))
+		.toBe('0');
+
+	await page.reload();
+	await expect(page.getByTestId('leveling-toggle')).toHaveAttribute('aria-pressed', 'false');
+	await expect.poll(async () => (await levelingProbe(page)).linear).toBe(1);
+
+	await page.getByTestId('leveling-toggle').click();
+	await expect(page.getByTestId('leveling-toggle')).toHaveAttribute('aria-pressed', 'true');
+	await expectLeveled(page, 'demo-track');
+});
+
+test('toggle is keyboard reachable with its state announced', async ({ page }) => {
+	await page.goto('/demo/player');
+
+	const toggle = page.getByTestId('leveling-toggle');
+	await expect(toggle).toHaveAccessibleName('Loudness leveling');
+
+	await toggle.focus();
+	await page.keyboard.press('Space');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+	await page.keyboard.press('Enter');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+});
