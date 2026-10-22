@@ -826,23 +826,37 @@ pub(crate) async fn library_db_client(
         .connect(hyperdrive.host(), hyperdrive.port())
         .map_err(|_| ())?;
     let config: tokio_postgres::Config = hyperdrive.connection_string().parse().map_err(|_| ())?;
-    let (client, connection) = config
-        .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-        .await
-        .map_err(|_| ())?;
-    let trace_id = trace_id.to_string();
-    let connection_build_sha = build_sha_from_env(env);
-    wasm_bindgen_futures::spawn_local(async move {
-        if connection.await.is_err() {
-            emit(
-                Level::Error,
-                &trace_id,
-                "ingest.library_db.connection_failed",
-                serde_json::json!({"build_sha": connection_build_sha}),
-            );
-        }
-    });
-    Ok(client)
+    // The connect is the only await here, so one deadline spans it: a
+    // stalled Hyperdrive handshake expires to the same detail-free `()`
+    // a refused handshake returns. The connection driver is spawned
+    // inside the raced operation, so expiry drops the pending connect
+    // instead of attaching a driver to a client nobody owns.
+    crate::library::with_db_deadline(
+        async {
+            let (client, connection) = config
+                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                .await
+                .map_err(|_| ())?;
+            let trace_id = trace_id.to_string();
+            let connection_build_sha = build_sha_from_env(env);
+            wasm_bindgen_futures::spawn_local(async move {
+                if connection.await.is_err() {
+                    emit(
+                        Level::Error,
+                        &trace_id,
+                        "ingest.library_db.connection_failed",
+                        serde_json::json!({"build_sha": connection_build_sha}),
+                    );
+                }
+            });
+            Ok(client)
+        },
+        worker::Delay::from(std::time::Duration::from_millis(
+            crate::library::LIBRARY_DB_DEADLINE_MS,
+        )),
+        || (),
+    )
+    .await
 }
 
 impl PgAdmissionLedger {
@@ -871,91 +885,126 @@ impl AdmissionLedger for PgAdmissionLedger {
         // One short-lived connection for the whole claim sequence; it is
         // dropped before the queue/meter awaits, so no session state ever
         // crosses them. Atomicity comes from the single UPDATE claim below,
-        // not from holding a connection.
-        let client = self.client().await?;
-        client
-            .execute(admission_ensure_sql(), &[&job_id, &stage])
-            .await
-            .map_err(|_| unavailable())?;
-        let claimed = client
-            .query_opt(admission_claim_sql(), &[&job_id, &stage])
-            .await
-            .map_err(|_| unavailable())?;
-        if let Some(row) = claimed {
-            self.claim_epoch = Some(row.get(0));
-            return Ok(AdmissionMark::Pending);
-        }
-        let row = client
-            .query_opt(admission_read_mark_sql(), &[&job_id, &stage])
-            .await
-            .map_err(|_| unavailable())?;
-        match row {
-            Some(row) => {
-                let state: String = row.get(0);
-                if state == "queued" {
-                    Ok(AdmissionMark::Queued)
+        // not from holding a connection. One deadline spans the connect
+        // plus all three statements: completing one statement must not
+        // disable the bound for a later stalled one.
+        crate::library::with_db_deadline(
+            async {
+                let client = self.client().await?;
+                client
+                    .execute(admission_ensure_sql(), &[&job_id, &stage])
+                    .await
+                    .map_err(|_| unavailable())?;
+                let claimed = client
+                    .query_opt(admission_claim_sql(), &[&job_id, &stage])
+                    .await
+                    .map_err(|_| unavailable())?;
+                if let Some(row) = claimed {
+                    self.claim_epoch = Some(row.get(0));
+                    Ok(AdmissionMark::Pending)
                 } else {
-                    // `pending` here means our claim lost the race after the
-                    // ensure; `claimed` means a live owner or an unexpired
-                    // lease. Either way this request must not send or meter.
-                    Ok(AdmissionMark::Busy)
+                    let row = client
+                        .query_opt(admission_read_mark_sql(), &[&job_id, &stage])
+                        .await
+                        .map_err(|_| unavailable())?;
+                    match row {
+                        Some(row) => {
+                            let state: String = row.get(0);
+                            if state == "queued" {
+                                Ok(AdmissionMark::Queued)
+                            } else {
+                                // `pending` here means our claim lost the race after the
+                                // ensure; `claimed` means a live owner or an unexpired
+                                // lease. Either way this request must not send or meter.
+                                Ok(AdmissionMark::Busy)
+                            }
+                        }
+                        None => Err(unavailable()),
+                    }
                 }
-            }
-            None => Err(unavailable()),
-        }
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || MeterWriteError::Transport("admission ledger unavailable".to_string()),
+        )
+        .await
     }
 
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
         let claim_epoch = self.claim_epoch.ok_or_else(|| {
             MeterWriteError::Transport("admission ledger unavailable".to_string())
         })?;
-        let client = self
-            .client()
-            .await
-            .map_err(|_| MeterWriteError::Transport("admission ledger unavailable".to_string()))?;
-        let updated = client
-            .execute(
-                admission_mark_queued_sql(),
-                &[&job_id, &stage, &claim_epoch],
-            )
-            .await
-            .map_err(|e| {
-                emit(
-                    Level::Error,
-                    &self.trace_id,
-                    "ingest.admission.commit_failed",
-                    serde_json::json!({
-                        "build_sha": build_sha_from_env(&self.env),
-                        "sqlstate": admission_commit_sqlstate(&e),
-                    }),
-                );
-                MeterWriteError::Transport("admission ledger unavailable".to_string())
-            })?;
-        if updated != 1 {
-            // Lost the claim (lease expired and someone else reclaimed) or
-            // already committed: fail closed so the retry converges instead
-            // of answering 202-and-unmarked.
-            return Err(MeterWriteError::Transport(
-                "admission ledger unavailable".to_string(),
-            ));
-        }
-        Ok(())
+        // One deadline spans the connect plus the commit: a stalled
+        // commit expires to the same detail-free transport error a
+        // refused commit returns, with the SQLSTATE handling kept
+        // inside the raced operation.
+        crate::library::with_db_deadline(
+            async {
+                let client = self.client().await.map_err(|_| {
+                    MeterWriteError::Transport("admission ledger unavailable".to_string())
+                })?;
+                let updated = client
+                    .execute(
+                        admission_mark_queued_sql(),
+                        &[&job_id, &stage, &claim_epoch],
+                    )
+                    .await
+                    .map_err(|e| {
+                        emit(
+                            Level::Error,
+                            &self.trace_id,
+                            "ingest.admission.commit_failed",
+                            serde_json::json!({
+                                "build_sha": build_sha_from_env(&self.env),
+                                "sqlstate": admission_commit_sqlstate(&e),
+                            }),
+                        );
+                        MeterWriteError::Transport("admission ledger unavailable".to_string())
+                    })?;
+                if updated != 1 {
+                    // Lost the claim (lease expired and someone else reclaimed) or
+                    // already committed: fail closed so the retry converges instead
+                    // of answering 202-and-unmarked.
+                    Err(MeterWriteError::Transport(
+                        "admission ledger unavailable".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || MeterWriteError::Transport("admission ledger unavailable".to_string()),
+        )
+        .await
     }
 
     async fn release_claim(&mut self, job_id: &str, stage: &str) {
         // Best-effort `claimed -> pending` so the immediate retry can
         // reclaim without waiting out the lease; ignored errors still
         // converge via lease expiry. Fresh short-lived connection: never
-        // held across the queue/meter awaits.
+        // held across the queue/meter awaits. Expiry is ignored like any
+        // other failure, but the await itself is still bounded.
         let Some(claim_epoch) = self.claim_epoch else {
             return;
         };
-        let Ok(client) = self.client().await else {
-            return;
-        };
-        let _ = client
-            .execute(admission_release_sql(), &[&job_id, &stage, &claim_epoch])
-            .await;
+        let _ = crate::library::with_db_deadline(
+            async {
+                let client = self.client().await.map_err(|_| ())?;
+                client
+                    .execute(admission_release_sql(), &[&job_id, &stage, &claim_epoch])
+                    .await
+                    .map_err(|_| ())?;
+                Ok::<(), ()>(())
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || (),
+        )
+        .await;
     }
 }
 

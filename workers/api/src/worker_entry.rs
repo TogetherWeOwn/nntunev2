@@ -243,9 +243,13 @@ fn cors_headers(
         ("access-control-allow-credentials", "true".to_string()),
     ];
     if status == 204 {
+        // Exactly the methods the scope map serves, plus the OPTIONS
+        // self-grant: omitting a served method (HEAD revalidation, PATCH
+        // edits) would preflight-block lawful bearer calls, and naming an
+        // unserved method would map fiction.
         headers.push((
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string(),
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
         ));
         headers.push((
             "access-control-allow-headers",
@@ -488,7 +492,7 @@ impl PgStore {
                 crate::logging::Level::Error,
                 "api.db.connection_error",
                 trace_id,
-                serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha}),
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
             )
         } else {
             None
@@ -1999,7 +2003,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             crate::logging::Level::Error,
             "api.start.misconfigured",
             &trace_id,
-            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha}),
+            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha, "release": build_sha}),
         );
         return internal_render(&trace_id);
     };
@@ -2086,6 +2090,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         "status_code": response.status,
         "duration_ms": now_millis().saturating_sub(start_ms),
         "build_sha": build_sha,
+        "release": build_sha,
     });
     if response.status >= 400 {
         if let Some(code) = response_error_code(response.status, &response.body) {
@@ -2197,7 +2202,7 @@ mod tests {
             assert_eq!(record["event"], "api.db.connection_error");
             assert_eq!(
                 record["fields"],
-                serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown"})
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown", "release": "unknown"})
             );
             assert!(!line.contains("private-"));
             assert!(!line.contains(hostile));
@@ -2723,7 +2728,7 @@ mod tests {
         assert_eq!(headers.len(), 6);
         assert!(headers.contains(&(
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string()
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string()
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",

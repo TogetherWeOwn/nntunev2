@@ -1349,52 +1349,70 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
     }
 
     async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError> {
-        let client = crate::library_db_client(self.env, self.trace_id)
-            .await
-            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
-        let params = crate::library::upsert_params(write);
-        let affected = client
-            .execute(
-                crate::library::upsert_library_sql(),
-                &[
-                    &params.job_id,
-                    &params.user_id,
-                    &params.idempotency_key,
-                    &params.release_mbid,
-                    &params.recording_mbids,
-                ],
-            )
-            .await
-            .map_err(|error| {
-                // Log the SQLSTATE only (never connection detail) and fail
-                // fast on deterministic classes: a schema mismatch such as
-                // the not-yet-migrated `library` table (42P01/42P10) must
-                // quarantine with an accurate reason, not burn the retry
-                // budget as "unavailable".
-                let sqlstate = error.as_db_error().map(|db| db.code().code());
-                crate::emit(
-                    nntune_logging::Level::Error,
-                    self.trace_id,
-                    "ingest.library.upsert_failed",
-                    serde_json::json!({
-                        "build_sha": crate::build_sha_from_env(self.env),
-                        "sqlstate": sqlstate.unwrap_or("none"),
-                    }),
-                );
-                if crate::library::is_deterministic_sqlstate(sqlstate) {
-                    JobError::permanent(ERR_WRITE_FAILED, "library database schema mismatch")
-                } else {
-                    JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
-                }
-            })?;
-        // The statement is fenced on the owner's users row: 0 affected
-        // rows means the account is being deleted. Fail permanently with
-        // the stable code — a fenced writer never queues behind the
-        // delete, and the (already-metered) match work must not settle
-        // as a phantom Done for a row that was never written. The mapping
-        // lives in [`crate::library::upsert_job_result`] (pinned there),
-        // so this arm stays a forward.
-        crate::library::upsert_job_result(affected)
+        // One deadline spans the connect plus the upsert: a stalled
+        // write expires to the same detail-free transient error a
+        // refused write returns, with the SQLSTATE fast-fail and the
+        // fenced row-count mapping kept inside the raced operation.
+        crate::library::with_db_deadline(
+            async {
+                let client = crate::library_db_client(self.env, self.trace_id)
+                    .await
+                    .map_err(|()| {
+                        JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                    })?;
+                let params = crate::library::upsert_params(write);
+                let affected = client
+                    .execute(
+                        crate::library::upsert_library_sql(),
+                        &[
+                            &params.job_id,
+                            &params.user_id,
+                            &params.idempotency_key,
+                            &params.release_mbid,
+                            &params.recording_mbids,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        // Log the SQLSTATE only (never connection detail) and fail
+                        // fast on deterministic classes: a schema mismatch such as
+                        // the not-yet-migrated `library` table (42P01/42P10) must
+                        // quarantine with an accurate reason, not burn the retry
+                        // budget as "unavailable".
+                        let sqlstate = error.as_db_error().map(|db| db.code().code());
+                        crate::emit(
+                            nntune_logging::Level::Error,
+                            self.trace_id,
+                            "ingest.library.upsert_failed",
+                            serde_json::json!({
+                                "build_sha": crate::build_sha_from_env(self.env),
+                                "sqlstate": sqlstate.unwrap_or("none"),
+                            }),
+                        );
+                        if crate::library::is_deterministic_sqlstate(sqlstate) {
+                            JobError::permanent(
+                                ERR_WRITE_FAILED,
+                                "library database schema mismatch",
+                            )
+                        } else {
+                            JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                        }
+                    })?;
+                // The statement is fenced on the owner's users row: 0 affected
+                // rows means the account is being deleted. Fail permanently with
+                // the stable code — a fenced writer never queues behind the
+                // delete, and the (already-metered) match work must not settle
+                // as a phantom Done for a row that was never written. The mapping
+                // lives in [`crate::library::upsert_job_result`] (pinned there),
+                // so this arm stays a forward.
+                crate::library::upsert_job_result(affected)
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || JobError::transient(ERR_WRITE_FAILED, "library database unavailable"),
+        )
+        .await
     }
 }
 
