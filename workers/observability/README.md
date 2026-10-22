@@ -105,3 +105,33 @@ Run the acceptance suite from the repository root with Node 24+:
 ```sh
 node --experimental-vm-modules --test workers/observability/tests/evaluate-health-window.test.mjs
 ```
+
+# Health-red verdict-to-alert payloads
+
+`render-health-alert.mjs` exports a pure, deterministic
+`renderHealthAlert(verdict, context)` that renders one `breach`/`breach`
+sustained health-red verdict plus caller context (`logsUrl`, `windowLabel`)
+into an alert payload object (`{content, embeds}`) shaped for a Discord
+webhook body. Any other verdict status, malformed verdict or context, or
+invalid input fails closed to `null` — never a fabricated alert, never a
+throw.
+
+Breach payloads carry the verdict status, the exact `red/valid` rational,
+the red/valid counts, the longest red span versus the sustained-red
+threshold in ms, the service/environment labels, the logs URL, and the
+window label. Build-SHA correlation flows through the logs URL only;
+health samples carry no release identity, so the renderer invents none.
+Output stays within alert bounds (content <= 2000 chars, one embed,
+6000-char total, <= 25 fields): oversized strings truncate to a prefix
+plus "…", so identical input always yields byte-identical output.
+
+This module is not wired or deployed: no consumer, schedule, delivery,
+dashboard, or live alerting reads from it. It performs no network,
+environment, clock, logging, or storage access and carries no webhook URL
+or secret.
+
+Run the acceptance suite from the repository root with Node 24+:
+
+```sh
+node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
+```
