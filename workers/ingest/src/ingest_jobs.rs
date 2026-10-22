@@ -238,9 +238,13 @@ mod tests {
         assert!(validate_admit_params("job_0123456789abcdef", "user_01", &key, 1700000000).is_ok());
         assert!(validate_admit_params("", "user_01", &key, 1700000000).is_err());
         assert!(validate_admit_params("job_1", "", &key, 1700000000).is_err());
+        assert!(validate_admit_params("job_1", &"u".repeat(129), &key, 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", "not-our-key", 1700000000).is_err());
+        assert!(validate_admit_params("job_1", "user_01", "ingest:abc", 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", &"k".repeat(769), 1700000000).is_err());
         assert!(validate_admit_params("job_1", "user_01", &key, -1).is_err());
         assert!(validate_admit_params("job_1", "user_01", &key, 253402300800).is_err());
+        assert!(validate_admit_params("job_1", "user_01", &key, 0).is_ok());
+        assert!(validate_admit_params("job_1", "user_01", &key, MAX_ACCEPTED_AT_SECS).is_ok());
     }
 }
