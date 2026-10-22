@@ -279,9 +279,9 @@ fn playback_takes_the_last_slot_while_other_lanes_keep_headroom() {
     last.plan_cap = 4;
     last.in_flight = 3;
     last.lane = Lane::Playback;
-    let grant = grant(&last);
-    assert_eq!(grant.effective_max_connections(), 4);
-    assert_eq!(grant.admitted_slot(), 4);
+    let last_grant = grant(&last);
+    assert_eq!(last_grant.effective_max_connections(), 4);
+    assert_eq!(last_grant.admitted_slot(), 4);
     for lane in [Lane::Prefetch, Lane::Ingest] {
         let mut held = request();
         held.provider_cap = 4;

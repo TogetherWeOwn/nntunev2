@@ -77,7 +77,8 @@ fn deny(req: &VetDialPlanRequest) -> LoaderDenial {
 fn single_public_v4_candidate_pins_exact_peer_port_and_tls_name() {
     let host = "news.example.invalid";
     let own = [public_v4()];
-    let req = positive(host, &refs(&own));
+    let candidates = refs(&own);
+    let req = positive(host, &candidates);
     let plan = accept(&req);
     let expected: IpAddr = own[0].parse().expect("fixture parses");
     assert_eq!(plan.peer(), SocketAddr::new(expected, 563));
@@ -88,7 +89,8 @@ fn single_public_v4_candidate_pins_exact_peer_port_and_tls_name() {
 #[test]
 fn single_public_v6_candidate_pins_exact_peer() {
     let own = [public_v6().to_string()];
-    let req = positive("news.example.invalid", &refs(&own));
+    let candidates = refs(&own);
+    let req = positive("news.example.invalid", &candidates);
     let plan = accept(&req);
     let expected: IpAddr = public_v6().parse().expect("fixture parses");
     assert_eq!(plan.peer(), SocketAddr::new(expected, 563));
@@ -98,7 +100,8 @@ fn single_public_v6_candidate_pins_exact_peer() {
 fn both_nntp_ports_vet_and_pin_exactly() {
     for port in [119, 563] {
         let own = [public_v4()];
-        let req = request("news.example.invalid", port, true, false, &refs(&own));
+        let candidates = refs(&own);
+        let req = request("news.example.invalid", port, true, false, &candidates);
         let plan = accept(&req);
         assert_eq!(plan.peer().port(), port);
     }
@@ -108,7 +111,8 @@ fn both_nntp_ports_vet_and_pin_exactly() {
 fn non_nntp_ports_deny_without_dial_plan() {
     for port in [0, 22, 80, 118, 120, 443, 562, 564, 1190, 5630, 8080, 65535] {
         let own = [public_v4()];
-        let req = request("news.example.invalid", port, true, false, &refs(&own));
+        let candidates = refs(&own);
+        let req = request("news.example.invalid", port, true, false, &candidates);
         deny(&req);
     }
 }
@@ -118,7 +122,8 @@ fn multiple_public_candidates_admit_a_member_of_the_vetted_set() {
     // S:360 requires the peer to be a member of the freshly vetted set; it
     // does not fix a selection order, so the test asserts membership only.
     let own = [public_v4(), public_v6().to_string(), v4(93, 184, 216, 35)];
-    let req = positive("news.example.invalid", &refs(&own));
+    let candidates = refs(&own);
+    let req = positive("news.example.invalid", &candidates);
     let plan = accept(&req);
     let vetted: Vec<IpAddr> = own
         .iter()
@@ -143,7 +148,8 @@ fn mixed_public_and_forbidden_set_denies_whichever_answer_is_last() {
             vec![public_v4(), public_v6().to_string(), bad.clone()],
             vec![bad.clone(), public_v4(), public_v6().to_string()],
         ] {
-            let req = positive("news.example.invalid", &refs(&ordered));
+            let candidates = refs(&ordered);
+            let req = positive("news.example.invalid", &candidates);
             deny(&req);
         }
     }
@@ -183,7 +189,8 @@ fn every_required_forbidden_family_denies_alone() {
     );
     for bad in &cases {
         let own = [bad.clone()];
-        let req = positive("news.example.invalid", &refs(&own));
+        let candidates = refs(&own);
+        let req = positive("news.example.invalid", &candidates);
         deny(&req);
     }
 }
@@ -203,7 +210,8 @@ fn unparseable_candidate_denies_alone_and_in_mixed_sets() {
         vec![public_v4(), "999.999.999.999".to_string()],
         vec!["".to_string(), public_v6().to_string()],
     ] {
-        let req = positive("news.example.invalid", &refs(&ordered));
+        let candidates = refs(&ordered);
+        let req = positive("news.example.invalid", &candidates);
         deny(&req);
     }
 }
@@ -217,7 +225,8 @@ fn valid_dns_and_ipv4_literal_hosts_admit() {
         "News.Example.INVALID",
     ] {
         let own = [public_v4()];
-        let req = positive(host, &refs(&own));
+        let candidates = refs(&own);
+        let req = positive(host, &candidates);
         let plan = accept(&req);
         // Original hostname is carried byte-exact for TLS validation: no
         // case folding, trimming or other normalization.
@@ -225,7 +234,8 @@ fn valid_dns_and_ipv4_literal_hosts_admit() {
     }
     let literal = public_v4();
     let own = [literal.clone()];
-    let req = positive(&literal, &refs(&own));
+    let candidates = refs(&own);
+    let req = positive(&literal, &candidates);
     accept(&req);
 }
 
@@ -251,7 +261,8 @@ fn malformed_hosts_deny() {
         "2001:db8::1".to_string(),
     ] {
         let own = [public_v4()];
-        let req = positive(&host, &refs(&own));
+        let candidates = refs(&own);
+        let req = positive(&host, &candidates);
         deny(&req);
     }
 }
@@ -259,13 +270,16 @@ fn malformed_hosts_deny() {
 #[test]
 fn plaintext_without_explicit_acknowledgement_denies() {
     let own = [public_v4()];
-    let acked = request("news.example.invalid", 119, false, true, &refs(&own));
+    let candidates = refs(&own);
+    let acked = request("news.example.invalid", 119, false, true, &candidates);
     let plan = accept(&acked);
     assert!(!plan.tls());
     assert_eq!(plan.tls_server_name(), "news.example.invalid");
-    let unacked = request("news.example.invalid", 119, false, false, &refs(&own));
+    let candidates = refs(&own);
+    let unacked = request("news.example.invalid", 119, false, false, &candidates);
     deny(&unacked);
-    let tls = request("news.example.invalid", 563, true, false, &refs(&own));
+    let candidates = refs(&own);
+    let tls = request("news.example.invalid", 563, true, false, &candidates);
     assert!(accept(&tls).tls());
 }
 
@@ -275,7 +289,8 @@ fn dial_plan_carries_no_hostname_dial_input() {
     // concrete socket address; the hostname survives solely as the TLS
     // server name. A transport that re-resolves has no input for it here.
     let own = [public_v4()];
-    let req = positive("news.example.invalid", &refs(&own));
+    let candidates = refs(&own);
+    let req = positive("news.example.invalid", &candidates);
     let plan = accept(&req);
     assert!(plan.peer().ip().is_ipv4() || plan.peer().ip().is_ipv6());
     assert_eq!(plan.tls_server_name(), "news.example.invalid");
@@ -293,13 +308,15 @@ fn denied_hosts_never_echo_into_fixed_error_output() {
         &"https://news.example.invalid/x".to_string(),
     ] {
         let own = [public_v4()];
-        let req = positive(host, &refs(&own));
+        let candidates = refs(&own);
+        let req = positive(host, &candidates);
         rendered.push(deny(&req).to_string());
     }
     assert!(rendered.iter().all(|r| r == "provider_unavailable"));
     for host in [&first, &second] {
         let own = [public_v4()];
-        let req = positive(host, &refs(&own));
+        let candidates = refs(&own);
+        let req = positive(host, &candidates);
         assert!(!deny(&req).to_string().contains(host.as_str()));
     }
 }
