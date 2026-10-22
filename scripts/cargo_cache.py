@@ -101,6 +101,31 @@ def load_policy(pool):
     return policy
 
 
+def warn_provisioning_mismatch(pool, policy):
+    """Warn (never refuse) when the policy cannot fit the pool filesystem.
+
+    Startup-only admission check: if floor + all slot budgets or the hard
+    limit exceeds the pool filesystem's total size, the installed numbers
+    assume a larger backing filesystem than exists. Print a structured
+    stderr finding and continue unchanged so degraded pools stay usable
+    until the host is reprovisioned. Must stay out of load_policy: the
+    retain recovery path calls it and must never gain a provisioning gate.
+    """
+    fs = os.statvfs(pool)
+    size = fs.f_blocks * fs.f_frsize
+    floor_plus_budgets = (policy['min_available_bytes']
+                          + policy['slots'] * policy['slot_budget_bytes'])
+    if floor_plus_budgets > size or policy['hard_limit_bytes'] > size:
+        print(json.dumps({'finding': 'pool_provisioning_mismatch',
+                          'floor_plus_budgets_bytes': floor_plus_budgets,
+                          'hard_limit_bytes': policy['hard_limit_bytes'],
+                          'filesystem_size_bytes': size,
+                          'slots': policy['slots'],
+                          'slot_budget_bytes': policy['slot_budget_bytes'],
+                          'min_available_bytes': policy['min_available_bytes']},
+                         sort_keys=True), file=sys.stderr)
+
+
 def acquire(pool, policy):
     for number in range(policy['slots']):
         slot = real_directory(pool / f'slot-{number}')
@@ -222,6 +247,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
         args = [args[0]] + required + args[1:]
     policy = load_policy(pool)
+    warn_provisioning_mismatch(pool, policy)
     if available(pool) < policy['min_available_bytes']:
         raise Refusal('backing filesystem has insufficient user-available bytes')
     slot, target, fd = acquire(pool, policy)
