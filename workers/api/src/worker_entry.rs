@@ -28,6 +28,7 @@ use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
     QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
+use crate::providers::{insert_provider_sql, ProviderMintRow};
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, VaultBlob, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -1417,6 +1418,47 @@ impl Store for PgStore {
                     )
                     .await
                     .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Account-deletion fence (ADR 0002 rule 3): the mint only lands
+                // while the owner's deleting_at is NULL, holding the user row
+                // FOR SHARE through the statement, so saving provider
+                // credentials cannot mint an identity behind the deletion
+                // marker. A fenced (0-row) mint fails closed as StoreError; the
+                // handler classifies it through `account_deleting` into the
+                // typed 409. The owner binds $2 (the user_id column), never a
+                // value; the statement shape (literals, fence) is pinned in
+                // `crate::providers` and below.
+                let affected = client
+                    .execute(
+                        insert_provider_sql(),
+                        &[
+                            &row.id,
+                            &row.user_id,
+                            &row.label,
+                            &row.encrypted_creds.as_slice(),
+                            &i32::try_from(row.kek_version).map_err(|_| StoreError)?,
+                            &row.dek_wrapped_nonce[..],
+                            &row.dek_wrapped.as_slice(),
+                            &row.payload_nonce[..],
+                            &i64_of(row.created_at)?,
+                            &i64_of(row.last_verified_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if affected == 0 {
+                    return Err(StoreError);
+                }
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
@@ -3571,6 +3613,82 @@ mod tests {
             .expect("the zero-row guard arm must close");
         assert!(
             mint[mint_guard..mint_guard + mint_arm_end].contains("return Err"),
+            "the zero-row guard must fail closed (return Err), not Ok"
+        );
+    }
+
+    #[test]
+    fn fenced_provider_mint_uses_the_pinned_statement_and_zero_row_guard() {
+        // ADR 0002 rule 3: the providers mint is a credential write behind
+        // the same deletion fence as the vault upsert. The statement shape
+        // (fence, literals, no ON CONFLICT) is pinned in
+        // `crate::providers`; this pins the production call site: it must
+        // call that statement (never an inline fork), bind the parameters
+        // in `PROVIDER_MINT_PARAM_ORDER`, and fail closed on 0 rows.
+        // Slice ONLY the fn body out of the pre-test source, so this
+        // test's own literals cannot satisfy the assertions.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let mint = production
+            .split_once("async fn insert_provider(")
+            .expect("insert_provider must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            mint.contains("insert_provider_sql()"),
+            "insert_provider must execute the pinned statement"
+        );
+        assert!(
+            !mint.contains("INSERT INTO providers"),
+            "insert_provider must not inline a fork of the statement"
+        );
+        // Bind order follows PROVIDER_MINT_PARAM_ORDER: several swaps
+        // (id/user_id/label, the two nonces, the two clocks) would still
+        // compile and silently corrupt the row, so the order is pinned
+        // positionally.
+        let binds = [
+            "&row.id",
+            "&row.user_id",
+            "&row.label",
+            "&row.encrypted_creds.as_slice()",
+            "try_from(row.kek_version)",
+            "&row.dek_wrapped_nonce[..]",
+            "&row.dek_wrapped.as_slice()",
+            "&row.payload_nonce[..]",
+            "i64_of(row.created_at)",
+            "i64_of(row.last_verified_at)",
+        ];
+        let mut last = 0;
+        for needle in binds {
+            let pos = mint
+                .find(needle)
+                .unwrap_or_else(|| panic!("insert_provider must bind {needle}"));
+            assert!(
+                pos > last,
+                "bind order must follow PROVIDER_MINT_PARAM_ORDER ({needle} out of order)"
+            );
+            last = pos;
+        }
+        let guard = mint
+            .find("if affected == 0")
+            .expect("insert_provider must fail closed on 0 rows");
+        let ok = mint
+            .find("Ok(())")
+            .expect("insert_provider must return Ok on the write path");
+        assert!(
+            guard < ok,
+            "the zero-row guard must precede the success return"
+        );
+        let arm_end = mint[guard..]
+            .find('}')
+            .expect("the zero-row guard arm must close");
+        assert!(
+            mint[guard..guard + arm_end].contains("return Err"),
             "the zero-row guard must fail closed (return Err), not Ok"
         );
     }
