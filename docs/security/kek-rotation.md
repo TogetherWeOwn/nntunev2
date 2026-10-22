@@ -93,9 +93,10 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
   `L`). Active if and only if
   `VAULT_KEK_CURRENT` is unset; per-version secrets are ignored in this
   mode, so staging `V<L>` ahead of cutover never changes serving. A
-  blanked `VAULT_KEK_CURRENT` (present-but-empty, as a dashboard "clear
-  this var" leaves behind) is not "unset": it refuses to start rather
-  than falling back to legacy.
+  blanked `VAULT_KEK_CURRENT` (present-but-blank — empty, as a
+  dashboard "clear this var" leaves behind, or whitespace-only from a
+  stray paste) is not "unset": it refuses to start rather than falling
+  back to legacy.
 - Versioned mode: `VAULT_KEK_CURRENT` (a **non-secret** config var,
   e.g. `VAULT_KEK_CURRENT=2` in wrangler `vars`, not `secrets`,
   replacing `VAULT_KEK_VERSION` at cutover) names the write version,

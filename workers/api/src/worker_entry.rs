@@ -86,7 +86,7 @@ fn decode_kek(raw: &str) -> Option<[u8; 32]> {
 /// tests drive the exact function `config_from_env` calls. Two
 /// exclusive modes (`docs/security/kek-rotation.md` §3):
 ///
-/// - `VAULT_KEK_CURRENT` present and non-empty: versioned mode. The
+/// - `VAULT_KEK_CURRENT` present and non-blank: versioned mode. The
 ///   current write key is `VAULT_KEK_V{current}` (required — missing,
 ///   blank or invalid fails startup, even when legacy vars are also
 ///   present, so a half-cutover never serves the wrong write
@@ -102,21 +102,26 @@ fn decode_kek(raw: &str) -> Option<[u8; 32]> {
 ///   priors. Per-version secrets are ignored here, so provisioning
 ///   `V<L>` ahead of the cutover deploy never changes serving behavior.
 ///
-/// A present-but-empty or present-but-unparsable `VAULT_KEK_CURRENT`
-/// fails startup rather than silently falling back to legacy: the
-/// operator asked for a versioned cutover, and serving legacy writes
-/// would split-brain the version the ceremony believes is current.
+/// A present-but-blank (empty or whitespace-only) or
+/// present-but-unparsable `VAULT_KEK_CURRENT` fails startup rather
+/// than silently falling back to legacy: the operator asked for a
+/// versioned cutover, and serving legacy writes would split-brain
+/// the version the ceremony believes is current.
 /// Callers must pass a presence-preserving lookup (`env_string_raw`,
 /// not `env_string`): empty-filtering the lookup would erase the
 /// absent/blank distinction this decision depends on.
 fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
-    // Present-but-empty CURRENT (a dashboard "clear this var") fails
-    // closed: it must never downgrade to legacy mode while retained
-    // `VAULT_KEK_BASE64` is still set.
+    // Present-but-blank CURRENT (empty from a dashboard "clear this
+    // var", or whitespace-only from a stray paste) fails closed: it
+    // must never downgrade to legacy mode while retained
+    // `VAULT_KEK_BASE64` is still set. The trim is load-bearing, not
+    // cosmetic: without it a whitespace-only value would refuse only
+    // incidentally via the u32 parse below, and a future trim of the
+    // lookup could silently re-open the legacy downgrade.
     match get("VAULT_KEK_CURRENT") {
         None => {}
         Some(current_raw) => {
-            if current_raw.is_empty() {
+            if current_raw.trim().is_empty() {
                 return None;
             }
             let current: u32 = current_raw.parse().ok()?;
@@ -3070,6 +3075,18 @@ mod tests {
         // Blanked CURRENT with no legacy fallback also refuses.
         let vars = kek_vars(&[("VAULT_KEK_CURRENT", String::new())]);
         assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Whitespace-only CURRENT (a dashboard value of a single space,
+        // or "2 " from a stray paste): refused by the blank guard, never
+        // silently read as absent — and never parsed as a version.
+        for blank in [" ", "  ", "2 ", "\t"] {
+            let mut vars = kek_vars(&legacy);
+            vars.insert("VAULT_KEK_CURRENT".to_string(), blank.to_string());
+            vars.insert("VAULT_KEK_V2".to_string(), kek_b64(2));
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "whitespace-only CURRENT {blank:?} must refuse to start"
+            );
+        }
         // Present-but-invalid priors fail startup, never serve half-keyed.
         for bad in [
             "!!!not-base64!!!".to_string(),
@@ -3177,6 +3194,59 @@ mod tests {
         assert!(
             body.contains("kek_set.kek") && body.contains("kek_set.version"),
             "Config::new must take the selected current key and version"
+        );
+    }
+
+    #[test]
+    fn env_string_raw_preserves_presence_without_filtering() {
+        // `env_string_raw` needs a wasm Env, so pin its
+        // presence-preserving body the same way the KEK wiring pins its
+        // call site: slice ONLY the fn out of the pre-test source, so
+        // this test's own literals cannot satisfy the assertions.
+        // Reverting the body to empty-filtering (the pre-PR production
+        // behavior) would silently downgrade a blanked
+        // VAULT_KEK_CURRENT to legacy mode with the suite green — the
+        // KEK unit tests drive `kek_set_from_lookup` through a HashMap
+        // closure, never through this fn. Each slice is bounded at the
+        // fn's own closing brace: these are negative assertions, so the
+        // looser next-fn bound would sweep in the neighboring
+        // const/struct and go brittle.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let raw_body = production
+            .split_once("fn env_string_raw(")
+            .expect("env_string_raw must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("env_string_raw must close")
+            .0;
+        assert!(
+            !raw_body.contains("is_empty"),
+            "env_string_raw must not filter empty values: presence preservation is the fail-closed decision's input"
+        );
+        assert!(
+            !raw_body.contains(".filter("),
+            "env_string_raw must not filter: the only empty filter lives in env_string"
+        );
+        assert!(
+            raw_body.contains("env.secret(name)") && raw_body.contains("env.var(name)"),
+            "env_string_raw must stay the secret-then-var fallthrough, not delegate to the filtering lookup"
+        );
+        // `env_string` stays the single place that maps present-but-empty
+        // to absent.
+        let body = production
+            .split_once("fn env_string(")
+            .expect("env_string must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("env_string must close")
+            .0;
+        assert!(
+            body.contains("env_string_raw(env, name).filter(|s| !s.is_empty())"),
+            "env_string must stay exactly the raw lookup plus the single empty filter"
         );
     }
 
