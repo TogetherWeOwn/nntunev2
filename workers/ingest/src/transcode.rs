@@ -348,8 +348,16 @@ pub async fn call_transcode_with_deadline(
     };
     let fetcher = match env.service(TRANSCODE_SERVICE_BINDING) {
         Ok(fetcher) => fetcher,
-        Err(error) => {
-            worker::console_log!("transcode binding unavailable: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(None),
+                "ingest.transcode.binding_missing",
+                serde_json::json!({
+                    "job_id": req.job_id,
+                    "build_sha": crate::build_sha_from_env(env),
+                }),
+            );
             return TranscodeCall::Retry;
         }
     };
@@ -370,8 +378,16 @@ pub async fn call_transcode_with_deadline(
     // the owned Delay cancels its local timer, not necessarily remote work.
     let deadline = Box::pin(Delay::from(Duration::from_millis(deadline_ms)));
     let fetch = Box::pin(async {
-        let response = fetcher.fetch_request(request).await.map_err(|error| {
-            worker::console_log!("transcode call failed job={}: {:?}", req.job_id, error);
+        let response = fetcher.fetch_request(request).await.map_err(|_| {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(None),
+                "ingest.transcode.call_failed",
+                serde_json::json!({
+                    "job_id": req.job_id,
+                    "build_sha": crate::build_sha_from_env(env),
+                }),
+            );
         })?;
         Ok((response.status().as_u16(), response.into_body()))
     });
