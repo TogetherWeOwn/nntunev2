@@ -158,12 +158,15 @@ impl KekSource for FakeKeks {
     }
 }
 
-/// Concurrent-PUT injector: before the CAS for `user_id`, replace the row
-/// envelope (fresh DEK + payload under the OLD version, as a vault PUT
-/// would), `remaining` times. The racing PUT then loses the CAS by design.
+/// Concurrent-write injector: before the CAS for `user_id`, either replace
+/// the row envelope (fresh DEK + payload under the configured PUT version,
+/// as a vault PUT would) or delete the row outright, `remaining` times. A
+/// same-version racing PUT loses the CAS by design; a PUT already at the
+/// target version (or a delete) exercises the Gone path instead.
 struct ContentionRule {
     user_id: String,
     remaining: u64,
+    delete: bool,
 }
 
 /// rusqlite-backed [`RewrapStore`]: executes the job's SQL consts with
@@ -192,10 +195,19 @@ impl<'a> SqliteRewrapStore<'a> {
         *self.contention.borrow_mut() = Some(ContentionRule {
             user_id: user_id.to_string(),
             remaining,
+            delete: false,
         });
     }
 
-    fn maybe_race_put(&self, user_id: &str) {
+    fn contend_delete(&self, user_id: &str) {
+        *self.contention.borrow_mut() = Some(ContentionRule {
+            user_id: user_id.to_string(),
+            remaining: 1,
+            delete: true,
+        });
+    }
+
+    fn maybe_race(&self, user_id: &str) {
         let mut guard = self.contention.borrow_mut();
         let Some(rule) = guard.as_mut() else {
             return;
@@ -204,6 +216,14 @@ impl<'a> SqliteRewrapStore<'a> {
             return;
         }
         rule.remaining -= 1;
+        if rule.delete {
+            let removed = self
+                .db
+                .execute("DELETE FROM provider_vaults WHERE user_id = ?1", [user_id])
+                .expect("racing delete removes the row");
+            assert_eq!(removed, 1, "racing delete must remove exactly one row");
+            return;
+        }
         let replacement = encrypt_vault(
             &self.put_kek,
             self.put_version,
@@ -322,9 +342,9 @@ impl RewrapStore for SqliteRewrapStore<'_> {
         rewrapped: &RewrappedEnvelope,
         now_secs: u64,
     ) -> Result<CasRewrapOutcome, StoreError> {
-        // A test-configured racing PUT lands between the claim read and the
-        // CAS write, exactly the interleaving the CAS guard exists for.
-        self.maybe_race_put(user_id);
+        // A test-configured racing write lands between the claim read and
+        // the CAS write, exactly the interleaving the CAS guard exists for.
+        self.maybe_race(user_id);
         let (sql, values) = sqlite_of(
             CAS_REWRAP_SQL,
             &[
@@ -1284,5 +1304,194 @@ fn worker_config_serves_as_the_job_key_source() {
     assert_eq!(
         decrypt_vault(&new_kek, "selector-user", &after).expect("decrypt rewrapped row"),
         b"selector synthetic credentials"
+    );
+}
+
+/// A multi-batch dry-run must page through every batch exactly once: five
+/// rows with `batch_limit: 2` report scanned/done 5/5 and complete, while
+/// the run record (cursor, counts) and every vault byte stay untouched.
+///
+/// Mutant killed: a cursor that only advances for live passes re-claims
+/// the first batch forever (scanned/done 20/20, complete false).
+#[test]
+fn dry_run_multi_batch_paginates_and_leaves_the_run_untouched() {
+    let db = fixture_db();
+    let (keks, old_kek, _new_kek) = FakeKeks::pair();
+    let mut before = Vec::new();
+    for index in 0..5 {
+        let user_id = format!("page-{index:02}");
+        let blob = seed_vault_row(
+            &db,
+            &user_id,
+            &old_kek,
+            OLD_VERSION,
+            format!("page payload {index}").as_bytes(),
+        );
+        before.push((user_id, blob));
+    }
+
+    let store = SqliteRewrapStore::new(&db, old_kek, OLD_VERSION);
+    let mut run = RunRecord::transient("staging", OLD_VERSION, NEW_VERSION, NOW);
+    let report = block_on(nntune_api::rotation::run_rewrap_pass(
+        &store,
+        &keks,
+        &mut run,
+        &RewrapParams {
+            batch_limit: 2,
+            max_batches: 10,
+            dry_run: true,
+            ..params_for(NEW_VERSION)
+        },
+    ))
+    .expect("dry run succeeds");
+    assert_eq!(
+        (report.scanned, report.done, report.complete),
+        (5, 5, true),
+        "a dry-run must page forward, never re-scan the first batch"
+    );
+    assert_eq!(run.cursor, None, "dry run must not advance the run cursor");
+    assert_eq!(
+        (
+            run.rows_done,
+            run.rows_failed,
+            run.rows_deferred,
+            run.claims_retried
+        ),
+        (0, 0, 0, 0),
+        "dry run must not accumulate into the transient record"
+    );
+    for (user_id, blob) in &before {
+        let (after, updated_at, rewrapped_at) = vault_row(&db, user_id);
+        assert_eq!(after.kek_version, OLD_VERSION, "dry run must not rewrap");
+        assert_eq!(after.dek_wrapped, blob.dek_wrapped);
+        assert_eq!(after.dek_wrapped_nonce, blob.dek_wrapped_nonce);
+        assert_eq!(after.payload, blob.payload);
+        assert_eq!(after.payload_nonce, blob.payload_nonce);
+        assert_eq!(updated_at, 20, "dry run must not touch updated_at");
+        assert_eq!(rewrapped_at, None);
+    }
+    assert!(
+        block_on(store.load_open_run("staging", NEW_VERSION))
+            .expect("load run")
+            .is_none(),
+        "dry run must not open or persist a run record"
+    );
+}
+
+/// A row PUT at the target version between claim and CAS is Gone: it
+/// counts scanned-only (no done/failed/deferred), still advances the
+/// cursor, and the newer envelope survives untouched.
+///
+/// Mutant killed: treating the reload-at-target arm as Failed (or
+/// retrying it) turns this pass red.
+#[test]
+fn row_put_at_target_mid_pass_counts_gone_and_keeps_the_newer_envelope() {
+    let db = fixture_db();
+    let (keks, old_kek, new_kek) = FakeKeks::pair();
+    seed_vault_row(
+        &db,
+        "gone-user",
+        &old_kek,
+        OLD_VERSION,
+        b"stale synthetic credentials",
+    );
+
+    // The racing PUT lands at the TARGET version: by CAS time this row no
+    // longer needs the pass.
+    let store = SqliteRewrapStore::new(&db, new_kek, NEW_VERSION);
+    store.contend("gone-user", 1);
+    let mut run =
+        block_on(store.open_run("staging", OLD_VERSION, NEW_VERSION, NOW)).expect("open run");
+    let report = block_on(nntune_api::rotation::run_rewrap_pass(
+        &store,
+        &keks,
+        &mut run,
+        &params_for(NEW_VERSION),
+    ))
+    .expect("pass succeeds");
+    assert_eq!(
+        (
+            report.scanned,
+            report.done,
+            report.failed,
+            report.deferred,
+            report.retried
+        ),
+        (1, 0, 0, 0, 1),
+        "a gone row counts scanned-only after exactly one lost claim"
+    );
+    assert!(report.complete);
+    assert_eq!(
+        run.cursor.as_deref(),
+        Some("gone-user"),
+        "a gone row must still advance the cursor past itself"
+    );
+
+    let (after, _, _) = vault_row(&db, "gone-user");
+    assert_eq!(after.kek_version, NEW_VERSION);
+    assert_eq!(
+        decrypt_vault(&new_kek, "gone-user", &after).expect("newer envelope intact"),
+        b"racing payload for gone-user",
+        "the newer envelope must survive untouched, never rewrapped"
+    );
+}
+
+/// A row deleted between claim and CAS is Gone: it counts scanned-only,
+/// siblings still rewrap, and the cursor ends past the surviving row.
+///
+/// Mutant killed: treating the reload-None arm as Failed (or retrying
+/// it) turns this pass red.
+#[test]
+fn row_deleted_mid_pass_counts_gone_without_touching_siblings() {
+    let db = fixture_db();
+    let (keks, old_kek, new_kek) = FakeKeks::pair();
+    seed_vault_row(
+        &db,
+        "aaa-deleted",
+        &old_kek,
+        OLD_VERSION,
+        b"doomed synthetic credentials",
+    );
+    seed_vault_row(
+        &db,
+        "zzz-kept",
+        &old_kek,
+        OLD_VERSION,
+        b"kept synthetic credentials",
+    );
+
+    let store = SqliteRewrapStore::new(&db, old_kek, OLD_VERSION);
+    store.contend_delete("aaa-deleted");
+    let mut run =
+        block_on(store.open_run("staging", OLD_VERSION, NEW_VERSION, NOW)).expect("open run");
+    let report = block_on(nntune_api::rotation::run_rewrap_pass(
+        &store,
+        &keks,
+        &mut run,
+        &params_for(NEW_VERSION),
+    ))
+    .expect("pass succeeds");
+    assert_eq!(
+        (report.scanned, report.done, report.failed, report.deferred),
+        (2, 1, 0, 0),
+        "a deleted row counts scanned-only while its sibling rewraps"
+    );
+    assert!(report.complete);
+    assert_eq!(
+        run.cursor.as_deref(),
+        Some("zzz-kept"),
+        "the cursor must end past the surviving row"
+    );
+    assert_eq!(
+        count_where(&db, "user_id = 'aaa-deleted'"),
+        0,
+        "the deleted row must stay deleted"
+    );
+    let (kept, _, kept_rewrapped_at) = vault_row(&db, "zzz-kept");
+    assert_eq!(kept.kek_version, NEW_VERSION);
+    assert_eq!(kept_rewrapped_at, Some(NOW as i64));
+    assert_eq!(
+        decrypt_vault(&new_kek, "zzz-kept", &kept).expect("sibling rewrapped"),
+        b"kept synthetic credentials"
     );
 }

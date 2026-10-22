@@ -284,7 +284,8 @@ SELECT kek_version, COUNT(*) AS row_count
 
 Job properties:
 
-- Batch ≤100 rows, ≤1 concurrent pass per environment (distributed lock
+- Batch ≤100 rows, ≤1 open pass per environment and target version
+  (`idx_rotation_runs_open` on `(env, to_version)`; distributed lock
   via a `rotation_state` row or Workflow singleton).
 - Progress table (`rotation_runs`: id, env, from_version, to_version,
   cursor, rows_done, rows_failed, started/finished) — resumable after

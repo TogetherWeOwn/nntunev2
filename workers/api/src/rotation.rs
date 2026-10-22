@@ -422,9 +422,14 @@ pub async fn run_rewrap_pass(
         .ok_or(JobError::UnknownKekVersion(params.to_version))?;
 
     let mut report = PassReport::default();
+    // Pagination cursor: advances past every visited row in both modes so
+    // a multi-batch dry-run pages forward instead of re-claiming the first
+    // batch. Only live passes write it back to the run record — a rehearsal
+    // leaves `run` (cursor, counts, timestamps) untouched.
+    let mut cursor = run.cursor.clone();
     for _ in 0..params.max_batches {
         let batch = store
-            .claim_batch(params.to_version, run.cursor.as_deref(), params.batch_limit)
+            .claim_batch(params.to_version, cursor.as_deref(), params.batch_limit)
             .await?;
         if batch.is_empty() {
             report.complete = true;
@@ -443,6 +448,7 @@ pub async fn run_rewrap_pass(
                 RowOutcome::Deferred => report.deferred += 1,
                 RowOutcome::Gone => {}
             }
+            cursor = Some(last_user.clone());
             if !params.dry_run {
                 run.cursor = Some(last_user);
             }
