@@ -298,13 +298,20 @@ fn background_connection_error_keeps_the_existing_redacted_build_identity() {
     );
     for call in fields {
         assert_eq!(call.args.len(), 1);
+        // Exact safe payload, any key order: the opaque error class plus
+        // the normalized build identity mirrored into release. Any extra
+        // key, missing release, or release not mirroring build_sha fails.
         assert!(
             matches!(
                 call.args[0],
-                "{\"error_class\":\"service_unavailable\",\"build_sha\":build_sha}"
-                    | "{\"build_sha\":build_sha,\"error_class\":\"service_unavailable\"}"
+                "{\"error_class\":\"service_unavailable\",\"build_sha\":build_sha,\"release\":build_sha}"
+                    | "{\"error_class\":\"service_unavailable\",\"release\":build_sha,\"build_sha\":build_sha}"
+                    | "{\"build_sha\":build_sha,\"error_class\":\"service_unavailable\",\"release\":build_sha}"
+                    | "{\"build_sha\":build_sha,\"release\":build_sha,\"error_class\":\"service_unavailable\"}"
+                    | "{\"release\":build_sha,\"error_class\":\"service_unavailable\",\"build_sha\":build_sha}"
+                    | "{\"release\":build_sha,\"build_sha\":build_sha,\"error_class\":\"service_unavailable\"}"
             ),
-            "database failure fields must contain only error_class and build_sha"
+            "database failure fields must contain only error_class, build_sha, and release mirroring build_sha"
         );
     }
 }
