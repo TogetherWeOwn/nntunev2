@@ -307,19 +307,13 @@ impl std::fmt::Debug for TrackSourceParams<'_> {
             .field("track_id", &self.track_id)
             .field("source_job_id", &self.source_job_id)
             .field("indexer_id", &self.indexer_id)
-            .field(
-                "nzb_ref_encrypted_len",
-                &self.nzb_ref_encrypted.len(),
-            )
+            .field("nzb_ref_encrypted_len", &self.nzb_ref_encrypted.len())
             .field("nzb_ref_kek_version", &self.nzb_ref_kek_version)
             .field(
                 "nzb_ref_dek_wrapped_nonce_len",
                 &self.nzb_ref_dek_wrapped_nonce.len(),
             )
-            .field(
-                "nzb_ref_dek_wrapped_len",
-                &self.nzb_ref_dek_wrapped.len(),
-            )
+            .field("nzb_ref_dek_wrapped_len", &self.nzb_ref_dek_wrapped.len())
             .field(
                 "nzb_ref_payload_nonce_len",
                 &self.nzb_ref_payload_nonce.len(),
@@ -568,10 +562,7 @@ mod tests {
             classify_track_zero_rows(false),
             TrackWriteOutcome::AccountDeleting
         );
-        assert_eq!(
-            classify_track_zero_rows(true),
-            TrackWriteOutcome::Duplicate
-        );
+        assert_eq!(classify_track_zero_rows(true), TrackWriteOutcome::Duplicate);
     }
 
     #[test]
@@ -715,7 +706,8 @@ mod tests {
                 "recording title missing from match",
             ),
         ] {
-            let derived = derive_track_rows(Some(RELEASE), &files, &[recording]).unwrap();
+            let recordings = [recording];
+            let derived = derive_track_rows(Some(RELEASE), &files, &recordings).unwrap();
             assert!(derived.matched);
             assert!(derived.rows.is_empty(), "{reason}");
             assert_eq!(
@@ -838,15 +830,9 @@ mod tests {
         assert_eq!(params.indexer_id, None);
         assert_eq!(params.nzb_ref_encrypted, encrypted.as_slice());
         assert_eq!(params.nzb_ref_kek_version, 1);
-        assert_eq!(
-            params.nzb_ref_dek_wrapped_nonce,
-            wrap_nonce.as_slice()
-        );
+        assert_eq!(params.nzb_ref_dek_wrapped_nonce, wrap_nonce.as_slice());
         assert_eq!(params.nzb_ref_dek_wrapped, wrapped.as_slice());
-        assert_eq!(
-            params.nzb_ref_payload_nonce,
-            payload_nonce.as_slice()
-        );
+        assert_eq!(params.nzb_ref_payload_nonce, payload_nonce.as_slice());
         assert_eq!(params.nzb_ref_payload_format, 1);
         assert_eq!(TRACK_SOURCE_PARAM_ORDER.len(), 10);
         assert!(validate_track_source_params(&params).is_ok());
@@ -929,7 +915,11 @@ mod tests {
                 "nzb_ref kek version must be >= 0",
             ),
         ] {
-            assert_eq!(validate_track_source_params(&params), Err(reason), "{reason}");
+            assert_eq!(
+                validate_track_source_params(&params),
+                Err(reason),
+                "{reason}"
+            );
         }
         for len in [0, 11, 13] {
             let short = vec![0u8; len];
@@ -1000,10 +990,7 @@ mod tests {
         let dumped = format!("{params:?}");
         assert!(dumped.contains("user_01"), "{dumped}");
         assert!(dumped.contains(REC1), "{dumped}");
-        assert!(
-            !dumped.contains("171"),
-            "sealed byte leaked: {dumped}"
-        );
+        assert!(!dumped.contains("171"), "sealed byte leaked: {dumped}");
         assert!(dumped.contains("nzb_ref_encrypted_len"), "{dumped}");
     }
 }
