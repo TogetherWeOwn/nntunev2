@@ -15,14 +15,21 @@
 //!   egress, threshold 5%) and the JSONL measurement record.
 //! - [`select`]: official-media selection (OMV/ATV gating, duration match,
 //!   ATV-only audio choice, cache keys/TTLs).
+//! - [`routes`]: fail-closed public fetch and extraction routing decisions,
+//!   natively tested and rendered by the wasm32 [`runtime`] adapter.
 //!
-//! This crate is pure portable logic: no network, no Worker bindings.
-//! Native builds and `cargo test` never link the Workers runtime. The
-//! wasm32 runtime entry, KV/DO bindings and the `connect()` proxy client
-//! land with the deploy-config slice.
+//! Portable logic plus the wasm32-only runtime entry: native builds and
+//! `cargo test` never link the Workers runtime. Cloudflare bindings (DO,
+//! KV) are declared in `workers/youtube/wrangler.toml.example`; the
+//! extraction wiring, the `connect()` proxy client and the staging deploy
+//! land with later Day-1 slices.
 
 pub mod client;
 pub mod gate;
 pub mod player;
 pub mod probe;
+pub mod routes;
 pub mod select;
+
+#[cfg(target_arch = "wasm32")]
+pub mod runtime;

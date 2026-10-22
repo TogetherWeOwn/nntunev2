@@ -1,8 +1,10 @@
 # YouTube backend spike: yt-dlp-style extraction on Workers
 
-Status: **Day 1 in progress** — non-proxy core landed (`workers/youtube`
-crate + 100-video corpus); gate measurement pending staging deploy, and
-the proxy-client slice parked until proxy credentials exist (see Open
+Status: **Day 1 in progress** — portable core, OMV/ATV selection and the
+runtime entry landed (`workers/youtube` crate + `YtExtract` Durable
+Object shell + `wrangler.toml.example` deploy contract); the extraction
+wiring, corpus re-cut and gate measurement are pending, and the
+proxy-client slice is parked until the resi dev path exists (see Open
 dependencies). Nothing below is a gate result yet.
 
 ## Decision
@@ -69,7 +71,8 @@ and **ATV** (the official audio track), read from
 The pure decision logic lives in `workers/youtube/src/select.rs`
 (type parse, allowlist/badge/duration/denylist gate, counterpart
 preference, ATV-only Opus choice, cache keys). The YTM search + `/next`
-I/O lands with the runtime-entry slice; the corpus re-cut runs from
+I/O lands with the extraction/measurement-wiring slice (kept out of the
+runtime-entry slice to keep it PR-sized); the corpus re-cut runs from
 egress that is not bot-walled (Worker egress or the resi dev path).
 
 Caching: MBID→selection about 30 days (`yt:sel:{mbid}:{isrc}`),
@@ -141,9 +144,11 @@ is the reference for version bumps.
 - **Day 1** (this card's first slices): Worker + `connect()` proxy
   client; 100-video corpus measurement from Worker egress; non-proxy
   parts first. Done so far: portable extraction core, probe planner,
-  gate verdict, official-media selection rules. Remaining: runtime
-  entry, corpus re-cut to the OMV/ATV method, proxy
-  client (needs creds), staging measurement run.
+  gate verdict, official-media selection rules, runtime entry
+  (`YtExtract` shell + `wrangler.toml.example` + wasm CI). Remaining:
+  extraction/measurement wiring (incl. YTM search + `/next` I/O),
+  corpus re-cut to the OMV/ATV method, proxy client (needs the resi
+  dev path), staging deploy + measurement run.
 - **Day 2:** tv client with the QuickJS solver (meriyah + QuickJS
   compiled to WASM, no eval; `youtubei.js` ships a `cf-worker` entry
   point needing a custom evaluator). CPU time + memory, cold and warm;
