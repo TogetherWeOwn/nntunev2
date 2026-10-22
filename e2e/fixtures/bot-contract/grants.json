@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "about": "Grant-envelope conformance vectors for spec section 5 (bot consumption contract). Wire: v1.<b64url(user_id|track_id|exp_unix)>.<b64url(hmac-sha256 over the payload segment)>; TTL cap 900 s + 60 s skew. See README.md in this directory. Secrets travel by name only: secret names resolve in the checker, never inline.",
+  "vectors": [
+    {
+      "id": "botgrant-001",
+      "title": "round trip verifies (mirrors the grant.rs round-trip values)",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTcwMDAwMDAwMA.e61BWh8nZSgpKGuDWgCGNee_i6OvhN6BR33HcuaBCZY",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": true, "user_id": "user-1", "track_id": "track-9", "exp_unix": 1700000000 }
+    },
+    {
+      "id": "botgrant-002",
+      "title": "bot play grant at the TTL cap verifies",
+      "token": "v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA5MDA.O3o2W5R29GN3sbvZOTXggSAUbegdZci_Ran6E1TKa5o",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": true, "user_id": "user-bot-7", "track_id": "track-synth-1724", "exp_unix": 1700000900 }
+    },
+    {
+      "id": "botgrant-003",
+      "title": "grant at cap + skew boundary (exp - now == 960) verifies",
+      "token": "v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA5NjA.yTsuauxLezyrehz-ozQS2OkrScB15ZsG1Asx8hAR5mc",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": true, "user_id": "user-bot-7", "track_id": "track-synth-1724", "exp_unix": 1700000960 }
+    },
+    {
+      "id": "botgrant-004",
+      "title": "expired grant (now == exp) rejects",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTcwMDAwMDAwMA.e61BWh8nZSgpKGuDWgCGNee_i6OvhN6BR33HcuaBCZY",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "expired" }
+    },
+    {
+      "id": "botgrant-005",
+      "title": "grant signed under another secret rejects",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTcwMDAwMDEwMA.vFH9nNMJASHWC2B5GJ2HwwCbShoiP-0xpftqJHNx5V0",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "bad-signature" }
+    },
+    {
+      "id": "botgrant-006",
+      "title": "grant with one flipped payload character rejects",
+      "token": "v1.BXNlci0xfHRyYWNrLTl8MTcwMDAwMDAwMA.e61BWh8nZSgpKGuDWgCGNee_i6OvhN6BR33HcuaBCZY",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "bad-signature" }
+    },
+    {
+      "id": "botgrant-007",
+      "title": "empty envelope segments reject as malformed",
+      "token": "v1..",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "malformed" }
+    },
+    {
+      "id": "botgrant-008",
+      "title": "wrong envelope version rejects as malformed",
+      "token": "v2.a.b",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "malformed" }
+    },
+    {
+      "id": "botgrant-009",
+      "title": "non-token garbage rejects as malformed",
+      "token": "not a token",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "malformed" }
+    },
+    {
+      "id": "botgrant-010",
+      "title": "two-segment payload with a valid signature rejects as malformed",
+      "token": "v1.dXNlci0xfHRyYWNrLTk.QI7S4Kcgt0Qs03fIuyHJANgZNlET3hncB3SWjbwYCFE",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "malformed" }
+    },
+    {
+      "id": "botgrant-011",
+      "title": "non-numeric exp with a valid signature rejects as malformed",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8bm90LWEtbnVtYmVy.Jp-9dxI-xUuZEAFqkQxpgF2pfxtXEQnh6gxUh6ep5I8",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": false, "reason": "malformed" }
+    },
+    {
+      "id": "botgrant-012",
+      "title": "grant one second past cap + skew (exp - now == 961) rejects",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTcwMDAwMDk2MQ.UKky478qNuW664yuGQJkKTUvZaQhIbOZsZQvWTfKzvk",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-013",
+      "title": "grant with a one-hour lifetime rejects as over TTL",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTcwMDAwMzYwMA.OJh4jFgNz8v9uJFRHyCQrMFJortdOW28E_Aw4vlFMvM",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    }
+  ]
+}
