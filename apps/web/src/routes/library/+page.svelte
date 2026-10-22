@@ -18,7 +18,10 @@
 		clearQueue,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		moveTrack,
 		nextTrack,
+		playNext,
+		removeTrack,
 		selectTrack as selectQueueIndex,
 		type QueueState
 	} from '#lib/player/queue.js';
@@ -30,6 +33,7 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	let queueAnnouncement = $state('');
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -93,6 +97,17 @@
 			artist: displayArtist(item) ?? '',
 			streamUrl: ''
 		});
+	}
+
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (moved === undefined) return;
+		const reordered = moveTrack(queue, from, to);
+		// Announce real moves only: a no-op reorder must not chatter the
+		// live region.
+		if (reordered === queue) return;
+		queue = reordered;
+		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
 	function refresh(): Promise<void> {
@@ -176,7 +191,15 @@
 					</li>
 				{/each}
 			</ul>
-			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
+			<PlayerQueue
+				state={queue}
+				announcement={queueAnnouncement}
+				onnext={() => (queue = nextTrack(queue))}
+				onmove={moveQueuedTrack}
+				onplaynext={(index) => (queue = playNext(queue, index))}
+				onremove={(index) => (queue = removeTrack(queue, index))}
+				onclear={() => (queue = clearQueue(queue))}
+			/>
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
