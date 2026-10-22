@@ -649,8 +649,14 @@ fn parse_filedesc_body(
     // A name that is empty after NUL trimming (empty or all-NUL) identifies
     // nothing: every such packet would collapse onto one nameless entry, and
     // the File ID derivation below would authenticate only hashes+length.
+    // A leading NUL is likewise nameless to C-string consumers while the
+    // parser would retain a distinct non-empty identity: reject it here,
+    // before the File ID derivation below could authenticate it.
     if name.is_empty() {
         return Err(malformed("FileDesc filename is empty after NUL trimming"));
+    }
+    if name[0] == 0 {
+        return Err(malformed("FileDesc filename starts with a NUL byte"));
     }
     let filename = String::from_utf8_lossy(name).into_owned();
 

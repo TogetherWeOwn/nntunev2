@@ -126,6 +126,55 @@ fn fixture_with_crcs(crcs: Vec<u32>, block_size: u64) -> Fixture {
     }
 }
 
+/// Builds the fixture around a caller-supplied raw FileDesc name, deriving
+/// the File ID from those exact bytes, so name-rule tests are self-consistent:
+/// only the rule under test may reject the set. `raw_name` must carry no
+/// trailing NUL padding of its own (the packet padder appends it), otherwise
+/// the parser's trailing trim would desync the identity derivation.
+fn fixture_with_name(raw_name: &[u8]) -> Fixture {
+    let data = file_bytes();
+    let whole_md5 = md5::compute(&data).0;
+    let first16k = md5::compute(&data[..data.len().min(16 * 1024)]).0;
+    let mut seed = Vec::new();
+    seed.extend_from_slice(&first16k);
+    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    seed.extend_from_slice(raw_name);
+    let file_id = md5::compute(&seed).0;
+
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&BLOCK_SIZE.to_le_bytes());
+    main_body.extend_from_slice(&1u32.to_le_bytes()); // 1 recoverable file
+    main_body.extend_from_slice(&file_id);
+    let set_id = md5::compute(&main_body).0;
+
+    let mut fd_body = Vec::new();
+    fd_body.extend_from_slice(&file_id);
+    fd_body.extend_from_slice(&whole_md5);
+    fd_body.extend_from_slice(&first16k);
+    fd_body.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    fd_body.extend_from_slice(raw_name);
+    while fd_body.len() % 4 != 0 {
+        fd_body.push(0);
+    }
+
+    let mut ifsc_body = Vec::new();
+    ifsc_body.extend_from_slice(&file_id);
+    for crc in block_crcs(&data) {
+        ifsc_body.extend_from_slice(&[0u8; 16]); // per-slice MD5 (unused by verify)
+        ifsc_body.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    let mut set_bytes = Vec::new();
+    set_bytes.extend(packet(&set_id, &ptype(b"FileDesc"), &fd_body));
+    set_bytes.extend(packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc_body));
+    set_bytes.extend(packet(&set_id, &ptype(b"Main\0\0\0\0"), &main_body));
+    Fixture {
+        data,
+        set_bytes,
+        file_id,
+    }
+}
+
 /// Split a packet stream at packet boundaries (declared lengths).
 fn split_packets(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
@@ -373,6 +422,27 @@ fn disjoint_filedesc_and_ifsc_identities_share_one_file_cap() {
     assert!(
         matches!(err, Error::Malformed(_)),
         "union cap: want Malformed, got: {err}"
+    );
+}
+
+/// A FileDesc name with a leading NUL byte is malformed even when the set is
+/// otherwise fully self-consistent (File ID derived from the raw name bytes,
+/// correct packet MD5, listed in Main): only the name rule may reject it.
+#[test]
+fn parse_and_stream_reject_leading_nul_filename() {
+    let f = fixture_with_name(b"\0track.flac");
+    let err = RecoverySet::parse(&f.set_bytes).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "leading-NUL name: want Malformed, got: {err}"
+    );
+    let mut builder = RecoverySetBuilder::new();
+    let err = builder
+        .add_stream(split_packets(&f.set_bytes)[0])
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "streaming path must agree, got: {err}"
     );
 }
 
