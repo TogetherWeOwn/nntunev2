@@ -32,6 +32,7 @@ pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
 pub mod indexer_fetch;
+pub mod ingest_jobs;
 pub mod jobs;
 pub mod library;
 pub mod matching;
