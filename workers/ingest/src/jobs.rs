@@ -1,7 +1,7 @@
 //! User-scoped ingest job state machine: idempotent and resumable.
 //!
 //! A job moves `Queued -> Searching|Parsing -> Probing -> Verifying
-//! -> (Repairing -> Verifying)? -> Matching -> Writing -> Done`.
+//! -> (Repairing -> Verifying)? -> Matching -> Transcoding -> Writing -> Done`.
 //! Any step may move to `Failed` with a reason; `Done`/`Failed` are
 //! terminal. Workers persist the [`JobCheckpoint`] after every step, so a
 //! crashed or evicted run resumes from the last checkpoint instead of
@@ -30,6 +30,7 @@ pub enum JobState {
     Verifying,
     Repairing,
     Matching,
+    Transcoding,
     Writing,
     Done,
     Failed,
@@ -103,7 +104,8 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
             }
         }
         JobState::Repairing => JobState::Verifying,
-        JobState::Matching => JobState::Writing,
+        JobState::Matching => JobState::Transcoding,
+        JobState::Transcoding => JobState::Writing,
         JobState::Writing => JobState::Done,
         JobState::Done => JobState::Done,
         JobState::Failed => JobState::Failed,
@@ -244,6 +246,18 @@ mod tests {
         assert_eq!(
             advance(JobState::Verifying, JobSource::NzbUpload, false),
             JobState::Matching
+        );
+    }
+
+    #[test]
+    fn matching_advances_through_transcoding_to_writing() {
+        assert_eq!(
+            advance(JobState::Matching, JobSource::NzbUpload, false),
+            JobState::Transcoding
+        );
+        assert_eq!(
+            advance(JobState::Transcoding, JobSource::NzbUpload, false),
+            JobState::Writing
         );
     }
 
