@@ -65,6 +65,13 @@
 //! Grant publication makes the B6 PR subject to the standing
 //! CISO/threat-model §8 gate.
 
+use std::future::Future;
+use std::time::Duration;
+
+use worker::{wasm_bindgen::JsValue, Delay, Env, Headers, Method, Request, RequestInit};
+
+use futures_util::StreamExt;
+
 use nntune_core::par2::scratch::{validate_object_key, validate_staging_id};
 use nntune_core::transcode::canonical_sha256_hex;
 
@@ -253,6 +260,122 @@ pub fn classify_transcode_reply(status: u16, body: &[u8]) -> TranscodeCall {
         400 | 401 | 403 | 404 | 409 | 413 => TranscodeCall::Untranscodable,
         _ => TranscodeCall::Retry,
     }
+}
+
+/// Fold one more reply chunk into the buffer, enforcing `cap` on the running
+/// total. Pure so the streaming policy is unit-tested without a service
+/// binding: the chunk that would cross the cap is refused and the capped
+/// prefix stays intact, never a truncated body handed to the classifier
+/// afterwards.
+fn push_transcode_chunk(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    if buf.len().saturating_add(chunk.len()) > cap {
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
+}
+
+/// Drain a reply chunk stream within `cap`. A chunk-level transport error
+/// fails closed to `Retry`, and the chunk that would cross the ceiling fails
+/// closed to `Retry` from its length: the remainder is never retained and no
+/// truncated prefix escapes for classification.
+async fn drain_transcode_stream<S, C, E>(
+    mut stream: S,
+    cap: usize,
+) -> Result<Vec<u8>, TranscodeCall>
+where
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+{
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return Err(TranscodeCall::Retry),
+        };
+        if !push_transcode_chunk(&mut buf, chunk.as_ref(), cap) {
+            return Err(TranscodeCall::Retry);
+        }
+    }
+    Ok(buf)
+}
+
+/// Dispatch one transcode request through the service binding. Transport
+/// or binding failures are `Retry`, never a guessed terminal outcome.
+///
+/// The reply body streams within `MAX_TRANSCODE_REPLY_BYTES`: the chunk that
+/// would cross the ceiling returns `Retry` from the length. The remainder
+/// is never retained and no truncated prefix reaches
+/// `classify_transcode_reply`.
+pub async fn call_transcode(env: &Env, req: &TranscodeRequest) -> TranscodeCall {
+    call_transcode_with_deadline(env, req, TRANSCODE_CALL_DEADLINE_MS).await
+}
+
+/// Settle headers and the capped reply under one owned, cancellable deadline.
+/// The same deadline is polled first at both stages; body progress never
+/// replenishes it. Ownership releases the timer on every return (including
+/// transport failure). Local settlement does not prove remote cancellation.
+/// Generic chunks let the runtime retain its zero-copy HTTP body adapter.
+pub async fn settle_transcode_call<F, S, D, C, E>(fetch: F, mut deadline: D) -> TranscodeCall
+where
+    F: Future<Output = Result<(u16, S), ()>> + Unpin,
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    D: Future<Output = ()> + Unpin,
+{
+    use crate::pool_deadline::race_against_deadline;
+
+    let (status, stream) = match race_against_deadline(fetch, &mut deadline).await {
+        Some(Ok(reply)) => reply,
+        Some(Err(())) | None => return TranscodeCall::Retry,
+    };
+    let drain = Box::pin(drain_transcode_stream(stream, MAX_TRANSCODE_REPLY_BYTES));
+    let body = match race_against_deadline(drain, &mut deadline).await {
+        Some(Ok(body)) => body,
+        Some(Err(_)) | None => return TranscodeCall::Retry,
+    };
+    classify_transcode_reply(status, &body)
+}
+
+/// Dispatch with an injectable total headers-plus-body budget in milliseconds.
+pub async fn call_transcode_with_deadline(
+    env: &Env,
+    req: &TranscodeRequest,
+    deadline_ms: u64,
+) -> TranscodeCall {
+    let Ok(body) = serde_json::to_string(req) else {
+        return TranscodeCall::Retry;
+    };
+    let fetcher = match env.service(TRANSCODE_SERVICE_BINDING) {
+        Ok(fetcher) => fetcher,
+        Err(error) => {
+            worker::console_log!("transcode binding unavailable: {:?}", error);
+            return TranscodeCall::Retry;
+        }
+    };
+    let headers = Headers::new();
+    if headers.set("content-type", "application/json").is_err() {
+        return TranscodeCall::Retry;
+    }
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(&body)));
+    let request = match Request::new_with_init(TRANSCODE_URL, &init) {
+        Ok(request) => request,
+        Err(_) => return TranscodeCall::Retry,
+    };
+    // Delay registers on first poll: the settlement polls it before the
+    // lazy fetch, then reuses it through the capped HTTP body drain. Dropping
+    // the owned Delay cancels its local timer, not necessarily remote work.
+    let deadline = Box::pin(Delay::from(Duration::from_millis(deadline_ms)));
+    let fetch = Box::pin(async {
+        let response = fetcher.fetch_request(request).await.map_err(|error| {
+            worker::console_log!("transcode call failed job={}: {:?}", req.job_id, error);
+        })?;
+        Ok((response.status().as_u16(), response.into_body()))
+    });
+    settle_transcode_call(fetch, deadline).await
 }
 
 /// `$n` parameter order for [`upsert_cache_object_sql`].
@@ -593,5 +716,139 @@ mod tests {
             classify_publish_zero_rows(false),
             PublishOutcome::AccountDeleting
         );
+    }
+
+    fn transcoded_body_of_len(total_len: usize) -> Vec<u8> {
+        let prefix = format!(
+            "{{\"status\":\"transcoded\",\"artifact_sha256\":\"{SOURCE_SHA}\",\"byte_size\":2326,\"pad\":\""
+        );
+        const SUFFIX: &[u8] = br#""}"#;
+        assert!(
+            total_len >= prefix.len() + SUFFIX.len(),
+            "body must fit the transcoded envelope"
+        );
+        let mut body = Vec::with_capacity(total_len);
+        body.extend_from_slice(prefix.as_bytes());
+        body.extend_from_slice(&vec![b'x'; total_len - prefix.len() - SUFFIX.len()]);
+        body.extend_from_slice(SUFFIX);
+        body
+    }
+
+    #[test]
+    fn transcode_chunk_fold_keeps_capped_prefix() {
+        // No stream involved: chunks summing past the cap must fail while
+        // only the capped prefix is buffered, never after a full read.
+        let mut buf = Vec::new();
+        assert!(push_transcode_chunk(
+            &mut buf,
+            b"hello",
+            MAX_TRANSCODE_REPLY_BYTES
+        ));
+        assert!(push_transcode_chunk(
+            &mut buf,
+            b" world!",
+            MAX_TRANSCODE_REPLY_BYTES
+        ));
+        assert_eq!(buf, b"hello world!");
+        assert!(!push_transcode_chunk(
+            &mut buf,
+            &vec![b'x'; MAX_TRANSCODE_REPLY_BYTES],
+            MAX_TRANSCODE_REPLY_BYTES
+        ));
+        // The failed push leaves the capped prefix intact.
+        assert_eq!(buf, b"hello world!");
+        // An exact fit is accepted; one byte more is not.
+        let mut exact = Vec::new();
+        assert!(push_transcode_chunk(
+            &mut exact,
+            &vec![0u8; MAX_TRANSCODE_REPLY_BYTES],
+            MAX_TRANSCODE_REPLY_BYTES
+        ));
+        assert_eq!(exact.len(), MAX_TRANSCODE_REPLY_BYTES);
+        assert!(!push_transcode_chunk(
+            &mut exact,
+            &[0u8; 1],
+            MAX_TRANSCODE_REPLY_BYTES
+        ));
+        assert_eq!(exact.len(), MAX_TRANSCODE_REPLY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn transcode_stream_pins_exact_ceiling_across_chunks() {
+        use futures_util::stream::{self};
+        let body = transcoded_body_of_len(MAX_TRANSCODE_REPLY_BYTES);
+        assert_eq!(body.len(), 65_536);
+        // Split across chunks so the boundary is exercised by the drain,
+        // not by a single whole-body buffer.
+        let mid = body.len() / 2;
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(body[..mid].to_vec()),
+            Ok(body[mid..].to_vec()),
+        ];
+        let drained = drain_transcode_stream(stream::iter(chunks), MAX_TRANSCODE_REPLY_BYTES)
+            .await
+            .expect("exact ceiling across chunks must drain");
+        assert_eq!(drained.len(), MAX_TRANSCODE_REPLY_BYTES);
+        assert_eq!(
+            classify_transcode_reply(200, &drained),
+            TranscodeCall::Completed {
+                artifact_sha256: SOURCE_SHA.to_string(),
+                byte_size: 2326,
+            },
+            "a well-formed transcoded reply at exactly 65,536 bytes must stay Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_stream_rejects_ceiling_plus_one_from_length() {
+        use futures_util::stream::{self};
+        let body = transcoded_body_of_len(MAX_TRANSCODE_REPLY_BYTES + 1);
+        assert_eq!(body.len(), 65_537);
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must stay well-formed JSON");
+        assert_eq!(
+            value.get("status").and_then(|s| s.as_str()),
+            Some("transcoded"),
+            "body must keep status=transcoded so only the byte ceiling flips the verdict"
+        );
+        let mid = body.len() / 2;
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(body[..mid].to_vec()),
+            Ok(body[mid..].to_vec()),
+        ];
+        // The drain itself must refuse the 65,537th byte: asserting only the
+        // classifier afterwards would stay green even if the loop cap were
+        // raised, because the classifier also rejects over-ceiling bodies.
+        assert_eq!(
+            drain_transcode_stream(stream::iter(chunks), MAX_TRANSCODE_REPLY_BYTES).await,
+            Err(TranscodeCall::Retry),
+            "the 65,537th byte must fail closed from its length without retaining it"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_stream_chunk_error_fails_closed() {
+        use futures_util::stream::{self};
+        let chunks = vec![
+            Ok::<Vec<u8>, ()>(br#"{"status":"transcoded"}"#.to_vec()),
+            Err(()),
+        ];
+        // A stream that yields a complete chunk and then errors must not fall
+        // through to classify the partial body as Completed.
+        assert_eq!(
+            drain_transcode_stream(stream::iter(chunks), MAX_TRANSCODE_REPLY_BYTES).await,
+            Err(TranscodeCall::Retry),
+            "a chunk error after a complete prefix must fail closed to Retry"
+        );
+    }
+
+    #[test]
+    fn transcode_request_serializes_for_the_front_post() {
+        let req = decide().unwrap();
+        let body = serde_json::to_value(&req).unwrap();
+        assert_eq!(body["input_key"], INPUT);
+        assert_eq!(body["staging_id"], STAGING);
+        assert_eq!(TRANSCODE_ENDPOINT, "/transcode");
+        assert_eq!(TRANSCODE_SERVICE_BINDING, "TRANSCODE_CONTAINER");
     }
 }

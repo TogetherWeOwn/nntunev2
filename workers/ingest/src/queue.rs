@@ -12,8 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::{JobSource, JobState};
 
 /// Ordered Workflow steps; `repair` runs only when verify asks for it.
-pub const WORKFLOW_STEPS: [&str; 7] = [
-    "search", "parse", "probe", "verify", "repair", "match", "write",
+pub const WORKFLOW_STEPS: [&str; 8] = [
+    "search",
+    "parse",
+    "probe",
+    "verify",
+    "repair",
+    "match",
+    "transcode",
+    "write",
 ];
 
 /// One unit of ingest work on the Queue.
@@ -159,6 +166,11 @@ mod tests {
         assert!(pipeline.starts_with("search>"));
         assert!(pipeline.ends_with(">write"));
         assert!(pipeline.contains(">repair>"));
+        // Transcoding sits between match and write (spec §4.2: the match
+        // assigns track identity first; the artifact publishes before
+        // the library write). Metering allowlists every step, so the
+        // transcode meter stage resolves here too.
+        assert!(pipeline.contains(">match>transcode>write"));
     }
 
     #[test]

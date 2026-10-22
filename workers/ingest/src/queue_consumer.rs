@@ -90,7 +90,7 @@ use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
-    ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+    ERR_TRANSCODE_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
     BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
@@ -237,6 +237,7 @@ fn unavailable_code(state: JobState) -> &'static str {
         JobState::Verifying => ERR_VERIFY_FAILED,
         JobState::Repairing => ERR_REPAIR_FAILED,
         JobState::Matching => ERR_MATCH_FAILED,
+        JobState::Transcoding => ERR_TRANSCODE_FAILED,
         JobState::Writing => ERR_WRITE_FAILED,
         _ => ERR_PROBE_FAILED,
     }
@@ -1372,12 +1373,16 @@ async fn execute_write_with<R: MatchWriteRuntime>(
     Ok(())
 }
 
-/// `Matching` + `Writing` in one delivery: resolve the match, meter
-/// `match`, advance, and write. Metering happens *before* each advance,
-/// so a meter failure retries the same state (re-resolving is idempotent)
-/// instead of dropping the event. A delivery that enters in `Writing`
-/// (checkpoint persisted after the match transition) re-resolves and
-/// writes without re-emitting `match`.
+/// `Matching`, then `Writing` once `Transcoding` has run: resolve the
+/// match, meter `match`, and advance. Metering happens *before* the
+/// advance, so a meter failure retries the same state (re-resolving is
+/// idempotent) instead of dropping the event. A delivery that enters in
+/// `Matching` ends after the advance: the transcode service call (up to
+/// 660 s) cannot share this delivery's budget, so the checkpoint —
+/// now `Transcoding` — settles as progress and the artifact step runs
+/// next. A delivery that enters in `Writing` (checkpoint persisted
+/// after the transcode transition) re-resolves and writes without
+/// re-emitting `match`.
 async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
@@ -1390,6 +1395,11 @@ async fn run_match_write_with<R: MatchWriteRuntime>(
             .await
             .map_err(|()| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
         advance_checkpoint(cp, false);
+        debug_assert_eq!(cp.state, JobState::Transcoding);
+        return Err(JobError::progress(
+            ERR_TRANSCODE_FAILED,
+            "transcoding pending",
+        ));
     }
     execute_write_with(runtime, msg, cp, &write).await
 }
@@ -1909,19 +1919,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_entry_meters_match_before_advancing_then_writes() {
+    async fn matching_entry_meters_match_then_yields_to_transcoding() {
         let msg = search_message();
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
-        run_match_write_with(&runtime, &msg, &mut cp)
+        // Matching no longer writes in the same delivery: the checkpoint
+        // advances to Transcoding and settles as progress (no attempt
+        // spent), so the artifact step runs next and the write waits
+        // for a post-transcode checkpoint.
+        let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
-            .expect("matching delivery succeeds");
-        assert_eq!(
-            runtime.calls(),
-            ["resolve", "meter:match", "upsert", "meter:write"]
-        );
-        assert_eq!(cp.state, JobState::Done);
+            .expect_err("matching delivery yields to transcoding");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert!(err.made_progress);
+        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        assert_eq!(cp.state, JobState::Transcoding);
     }
 
     #[tokio::test]
