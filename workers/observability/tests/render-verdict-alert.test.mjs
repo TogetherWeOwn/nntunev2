@@ -171,9 +171,10 @@ function isWebhookHost(hostname) {
 // WHATWG-parse replacement for text.includes('discord.com'): each token is
 // parsed as a URL where possible, else treated as a bare host, and the host
 // is compared exactly (plus leading-dot subdomains). Stricter than substring:
-// evil-discord.com and discord.com.evil.net correctly pass.
+// evil-discord.com and discord.com.evil.net correctly pass. Parentheses are
+// delimiters so Markdown links "[x](https://host/...)" tokenize the URL bare.
 function assertNoWebhookHost(text, message) {
-  const tokens = String(text).split(/[\s"'<>\[\]{}|,;]+/);
+  const tokens = String(text).split(/[\s"'<>\[\](){}|,;]+/);
   for (const token of tokens) {
     if (token.length === 0) continue;
     let hostname;
@@ -183,6 +184,41 @@ function assertNoWebhookHost(text, message) {
       hostname = token.split('/')[0].split(':')[0].split('?')[0].split('#')[0].split('@').pop();
     }
     assert.equal(isWebhookHost(hostname), false, message);
+  }
+}
+
+// WHATWG-parse survival check for truncated logs URLs: the combined worst
+// case truncates the URL, so verbatim equality cannot hold. Instead assert
+// that some payload string still parses to the expected logs host. Exact
+// hostname equality, no URL-substring check for CodeQL to flag.
+function assertLogsHostSurvives(payload, hostname, message) {
+  const carried = collectStringLeaves(payload).some((value) => {
+    try {
+      return new URL(value).hostname === hostname;
+    } catch {
+      return false;
+    }
+  });
+  assert.equal(carried, true, message);
+}
+
+// Lone-surrogate scan: every high surrogate must be followed by a low
+// surrogate, every low preceded by a high. Truncation that splits a
+// non-BMP pair leaves a lone surrogate a strict receiver can reject.
+function assertNoLoneSurrogates(payload, message) {
+  for (const leaf of collectStringLeaves(payload)) {
+    for (let i = 0; i < leaf.length; i += 1) {
+      const code = leaf.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        const next = leaf.charCodeAt(i + 1);
+        assert.equal(next >= 0xDC00 && next <= 0xDFFF, true,
+          `${message} (lone high surrogate at index ${i})`);
+      } else if (code >= 0xDC00 && code <= 0xDFFF) {
+        const prev = i > 0 ? leaf.charCodeAt(i - 1) : 0;
+        assert.equal(prev >= 0xD800 && prev <= 0xDBFF, true,
+          `${message} (lone low surrogate at index ${i})`);
+      }
+    }
   }
 }
 
@@ -667,6 +703,154 @@ test('module source carries no webhook URL', async () => {
   assert.equal(loadFailure, undefined, 'implement render-verdict-alert.mjs first');
   const source = await readFile(MODULE_URL, 'utf8');
   assertNoWebhookHost(source, 'module must not contain a webhook host');
+});
+
+// Break caught: contradictory counts/rate rendering a fabricated alert.
+// Rate must equal counts and the decimal must equal the producer half-up
+// format, otherwise the verdict fails closed.
+test('mismatched counts and rate rationals fail closed', () => {
+  const cases = [
+    ['counts/rate rational mismatch',
+      { total: 100, failed: 99 }, { failed: 0, total: 5, decimal: '0.0000' }],
+    ['counts/rate total mismatch with wrong decimal',
+      { total: 4, failed: 3 }, { failed: 1, total: 100, decimal: '9.9999' }],
+    ['decimal off by one unit in last place',
+      { total: 4, failed: 3 }, { failed: 3, total: 4, decimal: '0.7501' }],
+  ];
+  for (const [name, counts, rate] of cases) {
+    assert.equal(render(breachVerdict({ counts, rate }), contextFixture()), null,
+      `${name} must not render`);
+  }
+});
+
+test('rate decimals must equal producer half-up rounding', () => {
+  // 1/3 half-up to 4 places is 0.3333: renders.
+  const third = render(breachVerdict({
+    counts: { total: 3, failed: 1 },
+    rate: { failed: 1, total: 3, decimal: '0.3333' },
+  }), contextFixture());
+  assertBreachCarries(third, { rational: '1/3', decimal: '0.3333' });
+  // 1/6 half-up is 0.1667: truncated 0.1666 fails closed.
+  assert.equal(render(breachVerdict({
+    counts: { total: 6, failed: 1 },
+    rate: { failed: 1, total: 6, decimal: '0.1666' },
+  }), contextFixture()), null, 'truncated 1/6 decimal must not render');
+});
+
+// Break caught: alphabetical Top-fields omitting the breaching release.
+// Buckets rank by failures, so the breaching SHA survives both the rules
+// cap and the buckets cap.
+test('producer-shaped breach surfaces breaching release despite caps', () => {
+  const rules = Array.from({ length: 10 }, (_, i) => `error_class:rule_${String(i).padStart(2, '0')}`);
+  rules.push(`release:${SHA_B}`);
+  const releaseBuckets = ['0', '1', '2', '3', '4'].map((digit) => ({
+    key: digit.repeat(40), total: 1, failed: 0, decimal: '0.0000',
+  }));
+  releaseBuckets.push({ key: SHA_B, total: 3, failed: 3, decimal: '1.0000' });
+  releaseBuckets.push({ key: 'f'.repeat(40), total: 1, failed: 0, decimal: '0.0000' });
+  const verdict = breachVerdict({
+    thresholds: { breached_rules: rules },
+    breakdowns: {
+      by_error_class: {
+        buckets: [{ key: 'internal_error', total: 3, failed: 3, decimal: '1.0000' }],
+        overflow: emptyOverflow(),
+      },
+      by_release: { buckets: releaseBuckets, overflow: emptyOverflow() },
+      by_route: {
+        buckets: [{ key: 'GET /v1/library/search', total: 4, failed: 3, decimal: '0.7500' }],
+        overflow: emptyOverflow(),
+      },
+    },
+  });
+  const payload = render(verdict, contextFixture());
+  assert.notEqual(payload, null, 'ranked breach must render');
+  assertDiscordBounds(payload);
+  const text = JSON.stringify(payload);
+  assert.equal(text.includes(SHA_B), true, 'payload must carry the breaching release SHA');
+  assertNoWebhookHost(text, 'payload must not contain a webhook URL');
+});
+
+// Break caught: unpinned cap schedule. Combined worst case (long label,
+// long logs URL, 100 long rules, 100 long buckets in all three dimensions)
+// must stay within 6000 chars via the schedule. The no-schedule mutant
+// renders 6546 chars on this input; head renders 5334.
+test('combined worst case stays within bounds via cap schedule', () => {
+  const longRules = Array.from({ length: 100 }, (_, i) => `rule_${i}_${'R'.repeat(300)}`);
+  const longBuckets = (prefix) => Array.from({ length: 100 }, (_, i) => ({
+    key: `${prefix}_${i}_${'K'.repeat(300)}`, total: 1, failed: 1, decimal: '1.0000',
+  }));
+  const verdict = breachVerdict({
+    thresholds: { breached_rules: longRules },
+    breakdowns: {
+      by_error_class: { buckets: longBuckets('error'), overflow: emptyOverflow() },
+      by_release: { buckets: longBuckets('release'), overflow: emptyOverflow() },
+      by_route: { buckets: longBuckets('route'), overflow: emptyOverflow() },
+    },
+  });
+  const contextArg = contextFixture({
+    logsUrl: `https://logs.example.invalid/${'L'.repeat(2000)}`,
+    windowLabel: `window ${'W'.repeat(5000)}`,
+  });
+  const first = render(verdict, contextArg);
+  assert.notEqual(first, null, 'combined worst case must render within bounds, not fail closed');
+  assertDiscordBounds(first);
+  const text = JSON.stringify(first);
+  assert.equal(text.includes('3/4'), true, 'rational must survive schedule capping');
+  assert.equal(text.includes('0.7500'), true, 'decimal must survive schedule capping');
+  assertLogsHostSurvives(first, 'logs.example.invalid', 'logs host must survive schedule capping');
+  const second = render(verdict, contextFixture({
+    logsUrl: `https://logs.example.invalid/${'L'.repeat(2000)}`,
+    windowLabel: `window ${'W'.repeat(5000)}`,
+  }));
+  assert.equal(JSON.stringify(second), text, 'scheduled render must be deterministic');
+});
+
+// Break caught: truncation splitting non-BMP pairs. Emoji straddling every
+// cap (label, logs URL, rule, key) must not emit lone surrogates.
+test('emoji straddling truncation caps emits no lone surrogates', () => {
+  const bell = '🔔';
+  const longRule = `error_class:${bell.repeat(150)}`;
+  const emojiKey = (prefix) => `${prefix}:${bell.repeat(150)}`;
+  const verdict = breachVerdict({
+    thresholds: { breached_rules: [longRule, 'overall'] },
+    breakdowns: {
+      by_error_class: {
+        buckets: [{ key: emojiKey('error'), total: 3, failed: 3, decimal: '1.0000' }],
+        overflow: emptyOverflow(),
+      },
+      by_release: {
+        buckets: [{ key: emojiKey('release'), total: 3, failed: 3, decimal: '1.0000' }],
+        overflow: emptyOverflow(),
+      },
+      by_route: {
+        buckets: [{ key: emojiKey('route'), total: 4, failed: 3, decimal: '0.7500' }],
+        overflow: emptyOverflow(),
+      },
+    },
+  });
+  const contextArg = contextFixture({
+    logsUrl: `https://logs.example.invalid/${bell.repeat(600)}`,
+    windowLabel: bell.repeat(600),
+  });
+  const payload = render(verdict, contextArg);
+  assert.notEqual(payload, null, 'emoji input must truncate, not fail closed');
+  assertDiscordBounds(payload);
+  assertNoLoneSurrogates(payload, 'payload must carry no lone surrogates');
+  const text = JSON.stringify(payload);
+  assert.equal(text.includes('3/4'), true, 'rational must survive emoji truncation');
+  assertLogsHostSurvives(payload, 'logs.example.invalid', 'logs host must survive emoji truncation');
+});
+
+test('host-less logs URLs fail closed', () => {
+  for (const logsUrl of ['https://?x=1', 'https://#f', 'https://:8080/x']) {
+    assert.equal(render(breachVerdict(), contextFixture({ logsUrl })), null,
+      `logsUrl ${JSON.stringify(logsUrl)} must not render`);
+  }
+});
+
+test('webhook URLs inside Markdown links are detected', () => {
+  assert.throws(() => assertNoWebhookHost('[x](https://discord.com/api/webhooks/a/b)',
+    'webhook in Markdown link must be detected'));
 });
 
 test('no ambient effects across the whole suite', () => {
