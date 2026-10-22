@@ -817,6 +817,11 @@ jobs:
         working-directory: e2e
         run: npm ci
 
+      # A slow Azure mirror can consume the job budget before any tests run.
+      # Keep the runner's signed Ubuntu sources and fallback mirrors intact.
+      - name: Prefer the Ubuntu archive for browser dependencies
+        run: sudo sed -i 's|^http://azure\.archive\.ubuntu\.com/ubuntu/|https://archive.ubuntu.com/ubuntu/|' /etc/apt/apt-mirrors.txt
+
       - name: Install Playwright chromium (browser-level self-tests)
         working-directory: e2e
         run: npx playwright install --with-deps chromium
