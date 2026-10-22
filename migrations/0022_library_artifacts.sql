@@ -82,13 +82,17 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
     UNIQUE (user_id, idempotency_key)
 );
 
--- Drop stored defaults before any type change: a uuid/timestamptz
--- default cannot be coerced to the new type implicitly, so ALTER TYPE
--- would fail. DROP DEFAULT is a no-op when no default is set, and the
--- matching SET DEFAULT below re-establishes the union shape.
-ALTER TABLE ingest_jobs ALTER COLUMN id DROP DEFAULT;
-ALTER TABLE ingest_jobs ALTER COLUMN accepted_at DROP DEFAULT;
-
+-- Type changes drop and restore each column's default INSIDE the
+-- guarded branch that performs the change: a uuid/timestamptz default
+-- cannot be coerced to the new type implicitly, so ALTER TYPE would
+-- fail with the old default in place. The drop/restore must not sit
+-- outside the guards: the migrator applies statements in autocommit
+-- with no wrapping transaction (workers/api/tests/run_migration_tests.sh
+-- runs plain `psql -f`), so unconditional DROPs would leave every
+-- replay with a committed defaults gap that default-reliant billing
+-- inserts could hit as a NOT NULL violation. Guarded, a replay never
+-- touches the defaults; the unconditional SET DEFAULTs below stay as
+-- idempotent guards so both paths land on identical defaults.
 DO $$
 BEGIN
     IF EXISTS (
@@ -96,8 +100,10 @@ BEGIN
         WHERE table_schema = 'public' AND table_name = 'ingest_jobs'
           AND column_name = 'id' AND data_type = 'uuid'
     ) THEN
+        ALTER TABLE ingest_jobs ALTER COLUMN id DROP DEFAULT;
         ALTER TABLE ingest_jobs
             ALTER COLUMN id SET DATA TYPE TEXT USING (id::TEXT);
+        ALTER TABLE ingest_jobs ALTER COLUMN id SET DEFAULT (gen_random_uuid()::TEXT);
     END IF;
 END
 $$;
@@ -110,9 +116,12 @@ BEGIN
           AND column_name = 'accepted_at'
           AND data_type = 'timestamp with time zone'
     ) THEN
+        ALTER TABLE ingest_jobs ALTER COLUMN accepted_at DROP DEFAULT;
         ALTER TABLE ingest_jobs
             ALTER COLUMN accepted_at SET DATA TYPE BIGINT
             USING (extract(epoch FROM accepted_at)::BIGINT);
+        ALTER TABLE ingest_jobs
+            ALTER COLUMN accepted_at SET DEFAULT (extract(epoch from now())::bigint);
     END IF;
 END
 $$;
