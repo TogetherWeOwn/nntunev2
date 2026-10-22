@@ -1,7 +1,7 @@
 //! Pure live-loader core: SSRF dial-plan vetting, capacity derivation and
 //! fixed error mapping. First slice only; the runtime loader stays stopped.
 //!
-//! Three pure functions over caller-supplied inputs, with closed
+//! Four pure functions over caller-supplied inputs, with closed
 //! request/response types and the pinned bounds table:
 //!
 //! - [`vet_dial_plan`]: vet-ALL dial-plan check over pre-resolved candidate
