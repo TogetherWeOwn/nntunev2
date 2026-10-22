@@ -38,7 +38,7 @@ then these fixtures pin the port's v1-derived contract, not v1 bytes.
   production `MemStore::empty()` accepts nothing): `test` /
   `test@example.com` (apiKey `test-key-1`, password `test-pass`), `other` /
   `other@example.com` (apiKey `other-key-1`), `manager` /
-  `manager@example.com` (apiKey `manager-key-1`, admin-or-manager roles),
+  `manager@example.com` (apiKey `mgr-key-1`, admin-or-manager roles),
   `admin` / `admin@example.com` (apiKey `admin-key-1`, `adminRole` true).
   Playlists, stars, ratings, scrobbles and queues are per-user; another
   user's playlist answers 50, and `getUser`/`getAvatar` answer 50 unless

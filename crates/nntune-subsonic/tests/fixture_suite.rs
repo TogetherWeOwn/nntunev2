@@ -269,7 +269,7 @@ fn oversized_post_body_answers_error_10() {
 #[test]
 fn user_roles_match_v1_resource() {
     let app = app();
-    const MANAGER_KEY: &str = "apiKey=manager-key-1&v=1.16.1&c=fixture";
+    const MANAGER_KEY: &str = "apiKey=mgr-key-1&v=1.16.1&c=fixture";
     // Manager: not admin, but manages (upload/coverArt true).
     let (_, _, body) = get(
         &app,

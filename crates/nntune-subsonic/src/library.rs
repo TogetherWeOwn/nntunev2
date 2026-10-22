@@ -252,7 +252,7 @@ fn test_identities() -> Vec<(String, String, String, String, bool, bool)> {
         (
             "manager".to_string(),
             "manager-pass".to_string(),
-            "manager-key-1".to_string(),
+            "mgr-key-1".to_string(),
             "manager@example.com".to_string(),
             false,
             true,
