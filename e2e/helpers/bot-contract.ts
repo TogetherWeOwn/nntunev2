@@ -96,7 +96,10 @@ export function sha256Hex(data: string): string {
 
 /** HMAC-SHA256 of `message` under `secret`, base64url without padding. */
 export function hmacSha256Base64Url(secret: string, message: string): string {
-  return createHmac('sha256', secret).update(message, 'ascii').digest('base64url');
+  // `utf8`: `grant.rs` HMACs the raw segment bytes, so non-ASCII input
+  // must hash its UTF-8 bytes here too (`ascii` would mangle them and flip
+  // the reason from `malformed` to `bad-signature`).
+  return createHmac('sha256', secret).update(message, 'utf8').digest('base64url');
 }
 
 function isBase64UrlChar(code: number): boolean {
@@ -198,7 +201,9 @@ export function verifyGrant(
   const parts = payload.split('|');
   if (parts.length !== 3) return fail<ParsedGrant>('malformed');
   const [userId, trackId, expRaw] = parts as [string, string, string];
-  if (!/^[0-9]+$/.test(expRaw)) return fail<ParsedGrant>('malformed');
+  // Rust `str::parse::<u64>()` accepts one leading `+`: mirror it exactly
+  // (a `+exp` token verifies under `grant::verify`, so the checker must too).
+  if (!/^\+?[0-9]+$/.test(expRaw)) return fail<ParsedGrant>('malformed');
   const expUnix = Number(expRaw);
   if (!Number.isSafeInteger(expUnix)) return fail<ParsedGrant>('malformed');
   if (nowUnix >= expUnix) return fail<ParsedGrant>('expired');

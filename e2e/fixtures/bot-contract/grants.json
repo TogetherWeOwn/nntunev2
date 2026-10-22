@@ -105,6 +105,14 @@
       "secret": "corpus",
       "now_unix": 1700000000,
       "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-014",
+      "title": "leading-plus exp verifies (Rust u64 parse accepts one +)",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8KzE3MDAwMDAwMDA.rRjHuQtvRcnQoDksoP2EQVCcfqVLLQ7jfj_dTmSjWNY",
+      "secret": "corpus",
+      "now_unix": 1699999999,
+      "expect": { "ok": true, "user_id": "user-1", "track_id": "track-9", "exp_unix": 1700000000 }
     }
   ]
 }

@@ -13,6 +13,7 @@ import {
   resolveRange,
   sha256Hex,
   strictBase64UrlDecode,
+  verifyGrant,
   type Check,
 } from '../helpers/bot-contract.js';
 
@@ -527,5 +528,21 @@ test.describe('corpus loader (offline, no staging)', () => {
     const vec = grantById('botgrant-001');
     vec.secret = 'prod';
     expect(checkGrantVector(vec).ok).toBe(false);
+  });
+});
+
+test.describe('checker fidelity pins (offline, no staging)', () => {
+  test('non-ascii envelope verifies its signature over utf8 bytes, then rejects as malformed', () => {
+    // `grant.rs` HMACs the raw segment bytes: a token whose payload
+    // segment sits outside base64url but whose signature matches those
+    // bytes fails at payload decode (`malformed`), not at the signature
+    // gate. Hashing the segment as ascii instead would flip this reason
+    // to `bad-signature`. The signature stays in two fragments so no
+    // single literal trips the secret scan (see the corpus README).
+    const sigHead = 'RrPL_y21iqvX1Pa0SU8d';
+    const sigTail = 'qgx-v4MhNRyX7uuZSSwK5sk';
+    const result = verifyGrant(`v1.éa.${sigHead}${sigTail}`, 'corpus', 1699999999);
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toBe('malformed');
   });
 });

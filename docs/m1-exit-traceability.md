@@ -29,7 +29,7 @@ production secret-shape gate pin (`e2e/tests/deploy-production.spec.ts`,
 its own account and the journey skip budget tightened to recording_mbids only,
 plus the bot-contract conformance corpus spec
 (`e2e/tests/bot-contract.spec.ts`, offline only, feeding B8):
-`npm --prefix e2e run e2e:list` lists 500 tests in 30 files, including
+`npm --prefix e2e run e2e:list` lists 501 tests in 30 files, including
 3 queue-order integration pins and 2 new journey-gate pins.
 The previously verified web inventory remains 151 tests in 32 files
 (`pnpm --dir apps/web exec playwright test --list`, including the 5-test

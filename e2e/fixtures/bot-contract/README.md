@@ -4,7 +4,7 @@ JSON vectors + checker for the TWO-bot consumption contract, banked ahead
 of the B-chain runtime work so the B8 staging harness consumes them later.
 Offline only: no staging, no network, no real credentials.
 
-- Vectors: `grants.json` (13), `signed-url.json` (19), `profile-matrix.json` (32).
+- Vectors: `grants.json` (14), `signed-url.json` (19), `profile-matrix.json` (32).
 - Checker: `e2e/helpers/bot-contract.ts` (`checkGrantVector`,
   `checkSignedUrlVector`, `checkMatrixRow`).
 - Executable pins: `e2e/tests/bot-contract.spec.ts` (runs in
