@@ -132,10 +132,30 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		speed?.set(Number(value));
 	}
 
+	/** In-memory Storage stand-in when the browser blocks site storage. */
+	function memoryStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+		const entries = new Map<string, string>();
+		return {
+			getItem: (key) => entries.get(key) ?? null,
+			setItem: (key, value) => {
+				entries.set(key, String(value));
+			},
+			removeItem: (key) => {
+				entries.delete(key);
+			}
+		};
+	}
+
 	/** Persist the outgoing track's latest position (zero means never started). */
-	function persistPosition(trackId: string | undefined): void {
+	function persistPosition(
+		trackId: string | undefined,
+		element: HTMLAudioElement | undefined = audioEl
+	): void {
 		if (!trackId || !resumeStore) return;
-		const position = audioEl?.currentTime;
+		// An ended node carries the finished position: persisting it would
+		// resurrect the entry handleEnded just cleared.
+		if (element?.ended) return;
+		const position = element?.currentTime;
 		if (typeof position !== 'number' || !Number.isFinite(position) || position <= 0) return;
 		resumeStore.save(trackId, position);
 	}
@@ -162,9 +182,12 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
-	function releaseAudio(node: HTMLAudioElement) {
+	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
 		return {
 			destroy() {
+				// The action tears down on every swap and on unmount, before
+				// the source unloads: persist from this node while it holds time.
+				persistPosition(trackId, node);
 				node.pause();
 				node.removeAttribute('src');
 				node.load();
@@ -337,10 +360,20 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		(window as unknown as { __comforts?: { advanceSleep: typeof advanceSleep } }).__comforts = {
 			advanceSleep
 		};
-		speed = createPlaybackSpeed({ storage: localStorage, audio: () => audioEl });
+		// Reading `localStorage` itself can throw when site storage is
+		// blocked (cookie block, sandboxed iframe). Fall back to memory so
+		// the rest of setup — queue restore, share links, the tick clock —
+		// still runs; speed/resume then work for this page view only.
+		let store: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+		try {
+			store = localStorage;
+		} catch {
+			store = memoryStorage();
+		}
+		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
 		speedValue = String(speed.current());
 		speed.apply();
-		resumeStore = createResumeStore({ storage: localStorage });
+		resumeStore = createResumeStore({ storage: store });
 		try {
 			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
 		} catch {
@@ -351,28 +384,38 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		// keeps the default queue.
 		const params = new URLSearchParams(window.location.search);
 		const sharedId = params.get('track');
-		if (sharedId !== null && DEMO_TRACKS.some((track) => track.id === sharedId)) {
-			const index = queue.tracks.findIndex((track) => track.id === sharedId);
-			if (index >= 0) {
-				queue = selectTrack(queue, index);
-				const startAt = parseTimestampParam(params.get('t')) ?? 0;
-				void tick().then(() => {
-					if (current?.id !== sharedId || !audioEl) return;
-					try {
-						audioEl.currentTime = startAt;
-					} catch {
-						// The element is not seekable yet; it starts at 0.
-					}
-				});
+		const shared = DEMO_TRACKS.find((track) => track.id === sharedId);
+		if (shared !== undefined) {
+			let index = queue.tracks.findIndex((track) => track.id === shared.id);
+			if (index < 0) {
+				// A restored-but-empty queue (or one missing the track) must
+				// not swallow a valid link: re-add the track, then select it.
+				queue = addTrack(queue, shared);
+				index = queue.tracks.length - 1;
 			}
+			queue = selectTrack(queue, index);
+			const startAt = parseTimestampParam(params.get('t')) ?? 0;
+			void tick().then(() => {
+				if (current?.id !== shared.id || !audioEl) return;
+				try {
+					audioEl.currentTime = startAt;
+				} catch {
+					// The element is not seekable yet; it starts at 0.
+				}
+			});
 		}
 		status = current ? 'selected' : 'empty';
 		restored = true;
 		const tickId = setInterval(() => {
 			sleepTimer.tick();
 		}, 500);
+		// A reload never runs the destroy path: persist the live position
+		// on hide so resume survives it.
+		const persistOnPageHide = () => persistPosition(current?.id);
+		window.addEventListener('pagehide', persistOnPageHide);
 		// OS media controls are global: release them when the page goes away.
 		return () => {
+			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
 		};
@@ -425,7 +468,7 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	{#key `${current?.streamUrl}:${sourceRevision}`}
 		<audio
 			bind:this={audioEl}
-			use:releaseAudio
+			use:releaseAudio={current?.id}
 			data-testid="demo-audio"
 			src={current?.streamUrl}
 			preload="metadata"
