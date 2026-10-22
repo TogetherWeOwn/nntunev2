@@ -30,7 +30,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, RwLock};
@@ -71,6 +71,9 @@ const MAX_ARTIFACT_BYTES: u64 = 32 << 20;
 const ARTIFACT_NAME: &str = "artifact.ogg";
 /// Encode-process poll interval while waiting out the wall budget.
 const ENCODE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Bound teardown of requests rejected before their bodies were consumed.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_CLOSE_DRAIN_BYTES: usize = 1 << 20;
 
 /// Server configuration: where staged bytes live and which pinned
 /// binary encodes them. Both come from the image, never from requests.
@@ -556,13 +559,19 @@ impl Read for BodyReader<'_> {
                         loop {
                             let n = self.stream.read(&mut byte)?;
                             if n == 0 {
-                                break;
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "chunk trailer",
+                                ));
                             }
                             trailer.push(byte[0]);
-                            if trailer.ends_with(b"\r\n") {
-                                break;
-                            }
                             if trailer.len() > MAX_HEADER_BYTES {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "chunk trailer",
+                                ));
+                            }
+                            if trailer == b"\r\n" || trailer.ends_with(b"\r\n\r\n") {
                                 break;
                             }
                         }
@@ -654,7 +663,31 @@ fn parse_job_path(path: &str) -> Option<(String, String, &'static str, String)> 
     ))
 }
 
-fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
+fn close_connection(stream: &mut TcpStream) {
+    // Deliver response EOF before draining. Waiting for a rejected request's
+    // declared body first would deadlock clients already waiting for the reply.
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
+    let mut remaining = MAX_CLOSE_DRAIN_BYTES;
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() || stream.set_read_timeout(Some(timeout)).is_err() {
+            break;
+        }
+        let take = remaining.min(buf.len());
+        match stream.read(&mut buf[..take]) {
+            Ok(0) => break,
+            Ok(n) => remaining -= n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle(stream: &mut TcpStream, config: &ServerConfig, gate: &RwLock<()>) {
     let result = (|| -> Result<(), ApiError> {
         let (req, _leftover) = read_head(stream)?;
         match (req.method.as_str(), req.path.as_str()) {
@@ -744,6 +777,8 @@ fn handle(stream: &mut std::net::TcpStream, config: &ServerConfig, gate: &RwLock
     if let Err(err) = result {
         let _ = respond_error(stream, &err);
     }
+    // Route guards have dropped, so teardown never holds the mutation gate.
+    close_connection(stream);
 }
 
 /// Serve until the listener fails. Connections run on their own

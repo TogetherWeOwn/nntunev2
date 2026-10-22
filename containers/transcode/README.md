@@ -25,7 +25,13 @@ Only reachable through the hosting Durable Object's container port. (Sources: `c
 | `GET /jobs/{job_id}/t/{staging_id}/out/artifact.ogg` | stream the normalised artifact back |
 | `POST /cleanup` | delete one staging's bytes |
 
-(Sources: `containers/transcode/src/lib.rs:661-663` (`GET /health`); `:697-718` (`PUT .../in/{key}`); `:664-671` (`POST /transcode`); `:719-739` (`GET .../out/artifact.ogg`); `:672-696` (`POST /cleanup`); `:639-656` (path shape); `crates/nntune-core/src/transcode.rs:276-286` (input-key rule).)
+(Sources: `containers/transcode/src/lib.rs:694-696` (`GET /health`); `:730-751` (`PUT .../in/{key}`); `:697-704` (`POST /transcode`); `:752-772` (`GET .../out/artifact.ogg`); `:705-729` (`POST /cleanup`); `:648-665` (path shape); `crates/nntune-core/src/transcode.rs:276-286` (input-key rule).)
+
+Chunked input consumes the complete, size-bounded trailer section and rejects
+truncated trailers. Responses half-close before discarding unread request bytes;
+teardown has a 250 ms absolute deadline and a 1 MiB discard ceiling, outside the
+mutation gate. Early size refusals never wait for the advertised request body.
+(Sources: `containers/transcode/src/lib.rs:555-579` (trailers); `:666-689` (bounded teardown); `:777-782` (after route guards drop).)
 
 `POST /transcode` re-checks the staged bytes against the request's
 `source_sha256`, runs the pinned argv with an in-process wall-clock
@@ -39,7 +45,7 @@ directory and reruns; a different input for one staging conflicts
 persist nothing. No `prlimit` CPU/memory wrapper: inputs are
 verified-intact audio under the 64 MiB staging ceiling, not hostile
 damage, so the wall timeout plus the instance memory bound the cost.
-(Sources: `containers/transcode/src/lib.rs:215-270` (idempotency + input re-check); `:272-296` (bounded encode, timeout/signal mapping); `:298-343` (output validation, normalisation, stored verdicts); `:189-209` (wall-clock runner); `:56-71` (budgets and ceilings); `:19-30` (no-`prlimit` rationale).)
+(Sources: `containers/transcode/src/lib.rs:218-273` (idempotency + input re-check); `:275-299` (bounded encode, timeout/signal mapping); `:301-346` (output validation, normalisation, stored verdicts); `:192-212` (wall-clock runner); `:56-71` (budgets and ceilings); `:19-30` (no-`prlimit` rationale).)
 
 ## Single-object input boundary
 
@@ -47,7 +53,7 @@ damage, so the wall timeout plus the instance memory bound the cost.
   `Transcoding` step only records verified-intact, single-object audio
   files (empty `spool`), and the Container refuses a missing, empty,
   oversize or hash-mismatched staged input without running the
-  encoder. (Sources: `containers/transcode/src/lib.rs:160-179` (request validation); `:260-270` (staged-input checks).)
+  encoder. (Sources: `containers/transcode/src/lib.rs:163-182` (request validation); `:263-273` (staged-input checks).)
 - A verify staging for a file too large to assemble in memory instead
   records the file as its ordered spool-segment key list, which this
   input cannot consume; such files are excluded from the recorded
