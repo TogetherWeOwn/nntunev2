@@ -1,0 +1,8 @@
+{
+  "nullable_epochs": [
+    "trial_end_unix",
+    "paid_through_at_unix",
+    "grace_until_unix"
+  ],
+  "values": [null, 0, -1, -2208988800, 1700000000, 9223372036854775807, -9223372036854775808]
+}
