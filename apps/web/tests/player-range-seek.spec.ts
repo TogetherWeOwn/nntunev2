@@ -134,9 +134,30 @@ test('Range seek mid-track advances the audible position to the seek target', as
 	);
 
 	// The audible position must reach the seek target and keep advancing.
+	// The seeked counter is (re)armed BEFORE seeking: a bounded wait for the
+	// event proves the element actually sought, so natural playback cannot
+	// satisfy this pin (deleting the currentTime assignment must fail here
+	// instead of riding the position poll up to the target).
+	await audio.evaluate((element) => {
+		const player = element as HTMLAudioElement;
+		const win = window as unknown as { __seekedCount?: number };
+		win.__seekedCount = 0;
+		player.addEventListener('seeked', () => {
+			win.__seekedCount = (win.__seekedCount ?? 0) + 1;
+		});
+	});
 	await audio.evaluate((element, time) => {
 		(element as HTMLAudioElement).currentTime = time;
 	}, target);
+	await expect
+		.poll(
+			async () =>
+				audio.evaluate(
+					() => (window as unknown as { __seekedCount?: number }).__seekedCount ?? 0
+				),
+			{ timeout: 15_000 }
+		)
+		.toBeGreaterThan(0);
 	await expect
 		.poll(async () => (await audioSnapshot(audio)).currentTime, { timeout: 15_000 })
 		.toBeGreaterThan(target - 0.5);
@@ -241,14 +262,44 @@ test('pause, seek while paused, and resume holds position then continues from th
 	expect(held.errorCode).toBeNull();
 
 	// Resume: playback must continue from the seek target, not from the
-	// pre-pause position and not from the start.
+	// pre-pause position and not from the start. The floor listener is armed
+	// BEFORE resuming: every timeupdate sample plus every position-poll
+	// sample from here on must stay at or above target-0.5, so a restart
+	// from zero (or a return to the pre-pause position) trips the floor long
+	// before the position poll could pass vacuously.
+	await audio.evaluate((element) => {
+		const player = element as HTMLAudioElement;
+		const win = window as unknown as { __resumeMin?: number };
+		win.__resumeMin = Number.POSITIVE_INFINITY;
+		player.addEventListener('timeupdate', () => {
+			win.__resumeMin = Math.min(
+				win.__resumeMin ?? Number.POSITIVE_INFINITY,
+				player.currentTime
+			);
+		});
+	});
 	await audio.evaluate((element) => {
 		void (element as HTMLAudioElement).play();
 	});
 	await expect(page.getByTestId('player-status')).toContainText('playing', { timeout: 10_000 });
+	let pollMin = Number.POSITIVE_INFINITY;
 	await expect
-		.poll(async () => (await audioSnapshot(audio)).currentTime, { timeout: 10_000 })
+		.poll(
+			async () => {
+				const now = (await audioSnapshot(audio)).currentTime;
+				pollMin = Math.min(pollMin, now);
+				return now;
+			},
+			{ timeout: 10_000 }
+		)
 		.toBeGreaterThan(target + 0.2);
+	const eventMin = await audio.evaluate(
+		() => (window as unknown as { __resumeMin?: number }).__resumeMin ?? Number.NaN
+	);
+	expect(
+		Math.min(eventMin, pollMin),
+		'resume must continue from the seek target, never dipping below it'
+	).toBeGreaterThanOrEqual(target - 0.5);
 	const resumed = await audioSnapshot(audio);
 	expect(resumed.paused).toBe(false);
 	expect(resumed.errorCode).toBeNull();
