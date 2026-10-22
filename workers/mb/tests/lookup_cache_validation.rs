@@ -46,7 +46,7 @@
 
 use nntune_mb::{
     handle_lookup, ApiResponse, Artist, Entity, Kind, MbRepo, Recording, Release, RepoError,
-    SearchHit, SuccessCache,
+    RepoStage, SearchHit, SuccessCache,
 };
 use std::cell::RefCell;
 use std::future::Future;
@@ -124,7 +124,7 @@ impl MbRepo for FakeRepo {
         match &self.outcome {
             LookupOutcome::Found(entity) => Ok(Some(entity.clone())),
             LookupOutcome::Missing => Ok(None),
-            LookupOutcome::Fail => Err(RepoError),
+            LookupOutcome::Fail => Err(RepoError::new(RepoStage::Query)),
         }
     }
 
