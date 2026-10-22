@@ -88,6 +88,22 @@ fn kek_grace_window_old_reads_succeed_until_retire() {
             "wrong-version reads must fail generically"
         );
     }
+
+    // Same key, skewed stored version: isolates the AAD version binding.
+    // `decrypt_vault` rebuilds the DEK AAD from `blob.kek_version`, so a
+    // row whose version is flipped while still wrapped under the old KEK
+    // must fail authentication — generically — even though the key is
+    // right. Every case above pairs the version change with a different
+    // KEK, where an AES-GCM key mismatch alone would mask a dropped
+    // version pin.
+    let mut skewed = v1_blob.clone();
+    skewed.kek_version = 2;
+    let skew_err = vault::decrypt_vault(&KEK_V1, DRILL_USER, &skewed).unwrap_err();
+    assert_eq!(
+        skew_err.to_string(),
+        "vault unavailable",
+        "same-key version skew must fail generically"
+    );
 }
 
 #[test]
