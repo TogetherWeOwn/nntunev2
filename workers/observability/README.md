@@ -58,13 +58,13 @@ body. Any other verdict status, malformed verdict or context, or invalid
 input fails closed to `null` — never a fabricated alert, never a throw.
 
 Breach payloads carry the verdict status, the exact `failed/total`
-rational plus 4-decimal rate, the failed/total counts, every breached
-rule name, top breakdown entry keys per dimension, release SHAs, the logs
-URL, and the window label. Output stays within alert bounds (content <=
-2000 chars, one embed, 6000-char total, <= 25 fields): oversized strings
-truncate to a prefix plus "…" and oversized lists cap to a leading prefix
-with a "+N more" marker, so identical input always yields byte-identical
-output.
+rational plus 4-decimal rate, the failed/total counts, leading breached
+rule names (capped), top breakdown entry keys per dimension ranked by
+failures, release SHAs, the logs URL, and the window label. Output stays
+within alert bounds (content <= 2000 chars, one embed, 6000-char total,
+<= 25 fields): oversized strings truncate to a prefix plus "…" and
+oversized lists cap to a leading prefix with a "+N more" marker, so
+identical input always yields byte-identical output.
 
 This module is not wired or deployed: no consumer, schedule, delivery,
 dashboard, or live alerting reads from it. It performs no network,
