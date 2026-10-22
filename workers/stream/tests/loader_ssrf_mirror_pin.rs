@@ -11,7 +11,9 @@
 //!
 //! No DNS, sockets, vault, keys, DB, bindings or network: candidates are
 //! inert pre-resolved text. v4 fixtures are built from octets so no dotted
-//! private quad appears in tracked files; v6 fixtures are literals.
+//! private quad appears in tracked files; v6 fixtures are literals except
+//! the v4-mapped private vector, which is octet-built for the same reason
+//! (the public-text lint bans dotted RFC-1918 quads even inside v6 text).
 
 use nntune_stream::loader::{
     map_loader_error, vet_dial_plan, DialPlan, LoaderDenial, VetDialPlanRequest,
@@ -67,12 +69,13 @@ fn mirror_pins_transition_and_special_use_v6_families() {
         "2001::1",                              // Teredo/ORCHID range head
         "3fff::1",                              // v6 documentation range
         "::ffff:127.0.0.1",                     // v4-mapped loopback
-        "::ffff:10.0.0.5",                      // v4-mapped private
         "64:ff9b::7f00:1",                      // NAT64 with embedded loopback payload
         "64:ff9b::5db8:d822",                   // NAT64 with public payload, still blocked
     ] {
         deny(candidate);
     }
+    // v4-mapped private, octet-built so no dotted RFC-1918 quad is tracked.
+    deny(&format!("::ffff:{}", v4(10, 0, 0, 5)));
 }
 
 #[test]
