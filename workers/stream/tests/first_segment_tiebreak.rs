@@ -48,7 +48,7 @@ fn fixture_track(tag: &str, len: usize) -> (Vec<u8>, Vec<String>, Server) {
     let mut segments = Vec::new();
     for (i, chunk) in ciphered.chunks(SEG_LEN).enumerate() {
         let part = i as u32 + 1;
-        let mid = format!("<{tag}-seg{i}@synthetic.test>");
+        let mid = format!("{tag}-seg{i}@synthetic.test");
         articles.insert(
             mid.clone(),
             yenc::encode_part(
@@ -127,8 +127,8 @@ impl Server {
                 .map(|s| s.trim().trim_matches(|c| c == '<' || c == '>'))
             {
                 let full_mid = format!("<{mid}>");
-                fetched.lock().expect("fetched log").push(full_mid.clone());
-                match articles.get(&full_mid) {
+                fetched.lock().expect("fetched log").push(mid.to_string());
+                match articles.get(mid) {
                     Some(article) => {
                         let _ =
                             writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
@@ -337,8 +337,8 @@ impl StallServer {
                 .map(|s| s.trim().trim_matches(|c| c == '<' || c == '>'))
             {
                 let full_mid = format!("<{mid}>");
-                fetched.lock().expect("fetched log").push(full_mid.clone());
-                if full_mid == hang_mid {
+                fetched.lock().expect("fetched log").push(mid.to_string());
+                if mid == hang_mid {
                     // Hold the reply until shutdown: the client's short read
                     // deadline ends this fetch as a provider timeout.
                     while !stop.load(Ordering::SeqCst) {
@@ -346,7 +346,7 @@ impl StallServer {
                     }
                     break;
                 }
-                match articles.get(&full_mid) {
+                match articles.get(mid) {
                     Some(article) => {
                         let _ =
                             writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
@@ -402,7 +402,7 @@ fn truthful_articles(tag: &str, len: usize) -> (Vec<u8>, Vec<String>, HashMap<St
     let mut segments = Vec::new();
     for (i, chunk) in ciphered.chunks(SEG_LEN).enumerate() {
         let part = i as u32 + 1;
-        let mid = format!("<{tag}-seg{i}@synthetic.test>");
+        let mid = format!("{tag}-seg{i}@synthetic.test");
         articles.insert(
             mid.clone(),
             yenc::encode_part(

@@ -69,7 +69,7 @@
 //! disabled in `wrangler.toml.example` until that boundary lands.
 
 use futures_util::{Stream, StreamExt};
-use worker::{console_log, Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
+use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::dispatch::{
     content_sha256_hex, make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX,
@@ -487,13 +487,23 @@ async fn load_upload_parse(
         {
             Ok(Some(payload)) => payload,
             Ok(None) => return Err(unavailable()),
-            Err(error) => {
-                console_log!("ingest payload read failed: {:?}", error);
+            Err(_) => {
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                    "ingest.payload.read_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 return Err(unavailable());
             }
         },
-        Err(error) => {
-            console_log!("ingest payload binding unavailable: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.payload.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(unavailable());
         }
     };
@@ -682,15 +692,6 @@ fn apply_verify_outcome(
             // reads "over cap" here, not "provider lost it" — and no
             // `decide_repair` dispatch is spent on either arm.
             if size_refused_blocks > 0 {
-                // Worker-only line (`console_log!` aborts off-wasm):
-                // the terminal reason below already distinguishes the
-                // refusal class on every target.
-                #[cfg(target_arch = "wasm32")]
-                console_log!(
-                    "ingest verify unrecoverable: size-refused damage is terminal job={} refused={}",
-                    msg.job_id,
-                    size_refused_blocks
-                );
                 return Err(JobError::permanent(
                     ERR_VERIFY_FAILED,
                     "release has size-refused blocks beyond repair",
@@ -728,8 +729,13 @@ async fn run_verifying(
 ) -> Result<(), JobError> {
     let loaded = match crate::checkpoint::get_verify(env, &msg.job_id).await {
         Ok(loaded) => loaded,
-        Err(error) => {
-            console_log!("ingest verify progress read failed: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.verify_progress.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(JobError::transient(
                 ERR_VERIFY_FAILED,
                 "verify progress unavailable",
@@ -748,8 +754,13 @@ async fn run_verifying(
     };
     let bucket = match env.bucket(SCRATCH_BINDING) {
         Ok(bucket) => bucket,
-        Err(error) => {
-            console_log!("ingest scratch binding unavailable: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.scratch.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(JobError::transient(
                 ERR_VERIFY_FAILED,
                 "scratch storage unavailable",
@@ -790,15 +801,44 @@ async fn run_verifying(
     // Persist progress before the checkpoint settlement so a crash
     // between the two writes resumes from the older state with the
     // newer progress (scratch adoption covers a lost progress write).
-    if let Err(error) = crate::checkpoint::put_verify(env, &msg.job_id, &progress).await {
-        console_log!("ingest verify progress write failed: {:?}", error);
+    if crate::checkpoint::put_verify(env, &msg.job_id, &progress)
+        .await
+        .is_err()
+    {
+        crate::emit(
+            nntune_logging::Level::Error,
+            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+            "ingest.verify_progress.write_failed",
+            serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+        );
         return Err(JobError::transient(
             ERR_VERIFY_FAILED,
             "verify progress unavailable",
         ));
     }
     match outcome {
-        Ok(outcome) => apply_verify_outcome(msg, cp, outcome, made_progress),
+        Ok(outcome) => {
+            // Log at the edge, where build identity is available; keep the
+            // outcome-to-state mapping pure on both native and wasm targets.
+            if let VerifyOutcome::Unrecoverable {
+                size_refused_blocks,
+                ..
+            } = &outcome
+            {
+                if *size_refused_blocks > 0 {
+                    crate::emit(
+                        nntune_logging::Level::Error,
+                        &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                        "ingest.verify.size_refused_terminal",
+                        serde_json::json!({
+                            "build_sha": crate::build_sha_from_env(env),
+                            "size_refused_blocks": size_refused_blocks,
+                        }),
+                    );
+                }
+            }
+            apply_verify_outcome(msg, cp, outcome, made_progress)
+        }
         Err(VerifyError::Transient(detail)) => Err(JobError::transient(ERR_VERIFY_FAILED, detail)),
         Err(VerifyError::Permanent(detail)) => Err(JobError::permanent(ERR_VERIFY_FAILED, detail)),
     }
@@ -1056,8 +1096,13 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<Stri
         .cache_ttl(PAYLOAD_CACHE_TTL_SECS)
         .text()
         .await
-        .map_err(|error| {
-            console_log!("ingest match payload read failed: {:?}", error);
+        .map_err(|_| {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.match_payload.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             transient("upload payload unavailable")
         })
 }
@@ -1292,6 +1337,7 @@ trait MatchWriteRuntime {
 /// the Hyperdrive library upsert.
 struct EdgeMatchWrite<'a> {
     env: &'a Env,
+    trace_id: &'a str,
 }
 
 impl MatchWriteRuntime for EdgeMatchWrite<'_> {
@@ -1304,47 +1350,70 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
     }
 
     async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError> {
-        let client = crate::library_db_client(self.env)
-            .await
-            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
-        let params = crate::library::upsert_params(write);
-        let affected = client
-            .execute(
-                crate::library::upsert_library_sql(),
-                &[
-                    &params.job_id,
-                    &params.user_id,
-                    &params.idempotency_key,
-                    &params.release_mbid,
-                    &params.recording_mbids,
-                ],
-            )
-            .await
-            .map_err(|error| {
-                // Log the SQLSTATE only (never connection detail) and fail
-                // fast on deterministic classes: a schema mismatch such as
-                // the not-yet-migrated `library` table (42P01/42P10) must
-                // quarantine with an accurate reason, not burn the retry
-                // budget as "unavailable".
-                let sqlstate = error.as_db_error().map(|db| db.code().code());
-                console_log!(
-                    "ingest library upsert failed: sqlstate={}",
-                    sqlstate.unwrap_or("none")
-                );
-                if crate::library::is_deterministic_sqlstate(sqlstate) {
-                    JobError::permanent(ERR_WRITE_FAILED, "library database schema mismatch")
-                } else {
-                    JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
-                }
-            })?;
-        // The statement is fenced on the owner's users row: 0 affected
-        // rows means the account is being deleted. Fail permanently with
-        // the stable code — a fenced writer never queues behind the
-        // delete, and the (already-metered) match work must not settle
-        // as a phantom Done for a row that was never written. The mapping
-        // lives in [`crate::library::upsert_job_result`] (pinned there),
-        // so this arm stays a forward.
-        crate::library::upsert_job_result(affected)
+        // One deadline spans the connect plus the upsert: a stalled
+        // write expires to the same detail-free transient error a
+        // refused write returns, with the SQLSTATE fast-fail and the
+        // fenced row-count mapping kept inside the raced operation.
+        crate::library::with_db_deadline(
+            async {
+                let client = crate::library_db_client(self.env, self.trace_id)
+                    .await
+                    .map_err(|()| {
+                        JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                    })?;
+                let params = crate::library::upsert_params(write);
+                let affected = client
+                    .execute(
+                        crate::library::upsert_library_sql(),
+                        &[
+                            &params.job_id,
+                            &params.user_id,
+                            &params.idempotency_key,
+                            &params.release_mbid,
+                            &params.recording_mbids,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        // Log the SQLSTATE only (never connection detail) and fail
+                        // fast on deterministic classes: a schema mismatch such as
+                        // the not-yet-migrated `library` table (42P01/42P10) must
+                        // quarantine with an accurate reason, not burn the retry
+                        // budget as "unavailable".
+                        let sqlstate = error.as_db_error().map(|db| db.code().code());
+                        crate::emit(
+                            nntune_logging::Level::Error,
+                            self.trace_id,
+                            "ingest.library.upsert_failed",
+                            serde_json::json!({
+                                "build_sha": crate::build_sha_from_env(self.env),
+                                "sqlstate": sqlstate.unwrap_or("none"),
+                            }),
+                        );
+                        if crate::library::is_deterministic_sqlstate(sqlstate) {
+                            JobError::permanent(
+                                ERR_WRITE_FAILED,
+                                "library database schema mismatch",
+                            )
+                        } else {
+                            JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                        }
+                    })?;
+                // The statement is fenced on the owner's users row: 0 affected
+                // rows means the account is being deleted. Fail permanently with
+                // the stable code — a fenced writer never queues behind the
+                // delete, and the (already-metered) match work must not settle
+                // as a phantom Done for a row that was never written. The mapping
+                // lives in [`crate::library::upsert_job_result`] (pinned there),
+                // so this arm stays a forward.
+                crate::library::upsert_job_result(affected)
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || JobError::transient(ERR_WRITE_FAILED, "library database unavailable"),
+        )
+        .await
     }
 }
 
@@ -1409,7 +1478,16 @@ async fn run_match_write(
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
 ) -> Result<(), JobError> {
-    run_match_write_with(&EdgeMatchWrite { env }, msg, cp).await
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    run_match_write_with(
+        &EdgeMatchWrite {
+            env,
+            trace_id: &trace_id,
+        },
+        msg,
+        cp,
+    )
+    .await
 }
 
 /// Decide one delivery's settlement and whether the mutated checkpoint
@@ -1457,14 +1535,19 @@ fn persist_retry_delay_ms(failed_attempts: u32) -> Option<u64> {
     }
 }
 
-async fn persist(env: &Env, cp: &JobCheckpoint) -> bool {
+async fn persist(env: &Env, cp: &JobCheckpoint, trace_id: &str) -> bool {
     let mut failed_attempts = 0;
     loop {
         match crate::checkpoint::put(env, cp).await {
             Ok(()) => return true,
-            Err(error) => {
+            Err(_) => {
                 failed_attempts += 1;
-                console_log!("ingest checkpoint write failed: {:?}", error);
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    trace_id,
+                    "ingest.checkpoint.write_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 match persist_retry_delay_ms(failed_attempts) {
                     Some(delay_ms) => {
                         worker::Delay::from(std::time::Duration::from_millis(delay_ms)).await;
@@ -1490,8 +1573,13 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
             cp
         }
         Ok(None) => crate::checkpoint::initial(msg),
-        Err(error) => {
-            console_log!("ingest checkpoint read failed: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.checkpoint.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
         }
     };
@@ -1505,7 +1593,14 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
         Ok(())
     };
     let (must_persist, settlement) = plan_settlement(msg, &mut cp, step, step_ran);
-    if must_persist && !persist(env, &cp).await {
+    if must_persist
+        && !persist(
+            env,
+            &cp,
+            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+        )
+        .await
+    {
         return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
     }
     match settlement {
@@ -1542,30 +1637,50 @@ async fn send_continuation(env: &Env, msg: &QueueMsg) -> bool {
                 .await
             {
                 Ok(()) => true,
-                Err(error) => {
-                    console_log!("ingest continuation enqueue failed: {:?}", error);
+                Err(_) => {
+                    crate::emit(
+                        nntune_logging::Level::Error,
+                        &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                        "ingest.continuation.enqueue_failed",
+                        serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                    );
                     false
                 }
             }
         }
-        Err(error) => {
-            console_log!("ingest queue binding missing: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.continuation.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             false
         }
     }
 }
 
-async fn send_to_dlq(env: &Env, entry: &DlqEntry) -> bool {
+async fn send_to_dlq(env: &Env, entry: &DlqEntry, trace_id: &str) -> bool {
     match env.queue(DLQ_QUEUE_BINDING) {
         Ok(queue) => match queue.send(entry.clone()).await {
             Ok(()) => true,
-            Err(error) => {
-                console_log!("ingest DLQ send failed: {:?}", error);
+            Err(_) => {
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    trace_id,
+                    "ingest.dlq.send_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 false
             }
         },
-        Err(error) => {
-            console_log!("ingest DLQ binding missing: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                trace_id,
+                "ingest.dlq.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             false
         }
     }
@@ -1619,7 +1734,7 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
         Settlement::Quarantine(entry) => {
             // Never ack on DLQ-send failure: the redelivery re-plans from
             // the persisted `Failed` checkpoint and retries the send.
-            if send_to_dlq(env, &entry).await {
+            if send_to_dlq(env, &entry, &trace_id).await {
                 raw.ack()
             } else {
                 retry_raw(&raw, UNPERSISTED_RETRY_SECS)

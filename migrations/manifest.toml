@@ -99,6 +99,11 @@ target = "app"
 sha256 = "cd67e713c0da150acdcfa43a635a587818aaf6b8db4e7102040985291b6f8b4d"
 
 [[migration]]
-file = "0021_library_artifacts.sql"
+file = "0021_billing_schema.sql"
 target = "app"
-sha256 = "529cd3421478d0666542dd64a32db8f82fd0f483932c4b62b49caa40931c489f"
+sha256 = "ad1e437bff738a7a737ab8cd323fd0a9ff1e74e7e6f08730f186e5b71ab444a1"
+
+[[migration]]
+file = "0022_library_artifacts.sql"
+target = "app"
+sha256 = "74f0f93fae165fc27b79b89d09c54aed0df06f1a78be5672e4a52ba2256a6d95"

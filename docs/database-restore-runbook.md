@@ -151,12 +151,23 @@ forward-only (§4).
    3 and §7 RESTORE: confirm the KEK versions the restored rows need are
    still provisioned, and run the re-wrap pass over restored rows BEFORE
    reopening writes so no row stays pinned to a retired version. The
-   re-wrap runner and the versioned KEK map (`VAULT_KEK_V<N>`
-   per-version secrets + `VAULT_KEK_CURRENT` write-version var +
-   `rotation_runs` progress table) are **not implemented**
-   (`docs/security/kek-rotation.md` §7 NOT EXECUTABLE banner, §8 gate
-   items; the Worker reads only `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`):
-   a restore of a vault-bearing (app) database is blocked until they
+   versioned KEK map (`VAULT_KEK_V<N>` per-version secrets +
+   `VAULT_KEK_CURRENT` write-version var; `kek_set_from_lookup` in
+   `workers/api/src/worker_entry.rs`, `Config::kek_by_version` in
+   `workers/api/src/handlers.rs`, legacy single-key mode preserved) is
+   implemented, so confirming the restored rows' versions are
+   provisioned — re-provisioning a retired version's secret from the
+   operator store when the discovery window covers it — is executable.
+   That re-provisioning requires the serving Worker in versioned mode
+   (`VAULT_KEK_CURRENT` + `VAULT_KEK_V<N>` secrets: legacy single-key
+   mode serves exactly one version and cannot take a retired second one)
+   with the retired version inside the `CURRENT ± 8` discovery window;
+   outside the window the Worker never probes that secret and the rows
+   stay fail-closed unreadable.
+   The re-wrap runner and the `rotation_runs` progress table are still
+   **not implemented** (`docs/security/kek-rotation.md` §7 banner, §8
+   gate items): a restore that needs rows re-wrapped forward (rather
+   than merely read at their pinned versions) is blocked until they
    land. Retired key material stays in the operator store until the
    retire-after date (latest of re-wrap-complete + one window, oldest
    restorable backup/PITR horizon expiry) — a restore never justifies

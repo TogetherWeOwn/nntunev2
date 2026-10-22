@@ -1,4 +1,4 @@
--- Regression test for migration 0021. Run after
+-- Regression test for migration 0022. Run after
 -- ALL migrations are applied (see ../run_migration_tests.sh). Everything
 -- happens inside one transaction that is rolled back, so it leaves no rows;
 -- any broken expectation RAISEs and (with ON_ERROR_STOP) fails the run.
@@ -396,7 +396,7 @@ BEGIN
          'idx_track_media_track', 'idx_track_media_job',
          'idx_track_sources_track', 'idx_track_sources_job',
          'idx_tracks_mbid')) <> 7 THEN
-        RAISE EXCEPTION 'expected all seven 0021 access-path indexes to exist';
+        RAISE EXCEPTION 'expected all seven 0022 access-path indexes to exist';
     END IF;
 END $$;
 

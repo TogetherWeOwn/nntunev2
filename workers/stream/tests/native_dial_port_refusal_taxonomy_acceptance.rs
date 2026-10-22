@@ -480,7 +480,7 @@ fn small_track(tag: &str, len: usize) -> (Vec<u8>, Vec<String>, HashMap<String, 
         plain.push(((i * 7919 + tag.len()) % 256) as u8);
     }
     let ciphered: Vec<u8> = plain.iter().map(|b| b ^ CIPHER_KEY).collect();
-    let mid = format!("<{tag}-seg0@synthetic.test>");
+    let mid = format!("{tag}-seg0@synthetic.test");
     let text = yenc::encode_part(
         &ciphered,
         &format!("{tag}.flac"),
@@ -555,7 +555,7 @@ impl LoopbackNntp {
                 continue;
             };
             let full_mid = format!("<{mid}>");
-            match articles.get(&full_mid) {
+            match articles.get(mid) {
                 Some(article) => {
                     let _ = writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
                     for raw_line in article.split(|&b| b == b'\n') {

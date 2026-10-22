@@ -86,7 +86,7 @@ const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
 /// so bearer attempts share one per-client pool keyed on the client /64
 /// (IPv6) or full address (IPv4) BEFORE any credential DB work — the same
 /// two-layer shape as the finish-route lookup budget above. Denial answers
-/// the same generic 401 as any other bearer failure (no throttle oracle).
+/// the same plain 404 as any other bearer failure (no throttle oracle).
 /// 300 per minute admits legitimate API polling while capping a single
 /// client's DB amplification; 3000 per hour bounds sustained floods while
 /// admitting NAT-shared bursts. Both slots are claimed as one all-or-none
@@ -179,6 +179,14 @@ pub struct Config {
     pub session_secret: Vec<u8>,
     pub kek: [u8; 32],
     pub kek_version: u32,
+    /// Retained prior KEKs for mixed-version reads: `(version, key)` pairs
+    /// from the `VAULT_KEK_V<N>` per-version secrets. Order is irrelevant —
+    /// lookup is by exact version, and the current key always wins over a
+    /// retained entry for the same version (see [`Config::kek_by_version`]).
+    /// Empty in legacy single-key mode, where [`Config::new`] leaves it
+    /// untouched. Provisioned only by [`Config::with_prior_keks`]; the
+    /// Worker entry builds it from env, never from request input.
+    pub prior_keks: Vec<(u32, [u8; 32])>,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
     /// Verify-only previous session HMAC secret: `Some` only inside a
@@ -190,7 +198,8 @@ pub struct Config {
     /// `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` (see the
     /// Worker entry and `wrangler.toml.example`). Unprovisioned, issuance
     /// endpoints fail closed per-request (generic 500) and bearer routes
-    /// fail closed (401); every other route keeps serving, so
+    /// fail closed (plain 404, like header-absent callers); every other
+    /// route keeps serving, so
     /// provisioning the keyring is never a flag-day.
     pub native_rest_pepper: Option<Vec<u8>>,
     /// Version bound to [`Config::native_rest_pepper`]; stored per row and
@@ -252,6 +261,7 @@ impl Config {
             session_secret,
             kek,
             kek_version,
+            prior_keks: Vec::new(),
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
             session_previous_secret,
@@ -261,6 +271,40 @@ impl Config {
             qa_code_seam: false,
             qa_auth_token: None,
         })
+    }
+
+    /// Provision retained prior KEKs for mixed-version reads during a
+    /// rotation window (`docs/security/kek-rotation.md` §3): each
+    /// `(version, key)` pair comes from one `VAULT_KEK_V<N>` per-version
+    /// secret. The constructor leaves the set empty (legacy single-key
+    /// mode), so existing callers need no change; the Worker entry calls
+    /// this only after strict validation (unpadded-base64url decode plus
+    /// the 32-byte length, version parses as `u32`), like the native
+    /// keyring setter below. A retained entry for the current version
+    /// can never shadow the write key: [`Config::kek_by_version`]
+    /// checks the current key first.
+    pub fn with_prior_keks(mut self, prior_keks: Vec<(u32, [u8; 32])>) -> Self {
+        self.prior_keks = prior_keks;
+        self
+    }
+
+    /// Version-pinned KEK selector: exactly one candidate for `version` —
+    /// the current key when `version` is the configured write version,
+    /// else the retained prior for that version, else `None`. There is no
+    /// fallback loop and no fallthrough to another version's key: callers
+    /// map `None` (and any downstream AEAD failure) to the same generic
+    /// vault error, so an unknown version is indistinguishable from a bad
+    /// tag or a missing row. The current key wins over a same-version
+    /// retained entry by construction (checked first), so a stale prior
+    /// can neither shadow writes nor resurrect retired reads.
+    pub fn kek_by_version(&self, version: u32) -> Option<&[u8; 32]> {
+        if version == self.kek_version {
+            return Some(&self.kek);
+        }
+        self.prior_keks
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, key)| key)
     }
 
     /// Overlay operator-configured rate limits (from [vars]); the
@@ -2519,8 +2563,17 @@ where
         Ok(bytes) => bytes,
         Err(_) => return generic_vault(),
     };
+    // Encrypt through the selected current write version only: the
+    // selector resolves the configured current key (which always wins
+    // over a same-version retained entry), never a prior. `None` is
+    // unreachable by construction — the current version always selects
+    // the current key — and fails closed like every other vault error.
+    let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
+        Some(kek) => kek,
+        None => return generic_vault(),
+    };
     let blob = match vault::encrypt_vault(
-        &ctx.cfg.kek,
+        current_kek,
         ctx.cfg.kek_version,
         &claims.user_id,
         &plaintext,
@@ -2632,8 +2685,15 @@ where
             Ok(Some(row)) => row,
             _ => return fail(),
         };
-        match vault::decrypt_vault(&ctx.cfg.kek, &claims.user_id, &row.blob)
-            .ok()
+        // Version-pinned decrypt: exactly one candidate — the key for the
+        // stored row's own version. An unprovisioned version selects
+        // nothing (no fallback to the current key, no trying every key)
+        // and collapses into the same boolean as a bad tag or a missing
+        // row, so unknown versions are not an oracle.
+        match ctx
+            .cfg
+            .kek_by_version(row.blob.kek_version)
+            .and_then(|kek| vault::decrypt_vault(kek, &claims.user_id, &row.blob).ok())
             .and_then(|bytes| serde_json::from_slice::<VaultPayload>(&bytes).ok())
         {
             Some(payload) => (payload.provider, payload.indexer),
@@ -2752,18 +2812,6 @@ fn normalize_credential_label(raw: Option<&str>) -> Option<String> {
 
 fn validation_failed(message: &str) -> Response {
     let error = crate::api_error::ApiError::validation_failed(message);
-    Response {
-        status: error.status,
-        body: error.body_json(),
-        set_cookie: None,
-        retry_after: None,
-    }
-}
-
-fn credential_unauthorized() -> Response {
-    // Generic by construction: never says which check failed, never any
-    // secret material. Same outcome class as the core `CredentialError`.
-    let error = crate::api_error::ApiError::by_code("unauthorized", "invalid credential");
     Response {
         status: error.status,
         body: error.body_json(),
@@ -3002,14 +3050,17 @@ where
 /// HMAC or database work (unauthenticated bearer routes were plain 404s
 /// with no DB work before this credential class, so junk tokens must not
 /// buy Postgres connections). The lookup budget is claimed before the
-/// first query and its denial collapses to the same generic 401 (no
-/// throttle oracle), mirroring the finish-route lookup budget.
+/// first query and its denial collapses to the same plain 404 as any
+/// other bearer failure (no throttle oracle), mirroring the finish-route
+/// lookup budget.
 ///
-/// Failures map exactly like the core: unknown/tampered/revoked/expired
-/// (or an unprovisioned keyring) is the generic 401; a valid credential
-/// lacking the route's scope is the names-only 403. Successful use
-/// records `last_used_at` best-effort — its outcome never changes the
-/// decision, like audit writes.
+/// Every unauthenticated outcome — malformed, unknown, tampered,
+/// revoked, expired, or an unprovisioned keyring — is the same plain 404
+/// a header-absent caller receives (uniform posture: a presented bearer
+/// must not disclose route existence, and is never rescued by a cookie).
+/// Only a valid credential lacking the route's scope is distinct: the
+/// names-only 403. Successful use records `last_used_at` best-effort —
+/// its outcome never changes the decision, like audit writes.
 async fn authorize_bearer<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     authorization: Option<&str>,
@@ -3027,17 +3078,17 @@ where
     };
     let token = match extract_bearer_key(authorization) {
         Ok(token) => token,
-        Err(_) => return Err(credential_unauthorized()),
+        Err(_) => return Err(not_found()),
     };
     // Shape before HMAC/DB: random Authorization values cost no crypto
     // beyond the parse and no store work at all.
     if !is_plausible_credential_shape(token) {
-        return Err(credential_unauthorized());
+        return Err(not_found());
     }
     // Per-IP lookup budget BEFORE any credential DB work: a flood of
     // well-formed random `ntk_` tokens shares one pool (client /64 or
     // full address), claimed as one all-or-none pair so a burst-denied
-    // attempt burns neither budget. Denial is the generic 401.
+    // attempt burns neither budget. Denial is the plain 404.
     let ip_key = rate_limit_ip_key(&ctx.source_ip);
     let admitted = matches!(
         ctx.store
@@ -3060,7 +3111,7 @@ where
         Ok(PairAdmission::Allowed)
     );
     if !admitted {
-        return Err(credential_unauthorized());
+        return Err(not_found());
     }
     let peppers = ctx.cfg.native_rest_peppers();
     // Dual-pepper lookup: the presented secret is HMACed under each listed
@@ -3079,11 +3130,11 @@ where
                 break;
             }
             Ok(None) => {}
-            Err(_) => return Err(credential_unauthorized()),
+            Err(_) => return Err(not_found()),
         }
     }
     let Some(row) = found else {
-        return Err(credential_unauthorized());
+        return Err(not_found());
     };
     // The credential IS the identity on bearer routes: the owner check
     // runs against the row's own owner, and every downstream path
@@ -3097,7 +3148,7 @@ where
         &peppers,
     ) {
         Ok(()) => {}
-        Err(CredentialError::Unauthenticated) => return Err(credential_unauthorized()),
+        Err(CredentialError::Unauthenticated) => return Err(not_found()),
         Err(CredentialError::Forbidden) => return Err(scope_forbidden()),
         // Unreachable: `authorize` is pure verification and never mints.
         // Fail closed 503 if that ever changes.
@@ -3176,13 +3227,15 @@ where
 
 // --- Dispatch ------------------------------------------------------------------------------
 
-/// Every path the router serves. The Worker answers `OPTIONS` on exactly
-/// these paths with an empty 204 (the entry renders credentialed CORS
-/// headers only for an exact `Origin` match); anything else 404s, so a
-/// preflight never maps the API surface. The staging-only
-/// `POST /api/test-codes` seam is deliberately absent: its POST arm matches
-/// independently, and listing it here would answer `OPTIONS` with 204 in
-/// every posture — making the seam enumerable from production.
+/// Every exact path the router serves. The Worker answers `OPTIONS` on
+/// these paths — plus the single-segment dynamic revoke id and the
+/// scope-map-served native paths (see `options_preflight_served`) — with
+/// an empty 204 (the entry renders credentialed CORS headers only for an
+/// exact `Origin` match); anything else 404s, so a preflight never maps
+/// the API surface. The staging-only `POST /api/test-codes` seam is
+/// deliberately absent: its POST arm matches independently, and listing
+/// it here would answer `OPTIONS` with 204 in every posture — making the
+/// seam enumerable from production.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -3203,6 +3256,38 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault/test-connection"
             | "/v1/credentials"
     )
+}
+
+/// Paths a browser preflight may map: exact dispatch paths, the
+/// single-segment dynamic revoke id, and every scope-map-served native
+/// path (a lawful bearer HEAD revalidation or PATCH edit must clear
+/// preflight). Unserved shapes — unknown paths, empty or nested playlist
+/// segments, nested credential ids — stay 404, so a preflight never maps
+/// the API surface. A presented `Authorization` header never changes this
+/// posture (the OPTIONS method maps `Deny`, so the bearer gate is
+/// skipped): preflight answers the path, not the caller.
+fn options_preflight_served(path: &str) -> bool {
+    if is_known_path(path) {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("/v1/credentials/") {
+        return !rest.is_empty() && !rest.contains('/');
+    }
+    // Playlist subpaths preflight only as single items: nested,
+    // trailing-slash, or empty-segment shapes are denied before spend on
+    // every write method and have no dispatch reader, so they stay
+    // hidden on preflight too.
+    if let Some(rest) = path.strip_prefix("/v1/playlists/") {
+        if rest.is_empty() || rest.contains('/') {
+            return false;
+        }
+    }
+    ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+        .iter()
+        .any(|method| {
+            crate::native_rest::scope_for_operation(method, path)
+                != crate::native_rest::RouteDecision::Deny
+        })
 }
 
 /// Empty 204 for a preflight against a known path. Carries no ACA headers
@@ -3244,8 +3329,9 @@ where
         // Only a presented Authorization header enters the bearer gate:
         // header-absent callers (session cookies, anonymous) fall through
         // to the dispatch below (plain 404 until the data routes land).
-        // A presented-but-invalid bearer still fails closed here and is
-        // never rescued by a cookie.
+        // A presented-but-invalid bearer fails closed here with that same
+        // plain 404 — uniform posture, never a distinct 401 that would
+        // disclose route existence — and is never rescued by a cookie.
         if req.authorization.is_some() {
             if let Err(resp) = authorize_bearer(ctx, req.authorization.as_deref(), required).await {
                 return resp;
@@ -3275,23 +3361,16 @@ where
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Single-segment credential ids only; deeper shapes 404 inside
-        // the handler. The OPTIONS prefix below keeps browser preflights
+        // the handler. `options_preflight_served` keeps browser preflights
         // working for these dynamic paths (exact-path `is_known_path`
         // cannot name them).
         ("DELETE", path) if path.starts_with("/v1/credentials/") => {
             credentials_revoke(ctx, req).await
         }
-        // The revoke id is dynamic, so its preflight cannot be an exact
-        // `is_known_path` entry: match the same single-segment shape the
-        // handler serves (deeper shapes stay 404 on preflight too).
-        ("OPTIONS", path)
-            if is_known_path(path)
-                || path
-                    .strip_prefix("/v1/credentials/")
-                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
-        {
-            preflight_response()
-        }
+        // Preflight answers exactly the served paths (exact dispatch
+        // paths, the single-segment revoke id, and the scope-map-served
+        // native paths); unserved shapes stay 404 on preflight too.
+        ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
         _ => not_found(),
     }
 }
@@ -3425,6 +3504,9 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
+        /// Bearer-gate store-error pin: when set, the HMAC lookup fails
+        /// like a production query outage instead of answering Ok.
+        fail_native_credential_lookup: RefCell<bool>,
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
@@ -3888,6 +3970,9 @@ mod tests {
             key_hmac: &str,
         ) -> Result<Option<NativeCredentialRow>, StoreError> {
             *self.native_credential_lookups.borrow_mut() += 1;
+            if *self.fail_native_credential_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self
                 .native_credentials
                 .borrow()
@@ -5455,8 +5540,8 @@ mod tests {
             "successful bearer use records last_used_at"
         );
 
-        // Wrong scope is the names-only 403, never the 401 (which would
-        // claim the credential itself was bad).
+        // Wrong scope is the names-only 403, never the plain 404 (which
+        // hides route existence for unauthenticated callers).
         let forbidden = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {stream_secret}")));
         assert_eq!(forbidden.status, 403);
         assert_eq!(
@@ -5464,9 +5549,11 @@ mod tests {
             r#"{"code":"forbidden","message":"insufficient scope","retryable":false}"#
         );
 
-        // Presented-but-invalid bearers are the generic 401 — including
-        // malformed shapes (rejected before any HMAC/DB work) and a
-        // well-formed unknown key (fails closed after the lookup).
+        // Presented-but-invalid bearers are the same plain 404 a
+        // header-absent caller receives — including malformed shapes
+        // (rejected before any HMAC/DB work) and a well-formed unknown
+        // key (fails closed after the lookup). No distinct 401 may
+        // disclose route existence.
         for header in [
             Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
             Some(format!("Bearer ntk_{}", "0".repeat(43))),
@@ -5475,10 +5562,10 @@ mod tests {
             Some("__Host-nntune-session=abc123".to_string()),
         ] {
             let resp = h.call_bearer("GET", "/v1/search", header);
-            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(resp.status, 404, "{}", resp.body);
             assert_eq!(
                 resp.body,
-                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
             );
         }
 
@@ -5506,7 +5593,8 @@ mod tests {
         );
 
         // A presented bearer is never rescued by a session cookie: a valid
-        // cookie plus an invalid bearer is still the bearer 401.
+        // cookie plus an invalid bearer is still the plain 404 (uniform
+        // with the header-absent posture), never a distinct 401.
         let no_rescue = Request {
             method: "GET".to_string(),
             path: "/v1/search".to_string(),
@@ -5516,7 +5604,7 @@ mod tests {
             body: Vec::new(),
         };
         let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
-        assert_eq!(no_rescue.status, 401, "{}", no_rescue.body);
+        assert_eq!(no_rescue.status, 404, "{}", no_rescue.body);
 
         // And a valid bearer can never mint: issuance stays session-only.
         let bearer_mint_req = Request {
@@ -5539,7 +5627,7 @@ mod tests {
     fn malformed_bearer_shape_costs_no_store_work() {
         // ADR 0010 DoS pin: the shape gate must run BEFORE the per-IP
         // budget claim and the HMAC/DB lookup. A malformed token answers
-        // the generic 401 with zero `reserve_rate_limit_pair` calls and
+        // the plain 404 with zero `reserve_rate_limit_pair` calls and
         // zero `native_credential_by_hmac` lookups; a well-formed unknown
         // key reaches both and still fails closed. Short-circuiting the
         // `is_plausible_credential_shape` guard must fail here (both
@@ -5548,7 +5636,7 @@ mod tests {
         let pair_calls = || *h.store.rate_limit_pair_calls.borrow();
         let lookups = || *h.store.native_credential_lookups.borrow();
         let (base_pairs, base_lookups) = (pair_calls(), lookups());
-        // Each malformed shape: generic 401, no store work at all.
+        // Each malformed shape: plain 404, no store work at all.
         for header in [
             Some("Bearer ntk_short".to_string()),
             Some(format!("Bearer ntk_{}", "0".repeat(42))),
@@ -5556,10 +5644,10 @@ mod tests {
             Some("Bearer ntk_no-such-credential-000000000000000000".to_string()),
         ] {
             let resp = h.call_bearer("GET", "/v1/search", header);
-            assert_eq!(resp.status, 401, "{}", resp.body);
+            assert_eq!(resp.status, 404, "{}", resp.body);
             assert_eq!(
                 resp.body,
-                r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+                r#"{"code":"not_found","message":"not found","retryable":false}"#
             );
         }
         assert_eq!(
@@ -5580,7 +5668,7 @@ mod tests {
             "/v1/search",
             Some(format!("Bearer ntk_{}", "0".repeat(43))),
         );
-        assert_eq!(unknown.status, 401, "{}", unknown.body);
+        assert_eq!(unknown.status, 404, "{}", unknown.body);
         assert!(
             pair_calls() > base_pairs,
             "a well-formed key must claim the lookup budget"
@@ -5592,10 +5680,45 @@ mod tests {
     }
 
     #[test]
-    fn bearer_lookup_budget_denial_collapses_to_the_generic_401() {
+    fn bearer_store_error_collapses_to_the_plain_404() {
+        // Uniform-404 pin, store-error leg: a database failure during the
+        // bearer lookup must answer the same plain 404 a header-absent
+        // caller receives — never a distinct 401 that reopens the
+        // route-existence oracle on the error path. Reverting the lookup
+        // `Err` arm to the pre-slice 401 must fail here.
+        let h = peppered_harness();
+        *h.store.fail_native_credential_lookup.borrow_mut() = true;
+        let lookups = || *h.store.native_credential_lookups.borrow();
+        let base = lookups();
+        let header = Some(format!("Bearer ntk_{}", "0".repeat(43)));
+        let refused = h.call_bearer("GET", "/v1/search", header);
+        let absent = h.call_bearer("GET", "/v1/search", None);
+        assert_eq!(refused.status, 404, "{}", refused.body);
+        assert_eq!(absent.status, 404, "{}", absent.body);
+        assert_eq!(
+            refused.body, absent.body,
+            "store-error body must equal the header-absent body"
+        );
+        assert_eq!(
+            refused.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        assert!(refused.set_cookie.is_none(), "no session rescue/refresh");
+        assert!(
+            lookups() > base,
+            "the failing lookup must execute (else the Err arm is unpinned)"
+        );
+        assert!(
+            !refused.body.contains("ntk_"),
+            "no credential material in refusal"
+        );
+    }
+
+    #[test]
+    fn bearer_lookup_budget_denial_collapses_to_the_plain_404() {
         // ADR 0010 DoS: a flood of well-formed random `ntk_` tokens shares
         // one per-IP pool claimed before any credential DB work. Exhausting
-        // it denies with the SAME generic 401 as an unknown key (no
+        // it denies with the SAME plain 404 as an unknown key (no
         // throttle oracle), and even a valid credential is denied while
         // the budget is exhausted.
         let h = peppered_harness();
@@ -5630,13 +5753,13 @@ mod tests {
             assert!(admitted);
         }
 
-        // Now even the valid credential is denied — with the generic 401,
+        // Now even the valid credential is denied — with the plain 404,
         // never a 429 or any other shape.
         let denied = h.call_bearer("GET", "/v1/search", Some(format!("Bearer {secret}")));
-        assert_eq!(denied.status, 401, "{}", denied.body);
+        assert_eq!(denied.status, 404, "{}", denied.body);
         assert_eq!(
             denied.body,
-            r#"{"code":"unauthorized","message":"invalid credential","retryable":false}"#
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
         );
     }
 
@@ -5764,6 +5887,29 @@ mod tests {
         // Nested shapes are not credential ids: preflight stays 404 there.
         let resp = h.call_full("OPTIONS", "/v1/credentials/a/b", None, None, Some(ORIGIN));
         assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn options_preflight_pins_session_served_and_trailing_slash_posture() {
+        // Scope-map preflight pin, both legs the served-paths table leaves
+        // open: session-only paths answer 204 (a lawful cookie read must
+        // clear preflight), and the bare trailing-slash playlist shape
+        // stays 404. Narrowing the predicate to Bearer-only must fail the
+        // 204 legs; dropping the trailing-slash arm must fail the 404 leg
+        // (GET would map `/v1/playlists/` via the collection prefix).
+        let h = peppered_harness();
+        for path in ["/v1/me", "/v1/indexers"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "{path}");
+            assert!(resp.body.is_empty(), "{path}");
+        }
+        let resp = h.call_full("OPTIONS", "/v1/playlists/", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        assert!(resp.set_cookie.is_none());
     }
 
     #[test]
@@ -8833,7 +8979,13 @@ mod tests {
         for route in routes {
             let method = route["method"].as_str().expect("method");
             let path = route["path"].as_str().expect("path");
-            assert!(is_known_path(path), "{method} {path}");
+            // Exact dispatch paths plus the single-segment dynamic revoke
+            // id (exact-path `is_known_path` cannot name it).
+            let served = is_known_path(path)
+                || path
+                    .strip_prefix("/v1/credentials/")
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'));
+            assert!(served, "{method} {path}");
             let body = route.get("wire").map(|v| v.to_string());
             let resp = h.call_full(method, path, body, None, Some(ORIGIN));
             assert_ne!(resp.status, 404, "{method} {path}");
@@ -8874,6 +9026,9 @@ mod tests {
                 "vault-save" | "vault-test" => {
                     serde_json::from_value::<VaultPutBody>(wire.clone()).map(|_| ())
                 }
+                "credentials-mint" => {
+                    serde_json::from_value::<CredentialsMintBody>(wire.clone()).map(|_| ())
+                }
                 other => panic!("no handler body mapping for route {other}"),
             })
             .map_err(|e| e.to_string());
@@ -8887,8 +9042,8 @@ mod tests {
             pinned += 1;
         }
         assert_eq!(
-            pinned, 10,
-            "every body-bearing route (incl. the invite variant) is pinned"
+            pinned, 11,
+            "every body-bearing route (incl. the invite variant and the credentials mint) is pinned"
         );
     }
 

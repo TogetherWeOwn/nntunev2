@@ -599,6 +599,10 @@ describe('ApiClient', () => {
 				await client.saveProviderConfig(
 					route.input as unknown as Parameters<typeof client.saveProviderConfig>[0]
 				);
+			} else if (route.web === 'mintCredential') {
+				await client.mintCredential(
+					route.input as unknown as Parameters<typeof client.mintCredential>[0]
+				);
 			} else {
 				throw new Error(`fixture names an unknown client method: ${route.web}`);
 			}

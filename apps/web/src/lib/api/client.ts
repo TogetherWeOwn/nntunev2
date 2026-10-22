@@ -324,6 +324,54 @@ export function toLoginFinishBody(input: LoginFinishInput): Record<string, strin
 	};
 }
 
+/**
+ * Inputs for native-REST credential issuance. Pages pass camelCase fields
+ * and the builder emits the snake_case wire body the Worker parses
+ * (`deny_unknown_fields`). Wire shapes are pinned by
+ * `api-web-contract.json`.
+ */
+export interface CredentialsMintInput {
+	label?: string;
+	scopes: string[];
+	ttlSecs: number;
+}
+
+export function toCredentialsMintBody(input: CredentialsMintInput): Record<string, unknown> {
+	return {
+		...(input.label !== undefined ? { label: input.label } : {}),
+		scopes: input.scopes,
+		ttl_secs: input.ttlSecs
+	};
+}
+
+/**
+ * The one and only time the plaintext secret exists outside the client's
+ * hands: this 201 body. Callers must display it once and never store it.
+ */
+export interface MintedCredential {
+	id: string;
+	secret: string;
+	key_prefix: string;
+	scopes: string[];
+	expires_at: number;
+}
+
+/** One listed credential: routing and lifecycle facts only, never a secret. */
+export interface ListedCredential {
+	id: string;
+	label: string;
+	key_prefix: string;
+	scopes: string[];
+	created_at: number;
+	expires_at: number;
+	revoked_at: number | null;
+	last_used_at: number | null;
+}
+
+export interface CredentialsList {
+	credentials: ListedCredential[];
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -396,6 +444,27 @@ export class ApiClient {
 	/** Revoke every session for the authenticated account. */
 	async revokeAllSessions(): Promise<{ ok: true }> {
 		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	}
+
+	/**
+	 * Mint a native-REST bearer credential. Session-authenticated with a
+	 * fresh-session step-up; the 201 body carries the one-time secret, so
+	 * callers display it once and never store it.
+	 */
+	async mintCredential(input: CredentialsMintInput): Promise<MintedCredential> {
+		return this.post<MintedCredential>('/v1/credentials', toCredentialsMintBody(input));
+	}
+
+	/** List the account's native-REST credentials (lifecycle facts, no secrets). */
+	async listCredentials(): Promise<CredentialsList> {
+		return this.get<CredentialsList>('/v1/credentials');
+	}
+
+	/** Revoke one native-REST credential by id (owner-scoped, idempotent). */
+	async revokeCredential(id: string): Promise<{ ok: true }> {
+		return this.request<{ ok: true }>(`/v1/credentials/${encodeURIComponent(id)}`, {
+			method: 'DELETE'
+		});
 	}
 
 	/**
@@ -509,13 +578,21 @@ export class ApiClient {
 	/**
 	 * Live-test a provider (+ optional indexer) config without storing it.
 	 * The API validates (SSRF guard), dials, and returns a redacted result —
-	 * secrets never come back in the response.
+	 * secrets never come back in the response. The optional caller signal
+	 * lets the owning page fence a stale test: a pre-aborted signal sends no
+	 * request, and a response that arrives after abort — including a limit
+	 * response — rejects as an abort instead of publishing a paywall.
 	 */
-	async testProviderConnection(input: ProviderTestInput, retry?: () => void): Promise<ProviderTestResult> {
+	async testProviderConnection(
+		input: ProviderTestInput,
+		retry?: () => void,
+		signal?: AbortSignal
+	): Promise<ProviderTestResult> {
 		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(toVaultSaveBody(input))
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
 		}, retry);
 		return validateVaultTestResult(data, status);
 	}
@@ -523,10 +600,16 @@ export class ApiClient {
 	/**
 	 * Store a tested provider (+ optional indexer) config in the encrypted
 	 * vault. The API seals secrets with envelope encryption; responses are
-	 * redacted summaries, never secret material.
+	 * redacted summaries, never secret material. The optional caller signal
+	 * fences a stale save the same way as the connection test above.
 	 */
-	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
+	async saveProviderConfig(input: ProviderTestInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/vault', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
+		});
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
