@@ -2,14 +2,16 @@ import { expect, test, type Page } from '@playwright/test';
 
 /**
  * Loudness leveling over the demo player, mocked at the gain node: the page
- * exposes `__levelingProbe` (enabled/track/linear) so the specs assert the
- * resolved gain per fixture track without measuring real audio output.
+ * exposes `__levelingProbe` (enabled/track/linear/contextState) so the specs
+ * assert the resolved gain per fixture track without measuring real audio
+ * output, and pin that playback resumes a suspended leveling context.
  */
 
 interface LevelingProbe {
 	enabled: boolean;
 	trackId: string | null;
 	linear: number;
+	contextState: string;
 }
 
 const STORAGE_KEY = 'nntune.leveling.enabled';
@@ -27,6 +29,19 @@ async function levelingProbe(page: Page): Promise<LevelingProbe> {
 		if (!probe) throw new Error('leveling probe missing');
 		return probe();
 	});
+}
+
+/**
+ * Wait for client hydration: the probe only exists once Svelte mounts, so
+ * specs that interact before any probe poll must wait for it first —
+ * otherwise SSR markup can satisfy assertions while clicks get lost.
+ */
+async function waitForLevelingProbe(page: Page): Promise<void> {
+	await page.waitForFunction(
+		() =>
+			typeof (window as unknown as { __levelingProbe?: unknown }).__levelingProbe ===
+			'function'
+	);
 }
 
 /** Poll until the probe reports the track with its leveled gain. */
@@ -62,6 +77,7 @@ test('leveling defaults to on with per-fixture leveled gains', async ({ page }) 
 
 test('disabling the toggle drives unity gain and persists across reload', async ({ page }) => {
 	await page.goto('/demo/player');
+	await waitForLevelingProbe(page);
 
 	const toggle = page.getByTestId('leveling-toggle');
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
@@ -85,6 +101,7 @@ test('disabling the toggle drives unity gain and persists across reload', async 
 
 test('toggle is keyboard reachable with its state announced', async ({ page }) => {
 	await page.goto('/demo/player');
+	await waitForLevelingProbe(page);
 
 	const toggle = page.getByTestId('leveling-toggle');
 	await expect(toggle).toHaveAccessibleName('Loudness leveling');
@@ -95,4 +112,20 @@ test('toggle is keyboard reachable with its state announced', async ({ page }) =
 
 	await page.keyboard.press('Enter');
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('starting playback resumes the leveling context', async ({ page }) => {
+	await page.goto('/demo/player');
+	await waitForLevelingProbe(page);
+
+	// Re-selecting the current track starts playback without changing the
+	// track, so the leveling effect does not re-run: the play path's
+	// resume retry is what guarantees the routed context ends up running
+	// rather than muting playback while suspended. (Headless Chromium
+	// starts contexts running, so this pins the required end state as a
+	// tripwire; the suspended-then-resumed transition itself is exercised
+	// in strict-autoplay browsers, where the mount-time resume pends and
+	// only a play-gesture retry completes it.)
+	await page.getByTestId('queue-select-demo-track').click();
+	await expect.poll(async () => (await levelingProbe(page)).contextState).toBe('running');
 });

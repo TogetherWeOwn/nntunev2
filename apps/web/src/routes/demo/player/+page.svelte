@@ -120,11 +120,21 @@
 		const node = ensureLevelingGraph();
 		if (node) {
 			applyGainToNode(node, linear);
-			void levelingCtx?.resume().catch(() => {
-				// Autoplay policy can keep the context suspended until a user
-				// gesture; the gain is already set for when it resumes.
-			});
+			resumeLevelingContext();
 		}
+	}
+
+	/**
+	 * Best-effort resume of the page-local leveling context. The mount-time
+	 * resume can reject under autoplay policy (no user activation yet), and
+	 * a suspended context renders routed playback silent — so every play
+	 * path retries it inside the user's gesture.
+	 */
+	function resumeLevelingContext(): void {
+		if (!levelingCtx || levelingCtx.state === 'running') return;
+		void levelingCtx.resume().catch(() => {
+			// Still suspended; the next user-initiated play retries.
+		});
 	}
 
 	function setLevelingEnabled(enabled: boolean): void {
@@ -134,6 +144,9 @@
 
 	function playCurrent(reload = false): void {
 		if (!current) return;
+		// A play press is a user gesture: retry the mount-time resume so a
+		// suspended leveling context cannot mute this playback.
+		resumeLevelingContext();
 		// A failed media resource needs a fresh load even when its URL is
 		// unchanged. A keyed element also fences queued events from that load.
 		if (reload || status === 'error') sourceRevision += 1;
@@ -167,12 +180,18 @@
 		// A queued play event can arrive after a newer pause. The element's
 		// current paused flag distinguishes that from an explicit native resume.
 		if (!eventForCurrent(event) || (event.currentTarget as HTMLAudioElement).paused) return;
+		// Native controls bypass playCurrent: retry the resume on the gesture.
+		resumeLevelingContext();
 		if (status === 'error') playCurrent(true);
 		else if (status !== 'playing') status = 'loading';
 	}
 
 	function handlePlaying(event: Event): void {
-		if (eventForCurrent(event) && (status === 'loading' || status === 'playing')) status = 'playing';
+		if (!eventForCurrent(event)) return;
+		// Media Session and programmatic plays also land here; retry the
+		// resume so routed playback is never stuck silent.
+		resumeLevelingContext();
+		if (status === 'loading' || status === 'playing') status = 'playing';
 	}
 
 	function handlePause(event: Event): void {
@@ -291,12 +310,18 @@
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		(
 			window as unknown as {
-				__levelingProbe?: () => { enabled: boolean; trackId: string | null; linear: number };
+				__levelingProbe?: () => {
+					enabled: boolean;
+					trackId: string | null;
+					linear: number;
+					contextState: AudioContextState | 'unavailable';
+				};
 			}
 		).__levelingProbe = () => ({
 			enabled: levelingEnabled,
 			trackId: current?.id ?? null,
-			linear: levelingLinear
+			linear: levelingLinear,
+			contextState: levelingCtx?.state ?? 'unavailable'
 		});
 		try {
 			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
@@ -308,6 +333,15 @@
 		// OS media controls are global: release them when the page goes away.
 		return () => {
 			clearMediaSession();
+			// The leveling graph is page-local: close the context so repeat
+			// visits cannot exhaust the browser's context limit, and drop
+			// the probe so later visits never read stale state.
+			void levelingCtx?.close().catch(() => {});
+			levelingCtx = null;
+			levelingSource = null;
+			levelingGain = null;
+			wiredEl = null;
+			delete (window as unknown as { __levelingProbe?: unknown }).__levelingProbe;
 		};
 	});
 </script>
