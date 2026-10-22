@@ -436,7 +436,7 @@ test('malformed entries carrying secrets are never echoed or scored', () => {
     release: CANARIES[0], route: CANARIES[1], error_class: CANARIES[0], secret: CANARIES[3],
   }];
   const got = evaluate(observations, policyFixture({ min_invocations: 3 }));
-  assert.equal(got.counts.malformed, 1);
+  assert.equal(got.counts.excluded, 1);
   assert.equal(got.counts.failed, 0);
   assert.deepEqual(got.counts.by_flag, { http_5xx: 0, exception: 0, exceeded_cpu: 0, exceeded_memory: 0 });
 });
