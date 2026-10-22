@@ -74,6 +74,16 @@ fn store(production: &str) -> &str {
     function_body(implementation, "asyncfnconnect(&self)")
 }
 
+fn pgstore_impl(production: &str) -> &str {
+    production
+        .split_once("implPgStore{")
+        .expect("PgStore impl")
+        .1
+        .split_once("fnuser_from_row(")
+        .expect("following function bounds PgStore")
+        .0
+}
+
 struct Call<'a> {
     args: Vec<&'a str>,
     after: &'a str,
@@ -271,9 +281,17 @@ fn returned_client_finishes_setting_statement_timeout_to_the_overall_budget() {
 fn background_connection_error_keeps_the_existing_redacted_build_identity() {
     let source = production();
     let connect = store(&source);
-    assert!(connect.contains("connection.await.is_err()"));
-    assert!(connect.contains("\"api.db.connection_error\""));
-    let fields = calls(connect, "json!");
+    assert!(
+        connect.contains("Self::connection_diagnostic(connection,&trace_id,&build_sha)"),
+        "connect must delegate the driver to connection_diagnostic with the request trace"
+    );
+    // The emit site lives in the shared helper, so payload pins slice the
+    // whole PgStore impl block (mirroring the store_body pin), not just
+    // the connect body.
+    let pgstore = pgstore_impl(&source);
+    assert!(pgstore.contains("connection.await.is_err()"));
+    assert!(pgstore.contains("\"api.db.connection_error\""));
+    let fields = calls(pgstore, "json!");
     assert!(
         !fields.is_empty(),
         "connection error keeps structured fields"
