@@ -4,7 +4,7 @@ JSON vectors + checker for the TWO-bot consumption contract, banked ahead
 of the B-chain runtime work so the B8 staging harness consumes them later.
 Offline only: no staging, no network, no real credentials.
 
-- Vectors: `grants.json` (14), `signed-url.json` (19), `profile-matrix.json` (32).
+- Vectors: `grants.json` (20), `signed-url.json` (19), `profile-matrix.json` (32).
 - Checker: `e2e/helpers/bot-contract.ts` (`checkGrantVector`,
   `checkSignedUrlVector`, `checkMatrixRow`).
 - Executable pins: `e2e/tests/bot-contract.spec.ts` (runs in
@@ -97,9 +97,17 @@ with the exact reason:
 
 Cross-language proof (run locally, not in CI): every corpus token was
 additionally verified with the real `grant::verify` compiled standalone
-via `rustc` (no cargo), and the TS checker agrees with it 21/21; the
-crypto primitives reproduce the RFC 4231 and `sha256("abc")` vectors both
-implementations pin.
+via `rustc` (no cargo), and the TS checker agrees with it 28/28 (20 grant
+vectors plus 8 decisive URL-embedded grants); the crypto primitives
+reproduce the RFC 4231 and `sha256("abc")` vectors both implementations pin.
+
+The expiry boundary vectors (`botgrant-015` through `botgrant-020`) cover
+2^53 - 1, 2^53, 2^53 + 1, leading-plus 2^53 + 1, u64 maximum, and u64
+overflow. Parsing and TTL arithmetic use `BigInt` before narrowing to the
+corpus's JSON-safe successful outputs: in-range huge expiries reject as
+`ttl-too-long`, while u64 overflow remains `malformed`. The existing
+corpus test failed before the parser fix (four diagnostic mismatches)
+and passes after it; no spec assertion was changed.
 
 ## Minting new vectors
 

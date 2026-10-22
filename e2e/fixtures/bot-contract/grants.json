@@ -113,6 +113,54 @@
       "secret": "corpus",
       "now_unix": 1699999999,
       "expect": { "ok": true, "user_id": "user-1", "track_id": "track-9", "exp_unix": 1700000000 }
+    },
+    {
+      "id": "botgrant-015",
+      "title": "largest safe integer expiry remains over TTL",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8OTAwNzE5OTI1NDc0MDk5MQ.RCVaEe_9Y_cWkpl67YZstWOqW0NxC1OJuFM_Ec3ITck",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-016",
+      "title": "expiry at 2^53 rejects as over TTL, not malformed",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8OTAwNzE5OTI1NDc0MDk5Mg.jYfJyDpYsgQEkpJXhjIkmtAbspbZ_Gfk1v60B28Qew0",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-017",
+      "title": "expiry at 2^53 + 1 retains the Rust TTL reason",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8OTAwNzE5OTI1NDc0MDk5Mw.yZtwf7s4UEz4cCHzQRNyFquIjGkABWv8Ndtxvb2ninM",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-018",
+      "title": "leading-plus expiry above 2^53 retains the Rust TTL reason",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8KzkwMDcxOTkyNTQ3NDA5OTM.d5h4BZs8MScG3UkfnFBOhxpml1vumGWpSS7lP-0kX6w",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-019",
+      "title": "u64 maximum expiry is valid syntax but over TTL",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTg0NDY3NDQwNzM3MDk1NTE2MTU.EtockC3U-LorvVHuW2ZIubvbk7mOU0Zr-xh3L8eQ5yA",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "ttl-too-long" }
+    },
+    {
+      "id": "botgrant-020",
+      "title": "expiry above u64 maximum rejects as malformed",
+      "token": "v1.dXNlci0xfHRyYWNrLTl8MTg0NDY3NDQwNzM3MDk1NTE2MTY.EIG-hz5jDpXICNzVqOBw91YnYiT37rgHZGph-_YkDy0",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "malformed" }
     }
   ]
 }

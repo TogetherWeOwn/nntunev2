@@ -204,12 +204,17 @@ export function verifyGrant(
   // Rust `str::parse::<u64>()` accepts one leading `+`: mirror it exactly
   // (a `+exp` token verifies under `grant::verify`, so the checker must too).
   if (!/^\+?[0-9]+$/.test(expRaw)) return fail<ParsedGrant>('malformed');
-  const expUnix = Number(expRaw);
-  if (!Number.isSafeInteger(expUnix)) return fail<ParsedGrant>('malformed');
-  if (nowUnix >= expUnix) return fail<ParsedGrant>('expired');
-  if (expUnix - nowUnix > BOT_CONTRACT.maxGrantTtlSecs + BOT_CONTRACT.clockSkewSecs) {
+  // Parse the full Rust u64 domain before narrowing to the corpus's numeric
+  // output: a huge but valid expiry is over TTL, not malformed syntax.
+  const expBig = BigInt(expRaw);
+  if (expBig > 18446744073709551615n) return fail<ParsedGrant>('malformed');
+  const nowBig = BigInt(nowUnix);
+  if (nowBig >= expBig) return fail<ParsedGrant>('expired');
+  if (expBig - nowBig > BigInt(BOT_CONTRACT.maxGrantTtlSecs + BOT_CONTRACT.clockSkewSecs)) {
     return fail<ParsedGrant>('ttl-too-long');
   }
+  const expUnix = Number(expBig);
+  if (!Number.isSafeInteger(expUnix)) return fail<ParsedGrant>('malformed');
   return { ok: true, value: { userId, trackId, expUnix } };
 }
 
