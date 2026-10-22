@@ -134,7 +134,7 @@ fn fake_480_481_replies_drive_play_to_provider_auth_expired_without_quarantine()
         let mut cache = ContentCache::new();
         let mut meter = MemoryMeter::default();
         let token = grant::issue_at("user-1", "track-a", 1_700_000_000, 60, SECRET);
-        let segments = vec!["<a-seg0@synthetic.test>".to_string()];
+        let segments = vec!["a-seg0@synthetic.test".to_string()];
         let input = PlayInput {
             trace_id: None,
             token: &token,

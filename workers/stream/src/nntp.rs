@@ -112,30 +112,14 @@ fn parse_status_code(line: &str) -> Option<u16> {
     Some(code)
 }
 
-/// Whether `mid` (outer whitespace / `<>` already stripped) is safe to put
-/// on the wire inside `BODY <…>`: RFC 5536 msg-id shape (bracketless form),
-/// so a hostile NZB cannot smuggle CR/LF (extra NNTP commands) or
-/// desynchronize the pooled connection.
-///
-/// Rules (mirrors `workers/ingest` `validate_message_id` at its own
-/// 250-byte adapter ceiling): 1..=250 bytes, printable ASCII (`0x21..=0x7E`)
-/// only, no `<`/`>`, exactly one `@` with non-empty local and domain sides.
+/// Whether `mid` is safe to put on the wire inside `BODY <…>`: the shared
+/// segment-identity rule
+/// ([`nntune_core::segment_identity::valid_segment_id`], documented once
+/// there), validated byte-for-byte as given — never stripped or otherwise
+/// normalized — so a hostile NZB cannot smuggle CR/LF (extra NNTP
+/// commands) or desynchronize the pooled connection.
 pub fn valid_message_id(mid: &str) -> bool {
-    const MAX_LEN: usize = 250;
-    if mid.is_empty() || mid.len() > MAX_LEN {
-        return false;
-    }
-    if !mid.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return false;
-    }
-    if mid.contains('<') || mid.contains('>') {
-        return false;
-    }
-    let mut parts = mid.split('@');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(local), Some(domain), None) if !local.is_empty() && !domain.is_empty()
-    )
+    nntune_core::segment_identity::valid_segment_id(mid)
 }
 
 impl From<std::io::Error> for NntpError {
@@ -317,11 +301,10 @@ impl NntpClient {
         message_id: &str,
         deadline: &NntpDeadline,
     ) -> Result<Vec<u8>, NntpError> {
-        let mid = message_id.trim().trim_matches(|c| c == '<' || c == '>');
-        if !valid_message_id(mid) {
+        if !valid_message_id(message_id) {
             return Err(NntpError::InvalidMessageId(message_id.to_string()));
         }
-        let cmd = format!("BODY <{mid}>\r\n");
+        let cmd = format!("BODY <{message_id}>\r\n");
         let write_timeout = self.read_timeout.min(deadline.remaining()?);
         self.reader
             .get_mut()
@@ -500,7 +483,7 @@ mod tests {
         assert!(!valid_message_id("a<b@c"));
         assert!(!valid_message_id(&"a".repeat(251)));
         assert!(valid_message_id(&format!("{}@c", "a".repeat(248))));
-        // Shape rules (mirrors ingest `validate_message_id`): exactly one
+        // Shape rules (the shared segment-identity rule): exactly one
         // `@` with non-empty sides, printable ASCII only.
         assert!(!valid_message_id("not-an-id"));
         assert!(!valid_message_id("a@b@c"));
@@ -567,7 +550,7 @@ mod tests {
         let mut client =
             NntpClient::connect_with_timeouts(&addr, timeouts).expect("greeting arrives");
         let err = client
-            .article("<hung-seg0@synthetic.test>")
+            .article("hung-seg0@synthetic.test")
             .expect_err("hung upstream must time out");
         let elapsed = t0.elapsed();
         assert!(
@@ -616,7 +599,7 @@ mod tests {
             NntpClient::connect_with_timeouts(&addr, timeouts).expect("greeting arrives");
         let started = std::time::Instant::now();
         let error = client
-            .article("<trickle-seg0@synthetic.test>")
+            .article("trickle-seg0@synthetic.test")
             .expect_err("a trickling article must hit its operation deadline");
         let elapsed = started.elapsed();
         stop.store(true, Ordering::Relaxed);
@@ -670,7 +653,7 @@ mod tests {
         let mut client = NntpClient::connect_with_deadline(&addr, timeouts, &deadline)
             .expect("greeting still arrives within budget");
         let err = client
-            .article_with_deadline("<delayed-seg0@synthetic.test>", &deadline)
+            .article_with_deadline("delayed-seg0@synthetic.test", &deadline)
             .expect_err("silent article after a delayed greeting must time out");
         let elapsed = t0.elapsed();
 
