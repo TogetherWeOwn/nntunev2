@@ -389,6 +389,37 @@ async fn release_rate_limit_slot(
     Ok(())
 }
 
+/// Race `future` against a `timeout_ms` budget, returning the caller's
+/// opaque `error` on expiry. [`PgStore::connect`] uses this with the vault
+/// dial/total budgets; the timer is platform-appropriate (Worker `Delay`
+/// on wasm32, `futures-timer` natively). Expiry wins ties; both futures
+/// drop before the caller observes the result.
+pub async fn with_deadline<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+    timeout_ms: u64,
+    error: E,
+) -> Result<T, E> {
+    let duration = Duration::from_millis(timeout_ms);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = Delay::from(duration);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut future = std::pin::pin!(future);
+    let mut error = Some(error);
+    std::future::poll_fn(|cx| {
+        // Worker Delay arms on first poll, so poll it before starting I/O.
+        // Expiry wins if both become ready together; there is no late retry.
+        if deadline.as_mut().poll(cx).is_ready() {
+            let error = error.take().expect("deadline fires once");
+            return std::task::Poll::Ready(Err(error));
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the caller observes the result.
+}
+
 struct PgStore {
     env: Env,
     trace_id: String,
@@ -396,30 +427,55 @@ struct PgStore {
 
 impl PgStore {
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
-        let hyperdrive = self
-            .env
-            .hyperdrive(HYPERDRIVE_BINDING)
-            .map_err(|_| StoreError)?;
-        let socket = worker::Socket::builder()
-            .secure_transport(worker::SecureTransport::StartTls)
-            .connect(hyperdrive.host(), hyperdrive.port())
-            .map_err(|_| StoreError)?;
-        let config: tokio_postgres::Config = hyperdrive
-            .connection_string()
-            .parse()
-            .map_err(|_| StoreError)?;
-        let (client, connection) = config
-            .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-            .await
-            .map_err(|_| StoreError)?;
-        // The driver outlives the handler but still belongs to this request.
-        // Own its resolved trace and normalized build identity in the task.
-        let trace_id = self.trace_id.clone();
-        let build_sha = build_sha_from_env(&self.env);
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
-        });
-        Ok(client)
+        // One overall budget encloses dial, handshake, driver spawn, and
+        // statement setup: the handshake and SET consume the time left
+        // after dial rather than resetting the clock.
+        with_deadline(
+            async {
+                let hyperdrive = self
+                    .env
+                    .hyperdrive(HYPERDRIVE_BINDING)
+                    .map_err(|_| StoreError)?;
+                let socket = worker::Socket::builder()
+                    .secure_transport(worker::SecureTransport::StartTls)
+                    .connect(hyperdrive.host(), hyperdrive.port())
+                    .map_err(|_| StoreError)?;
+                // The builder connect is synchronous; the actual dial
+                // completes when the socket opens, bounded by the vault
+                // dial budget shared with the test-connection probe.
+                with_deadline(
+                    async { socket.opened().await.map(|_| ()).map_err(|_| StoreError) },
+                    DIAL_TIMEOUT_MS,
+                    StoreError,
+                )
+                .await?;
+                let config: tokio_postgres::Config = hyperdrive
+                    .connection_string()
+                    .parse()
+                    .map_err(|_| StoreError)?;
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The driver outlives the handler but still belongs to this request.
+                // Own its resolved trace and normalized build identity in the task.
+                let trace_id = self.trace_id.clone();
+                let build_sha = build_sha_from_env(&self.env);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
+                });
+                // Connect-time SET of the total budget; Hyperdrive RESETs
+                // pooled backends, so per-query bounds are separate work.
+                client
+                    .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(client)
+            },
+            TOTAL_TIMEOUT_MS,
+            StoreError,
+        )
+        .await
     }
 
     async fn connection_diagnostic<F, E>(
