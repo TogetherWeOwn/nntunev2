@@ -878,7 +878,7 @@ impl Server {
             {
                 bodies.fetch_add(1, Ordering::SeqCst);
                 let full_mid = format!("<{mid}>");
-                match articles.get(&full_mid) {
+                match articles.get(mid) {
                     Some(article) => {
                         let _ =
                             writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
@@ -932,10 +932,7 @@ fn live_fixture() -> LiveFixture {
     let mut segments = Vec::new();
     for (i, chunk) in plain.chunks(SEG_LEN).enumerate() {
         let part = i as u32 + 1;
-        // Bracketed spelling keys the fixture server's article map; play
-        // segments below carry the bare shared-rule identity.
-        let mid = format!("<slice-u64-seg{i}@synthetic.test>");
-        let bare = format!("slice-u64-seg{i}@synthetic.test");
+        let mid = format!("slice-u64-seg{i}@synthetic.test");
         articles.insert(
             mid.clone(),
             yenc::encode_part(
@@ -950,7 +947,7 @@ fn live_fixture() -> LiveFixture {
                 },
             ),
         );
-        segments.push(bare);
+        segments.push(mid);
     }
     let ranges = [(0u64, SEG_LEN as u64), (SEG_LEN as u64, BODY_LEN as u64)];
     (plain, segments, ranges, Server::start(articles))

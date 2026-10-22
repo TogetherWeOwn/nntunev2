@@ -118,10 +118,7 @@ fn fixture_track(tag: &str, len: usize, seg_len: usize) -> Fixture {
     let mut segments = Vec::new();
     for (i, chunk) in ciphered.chunks(seg_len).enumerate() {
         let part = i as u32 + 1;
-        // Bracketed spelling keys the fixture server's article map; play
-        // segments below carry the bare shared-rule identity.
-        let mid = format!("<{tag}-seg{i}@synthetic.test>");
-        let bare = format!("{tag}-seg{i}@synthetic.test");
+        let mid = format!("{tag}-seg{i}@synthetic.test");
         let text = yenc::encode_part(
             chunk,
             &format!("{tag}.flac"),
@@ -134,7 +131,7 @@ fn fixture_track(tag: &str, len: usize, seg_len: usize) -> Fixture {
             },
         );
         articles.insert(mid.clone(), text);
-        segments.push(bare);
+        segments.push(mid);
     }
     (plain, segments, articles)
 }
@@ -200,7 +197,7 @@ impl FakeNntp {
             {
                 bodies.fetch_add(1, Ordering::SeqCst);
                 let full_mid = format!("<{mid}>");
-                match articles.get(&full_mid) {
+                match articles.get(mid) {
                     Some(article) => {
                         let _ =
                             writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
