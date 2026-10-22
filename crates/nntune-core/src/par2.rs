@@ -75,8 +75,8 @@ pub const MAX_BLOCK_SIZE: u64 = 256 << 20;
 /// not on each per-path digest map, so disjoint FileDesc and IFSC identities
 /// cannot double the bound mid-stream.) Real sets describe a handful of
 /// files (Usenet posts: one to a few dozen), so 4096 is two orders of
-/// magnitude of headroom while bounding the retained metadata to a few
-/// megabytes worst case.
+/// magnitude of headroom. This bounds file identities, not retained bytes:
+/// individual FileDesc names and IFSC checksum lists are not byte-capped.
 pub const MAX_PAR2_FILES: usize = 4_096;
 
 /// Largest number of distinct recovery-slice exponents a builder retains.
