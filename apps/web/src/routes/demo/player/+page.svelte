@@ -46,6 +46,7 @@
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let shortcutsOpen = $state(false);
+	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
 
 	const current = $derived(currentTrack(queue));
@@ -160,13 +161,17 @@
 		void playback.unload();
 	}
 
-	function openShortcuts(): void {
+	async function openShortcuts(): Promise<void> {
 		if (shortcutsOpen) return;
 		shortcutsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		shortcutsOpen = true;
+		await tick();
+		// Native modality moves focus to Close and makes the background inert.
+		if (shortcutsOpen) shortcutsDialogEl?.showModal();
 	}
 
 	function closeShortcuts(): void {
+		shortcutsDialogEl?.close();
 		shortcutsOpen = false;
 		shortcutsOpener?.focus();
 	}
@@ -365,7 +370,15 @@
 	</div>
 
 	{#if shortcutsOpen}
-		<div data-testid="shortcuts-dialog" role="dialog" aria-label="Keyboard shortcuts">
+		<dialog
+			bind:this={shortcutsDialogEl}
+			data-testid="shortcuts-dialog"
+			aria-label="Keyboard shortcuts"
+			oncancel={(event) => {
+				event.preventDefault();
+				closeShortcuts();
+			}}
+		>
 			<h2>Keyboard shortcuts</h2>
 			<ul>
 				{#each SHORTCUT_ROWS as row (row.key)}
@@ -375,7 +388,7 @@
 			<button type="button" data-testid="shortcuts-close" onclick={closeShortcuts}>
 				Close
 			</button>
-		</div>
+		</dialog>
 	{/if}
 
 	<section data-testid="queue-panel" aria-label="Playback queue">

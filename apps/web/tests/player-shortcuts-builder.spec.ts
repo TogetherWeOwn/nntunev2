@@ -81,6 +81,67 @@ test('transport works from queue controls and ? never duplicates the dialog', as
 	await expect(queueButton).toBeFocused();
 });
 
+test('role=dialog guards visible modals without breaking shortcuts when hidden', async ({ page }) => {
+	const errors: string[] = [];
+	page.on('pageerror', (error) => errors.push(error.message));
+	await openPlayer(page);
+	await page.evaluate(() => {
+		const dialog = document.createElement('div');
+		dialog.setAttribute('role', 'dialog');
+		dialog.setAttribute('data-testid', 'role-dialog-probe');
+		dialog.textContent = 'Confirmation';
+		dialog.hidden = true;
+		document.querySelector('main')?.append(dialog);
+	});
+	const audio = page.getByTestId('demo-audio');
+	const probe = page.getByTestId('role-dialog-probe');
+
+	await page.keyboard.press('m');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(true);
+
+	await probe.evaluate((el: HTMLElement) => { el.hidden = false; });
+	await expect(probe).toBeVisible();
+	for (const key of ['k', 'n', 'p', 'j', 'l', 'm', '?']) await page.keyboard.press(key);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: selected');
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(true);
+	await expect(page.getByTestId('shortcuts-dialog')).toHaveCount(0);
+
+	await probe.evaluate((el: HTMLElement) => { el.hidden = true; });
+	await page.keyboard.press('m');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(false);
+	expect(errors).toEqual([]);
+});
+
+for (const opener of ['?', 'button'] as const) {
+	test(`shortcuts dialog takes modal focus from ${opener} and restores it on close`, async ({ page }) => {
+		await openPlayer(page);
+		const button = page.getByTestId('shortcuts-button');
+		await button.focus();
+		await page.keyboard.press(opener === '?' ? '?' : 'Enter');
+		const dialog = page.getByTestId('shortcuts-dialog');
+		const close = page.getByTestId('shortcuts-close');
+		await expect(dialog).toBeVisible();
+		await expect(close).toBeFocused();
+
+		const next = page.getByTestId('player-next');
+		await next.evaluate((el: HTMLButtonElement) => el.focus());
+		await expect(close).toBeFocused();
+		await page.keyboard.press('n');
+		await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+
+		await page.keyboard.press('Escape');
+		await expect(dialog).toHaveCount(0);
+		await expect(button).toBeFocused();
+
+		await page.keyboard.press('Enter');
+		await expect(close).toBeFocused();
+		await close.click();
+		await expect(dialog).toHaveCount(0);
+		await expect(button).toBeFocused();
+	});
+}
+
 test('seek clamps at the media bounds instead of overshooting', async ({ page }) => {
 	await page.addInitScript(() => {
 		sessionStorage.removeItem('nntune:demo-queue:v1');

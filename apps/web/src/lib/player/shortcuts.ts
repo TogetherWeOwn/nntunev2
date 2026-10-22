@@ -62,8 +62,8 @@ export interface ModalScope {
 
 function isRendered(candidate: unknown): boolean {
 	if (typeof candidate !== 'object' || candidate === null) return false;
-	const { getClientRects } = candidate as { getClientRects?: () => ArrayLike<unknown> };
-	return typeof getClientRects === 'function' && getClientRects().length > 0;
+	const element = candidate as { getClientRects?: () => ArrayLike<unknown> };
+	return typeof element.getClientRects === 'function' && element.getClientRects().length > 0;
 }
 
 /** True while a modal dialog (native or `role="dialog"`) captures keys. */

@@ -76,6 +76,20 @@ describe('isModalOpen', () => {
 		expect(isModalOpen(scope(null, [visible]))).toBe(true);
 	});
 
+	it('calls getClientRects with the dialog as its receiver', () => {
+		const dialog = {
+			rects: [{}] as unknown[],
+			getClientRects() {
+				return this.rects;
+			}
+		};
+		const modalScope = scope(null, [dialog]);
+
+		expect(isModalOpen(modalScope)).toBe(true);
+		dialog.rects = [];
+		expect(isModalOpen(modalScope)).toBe(false);
+	});
+
 	it('ignores hidden role=dialog regions', () => {
 		const hidden = { getClientRects: () => [] };
 		expect(isModalOpen(scope(null, [hidden]))).toBe(false);
