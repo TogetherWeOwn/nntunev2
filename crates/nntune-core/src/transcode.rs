@@ -334,6 +334,8 @@ mod tests {
                 "libopus",
                 "-b:a",
                 "64k",
+                "-vbr",
+                "off",
                 "-ar",
                 "48000",
                 "-ac",
