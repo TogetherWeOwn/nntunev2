@@ -102,9 +102,6 @@ pub const MAX_TRANSCODE_REPLY_BYTES: usize = 64 << 10;
 /// track is ~28.8 MB, plus Ogg framing. Anything larger is not this
 /// profile's output and is refused rather than published.
 pub const MAX_ARTIFACT_BYTES: u64 = 32 << 20;
-/// Scratch round-dir prefixes are short by construction
-/// (`ingest-scratch/{job_id}/r{round}/`); anything longer is not one.
-pub const MAX_SCRATCH_PREFIX_BYTES: usize = 256;
 /// Idempotency keys are `ingest:{user}:{sha}:{ref}` with bounded
 /// fields (see `jobs::derive_idempotency_key`); 768 covers the
 /// longest constructible key with headroom.
@@ -129,21 +126,12 @@ pub struct TranscodeRequest {
     pub staging_id: String,
 }
 
-/// True only for the round dir the job's verify staging lives in:
-/// `ingest-scratch/{job_id}/.../` with a trailing slash, a safe
-/// charset, and the length cap. The job containment is the point: a
-/// forged prefix must never address another job's staged bytes.
+/// True only for the round dir the job's verify staging lives in.
+/// The rule is shared with the transcode front parse
+/// (`nntune_core::transcode::validate_transcode_prefix`) so dispatch
+/// and front can never disagree on job containment.
 pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
-    if prefix.len() > MAX_SCRATCH_PREFIX_BYTES || !prefix.ends_with('/') {
-        return false;
-    }
-    let root = format!("ingest-scratch/{job_id}/");
-    if !prefix.starts_with(&root) {
-        return false;
-    }
-    prefix
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+    nntune_core::transcode::validate_transcode_prefix(prefix, job_id)
 }
 
 /// Decide one file's transcode dispatch: `Ok` carries the validated

@@ -286,6 +286,30 @@ pub fn validate_transcode_input_key(key: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
+/// Scratch round-dir prefixes are short by construction
+/// (`ingest-scratch/{job_id}/r{round}/`); anything longer is not one.
+pub const MAX_TRANSCODE_PREFIX_BYTES: usize = 256;
+
+/// True only for the round dir the job's verify staging lives in:
+/// `ingest-scratch/{job_id}/.../` with a trailing slash, a safe
+/// charset, and the length cap. The job containment is the point: a
+/// forged prefix must never address another job's staged bytes.
+///
+/// Shared by the ingest dispatch and the transcode front parse so the
+/// two can never disagree on the containment rule.
+pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
+    if prefix.len() > MAX_TRANSCODE_PREFIX_BYTES || !prefix.ends_with('/') {
+        return false;
+    }
+    let root = format!("ingest-scratch/{job_id}/");
+    if !prefix.starts_with(&root) {
+        return false;
+    }
+    prefix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +554,42 @@ mod tests {
         assert!(!validate_transcode_input_key("../0007-x"));
         assert!(!validate_transcode_input_key(""));
         assert!(!validate_transcode_input_key(&format!("0007-{hex}x")));
+    }
+
+    #[test]
+    fn transcode_prefix_containment_pins_job_root() {
+        const JOB: &str = "job_01J9ZQ8K2M";
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1/",
+            JOB
+        ));
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r12/",
+            JOB
+        ));
+        // Another job, missing slash, hostile bytes fail. Dots pass
+        // the charset (R2 keys are flat strings, so `..` traverses
+        // nothing) but containment still holds: the prefix must start
+        // with this job's root.
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_other/r1/",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1",
+            JOB
+        ));
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1.backup/",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1/\0",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix("", JOB));
+        let long = format!("ingest-scratch/{JOB}/r1/{}", "x".repeat(256));
+        assert!(long.len() > MAX_TRANSCODE_PREFIX_BYTES);
+        assert!(!validate_transcode_prefix(&long, JOB));
     }
 }
