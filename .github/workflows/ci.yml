@@ -1010,12 +1010,16 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      - name: Projector scripts parse clean
+      - name: Observability scripts parse clean
         run: |
           node --check workers/observability/project-tail-event.mjs
           node --check workers/observability/tests/project-tail-event.test.mjs
+          node --check workers/observability/evaluate-error-window.mjs
+          node --check workers/observability/tests/evaluate-error-window.test.mjs
       - name: Run Tail projection acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
+      - name: Run error-window acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/evaluate-error-window.test.mjs
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
