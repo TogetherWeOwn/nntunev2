@@ -86,7 +86,7 @@ use crate::pool_probe::{call_pool_probe, check_outcome, PoolProbeError};
 use crate::probe::{
     apply_probe_batch, build_probe_request_with_ranges, ProbeOutcome, ProbeRequest, ProbeTally,
 };
-use crate::queue::{validate_indexer_ref, QueueMsg};
+use crate::queue::{validate_indexer_ref, validate_provider_id, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
@@ -157,6 +157,15 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     }
     if msg.state != JobState::Queued || msg.attempt != 1 || msg.repair_rounds != 0 {
         return Err("invalid initial queue state");
+    }
+    // Attribution is optional but shape-pinned: a malformed id must fail
+    // closed here, never ride into the grant publication later. Checked
+    // before the per-source identity comparisons so both sources report
+    // the same cause.
+    if let Some(provider_id) = msg.provider_id.as_deref() {
+        if !validate_provider_id(provider_id) {
+            return Err("invalid provider id");
+        }
     }
 
     match msg.source {
@@ -1442,21 +1451,16 @@ async fn execute_write_with<R: MatchWriteRuntime>(
     Ok(())
 }
 
-/// `Matching` + `Writing` in one delivery: resolve the match, meter
-/// `match`, advance, and write. Metering happens *before* each advance,
-/// so a meter failure retries the same state (re-resolving is idempotent)
-/// instead of dropping the event. A delivery that enters in `Writing`
-/// (checkpoint persisted after the match transition) re-resolves and
-/// writes without re-emitting `match`.
-///
-/// `Transcoding` sits between the two in the state order but its
-/// execution arm is not wired yet (no front Worker, Container, or
-/// publication bindings in this slice), so the match delivery steps
-/// straight through it to `Writing`: persisting a `Transcoding`
-/// checkpoint `run_step` cannot dispatch would strand the job on the
-/// boundary fallback. When the B6 runtime lands the artifact step it
-/// re-splits this delivery — match, settle `Transcoding` as progress,
-/// transcode on the next delivery inside its own 660 s budget.
+/// `Matching`, then `Writing` once `Transcoding` has run: resolve the
+/// match, meter `match`, and advance. Metering happens *before* the
+/// advance, so a meter failure retries the same state (re-resolving is
+/// idempotent) instead of dropping the event. A delivery that enters in
+/// `Matching` ends after the advance: the transcode service call (up to
+/// 660 s) cannot share this delivery's budget, so the checkpoint —
+/// now `Transcoding` — settles as progress and the artifact step runs
+/// next. A delivery that enters in `Writing` (checkpoint persisted
+/// after the transcode transition) re-resolves and writes without
+/// re-emitting `match`.
 async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
@@ -1470,9 +1474,10 @@ async fn run_match_write_with<R: MatchWriteRuntime>(
             .map_err(|()| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
         advance_checkpoint(cp, false);
         debug_assert_eq!(cp.state, JobState::Transcoding);
-        // Reserved, not runnable: see the doc comment above.
-        advance_checkpoint(cp, false);
-        debug_assert_eq!(cp.state, JobState::Writing);
+        return Err(JobError::progress(
+            ERR_TRANSCODE_FAILED,
+            "transcoding pending",
+        ));
     }
     execute_write_with(runtime, msg, cp, &write).await
 }
@@ -1792,6 +1797,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_provider_id_fails_validation() {
+        // provider_id rides the message as pool-fetch attribution (ingest
+        // never mints it); a malformed value must fail closed here rather
+        // than ride into a grant write later. Injected through JSON so the
+        // test also covers the wire shape, not just the struct field.
+        let mut value = serde_json::to_value(search_message()).unwrap();
+        value["provider_id"] = serde_json::json!("not-a-uuid");
+        let msg: QueueMsg = serde_json::from_value(value).unwrap();
+        assert_eq!(validate_queue_msg(&msg).unwrap_err(), "invalid provider id");
+    }
+
+    #[test]
     fn traced_search_messages_keep_their_identity() {
         // The route stamps the resolved inbound trace after building, and the
         // consumer re-stamps every delivery: the trace must not affect the
@@ -2038,23 +2055,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_entry_meters_match_before_advancing_then_writes() {
+    async fn matching_entry_meters_match_then_yields_to_transcoding() {
         let msg = search_message();
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
-        // Transcoding is reserved but unwired, so the match delivery
-        // steps straight through it to Writing and completes: no
-        // checkpoint is ever persisted in a state run_step cannot
-        // dispatch.
-        run_match_write_with(&runtime, &msg, &mut cp)
+        // Matching no longer writes in the same delivery: the checkpoint
+        // advances to Transcoding and settles as progress (no attempt
+        // spent), so the artifact step runs next and the write waits
+        // for a post-transcode checkpoint.
+        let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
-            .expect("matching delivery succeeds");
-        assert_eq!(
-            runtime.calls(),
-            ["resolve", "meter:match", "upsert", "meter:write"]
-        );
-        assert_eq!(cp.state, JobState::Done);
+            .expect_err("matching delivery yields to transcoding");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert!(err.made_progress);
+        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        assert_eq!(cp.state, JobState::Transcoding);
     }
 
     #[tokio::test]

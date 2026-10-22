@@ -77,6 +77,18 @@ pub struct QueueMsg {
     /// the later retries.
     #[serde(default)]
     pub payload_ref: Option<String>,
+    /// Pool-fetch attribution: the `providers.id` (UUID text) whose
+    /// connection served this job's bytes, carried for the §4.2 grant
+    /// publication (`user_cache_grants` needs the fetching provider).
+    /// Ingest never mints it — the only future source is the stream
+    /// pool's provider wiring, which does not exist yet (the pool
+    /// answers `provider_unavailable` until then), so admission always
+    /// sends `None`. `#[serde(default)]` so older messages still decode.
+    /// The checkpoint is the live copy after admission: Queue bodies are
+    /// immutable on redelivery, so a redelivered `None` must never
+    /// clobber a checkpoint that already carries an id.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 /// Native par2 repair dispatched to the Container batch job via the
@@ -155,6 +167,23 @@ pub fn validate_indexer_ref(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Provider identity shape: `8-4-4-4-12` hex, the text form of the
+/// `providers.id` UUID the grant publication binds to. Case-insensitive
+/// like [`validate_mbid`] (the `::uuid` cast normalizes anyway) with no
+/// version/variant pin: the pool's future attribution format is not
+/// ours to constrain beyond the UUID shape.
+pub fn validate_provider_id(raw: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = raw.split('-').collect();
+    if parts.len() != GROUPS.len() {
+        return false;
+    }
+    parts
+        .iter()
+        .zip(GROUPS)
+        .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +219,7 @@ mod tests {
             limit: None,
             page: None,
             payload_ref: Some("nzb:sha256:abc".into()),
+            provider_id: Some("11111111-1111-4111-8111-111111111111".into()),
         };
         let back: QueueMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
@@ -197,6 +227,45 @@ mod tests {
             back.trace_id.as_deref(),
             Some("9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c")
         );
+        assert_eq!(
+            back.provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    #[test]
+    fn provider_id_pins_the_uuid_shape() {
+        assert!(validate_provider_id("11111111-1111-4111-8111-111111111111"));
+        // Case-insensitive: the ::uuid cast normalizes.
+        assert!(validate_provider_id("AAAAAAAA-1111-4111-8111-111111111111"));
+        for bad in [
+            "",
+            "not-a-uuid",
+            "11111111-1111-4111-8111-11111111111",
+            "11111111-1111-4111-8111-1111111111111",
+            "11111111111141118111111111111111",
+            "zzzzzzzz-1111-4111-8111-111111111111",
+            "11111111_1111_4111_8111_111111111111",
+            "11111111-1111-4111-8111-111111111111-extra",
+        ] {
+            assert!(!validate_provider_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn queue_msg_reads_pre_attribution_messages_as_unattributed() {
+        // Messages enqueued before `provider_id` existed still decode;
+        // the job simply has no pool attribution yet.
+        let legacy = serde_json::json!({
+            "job_id": "job_1",
+            "user_id": "u1",
+            "idempotency_key": "ingest:u1:abc:upload",
+            "source": "nzb_upload",
+            "state": "queued",
+            "attempt": 1,
+        });
+        let back: QueueMsg = serde_json::from_value(legacy).unwrap();
+        assert!(back.provider_id.is_none());
     }
 
     #[test]
