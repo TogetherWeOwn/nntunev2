@@ -203,6 +203,34 @@ test('speed applies to the audio element and survives reload', async ({ page }) 
 	expect(await storedValue(page, SPEED_KEY)).toBe('0.5');
 });
 
+test('blocked localStorage getter preserves player mount, share seek, and live speed', async ({ page }) => {
+	// A bare localStorage read during mount must fail this regression, even if
+	// storage methods are guarded. Use the fresh page context, not openPlayer's
+	// default storage-clearing setup, and keep media synthetic and pending.
+	await page.route('**/api/demo/audio**', () => {});
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'localStorage', {
+			configurable: true,
+			get() {
+				throw new DOMException('Storage access blocked', 'SecurityError');
+			}
+		});
+		HTMLMediaElement.prototype.play = function () {
+			return new Promise<void>(() => {});
+		};
+		HTMLMediaElement.prototype.pause = function () {};
+	});
+
+	await page.goto('/demo/player?track=second-signal&t=90');
+	await expect(page.getByTestId('queue-item')).toHaveCount(3);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect.poll(() => currentTime(page)).toBe(90);
+
+	await page.getByTestId('playback-speed').selectOption('1.5');
+	await expect(page.getByTestId('playback-speed')).toHaveValue('1.5');
+	await expect.poll(() => playbackRate(page)).toBe(1.5);
+});
+
 test('speed stays applied after navigating to the next track', async ({ page }) => {
 	await openPlayer(page);
 	await page.getByTestId('playback-speed').selectOption('1.5');
