@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nntune_core::par2::scratch::sha256_hex;
-use nntune_core::transcode::{normalize_ogg_serial, OGG_FIXED_SERIAL};
 use nntune_transcode_server::{serve, ServerConfig};
 
 pub const HEX_A: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
