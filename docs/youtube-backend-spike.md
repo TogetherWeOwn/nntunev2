@@ -165,6 +165,6 @@ is the reference for version bumps.
   from the dev environment); nothing proxy-dependent runs before that.
   No separate proxy spend is needed inside this spike; production's
   separate residential service is procured outside it.
-- **Staging deploy** of the measurement worker (needs the runtime-entry
-  slice first). No gate numbers exist until bytes are fetched from
-  Worker egress.
+- **Staging deploy** of the measurement worker (entry + template
+  landed; needs provisioned KV namespaces and a real `wrangler.toml`).
+  No gate numbers exist until bytes are fetched from Worker egress.

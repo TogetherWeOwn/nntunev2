@@ -8,9 +8,10 @@ license = "MIT"
 [lib]
 name = "nntune_youtube"
 path = "src/lib.rs"
-# cdylib for the Worker (wasm32); rlib so unit tests link it. The wasm32
-# runtime entry (fetch handler, Durable Object, proxy client) lands with
-# the deploy-config slice; until then this crate is a portable core.
+# cdylib for the Worker (wasm32); rlib so unit tests link it. The wasm32-only
+# runtime entry (fetch handler, YtExtract Durable Object) lives in
+# src/runtime.rs with its worker/wasm-bindgen deps below; the extraction
+# wiring, proxy client and staging deploy land with later Day-1 slices.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
