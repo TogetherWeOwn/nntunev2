@@ -641,13 +641,16 @@ jobs:
       - name: Smoke the shipped server and pinned ffmpeg binary
         run: |
           docker run -d --name transcode-smoke -p 18082:8080 nntune-transcode:ci
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18082/health; then break; fi
             sleep 1
           done
           curl -fsS http://127.0.0.1:18082/health | grep -q '"ok":true'
-          docker exec transcode-smoke ffmpeg -version | head -1
-          docker exec transcode-smoke ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libopus'
+          docker exec transcode-smoke ffmpeg -version
+          # Consume the listing before matching so pipefail cannot mistake
+          # grep's early pipe close for an ffmpeg capability failure.
+          docker exec transcode-smoke ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/transcode-encoders.txt"
+          grep -Eq '^[[:space:]]*A[^[:space:]]{5}[[:space:]]+libopus[[:space:]]' "$RUNNER_TEMP/transcode-encoders.txt"
           docker rm -f transcode-smoke
       - name: Run transcode determinism self-test
         run: bash containers/transcode/tests/determinism_self_test.sh nntune-transcode:ci 18081
