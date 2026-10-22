@@ -1700,6 +1700,47 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toMatch(
       /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n/m,
     );
+    // Same-host routes: the generated staging config must serve /v1/*,
+    // /healthz, plus the staging-only /api/test-codes seam on the
+    // staging host, with route hosts derived from the RP repo var
+    // (asserted the exact staging host in the validation block above)
+    // so the RP pair and the serving host cannot drift. The web Worker
+    // owns the catch-all; the most specific route wins.
+    //
+    // Pin the guard code itself (anchored), not just the error text: a
+    // weakened check that keeps the message would otherwise hold the
+    // suite green while letting a bad rp_id through — a value with a
+    // trailing quote interpolates into the generated TOML, and a stale
+    // hostname silently splits the api routes onto the old host. The
+    // exact-host literal is cross-checked against config/staging.json in
+    // the single-source test below.
+    expect(section).toMatch(
+      /^[ \t]*assert re\.fullmatch\(r"\[a-z0-9\]\(\?:\[a-z0-9\.-\]\*\[a-z0-9\]\)\?", rp_id or ""\), \\$/m,
+    );
+    expect(section).toContain('must be a bare lowercase hostname (route host)');
+    expect(section).toMatch(/^[ \t]*assert rp_id == "staging\.nntune\.com", \\$/m);
+    expect(section).toContain(
+      'API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)',
+    );
+    expect(section).toMatch(
+      /^[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n/m,
+    );
+  };
+
+  // Web catch-all pin (anchored): the staging host must resolve to a
+  // live [[env.staging.routes]] block — header, pattern, and zone_name
+  // at line starts — so commenting the route out (the pattern text
+  // still appears in the file) cannot hold the suite green the way a
+  // bare substring check would.
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const assertWebStagingCatchAll = (webWrangler: string, rpId: string) => {
+    const host = escapeRegExp(rpId);
+    expect(webWrangler).toMatch(
+      new RegExp(
+        `^[ \\t]*\\[\\[env\\.staging\\.routes\\]\\]\\n[ \\t]*pattern = "${host}/\\*"\\n[ \\t]*zone_name = "nntune\\.com"\\n`,
+        'm',
+      ),
+    );
   };
 
   const assertDeployGuard = (body: string) => {
@@ -1728,6 +1769,90 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
 
   test('staging-api lane carries BUILD_SHA + hyperdrive gate evidence', () => {
     assertStagingApi(jobsBody);
+  });
+
+  test('staging hostname is one source of truth across config, routes and the api lane', () => {
+    // config/staging.json is canonical: the RP pair, the web Worker's
+    // staging catch-all, and the api lane's route derivation must all
+    // name the same host, or passkeys (RP ID) and serving routes drift
+    // apart silently. The repo variable value itself is set server-side
+    // to the canonical host and enforced at deploy time by the api
+    // lane's exact-host assertion; here we pin the derivation spelling
+    // and cross-check that assertion's literal against the canonical host.
+    const staging = JSON.parse(
+      readFileSync(new URL('../../config/staging.json', import.meta.url), 'utf8'),
+    ) as Record<string, string>;
+    const prod = JSON.parse(
+      readFileSync(new URL('../../config/prod.json', import.meta.url), 'utf8'),
+    ) as Record<string, string>;
+    const rpId = staging['auth.rp_id'];
+    expect(rpId).toBe('staging.nntune.com');
+    expect(staging['auth.rp_origin']).toBe(`https://${rpId}`);
+    expect(prod['auth.rp_id']).toBe('nntune.com');
+    expect(prod['auth.rp_origin']).toBe('https://nntune.com');
+    const webWrangler = readFileSync(
+      new URL('../../apps/web/wrangler.toml', import.meta.url),
+      'utf8',
+    );
+    assertWebStagingCatchAll(webWrangler, rpId!);
+    expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/v1/*"');
+    expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/api/test-codes"');
+    expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/healthz"');
+    // The deploy-time exact-host literal must equal the canonical host:
+    // config/staging.json stays the single source even though the
+    // workflow enforces the value where the server-side var is read.
+    const rpIdAssertion = jobsBody.match(/^[ \t]*assert rp_id == "([^"]+)", \\$/m);
+    expect(rpIdAssertion?.[1]).toBe(rpId);
+  });
+
+  test('commented web catch-all trips the staging route pin', () => {
+    // The single-source pin above reads the live file through
+    // assertWebStagingCatchAll; the same helper must reject a commented
+    // route, where the pattern text still appears in the file (the
+    // bare-substring trap that held the suite green before anchoring).
+    const staging = JSON.parse(
+      readFileSync(new URL('../../config/staging.json', import.meta.url), 'utf8'),
+    ) as Record<string, string>;
+    const webWrangler = readFileSync(
+      new URL('../../apps/web/wrangler.toml', import.meta.url),
+      'utf8',
+    );
+    const commentedRouteMutant = webWrangler.replace(
+      'pattern = "staging.nntune.com/*"',
+      '# pattern = "staging.nntune.com/*"',
+    );
+    expect(commentedRouteMutant).not.toBe(webWrangler);
+    expect(() =>
+      assertWebStagingCatchAll(commentedRouteMutant, staging['auth.rp_id']!),
+    ).toThrow();
+  });
+
+  test('superseded v2-staging hostname is gone from live config', () => {
+    // The old staging hostname survives only as the DNS deletion pointer
+    // in docs/ops.md (removed once the host confirms deletion); every
+    // live config surface must name the new host. Resource names such as
+    // `nntunev2-staging` (Hyperdrive configs, KV namespaces) are not the
+    // hostname and are out of scope — the match requires the dot.
+    const renamed = [
+      '../../config/staging.json',
+      '../../config/fixtures/drift-type-mismatch.json',
+      '../../config/fixtures/drift-extra-key.json',
+      '../../config/fixtures/match-prod.json',
+      '../../config/fixtures/drift-missing-key.json',
+      '../../crates/nntune-config/src/lib.rs',
+      '../../crates/nntune-config/tests/error_display.rs',
+      '../../apps/web/wrangler.toml',
+      '../../workers/api/wrangler.toml.example',
+    ];
+    for (const file of renamed) {
+      const text = readFileSync(new URL(file, import.meta.url), 'utf8');
+      expect(text, `${file} must not reference the superseded staging host`).not.toContain(
+        'v2-staging.nntune.com',
+      );
+    }
+    expect(jobsBody, 'deploy.yml must not reference the superseded staging host').not.toContain(
+      'v2-staging.nntune.com',
+    );
   });
 
   test('synthetic backend-deploy mutants trip the pins above', () => {
@@ -1844,6 +1969,53 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '          [env.staging.vars]\n',
       '          # [env.staging.vars]\n',
     );
+    // Api lane whose generated config drops the /v1/* route: credentialed
+    // API calls would fall through to the web catch-all and 404.
+    const droppedV1RouteMutant = jobsBody.replace(
+      '          pattern = "${API_RP_ID_STAGING}/v1/*"\n',
+      '',
+    );
+    // Api lane whose generated config drops the QA seam route: the
+    // staging-only /api/test-codes retrieval would fall through to web.
+    const droppedSeamRouteMutant = jobsBody.replace(
+      '          pattern = "${API_RP_ID_STAGING}/api/test-codes"\n',
+      '',
+    );
+    // Api lane whose generated config comments out a routes header: the
+    // TOML then defines no routes table at all (the keys fall into
+    // env.staging.vars), and an unanchored pin would keep matching the
+    // bracket text inside the comment.
+    const commentedRoutesHeaderMutant = jobsBody.replace(
+      '          [[env.staging.routes]]\n',
+      '          # [[env.staging.routes]]\n',
+    );
+    // Api lane whose route host derives from the origin repo var: the
+    // pattern would carry a full https:// URL instead of a bare host.
+    const routeHostSwappedMutant = jobsBody.replace(
+      '          pattern = "${API_RP_ID_STAGING}/v1/*"\n',
+      '          pattern = "${API_RP_ORIGIN_STAGING}/v1/*"\n',
+    );
+    // Api lane whose generated config drops the /healthz route: the api
+    // liveness probe would fall through to the web catch-all and 404
+    // (the web app serves /api/health, not /healthz).
+    const droppedHealthzRouteMutant = jobsBody.replace(
+      '          pattern = "${API_RP_ID_STAGING}/healthz"\n',
+      '',
+    );
+    // Api lane whose bare-hostname guard keeps its message but weakens
+    // the regex to a non-empty check: a hostile rp_id (e.g. with a
+    // trailing quote) would interpolate into the generated TOML.
+    const weakenedRegexMutant = jobsBody.replace(
+      'assert re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", rp_id or ""), \\',
+      'assert (rp_id or "") != "", \\',
+    );
+    // Api lane whose exact-host guard keeps its message but accepts any
+    // non-empty var: a stale repo var (e.g. the superseded staging
+    // host) would silently split the api routes onto the old host.
+    const weakenedExactHostMutant = jobsBody.replace(
+      'assert rp_id == "staging.nntune.com", \\',
+      'assert rp_id != "", \\',
+    );
 
     for (const mutant of [
       workerMutant,
@@ -1871,6 +2043,13 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       rpIdSwappedMutant,
       rpOriginSwappedMutant,
       commentedVarsHeaderMutant,
+      droppedV1RouteMutant,
+      droppedSeamRouteMutant,
+      commentedRoutesHeaderMutant,
+      routeHostSwappedMutant,
+      droppedHealthzRouteMutant,
+      weakenedRegexMutant,
+      weakenedExactHostMutant,
     ]) {
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
@@ -1904,6 +2083,13 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(rpIdSwappedMutant)).toThrow();
     expect(() => assertStagingApi(rpOriginSwappedMutant)).toThrow();
     expect(() => assertStagingApi(commentedVarsHeaderMutant)).toThrow();
+    expect(() => assertStagingApi(droppedV1RouteMutant)).toThrow();
+    expect(() => assertStagingApi(droppedSeamRouteMutant)).toThrow();
+    expect(() => assertStagingApi(commentedRoutesHeaderMutant)).toThrow();
+    expect(() => assertStagingApi(routeHostSwappedMutant)).toThrow();
+    expect(() => assertStagingApi(droppedHealthzRouteMutant)).toThrow();
+    expect(() => assertStagingApi(weakenedRegexMutant)).toThrow();
+    expect(() => assertStagingApi(weakenedExactHostMutant)).toThrow();
   });
 });
 

@@ -420,7 +420,8 @@ pub fn extract_bearer_key(authorization: Option<&str>) -> Result<&str, Credentia
 /// Postgres connection or query (ADR 0010 DoS: unauthenticated bearer
 /// routes were plain 404s with no DB work before this credential class).
 /// A well-formed random token still reaches the HMAC lookup and fails
-/// closed with the generic 401; shape alone never authenticates.
+/// closed with the same plain 404 as a header-absent caller (no
+/// route-existence oracle); shape alone never authenticates.
 pub fn is_plausible_credential_shape(token: &str) -> bool {
     let Some(rest) = token.strip_prefix(CREDENTIAL_PREFIX) else {
         return false;
@@ -491,10 +492,18 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             Deny
         }
-        // Only the pinned HEAD shape is bearer-reachable; other HEAD
-        // shapes stay Deny until the map is updated.
+        // HEAD revalidates exactly the GET-readable catalog roots: a
+        // lawful bearer HEAD must clear the same gate as the GET it
+        // revalidates, and every other HEAD shape stays Deny until the
+        // map is explicitly updated.
         "HEAD" => {
-            if path == "/v1/search" {
+            if path == "/v1/library"
+                || path == "/v1/artists"
+                || path == "/v1/releases"
+                || path == "/v1/tracks"
+                || path == "/v1/search"
+                || path == "/v1/playlists"
+            {
                 return Bearer(Scope::LibraryRead);
             }
             Deny
@@ -531,7 +540,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             Deny
         }
         "PUT" => {
-            if path.starts_with("/v1/playlists/") && path.len() > "/v1/playlists/".len() {
+            // Single-segment item shapes only: nested, trailing-slash or
+            // empty-segment shapes deny here, before any bearer lookup or
+            // rate-limit spend downstream.
+            if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             if path == "/v1/me" || path == "/v1/vault" {
@@ -540,13 +552,15 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             Deny
         }
         "PATCH" => {
-            if path.starts_with("/v1/playlists/") && path.len() > "/v1/playlists/".len() {
+            // Single-segment item shapes only (see PUT).
+            if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             Deny
         }
         "DELETE" => {
-            if path.starts_with("/v1/playlists/") && path.len() > "/v1/playlists/".len() {
+            // Single-segment item shapes only (see PUT).
+            if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
             if one_segment_after("/v1/libraries/", path) {
@@ -654,7 +668,7 @@ mod tests {
             "{CREDENTIAL_PREFIX}{dashed}"
         )));
         // Well-formed random entropy passes the gate (it still fails closed
-        // after the HMAC lookup with the generic 401; shape alone never
+        // after the HMAC lookup with the plain 404; shape alone never
         // authenticates).
         assert!(is_plausible_credential_shape(&format!(
             "{CREDENTIAL_PREFIX}{}",
@@ -663,15 +677,29 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_head_denies_while_pinned_head_passes() {
-        // Only the pinned HEAD shape is bearer-reachable.
-        assert_eq!(
-            scope_for_operation("HEAD", "/v1/search"),
-            RouteDecision::Bearer(Scope::LibraryRead)
-        );
-        assert_eq!(
-            scope_for_operation("HEAD", "/v1/library"),
-            RouteDecision::Deny
-        );
+    fn head_revalidates_every_catalog_root_and_nothing_else() {
+        // HEAD clears the same gate as the GET it revalidates, on every
+        // catalog root; non-catalog and unknown HEAD shapes stay Deny.
+        for path in [
+            "/v1/library",
+            "/v1/artists",
+            "/v1/releases",
+            "/v1/tracks",
+            "/v1/search",
+            "/v1/playlists",
+        ] {
+            assert_eq!(
+                scope_for_operation("HEAD", path),
+                RouteDecision::Bearer(Scope::LibraryRead),
+                "HEAD {path}"
+            );
+        }
+        for path in ["/v1/plays", "/v1/stream", "/v1/ingest", "/v1/nope"] {
+            assert_eq!(
+                scope_for_operation("HEAD", path),
+                RouteDecision::Deny,
+                "HEAD {path}"
+            );
+        }
     }
 }

@@ -34,7 +34,7 @@
 
 use nntune_mb::{
     handle_release_recordings, handle_search_paged, ApiResponse, Entity, Kind, MbRepo, Recording,
-    RepoError, SearchHit, SuccessCache,
+    RepoError, RepoStage, SearchHit, SuccessCache,
 };
 use std::cell::RefCell;
 use std::future::Future;
@@ -142,7 +142,7 @@ impl MbRepo for FakeRepo {
         *self.last_search.borrow_mut() = Some((kind, normalized_q.to_string(), limit, offset));
         match &self.search_outcome {
             SearchOutcome::Hits(hits) => Ok(hits.clone()),
-            SearchOutcome::Fail => Err(RepoError),
+            SearchOutcome::Fail => Err(RepoError::new(RepoStage::Query)),
         }
     }
 
@@ -155,7 +155,7 @@ impl MbRepo for FakeRepo {
         match &self.recordings_outcome {
             RecordingsOutcome::Some(rows) => Ok(Some(rows.clone())),
             RecordingsOutcome::Missing => Ok(None),
-            RecordingsOutcome::Fail => Err(RepoError),
+            RecordingsOutcome::Fail => Err(RepoError::new(RepoStage::Query)),
         }
     }
 }

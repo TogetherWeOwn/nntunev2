@@ -118,23 +118,28 @@ fn fetch_with_scripted_reply(
 
 #[test]
 fn hostile_message_ids_rejected_before_any_wire_write() {
-    // Empty, bracket-only, and control-byte hostile ids (post-trim /
-    // post-`<>`-strip view in comments): none may reach the socket.
+    // Empty, bracket-only, padded, bracketed-well-shaped, and control-byte
+    // hostile ids: none is a bare identity and none is normalized into one,
+    // so none may reach the socket.
     let hostile: &[&str] = &[
-        "",                             // empty
-        "   ",                          // whitespace-only -> empty after trim
-        "<>",                           // bracket-only -> empty after strip
-        "<<<>>>",                       // bracket-only, nested
-        "<   >",                        // bracket-wrapped whitespace -> inner spaces
-        "x>\r\nBODY <other@article>",   // CRLF command smuggle
-        "seg\r\nINJECT@synthetic.test", // CRLF injection
-        "a\nb@c",                       // LF
-        "a\rb@c",                       // CR
-        "a\0b@c",                       // NUL
-        "a b@c",                        // space
-        "a\tb@c",                       // tab
-        "a<b@c",                        // inner angle bracket
-        "a>b@c",                        // inner angle bracket
+        "",                               // empty
+        "   ",                            // whitespace-only
+        "<>",                             // bracket-only
+        "<<<>>>",                         // bracket-only, nested
+        "<   >",                          // bracket-wrapped whitespace
+        "<good-seg0@synthetic.test>",     // bracketed well-shaped: refused, never stripped
+        "  <good-seg0@synthetic.test>  ", // padded bracketed
+        " good-seg0@synthetic.test",      // padded
+        "good-seg0@synthetic.test ",      // padded
+        "x>\r\nBODY <other@article>",     // CRLF command smuggle
+        "seg\r\nINJECT@synthetic.test",   // CRLF injection
+        "a\nb@c",                         // LF
+        "a\rb@c",                         // CR
+        "a\0b@c",                         // NUL
+        "a b@c",                          // space
+        "a\tb@c",                         // tab
+        "a<b@c",                          // inner angle bracket
+        "a>b@c",                          // inner angle bracket
     ];
     for id in hostile {
         assert_rejected_before_wire_write(id);
@@ -156,15 +161,14 @@ fn well_formed_id_proceeds_to_normal_handling() {
         "scripted 430 must surface as NoSuchArticle, got {outcome:?}"
     );
 
-    // Bracketed form strips to the same wire command; 222 path returns the
-    // dot-unstuffed body.
+    // Bare well-shaped id, 222 path: returns the dot-unstuffed body.
     let (outcome, command) = fetch_with_scripted_reply(
-        "<good-seg0@synthetic.test>",
+        "good-seg0@synthetic.test",
         b"222 article follows\r\nHello\r\n.\r\n",
     );
     assert_eq!(
         command, "BODY <good-seg0@synthetic.test>\r\n",
-        "bracketed id must strip to the same BODY command"
+        "bare id must reach the wire as a single BODY command"
     );
     assert_eq!(
         outcome.expect("222 must fetch"),

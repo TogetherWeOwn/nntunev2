@@ -12,11 +12,15 @@
 //! - recording: mbid, release_mbid, title, track_no, duration_ms, updated_at
 //! - track:     release_mbid, recording_mbid, medium_no, track_no, updated_at
 //!
-//! Normalization: empty nullable numeric/uuid/timestamp fields are rewritten
-//! to the `COPY` null marker `\N`, and the 1-based dump line number is
-//! appended as the final column (the loader COPYs it into `line_no`).
-//! Everything else passes through byte-equal so a `SELECT` after import
-//! returns exactly what the dump held.
+//! Normalization: empty nullable fields are rewritten to the `COPY` null
+//! marker `\N`; typed columns are validated on their COPY-decoded value
+//! and emitted canonical and COPY-safe (lowercase UUIDs, plain integers,
+//! re-escaped countries, decoded timestamps); and the 1-based dump line
+//! number is appended as the final column (the loader COPYs it into
+//! `line_no`). Text columns pass through byte-equal: Postgres decodes COPY
+//! text escapes on import, so a `SELECT` after import returns the decoded
+//! meaning of the dump's encoded bytes. Poison rows always keep the exact
+//! original dump bytes.
 
 /// Which curated dump file a line comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,20 +200,26 @@ impl FieldKind {
         // as NULL and violate the constraint inside the transaction: catch
         // it here so the row goes to the dead-letter table instead, while
         // `\N` in a nullable column normalizes to the same NULL marker.
+        // This gate sees the RAW token on purpose: an ENCODED backslash-N
+        // (e.g. `\134N`, which decodes to the two characters `\` + `N`) is
+        // data, never NULL, and keeps flowing to the checks below.
         if value == "\\N" {
             if not_null {
                 return Err(reason::NULL_IN_NOT_NULL);
             }
             return Ok("\\N".to_string());
         }
-        // Every path below validates COPY text escapes for each raw field:
-        // only `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, octal
-        // `\` + 1-3 octal digits, and hex `\x` + 1-2 hex digits may follow
-        // a backslash, else the row would load mangled or was never a
+        // One bounded COPY text decoder feeds both jobs: it rejects
+        // malformed/unsupported escapes (plus NUL and non-UTF-8 decodings)
+        // exactly as before, and its decoded value is what the typed
+        // checks below validate, so `\x55S` and `US` take the same path.
+        // Only `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, octal `\` + 1-3
+        // octal digits, and hex `\x` + 1-2 hex digits may follow a
+        // backslash, else the row would load mangled or was never a
         // canonical dump escape. (Run before numeric/uuid/timestamp checks
         // so a bad escape reports as an escape, not as a bad value.)
-        check_escapes(value)?;
-        if value.is_empty() {
+        let decoded = decode_copy_field(value)?;
+        if decoded.is_empty() {
             if not_null {
                 // `updated_at` defaults to now() on NOT NULL violation inside
                 // COPY, which would silently stamp rows: poison instead so
@@ -227,65 +237,82 @@ impl FieldKind {
             }
             return Ok("\\N".to_string());
         }
+        // Typed columns validate the DECODED value and emit it canonical
+        // and COPY-safe, so every spelling of one value (literal, octal,
+        // hex, padded, cased) loads the same key Postgres would store.
+        // Semantic failures keep the literal reason taxonomy; only text
+        // keeps the original token.
         match self {
             FieldKind::Uuid => {
-                if is_uuid(value) {
-                    Ok(value.to_string())
+                if is_uuid(&decoded) {
+                    Ok(decoded.to_ascii_lowercase())
                 } else {
                     Err(reason::BAD_UUID)
                 }
             }
-            FieldKind::Smallint => {
-                if value.parse::<i16>().is_ok() {
-                    Ok(value.to_string())
-                } else {
-                    Err(reason::BAD_INT)
-                }
-            }
+            FieldKind::Smallint => match decoded.parse::<i16>() {
+                Ok(n) => Ok(n.to_string()),
+                Err(_) => Err(reason::BAD_INT),
+            },
             FieldKind::Timestamp => {
-                if is_timestamp(value) {
-                    Ok(value.to_string())
+                // A validated timestamp holds no backslash, tab, CR or LF,
+                // so the decoded value is already COPY-safe as emitted.
+                if is_timestamp(&decoded) {
+                    Ok(decoded)
                 } else {
                     Err(reason::BAD_TIMESTAMP)
                 }
             }
             FieldKind::Country => {
-                if value.chars().count() == 2 {
-                    Ok(value.to_string())
+                // Character count on the DECODED value: `\x55S` is the two
+                // characters `US`, while `\t` is one character and poison.
+                // Re-escape so the decoded meaning round-trips through COPY
+                // instead of becoming a separator or NULL: a decoded tab
+                // emits as `\t`, a decoded backslash-N as `\\N`.
+                if decoded.chars().count() == 2 {
+                    Ok(escape_copy_text(&decoded))
                 } else {
                     Err(reason::BAD_COUNTRY)
                 }
             }
-            FieldKind::Duration => match value.parse::<i32>() {
-                Ok(n) if n >= 0 => Ok(value.to_string()),
+            FieldKind::Duration => match decoded.parse::<i32>() {
+                Ok(n) if n >= 0 => Ok(n.to_string()),
                 Ok(_) => Err(reason::NEGATIVE_DURATION),
                 Err(_) => Err(reason::BAD_INT),
             },
             // Medium/track positions: SMALLINT in the schema, and a
             // negative position would trip the mb_track CHECK inside the
             // chunk transaction, so it is poison here instead.
-            FieldKind::Position => match value.parse::<i16>() {
-                Ok(n) if n >= 0 => Ok(value.to_string()),
+            FieldKind::Position => match decoded.parse::<i16>() {
+                Ok(n) if n >= 0 => Ok(n.to_string()),
                 Ok(_) => Err(reason::NEGATIVE_POSITION),
                 Err(_) => Err(reason::BAD_INT),
             },
+            // Text passes through byte-equal: Postgres decodes COPY text
+            // escapes on import, so the stored value is the decoded meaning
+            // of the dump's encoded bytes. The decoder above already refused
+            // anything COPY would load mangled.
             FieldKind::Text => Ok(value.to_string()),
         }
     }
 }
 
-/// `COPY (FORMAT text)` escape check, mirroring exactly what `COPY FROM`
-/// documents: `\b \f \n \r \t \v \\`, backslash plus 1-3 octal digits, and
-/// `\x` plus 1-2 hex digits. Anything else after a backslash (including a
-/// dangling backslash, `\o`, `\u`, a bare `\x`, or `\x` with no hex digits)
-/// is poison: COPY would either load a different value than the dump holds
-/// (`\q` loads as `q`, dropping the backslash) or the row was never a
-/// canonical dump escape, so it goes to the dead-letter table for operator
-/// review instead of being mangled into the mirror. Deliberately stricter
-/// than COPY, which accepts any other backslashed character as itself: the
-/// importer only passes through escapes whose stored value is the documented
-/// control character or byte.
-fn check_escapes(value: &str) -> Result<(), &'static str> {
+/// Decode one `COPY (FORMAT text)` field, mirroring exactly what `COPY
+/// FROM` documents: `\b \f \n \r \t \v \\`, backslash plus 1-3 octal
+/// digits, and `\x` plus 1-2 hex digits. Anything else after a backslash
+/// (including a dangling backslash, `\o`, `\u`, a bare `\x`, or `\x` with
+/// no hex digits) is poison: COPY would either load a different value than
+/// the dump holds (`\q` loads as `q`, dropping the backslash) or the row
+/// was never a canonical dump escape, so it goes to the dead-letter table
+/// for operator review instead of being mangled into the mirror.
+/// Deliberately stricter than COPY, which accepts any other backslashed
+/// character as itself: the importer only passes through escapes whose
+/// stored value is the documented control character or byte.
+///
+/// The single decoder feeds both byte safety and typed validation: text
+/// columns validate through it and keep the original token, while typed
+/// columns validate the decoded value it returns.
+fn decode_copy_field(value: &str) -> Result<String, &'static str> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -347,10 +374,32 @@ fn check_escapes(value: &str) -> Result<(), &'static str> {
         }
         i += 1;
     }
-    if decoded.contains(&0) || std::str::from_utf8(&decoded).is_err() {
+    if decoded.contains(&0) {
         return Err(reason::BAD_ESCAPE);
     }
-    Ok(())
+    String::from_utf8(decoded).map_err(|_| reason::BAD_ESCAPE)
+}
+
+/// Re-escape a decoded typed value so it round-trips through
+/// `COPY (FORMAT text)` as data: backslash, tab, LF, CR and the other C0
+/// controls COPY names get their short spellings, everything else
+/// (including multi-byte UTF-8) passes through raw. NUL cannot appear:
+/// the decoder already refused it.
+fn escape_copy_text(decoded: &str) -> String {
+    let mut out = String::with_capacity(decoded.len());
+    for c in decoded.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Lowercase or uppercase hex UUID `8-4-4-4-12`, no braces, no `urn:`.
@@ -787,5 +836,100 @@ mod tests {
         assert_eq!(plan_chunks(6000, 5000, 2000), vec![]);
         assert_eq!(plan_chunks(0, 0, 2000), vec![]);
         assert_eq!(plan_chunks(0, 10, 2000), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn copy_field_decoder_vectors() {
+        // The one decoder both byte safety and typed checks share.
+        for (token, want) in [
+            ("plain", "plain"),
+            (r"\141", "a"),
+            (r"\x61", "a"),
+            (r"\101", "A"),
+            (r"\x41", "A"),
+            (r"\7", "\x07"),
+            (r"\40", " "),
+            (r"\x4", "\x04"),
+            (r"\t", "\t"),
+            (r"\\", "\\"),
+            (r"\125S", "US"),
+            (r"\303\251", "é"),
+            (r"\xc3\xa9", "é"),
+        ] {
+            assert_eq!(decode_copy_field(token), Ok(want.to_string()), "{token:?}");
+        }
+        for token in [
+            r"\q",
+            r"\o",
+            r"\x",
+            r"\xZZ",
+            r"\8",
+            r"\9",
+            r"\400",
+            r"\777",
+            r"\0",
+            r"\000",
+            r"\x0",
+            r"\x00",
+            r"\377",
+            r"\xc3\x28",
+            "trailing\\",
+            "raw\rcr",
+            "raw\0nul",
+        ] {
+            assert_eq!(
+                decode_copy_field(token),
+                Err(reason::BAD_ESCAPE),
+                "{token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_typed_values_emit_canonical_copy_safe_forms() {
+        // UUIDs canonicalize to lowercase whatever the spelling.
+        let raw = artist_line(&MBID.to_ascii_uppercase(), TS);
+        assert_eq!(
+            validate_line(Table::Artist, 1, &raw),
+            Ok(format!("{}\t1", artist_line(MBID, TS)))
+        );
+        let raw = artist_line(&format!(r"\x36{}", &MBID[1..]), TS);
+        assert_eq!(
+            validate_line(Table::Artist, 1, &raw),
+            Ok(format!("{}\t1", artist_line(MBID, TS)))
+        );
+        // Integers canonicalize: padding, `+` and escapes all collapse.
+        for (token, want) in [("+001", "1"), ("0002", "2"), (r"\061", "1"), (r"\x32", "2")] {
+            let raw = format!("{MBID2}\t{MBID}\t{token}\t{token}\t{TS}");
+            let want = format!("{MBID2}\t{MBID}\t{want}\t{want}\t{TS}\t1");
+            assert_eq!(validate_line(Table::Track, 1, &raw), Ok(want), "{token:?}");
+        }
+        // Countries validate on decoded characters and re-escape COPY-safe.
+        for (token, want) in [
+            (r"\x55S", "US"),
+            (r"\303\251A", "éA"),
+            (r"\x09A", r"\tA"),
+            (r"\134N", r"\\N"),
+        ] {
+            let raw = artist_line(MBID, TS).replace("\tUS\t", &format!("\t{token}\t"));
+            let want = artist_line(MBID, TS).replace("\tUS\t", &format!("\t{want}\t"));
+            assert_eq!(
+                validate_line(Table::Artist, 1, &raw),
+                Ok(format!("{want}\t1")),
+                "{token:?}"
+            );
+        }
+        // Timestamps validate decoded digits and separators.
+        let raw = artist_line(MBID, r"\062024-05-01\04012:00:00Z");
+        assert_eq!(
+            validate_line(Table::Artist, 1, &raw),
+            Ok(format!("{}\t1", artist_line(MBID, "2024-05-01 12:00:00Z")))
+        );
+        // Text still passes through byte-equal, escapes and all.
+        let raw = artist_line(MBID, TS).replacen("The Band", r"A \x55 B \\ C", 1);
+        assert_eq!(
+            validate_line(Table::Artist, 1, &raw),
+            Ok(format!("{raw}\t1"))
+        );
     }
 }

@@ -87,6 +87,10 @@ jobs:
       # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
+      # The YouTube measurement Worker entry (YtExtract Durable Object) only
+      # compiles on wasm32: check and lint it on the target it deploys to.
+      - run: cargo check -p nntune-youtube --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-youtube --target wasm32-unknown-unknown -- -D warnings
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # every committed lockfile (workspace root, workers/api, workers/ingest,
@@ -169,7 +173,9 @@ jobs:
   worker-wasm-sizes:
     name: worker wasm sizes (report-only)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
+    # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
+    timeout-minutes: 35
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -224,6 +230,8 @@ jobs:
           persist-credentials: false
       - name: Run the bounded-pool offline suite
         run: python3 scripts/test_cargo_cache.py
+      - name: Run the pool capacity acceptance suite
+        run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy
         run: |
           python3 - <<'EOF'
@@ -994,11 +1002,36 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
+  # Privacy-safe Tail observation projection: pure, dependency-free ESM
+  # projector with VM-isolated acceptance tests. No Cloudflare API,
+  # network, or deploy. Keep this job id in ci-ok's needs.
+  tail-projection:
+    name: tail-projection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Observability scripts parse clean
+        run: |
+          node --check workers/observability/project-tail-event.mjs
+          node --check workers/observability/tests/project-tail-event.test.mjs
+          node --check workers/observability/evaluate-error-window.mjs
+          node --check workers/observability/tests/evaluate-error-window.test.mjs
+      - name: Run Tail projection acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
+      - name: Run error-window acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/evaluate-error-window.test.mjs
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

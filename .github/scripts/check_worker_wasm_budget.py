@@ -13,6 +13,7 @@ change): ``BUDGET_BYTES = 3_000_000`` decimal bytes of gzip-9 output per
 Worker module. Measured 2026-10-17 headroom: api 773,637, ingest 874,834,
 mb 615,300, repair 310,452, stream 285,144 -- every Worker under a third
 of the ceiling, so the budget bites on real regressions, not on noise.
+Measured 2026-10-22: youtube 207,435 (same ceiling).
 
 Fail-closed by construction:
 
@@ -51,8 +52,8 @@ TARGET = "wasm32-unknown-unknown"
 BUDGET_BYTES = 3_000_000
 
 # One entry per Worker. ``kind`` selects how the crate is addressed:
-# standalone crates (own Cargo.toml, own target dir) vs the stream crate
-# (workspace member, repo-root target dir). Every crate has a committed,
+# standalone crates (own Cargo.toml, own target dir) vs the stream/youtube
+# crates (workspace members, repo-root target dir). Every crate has a committed,
 # cargo-deny-audited Cargo.lock and builds with ``--locked`` so the
 # measured module matches the audited dependency graph -- matching the
 # required CI lanes.
@@ -96,6 +97,14 @@ WORKERS = (
         "locked": True,
         "target_dir": "target",
         "wasm": "nntune_stream.wasm",
+    },
+    {
+        "worker": "youtube",
+        "kind": "package",
+        "package": "nntune-youtube",
+        "locked": True,
+        "target_dir": "target",
+        "wasm": "nntune_youtube.wasm",
     },
 )
 

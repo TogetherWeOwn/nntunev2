@@ -63,8 +63,8 @@ the core and require exactly one row before any response.
 | `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
-`OPTIONS` on any listed route except the staging-only `POST /api/test-codes`
-seam answers an empty 204. Credentialed CORS
+`OPTIONS` on any listed route (and the scope-map-served native paths, never
+the staging-only `POST /api/test-codes` seam) answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web

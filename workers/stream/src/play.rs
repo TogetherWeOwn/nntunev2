@@ -49,7 +49,7 @@ use crate::api_error::ApiError;
 use crate::cache::{CacheServe, CacheStatus, ContentCache, MultipartUpload};
 use crate::grant::{self, GrantError};
 use crate::meter::{stream_seconds_for_bytes, Meter, MeterEvent, MeterKind};
-use crate::nntp::{valid_message_id, NntpClient, NntpDeadline, NntpError, UpstreamTimeouts};
+use crate::nntp::{NntpClient, NntpDeadline, NntpError, UpstreamTimeouts};
 use crate::observability::{CacheObserveEvent, CacheStatus as ObserveStatus};
 use crate::pool::{Lane, Lease, OrphanedPlay, Pool, PoolError};
 use crate::prefetch::should_prefetch;
@@ -83,8 +83,9 @@ pub enum PlayError {
     },
     /// An article is gone (`430`/`423`): this track fails, the pool is fine.
     ArticleMissing(String),
-    /// A segment id from NZB metadata failed validation and was never sent
-    /// to the provider: this track fails, the pool is fine.
+    /// Track metadata failed validation — a segment id outside the shared
+    /// identity rule, or an empty segment list — and was never sent to the
+    /// provider: this track fails final (400), the pool is fine.
     InvalidSegment(String),
     /// The provider connection failed or misbehaved (quarantines the pool).
     Upstream(String),
@@ -547,11 +548,19 @@ fn play_authorized(
 
     meter.emit(ev(MeterKind::CacheMiss, user, input.track_id, 0));
     if input.segments.is_empty() {
-        return Err(PlayError::Upstream("track has no segments".into()));
+        // Local metadata verdict, like a bad segment id below: final 400,
+        // never a retryable 502 — nothing about the provider failed, so the
+        // pool stays untouched (no lease, no dial, no quarantine, no
+        // provider-error meter).
+        return Err(PlayError::InvalidSegment("track has no segments".into()));
     }
     // Fail fast on hostile metadata: no lease, no dial, nothing on the wire.
     // (`NntpClient::article` re-validates as defense in depth.)
-    if let Some(bad) = input.segments.iter().find(|s| !valid_segment_id(s)) {
+    if let Some(bad) = input
+        .segments
+        .iter()
+        .find(|s| !nntune_core::segment_identity::valid_segment_id(s))
+    {
         return Err(PlayError::InvalidSegment(bad.clone()));
     }
     // Covering-segment plan: ranges are a *hint*, never trusted blindly.
@@ -885,11 +894,6 @@ fn open_and_fetch(
 enum SegmentError {
     Nntp(NntpError),
     Decode(YencError),
-}
-
-/// Same stripping as `NntpClient::article`: outer whitespace and `<>`.
-fn valid_segment_id(message_id: &str) -> bool {
-    valid_message_id(message_id.trim().trim_matches(|c| c == '<' || c == '>'))
 }
 
 fn fetch_segment(client: &mut NntpClient, message_id: &str) -> Result<Decoded, SegmentError> {
@@ -2158,11 +2162,11 @@ mod tests {
             now_unix,
             up_next: None,
         };
-        // Empty segments fail on the miss path: proof the expired entry did
-        // not serve.
+        // Empty segments fail on the miss path with the final metadata
+        // verdict: proof the expired entry did not serve.
         assert!(matches!(
             play(&mut pool, &mut cache, &mut meter, secret, &input),
-            Err(PlayError::Upstream(_))
+            Err(PlayError::InvalidSegment(_))
         ));
     }
 

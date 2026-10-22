@@ -984,6 +984,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nntune-youtube"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 3.0.9",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
