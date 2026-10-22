@@ -737,6 +737,35 @@ test('rate decimals must equal producer half-up rounding', () => {
   }), contextFixture()), null, 'truncated 1/6 decimal must not render');
 });
 
+// Break caught: unpinned exact-total bound. Totals above the exact
+// integer-math limit cannot be producer output and fail closed; without
+// the bound, inexact float decimals render a fabricated alert.
+test('exact-total bound renders at the limit and fails closed above it', () => {
+  const atLimit = render(breachVerdict({
+    counts: { total: 450000000000, failed: 225000000000 },
+    rate: { failed: 225000000000, total: 450000000000, decimal: '0.5000' },
+  }), contextFixture());
+  assertBreachCarries(atLimit, { rational: '225000000000/450000000000', decimal: '0.5000' });
+  assert.equal(render(breachVerdict({
+    counts: { total: 450000000001, failed: 225000000000 },
+    rate: { failed: 225000000000, total: 450000000001, decimal: '0.5000' },
+  }), contextFixture()), null, 'total just above the exact bound must not render');
+  assert.equal(render(breachVerdict({
+    counts: { total: 999999999999999, failed: 333333333333333 },
+    rate: { failed: 333333333333333, total: 999999999999999, decimal: '0.9995' },
+  }), contextFixture()), null, 'inexact float decimal above the bound must not render');
+});
+
+// Break caught: unpinned counts/rate equality check. A matching decimal
+// with a differing rate rational must still fail closed; without the
+// equality check a contradictory verdict renders.
+test('rate rational mismatch with matching decimal fails closed', () => {
+  assert.equal(render(breachVerdict({
+    counts: { total: 4, failed: 3 },
+    rate: { failed: 1, total: 100, decimal: '0.7500' },
+  }), contextFixture()), null, 'rate rational differing from counts must not render');
+});
+
 // Break caught: alphabetical Top-fields omitting the breaching release.
 // Buckets rank by failures, so the breaching SHA survives both the rules
 // cap and the buckets cap.
