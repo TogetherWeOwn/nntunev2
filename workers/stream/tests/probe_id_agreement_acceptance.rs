@@ -2,37 +2,40 @@
 //!
 //! Contract under test:
 //!
-//! - `workers/stream/src/probe.rs:166` `valid_probe_id` claims to be
-//!   identical to `workers/ingest/src/probe.rs:64` `validate_message_id`
-//!   (RFC 5536 `msg-id`, bracketless): 1..=512 bytes of printable ASCII, no
-//!   `<`/`>`, exactly one `@` with non-empty sides.
+//! - `workers/stream/src/probe.rs` `valid_probe_id` and
+//!   `workers/ingest/src/probe.rs` `validate_message_id` are both thin
+//!   delegations to the one shared rule,
+//!   `nntune_core::segment_identity::valid_segment_id` (RFC 5536 `msg-id`,
+//!   bracketless): 1..=250 bytes of printable ASCII, no `<`/`>`, exactly
+//!   one `@` with non-empty sides, never normalized.
 //!
 //! A stream-accepted id must never be rejected at the ingest envelope, and
 //! vice versa, so this file pins the agreement two ways:
 //!
 //! - the shared vector table below drives `valid_probe_id` directly: every
-//!   vector pins its expected verdict (empty, 513-byte, space, `<`/`>`,
-//!   double-`@`, NUL, non-printable, non-ASCII, plus valid controls
-//!   including the exact 512-byte boundary and the `!`/`~` charset edges);
+//!   vector pins its expected verdict (empty, 251/512/513-byte, space,
+//!   `<`/`>`, double-`@`, NUL, non-printable, non-ASCII, plus valid
+//!   controls including the exact 249/250-byte boundary and the `!`/`~`
+//!   charset edges);
 //! - `ingest_validator_body_matches_stream` extracts both validator bodies
-//!   as source text, requires each to stay self-contained (the `> 512` cap
-//!   and `(0x21..=0x7E)` range as literals inside the body, never an
-//!   external const/helper), and requires them identical modulo the
-//!   function name. Identical self-contained bodies agree on every input,
-//!   so the behavioral vectors pin ingest transitively: any unilateral rule
-//!   change on either side breaks the body equality, and any stream-side
-//!   semantic change also breaks the vectors.
+//!   as source text, requires each to delegate to the shared rule (the
+//!   `segment_identity::valid_segment_id` path as a literal inside the
+//!   body, so a forked local predicate fails the pin), and requires the
+//!   bodies identical modulo the function name. Identical delegating
+//!   bodies agree on every input, so the behavioral vectors pin ingest
+//!   transitively: any unilateral rule change on either side breaks the
+//!   body equality, and any stream-side semantic change also breaks the
+//!   vectors.
 //!
 //! Sensitivity (what each pin kills; implementation stays untouched):
 //!
-//! - relaxing/tightening either validator (cap, charset, `<`/`>` ban, `@`
-//!   splitting, empty-side rule) changes its body text, so the equality pin
-//!   fails naming the drifted side;
-//! - relaxing/tightening the stream validator additionally fails the vector
-//!   asserts on the drifted vectors;
-//! - tightening both validators identically keeps the equality pin green but
-//!   fails the vectors whose verdicts changed (semantics moved; the vectors
-//!   are the contract);
+//! - forking either validator into a local predicate (cap, charset,
+//!   `<`/`>` ban, `@` splitting, empty-side rule, or any trim/unbracket
+//!   normalization) drops the delegation literal, so the pin fails naming
+//!   the drifted side;
+//! - relaxing/tightening the shared rule additionally fails the vector
+//!   asserts on the drifted vectors (semantics moved; the vectors are the
+//!   contract);
 //! - deleting/renaming either function fails the extraction with a message
 //!   pointing at both files.
 //!
@@ -46,10 +49,9 @@
 //! compiles `tests/`, so the missing file in those contexts is never
 //! touched; full-checkout `cargo test` always has it.
 //!
-//! Out of scope: changing either validator's rules, the crate-level guard
-//! (core `nntune-core` NNTP argument validation, sibling card), the stream
-//! `nntp.rs` BODY adapter's own 250-byte shape rule (a different ceiling,
-//! pinned by `tests/message_id_shape_regression.rs`).
+//! Out of scope: changing the shared rule's ceiling or shape (owned by
+//! `nntune-core`), the crate-level guard (core `nntune-core` NNTP argument
+//! validation, sibling card).
 //!
 //! Run only this file:
 //!
@@ -68,6 +70,9 @@ const STREAM_PROBE_RS: &str = include_str!("../src/probe.rs");
 
 const STREAM_SIG: &str = "pub fn valid_probe_id(id: &str) -> bool {";
 const INGEST_SIG: &str = "pub fn validate_message_id(id: &str) -> bool {";
+/// The shared-rule path both validator bodies must delegate to. A forked
+/// local predicate drops this literal and fails the pin.
+const SHARED_RULE_PATH: &str = "segment_identity::valid_segment_id";
 
 /// The text of the validator starting at `signature` through its closing
 /// `}` at column 0 (both bodies are flat: no nested column-0 braces).
@@ -90,22 +95,33 @@ fn validator_body<'a>(source: &'a str, file: &str, signature: &str) -> &'a str {
 /// agree with this table; the body-equality pin extends the agreement to
 /// every input.
 fn agreement_vectors() -> Vec<(String, bool)> {
-    let at_cap = format!("{}@{}", "a".repeat(250), "b".repeat(261));
-    let over_cap = format!("{}@{}", "a".repeat(250), "b".repeat(262));
-    assert_eq!(at_cap.len(), 512, "exactly-at-cap control must be 512 B");
-    assert_eq!(over_cap.len(), 513, "over-cap vector must be 513 B");
+    let under_cap = format!("{}@{}", "a".repeat(124), "b".repeat(124));
+    let at_cap = format!("{}@{}", "a".repeat(124), "b".repeat(125));
+    let over_cap = format!("{}@{}", "a".repeat(125), "b".repeat(125));
+    let wire_refused = format!("{}@{}", "a".repeat(250), "b".repeat(261));
+    let far_over = format!("{}@{}", "a".repeat(250), "b".repeat(262));
+    assert_eq!(under_cap.len(), 249, "under-cap control must be 249 B");
+    assert_eq!(at_cap.len(), 250, "exactly-at-cap control must be 250 B");
+    assert_eq!(over_cap.len(), 251, "over-cap vector must be 251 B");
+    assert_eq!(wire_refused.len(), 512, "wire-refused vector must be 512 B");
+    assert_eq!(far_over.len(), 513, "far-over vector must be 513 B");
     vec![
-        // Valid controls (including the 0x21/0x7E printable-ASCII edges).
+        // Valid controls (including the 0x21/0x7E printable-ASCII edges and
+        // the shared 250-byte ceiling boundary).
         ("seg-one@synthetic.invalid".to_string(), true),
         ("!a@synthetic.invalid".to_string(), true),
         ("~a@synthetic.invalid".to_string(), true),
+        (under_cap, true),
         (at_cap, true),
         // Empty and overlong.
         (String::new(), false),
         (over_cap, false),
+        (wire_refused, false),
+        (far_over, false),
         // Space (0x20, below the printable range).
         ("has space@synthetic.invalid".to_string(), false),
-        // Angle brackets: bracketed, trailing, and injection-shaped.
+        // Angle brackets: bracketed, trailing, and injection-shaped. Never
+        // unbracketed into acceptance.
         ("<seg@synthetic.invalid>".to_string(), false),
         ("seg@synthetic.invalid>".to_string(), false),
         (
@@ -137,10 +153,10 @@ fn shared_vectors_cover_every_required_shape() {
     let vectors = agreement_vectors();
     assert_eq!(
         vectors.len(),
-        21,
-        "agreement table must keep all 21 vectors \
-         (empty, 513 B, space, brackets, double-@, NUL, non-printable, \
-         non-ASCII, controls incl. !/~ edges)"
+        24,
+        "agreement table must keep all 24 vectors \
+         (empty, 251/512/513 B, space, brackets, double-@, NUL, \
+         non-printable, non-ASCII, controls incl. 249/250 B and !/~ edges)"
     );
     assert!(
         vectors.iter().any(|(_, ok)| *ok),
@@ -169,15 +185,9 @@ fn ingest_validator_body_matches_stream() {
         ("validate_message_id", ingest_raw),
     ] {
         assert!(
-            body.contains("> 512"),
-            "{label} body must keep the `> 512` cap literal inline: \
-             extracting it to a const would let the two caps drift \
-             while the bodies still match"
-        );
-        assert!(
-            body.contains("(0x21..=0x7E)"),
-            "{label} body must keep the `(0x21..=0x7E)` range literal inline: \
-             extracting it would let the charsets drift \
+            body.contains(SHARED_RULE_PATH),
+            "{label} body must delegate to the shared `{SHARED_RULE_PATH}` rule: \
+             a forked local predicate would let the two sides drift \
              while the bodies still match"
         );
     }

@@ -1,13 +1,15 @@
 //! Play empty-segments fail-closed: an empty `segments` list is rejected
-//! before any pool lease or dial.
+//! with the final local-metadata verdict before any pool lease or dial.
 //!
-//! Pins `play_authorized` (`workers/stream/src/play.rs:516`, `segments.is_empty`
-//! → `Err(Upstream("track has no segments"))`): the guard sits after the
-//! cache-miss meter event and before segment-id validation and
-//! `pool.try_acquire`, so a metadata-less track fails closed with the pool
-//! untouched (no lease held, no connection opened, no quarantine). The
-//! single-segment control proves the harness can dial: the same wiring with
-//! one segment plays, streams, and caches.
+//! Pins `play_authorized` (`segments.is_empty` → `Err(InvalidSegment("track
+//! has no segments"))`): the guard sits after the cache-miss meter event
+//! and before segment-id validation and `pool.try_acquire`, so a
+//! metadata-less track fails closed with the pool untouched (no lease
+//! held, no connection opened, no quarantine, no provider-error meter)
+//! and a final 400 `invalid_request` envelope — never a retryable 502,
+//! because nothing about the provider failed. The single-segment control
+//! proves the harness can dial: the same wiring with one segment plays,
+//! streams, and caches.
 //!
 //! Failing command:
 //! `cargo test --locked -p nntune-stream --test play_empty_segments`
@@ -15,7 +17,8 @@
 //! Sensitivity: removing the guard must fail
 //! `empty_segments_fails_closed_without_touching_pool` (the play dials the
 //! closed address and returns a dial error instead of the `no segments`
-//! diagnostic).
+//! diagnostic); re-mapping the empty verdict to `Upstream` must fail the
+//! envelope asserts below.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -69,12 +72,22 @@ fn empty_segments_fails_closed_without_touching_pool() {
         Err(err) => err,
     };
     match &err {
-        PlayError::Upstream(detail) => assert!(
+        PlayError::InvalidSegment(detail) => assert!(
             detail.contains("no segments"),
             "empty segments must name the no-segments diagnostic, got {detail:?}"
         ),
-        other => panic!("empty segments must fail with the no-segments Upstream, got {other:?}"),
+        other => panic!(
+            "empty segments must fail with the no-segments InvalidSegment, got {other:?}"
+        ),
     }
+    // Final local verdict: 400, non-retryable, no Retry-After — an empty
+    // track says nothing about the provider.
+    assert_eq!(err.http_status(), 400);
+    let envelope = err.api_error();
+    assert_eq!(envelope.status, 400);
+    assert_eq!(envelope.code, "invalid_request");
+    assert!(!envelope.retryable);
+    assert!(err.retry_after_header().is_none());
 
     assert_eq!(pool.in_use(), 0, "no lease may be held");
     assert_eq!(pool.connects(), 0, "no connection may be opened");
@@ -91,6 +104,14 @@ fn empty_segments_fails_closed_without_touching_pool() {
     // the failure is the guard itself, not an auth or pool rejection.
     assert!(meter.has_kind(MeterKind::PlayStart));
     assert!(meter.has_kind(MeterKind::CacheMiss));
+    assert!(
+        !meter.has_kind(MeterKind::ProviderError),
+        "a refused play is not a provider failure"
+    );
+    assert!(
+        !meter.has_kind(MeterKind::QuarantineEntered),
+        "a refused play never quarantines"
+    );
 }
 
 /// Control: the same wiring with one segment plays end to end, proving the

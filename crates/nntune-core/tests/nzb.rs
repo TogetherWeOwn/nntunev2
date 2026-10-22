@@ -202,9 +202,12 @@ fn xxee_and_billion_laughs_are_rejected() {
 
 #[test]
 fn normalize_message_id_rules() {
-    assert_eq!(normalize_message_id("<a@b>").unwrap(), "a@b");
-    assert_eq!(normalize_message_id("  a@b  ").unwrap(), "a@b");
-    assert_eq!(normalize_message_id("< a@b >").unwrap(), "a@b");
+    // Strict: only already-bare ids pass; brackets and padding are refused,
+    // never trimmed or stripped into acceptance.
+    assert_eq!(normalize_message_id("a@b").unwrap(), "a@b");
+    assert!(normalize_message_id("<a@b>").is_err());
+    assert!(normalize_message_id("  a@b  ").is_err());
+    assert!(normalize_message_id("< a@b >").is_err());
     assert!(normalize_message_id("").is_err());
     assert!(normalize_message_id("a b@c").is_err());
     assert!(normalize_message_id("a<b@c>").is_err());
