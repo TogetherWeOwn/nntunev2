@@ -299,8 +299,10 @@ mod tests {
             include_str!("queue_consumer.rs").matches(&put_call).count(),
             1
         );
-        // The consumer plans exactly one persist per delivery.
-        let persist_call = ["!persist", "(env, &cp).await"].concat();
+        // The consumer plans exactly one persist per delivery. The call
+        // carries the delivery trace alongside the checkpoint, so pin the
+        // negated call head rather than the full argument list.
+        let persist_call = ["!persist", "("].concat();
         assert_eq!(
             include_str!("queue_consumer.rs")
                 .matches(&persist_call)
