@@ -366,9 +366,14 @@ class CacheTests(unittest.TestCase):
         self.write_alphabet_harness(control, historical=False)
         (control / 'evidence').mkdir()
         (control / 'evidence' / 'capture.json').write_bytes(b'{}')
+        # Isolate the evidence veto: the historical generated inputs would
+        # satisfy preservation on their own, so remove them; only the
+        # evidence directory in the cleaned fixture can veto below.
+        for name in ('Cargo.toml', 'alphabet.rs', 'Cargo.lock'):
+            (historical / name).unlink()
         veto = cache.preservation_veto(slot / 'target')
         self.assertIsNotNone(veto)
-        self.assertIn('preserved', veto)
+        self.assertIn('preserved directory in target: evidence', veto)
 
     def test_alphabet_harness_cleaned_layout_acquires(self):
         # The post-cleanup layout the fixed harness leaves (lock plus

@@ -30,58 +30,77 @@ fn play_ledger_alphabet_contract() {
     fs::create_dir_all(&scratch).expect("create native contract harness");
     let harness_lock = fs::File::create(scratch.join("harness.lock")).expect("open harness lock");
     harness_lock.lock().expect("lock native contract harness");
-    // Remove the generated manifest, test source, and lockfile when this
-    // scope ends, on success or on harness failure. The scratch directory
-    // lives inside Cargo-owned target storage, where leftover generated
-    // sources would fail later pool admission; the nested target/ and
-    // harness.lock stay for bounded build reuse and cross-process
-    // serialization. Declared after harness_lock so cleanup runs while the
-    // lock is still held; `_generated` (not `_`) so the guard drops at
-    // scope end rather than immediately.
-    let _generated = GeneratedInputs {
-        paths: [
-            scratch.join("Cargo.toml"),
-            scratch.join("alphabet.rs"),
-            scratch.join("Cargo.lock"),
-        ],
-    };
-    let manifest = format!(
-        "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [workspace]\n\
-         [dependencies]\nnntune-stream = {{ path = {stream:?} }}\nnntune-api = {{ path = {api:?} }}\n\
-         [[test]]\nname = \"alphabet\"\npath = \"alphabet.rs\"\n"
-    );
-    fs::write(scratch.join("Cargo.toml"), manifest).expect("write test-only manifest");
-    fs::write(scratch.join("alphabet.rs"), CONTRACT_TESTS).expect("write contract tests");
-    // Seed the API's resolved versions while Cargo adds stream-only
-    // dependencies. The generated lockfile belongs only to scratch.
-    fs::copy(api.join("Cargo.lock"), scratch.join("Cargo.lock")).expect("seed API lockfile");
-    let cargo = std::env::var_os("CARGO").expect("Cargo test runner");
-    let lock = Command::new(&cargo)
-        .args(["metadata", "--format-version", "1", "--manifest-path"])
-        .arg(scratch.join("Cargo.toml"))
-        .output()
-        .expect("resolve native contract harness");
+    // Remove the generated manifest, test source, and lockfile when the
+    // inner scope ends, on success or on harness failure. The scratch
+    // directory lives inside Cargo-owned target storage, where leftover
+    // generated sources would fail later pool admission; the nested
+    // target/ and harness.lock stay for bounded build reuse and
+    // cross-process serialization. The inner scope drops the guard while
+    // harness_lock is still held (preserving drop order) so the post-run
+    // assertions below observe the real cleanup; `_generated` (not `_`)
+    // so the guard drops at scope end rather than immediately.
+    {
+        let _generated = GeneratedInputs {
+            paths: [
+                scratch.join("Cargo.toml"),
+                scratch.join("alphabet.rs"),
+                scratch.join("Cargo.lock"),
+            ],
+        };
+        let manifest = format!(
+            "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [workspace]\n\
+             [dependencies]\nnntune-stream = {{ path = {stream:?} }}\nnntune-api = {{ path = {api:?} }}\n\
+             [[test]]\nname = \"alphabet\"\npath = \"alphabet.rs\"\n"
+        );
+        fs::write(scratch.join("Cargo.toml"), manifest).expect("write test-only manifest");
+        fs::write(scratch.join("alphabet.rs"), CONTRACT_TESTS).expect("write contract tests");
+        // Seed the API's resolved versions while Cargo adds stream-only
+        // dependencies. The generated lockfile belongs only to scratch.
+        fs::copy(api.join("Cargo.lock"), scratch.join("Cargo.lock")).expect("seed API lockfile");
+        let cargo = std::env::var_os("CARGO").expect("Cargo test runner");
+        let lock = Command::new(&cargo)
+            .args(["metadata", "--format-version", "1", "--manifest-path"])
+            .arg(scratch.join("Cargo.toml"))
+            .output()
+            .expect("resolve native contract harness");
+        assert!(
+            lock.status.success(),
+            "harness setup is not assertion-level RED:\n{}\n{}",
+            String::from_utf8_lossy(&lock.stdout),
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let result = Command::new(cargo)
+            .args(["test", "--locked", "--manifest-path"])
+            .arg(scratch.join("Cargo.toml"))
+            // Do not compete for the outer Cargo invocation's target lock.
+            .arg("--target-dir")
+            .arg(scratch.join("target"))
+            .args(["--test", "alphabet", "--", "--nocapture"])
+            .output()
+            .expect("run native stream/API contract assertions");
+        assert!(
+            result.status.success(),
+            "native stream/API contract failed (compile errors are not RED):\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    // Pin the real harness wiring: deleting the guard above leaves the
+    // generated inputs behind and must fail the suite, so observe the
+    // actual scratch instead of trusting the probes alone.
+    assert_inputs_removed(&[
+        scratch.join("Cargo.toml"),
+        scratch.join("alphabet.rs"),
+        scratch.join("Cargo.lock"),
+    ]);
     assert!(
-        lock.status.success(),
-        "harness setup is not assertion-level RED:\n{}\n{}",
-        String::from_utf8_lossy(&lock.stdout),
-        String::from_utf8_lossy(&lock.stderr)
+        scratch.join("target").is_dir(),
+        "harness must keep its nested target/ for bounded build reuse"
     );
-    let result = Command::new(cargo)
-        .args(["test", "--locked", "--manifest-path"])
-        .arg(scratch.join("Cargo.toml"))
-        // Do not compete for the outer Cargo invocation's target lock.
-        .arg("--target-dir")
-        .arg(scratch.join("target"))
-        .args(["--test", "alphabet", "--", "--nocapture"])
-        .output()
-        .expect("run native stream/API contract assertions");
     assert!(
-        result.status.success(),
-        "native stream/API contract failed (compile errors are not RED):\n{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
+        scratch.join("harness.lock").is_file(),
+        "harness must keep harness.lock for cross-process serialization"
     );
 }
 
