@@ -102,3 +102,8 @@ sha256 = "cd67e713c0da150acdcfa43a635a587818aaf6b8db4e7102040985291b6f8b4d"
 file = "0021_billing_schema.sql"
 target = "app"
 sha256 = "ad1e437bff738a7a737ab8cd323fd0a9ff1e74e7e6f08730f186e5b71ab444a1"
+
+[[migration]]
+file = "0022_library_artifacts.sql"
+target = "app"
+sha256 = "f28d63c5b585c98aecaa2949c962481a05abf93dff199388ce17f7190434a62a"

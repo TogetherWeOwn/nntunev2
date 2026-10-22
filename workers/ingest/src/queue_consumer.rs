@@ -90,7 +90,7 @@ use crate::queue::{validate_indexer_ref, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
-    ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+    ERR_TRANSCODE_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
     BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
@@ -237,6 +237,7 @@ fn unavailable_code(state: JobState) -> &'static str {
         JobState::Verifying => ERR_VERIFY_FAILED,
         JobState::Repairing => ERR_REPAIR_FAILED,
         JobState::Matching => ERR_MATCH_FAILED,
+        JobState::Transcoding => ERR_TRANSCODE_FAILED,
         JobState::Writing => ERR_WRITE_FAILED,
         _ => ERR_PROBE_FAILED,
     }
@@ -1447,6 +1448,15 @@ async fn execute_write_with<R: MatchWriteRuntime>(
 /// instead of dropping the event. A delivery that enters in `Writing`
 /// (checkpoint persisted after the match transition) re-resolves and
 /// writes without re-emitting `match`.
+///
+/// `Transcoding` sits between the two in the state order but its
+/// execution arm is not wired yet (no front Worker, Container, or
+/// publication bindings in this slice), so the match delivery steps
+/// straight through it to `Writing`: persisting a `Transcoding`
+/// checkpoint `run_step` cannot dispatch would strand the job on the
+/// boundary fallback. When the B6 runtime lands the artifact step it
+/// re-splits this delivery — match, settle `Transcoding` as progress,
+/// transcode on the next delivery inside its own 660 s budget.
 async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
@@ -1459,6 +1469,10 @@ async fn run_match_write_with<R: MatchWriteRuntime>(
             .await
             .map_err(|()| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
         advance_checkpoint(cp, false);
+        debug_assert_eq!(cp.state, JobState::Transcoding);
+        // Reserved, not runnable: see the doc comment above.
+        advance_checkpoint(cp, false);
+        debug_assert_eq!(cp.state, JobState::Writing);
     }
     execute_write_with(runtime, msg, cp, &write).await
 }
@@ -2029,6 +2043,10 @@ mod tests {
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
+        // Transcoding is reserved but unwired, so the match delivery
+        // steps straight through it to Writing and completes: no
+        // checkpoint is ever persisted in a state run_step cannot
+        // dispatch.
         run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect("matching delivery succeeds");

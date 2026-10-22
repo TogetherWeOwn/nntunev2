@@ -76,3 +76,32 @@ Run the acceptance suite from the repository root with Node 24+:
 ```sh
 node --experimental-vm-modules --test workers/observability/tests/render-verdict-alert.test.mjs
 ```
+
+# Sustained health-red window verdicts
+
+`evaluate-health-window.mjs` exports a pure, deterministic
+`evaluateHealthWindow(samples, policy)` that reduces an explicit array of
+`{t, ok}` health samples the caller has already windowed (each sample
+carries its own caller-supplied ms clock, so window membership is the
+caller's job) to one sustained-red verdict for the staging API. Each call
+evaluates exactly one window; no cross-window state is kept.
+
+The policy binds the `api`/`staging` labels, a `red_for_ms` sustained-red
+threshold (1..3600000), and a `min_samples` denominator floor (1..100000).
+Valid samples are ordered by `t` ascending (stable) within each
+malformed-delimited segment; malformed entries are skipped, counted, and
+split contiguity, so no breach may span untrusted evidence. A contiguous
+not-ok run breaches iff (last_t - first_t) >= red_for_ms; below-floor
+windows report `unknown`/`insufficient_data` with the longest red span
+still reported. Invalid policy or a non-array root fails closed to `null`
+— never a fabricated verdict, never a throw.
+
+This module is not wired or deployed: no consumer, schedule, delivery,
+dashboard, or live alerting reads from it. It performs no network,
+environment, clock, logging, or storage access.
+
+Run the acceptance suite from the repository root with Node 24+:
+
+```sh
+node --experimental-vm-modules --test workers/observability/tests/evaluate-health-window.test.mjs
+```
