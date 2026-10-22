@@ -377,8 +377,9 @@ pub enum AudioSource {
 
 /// Pick the audio format: the best available Opus from the ATV
 /// (itag 251 first, else the highest-bitrate Opus format; a missing
-/// bitrate sorts as 0 and ties keep shelf order). Returns `None` for an
-/// OMV source or when no Opus format exists.
+/// bitrate sorts as 0 and ties keep shelf order). Cipher-only formats
+/// (no plain URL) are skipped: they cannot be fetched. Returns `None`
+/// for an OMV source or when no fetchable Opus format exists.
 pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Option<&StreamFormat> {
     if !matches!(source, AudioSource::Atv) {
         return None;
@@ -390,7 +391,7 @@ pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Opt
             .mime
             .as_deref()
             .is_some_and(|mime| mime.contains("opus"));
-        if !opus {
+        if !opus || format.url.is_none() {
             continue;
         }
         if format.itag == PREFERRED_AUDIO_ITAG {
@@ -738,6 +739,53 @@ mod tests {
     fn audio_never_from_omv() {
         let formats = vec![opus_format(251, Some(160_000))];
         assert_eq!(select_audio_format(&formats, AudioSource::Omv), None);
+    }
+
+    fn cipher_only_opus_format(itag: i64, bitrate: Option<u64>) -> StreamFormat {
+        StreamFormat {
+            itag,
+            bitrate,
+            mime: Some("audio/webm; codecs=\"opus\"".to_string()),
+            url: None,
+            has_signature_cipher: true,
+            has_n_param: false,
+            has_sabr: false,
+            ip: None,
+        }
+    }
+
+    #[test]
+    fn audio_skips_cipher_only_251_for_fetchable_opus() {
+        // A cipher-only 251 has no fetchable URL: it must not shadow a
+        // usable format via the preferred-itag fast path.
+        let formats = vec![
+            cipher_only_opus_format(251, Some(160_000)),
+            opus_format(249, Some(50_000)),
+        ];
+        let picked = select_audio_format(&formats, AudioSource::Atv).expect("audio");
+        assert_eq!(picked.itag, 249);
+        assert!(picked.url.is_some());
+    }
+
+    #[test]
+    fn audio_cipher_only_high_bitrate_does_not_replace_usable_fallback() {
+        // A cipher-only format must not win the highest-bitrate fallback
+        // either, however large its advertised bitrate.
+        let formats = vec![
+            opus_format(249, Some(50_000)),
+            cipher_only_opus_format(250, Some(999_999)),
+        ];
+        let picked = select_audio_format(&formats, AudioSource::Atv).expect("audio");
+        assert_eq!(picked.itag, 249);
+        assert!(picked.url.is_some());
+    }
+
+    #[test]
+    fn audio_none_when_only_cipher_only_opus() {
+        // Fail closed: cipher-only Opus with nothing fetchable yields no
+        // audio, the same as no Opus at all.
+        let formats = vec![cipher_only_opus_format(251, Some(160_000))];
+        assert_eq!(select_audio_format(&formats, AudioSource::Atv), None);
     }
 
     #[test]

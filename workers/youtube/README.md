@@ -20,10 +20,12 @@ measured findings) lives in `docs/youtube-backend-spike.md`.
 - `src/gate.rs` — the GO/NO-GO verdict (byte-fetch failure rate from
   Worker egress, threshold 5%) and the per-video JSONL measurement
   record.
-- `corpus/day1.json` — the 100-video Day-1 corpus (50 VEVO label music
-  videos, 50 auto-generated `- Topic` audio tracks), built by
-  `corpus/build.sh` via YouTube search + oEmbed verify/classify. See
-  `corpus/SOURCES.md` for the method.
+- `corpus/day1.json` — HISTORICAL, retired: the original 100-video
+  Day-1 corpus (50 VEVO label music videos, 50 auto-generated
+  `- Topic` audio tracks). The VEVO/Topic substring method is
+  superseded by the OMV/ATV selection rules; `corpus/build.sh` fails
+  closed until rewritten. See `corpus/SOURCES.md` for the method and
+  the pending re-cut.
 
 Pure portable logic: no network, no Worker bindings, no new external
 dependencies (`serde` + `serde_json` only). Native builds and `cargo

@@ -141,7 +141,8 @@ is the reference for version bumps.
 - **Day 1** (this card's first slices): Worker + `connect()` proxy
   client; 100-video corpus measurement from Worker egress; non-proxy
   parts first. Done so far: portable extraction core, probe planner,
-  gate verdict, verified corpus. Remaining: runtime entry, proxy
+  gate verdict, official-media selection rules. Remaining: runtime
+  entry, corpus re-cut to the OMV/ATV method, proxy
   client (needs creds), staging measurement run.
 - **Day 2:** tv client with the QuickJS solver (meriyah + QuickJS
   compiled to WASM, no eval; `youtubei.js` ships a `cf-worker` entry
