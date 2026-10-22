@@ -194,12 +194,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   closed once configured. Credential hardening, not journey coverage.
 - `e2e/tests/bot-contract.spec.ts` pins the bot-contract conformance
   corpus (spec section 5) offline on every PR via `test:unit`: the checker
-  passes each corpus (`:81` "checker passes every grant vector", `:189`
-  "checker passes every signed-url vector", `:281` "checker passes every
+  passes each corpus (`:82` "checker passes every grant vector", `:190`
+  "checker passes every signed-url vector", `:282` "checker passes every
   matrix row"), each mutation battery fails its broken shapes by name
-  (`:129` "grant mutants fail by name", `:199` "signed-url mutants fail by
-  name", `:291` "matrix mutants fail by name"), and the stable IDs plus
-  typed codes match their pinned sources (`:446`, `:468`, `:482`, `:492`).
+  (`:130` "grant mutants fail by name", `:200` "signed-url mutants fail by
+  name", `:292` "matrix mutants fail by name"), and the stable IDs plus
+  typed codes match their pinned sources (`:447`, `:469`, `:483`, `:493`).
   No live legs: the B8 staging harness feeds these vectors to staging
   later (`e2e/fixtures/bot-contract/`). Test infra, not journey coverage.
 - `e2e/tests/security-sign-out-everywhere.spec.ts:135`
