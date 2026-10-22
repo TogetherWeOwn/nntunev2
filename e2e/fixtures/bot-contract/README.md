@@ -117,4 +117,8 @@ token = f"v1.{payload}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
 ```
 
 New vectors need stable ids, an expectation, and at least one mutant in
-the spec battery that breaks the new shape.
+the spec battery that breaks the new shape. The high-entropy `v1.…`
+segments trip the `generic-api-key` rule, so `.gitleaks.toml` allowlists
+exactly that envelope shape (regex-only, since allowlist fields are ORed):
+non-`v1` and other-rule findings in these files still trip, as the PR's
+probe evidence shows.
