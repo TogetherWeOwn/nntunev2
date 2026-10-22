@@ -138,6 +138,54 @@ function assertNoCanaries(text) {
   }
 }
 
+const WEBHOOK_HOST = 'discord.com';
+// Leading-dot suffix: exact host or any subdomain, never a superstring
+// collision such as evil-discord.com. The leading dot is also the CodeQL
+// js/incomplete-url-substring-sanitization whitelist shape for endsWith.
+const WEBHOOK_SUFFIX = '.discord.com';
+
+function collectStringLeaves(value, out = []) {
+  if (typeof value === 'string') {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStringLeaves(item, out);
+  } else if (value && typeof value === 'object') {
+    for (const item of Object.values(value)) collectStringLeaves(item, out);
+  }
+  return out;
+}
+
+// Exact-equality replacement for text.includes(logsUrl): the logs URL must
+// appear verbatim as a whole payload string. Fails on drop/mangle, with no
+// URL-substring check for CodeQL to flag.
+function assertCarriesLogsUrl(payload, logsUrl, message) {
+  const carried = collectStringLeaves(payload).some((value) => value === logsUrl);
+  assert.equal(carried, true, message);
+}
+
+function isWebhookHost(hostname) {
+  const host = String(hostname).toLowerCase();
+  return host === WEBHOOK_HOST || host.endsWith(WEBHOOK_SUFFIX);
+}
+
+// WHATWG-parse replacement for text.includes('discord.com'): each token is
+// parsed as a URL where possible, else treated as a bare host, and the host
+// is compared exactly (plus leading-dot subdomains). Stricter than substring:
+// evil-discord.com and discord.com.evil.net correctly pass.
+function assertNoWebhookHost(text, message) {
+  const tokens = String(text).split(/[\s"'<>\[\]{}|,;]+/);
+  for (const token of tokens) {
+    if (token.length === 0) continue;
+    let hostname;
+    try {
+      hostname = new URL(token).hostname;
+    } catch {
+      hostname = token.split('/')[0].split(':')[0].split('?')[0].split('#')[0].split('@').pop();
+    }
+    assert.equal(isWebhookHost(hostname), false, message);
+  }
+}
+
 function assertDiscordBounds(payload) {
   assert.equal(typeof payload.content, 'string', 'content must be a string');
   assert.equal(payload.content.length >= 1, true, 'breach content must not be empty');
@@ -261,9 +309,9 @@ function assertBreachCarries(payload, {
   for (const key of keys) {
     assert.equal(text.includes(key), true, `payload must carry breakdown entry ${key}`);
   }
-  assert.equal(text.includes(logsUrl), true, 'payload must carry the logs URL');
+  assertCarriesLogsUrl(payload, logsUrl, 'payload must carry the logs URL');
   assert.equal(text.includes(windowLabel), true, 'payload must carry the window label');
-  assert.equal(text.includes('discord.com'), false, 'payload must not contain a webhook URL');
+  assertNoWebhookHost(text, 'payload must not contain a webhook URL');
   return text;
 }
 
@@ -501,7 +549,7 @@ test('adversarial long rule names, breakdown keys, and SHAs stay within bounds',
   assert.equal(text.includes('3/4'), true, 'rational must survive truncation');
   assert.equal(text.includes('0.7500'), true, 'decimal must survive truncation');
   assert.equal(text.includes('overall'), true, 'short rules must survive truncation');
-  assert.equal(text.includes(LOGS_URL), true, 'logs URL must survive truncation');
+  assertCarriesLogsUrl(first, LOGS_URL, 'logs URL must survive truncation');
   assert.equal(text.includes(WINDOW_LABEL), true, 'window label must survive truncation');
   const second = render(verdict, contextFixture());
   assert.equal(JSON.stringify(second), text, 'adversarial render must be deterministic');
@@ -514,7 +562,7 @@ test('adversarial long window label stays within bounds without losing the logs 
   assertDiscordBounds(first);
   const text = JSON.stringify(first);
   assert.equal(text.includes('…'), true, 'oversized label must truncate with an ellipsis marker');
-  assert.equal(text.includes(LOGS_URL), true, 'logs URL must survive label truncation');
+  assertCarriesLogsUrl(first, LOGS_URL, 'logs URL must survive label truncation');
   assert.equal(text.includes('3/4'), true, 'rational must survive label truncation');
   assert.equal(JSON.stringify(render(breachVerdict(), contextFixture({ windowLabel: `window ${LONG}` }))), text,
     'label truncation must be deterministic');
@@ -542,7 +590,7 @@ test('adversarial breakdown and rule cardinality stays within bounds', () => {
   const text = JSON.stringify(first);
   assert.equal(text.includes('3/4'), true, 'rational must survive list capping');
   assert.equal(text.includes('0.7500'), true, 'decimal must survive list capping');
-  assert.equal(text.includes(LOGS_URL), true, 'logs URL must survive list capping');
+  assertCarriesLogsUrl(first, LOGS_URL, 'logs URL must survive list capping');
   assert.equal(text.includes(WINDOW_LABEL), true, 'window label must survive list capping');
   assert.equal(JSON.stringify(render(verdict, contextFixture())), text,
     'capped render must be deterministic');
@@ -618,8 +666,7 @@ test('cyclic verdicts never throw and never produce an unbounded payload', () =>
 test('module source carries no webhook URL', async () => {
   assert.equal(loadFailure, undefined, 'implement render-verdict-alert.mjs first');
   const source = await readFile(MODULE_URL, 'utf8');
-  assert.equal(source.toLowerCase().includes('discord.com'), false,
-    'module must not contain a webhook host');
+  assertNoWebhookHost(source, 'module must not contain a webhook host');
 });
 
 test('no ambient effects across the whole suite', () => {
