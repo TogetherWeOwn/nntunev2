@@ -249,6 +249,60 @@ test('resume restores on reselect and clears at track end', async ({ page }) => 
 	expect(afterEnd['second-signal']).toBeUndefined();
 });
 
+test('resume restores the selected track and position after an ordinary reload', async ({ page }) => {
+	await openPlayer(page, { clearComfortStorage: false });
+	await page.getByTestId('queue-select-second-signal').click();
+	await settle(page, 'resolve');
+	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
+		el.currentTime = 42.5;
+		el.dispatchEvent(new Event('timeupdate'));
+	});
+	await expect.poll(() => currentTime(page)).toBe(42.5);
+
+	await page.reload();
+	await expect(page).toHaveURL(/\/demo\/player$/);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect.poll(() => currentTime(page)).toBe(42.5);
+});
+
+test('reselecting the current track preserves live time instead of a stale resume position', async ({ page }) => {
+	await openPlayer(page);
+	await startPlaying(page);
+	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
+		el.currentTime = 60;
+		el.dispatchEvent(new Event('timeupdate'));
+	});
+	await page.evaluate(() => localStorage.setItem('nntune:resume:v1', '{"demo-track":20}'));
+	await expect.poll(() => currentTime(page)).toBe(60);
+
+	await page.getByTestId('queue-select-demo-track').click();
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect.poll(() => currentTime(page)).toBe(60);
+});
+
+for (const boundary of [
+	{ track: 'demo-track', title: 'Demo track', button: 'player-prev' },
+	{ track: 'third-light', title: 'Third Light', button: 'player-next' }
+]) {
+	test(`${boundary.button} at the queue boundary does not seek to a saved resume position`, async ({ page }) => {
+		await openPlayer(page);
+		await page.getByTestId(`queue-select-${boundary.track}`).click();
+		await settle(page, 'resolve');
+		await expect(page.getByTestId('now-playing')).toContainText(boundary.title);
+		await expect.poll(() => currentTime(page)).toBe(0);
+		await page.evaluate((track) => {
+			localStorage.setItem('nntune:resume:v1', JSON.stringify({ [track]: 20 }));
+		}, boundary.track);
+
+		await page.getByTestId(boundary.button).click();
+		await expect(page.getByTestId('now-playing')).toContainText(boundary.title);
+		await expect(page.getByTestId('queue-item')).toHaveCount(3);
+		await expect.poll(() => currentTime(page)).toBe(0);
+	});
+}
+
 test('share link resolves the track and seeks to t', async ({ page }) => {
 	await page.route('**/api/demo/audio**', () => {});
 	await page.goto('/demo/player?track=second-signal&t=90');
