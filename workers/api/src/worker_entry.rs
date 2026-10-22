@@ -468,8 +468,8 @@ impl PgStore {
                         );
                     }
                 });
-                // Bound every later query on this connection to the same
-                // overall budget; the driver is already running above.
+                // Connect-time SET of the total budget; Hyperdrive RESETs
+                // pooled backends, so per-query bounds are separate work.
                 client
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
