@@ -141,6 +141,15 @@ class CacheTests(unittest.TestCase):
             self.assertTrue((slot_a / 'scratch' / ws_a).is_dir())
         finally:
             os.close(fd_a)
+        # Same worktree re-acquiring with no intervening other worktree
+        # keeps its incremental build cache.
+        slot_a1, target_a1, fd_a1 = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            self.assertEqual(slot_a1.name, 'slot-0')
+            self.assertEqual(target_a1, target_a)
+            self.assertTrue((target_a1 / 'debug' / 'marker-a').exists())
+        finally:
+            os.close(fd_a1)
         slot_b, target_b, fd_b = cache.acquire(self.pool, self.policy, work_b)
         try:
             self.assertEqual(slot_b.name, 'slot-0')
@@ -217,8 +226,12 @@ class CacheTests(unittest.TestCase):
         (target / ws_b / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 16)
         self.assertIn('preserved', cache.preservation_veto(target))
         (target / ws_b / 'debug' / 'stashed-source.rs').unlink()
+        (target / ws_a / 'debug' / 'backup.tar.gz').write_bytes(b'x' * 16)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (target / ws_a / 'debug' / 'backup.tar.gz').unlink()
         (scratch / ws_a / 'backup.tar.gz').write_bytes(b'x' * 16)
         # backup stem is protected even under an arbitrary temp name
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
         (scratch / ws_a / 'backup.tar.gz').unlink()
         (scratch / ws_a / 'backup').mkdir()
         self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
@@ -275,6 +288,77 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(backup.is_dir())
         self.assertEqual(list((slot / 'target').iterdir()), [slot / 'target' / ws_a])
         self.assertEqual(list((slot / 'scratch').iterdir()), [slot / 'scratch' / ws_a])
+
+    def test_mixed_worktree_legacy_layout_vetoes(self):
+        # An old/new script rollout leaves target/ holding one ws-*
+        # subdir plus a legacy debug/ tree. Both vetoes must flag the
+        # mixed provenance for Operator inspection instead of scanning
+        # it as pure legacy output.
+        target = self.pool / 'slot-0' / 'target'
+        scratch = self.pool / 'slot-0' / 'scratch'
+        ws_a = cache.workspace_subdir_name(self.root / 'a')
+        (target / ws_a / 'debug').mkdir(parents=True)
+        (target / 'debug' / 'deps').mkdir(parents=True)
+        (target / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (scratch / ws_a).mkdir(parents=True)
+        (scratch / 'tmpfile').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+
+    def test_over_budget_other_worktree_output_reuses_slot_after_eviction(self):
+        # The post-eviction re-measure restores a slot that was over
+        # budget only because of another worktree's subdirs: eviction
+        # frees the bytes, then acquire re-measures before the budget
+        # gate instead of refusing until Operator inspection.
+        work_other = self.root / 'work-other'
+        work_new = self.root / 'work-new'
+        work_other.mkdir()
+        work_new.mkdir()
+        ws_other = cache.workspace_subdir_name(work_other)
+        slot = self.pool / 'slot-0'
+        big = slot / 'target' / ws_other / 'debug' / 'libbig.rlib'
+        big.parent.mkdir(parents=True)
+        big.write_bytes(b'x' * (512 * 1024))
+        (slot / 'scratch' / ws_other).mkdir(parents=True)
+        self.assertGreaterEqual(cache.usage(slot), self.policy['slot_budget_bytes'])
+        got, target, fd = cache.acquire(self.pool, self.policy, work_new)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+            ws_new = cache.workspace_subdir_name(work_new)
+            self.assertEqual(target, slot / 'target' / ws_new)
+            self.assertEqual(list(target.iterdir()), [])
+        finally:
+            os.close(fd)
+
+    def test_eviction_io_error_skips_slot_instead_of_aborting(self):
+        # A filesystem error while evicting one slot refuses that slot
+        # so acquire tries the next one instead of aborting the pool
+        # scan with a raw OSError.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / ws_a / 'debug').mkdir(parents=True)
+        (slot / 'target' / ws_a / 'debug' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        real_rmtree = shutil.rmtree
+
+        def fail_slot0(path, *args, **kwargs):
+            if slot in Path(path).parents:
+                raise PermissionError('injected eviction failure')
+            return real_rmtree(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with patch.object(cache.shutil, 'rmtree', side_effect=fail_slot0):
+                got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
 
     def test_guard_stops_growth_and_retains_lease(self):
         self.policy['slot_budget_bytes'] = 24 * 1024

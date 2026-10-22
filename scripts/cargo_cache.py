@@ -133,8 +133,9 @@ def _prepare_worktree_dirs(slot, ws_name):
 
     Both parents are fully preflighted (layout, symlink, and veto
     checks) before either is mutated, and each evicted subdir passes
-    the same preservation veto retention uses: a refused slot is left
-    unchanged, never partially evicted.
+    the same preservation veto retention uses: a veto-refused slot is
+    left unchanged, never partially evicted. Filesystem errors during
+    eviction refuse the slot so acquire can try the next one.
     """
     plans = []
     for parent_name, veto_fn in (('target', preservation_veto),
@@ -176,14 +177,17 @@ def _prepare_worktree_dirs(slot, ws_name):
                 raise Refusal(f'symlink in {parent_name} during migration: {entry.name}')
         plans.append((parent, parent_name, list(entries), True))
     for parent, parent_name, evict, is_migration in plans:
-        for entry in evict:
-            if entry.is_symlink():
-                raise Refusal(f'symlink in {parent_name} during eviction: {entry.name}')
-            if entry.is_dir():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-        (parent / ws_name).mkdir(exist_ok=True)
+        try:
+            for entry in evict:
+                if entry.is_symlink():
+                    raise Refusal(f'symlink in {parent_name} during eviction: {entry.name}')
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+            (parent / ws_name).mkdir(exist_ok=True)
+        except OSError as error:
+            raise Refusal(f'cannot prepare {parent_name} in {slot.name}: {error}') from error
         real_directory(parent / ws_name)
         if is_migration:
             print(json.dumps({'finding': 'worktree_layout_migrated', 'slot': slot.name,
