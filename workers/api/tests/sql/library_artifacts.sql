@@ -367,23 +367,25 @@ BEGIN
 
     -- RESTRICT (ADR 0002 rule 3): deletion is an explicit batched
     -- procedure — a bare parent delete fails instead of cascading.
+    -- ON DELETE RESTRICT raises restrict_violation (23001), not the
+    -- insert-side foreign_key_violation (23503), so catch both.
     BEGIN
         DELETE FROM users WHERE id = 'user-la-1';
         RAISE EXCEPTION 'user delete cascaded past RESTRICT children';
-    EXCEPTION WHEN foreign_key_violation THEN
+    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
         NULL;
     END;
     BEGIN
         DELETE FROM ingest_jobs WHERE id = 'job_01testartifact0001';
         RAISE EXCEPTION 'job delete cascaded past RESTRICT media';
-    EXCEPTION WHEN foreign_key_violation THEN
+    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
         NULL;
     END;
     BEGIN
         DELETE FROM cache_objects
         WHERE content_hash = '9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734';
         RAISE EXCEPTION 'object delete cascaded past RESTRICT grants';
-    EXCEPTION WHEN foreign_key_violation THEN
+    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
         NULL;
     END;
 
