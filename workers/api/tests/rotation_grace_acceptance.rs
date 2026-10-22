@@ -72,11 +72,17 @@ fn kek_grace_window_old_reads_succeed_until_retire() {
         vault::decrypt_vault(&KEK_V2, DRILL_USER, &rewrapped).expect("v2 reads rewrapped row");
     assert_eq!(migrated, DRILL_PLAINTEXT);
 
+    // Keep the KEK unchanged to isolate the stored version's AAD binding.
+    let mut skewed = v1_blob.clone();
+    skewed.kek_version = 2;
+
     // Version-pinned decrypt is strict both ways, and every failure carries
     // the identical generic message — the same text the HTTP envelope
     // carries — so a wrong version (or a wholly wrong key) is no oracle for
     // an attacker and no distinguishing detail for operators either.
     for err in [
+        vault::decrypt_vault(&KEK_V1, DRILL_USER, &skewed)
+            .expect_err("same-key version-only tampering must fail"),
         vault::decrypt_vault(&KEK_V2, DRILL_USER, &v1_blob).unwrap_err(),
         vault::decrypt_vault(&KEK_V1, DRILL_USER, &rewrapped).unwrap_err(),
         vault::decrypt_vault(&KEK_WRONG, DRILL_USER, &v1_blob).unwrap_err(),
