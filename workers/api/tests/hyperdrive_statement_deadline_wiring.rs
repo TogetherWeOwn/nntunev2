@@ -217,10 +217,38 @@ fn assert_bounded(piece: &str, name: &str) {
         ".simple_query",
         ".commit(",
         ".rollback(",
+        // Statement helpers are statement calls too: a client escaping
+        // the seam into a helper is invisible to the driver markers.
+        "claim_rate_limit_slot(",
+        "delete_expired_rate_limit_slots(",
     ] {
         assert!(
             !remainder.contains(marker),
             "{name} must run no statement outside the bound operation ({marker} escapes the seam)"
+        );
+    }
+    // Durable escape rule: every statement, direct or via helper, needs an
+    // await. The remainder keeps exactly one `.await` (the bounded call's
+    // own: signatures cannot await, so the first one is it); strip it and
+    // forbid any further await plus any handle use, so moving a helper
+    // call after the awaited bound fails here, not in production.
+    let awaited = ".await";
+    let await_pos = remainder
+        .find(awaited)
+        .expect("the bounded call is awaited");
+    let unawaited = format!(
+        "{}{}",
+        &remainder[..await_pos],
+        &remainder[await_pos + awaited.len()..]
+    );
+    assert!(
+        !unawaited.contains(awaited),
+        "{name} must await nothing outside the bound operation (a second .await escapes the seam)"
+    );
+    for handle in ["&client", "&transaction"] {
+        assert!(
+            !unawaited.contains(handle),
+            "{name} must use no client handle outside the bound operation ({handle} escapes the seam)"
         );
     }
 }
@@ -300,13 +328,15 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
         .expect("pair opens one transaction")
         .1;
     assert_eq!(
-        in_transaction.matches("claim_rate_limit_slot(").count(),
+        in_transaction
+            .matches("claim_rate_limit_slot(&transaction,")
+            .count(),
         2,
-        "both claims must run inside the pair transaction"
+        "both claims must run on the pair transaction handle"
     );
     assert!(
-        in_transaction.contains("delete_expired_rate_limit_slots("),
-        "the pair delete must run inside the pair transaction"
+        in_transaction.contains("delete_expired_rate_limit_slots(&transaction,"),
+        "the pair delete must run on the pair transaction handle"
     );
     assert!(
         in_transaction.contains(".commit("),
