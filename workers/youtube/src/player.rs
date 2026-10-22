@@ -39,6 +39,9 @@ impl Playability {
 pub struct StreamFormat {
     /// Innertube itag (0 when the response omits it).
     pub itag: i64,
+    /// Innertube `bitrate` in bits per second, when present. The audio
+    /// selector ranks fallback Opus formats by this.
+    pub bitrate: Option<u64>,
     /// MIME type with codecs, when present.
     pub mime: Option<String>,
     /// Plain stream URL; `None` when the format only carries a
@@ -105,6 +108,7 @@ fn parse_format(format: &serde_json::Value) -> StreamFormat {
             .get("itag")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0),
+        bitrate: format.get("bitrate").and_then(serde_json::Value::as_u64),
         mime: format
             .get("mimeType")
             .and_then(serde_json::Value::as_str)
@@ -188,6 +192,7 @@ mod tests {
             "streamingData": {
                 "formats": [{
                     "itag": 18,
+                    "bitrate": 500000,
                     "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
                     "url": "https://rr1---sn-abc123.googlevideo.com/videoplayback?expire=1&ip=203.0.113.7&n=xyz&id=1&itag=18"
                 }],
@@ -203,6 +208,7 @@ mod tests {
         assert_eq!(outcome.formats.len(), 2);
         let progressive = &outcome.formats[0];
         assert_eq!(progressive.itag, 18);
+        assert_eq!(progressive.bitrate, Some(500_000));
         assert!(progressive.url.is_some());
         assert!(!progressive.has_signature_cipher);
         assert!(progressive.has_n_param);
@@ -210,6 +216,7 @@ mod tests {
         assert_eq!(progressive.ip.as_deref(), Some("203.0.113.7"));
         let audio = &outcome.formats[1];
         assert_eq!(audio.itag, 140);
+        assert_eq!(audio.bitrate, None);
         assert_eq!(audio.url, None);
         assert!(audio.has_signature_cipher);
     }

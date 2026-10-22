@@ -14,12 +14,16 @@ pub fn head_range() -> String {
 }
 
 /// `Range` header for a 256 KiB window centered in a `total_bytes` file.
-/// `None` when the file fits in one head window (mid == head then).
+/// `None` when the file fits in one head window, or when the centered
+/// window would start at byte 0 (mid == head then).
 pub fn mid_range(total_bytes: u64) -> Option<String> {
     if total_bytes <= HEAD_BYTES {
         return None;
     }
     let start = total_bytes / 2 - HEAD_BYTES / 2;
+    if start == 0 {
+        return None;
+    }
     Some(format!("bytes={}-{}", start, start + HEAD_BYTES - 1))
 }
 
@@ -46,5 +50,14 @@ mod tests {
     fn mid_window_absent_for_small_files() {
         assert_eq!(mid_range(HEAD_BYTES), None);
         assert_eq!(mid_range(100), None);
+    }
+
+    #[test]
+    fn mid_window_none_when_mid_equals_head() {
+        // HEAD_BYTES + 1 centers the window at byte 0, duplicating the
+        // head probe: report no mid window instead of a redundant fetch.
+        assert_eq!(mid_range(HEAD_BYTES + 1), None);
+        // One byte larger and the centered window starts at byte 1.
+        assert_eq!(mid_range(HEAD_BYTES + 2).as_deref(), Some("bytes=1-262144"));
     }
 }

@@ -116,8 +116,8 @@ pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidat
         video_id: video_id.to_string(),
         channel_id: channel_from_runs(renderer),
         music_video_type,
-        official_artist: badges.iter().any(|b| b == OFFICIAL_ARTIST_BADGE),
-        verified: badges.iter().any(|b| b == VERIFIED_BADGE),
+        official_artist: badges.iter().any(|b| *b == OFFICIAL_ARTIST_BADGE),
+        verified: badges.iter().any(|b| *b == VERIFIED_BADGE),
         duration_secs: duration_from_renderer(renderer),
     })
 }
@@ -176,18 +176,21 @@ fn badge_icon_types(renderer: &serde_json::Value) -> Vec<&str> {
     icons
 }
 
-/// Shelf duration: the last duration-shaped run in the fixed columns,
-/// falling back to the flex columns.
-fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
+/// All run texts in one column kind, in shelf order.
+fn column_texts<'a>(
+    renderer: &'a serde_json::Value,
+    columns_key: &str,
+    column_renderer_key: &str,
+) -> Vec<&'a str> {
     let mut texts = Vec::new();
     if let Some(columns) = renderer
-        .get("fixedColumns")
+        .get(columns_key)
         .and_then(serde_json::Value::as_array)
     {
         for column in columns {
             if let Some(runs) = column
-                .get("musicResponsiveListItemFixedColumnRenderer")
-                .and_then(|fixed| fixed.get("text"))
+                .get(column_renderer_key)
+                .and_then(|column| column.get("text"))
                 .and_then(|text| text.get("runs"))
                 .and_then(serde_json::Value::as_array)
             {
@@ -198,25 +201,36 @@ fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
             }
         }
     }
-    if let Some(columns) = renderer
-        .get("flexColumns")
-        .and_then(serde_json::Value::as_array)
-    {
-        for column in columns {
-            if let Some(runs) = column
-                .get("musicResponsiveListItemFlexColumnRenderer")
-                .and_then(|flex| flex.get("text"))
-                .and_then(|text| text.get("runs"))
-                .and_then(serde_json::Value::as_array)
-            {
-                texts.extend(
-                    runs.iter()
-                        .filter_map(|run| run.get("text").and_then(serde_json::Value::as_str)),
-                );
-            }
+    texts
+}
+
+/// Shelf duration: the last duration-shaped run in the fixed columns,
+/// falling back to the flex columns only when the fixed columns yield
+/// nothing. Fixed-first matters because flex subtitle runs carry bare
+/// numbers (years, album metadata) that parse as durations and would
+/// otherwise shadow the real shelf duration.
+fn duration_from_renderer(renderer: &serde_json::Value) -> Option<u64> {
+    let fixed = column_texts(
+        renderer,
+        "fixedColumns",
+        "musicResponsiveListItemFixedColumnRenderer",
+    );
+    for text in fixed.iter().rev() {
+        if let Some(duration) = parse_duration(text) {
+            return Some(duration);
         }
     }
-    texts.iter().rev().filter_map(|t| parse_duration(t)).next()
+    let flex = column_texts(
+        renderer,
+        "flexColumns",
+        "musicResponsiveListItemFlexColumnRenderer",
+    );
+    for text in flex.iter().rev() {
+        if let Some(duration) = parse_duration(text) {
+            return Some(duration);
+        }
+    }
+    None
 }
 
 /// Parse a shelf duration (`m:ss`, `h:mm:ss` or bare seconds).
@@ -286,13 +300,18 @@ pub fn gate_candidate(
     {
         return Err(Rejection::Denylisted);
     }
-    match candidate.channel_id.as_deref() {
-        Some(channel) if policy.allowed_channels.contains(&channel) => {
-            if policy.denylisted_channels.contains(&channel) {
-                return Err(Rejection::Denylisted);
-            }
+    if let Some(channel) = candidate.channel_id.as_deref() {
+        // Denylist first: a denylisted channel reports Denylisted even
+        // when it is outside the allowlist, so the rejection label stays
+        // truthful for the per-layer hit/escape telemetry.
+        if policy.denylisted_channels.contains(&channel) {
+            return Err(Rejection::Denylisted);
         }
-        _ => return Err(Rejection::ChannelNotAllowed),
+        if !policy.allowed_channels.contains(&channel) {
+            return Err(Rejection::ChannelNotAllowed);
+        }
+    } else {
+        return Err(Rejection::ChannelNotAllowed);
     }
     if !(candidate.official_artist || candidate.verified) {
         return Err(Rejection::MissingBadge);
@@ -357,13 +376,15 @@ pub enum AudioSource {
 }
 
 /// Pick the audio format: the best available Opus from the ATV
-/// (itag 251 first, else the first Opus format). Returns `None` for an
+/// (itag 251 first, else the highest-bitrate Opus format; a missing
+/// bitrate sorts as 0 and ties keep shelf order). Returns `None` for an
 /// OMV source or when no Opus format exists.
 pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Option<&StreamFormat> {
     if !matches!(source, AudioSource::Atv) {
         return None;
     }
-    let mut fallback = None;
+    let mut best: Option<&StreamFormat> = None;
+    let mut best_bitrate = 0u64;
     for format in formats {
         let opus = format
             .mime
@@ -375,11 +396,13 @@ pub fn select_audio_format(formats: &[StreamFormat], source: AudioSource) -> Opt
         if format.itag == PREFERRED_AUDIO_ITAG {
             return Some(format);
         }
-        if fallback.is_none() {
-            fallback = Some(format);
+        let bitrate = format.bitrate.unwrap_or(0);
+        if best.is_none() || bitrate > best_bitrate {
+            best = Some(format);
+            best_bitrate = bitrate;
         }
     }
-    fallback
+    best
 }
 
 /// MBID→selection cache key (TTL [`SELECTION_TTL_SECS`]).
@@ -493,6 +516,37 @@ mod tests {
     }
 
     #[test]
+    fn fixed_duration_wins_over_numeric_flex_runs() {
+        // A bare-number flex run (year metadata) must not shadow the
+        // fixed-column shelf duration.
+        let mut item = omv_item();
+        item["musicResponsiveListItemRenderer"]["flexColumns"][1]
+            ["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"]
+            .as_array_mut()
+            .expect("runs")
+            .push(json!({"text": "2024"}));
+        let candidate = parse_search_candidate(&item).expect("parse");
+        assert_eq!(candidate.duration_secs, Some(225));
+        assert_eq!(gate_candidate(&candidate, Some(225), &policy()), Ok(()));
+    }
+
+    #[test]
+    fn duration_falls_back_to_flex_columns() {
+        // TwoRow-style shelf items carry no fixed columns: the flex
+        // duration is the shelf duration then.
+        let mut item = omv_item();
+        item["musicResponsiveListItemRenderer"]
+            .as_object_mut()
+            .expect("renderer")
+            .remove("fixedColumns");
+        item["musicResponsiveListItemRenderer"]["flexColumns"][0]
+            ["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"] =
+            json!([{"text": "4:05"}]);
+        let candidate = parse_search_candidate(&item).expect("parse");
+        assert_eq!(candidate.duration_secs, Some(245));
+    }
+
+    #[test]
     fn substring_matching_never_accepts() {
         // "VEVO" in the title with no OMV type: rejected.
         let vevo = SearchCandidate {
@@ -587,6 +641,22 @@ mod tests {
     }
 
     #[test]
+    fn denylisted_channel_reports_denylisted_off_allowlist() {
+        // The denylist outranks the allowlist so the rejection label
+        // stays truthful for the per-layer hit/escape telemetry.
+        let candidate = parse_search_candidate(&omv_item()).expect("parse");
+        let policy = SelectionPolicy {
+            allowed_channels: &["UCsomeoneelse00000000000"],
+            denylisted_videos: &[],
+            denylisted_channels: &["UCchannel12345678901234"],
+        };
+        assert_eq!(
+            gate_candidate(&candidate, Some(225), &policy),
+            Err(Rejection::Denylisted)
+        );
+    }
+
+    #[test]
     fn counterpart_preferred_when_verified() {
         let top = parse_search_candidate(&omv_item()).expect("parse");
         let mut counterpart = top.clone();
@@ -625,9 +695,10 @@ mod tests {
         }
     }
 
-    fn opus_format(itag: i64) -> StreamFormat {
+    fn opus_format(itag: i64, bitrate: Option<u64>) -> StreamFormat {
         StreamFormat {
             itag,
+            bitrate,
             mime: Some("audio/webm; codecs=\"opus\"".to_string()),
             url: Some("https://host.test/videoplayback?ip=203.0.113.7".to_string()),
             has_signature_cipher: false,
@@ -639,21 +710,32 @@ mod tests {
 
     #[test]
     fn audio_prefers_itag_251_opus() {
-        let formats = vec![opus_format(249), opus_format(251), opus_format(250)];
+        let formats = vec![
+            opus_format(249, Some(50_000)),
+            opus_format(251, Some(160_000)),
+            opus_format(250, Some(70_000)),
+        ];
         let picked = select_audio_format(&formats, AudioSource::Atv).expect("audio");
         assert_eq!(picked.itag, 251);
     }
 
     #[test]
-    fn audio_falls_back_to_any_opus() {
-        let formats = vec![opus_format(249), opus_format(250)];
+    fn audio_falls_back_to_highest_bitrate_opus() {
+        // Shelf order carries no bitrate guarantee: the best wins, not
+        // the first. A missing bitrate sorts as 0, below any present one.
+        let formats = vec![
+            opus_format(249, Some(50_000)),
+            opus_format(250, None),
+            opus_format(249, Some(70_000)),
+        ];
         let picked = select_audio_format(&formats, AudioSource::Atv).expect("audio");
         assert_eq!(picked.itag, 249);
+        assert_eq!(picked.bitrate, Some(70_000));
     }
 
     #[test]
     fn audio_never_from_omv() {
-        let formats = vec![opus_format(251)];
+        let formats = vec![opus_format(251, Some(160_000))];
         assert_eq!(select_audio_format(&formats, AudioSource::Omv), None);
     }
 
@@ -661,6 +743,7 @@ mod tests {
     fn audio_none_without_opus() {
         let formats = vec![StreamFormat {
             itag: 140,
+            bitrate: Some(128_000),
             mime: Some("audio/mp4; codecs=\"mp4a.40.2\"".to_string()),
             url: Some("https://host.test/videoplayback?ip=203.0.113.7".to_string()),
             has_signature_cipher: false,
