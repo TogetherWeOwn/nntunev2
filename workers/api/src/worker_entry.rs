@@ -243,9 +243,13 @@ fn cors_headers(
         ("access-control-allow-credentials", "true".to_string()),
     ];
     if status == 204 {
+        // Exactly the methods the scope map serves, plus the OPTIONS
+        // self-grant: omitting a served method (HEAD revalidation, PATCH
+        // edits) would preflight-block lawful bearer calls, and naming an
+        // unserved method would map fiction.
         headers.push((
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string(),
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
         ));
         headers.push((
             "access-control-allow-headers",
@@ -2668,7 +2672,7 @@ mod tests {
         assert_eq!(headers.len(), 6);
         assert!(headers.contains(&(
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string()
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string()
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",
