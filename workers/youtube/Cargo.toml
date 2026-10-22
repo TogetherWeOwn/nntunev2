@@ -1,0 +1,33 @@
+[package]
+name = "nntune-youtube"
+version = "0.1.0"
+edition = "2021"
+description = "NNTune v2 YouTube backend spike: portable yt-dlp-style extraction core for the Cloudflare Worker (Day 1: VISIONOS client, GO/NO-GO gate)"
+license = "MIT"
+
+[lib]
+name = "nntune_youtube"
+path = "src/lib.rs"
+# cdylib for the Worker (wasm32); rlib so unit tests link it. The wasm32-only
+# runtime entry (fetch handler, YtExtract Durable Object) lives in
+# src/runtime.rs with its worker/wasm-bindgen deps below; the extraction
+# wiring, proxy client and staging deploy land with later Day-1 slices.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Worker + YtExtract Durable Object entry (src/runtime.rs), wasm32 only:
+# native builds and `cargo test` stay free of the Workers runtime.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8"
+# `#[durable_object]` expands to `#[wasm_bindgen]` items resolved by name.
+wasm-bindgen = "0.2.129"
+
+[dev-dependencies]
+# AST token pin of the wasm32-only adapter (see routes.rs tests): mirrors
+# workers/stream so `with_status` removal or match-arm swaps turn the native
+# suite red.
+quote = "1"
+syn = { version = "3", features = ["full"] }

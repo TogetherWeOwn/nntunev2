@@ -243,9 +243,13 @@ fn cors_headers(
         ("access-control-allow-credentials", "true".to_string()),
     ];
     if status == 204 {
+        // Exactly the methods the scope map serves, plus the OPTIONS
+        // self-grant: omitting a served method (HEAD revalidation, PATCH
+        // edits) would preflight-block lawful bearer calls, and naming an
+        // unserved method would map fiction.
         headers.push((
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string(),
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
         ));
         headers.push((
             "access-control-allow-headers",
@@ -385,45 +389,114 @@ async fn release_rate_limit_slot(
     Ok(())
 }
 
+/// Race `future` against a `timeout_ms` budget, returning the caller's
+/// opaque `error` on expiry. [`PgStore::connect`] uses this with the vault
+/// dial/total budgets; the timer is platform-appropriate (Worker `Delay`
+/// on wasm32, `futures-timer` natively). Expiry wins ties; both futures
+/// drop before the caller observes the result.
+pub async fn with_deadline<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+    timeout_ms: u64,
+    error: E,
+) -> Result<T, E> {
+    let duration = Duration::from_millis(timeout_ms);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = Delay::from(duration);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(duration);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut future = std::pin::pin!(future);
+    let mut error = Some(error);
+    std::future::poll_fn(|cx| {
+        // Worker Delay arms on first poll, so poll it before starting I/O.
+        // Expiry wins if both become ready together; there is no late retry.
+        if deadline.as_mut().poll(cx).is_ready() {
+            let error = error.take().expect("deadline fires once");
+            return std::task::Poll::Ready(Err(error));
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the caller observes the result.
+}
+
 struct PgStore {
     env: Env,
+    trace_id: String,
 }
 
 impl PgStore {
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
-        let hyperdrive = self
-            .env
-            .hyperdrive(HYPERDRIVE_BINDING)
-            .map_err(|_| StoreError)?;
-        let socket = worker::Socket::builder()
-            .secure_transport(worker::SecureTransport::StartTls)
-            .connect(hyperdrive.host(), hyperdrive.port())
-            .map_err(|_| StoreError)?;
-        let config: tokio_postgres::Config = hyperdrive
-            .connection_string()
-            .parse()
-            .map_err(|_| StoreError)?;
-        let (client, connection) = config
-            .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-            .await
-            .map_err(|_| StoreError)?;
-        // Build identity rides along: a background task has no inbound
-        // trace, so it roots a fresh one and carries the same explicit
-        // known-or-unknown SHA as the request lines.
-        let build_sha = build_sha_from_env(&self.env);
-        wasm_bindgen_futures::spawn_local(async move {
-            // No detail in logs: driver errors can carry host/role strings.
-            // A background task has no inbound trace, so it roots a fresh one.
-            if connection.await.is_err() {
-                let _ = emit_record(
-                    crate::logging::Level::Error,
-                    "api.db.connection_error",
-                    &crate::logging::resolve_trace_id(None),
-                    serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha}),
-                );
-            }
-        });
-        Ok(client)
+        // One overall budget encloses dial, handshake, driver spawn, and
+        // statement setup: the handshake and SET consume the time left
+        // after dial rather than resetting the clock.
+        with_deadline(
+            async {
+                let hyperdrive = self
+                    .env
+                    .hyperdrive(HYPERDRIVE_BINDING)
+                    .map_err(|_| StoreError)?;
+                let socket = worker::Socket::builder()
+                    .secure_transport(worker::SecureTransport::StartTls)
+                    .connect(hyperdrive.host(), hyperdrive.port())
+                    .map_err(|_| StoreError)?;
+                // The builder connect is synchronous; the actual dial
+                // completes when the socket opens, bounded by the vault
+                // dial budget shared with the test-connection probe.
+                with_deadline(
+                    async { socket.opened().await.map(|_| ()).map_err(|_| StoreError) },
+                    DIAL_TIMEOUT_MS,
+                    StoreError,
+                )
+                .await?;
+                let config: tokio_postgres::Config = hyperdrive
+                    .connection_string()
+                    .parse()
+                    .map_err(|_| StoreError)?;
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The driver outlives the handler but still belongs to this request.
+                // Own its resolved trace and normalized build identity in the task.
+                let trace_id = self.trace_id.clone();
+                let build_sha = build_sha_from_env(&self.env);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
+                });
+                // Connect-time SET of the total budget; Hyperdrive RESETs
+                // pooled backends, so per-query bounds are separate work.
+                client
+                    .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(client)
+            },
+            TOTAL_TIMEOUT_MS,
+            StoreError,
+        )
+        .await
+    }
+
+    async fn connection_diagnostic<F, E>(
+        connection: F,
+        trace_id: &str,
+        build_sha: &str,
+    ) -> Option<String>
+    where
+        F: std::future::Future<Output = Result<(), E>>,
+    {
+        // No detail in logs: driver errors can carry host/role strings.
+        if connection.await.is_err() {
+            emit_record(
+                crate::logging::Level::Error,
+                "api.db.connection_error",
+                trace_id,
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
+            )
+        } else {
+            None
+        }
     }
 }
 
@@ -1512,6 +1585,23 @@ impl Dialer for SocketDialer {
 struct WebhookMailer {
     env: Env,
     origin: String,
+    trace_id: String,
+}
+
+/// Native-testable request headers; the runtime supplies the resolved trace
+/// header pair and operator-provisioned authorization, never inbound identity.
+fn webhook_header_pairs(
+    trace: (&'static str, &str),
+    api_key: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![
+        ("content-type", "application/json".to_string()),
+        (trace.0, trace.1.to_string()),
+    ];
+    if let Some(key) = api_key {
+        pairs.push(("authorization", format!("Bearer {key}")));
+    }
+    pairs
 }
 
 // Dropping a Rust fetch future alone does not cancel its JavaScript promise.
@@ -1538,13 +1628,12 @@ impl Mailer for WebhookMailer {
         }
         let body = magic_link_payload(&self.origin, email, token).to_string();
         let headers = Headers::new();
-        headers
-            .set("content-type", "application/json")
-            .map_err(|_| StoreError)?;
-        if let Some(key) = env_string(&self.env, "EMAIL_API_KEY") {
-            headers
-                .set("authorization", &format!("Bearer {key}"))
-                .map_err(|_| StoreError)?;
+        let api_key = env_string(&self.env, "EMAIL_API_KEY");
+        for (name, value) in webhook_header_pairs(
+            (crate::logging::TRACE_HEADER, &self.trace_id),
+            api_key.as_deref(),
+        ) {
+            headers.set(name, &value).map_err(|_| StoreError)?;
         }
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
@@ -1571,6 +1660,7 @@ impl Mailer for WebhookMailer {
 fn render_header_pairs(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
+    trace_id: &str,
 ) -> Vec<(&'static str, String)> {
     let mut pairs = vec![
         (
@@ -1583,6 +1673,7 @@ fn render_header_pairs(
         ),
         ("cache-control", "no-store".to_string()),
         ("x-content-type-options", "nosniff".to_string()),
+        (crate::logging::TRACE_HEADER, trace_id.to_string()),
     ];
     if let Some(cookie) = &response.set_cookie {
         pairs.push(("set-cookie", cookie.clone()));
@@ -1603,9 +1694,10 @@ fn render_header_pairs(
 fn render(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
+    trace_id: &str,
 ) -> WorkerResult<Response> {
     let headers = Headers::new();
-    for (name, value) in render_header_pairs(response, cors) {
+    for (name, value) in render_header_pairs(response, cors, trace_id) {
         headers.append(name, &value)?;
     }
     Ok(
@@ -1615,16 +1707,17 @@ fn render(
     )
 }
 
-fn internal_render() -> WorkerResult<Response> {
-    render(
-        &handlers::Response {
-            status: 500,
-            body: r#"{"error":"internal error"}"#.to_string(),
-            set_cookie: None,
-            retry_after: None,
-        },
-        &[],
-    )
+fn internal_response() -> handlers::Response {
+    handlers::Response {
+        status: 500,
+        body: r#"{"error":"internal error"}"#.to_string(),
+        set_cookie: None,
+        retry_after: None,
+    }
+}
+
+fn internal_render(trace_id: &str) -> WorkerResult<Response> {
+    render(&internal_response(), &[], trace_id)
 }
 
 // --- Request-body collection & dispatch gate --------------------------------
@@ -1808,8 +1901,9 @@ fn response_error_code(status: u16, body: &str) -> Option<String> {
     }
 }
 
-/// Log-safe display path: the bare path for served routes, a fixed
-/// `unknown` sentinel otherwise. Raw request paths must never reach the
+/// Log-safe display path: the bare path for static served routes, a fixed
+/// template for credential revocation, and `unknown` otherwise. Raw paths
+/// must never reach the
 /// log: the catch-all 404 arm serves arbitrary probe paths that can carry
 /// addresses or tokens, and unbounded distinct values would break log
 /// grouping. Query strings are stripped before the known-path check for
@@ -1818,6 +1912,11 @@ fn served_display_path(path: &str) -> String {
     let bare = path.split('?').next().unwrap_or("");
     if handlers::is_known_path(bare) {
         bare.to_string()
+    } else if bare
+        .strip_prefix("/v1/credentials/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        "/v1/credentials/{id}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -1904,9 +2003,9 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             crate::logging::Level::Error,
             "api.start.misconfigured",
             &trace_id,
-            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha}),
+            serde_json::json!({"error_class": "internal_error", "build_sha": build_sha, "release": build_sha}),
         );
-        return internal_render();
+        return internal_render(&trace_id);
     };
     // Classify the body source from the actual runtime request, then
     // collect through the tested seam: a legitimate bodyless request
@@ -1959,10 +2058,14 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let ctx = handlers::Ctx {
         cfg: &config,
-        store: &PgStore { env: env.clone() },
+        store: &PgStore {
+            env: env.clone(),
+            trace_id: trace_id.clone(),
+        },
         mailer: &WebhookMailer {
             origin: config.origin.clone(),
             env: env.clone(),
+            trace_id: trace_id.clone(),
         },
         dialer: &SocketDialer,
         dns: &DohDns,
@@ -1987,6 +2090,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         "status_code": response.status,
         "duration_ms": now_millis().saturating_sub(start_ms),
         "build_sha": build_sha,
+        "release": build_sha,
     });
     if response.status >= 400 {
         if let Some(code) = response_error_code(response.status, &response.body) {
@@ -2003,7 +2107,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         headers_map.get("origin").map(String::as_str),
         &config.origin,
     );
-    render(&response, &cors)
+    render(&response, &cors, &trace_id)
 }
 
 /// Client address for audit rows and rate-limit keys. Header data is not
@@ -2016,6 +2120,131 @@ fn client_source_ip(headers: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    #[test]
+    fn resolved_trace_reaches_response_mail_and_driver_diagnostics() {
+        use futures_util::FutureExt;
+
+        let hostile = "victim@example.com\r\nset-cookie: private-canary";
+        for inbound in [Some(REQUEST_TRACE), None, Some(hostile)] {
+            let trace_id = crate::logging::resolve_trace_id(inbound);
+            assert!(crate::logging::is_valid_trace_id(&trace_id));
+            if inbound == Some(REQUEST_TRACE) {
+                assert_eq!(trace_id, REQUEST_TRACE);
+            }
+            for response in [
+                handlers::Response {
+                    status: 200,
+                    body: r#"{"ok":true}"#.to_string(),
+                    set_cookie: Some("session=synthetic; HttpOnly".to_string()),
+                    retry_after: None,
+                },
+                handlers::Response {
+                    status: 401,
+                    body: r#"{"error":"unauthorized"}"#.to_string(),
+                    set_cookie: None,
+                    retry_after: None,
+                },
+                handlers::invalid_request(),
+                handlers::preflight_response(),
+                internal_response(),
+            ] {
+                let cors = cors_headers(
+                    response.status,
+                    Some("https://app.example"),
+                    "https://app.example",
+                );
+                let pairs = render_header_pairs(&response, &cors, &trace_id);
+                assert_eq!(
+                    pairs
+                        .iter()
+                        .filter(|(name, _)| *name == crate::logging::TRACE_HEADER)
+                        .count(),
+                    1
+                );
+                assert!(pairs.contains(&(crate::logging::TRACE_HEADER, trace_id.clone())));
+                assert!(cors.iter().all(|pair| pairs.contains(pair)));
+                if let Some(cookie) = &response.set_cookie {
+                    assert!(pairs.contains(&("set-cookie", cookie.clone())));
+                }
+                assert!(!format!("{pairs:?}").contains(hostile));
+            }
+            for api_key in [None, Some("synthetic-mail-key")] {
+                let captured =
+                    webhook_header_pairs((crate::logging::TRACE_HEADER, &trace_id), api_key);
+                assert!(captured.contains(&("content-type", "application/json".to_string())));
+                assert!(captured.contains(&(crate::logging::TRACE_HEADER, trace_id.clone())));
+                assert_eq!(
+                    captured
+                        .iter()
+                        .find(|(name, _)| *name == "authorization")
+                        .map(|(_, value)| value.as_str()),
+                    api_key.map(|_| "Bearer synthetic-mail-key")
+                );
+                assert_eq!(captured.len(), if api_key.is_some() { 3 } else { 2 });
+                assert!(!format!("{captured:?}").contains(hostile));
+            }
+            let line = PgStore::connection_diagnostic(
+                std::future::ready(Err::<(), _>(
+                    "postgres://private-role:private-password@private-host",
+                )),
+                &trace_id,
+                "unknown",
+            )
+            .now_or_never()
+            .expect("synthetic driver is ready")
+            .expect("failure emits a record");
+            let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(record.as_object().unwrap().len(), 6);
+            assert_eq!(record["trace_id"], trace_id);
+            assert_eq!(record["event"], "api.db.connection_error");
+            assert_eq!(
+                record["fields"],
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown", "release": "unknown"})
+            );
+            assert!(!line.contains("private-"));
+            assert!(!line.contains(hostile));
+            assert!(PgStore::connection_diagnostic(
+                std::future::ready(Ok::<(), ()>(())),
+                &trace_id,
+                "unknown"
+            )
+            .now_or_never()
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn dynamic_revoke_logs_only_the_fixed_template() {
+        for path in [
+            "/v1/credentials/private-id",
+            "/v1/credentials/victim@example.com?token=private-token",
+            "/v1/credentials/%2Fprivate-id?token=private-token",
+        ] {
+            let route = served_display_path(path);
+            assert_eq!(route, "/v1/credentials/{id}");
+            let line = emit_record(
+                crate::logging::Level::Info,
+                "api.request.served",
+                REQUEST_TRACE,
+                serde_json::json!({"route": format!("DELETE {route}"), "status_code": 200, "duration_ms": 0, "build_sha": "unknown"}),
+            ).unwrap();
+            assert!(!line.contains("private-"));
+            assert!(!line.contains("victim@example.com"));
+            assert!(!line.contains('?'));
+        }
+        for path in [
+            "/v1/credentials/",
+            "/v1/credentials/a/b?token=private-token",
+            "/probe/private-id",
+        ] {
+            assert_eq!(served_display_path(path), "unknown");
+        }
+        assert_eq!(internal_response().body, r#"{"error":"internal error"}"#);
+    }
 
     #[test]
     fn client_source_ip_takes_only_a_clean_cf_connecting_ip() {
@@ -2231,7 +2460,7 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     fn assert_render_security_headers(response: &handlers::Response) {
-        let rendered = render(response, &[]).expect("response renders");
+        let rendered = render(response, &[], REQUEST_TRACE).expect("response renders");
         let headers = rendered.headers();
         assert_eq!(rendered.status_code(), response.status);
         assert_eq!(
@@ -2267,7 +2496,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn assert_render_security_headers(response: &handlers::Response) {
         // wasm-bindgen Response accessors cannot run on native targets.
-        let headers = render_header_pairs(response, &[]);
+        let headers = render_header_pairs(response, &[], REQUEST_TRACE);
         assert!(headers.contains(&(
             "content-security-policy",
             "default-src 'none'; frame-ancestors 'none'".to_string()
@@ -2284,7 +2513,7 @@ mod tests {
             set_cookie: None,
             retry_after: None,
         };
-        let headers = render_header_pairs(&response, &[]);
+        let headers = render_header_pairs(&response, &[], REQUEST_TRACE);
 
         assert!(headers.contains(&(
             "content-type",
@@ -2325,7 +2554,7 @@ mod tests {
             set_cookie: None,
             retry_after: Some(3600),
         };
-        let headers = render_header_pairs(&throttled, &[]);
+        let headers = render_header_pairs(&throttled, &[], REQUEST_TRACE);
         assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
         let plain = handlers::Response {
             status: 200,
@@ -2333,7 +2562,7 @@ mod tests {
             set_cookie: None,
             retry_after: None,
         };
-        let headers = render_header_pairs(&plain, &[]);
+        let headers = render_header_pairs(&plain, &[], REQUEST_TRACE);
         assert!(!headers
             .iter()
             .any(|(name, _)| *name == crate::rate_limit::RETRY_AFTER_HEADER));
@@ -2499,7 +2728,7 @@ mod tests {
         assert_eq!(headers.len(), 6);
         assert!(headers.contains(&(
             "access-control-allow-methods",
-            "GET, POST, PUT, DELETE, OPTIONS".to_string()
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".to_string()
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",

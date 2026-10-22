@@ -292,3 +292,140 @@ test('a non-dismissal ceremony error keeps the exact current failure banner', as
 	expect(traffic.finishPosts).toBe(0);
 	expect(traffic.vaultSaves).toBe(1);
 });
+
+const TRANSITION_RESTART_NOTICE =
+	'This setup was reset after an authentication change. Sign in and start setup again; ' +
+	're-enter and retest your credentials. Requests already submitted may still complete.';
+
+async function reachDraft(page: Page, tag: string): Promise<void> {
+	await page.goto('/onboarding/byop');
+	await page.getByLabel('Hostname').fill(`news.${tag}.example.test`);
+	await page.getByLabel('Username').fill(`${tag}-reader`);
+	await page.getByLabel('Password', { exact: true }).fill(`${tag}-probe-password`);
+	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByLabel('Indexer URL').fill(`https://indexer.${tag}.example.test`);
+	await page.getByLabel('Indexer API key').fill(`${tag}-probe-indexer-key`);
+	await page.getByRole('button', { name: 'Continue' }).click();
+	await expect(page.getByRole('region', { name: 'Test the connection' })).toBeVisible();
+}
+
+/** A second tab in the same context performs a real live logout. */
+async function deliverTransition(page: Page): Promise<void> {
+	const actor = await page.context().newPage();
+	await actor.route('**/v1/vault', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
+	);
+	await actor.route('**/v1/session/logout', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true })
+		})
+	);
+	await actor.goto('/account/security');
+	await actor.getByRole('button', { name: /^sign out$/i }).click();
+	await actor.waitForURL('**/login');
+	await actor.close();
+}
+
+test('a retained paywall retry is inert after a delivered transition', async ({ page }) => {
+	const pageErrors: string[] = [];
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	let tests = 0;
+	const bodies: Array<Record<string, unknown>> = [];
+	await page.route('**/v1/vault/test', async (route) => {
+		tests += 1;
+		bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+		await route.fulfill({
+			status: 429,
+			headers: { 'content-type': 'application/json', 'Retry-After': '0' },
+			body: JSON.stringify({ code: 'rate_limited', message: 'limit reached' })
+		});
+	});
+	await reachDraft(page, 'retry');
+	await page.getByTestId('byop-test-connection').click();
+
+	// The limit response publishes the global paywall with a live retained
+	// retry; the first dispatch carried the typed secrets.
+	const dialog = page.getByRole('dialog');
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByRole('button', { name: 'Retry' })).toBeEnabled();
+	expect(tests).toBe(1);
+	expect(JSON.stringify(bodies[0])).toContain('retry-probe-password');
+
+	await deliverTransition(page);
+
+	// Fail-closed restart; the previously published paywall may remain
+	// visible, but its retained retry cannot submit or restore the old draft.
+	const notice = page.getByText(TRANSITION_RESTART_NOTICE);
+	await expect(notice).toBeVisible();
+	await expect(page.locator('a[href="/login"]')).toHaveCount(1);
+	if (await dialog.isVisible()) {
+		await dialog.getByRole('button', { name: 'Retry' }).click();
+	}
+	await page.waitForTimeout(350);
+	expect(tests).toBe(1);
+	expect(bodies).toHaveLength(1);
+	await expect(notice).toBeVisible();
+	await expect(page.getByTestId('byop-save')).toHaveCount(0);
+	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
+	expect.soft(pageErrors).toEqual([]);
+});
+
+test('a late limit response after the transition publishes no new paywall', async ({
+	page
+}) => {
+	const pageErrors: string[] = [];
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	await page.addInitScript(() => {
+		const nativeFetch = window.fetch.bind(window);
+		const hooks = window as unknown as {
+			__heldTests: number;
+			__settleTest?: (response: Response) => void;
+		};
+		hooks.__heldTests = 0;
+		window.fetch = (input, init) => {
+			const request = new Request(input, init);
+			if (new URL(request.url).pathname !== '/v1/vault/test') {
+				return nativeFetch(input, init);
+			}
+			return new Promise<Response>((resolve) => {
+				hooks.__heldTests += 1;
+				hooks.__settleTest = (response) => resolve(response);
+			});
+		};
+	});
+	await reachDraft(page, 'latepaywall');
+	await page.getByTestId('byop-test-connection').click();
+	await expect
+		.poll(
+			() => page.evaluate(() => (window as unknown as { __heldTests: number }).__heldTests ?? -1)
+		)
+		.toBe(1);
+
+	await deliverTransition(page);
+
+	const notice = page.getByText(TRANSITION_RESTART_NOTICE);
+	await expect(notice).toBeVisible();
+	await expect(page.locator('a[href="/login"]')).toHaveCount(1);
+
+	// The held limit response arrives after reset: the fenced page must
+	// suppress the late global paywall publication, not just the inline
+	// state. The held transport deliberately ignores abort.
+	await page.evaluate(() => {
+		const settle = (window as unknown as { __settleTest?: (r: Response) => void }).__settleTest;
+		if (!settle) throw new Error('No held connection test');
+		settle(
+			new Response(JSON.stringify({ code: 'rate_limited', message: 'limit reached' }), {
+				status: 429,
+				headers: { 'content-type': 'application/json', 'Retry-After': '0' }
+			})
+		);
+	});
+	await page.waitForTimeout(350);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await expect(notice).toBeVisible();
+	await expect(page.getByTestId('byop-save')).toHaveCount(0);
+	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
+	expect.soft(pageErrors).toEqual([]);
+});

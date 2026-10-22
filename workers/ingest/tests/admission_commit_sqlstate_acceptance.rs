@@ -1,17 +1,10 @@
-//! Acceptance tests: admission-ledger commit failures log SQLSTATE only.
+//! Acceptance tests: admission commit and sibling upsert failures emit SQLSTATE only.
 //!
-//! Contract: when the `mark_queued` commit (`PgAdmissionLedger` in
-//! `src/lib.rs`) fails with a `tokio_postgres::Error`, the log line carries
-//! the SQLSTATE code (`error.as_db_error().map(|db| db.code().code())`,
-//! `"none"` for non-DB errors) and NEVER the error's Debug/Display rendering
-//! or its message/detail/hint — those can embed server detail (constraint
-//! names, key values, connection context). This mirrors the sibling
-//! precedent in `src/queue_consumer.rs` (library upsert).
-//!
-//! The commit path is wasm/Hyperdrive-only, so it cannot execute on the
-//! host; the pin is therefore source-shaped, scoped to the `mark_queued`
-//! body (plus any one-level helper it calls), sliced from production
-//! (pre-`#[cfg(test)]`) source so test literals cannot satisfy it.
+//! These Hyperdrive paths cannot execute on the host. Source predicates inspect
+//! the actual execute-error closures (not unrelated events elsewhere), plus
+//! one-level SQLSTATE helpers. Synthetic mutants exercise the same predicates:
+//! dropping the log/category or its trace/build context must fail the guard.
+//! The paired logging-standard acceptance file remains independently protected.
 
 fn production(source: &str) -> &str {
     source
@@ -20,10 +13,8 @@ fn production(source: &str) -> &str {
         .0
 }
 
-/// Text of `PgAdmissionLedger::mark_queued` in production `lib.rs`.
 fn mark_queued_body() -> &'static str {
     let prod = production(include_str!("../src/lib.rs"));
-    // Anchor on the Pg impl, not the trait declaration of the same name.
     let pg_impl = prod
         .split_once("impl AdmissionLedger for PgAdmissionLedger")
         .expect("PgAdmissionLedger impl must exist")
@@ -37,178 +28,320 @@ fn mark_queued_body() -> &'static str {
         .0
 }
 
-/// Brace-matched body of `fn <name>(...)` in `source`, if defined there.
-fn fn_body(source: &str, name: &str) -> Option<String> {
-    let start = source.find(&format!("fn {name}("))?;
-    let open = source[start..].find('{')? + start;
+/// Match a call/body delimiter without counting comments or string contents.
+fn balanced_end(source: &str, open: usize, left: u8, right: u8) -> Option<usize> {
+    let bytes = source.as_bytes();
     let mut depth = 0usize;
-    for (i, ch) in source[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(source[open..=open + i].to_string());
+    let mut i = open;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            i += source[i..].find('\n').unwrap_or(bytes.len() - i);
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            let mut comments = 1;
+            i += 2;
+            while i < bytes.len() && comments > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    comments += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    comments -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
-            _ => {}
+            continue;
         }
+        if bytes[i] == b'"' {
+            // A raw string's closing quote has the same hash suffix as its opener.
+            let hashes = bytes[..i].iter().rev().take_while(|b| **b == b'#').count();
+            let raw = i > hashes && bytes[i - hashes - 1] == b'r';
+            i += 1;
+            if raw {
+                let suffix = format!("\"{}", "#".repeat(hashes));
+                i += source[i..].find(&suffix)? + suffix.len();
+            } else {
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == left {
+            depth += 1;
+        } else if bytes[i] == right {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
     }
     None
 }
 
-/// `mark_queued` plus the body of any one-level helper it calls that is
-/// defined in production `lib.rs`/`library.rs` (so an extracted
-/// `pg_sqlstate(..)` helper satisfies the pin exactly like inline code).
+fn fn_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let start = source.find(&format!("fn {name}("))?;
+    let open = source[start..].find('{')? + start;
+    Some(&source[open..balanced_end(source, open, b'{', b'}')?])
+}
+
+fn execute_error_handler<'a>(body: &'a str, sql: &str) -> &'a str {
+    let after_execute = body
+        .split_once(sql)
+        .expect("execute SQL anchor must exist")
+        .1;
+    let after_map = after_execute
+        .split_once(".map_err(")
+        .expect("execute failure must have an error handler")
+        .1;
+    let open = after_map.find('{').expect("error closure must have a body");
+    &after_map[open..balanced_end(after_map, open, b'{', b'}').expect("closed error handler")]
+}
+
+fn commit_handler() -> &'static str {
+    execute_error_handler(mark_queued_body(), "admission_mark_queued_sql()")
+}
+
+fn upsert_handler() -> &'static str {
+    let consumer = production(include_str!("../src/queue_consumer.rs"));
+    let edge_impl = consumer
+        .split_once("impl MatchWriteRuntime for EdgeMatchWrite<'_>")
+        .expect("edge upsert impl must exist")
+        .1;
+    let upsert = fn_body(edge_impl, "upsert").expect("edge upsert body must exist");
+    execute_error_handler(upsert, "upsert_library_sql()")
+}
+
+/// Include only one-level helpers actually called from the commit failure arm.
 fn commit_context() -> String {
-    let body = mark_queued_body();
+    let body = commit_handler();
     let mut context = body.to_string();
     let sources = [
         production(include_str!("../src/lib.rs")),
         production(include_str!("../src/library.rs")),
     ];
-    // Candidate helper names: identifiers immediately followed by `(`.
-    let mut names: Vec<&str> = Vec::new();
     for (i, _) in body.match_indices('(') {
-        let name: String = body[..i]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        if !name.is_empty() {
-            // Leak is fine in a test; names come from 'static source.
-            names.push(Box::leak(name.into_boxed_str()));
+        let start = body[..i]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |j| j + 1);
+        let name = &body[start..i];
+        if name.is_empty() {
+            continue;
         }
-    }
-    for name in names {
         for source in sources {
             if let Some(helper) = fn_body(source, name) {
-                context.push_str("\n// helper: ");
-                context.push_str(name);
                 context.push('\n');
-                context.push_str(&helper);
+                context.push_str(helper);
             }
         }
     }
     context
 }
 
-#[test]
-fn sibling_precedent_still_logs_sqlstate_only() {
-    // Positive control / anchor: the pattern the commit path must mirror.
-    // If this fails, the precedent moved and this file needs re-anchoring,
-    // not silent weakening.
-    let consumer = production(include_str!("../src/queue_consumer.rs"));
+fn compact(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Pin all four emit arguments together; another log cannot supply missing fields.
+fn assert_failure_event(handler: &str, event: &str, trace: &str, build: &str, category: &str) {
+    let calls: Vec<&str> = handler
+        .match_indices("emit(")
+        .filter(|(i, _)| {
+            *i == 0
+                || !handler.as_bytes()[i - 1].is_ascii_alphanumeric()
+                    && handler.as_bytes()[i - 1] != b'_'
+        })
+        .filter_map(|(i, _)| {
+            let open = i + "emit".len();
+            let end = balanced_end(handler, open, b'(', b')')?;
+            Some(&handler[i..end])
+        })
+        .filter(|call| call.contains(&format!("\"{event}\"")))
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "failure handler must emit {event} exactly once"
+    );
+    let call = compact(calls[0]);
     assert!(
-        consumer.contains("error.as_db_error().map(|db| db.code().code())"),
-        "queue_consumer.rs must keep the SQLSTATE extraction precedent"
+        call.starts_with(&format!("emit(Level::Error,{trace},\"{event}\","))
+            || call.starts_with(&format!(
+                "emit(nntune_logging::Level::Error,{trace},\"{event}\","
+            )),
+        "failure event must keep Error level and the originating trace: {call}"
     );
     assert!(
-        consumer.contains("sqlstate={}") && consumer.contains("unwrap_or(\"none\")"),
-        "queue_consumer.rs must keep logging sqlstate= with a \"none\" fallback"
+        call.contains("serde_json::json!({"),
+        "structured fields required: {call}"
+    );
+    assert!(
+        call.contains(&format!("\"build_sha\":{build}")),
+        "build identity missing: {call}"
+    );
+    assert!(
+        call.contains(&format!("\"sqlstate\":{category}")),
+        "SQLSTATE category missing: {call}"
+    );
+}
+
+fn assert_commit_event(handler: &str) {
+    assert_failure_event(
+        handler,
+        "ingest.admission.commit_failed",
+        "&self.trace_id",
+        "build_sha_from_env(&self.env)",
+        "admission_commit_sqlstate(&e)",
+    );
+}
+
+fn assert_upsert_event(handler: &str) {
+    assert_failure_event(
+        handler,
+        "ingest.library.upsert_failed",
+        "self.trace_id",
+        "crate::build_sha_from_env(self.env)",
+        "sqlstate.unwrap_or(\"none\")",
     );
 }
 
 #[test]
+fn sibling_precedent_still_logs_sqlstate_only() {
+    let handler = upsert_handler();
+    assert!(handler.contains("error.as_db_error().map(|db| db.code().code())"));
+    assert_upsert_event(handler);
+}
+
+#[test]
 fn commit_failure_is_still_detail_free_transport_error() {
-    // Positive control (green before and after): the caller-facing error
-    // stays the stable, detail-free string; only the LOG changes.
-    let body = mark_queued_body();
+    let handler = commit_handler();
     assert!(
-        body.contains("MeterWriteError::Transport(\"admission ledger unavailable\".to_string())"),
-        "commit failure must keep mapping to the detail-free transport error"
+        handler
+            .contains("MeterWriteError::Transport(\"admission ledger unavailable\".to_string())"),
+        "execute failure must keep mapping to the detail-free transport error"
+    );
+    assert!(mark_queued_body().contains("admission_mark_queued_sql()"));
+}
+
+fn assert_sqlstate_extraction(context: &str) {
+    assert!(
+        context.contains("as_db_error()"),
+        "DbError extraction required"
     );
     assert!(
-        body.contains("admission_mark_queued_sql()"),
-        "slice anchor: mark_queued must run the commit statement"
+        context.contains(".code().code()"),
+        "SQLSTATE code extraction required"
+    );
+    assert!(
+        context.contains("unwrap_or(\"none\")"),
+        "non-DB errors require the none category"
     );
 }
 
 #[test]
 fn commit_failure_log_carries_the_sqlstate_code() {
-    let context = commit_context();
-    assert!(
-        context.contains("as_db_error()"),
-        "commit failure path must extract the DbError via as_db_error() \
-         (queue_consumer.rs precedent), got:\n{context}"
-    );
-    assert!(
-        context.contains(".code().code()"),
-        "commit failure path must read the SQLSTATE via .code().code(), got:\n{context}"
-    );
-    assert!(
-        context.contains("sqlstate="),
-        "commit failure log line must carry `sqlstate=` like the sibling \
-         precedent, got:\n{context}"
-    );
-    assert!(
-        context.contains("unwrap_or(\"none\")"),
-        "non-DB errors (no SQLSTATE) must log the \"none\" placeholder, \
-         never panic or fall back to the raw error, got:\n{context}"
-    );
+    assert_sqlstate_extraction(&commit_context());
+    assert_commit_event(commit_handler());
 }
 
 #[test]
-fn commit_failure_log_never_renders_the_raw_error() {
-    let context = commit_context();
-    assert!(
-        !context.contains("{:?}"),
-        "commit failure path must not Debug-format anything: the Debug of \
-         tokio_postgres::Error embeds the server message/detail, got:\n{context}"
-    );
-    for leak in [".message()", ".detail()", ".hint()"] {
-        assert!(
-            !context.contains(leak),
-            "commit failure path must not read DbError {leak} — SQLSTATE \
-             code only, got:\n{context}"
-        );
+fn sqlstate_extraction_guard_rejects_missing_code_and_non_db_fallback() {
+    let helper = r#"{ error.as_db_error().map(|db| db.code().code()).unwrap_or("none") }"#;
+    assert_sqlstate_extraction(helper);
+    for mutant in [
+        helper.replace("as_db_error()", "other()"),
+        helper.replace(".code().code()", ".message()"),
+        helper.replace(".unwrap_or(\"none\")", ".unwrap()"),
+        helper.replace("\"none\"", "\"unknown\""),
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_sqlstate_extraction(&mutant)).is_err());
     }
-    // Display leaks the same server message as Debug: no console_log! in
-    // the commit context may interpolate the raw error binding itself.
-    for (i, _) in context.match_indices("console_log!") {
-        let stmt = context[i..].split(");").next().unwrap_or(&context[i..]);
-        for raw in [
-            "{e}",
-            "{error}",
-            ", e)",
-            ", error)",
-            "e.to_string()",
-            "error.to_string()",
-        ] {
+}
+
+#[test]
+fn failure_contexts_never_read_server_details() {
+    for context in [commit_context(), upsert_handler().to_string()] {
+        for leak in [".message()", ".detail()", ".hint()"] {
             assert!(
-                !stmt.contains(raw),
-                "commit log must not render the raw error via `{raw}` — \
-                 SQLSTATE code only, got:\n{stmt}"
+                !context.contains(leak),
+                "failure path must not read {leak}: {context}"
             );
         }
     }
-    // The current (pre-fix) leaking line, pinned by name so a rename of the
-    // binding cannot slip the same rendering past the generic checks above.
-    assert!(
-        !production(include_str!("../src/lib.rs")).contains("admission ledger commit failed: {:?}"),
-        "the `admission ledger commit failed: {{:?}}` log must be replaced \
-         by the SQLSTATE-only form"
-    );
 }
 
 #[test]
 fn commit_failure_still_logs_at_the_commit_site() {
-    // The fix must keep a log at the failure site (dropping the log line
-    // entirely would satisfy the leak bans but lose operability).
-    let context = commit_context();
-    let logs: Vec<&str> = context
-        .match_indices("console_log!")
-        .map(|(i, _)| &context[i..])
-        .collect();
-    assert!(
-        logs.iter().any(|invocation| {
-            let stmt = invocation.split(");").next().unwrap_or(invocation);
-            stmt.contains("admission ledger commit failed") && stmt.contains("sqlstate={}")
-        }),
-        "mark_queued must keep an `admission ledger commit failed` \
-         console_log! carrying sqlstate=, got:\n{context}"
-    );
+    assert_commit_event(commit_handler());
+}
+
+#[test]
+fn structured_event_predicates_reject_missing_log_category_and_context() {
+    // Hand-written fixtures, not production edits. Every mutation below removes
+    // an operational/privacy contract field while retaining valid Rust syntax.
+    let commit = r#"emit(Level::Error, &self.trace_id, "ingest.admission.commit_failed",
+        serde_json::json!({"build_sha": build_sha_from_env(&self.env),
+            "sqlstate": admission_commit_sqlstate(&e)}));"#;
+    let upsert = r#"crate::emit(nntune_logging::Level::Error, self.trace_id, "ingest.library.upsert_failed",
+        serde_json::json!({"build_sha": crate::build_sha_from_env(self.env),
+            "sqlstate": sqlstate.unwrap_or("none")}));"#;
+    assert_commit_event(commit);
+    assert_upsert_event(upsert);
+    for (fixture, predicate) in [
+        (commit, assert_commit_event as fn(&str)),
+        (upsert, assert_upsert_event as fn(&str)),
+    ] {
+        for (name, mutant) in [
+            ("omitted event", String::new()),
+            ("wrong event", fixture.replace("_failed", "_succeeded")),
+            (
+                "omitted category",
+                fixture.replace("\"sqlstate\"", "\"other\""),
+            ),
+            (
+                "omitted build identity",
+                fixture.replace("\"build_sha\"", "\"other\""),
+            ),
+            (
+                "wrong trace",
+                fixture.replace("self.trace_id", "unrelated_trace"),
+            ),
+            (
+                "wrong severity",
+                fixture.replace("Level::Error", "Level::Info"),
+            ),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| predicate(&mutant)).is_err(),
+                "guard accepted {name}: {mutant}"
+            );
+        }
+    }
+    let no_fallback = upsert.replace("sqlstate.unwrap_or(\"none\")", "sqlstate.unwrap()");
+    assert!(std::panic::catch_unwind(|| assert_upsert_event(&no_fallback)).is_err());
+    let raw_category = commit.replace("admission_commit_sqlstate(&e)", "format!(\"{e}\")");
+    assert!(std::panic::catch_unwind(|| assert_commit_event(&raw_category)).is_err());
+}
+
+#[test]
+fn execute_failure_anchor_excludes_unrelated_events() {
+    // A matching event before the SQL or after the error closure must not mask
+    // an omitted commit log. This exercises the same slice used on production.
+    let body = r#"{
+        emit(Level::Error, &self.trace_id, "ingest.admission.commit_failed",
+            serde_json::json!({"build_sha": build_sha_from_env(&self.env),
+                "sqlstate": admission_commit_sqlstate(&e)}));
+        client.execute(admission_mark_queued_sql(), &[]).await.map_err(|e| {
+            MeterWriteError::Transport("admission ledger unavailable".to_string())
+        })?;
+        emit(Level::Error, &self.trace_id, "ingest.admission.commit_failed",
+            serde_json::json!({"build_sha": build_sha_from_env(&self.env),
+                "sqlstate": admission_commit_sqlstate(&e)}));
+    }"#;
+    let handler = execute_error_handler(body, "admission_mark_queued_sql()");
+    assert!(std::panic::catch_unwind(|| assert_commit_event(handler)).is_err());
 }

@@ -347,8 +347,8 @@ mod tests {
     /// Minimal valid KV: the two identity keys, which have no defaults.
     fn identity() -> HashMap<String, String> {
         kv(&[
-            ("auth.rp_id", "v2-staging.nntune.com"),
-            ("auth.rp_origin", "https://v2-staging.nntune.com"),
+            ("auth.rp_id", "staging.nntune.com"),
+            ("auth.rp_origin", "https://staging.nntune.com"),
         ])
     }
 
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(config.get_u64("mb.search_cache_ttl_s"), Some(300));
         assert_eq!(config.get_u64("mb.search_limit"), Some(25));
         assert_eq!(config.get_u64("ingest.payload_ttl_secs"), Some(2592000));
-        assert_eq!(config.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
+        assert_eq!(config.get_str("auth.rp_id"), Some("staging.nntune.com"));
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn nonblank_string_with_surrounding_spaces_round_trips_exact() {
-        let spaced = "  v2-staging.nntune.com  ";
+        let spaced = "  staging.nntune.com  ";
         let mut raw = identity();
         raw.insert("auth.rp_id".to_string(), spaced.to_string());
         let config = Config::load(&raw).expect("spaced string loads");
@@ -529,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             config.get_str("auth.rp_id"),
-            Some("v2-staging.nntune.com"),
+            Some("staging.nntune.com"),
             "rp_id must not be mutated by a failed overlay"
         );
         assert_eq!(config.get_u64("session.ttl_secs"), Some(86400));
@@ -571,7 +571,7 @@ mod tests {
                 expected: ConfigType::Str,
             }),
         );
-        assert_eq!(config.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
+        assert_eq!(config.get_str("auth.rp_id"), Some("staging.nntune.com"));
     }
 
     #[test]
@@ -771,11 +771,11 @@ mod tests {
         // values — it must not require cross-env sameness.
         let staging = Config::load(&fixture_kv("staging")).expect("staging loads");
         let prod = Config::load(&fixture_kv("prod")).expect("prod loads");
-        assert_eq!(staging.get_str("auth.rp_id"), Some("v2-staging.nntune.com"));
+        assert_eq!(staging.get_str("auth.rp_id"), Some("staging.nntune.com"));
         assert_eq!(prod.get_str("auth.rp_id"), Some("nntune.com"));
         assert_eq!(
             staging.get_str("auth.rp_origin"),
-            Some("https://v2-staging.nntune.com")
+            Some("https://staging.nntune.com")
         );
         assert_eq!(prod.get_str("auth.rp_origin"), Some("https://nntune.com"));
         // Literal anchors (not derived from `spec.parse`): a parser mutant
