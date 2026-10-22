@@ -2,5 +2,7 @@
 useDefault = true
 
 [allowlist]
-description = "Bot-contract corpus fixtures (e2e/fixtures/bot-contract/): v1 HMAC tokens minted under the published synthetic corpus secret. Pinned offline test vectors; the MACs authenticate nothing and the secret is public by design. Shape-scoped only (gitleaks allowlist fields are ORed, so paths/rules would over-suppress): the regex matches the v1 envelope with a substantial payload and signature, and anything else still trips. Verified: non-v1 and other-rule probes in the corpus files trip (see the PR)."
-regexes = ['v1\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}']
+description = "Bot-contract corpus fixtures (e2e/fixtures/bot-contract/): v1 HMAC tokens minted under the published synthetic corpus secret. Pinned offline test vectors; the MACs authenticate nothing and the secret is public by design. Conjunctive (condition AND): fixtures path plus the v1 envelope with a substantial payload and signature; anything else still trips. Residual: a real grant pasted inside the fixtures directory would still be suppressed; that directory must never hold real secrets."
+condition = "AND"
+paths = ['e2e/fixtures/bot-contract/.*']
+regexes = ['^v1\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}$']
