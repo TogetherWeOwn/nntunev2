@@ -35,32 +35,39 @@ function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isValidPolicy(policy) {
+// Each policy field is read exactly once and the captured values are both
+// validated and used, so a nondeterministic getter cannot pass validation
+// with one value and have another value echoed into the verdict.
+function readPolicy(policy) {
   try {
-    if (!isRecord(policy)) return false;
-    if (policy.service !== EXPECTED_SERVICE) return false;
-    if (policy.environment !== EXPECTED_ENVIRONMENT) return false;
+    if (!isRecord(policy)) return null;
+    const service = policy.service;
+    const environment = policy.environment;
     const redForMs = policy.red_for_ms;
+    const minSamples = policy.min_samples;
+    if (service !== EXPECTED_SERVICE) return null;
+    if (environment !== EXPECTED_ENVIRONMENT) return null;
     if (
       typeof redForMs !== 'number'
       || !Number.isInteger(redForMs)
       || redForMs < RED_FOR_MS_MIN
       || redForMs > RED_FOR_MS_MAX
     ) {
-      return false;
+      return null;
     }
-    const minSamples = policy.min_samples;
     if (
       typeof minSamples !== 'number'
       || !Number.isInteger(minSamples)
       || minSamples < MIN_SAMPLES_MIN
       || minSamples > MIN_SAMPLES_MAX
     ) {
-      return false;
+      return null;
     }
-    return true;
+    return {
+      service, environment, redForMs, minSamples,
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -87,12 +94,13 @@ function compareSamples(a, b) {
 
 export function evaluateHealthWindow(samples, policy) {
   try {
-    if (!isValidPolicy(policy)) return null;
+    const validated = readPolicy(policy);
+    if (validated === null) return null;
     if (!Array.isArray(samples)) return null;
-    const service = policy.service;
-    const environment = policy.environment;
-    const redForMs = policy.red_for_ms;
-    const minSamples = policy.min_samples;
+    const service = validated.service;
+    const environment = validated.environment;
+    const redForMs = validated.redForMs;
+    const minSamples = validated.minSamples;
 
     let valid = 0;
     let red = 0;
