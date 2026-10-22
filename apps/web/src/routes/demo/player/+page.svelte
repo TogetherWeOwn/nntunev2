@@ -252,26 +252,29 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	// the incoming track to its saved one. Natural `ended` advances go
 	// through goNext directly: the ended track is cleared, not persisted.
 	function userNext(): void {
-		persistPosition(current?.id);
+		const outgoingId = current?.id;
+		persistPosition(outgoingId);
 		goNext();
-		seekCurrentResume();
+		if (current?.id !== outgoingId) seekCurrentResume();
 	}
 
 	function userPrevious(): void {
-		persistPosition(current?.id);
+		const outgoingId = current?.id;
+		persistPosition(outgoingId);
 		goPrevious();
-		seekCurrentResume();
+		if (current?.id !== outgoingId) seekCurrentResume();
 	}
 
 	function selectAt(index: number): void {
 		const next = selectTrack(queue, index);
 		const nextId = next.tracks[next.currentIndex]?.id;
-		// Reselecting the current track is not a switch: persisting its
-		// untouched position would overwrite a seeded resume entry.
+		// Keep live progress on reselection; a never-started element can
+		// still load a seeded resume entry under the selection contract.
+		const shouldResume = nextId !== current?.id || !audioEl?.currentTime;
 		if (nextId !== undefined && nextId !== current?.id) persistPosition(current?.id);
 		queue = next;
 		playCurrent();
-		if (nextId !== undefined) seekToResume(nextId);
+		if (nextId !== undefined && shouldResume) seekToResume(nextId);
 	}
 
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
