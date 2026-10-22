@@ -92,7 +92,10 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
   `VAULT_KEK_VERSION` (the integer version stamped on every row; call it
   `L`). Active if and only if
   `VAULT_KEK_CURRENT` is unset; per-version secrets are ignored in this
-  mode, so staging `V<L>` ahead of cutover never changes serving.
+  mode, so staging `V<L>` ahead of cutover never changes serving. A
+  blanked `VAULT_KEK_CURRENT` (present-but-empty, as a dashboard "clear
+  this var" leaves behind) is not "unset": it refuses to start rather
+  than falling back to legacy.
 - Versioned mode: `VAULT_KEK_CURRENT` (a **non-secret** config var,
   e.g. `VAULT_KEK_CURRENT=2` in wrangler `vars`, not `secrets`,
   replacing `VAULT_KEK_VERSION` at cutover) names the write version,
@@ -127,9 +130,9 @@ Provisioning has two modes (`wrangler.toml.example`, parsed by
   no separate three-prior runtime cap. Retirement still requires the
   row-count and backup/PITR-horizon proof in §5 invariant 3; moving a
   version outside the window is not a substitute for that proof.
-  A half-provisioned versioned config (missing or invalid current key,
-  unparsable `CURRENT`, invalid retained prior) refuses to start rather
-  than serving the wrong write version.
+  A half-provisioned versioned config (missing, blank, or invalid
+  current key; blank or unparsable `CURRENT`; blank or invalid retained
+  prior) refuses to start rather than serving the wrong write version.
 - Staging and production have **independent key sets generated
   independently** — never copy a KEK value between environments, never
   reuse a version number scheme as a shared secret. A rotation ceremony
