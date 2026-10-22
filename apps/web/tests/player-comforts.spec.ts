@@ -203,6 +203,18 @@ test('speed applies to the audio element and survives reload', async ({ page }) 
 	expect(await storedValue(page, SPEED_KEY)).toBe('0.5');
 });
 
+test('speed stays applied after navigating to the next track', async ({ page }) => {
+	await openPlayer(page);
+	await page.getByTestId('playback-speed').selectOption('1.5');
+	await expect.poll(() => playbackRate(page)).toBe(1.5);
+
+	await page.getByTestId('player-next').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect(page.getByTestId('playback-speed')).toHaveValue('1.5');
+	await expect.poll(() => playbackRate(page)).toBe(1.5);
+	expect(await storedValue(page, SPEED_KEY)).toBe('1.5');
+});
+
 test('resume restores on reselect and clears at track end', async ({ page }) => {
 	await openPlayer(page);
 	await page.getByTestId('queue-select-second-signal').click();
@@ -246,6 +258,20 @@ test('share link resolves the track and seeks to t', async ({ page }) => {
 
 	await page.goto('/demo/player?track=third-light&t=1:30');
 	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect.poll(() => currentTime(page)).toBe(90);
+});
+
+test('share link restores its track into an empty saved queue and seeks to t', async ({ page }) => {
+	// Preserve session storage across document navigations in this case.
+	await openPlayer(page, { clearComfortStorage: false });
+	await page.getByTestId('queue-clear').click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await page.reload();
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+
+	await page.goto('/demo/player?track=second-signal&t=90');
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
 	await expect.poll(() => currentTime(page)).toBe(90);
 });
 
