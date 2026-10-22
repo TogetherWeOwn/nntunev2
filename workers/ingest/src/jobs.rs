@@ -84,6 +84,14 @@ pub struct JobCheckpoint {
     #[serde(default)]
     pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
+    /// Pool-fetch attribution (see [`QueueMsg::provider_id`](crate::queue::QueueMsg::provider_id)).
+    /// Projected from the message at admission and carried as the live
+    /// copy thereafter: Queue bodies are immutable on redelivery, so the
+    /// checkpoint — not the redelivered message — is what the grant
+    /// publication reads. `#[serde(default)]` keeps pre-attribution
+    /// checkpoints readable (they resume unattributed).
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 /// Advance one step on success. `repair_needed` is only read in `Verifying`.
@@ -325,6 +333,7 @@ mod tests {
             missing_blocks: 0,
             failure_code: None,
             failure_reason: None,
+            provider_id: None,
         }
     }
 
@@ -384,6 +393,36 @@ mod tests {
         let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(legacy_cp.probe_tally.is_none());
         assert_eq!(legacy_cp.repair_rounds, 0);
+    }
+
+    #[test]
+    fn checkpoint_carries_provider_attribution_with_legacy_default() {
+        // Attribution rides the checkpoint as the live copy (the grant
+        // publication reads it from here, not from the immutable Queue
+        // body), and checkpoints written before the field existed still
+        // decode (unattributed).
+        let mut cp = checkpoint_at(JobState::Verifying);
+        assert!(cp.provider_id.is_none());
+        cp.provider_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        let back: JobCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(back, cp);
+        assert_eq!(
+            back.provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+
+        let legacy = serde_json::json!({
+            "job_id": "job_0123456789abcdef",
+            "user_id": "user_01",
+            "idempotency_key": format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            "source": "nzb_upload",
+            "state": "verifying",
+            "attempt": 1,
+            "failure_reason": null,
+        });
+        let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_cp.provider_id.is_none());
     }
 
     #[test]

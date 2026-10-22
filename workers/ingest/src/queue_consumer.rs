@@ -86,7 +86,7 @@ use crate::pool_probe::{call_pool_probe, check_outcome, PoolProbeError};
 use crate::probe::{
     apply_probe_batch, build_probe_request_with_ranges, ProbeOutcome, ProbeRequest, ProbeTally,
 };
-use crate::queue::{validate_indexer_ref, QueueMsg};
+use crate::queue::{validate_indexer_ref, validate_provider_id, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
@@ -157,6 +157,15 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     }
     if msg.state != JobState::Queued || msg.attempt != 1 || msg.repair_rounds != 0 {
         return Err("invalid initial queue state");
+    }
+    // Attribution is optional but shape-pinned: a malformed id must fail
+    // closed here, never ride into the grant publication later. Checked
+    // before the per-source identity comparisons so both sources report
+    // the same cause.
+    if let Some(provider_id) = msg.provider_id.as_deref() {
+        if !validate_provider_id(provider_id) {
+            return Err("invalid provider id");
+        }
     }
 
     match msg.source {
@@ -1670,6 +1679,18 @@ mod tests {
             build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         incomplete_upload.payload_ref = None;
         assert!(validate_queue_msg(&incomplete_upload).is_err());
+    }
+
+    #[test]
+    fn malformed_provider_id_fails_validation() {
+        // provider_id rides the message as pool-fetch attribution (ingest
+        // never mints it); a malformed value must fail closed here rather
+        // than ride into a grant write later. Injected through JSON so the
+        // test also covers the wire shape, not just the struct field.
+        let mut value = serde_json::to_value(search_message()).unwrap();
+        value["provider_id"] = serde_json::json!("not-a-uuid");
+        let msg: QueueMsg = serde_json::from_value(value).unwrap();
+        assert_eq!(validate_queue_msg(&msg).unwrap_err(), "invalid provider id");
     }
 
     #[test]

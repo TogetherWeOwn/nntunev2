@@ -54,6 +54,10 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         missing_blocks: 0,
         failure_code: None,
         failure_reason: None,
+        // Attribution starts here and lives on the checkpoint after:
+        // redelivered Queue bodies are immutable, so the message copy
+        // must never be read back over this field.
+        provider_id: msg.provider_id.clone(),
     }
 }
 
@@ -211,6 +215,22 @@ mod tests {
         assert_eq!(cp.attempt, 1);
         assert_eq!(cp.job_id, msg.job_id);
         assert_eq!(cp.idempotency_key, msg.idempotency_key);
+    }
+
+    #[test]
+    fn initial_projects_provider_attribution_onto_the_checkpoint() {
+        // The checkpoint is the live attribution copy: whatever the
+        // (validated) admission message carries starts here, and the
+        // redelivered message never writes back over it.
+        let plain = msg();
+        assert!(plain.provider_id.is_none());
+        assert!(initial(&plain).provider_id.is_none());
+        let mut attributed = msg();
+        attributed.provider_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        assert_eq!(
+            initial(&attributed).provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
     }
 
     #[test]

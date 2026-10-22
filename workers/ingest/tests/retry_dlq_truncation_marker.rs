@@ -42,6 +42,7 @@ fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
         missing_blocks: 0,
         failure_code: None,
         failure_reason: None,
+        provider_id: msg.provider_id.clone(),
     }
 }
 
