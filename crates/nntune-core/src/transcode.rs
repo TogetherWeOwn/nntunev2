@@ -62,7 +62,9 @@ pub const OGG_FIXED_SERIAL: u32 = 1;
 ///   (a video stream in tagged FLAC/MP3) must never reach the muxer.
 /// - `-map_metadata -1`: input tags differ between rips of identical
 ///   audio and would otherwise break byte-identical output.
-/// - `-c:a libopus -b:a 64k -ar 48000 -ac 2`: the §4.1 profile.
+/// - `-c:a libopus -b:a 64k -vbr off -ar 48000 -ac 2`: the §4.1 profile.
+///   Explicit CBR keeps packet bitrate at 64k; libopus's default VBR
+///   treats `-b:a` as a target and can exceed the profile's envelope.
 ///
 /// The exact argv is pinned by tests: any flag change alters artifact
 /// bytes and therefore every content hash, so it is a deliberate,
@@ -84,6 +86,8 @@ pub fn ffmpeg_argv(input: &str, output: &str) -> Vec<String> {
         "libopus".to_string(),
         "-b:a".to_string(),
         "64k".to_string(),
+        "-vbr".to_string(),
+        "off".to_string(),
         "-ar".to_string(),
         "48000".to_string(),
         "-ac".to_string(),

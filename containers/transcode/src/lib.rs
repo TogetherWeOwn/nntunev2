@@ -137,6 +137,12 @@ impl ApiError {
     fn not_found() -> Self {
         Self::new(404, "not_found")
     }
+    fn request_body(err: io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => Self::invalid(),
+            _ => Self::from(err),
+        }
+    }
 }
 
 impl From<io::Error> for ApiError {
@@ -389,7 +395,10 @@ fn store_input(
     let mut written: u64 = 0;
     let mut buf = [0u8; 64 << 10];
     loop {
-        let n = body.read(&mut buf)?;
+        let n = body.read(&mut buf).map_err(|err| {
+            let _ = fs::remove_file(&tmp);
+            ApiError::request_body(err)
+        })?;
         if n == 0 {
             break;
         }
@@ -603,7 +612,7 @@ fn read_json_body(stream: &mut dyn Read, req: &Request) -> Result<Vec<u8>, ApiEr
     let mut body = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(&mut buf).map_err(ApiError::request_body)?;
         if n == 0 {
             break;
         }
