@@ -115,17 +115,35 @@ test('toggle is keyboard reachable with its state announced', async ({ page }) =
 });
 
 test('starting playback resumes the leveling context', async ({ page }) => {
+	await page.addInitScript(() => {
+		const NativeAudioContext = window.AudioContext;
+		let context: AudioContext | undefined;
+		window.AudioContext = class extends NativeAudioContext {
+			constructor(...args: ConstructorParameters<typeof AudioContext>) {
+				super(...args);
+				context = this;
+			}
+		};
+		(window as unknown as { __suspendLevelingContext: () => Promise<void> })
+			.__suspendLevelingContext = async () => {
+			if (!context) throw new Error('leveling context missing');
+			await context.suspend();
+		};
+	});
 	await page.goto('/demo/player');
 	await waitForLevelingProbe(page);
+	await expectLeveled(page, 'demo-track');
 
-	// Re-selecting the current track starts playback without changing the
-	// track, so the leveling effect does not re-run: the play path's
-	// resume retry is what guarantees the routed context ends up running
-	// rather than muting playback while suspended. (Headless Chromium
-	// starts contexts running, so this pins the required end state as a
-	// tripwire; the suspended-then-resumed transition itself is exercised
-	// in strict-autoplay browsers, where the mount-time resume pends and
-	// only a play-gesture retry completes it.)
+	// Suspend the real context even when headless autoplay starts it running.
+	// The hook is test-local; neither context state nor resume is mocked.
+	await page.evaluate(() =>
+		(window as unknown as { __suspendLevelingContext: () => Promise<void> })
+			.__suspendLevelingContext()
+	);
+	await expect.poll(async () => (await levelingProbe(page)).contextState).toBe('suspended');
+
+	// Selecting the same track leaves the leveling effect idle, so only the
+	// play-path retries can resume the graph. Removing them must fail here.
 	await page.getByTestId('queue-select-demo-track').click();
 	await expect.poll(async () => (await levelingProbe(page)).contextState).toBe('running');
 });
