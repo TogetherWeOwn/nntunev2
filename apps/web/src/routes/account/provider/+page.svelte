@@ -3,6 +3,7 @@
 	import { beforeNavigate } from '$app/navigation';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError, type SavedProviderSummary } from '#lib/api/client.js';
+	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY, browserStorage, clearSnapshot, invalidateLibraryCache } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
@@ -58,12 +59,16 @@
 			active = true;
 			if (!expired) void loadSummary();
 		};
+		// Same-window transitions share the delivered-event reset: expire the
+		// summary without rebroadcasting, requesting or navigating.
+		const unsubscribeLocal = subscribeLocalAuthTransition(() => sessionExpired(false));
 		window.addEventListener('storage', authTransition);
 		window.addEventListener('pagehide', leavePage);
 		window.addEventListener('pageshow', restorePage);
 		void loadSummary();
 		return () => {
 			leavePage();
+			unsubscribeLocal();
 			window.removeEventListener('storage', authTransition);
 			window.removeEventListener('pagehide', leavePage);
 			window.removeEventListener('pageshow', restorePage);

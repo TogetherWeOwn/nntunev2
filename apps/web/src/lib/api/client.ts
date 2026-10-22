@@ -578,13 +578,21 @@ export class ApiClient {
 	/**
 	 * Live-test a provider (+ optional indexer) config without storing it.
 	 * The API validates (SSRF guard), dials, and returns a redacted result —
-	 * secrets never come back in the response.
+	 * secrets never come back in the response. The optional caller signal
+	 * lets the owning page fence a stale test: a pre-aborted signal sends no
+	 * request, and a response that arrives after abort — including a limit
+	 * response — rejects as an abort instead of publishing a paywall.
 	 */
-	async testProviderConnection(input: ProviderTestInput, retry?: () => void): Promise<ProviderTestResult> {
+	async testProviderConnection(
+		input: ProviderTestInput,
+		retry?: () => void,
+		signal?: AbortSignal
+	): Promise<ProviderTestResult> {
 		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(toVaultSaveBody(input))
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
 		}, retry);
 		return validateVaultTestResult(data, status);
 	}
@@ -592,10 +600,16 @@ export class ApiClient {
 	/**
 	 * Store a tested provider (+ optional indexer) config in the encrypted
 	 * vault. The API seals secrets with envelope encryption; responses are
-	 * redacted summaries, never secret material.
+	 * redacted summaries, never secret material. The optional caller signal
+	 * fences a stale save the same way as the connection test above.
 	 */
-	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
+	async saveProviderConfig(input: ProviderTestInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/vault', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
+		});
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
