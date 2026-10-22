@@ -20,6 +20,15 @@ measured findings) lives in `docs/youtube-backend-spike.md`.
 - `src/gate.rs` — the GO/NO-GO verdict (byte-fetch failure rate from
   Worker egress, threshold 5%) and the per-video JSONL measurement
   record.
+- `src/select.rs` — official-media selection (OMV/ATV gating, duration
+  match, ATV-only audio choice, cache keys/TTLs).
+- `src/routes.rs` — fail-closed public fetch and extraction routing
+  decisions, natively tested.
+- `src/runtime.rs` (wasm32 only) — the Worker entry: public fetch 404
+  plus the `YtExtract` Durable Object (`POST /extract`, retryable 503
+  until the extraction wiring lands).
+- `wrangler.toml.example` — deploy contract: `YT_EXTRACT` binding +
+  SQLite migration, `YT_CONFIG` / `YT_PLAYER_CACHE` KV placeholders.
 - `corpus/day1.json` — HISTORICAL, retired: the original 100-video
   Day-1 corpus (50 VEVO label music videos, 50 auto-generated
   `- Topic` audio tracks). The VEVO/Topic substring method is
@@ -27,16 +36,19 @@ measured findings) lives in `docs/youtube-backend-spike.md`.
   closed until rewritten. See `corpus/SOURCES.md` for the method and
   the pending re-cut.
 
-Pure portable logic: no network, no Worker bindings, no new external
-dependencies (`serde` + `serde_json` only). Native builds and `cargo
-test` never link the Workers runtime.
+Portable logic plus the wasm32-only runtime entry: native builds and
+`cargo test` never link the Workers runtime (`worker` + `wasm-bindgen`
+are wasm32-only dependencies).
 
 ## What's next (later Day-1 slices)
 
-- The wasm32 runtime entry (fetch handler, Durable Object, `wrangler.toml`
-  + binding-manifest entry) and the `connect()` proxy client. The proxy
-  slice is parked until the host procures proxy credentials (owner spend
-  OK); the runtime entry needs no proxy.
+- The extraction/measurement wiring: `POST /extract` runs `/player`
+  extraction, the public fetch serves measurement routes, and the YTM
+  search + `/next` I/O lands for the corpus re-cut.
+- The staging deploy (template → real `wrangler.toml` + provisioned KV)
+  and the `connect()` proxy client. The proxy slice is parked until the
+  dev path to the home residential endpoint is available; the runtime
+  entry needs no proxy.
 - The staging measurement run that produces the actual gate numbers: it
   must run from Worker egress, because extraction-IP reputation varies
   by egress (dev egress is fully bot-walled; see finding P1 in the
@@ -47,6 +59,8 @@ test` never link the Workers runtime.
 ```sh
 python3 scripts/cargo_cache.py run -- test -p nntune-youtube
 python3 scripts/cargo_cache.py run -- clippy -p nntune-youtube --all-targets -- -D warnings
+python3 scripts/cargo_cache.py run -- check -p nntune-youtube --target wasm32-unknown-unknown
+python3 scripts/cargo_cache.py run -- clippy -p nntune-youtube --target wasm32-unknown-unknown -- -D warnings
 ```
 
 (`cargo` itself lives in `/paperclip/.cargo/bin` and is not on `PATH`;

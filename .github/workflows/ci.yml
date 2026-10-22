@@ -87,6 +87,10 @@ jobs:
       # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
+      # The YouTube measurement Worker entry (YtExtract Durable Object) only
+      # compiles on wasm32: check and lint it on the target it deploys to.
+      - run: cargo check -p nntune-youtube --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-youtube --target wasm32-unknown-unknown -- -D warnings
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # every committed lockfile (workspace root, workers/api, workers/ingest,
@@ -169,7 +173,9 @@ jobs:
   worker-wasm-sizes:
     name: worker wasm sizes (report-only)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
+    # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
+    timeout-minutes: 35
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
