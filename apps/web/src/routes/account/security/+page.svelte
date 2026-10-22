@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import type { PageProps } from './$types';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
@@ -8,8 +9,13 @@
 	type Props = { data?: Partial<PageProps['data']> | void };
 	let { data = { sessionCheckFailed: false } }: Props = $props();
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 
 	function redirectToLogin() {
+		if (!alive) return;
 		// Crossing an auth boundary: drop this tab's library snapshots and
 		// broadcast the transition so other open tabs stop showing them.
 		invalidateLibraryCache();
@@ -22,13 +28,14 @@
 	let revokeIncomplete = $state(false);
 
 	async function signOut() {
-		if (busy !== null) return;
+		if (!alive || busy !== null) return;
 		busy = 'local';
 		actionError = null;
 		revokeIncomplete = false;
 		try {
 			await client.logout();
 		} catch (error) {
+			if (!alive) return;
 			if (error instanceof ApiError && error.status === 401) {
 				redirectToLogin();
 				return;
@@ -36,18 +43,21 @@
 			actionError = 'Could not sign out. Please try again.';
 			busy = null;
 			return;
+		} finally {
+			if (!alive) busy = null;
 		}
 		redirectToLogin();
 	}
 
 	async function signOutEverywhere() {
-		if (busy !== null || !window.confirm('Sign out on every device?')) return;
+		if (!alive || busy !== null || !window.confirm('Sign out on every device?')) return;
 		busy = 'everywhere';
 		actionError = null;
 		revokeIncomplete = false;
 		try {
 			await client.revokeAllSessions();
 		} catch (error) {
+			if (!alive) return;
 			if (error instanceof ApiError && error.status === 401) {
 				// A 401 means this request was rejected before any session
 				// was revoked, so staying here with an explicit message keeps
@@ -66,6 +76,8 @@
 			actionError = 'Could not confirm sign out everywhere. Please try again.';
 			busy = null;
 			return;
+		} finally {
+			if (!alive) busy = null;
 		}
 		redirectToLogin();
 	}

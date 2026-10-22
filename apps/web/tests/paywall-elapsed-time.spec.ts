@@ -231,10 +231,11 @@ test('a new limit response while the modal stays open establishes a fresh deadli
 	await page.clock.fastForward(31_000);
 	await expect(countdown).toHaveText('You can try again now.');
 
-	// Still the same modal mount: analytics fired once, for the first model.
+	// A replacement is a new display even though the modal stays mounted.
 	const events = await paywallEvents(page);
-	expect(events).toHaveLength(1);
+	expect(events).toHaveLength(2);
 	expect(events[0]).toMatchObject({ kind: 'retryable', status: 429, retryAfterSeconds: 45 });
+	expect(events[1]).toMatchObject({ kind: 'retryable', status: 429, retryAfterSeconds: 30 });
 });
 
 test('unknown wait keeps current copy, shows no countdown, and never auto-retries', async ({

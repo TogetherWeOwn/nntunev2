@@ -54,6 +54,26 @@ test('readiness endpoint reports ok when ready', async ({ request }) => {
 	await expect(response.json()).resolves.toEqual({ ok: true });
 });
 
+test('security.txt is served at the canonical RFC 9116 path', async ({ request }) => {
+	// URL-level pin: the whole value of this endpoint is its canonical
+	// location, so assert the route resolves here, not just that GET works.
+	const response = await request.get('/.well-known/security.txt');
+
+	expect(response.status()).toBe(200);
+	expect(response.headers()['content-type']).toMatch(/^text\/plain(?:;|$)/);
+	const body = await response.text();
+	expect(body).toContain(
+		'Contact: https://github.com/TogetherWeOwn/nntunev2/security/advisories/new'
+	);
+
+	const expiresLine = body.split('\n').find((line) => line.startsWith('Expires: '));
+	expect(expiresLine).toBeDefined();
+	const parsed = Date.parse(expiresLine!.slice('Expires: '.length));
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	expect(parsed).toBeGreaterThan(Date.now() + 180 * DAY_MS);
+	expect(parsed).toBeLessThanOrEqual(Date.now() + 366 * DAY_MS);
+});
+
 /**
  * E2E contract-hook coverage (TESTIDS in e2e/helpers/contract.ts, 20 hooks).
  * The static companion (apps/web/src/lib/contract.test.ts) pins that each
@@ -74,10 +94,10 @@ test('readiness endpoint reports ok when ready', async ({ request }) => {
  * instance; the library inline instance is gated behind the overLimit=false
  * placeholder and cannot render yet).
  *
- * Pinned elsewhere: audio-player — library/+page.svelte renders it once a
- * library row is selected (the queue's current track reveals the
- * placeholder player with an empty src); the render pin lives in the
- * library player-queue companion spec, so it is not repeated here.
+ * Audio-player: no library item carries a stream URL yet, so selecting a
+ * row must render no <audio> element at all (never one with an empty src);
+ * the absent-audio and honest-copy pins are the acceptance tests at the
+ * bottom of this file.
  */
 test('contract routes resolve and render their e2e hooks', async ({ page, request }) => {
 	for (const href of ['/signup', '/onboarding/byop', '/library', '/library/import']) {
@@ -328,4 +348,135 @@ test('wizard hides save until a connection test passes', async ({ page }) => {
 	// Save stays hidden until the live test passes, so the wizard can never
 	// store credentials that were not just tested.
 	await expect(page.getByRole('button', { name: /save provider/i })).toHaveCount(0);
+});
+
+/**
+ * Acceptance: validated, honest library + import UI.
+ *
+ * OWNERSHIP: the tests from here to the end of this file are
+ * acceptance-owned. The paired build card lands the route changes on top
+ * of this branch and must make them pass WITHOUT editing them; a wrong
+ * test comes back to the acceptance card instead. The validator half is
+ * `apps/web/src/lib/library/import-validation.test.ts`.
+ *
+ * Honest-copy shape pinned here (exact wording is the builder's):
+ * user-facing "not available yet" text, no internal slice/roadmap words,
+ * no promise about timing, and no claim that a file was uploaded or
+ * is being processed.
+ */
+const NOT_AVAILABLE_YET = /not (yet )?available|isn'?t available|not available yet/i;
+const INTERNAL_OR_PROMISING =
+	/\bslice\b|lands with|coming soon|stay tuned|will be available/i;
+const CLAIMS_UPLOAD_OR_PROCESSING =
+	/file received|has been uploaded|upload(ed|ing)? (complete|successful)|is being processed|processing your/i;
+
+test('library renders no audio element while the selected track has no stream URL', async ({
+	page
+}) => {
+	await page.route('**/api/library', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify([{ id: 'no-stream-1', title: 'Silent Song', artist: 'No Stream' }])
+		})
+	);
+
+	await page.goto('/library');
+	await expect(page.getByTestId('library-item')).toHaveCount(1);
+	await expect(page.locator('audio')).toHaveCount(0);
+
+	// Selecting the row makes it the queue's current track — the state that
+	// used to reveal <audio data-testid="audio-player" src="">, which made
+	// the browser request the page URL as if it were media.
+	await page.getByTestId('library-item').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Silent Song');
+
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect(page.locator('audio')).toHaveCount(0);
+});
+
+test('library usage copy is honest not-available-yet text', async ({ page }) => {
+	await page.goto('/library');
+
+	const meter = page.getByTestId('usage-meter');
+	await expect(meter).toBeVisible();
+	await expect(meter).toContainText(NOT_AVAILABLE_YET);
+	await expect(meter).not.toContainText(INTERNAL_OR_PROMISING);
+	await expect(page.getByRole('main')).not.toContainText(INTERNAL_OR_PROMISING);
+});
+
+test('import rejects empty, oversized and wrong-extension files with an alert and no upload request', async ({
+	page
+}) => {
+	const cases = [
+		{
+			label: 'zero-byte .nzb',
+			name: 'empty.nzb',
+			buffer: Buffer.alloc(0),
+			message: /empty|no data|0 bytes/i
+		},
+		{
+			label: 'one byte over the 2 MiB intake cap',
+			name: 'huge.nzb',
+			buffer: Buffer.alloc(2 * 1024 * 1024 + 1),
+			message: /too (large|big)|size|limit|exceed|maximum|2\s?(mb|mib)/i
+		},
+		{
+			label: 'wrong extension',
+			name: 'notes.txt',
+			buffer: Buffer.from('not an nzb'),
+			message: /nzb|extension|type/i
+		}
+	];
+
+	for (const { label, name, buffer, message } of cases) {
+		await page.goto('/library/import');
+		await expect(page.getByTestId('import-file')).toBeAttached();
+		await page.waitForLoadState('networkidle');
+
+		// Count mutating (upload-shaped) requests made after the selection.
+		const uploads: string[] = [];
+		const onRequest = (request: { method(): string; url(): string }) => {
+			if (['POST', 'PUT', 'PATCH'].includes(request.method())) {
+				uploads.push(`${request.method()} ${request.url()}`);
+			}
+		};
+		page.on('request', onRequest);
+		try {
+			await page
+				.getByTestId('import-file')
+				.setInputFiles({ name, mimeType: 'application/octet-stream', buffer });
+
+			const alert = page.getByRole('alert');
+			await expect(alert, `alert for ${label}`).toBeVisible();
+			await expect(alert, `alert text for ${label}`).toContainText(message);
+			await expect(alert).not.toContainText(INTERNAL_OR_PROMISING);
+			// Let any (buggy) upload fire before counting.
+			await page.waitForTimeout(250);
+			expect(uploads, `no upload request for ${label}`).toEqual([]);
+		} finally {
+			page.off('request', onRequest);
+		}
+	}
+});
+
+test('import answers a valid file with an honest status, not a claim of upload or processing', async ({
+	page
+}) => {
+	await page.goto('/library/import');
+	await page.getByTestId('import-file').setInputFiles({
+		name: 'album.nzb',
+		mimeType: 'application/x-nzb',
+		buffer: Buffer.from('<?xml version="1.0"?><nzb></nzb>')
+	});
+
+	const status = page.getByTestId('import-status');
+	await expect(status).toBeVisible();
+	await expect(status).toContainText(NOT_AVAILABLE_YET);
+	await expect(status).not.toContainText(INTERNAL_OR_PROMISING);
+	await expect(status).not.toContainText(CLAIMS_UPLOAD_OR_PROCESSING);
+	// The valid path is a status, not an error.
+	await expect(page.getByRole('alert')).toHaveCount(0);
+	// And the whole page carries no internal slice/roadmap wording.
+	await expect(page.getByRole('main')).not.toContainText(INTERNAL_OR_PROMISING);
 });
