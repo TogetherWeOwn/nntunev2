@@ -39,9 +39,13 @@ import { expect, test, type Browser, type Page } from '@playwright/test';
  * builder's determinism units over larger fixtures carry the rest; this
  * pin carries the browser-level same-seed/same-order contract.
  *
- * Out of scope (not pinned): behaviour after a full radio pass (loop with
- * a new seed vs. stop), queue-panel edits during radio, MediaSession
- * metadata for radio tracks, default-seed stability across reloads.
+ * Transition pins: a full natural-end pass rolls into the seed+1 mix;
+ * Next advances within and between passes without leaving radio; Previous
+ * and explicit queue selection return to queue playback; clear exits to
+ * empty and ignores stray ends. The queue itself remains unchanged in radio.
+ *
+ * Out of scope (not pinned): queue reordering/additions during radio,
+ * MediaSession metadata for radio tracks, default-seed stability across reloads.
  */
 
 const SEED = 7;
@@ -208,6 +212,117 @@ test('radio stop returns to idle and stays stopped', async ({ page }) => {
 	await page.waitForTimeout(500);
 	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
 	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+	await expect.poll(() => playCalls(page)).toBe(callsBefore);
+});
+
+/** Assert real transport state as well as the play request, including same-title boundaries. */
+async function expectRadioTrack(page: Page, title: string, callsBefore: number): Promise<void> {
+	await expect(page.getByTestId('radio-badge')).toBeVisible();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect(page.getByTestId('now-playing')).toContainText(title);
+	await expect.poll(() => playCalls(page)).toBe(callsBefore + 1);
+}
+
+test('natural radio rollover stays playing and uses the seed+1 permutation', async ({
+	page,
+	browser
+}) => {
+	// Independent entry paths: a fresh seed+1 session is the oracle for the
+	// rollover path, not the implementation's shuffle helper. The fixture
+	// must distinguish adjacent seeds so a repeated-seed rollover cannot pass.
+	const nextPass = await radioOrderInFreshContext(browser, SEED + 1);
+	await openPlayer(page);
+	await playThroughToRadio(page);
+	const firstPass = await collectRadioOrder(page, CATALOGUE_TITLES.length);
+	expect(nextPass).not.toEqual(firstPass);
+	expect([...nextPass].sort()).toEqual([...CATALOGUE_TITLES].sort());
+
+	// collectRadioOrder consumed two ends. This third one crosses the last
+	// radio track boundary rather than merely reaching the last track.
+	for (const title of nextPass) {
+		const callsBefore = await playCalls(page);
+		await naturalEnd(page);
+		await expectRadioTrack(page, title, callsBefore);
+	}
+	expect(
+		await page.getByTestId('queue-item').evaluateAll((items) =>
+			items.map((item) => item.getAttribute('data-track-id'))
+		)
+	).toEqual(['demo-track', 'second-signal', 'third-light']);
+});
+
+test('Next in radio advances within the pass and across rollover without ending', async ({
+	page,
+	browser
+}) => {
+	const firstPass = await radioOrderInFreshContext(browser, SEED);
+	const nextPass = await radioOrderInFreshContext(browser, SEED + 1);
+	expect(nextPass).not.toEqual(firstPass);
+	await openPlayer(page);
+	await playThroughToRadio(page);
+	await expect(page.getByTestId('now-playing')).toContainText(firstPass[0]!);
+
+	// Two in-pass Next clicks, then the boundary click and the rest of seed+1.
+	for (const title of [...firstPass.slice(1), ...nextPass]) {
+		const callsBefore = await playCalls(page);
+		await page.getByTestId('player-next').click();
+		await expectRadioTrack(page, title, callsBefore);
+	}
+	expect(
+		await page.getByTestId('queue-item').evaluateAll((items) =>
+			items.map((item) => item.getAttribute('data-track-id'))
+		)
+	).toEqual(['demo-track', 'second-signal', 'third-light']);
+});
+
+test('Previous exits radio to the preceding queued track', async ({ page }) => {
+	await openPlayer(page);
+	await playThroughToRadio(page);
+
+	await page.getByTestId('player-prev').click();
+
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	// A subsequent end follows the queue, not the abandoned radio mix.
+	await naturalEnd(page);
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+});
+
+test('explicit queue selection exits radio to the selected queued track', async ({ page }) => {
+	await openPlayer(page);
+	await playThroughToRadio(page);
+
+	await page.getByTestId('queue-select-demo-track').click();
+
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await naturalEnd(page);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+});
+
+test('clear exits radio to empty and stray ends cannot restart playback', async ({ page }) => {
+	await openPlayer(page);
+	await playThroughToRadio(page);
+
+	await page.getByTestId('queue-clear').click();
+
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: empty');
+	const callsBefore = await playCalls(page);
+	await naturalEnd(page);
+	await page.waitForTimeout(500);
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: empty');
+	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 	await expect.poll(() => playCalls(page)).toBe(callsBefore);
 });
 
