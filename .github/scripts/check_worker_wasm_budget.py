@@ -91,6 +91,14 @@ WORKERS = (
         "wasm": "nntune_repair.wasm",
     },
     {
+        "worker": "transcode",
+        "kind": "manifest",
+        "manifest": "workers/transcode/Cargo.toml",
+        "locked": True,
+        "target_dir": "workers/transcode/target",
+        "wasm": "nntune_transcode.wasm",
+    },
+    {
         "worker": "stream",
         "kind": "package",
         "package": "nntune-stream",

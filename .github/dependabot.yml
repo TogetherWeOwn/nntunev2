@@ -11,11 +11,13 @@
 # One entry per manifest directory: Dependabot takes no globs, and each
 # ecosystem looks only in its configured directory. The root workspace
 # (`Cargo.toml`, members: `crates/nntune-core`) does NOT cover
-# `workers/api`, `workers/ingest`, `workers/mb` or `workers/repair`
+# `workers/api`, `workers/ingest`, `workers/mb`, `workers/repair` or
+# `workers/transcode`
 # (excluded standalone crates), so they get their own cargo entries. The batch
-# import image (`containers/mb-import/Dockerfile`, FROM postgres) and the
-# repair image (`containers/repair/Dockerfile`, FROM debian/rust) each get
-# their own docker entry. Rolling codename tags (`debian:bookworm-slim`,
+# import image (`containers/mb-import/Dockerfile`, FROM postgres), the
+# repair image (`containers/repair/Dockerfile`, FROM debian/rust) and the
+# transcode image (`containers/transcode/Dockerfile`, FROM debian/rust)
+# each get their own docker entry. Rolling codename tags (`debian:bookworm-slim`,
 # `rust:1-bookworm`) carry no numeric version for Dependabot to compare,
 # so a docker entry opens version-tag PRs plus digest-refresh PRs: every
 # FROM carries a tag+digest pin, so base rebuilds arrive as digest-update
@@ -25,9 +27,10 @@
 #
 # Lockfiles: tracked at the root and for every standalone Worker crate (see
 # root `.gitignore` negations): `Cargo.lock`, `workers/api/Cargo.lock`,
-# `workers/ingest/Cargo.lock`, `workers/mb/Cargo.lock` and
-# `workers/repair/Cargo.lock`. Each cargo entry therefore sees transitive
-# dependencies and its updates are reviewed lockfile changes.
+# `workers/ingest/Cargo.lock`, `workers/mb/Cargo.lock`,
+# `workers/repair/Cargo.lock` and `workers/transcode/Cargo.lock`. Each cargo
+# entry therefore sees transitive dependencies and its updates are reviewed
+# lockfile changes.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
 # `pr-lint`, Paperclip Review) all appear on it before relying on them —
@@ -163,6 +166,28 @@ updates:
       prefix: "chore"
       include: "scope"
 
+  # Transcode worker (standalone crate, streams one staged scratch object
+  # into the opus-64 transcode Container and back).
+  - package-ecosystem: "cargo"
+    directory: "/workers/transcode"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
   # Batch import image (FROM postgres, tag+digest pinned).
   - package-ecosystem: "docker"
     directory: "/containers/mb-import"
@@ -189,6 +214,29 @@ updates:
   # refreshes for base rebuilds (see header). Pinned by .github/scripts/check_dependabot_coverage.py.
   - package-ecosystem: "docker"
     directory: "/containers/repair"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Transcode image (FROM debian, rust, both tag+digest pinned): rolling
+  # codename tags, so this entry tracks version-tag bumps plus digest
+  # refreshes for base rebuilds (see header). Pinned by .github/scripts/check_dependabot_coverage.py.
+  - package-ecosystem: "docker"
+    directory: "/containers/transcode"
     groups:
       minor-and-patch:
         applies-to: version-updates

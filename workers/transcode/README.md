@@ -8,8 +8,9 @@ The no-route Worker that fronts the `opus-64` transcode Container
   (`POST /transcode`). Every other method/path is a 404.
   (Sources: `wrangler.toml:15,18` and the `NOT YET DEPLOYED` header
   `:11-13`; `src/runtime.rs:129-147`;
-  `workers/ingest/src/transcode.rs:82-87` (binding contract),
-  `:298-299` (`call_transcode`).)
+  `workers/ingest/wrangler.toml.example:163-168` (service binding);
+  `workers/ingest/src/transcode.rs:95-100` (binding contract),
+  `:323-324` (`call_transcode`).)
 - **One Durable Object per job.** Requests are validated, then routed
   to `TranscodeContainer` (`id_from_name(job_id)`), so a job's encodes
   serialise behind one object and one Container. The object refuses
@@ -129,4 +130,5 @@ cargo check --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown
 cargo clippy --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 ```
 
-(Mirrors CI job `rust (workers/transcode)`.)
+(Mirrors CI job `rust (workers/transcode)`;
+Sources: `.github/workflows/ci.yml:594-615`.)
