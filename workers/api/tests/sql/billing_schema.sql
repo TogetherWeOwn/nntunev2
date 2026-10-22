@@ -149,14 +149,29 @@ BEGIN
     INSERT INTO billing_operations
         (user_id, kind, state, request_key, request_payload)
     VALUES ('user-bil-2', 'trial_create', 'needs_reconcile', 'req-3', '{}');
+    -- needs_reconcile counts as unresolved: a fresh create beside it must be
+    -- refused (fresh request key, so only the single-flight predicate can
+    -- fire — dropping the state from it must fail the gate).
+    BEGIN
+        INSERT INTO billing_operations
+            (user_id, kind, state, request_key, request_payload)
+        VALUES ('user-bil-2', 'paid_convert', 'pending', 'req-3-conflict', '{}');
+        RAISE EXCEPTION 'single flight accepted a row beside needs_reconcile';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
     UPDATE billing_operations SET state = 'done' WHERE request_key = 'req-1';
     INSERT INTO billing_operations
         (user_id, kind, state, request_key, request_payload)
     VALUES ('user-bil-1', 'paid_convert', 'submitted', 'req-4', '{}');
+    -- Terminal state, so the duplicate key below can only violate the
+    -- request_key UNIQUE — user-bil-2 still holds the unresolved req-3 row,
+    -- and a pending/submitted/needs_reconcile state would trip single flight
+    -- too (same SQLSTATE, unisolated assertion).
     BEGIN
         INSERT INTO billing_operations
             (user_id, kind, state, request_key, request_payload)
-        VALUES ('user-bil-2', 'paid_convert', 'pending', 'req-3', '{}');
+        VALUES ('user-bil-2', 'paid_convert', 'done', 'req-3', '{}');
         RAISE EXCEPTION 'UNIQUE accepted a duplicate request_key';
     EXCEPTION WHEN unique_violation THEN
         NULL;
@@ -202,6 +217,48 @@ BEGIN
     EXCEPTION WHEN unique_violation THEN
         NULL;
     END;
+    -- Every remaining live-slot status conflicts with the held trialing row:
+    -- dropping any one of them from the predicate must fail the gate.
+    BEGIN
+        INSERT INTO subscriptions
+            (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+        VALUES ('user-bil-1', 'sub_live_incomplete', 'cus_1', 'si_2',
+                'price_sel_plus', 'plus', 'incomplete');
+        RAISE EXCEPTION 'live slot accepted incomplete beside trialing';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO subscriptions
+            (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+        VALUES ('user-bil-1', 'sub_live_past_due', 'cus_1', 'si_2',
+                'price_sel_plus', 'plus', 'past_due');
+        RAISE EXCEPTION 'live slot accepted past_due beside trialing';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO subscriptions
+            (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+        VALUES ('user-bil-1', 'sub_live_unpaid', 'cus_1', 'si_2',
+                'price_sel_plus', 'plus', 'unpaid');
+        RAISE EXCEPTION 'live slot accepted unpaid beside trialing';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO subscriptions
+            (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+        VALUES ('user-bil-1', 'sub_live_paused', 'cus_1', 'si_2',
+                'price_sel_plus', 'plus', 'paused');
+        RAISE EXCEPTION 'live slot accepted paused beside trialing';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
     -- Terminal rows do not reserve the slot; unknown provider states are
     -- stored verbatim (fail closed at read, never rejected at write).
     INSERT INTO subscriptions
@@ -209,9 +266,11 @@ BEGIN
          stripe_subscription_item_id, stripe_price_id, plan_id, status)
     VALUES ('user-bil-1', 'sub_old_1', 'cus_1', 'si_0', 'price_old_plus',
             'plus', 'canceled'),
+           ('user-bil-1', 'sub_old_2', 'cus_1', 'si_7', 'price_old_plus',
+            'plus', 'incomplete_expired'),
            ('user-bil-1', 'sub_odd_1', 'cus_1', 'si_9', 'price_sel_plus',
             'plus', 'weird_remote_status');
-    IF (SELECT count(*) FROM subscriptions WHERE user_id = 'user-bil-1') <> 3 THEN
+    IF (SELECT count(*) FROM subscriptions WHERE user_id = 'user-bil-1') <> 4 THEN
         RAISE EXCEPTION 'terminal/unknown rows must coexist with the live row';
     END IF;
     BEGIN
@@ -249,6 +308,13 @@ BEGIN
         INSERT INTO usage_ledger (user_id, period, stream_seconds)
         VALUES ('user-bil-1', '2026-10-19', -1);
         RAISE EXCEPTION 'CHECK accepted negative stream_seconds';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO usage_ledger (user_id, period, ingest_jobs)
+        VALUES ('user-bil-1', '2026-10-19', -1);
+        RAISE EXCEPTION 'CHECK accepted negative ingest_jobs';
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;

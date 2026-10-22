@@ -409,6 +409,18 @@ mod tests {
                 entitled: true,
             }
         );
+        // Scheduled cancellation keeps LIVE coverage: cancel_at_period_end is
+        // not terminal (ADR 0005) — access runs to paid_through_at. Only the
+        // settlement allowance below excludes it. This pins the live arm
+        // against a `&& !cancel` regression (paying users cut at cancel time).
+        let scheduled_live = sub("plus", "active", true, None, Some(NOW + DAY), None);
+        assert_eq!(
+            resolve_effective_plan(Some(scheduled_live), NOW),
+            EffectivePlan {
+                plan: PlanId::Plus,
+                entitled: true,
+            }
+        );
         // Exactly at the bound cuts (strict `<`, never sliding).
         let at_bound = sub(
             "pro-5x",
@@ -454,6 +466,32 @@ mod tests {
         );
         assert_eq!(
             resolve_effective_plan(Some(grace), NOW),
+            EffectivePlan {
+                plan: PlanId::Pro20x,
+                entitled: true,
+            }
+        );
+        // cancel_at_period_end never gates past_due: the coverage and grace
+        // arms ignore it by design (ADR 0005 pins no cancel exclusion for
+        // past_due) — pin both so a `&& !cancel` backport fails loudly.
+        let covered_cancel = sub("plus", "past_due", true, None, Some(NOW + DAY), None);
+        assert_eq!(
+            resolve_effective_plan(Some(covered_cancel), NOW),
+            EffectivePlan {
+                plan: PlanId::Plus,
+                entitled: true,
+            }
+        );
+        let grace_cancel = sub(
+            "pro-20x",
+            "past_due",
+            true,
+            None,
+            Some(NOW - DAY),
+            Some(NOW + 6 * DAY),
+        );
+        assert_eq!(
+            resolve_effective_plan(Some(grace_cancel), NOW),
             EffectivePlan {
                 plan: PlanId::Pro20x,
                 entitled: true,
