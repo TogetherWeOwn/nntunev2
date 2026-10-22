@@ -106,7 +106,7 @@ const TRANSITION_KEY = 'nntune.library.auth-transition.v1';
 const SIGNED_IN_EMAIL = 'nntune:signed-in-email';
 
 interface TransitionHeld {
-	release: (status: number, body: unknown) => void;
+	release: (status: number, body: unknown) => Promise<void>;
 	count: () => Promise<number>;
 }
 
@@ -136,7 +136,7 @@ async function holdConnectionTest(page: Page): Promise<TransitionHeld> {
 	});
 	return {
 		release: (status, body) =>
-			void page.evaluate(
+			page.evaluate(
 				({ status, body }) => {
 					const settle = (
 						window as unknown as { __settleTest?: (response: Response) => void }

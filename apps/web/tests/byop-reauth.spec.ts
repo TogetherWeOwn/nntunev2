@@ -150,7 +150,7 @@ const TRANSITION_RESTART_NOTICE =
 	're-enter and retest your credentials. Requests already submitted may still complete.';
 
 interface HeldEndpoints {
-	release: (path: string, status: number, body: unknown) => void;
+	release: (path: string, status: number, body: unknown) => Promise<void>;
 	count: (path: string) => Promise<number>;
 }
 
@@ -180,7 +180,7 @@ async function holdEndpoints(page: Page, paths: string[]): Promise<HeldEndpoints
 	}, paths);
 	return {
 		release: (path, status, body) =>
-			void page.evaluate(
+			page.evaluate(
 				({ path, status, body }) => {
 					const settle = (window as unknown as { __settleHeld: Record<string, (r: Response) => void> })
 						.__settleHeld[path];

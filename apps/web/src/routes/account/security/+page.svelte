@@ -81,9 +81,7 @@
 				// session is confirmed gone, so local library snapshots
 				// still cross the auth boundary and are invalidated here —
 				// even when abandoned, but then with no message or redirect.
-				invalidateLibraryCache();
-				clearSignedInEmail();
-				notifyLocalAuthTransition();
+				crossAuthBoundary();
 				if (!alive) return;
 				actionError =
 					'Your session expired before other devices were signed out. Sign in again and repeat Sign out everywhere.';
