@@ -406,6 +406,10 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		}
 		status = current ? 'selected' : 'empty';
 		restored = true;
+		// An ordinary reload restores the queue but mounts a fresh element
+		// at zero: resume the selected track's saved position. Share links
+		// already sought above and stay authoritative.
+		if (shared === undefined && current) seekToResume(current.id);
 		const tickId = setInterval(() => {
 			sleepTimer.tick();
 		}, 500);
