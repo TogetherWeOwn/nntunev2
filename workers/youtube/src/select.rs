@@ -116,8 +116,8 @@ pub fn parse_search_candidate(item: &serde_json::Value) -> Option<SearchCandidat
         video_id: video_id.to_string(),
         channel_id: channel_from_runs(renderer),
         music_video_type,
-        official_artist: badges.iter().any(|b| *b == OFFICIAL_ARTIST_BADGE),
-        verified: badges.iter().any(|b| *b == VERIFIED_BADGE),
+        official_artist: badges.contains(&OFFICIAL_ARTIST_BADGE),
+        verified: badges.contains(&VERIFIED_BADGE),
         duration_secs: duration_from_renderer(renderer),
     })
 }
@@ -661,7 +661,8 @@ mod tests {
         let top = parse_search_candidate(&omv_item()).expect("parse");
         let mut counterpart = top.clone();
         counterpart.video_id = "counterpart1".to_string();
-        let picked = select_omv(Some(&counterpart), &[top], Some(225), &policy()).expect("select");
+        let ranked = [top];
+        let picked = select_omv(Some(&counterpart), &ranked, Some(225), &policy()).expect("select");
         assert_eq!(picked.video_id, "counterpart1");
     }
 
