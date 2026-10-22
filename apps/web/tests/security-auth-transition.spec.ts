@@ -719,24 +719,26 @@ test('abandoned logout resets the same-window BYOP draft and fences its pending 
 	expect(saves).toBe(0);
 	expect(reauthPosts).toBe(0);
 
-	// Programmatic handler paths cannot bypass the guard either: rendered
-	// controls stay disabled and direct activation dispatches nothing.
-	const testControl = page.getByTestId('byop-test-connection');
-	if ((await testControl.count()) > 0) await expect(testControl).toBeDisabled();
+	// A post-reset refill to step 3 renders the test control disabled, and
+	// force-activating the rendered handler dispatches nothing: the entry
+	// guard — not just the missing button — fences stale submits. A
+	// synthetic dispatch bypasses the disabled activation gate, so this
+	// reaches the handler a dispatch on the unrendered step-1 controls
+	// could not.
+	await fillByopDraft(page, 'refill');
+	await expect(page.getByTestId('byop-test-connection')).toBeDisabled();
 	await page.evaluate(() => {
-		document.querySelector('[data-testid="byop-test-connection"]')?.dispatchEvent(
-			new MouseEvent('click', { bubbles: true })
-		);
-		document.querySelector('[data-testid="byop-save"]')?.dispatchEvent(
-			new MouseEvent('click', { bubbles: true })
-		);
+		document
+			.querySelector('[data-testid="byop-test-connection"]')
+			?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 	});
-	await page.getByLabel('Password', { exact: true }).press('Enter');
 	await page.waitForTimeout(350);
 	expect(await requestCount(page, '/v1/vault/test')).toBe(1);
 	expect(saves).toBe(0);
 	expect(reauthPosts).toBe(0);
 	await expect(notice).toBeVisible();
+	await expect(page.getByTestId('byop-save')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Reauthenticate and save' })).toHaveCount(0);
 	const probe = await probeSnapshot(page);
 	expect.soft(probe.rejections).toEqual([]);
 	expect.soft(observed.pageErrors).toEqual([]);
@@ -752,13 +754,15 @@ test('abandoned logout clears tested state and fences an already-dispatched save
 		// and must fail fast through the catch-all instead of hanging.
 		{ path: '/v1/vault', methods: ['PUT'] }
 	]);
-	await page.route('**/v1/vault/test', (route) =>
-		route.fulfill({
+	let tests = 0;
+	await page.route('**/v1/vault/test', async (route) => {
+		tests += 1;
+		await route.fulfill({
 			status: 200,
 			contentType: 'application/json',
 			body: JSON.stringify({ ok: true, latencyMs: 5 })
-		})
-	);
+		});
+	});
 	const endpoint = await beginSecurity(page, 'logout');
 	await clientNavigate(page, '/onboarding/byop');
 	await fillByopDraft(page, 'save');
@@ -789,17 +793,67 @@ test('abandoned logout clears tested state and fences an already-dispatched save
 	expect(await requestCount(page, '/v1/vault')).toBe(1);
 	expect(await requestCount(page, endpoint)).toBe(1);
 
-	// A queued submit retaining the old draft dispatches nothing after reset.
+	// A post-reset refill to step 3 renders the test control disabled, and
+	// force-activating the rendered handler dispatches no new test and
+	// replays no save. A synthetic dispatch bypasses the disabled
+	// activation gate, so this reaches the handler a dispatch on the
+	// unrendered step-1 controls could not.
+	await fillByopDraft(page, 'refill');
+	await expect(page.getByTestId('byop-test-connection')).toBeDisabled();
 	await page.evaluate(() => {
-		document.querySelector('[data-testid="byop-save"]')?.dispatchEvent(
-			new MouseEvent('click', { bubbles: true })
-		);
-		document.querySelector('[data-testid="byop-test-connection"]')?.dispatchEvent(
-			new MouseEvent('click', { bubbles: true })
-		);
+		document
+			.querySelector('[data-testid="byop-test-connection"]')
+			?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 	});
 	await page.waitForTimeout(350);
+	expect(tests).toBe(1);
 	expect(await requestCount(page, '/v1/vault')).toBe(1);
+	const probe = await probeSnapshot(page);
+	expect.soft(probe.rejections).toEqual([]);
+	expect.soft(observed.pageErrors).toEqual([]);
+});
+
+test('abandoned logout suppresses the late limit paywall for an already-dispatched save', async ({
+	page
+}) => {
+	const observed = await fixtures(page, [
+		'/v1/session/logout',
+		// Only the save PUT is held; the security load probes GET /v1/vault
+		// and must fail fast through the catch-all instead of hanging.
+		{ path: '/v1/vault', methods: ['PUT'] }
+	]);
+	await page.route('**/v1/vault/test', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: true, latencyMs: 5 })
+		})
+	);
+	const endpoint = await beginSecurity(page, 'logout');
+	await clientNavigate(page, '/onboarding/byop');
+	await fillByopDraft(page, 'savepaywall');
+	await page.getByTestId('byop-test-connection').click();
+	await expect(page.getByTestId('byop-save')).toBeEnabled();
+	await page.getByTestId('byop-save').click();
+	await expect.poll(() => requestCount(page, '/v1/vault')).toBe(1);
+	observed.navigations.length = 0;
+
+	await release(page, endpoint, 200, { ok: true });
+
+	const notice = page.getByText(RESTART_NOTICE);
+	await expect(notice).toBeVisible();
+	await expect(page.getByTestId('byop-save')).toHaveCount(0);
+
+	// The late limit response for the dispatched save must not publish the
+	// global paywall: the reset aborted the caller's signal and the client
+	// checks it before publication. The held transport deliberately
+	// ignores abort.
+	await release(page, '/v1/vault', 429, { code: 'rate_limited', message: 'limit reached' });
+	await page.waitForTimeout(350);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await expect(notice).toBeVisible();
+	expect(await requestCount(page, '/v1/vault')).toBe(1);
+	expect(await requestCount(page, endpoint)).toBe(1);
 	const probe = await probeSnapshot(page);
 	expect.soft(probe.rejections).toEqual([]);
 	expect.soft(observed.pageErrors).toEqual([]);

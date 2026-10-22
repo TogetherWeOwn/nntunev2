@@ -233,9 +233,11 @@ async function installImmediateCeremony(page: Page): Promise<void> {
 }
 
 /**
- * Hold the browser ceremony open until the test calls
- * `window.__releaseCeremony()`; calls are counted in
- * `window.__ceremonyCalls`.
+ * Hold the browser ceremony open until its abort signal fires, like the
+ * native passkey prompt the page drives. Signal presence is recorded in
+ * `window.__ceremonyGotSignal` and the settlement in
+ * `window.__ceremonyOutcome` (`pending` until the signal aborts); calls
+ * are counted in `window.__ceremonyCalls`.
  */
 async function installHeldCeremony(page: Page): Promise<void> {
 	await page.addInitScript(() => {
@@ -259,17 +261,34 @@ async function installHeldCeremony(page: Page): Promise<void> {
 		});
 		const hooks = window as unknown as {
 			__ceremonyCalls: number;
-			__releaseCeremony: () => void;
-			__resolveCeremony?: () => void;
+			__ceremonyGotSignal: boolean;
+			__ceremonyOutcome: 'pending' | 'aborted';
 		};
 		hooks.__ceremonyCalls = 0;
-		hooks.__releaseCeremony = () => hooks.__resolveCeremony?.();
+		hooks.__ceremonyGotSignal = false;
+		hooks.__ceremonyOutcome = 'pending';
 		Object.defineProperty(navigator, 'credentials', {
 			value: {
-				get: async () => {
+				get: async (options?: { signal?: AbortSignal }) => {
 					hooks.__ceremonyCalls += 1;
-					await new Promise<void>((resolve) => {
-						hooks.__resolveCeremony = resolve;
+					const signal = options?.signal;
+					// Record signal presence before abort settlement so the
+					// no-signal mutant stays observable even though nothing
+					// ever aborts it.
+					if (signal instanceof AbortSignal) hooks.__ceremonyGotSignal = true;
+					if (signal?.aborted) {
+						hooks.__ceremonyOutcome = 'aborted';
+						throw new DOMException('fixture ceremony aborted', 'AbortError');
+					}
+					await new Promise<void>((_resolve, reject) => {
+						signal?.addEventListener(
+							'abort',
+							() => {
+								hooks.__ceremonyOutcome = 'aborted';
+								reject(new DOMException('fixture ceremony aborted', 'AbortError'));
+							},
+							{ once: true }
+						);
 					});
 					return new FixturePublicKeyCredential();
 				}
@@ -284,10 +303,16 @@ async function ceremonyCalls(page: Page): Promise<number> {
 	);
 }
 
-async function releaseCeremony(page: Page): Promise<void> {
-	await page.evaluate(() => {
-		(window as unknown as { __releaseCeremony?: () => void }).__releaseCeremony?.();
-	});
+async function ceremonyGotSignal(page: Page): Promise<boolean> {
+	return page.evaluate(
+		() => (window as unknown as { __ceremonyGotSignal?: boolean }).__ceremonyGotSignal ?? false
+	);
+}
+
+async function ceremonyOutcome(page: Page): Promise<string> {
+	return page.evaluate(
+		() => (window as unknown as { __ceremonyOutcome?: string }).__ceremonyOutcome ?? 'missing'
+	);
 }
 
 interface ReauthTraffic {
@@ -408,7 +433,42 @@ test('transition during held reauth start opens no ceremony and replays no save'
 	expect.soft(pageErrors).toEqual([]);
 });
 
-test('transition during the held ceremony finishes nothing and replays no save', async ({
+test('transition during held reauth start suppresses the late limit paywall', async ({
+	page
+}) => {
+	const pageErrors: string[] = [];
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	await installImmediateCeremony(page);
+	const held = await holdEndpoints(page, ['/v1/session/reauthenticate/start']);
+	const traffic = await reachReauthPrompt(page);
+	await page.getByRole('button', { name: 'Reauthenticate and save' }).click();
+	await expect.poll(() => held.count('/v1/session/reauthenticate/start')).toBe(1);
+
+	await deliverTransition(page);
+
+	const notice = page.getByText(TRANSITION_RESTART_NOTICE);
+	await expect(notice).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Reauthenticate and save' })).toHaveCount(0);
+	await expect(page.getByLabel('Password', { exact: true })).toHaveValue('');
+
+	// The late limit response must not publish the global paywall: the
+	// reset aborted the caller's signal and the client checks it before
+	// publication. The held transport deliberately ignores abort.
+	await held.release('/v1/session/reauthenticate/start', 429, {
+		code: 'rate_limited',
+		message: 'limit reached'
+	});
+	await page.waitForTimeout(350);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await expect(notice).toBeVisible();
+	expect(traffic.finishPosts).toBe(0);
+	expect(traffic.saves).toBe(1);
+	expect(await held.count('/v1/session/reauthenticate/start')).toBe(1);
+	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
+	expect.soft(pageErrors).toEqual([]);
+});
+
+test('transition during the held ceremony aborts it and replays no save', async ({
 	page
 }) => {
 	const pageErrors: string[] = [];
@@ -425,8 +485,11 @@ test('transition during the held ceremony finishes nothing and replays no save',
 	await expect(notice).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Reauthenticate and save' })).toHaveCount(0);
 
-	// The late ceremony resolution dispatches no finish and no save.
-	await releaseCeremony(page);
+	// The reset aborts the pending ceremony in place — the test never
+	// releases it — so no finish and no save can follow. The ceremony must
+	// have been handed an abort signal for that to happen.
+	await expect.poll(() => ceremonyOutcome(page)).toBe('aborted');
+	expect(await ceremonyGotSignal(page)).toBe(true);
 	await page.waitForTimeout(350);
 	await expect(notice).toBeVisible();
 	expect(await ceremonyCalls(page)).toBe(1);
@@ -456,6 +519,41 @@ test('transition during held reauth finish replays no save', async ({ page }) =>
 	// nowhere: an old reauth success must never replay a save.
 	await held.release('/v1/session/reauthenticate/finish', 200, { ok: true });
 	await page.waitForTimeout(350);
+	await expect(notice).toBeVisible();
+	expect(traffic.saves).toBe(1);
+	expect(await held.count('/v1/session/reauthenticate/finish')).toBe(1);
+	await expect(page.getByText(/credentials are sealed/i)).toHaveCount(0);
+	expect.soft(new URL(page.url()).pathname).toBe('/onboarding/byop');
+	expect.soft(pageErrors).toEqual([]);
+});
+
+test('transition during held reauth finish suppresses the late limit paywall', async ({
+	page
+}) => {
+	const pageErrors: string[] = [];
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	await installImmediateCeremony(page);
+	const held = await holdEndpoints(page, ['/v1/session/reauthenticate/finish']);
+	const traffic = await reachReauthPrompt(page);
+	await page.getByRole('button', { name: 'Reauthenticate and save' }).click();
+	await expect.poll(() => held.count('/v1/session/reauthenticate/finish')).toBe(1);
+	expect(traffic.startPosts).toBe(1);
+
+	await deliverTransition(page);
+
+	const notice = page.getByText(TRANSITION_RESTART_NOTICE);
+	await expect(notice).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Reauthenticate and save' })).toHaveCount(0);
+
+	// The late limit response must not publish the global paywall: the
+	// reset aborted the caller's signal and the client checks it before
+	// publication. The held transport deliberately ignores abort.
+	await held.release('/v1/session/reauthenticate/finish', 429, {
+		code: 'rate_limited',
+		message: 'limit reached'
+	});
+	await page.waitForTimeout(350);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
 	await expect(notice).toBeVisible();
 	expect(traffic.saves).toBe(1);
 	expect(await held.count('/v1/session/reauthenticate/finish')).toBe(1);
