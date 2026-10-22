@@ -13,7 +13,7 @@
 
 use nntune_mb::{
     handle_lookup, handle_release_recordings, handle_search_paged, ApiResponse, Entity, Kind,
-    MbRepo, Recording, Release, RepoError, SearchHit, SuccessCache,
+    MbRepo, Recording, Release, RepoError, RepoStage, SearchHit, SuccessCache,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -132,7 +132,7 @@ impl MbRepo for FakeRepo {
             .borrow_mut()
             .push(Call::Lookup(kind, mbid.to_owned()));
         match self.outcome {
-            Outcome::Error => Err(RepoError),
+            Outcome::Error => Err(RepoError::new(RepoStage::Query)),
             Outcome::Missing => Ok(None),
             Outcome::Success => Ok(Some(match kind {
                 Kind::Release => Entity::Release(Release {
@@ -154,7 +154,7 @@ impl MbRepo for FakeRepo {
             .borrow_mut()
             .push(Call::Recordings(mbid.to_owned()));
         match self.outcome {
-            Outcome::Error => Err(RepoError),
+            Outcome::Error => Err(RepoError::new(RepoStage::Query)),
             Outcome::Missing => Ok(None),
             Outcome::Success => Ok(Some(vec![fresh_recording(ROW_MBID)])),
         }
@@ -171,7 +171,7 @@ impl MbRepo for FakeRepo {
             .borrow_mut()
             .push(Call::Search(kind, q.to_owned(), limit, offset));
         match self.outcome {
-            Outcome::Error => Err(RepoError),
+            Outcome::Error => Err(RepoError::new(RepoStage::Query)),
             Outcome::Missing => Ok(vec![]),
             Outcome::Success => Ok(vec![SearchHit {
                 mbid: ROW_MBID.to_owned(),
