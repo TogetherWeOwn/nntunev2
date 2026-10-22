@@ -14,8 +14,10 @@
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
-//! a fresh timeout literal instead of the vault total, or expiry that
-//! formats driver detail instead of returning the opaque error.
+//! a client that escapes the seam for a later statement, a rate-limit
+//! pair that compensates in Rust instead of one transaction, a fresh
+//! timeout literal instead of the vault total, or expiry that formats
+//! driver detail instead of returning the opaque error.
 
 fn production() -> String {
     let source = include_str!("../src/worker_entry.rs")
@@ -193,6 +195,34 @@ fn assert_bounded(piece: &str, name: &str) {
         call.after.starts_with(".await"),
         "{name} must await the bound operation"
     );
+    // Placement: the whole method connects exactly once, and no statement
+    // runs outside the bounded argument. A client that escapes the seam —
+    // an extra connect, or a query/execute/transaction after the awaited
+    // bound — fails here, not in production.
+    assert_eq!(
+        piece.matches("self.connect()").count(),
+        1,
+        "{name} must connect exactly once, inside the bound operation"
+    );
+    let arg = call.args[0];
+    let arg_start = arg.as_ptr() as usize - piece.as_ptr() as usize;
+    let remainder = format!("{}{}", &piece[..arg_start], &piece[arg_start + arg.len()..]);
+    for marker in [
+        "self.connect()",
+        ".query",
+        ".execute",
+        ".batch_execute",
+        ".transaction(",
+        ".prepare",
+        ".simple_query",
+        ".commit(",
+        ".rollback(",
+    ] {
+        assert!(
+            !remainder.contains(marker),
+            "{name} must run no statement outside the bound operation ({marker} escapes the seam)"
+        );
+    }
 }
 
 #[test]
@@ -240,6 +270,59 @@ fn single_use_claim_races_its_statement_and_keeps_the_invalid_mapping() {
     assert!(
         single.contains("AuthError::Invalid"),
         "claim must keep mapping store failure to AuthError::Invalid"
+    );
+}
+
+#[test]
+fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
+    // Deadline expiry drops the raced future, so an Err-arm release written
+    // inside it can never run: the pair must commit its delete plus both
+    // claims in one database transaction (a dropped tokio-postgres
+    // transaction rolls back) instead of compensating in Rust. PgStore
+    // needs a Worker Env, so this source pin plus the seam drop test in
+    // worker_entry.rs are the native proof; the drop itself is pinned by
+    // hyperdrive_deadline.rs against the shared helper.
+    let source = production();
+    let store = source
+        .split_once("implStoreforPgStore{")
+        .expect("Store impl")
+        .1
+        .split_once("implSingleUseStoreforPgStore{")
+        .expect("SingleUseStore impl bounds the Store impl")
+        .0;
+    let mut pieces = store.split("asyncfn");
+    pieces.next().expect("preamble before the first method");
+    let pair = pieces
+        .find(|piece| method_name(piece) == "reserve_rate_limit_pair")
+        .expect("pair piece");
+    let in_transaction = pair
+        .split_once(".transaction(")
+        .expect("pair opens one transaction")
+        .1;
+    assert_eq!(
+        in_transaction.matches("claim_rate_limit_slot(").count(),
+        2,
+        "both claims must run inside the pair transaction"
+    );
+    assert!(
+        in_transaction.contains("delete_expired_rate_limit_slots("),
+        "the pair delete must run inside the pair transaction"
+    );
+    assert!(
+        in_transaction.contains(".commit("),
+        "an allowed pair must commit both claims together"
+    );
+    assert!(
+        in_transaction.contains(".rollback("),
+        "a denied pair must roll back instead of compensating in Rust"
+    );
+    assert!(
+        !pair.contains("release_rate_limit_slot"),
+        "no Err-arm release may remain: rollback owns pair atomicity"
+    );
+    assert!(
+        !source.contains("release_rate_limit_slot"),
+        "the compensating helper is deleted, not just unused"
     );
 }
 

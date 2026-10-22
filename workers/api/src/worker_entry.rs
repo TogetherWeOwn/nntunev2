@@ -14,6 +14,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use tokio_postgres::GenericClient;
 use worker::{
     Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
     Result as WorkerResult,
@@ -299,7 +300,7 @@ fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
 }
 
 async fn delete_expired_rate_limit_slots(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     now: i64,
 ) -> Result<(), StoreError> {
     client
@@ -317,7 +318,7 @@ async fn delete_expired_rate_limit_slots(
 /// release), `Ok(None)` is an exhausted budget. Caller has already
 /// deleted expired rows for `now_i`.
 async fn claim_rate_limit_slot(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     budget: &RateLimitBudget<'_>,
     now: u64,
     now_i: i64,
@@ -366,27 +367,6 @@ async fn claim_rate_limit_slot(
         }
     }
     Ok(None)
-}
-
-/// Release the exact slot `claim_rate_limit_slot` took for `budget`
-/// at `now` (same scope, action, slot and expiry), so the pair
-/// path's compensation can never free another request's slot.
-async fn release_rate_limit_slot(
-    client: &tokio_postgres::Client,
-    budget: &RateLimitBudget<'_>,
-    slot: i32,
-    now: u64,
-) -> Result<(), StoreError> {
-    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
-    client
-        .execute(
-            "DELETE FROM auth_rate_limit_slots \
-             WHERE scope_key = $1 AND action = $2 AND slot = $3 AND expires_at = $4",
-            &[&budget.scope_key, &budget.action, &slot, &expires_at],
-        )
-        .await
-        .map_err(|_| StoreError)?;
-    Ok(())
 }
 
 /// Race `future` against a `timeout_ms` budget, returning the caller's
@@ -1441,30 +1421,33 @@ impl Store for PgStore {
                 if !rate_limit_budget_admissible(&second) {
                     return Ok(PairAdmission::DeniedSecond);
                 }
-                // All-or-none on one connection: claim the first slot, then the
-                // second; if the second does not admit, release the first by
-                // its exact identity (scope, action, slot, expiry). A live
-                // slot cannot be overwritten by another claim (reuse requires
-                // an expired row), so the compensating DELETE can only remove
-                // the slot this call just took — a denied attempt ends up
-                // consuming neither budget.
-                let client = self.connect().await?;
+                // All-or-none in one transaction: the delete plus both
+                // claims commit together, so deadline expiry — which drops
+                // this future — rolls back instead of stranding the first
+                // slot past an unreachable Err-arm release. A dropped
+                // tokio-postgres transaction rolls back (and the driver
+                // terminate aborts it server-side); `?` errors take the
+                // same implicit rollback with no extra round-trip.
+                let mut client = self.connect().await?;
                 let now_i = i64_of(now)?;
-                delete_expired_rate_limit_slots(&client, now_i).await?;
-                let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await?
-                else {
+                let transaction = client.transaction().await.map_err(|_| StoreError)?;
+                delete_expired_rate_limit_slots(&transaction, now_i).await?;
+                if claim_rate_limit_slot(&transaction, &first, now, now_i)
+                    .await?
+                    .is_none()
+                {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
                     return Ok(PairAdmission::DeniedFirst);
-                };
-                match claim_rate_limit_slot(&client, &second, now, now_i).await {
-                    Ok(Some(_)) => Ok(PairAdmission::Allowed),
-                    Ok(None) => {
-                        release_rate_limit_slot(&client, &first, first_slot, now).await?;
-                        Ok(PairAdmission::DeniedSecond)
-                    }
-                    Err(err) => {
-                        let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
-                        Err(err)
-                    }
+                }
+                if claim_rate_limit_slot(&transaction, &second, now, now_i)
+                    .await?
+                    .is_some()
+                {
+                    transaction.commit().await.map_err(|_| StoreError)?;
+                    Ok(PairAdmission::Allowed)
+                } else {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    Ok(PairAdmission::DeniedSecond)
                 }
             },
             TOTAL_TIMEOUT_MS,
@@ -3374,5 +3357,37 @@ mod tests {
     fn bounded_statement_passes_a_ready_operation_through() {
         let mut bounded = Box::pin(PgStore::bounded(async { Ok::<_, StoreError>(7u8) }, 5_000));
         assert_eq!(poll_bounded_to_ready(bounded.as_mut()).unwrap(), 7);
+    }
+
+    #[test]
+    fn bounded_expiry_drops_between_phases_before_in_future_compensation_runs() {
+        use std::cell::Cell;
+        // The rate-limit pair claims its first slot, then its second,
+        // inside one bounded future. When the second phase stalls past
+        // the budget, the seam drops the whole future — an Err-arm
+        // release written inside the future can never run. The pair
+        // therefore commits both claims in one database transaction (a
+        // dropped tokio-postgres transaction rolls back) instead of
+        // compensating in Rust; this test pins the drop that makes that
+        // necessary, using the real seam with no database.
+        let compensated = Cell::new(false);
+        let mut raced = Box::pin(PgStore::bounded(
+            async {
+                match std::future::pending::<Result<(), StoreError>>().await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        compensated.set(true);
+                        Err(err)
+                    }
+                }
+            },
+            25,
+        ));
+        let outcome = poll_bounded_to_ready(raced.as_mut());
+        assert!(outcome.is_err(), "a stalled second phase must fail closed");
+        assert!(
+            !compensated.get(),
+            "expiry drops the future: in-future compensation never runs"
+        );
     }
 }
