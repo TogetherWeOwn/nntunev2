@@ -138,6 +138,19 @@ function policyFixture(overrides = {}) {
   };
 }
 
+function flipPolicy(field, first, second) {
+  const policy = policyFixture();
+  let reads = 0;
+  Object.defineProperty(policy, field, {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return reads === 1 ? first : second;
+    },
+  });
+  return policy;
+}
+
 function sample(t, ok, overrides = {}) {
   return { t, ok, ...overrides };
 }
@@ -302,6 +315,27 @@ test('single red below the floor is unknown, never a breach', () => {
   const got = evaluate([red(0)]);
   assert.equal(got.verdict, 'unknown');
   assert.equal(got.longest_red_span_ms, 0);
+});
+
+// Break caught: a floor that counts malformed entries toward min_samples
+// ((valid + malformed) >= min_samples) instead of the valid-only floor.
+test('below-floor reds with malformed entries stay unknown', () => {
+  const samples = [red(0), red(120000), null, null, null, null, null];
+  const got = evaluate(samples, policyFixture({ min_samples: 3 }));
+  assert.equal(got.verdict, 'unknown');
+  assert.equal(got.reason, 'insufficient_data');
+  assert.deepEqual(got.counts, { valid: 2, red: 2, malformed: 5 });
+  assert.equal(got.longest_red_span_ms, 120000);
+  assert.equal(got.red_for_ms, 120000);
+});
+
+test('same reds with malformed entries breach at the floor (control)', () => {
+  const samples = [red(0), red(120000), null, null, null, null, null];
+  const got = evaluate(samples, policyFixture({ min_samples: 2 }));
+  assert.equal(got.verdict, 'breach');
+  assert.equal(got.reason, 'breach');
+  assert.deepEqual(got.counts, { valid: 2, red: 2, malformed: 5 });
+  assert.equal(got.longest_red_span_ms, 120000);
 });
 
 test('window exactly at the floor is evaluated', () => {
@@ -482,6 +516,23 @@ test('policy is read on each call, not cached from an earlier window', () => {
   assert.equal(evaluate([healthy(0), healthy(60000)],
     policyFixture({ environment: 'production' })), null);
   assert.equal(evaluate([healthy(0), healthy(60000)]).verdict, 'ok');
+});
+
+// Break caught: policy fields re-read after validation, so a nondeterministic
+// getter passes validation with one value while another is used and echoed.
+test('flipping red_for_ms getter keeps the validated first read', () => {
+  const got = evaluate([healthy(0), healthy(60000)],
+    flipPolicy('red_for_ms', 120000, 0));
+  assert.equal(got.verdict, 'ok');
+  assert.equal(got.reason, 'healthy');
+  assert.equal(got.red_for_ms, 120000);
+});
+
+test('flipping service getter echoes the validated first read', () => {
+  const got = evaluate([healthy(0), healthy(60000)],
+    flipPolicy('service', 'api', 'canary'));
+  assert.equal(got.verdict, 'ok');
+  assert.equal(got.service, 'api');
 });
 
 test('extra policy fields are ignored without changing the verdict', () => {
