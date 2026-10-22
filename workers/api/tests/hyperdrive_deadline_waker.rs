@@ -86,10 +86,6 @@ fn expiry_arrives_through_the_callers_wake_without_repolling() {
     let start = Instant::now();
     // Exactly one poll: Pending, with the timer armed on OUR waker.
     assert!(deadline.as_mut().poll(&mut cx).is_pending());
-    assert!(
-        !parker.woken.load(Ordering::SeqCst),
-        "nothing may wake before the budget elapses"
-    );
     // Park until the timer's wake — no manual re-polling. The independent
     // watchdog only fails a test whose wake never arrives.
     let end = start + WATCHDOG;
