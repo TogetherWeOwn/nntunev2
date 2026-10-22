@@ -99,6 +99,43 @@ const OGG_SERIAL_OFFSET: usize = 14;
 const OGG_CRC_OFFSET: usize = 22;
 const OGG_NSEG_OFFSET: usize = 26;
 
+/// Ogg page CRC lookup table (RFC 3533 §6, the libogg direct
+/// algorithm): polynomial `0x04C11DB7`, MSB-first, initial value 0,
+/// no reflection, no final XOR. This is NOT the IEEE 802.3 / zlib
+/// CRC-32 (`crc32fast`): same nominal polynomial, genuinely
+/// different checksum — a page stamped with the IEEE value fails
+/// decoder verification and is rejected or skipped.
+const fn ogg_crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut r = (i as u32) << 24;
+        let mut j = 0;
+        while j < 8 {
+            r = if r & 0x8000_0000 != 0 {
+                (r << 1) ^ 0x04C1_1DB7
+            } else {
+                r << 1
+            };
+            j += 1;
+        }
+        table[i] = r;
+        i += 1;
+    }
+    table
+}
+
+static OGG_CRC_TABLE: [u32; 256] = ogg_crc_table();
+
+/// Ogg page CRC over `data` (normally a page with the CRC field
+/// zeroed). Direct MSB-first CRC-32, poly `0x04C11DB7`, init 0, no
+/// final XOR — see [`OGG_CRC_TABLE`].
+fn ogg_crc(data: &[u8]) -> u32 {
+    data.iter().fold(0u32, |crc, &b| {
+        (crc << 8) ^ OGG_CRC_TABLE[(((crc >> 24) as u8) ^ b) as usize]
+    })
+}
+
 /// Why an Ogg byte string cannot be normalised. Offsets are byte
 /// positions into the input; no input bytes are ever echoed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,10 +202,11 @@ pub fn split_ogg_pages(ogg: &[u8]) -> Result<Vec<(usize, usize)>, OggNormalizeEr
 }
 
 /// Rewrite every Ogg page serial in `ogg` to `serial`, recomputing
-/// each page's CRC32 (IEEE, over the page with the CRC field zeroed).
-/// All other bytes — headers, packets, granule positions — pass
-/// through untouched, so normalising the same logical stream twice
-/// (or normalising an already-normalised artifact) is idempotent.
+/// each page's CRC (the Ogg direct CRC-32, [`ogg_crc`], over the page
+/// with the CRC field zeroed). All other bytes — headers, packets,
+/// granule positions — pass through untouched, so normalising the
+/// same logical stream twice (or normalising an already-normalised
+/// artifact) is idempotent.
 ///
 /// Fails closed on anything that is not a clean run of Ogg pages;
 /// the caller treats that as an undecodable encode, never as bytes
@@ -180,7 +218,7 @@ pub fn normalize_ogg_serial(ogg: &[u8], serial: u32) -> Result<Vec<u8>, OggNorma
         let mut page = ogg[offset..offset + len].to_vec();
         page[OGG_SERIAL_OFFSET..OGG_SERIAL_OFFSET + 4].copy_from_slice(&serial.to_le_bytes());
         page[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
-        let crc = crc32fast::hash(&page);
+        let crc = ogg_crc(&page);
         page[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&page);
     }
@@ -292,7 +330,7 @@ mod tests {
         page.push(table.len() as u8);
         page.extend_from_slice(&table);
         page.extend_from_slice(body);
-        let crc = crc32fast::hash(&page);
+        let crc = ogg_crc(&page);
         page[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         page
     }
@@ -307,8 +345,49 @@ mod tests {
             let stored =
                 u32::from_le_bytes(page[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].try_into().unwrap());
             page[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
-            crc32fast::hash(&page) == stored
+            ogg_crc(&page) == stored
         })
+    }
+
+    /// First page of a real encoder-made Vorbis stream: beginning-of-
+    /// stream identification header, serial `0x47b3c05d`, stored CRC
+    /// `0x271310d6` exactly as the encoder wrote it. Pinning a page no
+    /// test helper produced is the point: without it the suite only
+    /// checks the implementation against itself, which is how the IEEE
+    /// CRC-32 confusion shipped in the first place.
+    const REAL_ENCODER_PAGE: &[u8; 58] = &[
+        0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5d,
+        0xc0, 0xb3, 0x47, 0x00, 0x00, 0x00, 0x00, 0xd6, 0x10, 0x13, 0x27, 0x01, 0x1e, 0x01, 0x76,
+        0x6f, 0x72, 0x62, 0x69, 0x73, 0x00, 0x00, 0x00, 0x00, 0x02, 0x44, 0xac, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x03, 0x71, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb8, 0x01,
+    ];
+
+    #[test]
+    fn ogg_crc_matches_a_real_encoder_page() {
+        // The encoder's stored CRC verifies under our implementation.
+        assert!(crcs_verify(REAL_ENCODER_PAGE));
+        let mut zeroed = REAL_ENCODER_PAGE.to_vec();
+        zeroed[OGG_CRC_OFFSET..OGG_CRC_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(ogg_crc(&zeroed), 0x2713_10d6);
+        // ...and it is NOT the IEEE CRC-32 of the same bytes: the
+        // confusion this test exists to prevent from recurring.
+        assert_ne!(crc32fast::hash(&zeroed), 0x2713_10d6);
+
+        // Normalising the real page keeps it verifiable: fixed serial,
+        // recomputed CRC, identical body (nseg = 1, so the body starts
+        // one byte past the 27-byte header).
+        let out = normalize_ogg_serial(REAL_ENCODER_PAGE, OGG_FIXED_SERIAL).unwrap();
+        assert!(crcs_verify(&out));
+        let serial = u32::from_le_bytes(
+            out[OGG_SERIAL_OFFSET..OGG_SERIAL_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(serial, OGG_FIXED_SERIAL);
+        assert_eq!(
+            &out[OGG_MIN_HEADER + 1..],
+            &REAL_ENCODER_PAGE[OGG_MIN_HEADER + 1..]
+        );
     }
 
     #[test]

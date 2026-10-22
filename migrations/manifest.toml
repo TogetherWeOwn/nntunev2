@@ -106,4 +106,4 @@ sha256 = "ad1e437bff738a7a737ab8cd323fd0a9ff1e74e7e6f08730f186e5b71ab444a1"
 [[migration]]
 file = "0022_library_artifacts.sql"
 target = "app"
-sha256 = "74f0f93fae165fc27b79b89d09c54aed0df06f1a78be5672e4a52ba2256a6d95"
+sha256 = "f28d63c5b585c98aecaa2949c962481a05abf93dff199388ce17f7190434a62a"
