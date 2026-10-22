@@ -42,6 +42,7 @@ use crate::auth::{
 // Single unpadded-base64url codec (F-HARD-01): `crate::b64` over the
 // `base64` crate. The aliased names keep wire-format call sites unchanged.
 use crate::b64::{decode as b64url_decode, encode as b64url_encode};
+use crate::providers::{self, ProviderMintRow};
 use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{
     self, AuditEvent, DnsResolver, IndexerConfig, ProviderConfig, ValidatedTarget, VaultBlob,
@@ -698,6 +699,16 @@ pub trait Store {
         row: &VaultRow,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Mint one `providers` row for a vault save (migration 0022,
+    /// envelope v2). Fail-closed default (`Err`) so an unprovisioned
+    /// store can never report a mint it did not durably record;
+    /// production and the test fake override it.
+    fn insert_provider(
+        &self,
+        _row: &ProviderMintRow,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -2516,6 +2527,86 @@ where
     }
 }
 
+/// Outcome of one [`mint_provider_row`] call: the mint either
+/// landed, the OS RNG was unavailable (retryable 503), or the write
+/// failed (fenced 409 or generic vault failure, classified downstream
+/// through [`vault_write_failure`]).
+enum MintOutcome {
+    Minted,
+    RandomnessUnavailable,
+    Store,
+}
+
+/// Mint the identity-bearing `providers` row for one vault save
+/// (migration 0022, envelope v2): fresh UUID, host-derived label, the
+/// provider config sealed under the current write KEK. Pure mint
+/// inputs — validation, KEK selection and the vault upsert stay with
+/// the caller.
+async fn mint_provider_row<S: Store>(
+    store: &S,
+    kek: &[u8; 32],
+    kek_version: u32,
+    user_id: &str,
+    provider: &ProviderConfig,
+    now: u64,
+) -> MintOutcome {
+    // Fresh credential identity first: every failure below fails the
+    // PUT closed (the vault row already landed; a retry re-saves the
+    // single vault row and mints again).
+    let id = match providers::mint_provider_id() {
+        Ok(id) => id,
+        Err(_) => return MintOutcome::RandomnessUnavailable,
+    };
+    // `ProviderConfig` as caller-serialized JSON (payload format 1);
+    // serialization of a validated struct cannot fail, so a failure
+    // here collapses into the generic store outcome.
+    let plaintext = match serde_json::to_vec(provider) {
+        Ok(bytes) => bytes,
+        Err(_) => return MintOutcome::Store,
+    };
+    let envelope =
+        match providers::encrypt_provider_creds(kek, kek_version, user_id, &id, &plaintext) {
+            Ok(envelope) => envelope,
+            Err(vault::VaultError::RandomnessUnavailable) => {
+                return MintOutcome::RandomnessUnavailable
+            }
+            Err(_) => return MintOutcome::Store,
+        };
+    let row = ProviderMintRow {
+        id,
+        user_id: user_id.to_string(),
+        label: providers::provider_label_for_host(&provider.host),
+        encrypted_creds: envelope.ciphertext,
+        kek_version,
+        dek_wrapped_nonce: envelope.dek_wrapped_nonce,
+        dek_wrapped: envelope.dek_wrapped,
+        payload_nonce: envelope.payload_nonce,
+        created_at: now,
+        last_verified_at: now,
+    };
+    // By-construction values, but the clock is caller input: a faulty
+    // `now` fails here instead of as a 23514 at the database.
+    if providers::validate_mint_row(&row).is_err() {
+        return MintOutcome::Store;
+    }
+    match store.insert_provider(&row).await {
+        Ok(()) => MintOutcome::Minted,
+        Err(_) => MintOutcome::Store,
+    }
+}
+
+/// Classify a failed vault-flow write: a fenced write (account being
+/// deleted) is the typed 409, never the generic vault failure;
+/// anything else stays generic so a probe failure cannot leak a new
+/// shape. Shared by the vault upsert and the providers mint (same
+/// fence, same classification).
+async fn vault_write_failure<S: Store>(store: &S, user_id: &str) -> Response {
+    if matches!(store.account_deleting(user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    generic_vault()
+}
+
 async fn vault_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2588,13 +2679,26 @@ where
         updated_at: ctx.now,
     };
     if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
-        // A fenced upsert (account being deleted) is the typed 409,
-        // never the generic vault failure; anything else stays generic
-        // so a probe failure cannot leak a new shape.
-        if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-            return account_deleting_response();
-        }
-        return generic_vault();
+        return vault_write_failure(ctx.store, &claims.user_id).await;
+    }
+    // Mint the providers row for this save, after the vault upsert: the
+    // vault row is the primary artifact, and a mint failure fails the
+    // PUT closed (a retry re-saves the single vault row and mints again
+    // with identical plaintext; the pool resolves the latest row per
+    // user).
+    match mint_provider_row(
+        ctx.store,
+        current_kek,
+        ctx.cfg.kek_version,
+        &claims.user_id,
+        &payload.provider,
+        ctx.now,
+    )
+    .await
+    {
+        MintOutcome::Minted => {}
+        MintOutcome::RandomnessUnavailable => return unavailable(),
+        MintOutcome::Store => return vault_write_failure(ctx.store, &claims.user_id).await,
     }
     ctx.audit(&claims.user_id, audit_action, true).await;
     summary_response(Some(&row))
@@ -3488,6 +3592,7 @@ mod tests {
         sessions: RefCell<HashMap<String, SessionRecord>>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
+        providers: RefCell<Vec<ProviderMintRow>>,
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
@@ -4045,6 +4150,15 @@ mod tests {
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
+            Ok(())
+        }
+        async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
+            // Mirror the production in-statement fence: a deleting
+            // account's mint writes nothing and fails.
+            if self.deleting_users.borrow().contains(&row.user_id) {
+                return Err(StoreError);
+            }
+            self.providers.borrow_mut().push(row.clone());
             Ok(())
         }
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
@@ -5091,6 +5205,87 @@ mod tests {
             "{}",
             resp.body
         );
+    }
+
+    #[test]
+    fn vault_put_mints_a_provider_row_and_a_fenced_put_mints_none() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        // Fence open: the save lands a vault row AND a providers row.
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let minted = h.store.providers.borrow();
+        assert_eq!(minted.len(), 1, "one providers row per save");
+        let row = &minted[0];
+        assert_eq!(row.user_id, "u1");
+        assert_eq!(row.label, "news.example.com");
+        assert!(
+            crate::providers::validate_provider_mint_id(&row.id),
+            "{}",
+            row.id
+        );
+        assert_eq!(row.kek_version, 1);
+        assert!(!row.encrypted_creds.is_empty());
+        assert_eq!(row.dek_wrapped.len(), crate::providers::WRAPPED_DEK_LEN);
+        assert_eq!((row.created_at, row.last_verified_at), (NOW, NOW));
+        // The minted envelope decrypts under the test KEK with the
+        // stored row binding (user + minted id).
+        let back = crate::providers::decrypt_provider_creds(
+            &[9u8; 32],
+            "u1",
+            &row.id,
+            crate::providers::CREDS_ENVELOPE_VERSION,
+            crate::providers::CREDS_PAYLOAD_FORMAT_JSON_V1,
+            row.kek_version,
+            &crate::providers::ProviderCredsEnvelope {
+                dek_wrapped_nonce: row.dek_wrapped_nonce,
+                dek_wrapped: row.dek_wrapped.clone(),
+                payload_nonce: row.payload_nonce,
+                ciphertext: row.encrypted_creds.clone(),
+            },
+        )
+        .expect("minted envelope must decrypt");
+        let sealed: serde_json::Value = serde_json::from_slice(&back).expect("JSON payload");
+        assert_eq!(sealed["host"], "news.example.com");
+        assert_eq!(sealed["username"], "synthetic-user");
+        drop(minted);
+        // A second save mints a second row (insert-per-save: rotations
+        // mint a fresh credential identity).
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(h.store.providers.borrow().len(), 2);
+        // Fenced: the typed 409, and no further mint.
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(h.store.providers.borrow().len(), 2);
     }
 
     #[test]
