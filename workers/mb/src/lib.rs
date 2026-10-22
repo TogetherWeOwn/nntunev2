@@ -27,6 +27,7 @@
 
 use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use serde::Serialize;
+use std::future::Future;
 
 mod api_error;
 use api_error::ApiError;
@@ -625,10 +626,106 @@ impl SearchHit {
 
 // --- Core handler traits and logic ----------------------------------------
 
-/// Opaque repository failure. Carries no detail on purpose: handler
-/// responses must never leak DB/driver internals to clients.
-#[derive(Debug)]
-pub struct RepoError;
+/// Where a repository failure happened. The stage is the only operational
+/// detail a database failure ever carries: no SQL, parameters, connection
+/// details, driver text or user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoStage {
+    /// Hyperdrive binding, socket, config or `connect_raw` failure.
+    Connect,
+    /// A dispatched query the driver rejected or dropped.
+    Query,
+    /// A returned row that did not decode into the expected shape.
+    Decode,
+    /// The per-operation deadline fired before the operation finished.
+    Timeout,
+}
+
+impl RepoStage {
+    /// Stable operator-facing label, also the `stage` log field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoStage::Connect => "connect",
+            RepoStage::Query => "query",
+            RepoStage::Decode => "decode",
+            RepoStage::Timeout => "timeout",
+        }
+    }
+}
+
+/// Opaque repository failure. Carries its stage only, on purpose: handler
+/// responses must never leak DB/driver internals to clients, and the
+/// structured failure line carries the stage label, never the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoError {
+    stage: RepoStage,
+}
+
+impl RepoError {
+    pub fn new(stage: RepoStage) -> Self {
+        RepoError { stage }
+    }
+
+    pub fn stage(&self) -> RepoStage {
+        self.stage
+    }
+}
+
+/// Production per-operation database budget in milliseconds. Every
+/// Hyperdrive connect and every repository query runs under its own
+/// deadline of this length (see [`with_db_deadline`]).
+///
+/// Against the MB SLOs (lookup p95 <50 ms hit / <250 ms miss, search p95
+/// <600 ms): 1500 ms leaves headroom above the slowest SLO for a cold
+/// Hyperdrive start on a legitimate in-SLO query, while still bounding a
+/// hung socket far below Worker invocation limits. The bound shapes the
+/// failure tail only — the success path never waits for it.
+pub const DB_OPERATION_DEADLINE_MS: u64 = 1_500;
+
+/// Race one fallible operation against a finite deadline, in the style of
+/// the api worker's mail-send helper: `worker::Delay` on wasm,
+/// `futures_timer::Delay` natively. The deadline is polled before the
+/// operation, so it is armed before dispatch and expiry wins a tie; a
+/// finished operation returns at once (the deadline is released, never
+/// awaited) and an expired one fails as [`RepoStage::Timeout`]. Both
+/// futures are dropped on completion; dropping the waiter stops the wait,
+/// not the server work, so `connect` also sets `statement_timeout`.
+pub async fn with_db_deadline<T>(
+    budget: std::time::Duration,
+    op: impl std::future::Future<Output = Result<T, RepoError>>,
+) -> Result<T, RepoError> {
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(budget);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(budget);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut op = std::pin::pin!(op);
+    std::future::poll_fn(|cx| {
+        // A Worker Delay arms on first poll, so poll it before starting
+        // I/O. Expiry wins if both become ready together; there is no
+        // late completion — the abandoned operation drops below.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(RepoError::new(RepoStage::Timeout)));
+        }
+        op.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the caller builds a response.
+}
+
+/// Structured event for a failed repository call, emitted once per
+/// failure from the HTTP layer (which owns the trace id). The rendered
+/// line carries the stage only — see [`db_failed_fields`].
+pub const DB_FAILED_EVENT: &str = "mb.db.failed";
+
+/// The exact fields of an [`DB_FAILED_EVENT`] line: the failure stage
+/// plus the build identity, nothing else. Taking only these two inputs
+/// is what makes the no-secret guarantee structural: SQL, parameters,
+/// connection details, driver text and user input cannot reach the
+/// rendered line through this seam.
+pub fn db_failed_fields(stage: RepoStage, build_sha: &str) -> serde_json::Value {
+    serde_json::json!({"stage": stage.as_str(), "build_sha": build_sha})
+}
 
 /// Read-only mirror repository over the `MB_DB` Hyperdrive binding.
 /// `search` takes the resolved page so SQL applies `LIMIT`/`OFFSET`
@@ -1176,49 +1273,95 @@ mod http_layer {
     }
 
     impl PgRepo {
+        /// One finite budget per operation, drawn from the documented
+        /// production default. Connect and each query get their own.
+        fn db_budget() -> std::time::Duration {
+            std::time::Duration::from_millis(DB_OPERATION_DEADLINE_MS)
+        }
+
+        /// Exactly one staged failure line per failed repository call.
+        /// The stage is the only operational detail; the cause never logs.
+        fn emit_db_failed(&self, stage: RepoStage) {
+            emit(
+                Level::Error,
+                &self.trace_id,
+                DB_FAILED_EVENT,
+                db_failed_fields(stage, &build_sha_from_env(&self.env)),
+            );
+        }
+
         async fn connect(&self) -> Result<tokio_postgres::Client, RepoError> {
-            let hyperdrive = self.env.hyperdrive(MB_DB_BINDING).map_err(|_| RepoError)?;
+            let hyperdrive = self
+                .env
+                .hyperdrive(MB_DB_BINDING)
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let socket = worker::Socket::builder()
                 .secure_transport(worker::SecureTransport::StartTls)
                 .connect(hyperdrive.host(), hyperdrive.port())
-                .map_err(|_| RepoError)?;
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let config: tokio_postgres::Config = hyperdrive
                 .connection_string()
                 .parse()
-                .map_err(|_| RepoError)?;
-            let (client, connection) = config
-                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-                .await
-                .map_err(|_| RepoError)?;
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let trace_id = self.trace_id.clone();
             // Build identity rides the detached line too (mirrors the api
             // worker): the deploy lane's public BUILD_SHA var, or explicit
             // "unknown" when unwired.
             let build_sha = build_sha_from_env(&self.env);
-            wasm_bindgen_futures::spawn_local(async move {
-                // Detail stays out of logs: driver errors can carry
-                // host/role strings that are not needed to triage.
-                if connection.await.is_err() {
-                    emit(
-                        Level::Error,
-                        &trace_id,
-                        "mb.db.connect_failed",
-                        serde_json::json!({"stage": "connect", "build_sha": build_sha}),
-                    );
-                }
-            });
-            Ok(client)
+            let raw = async {
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Detail stays out of logs: driver errors can carry
+                    // host/role strings that are not needed to triage.
+                    if connection.await.is_err() {
+                        emit(
+                            Level::Error,
+                            &trace_id,
+                            "mb.db.connect_failed",
+                            serde_json::json!({"stage": "connect", "build_sha": build_sha}),
+                        );
+                    }
+                });
+                // Dropping the waiter does not cancel the server query:
+                // the driver keeps paging for a hung-up receiver, so a
+                // timed-out query would keep running and hold its pooled
+                // backend connection. Cap execution where the server
+                // enforces it (mirrors the api worker's connect setup).
+                client
+                    .batch_execute(&format!(
+                        "SET statement_timeout = {}",
+                        DB_OPERATION_DEADLINE_MS
+                    ))
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                Ok(client)
+            };
+            // A timeout keeps its own stage; a refused connect stays Connect.
+            with_db_deadline(Self::db_budget(), raw).await
         }
     }
 
     impl MbRepo for PgRepo {
         async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError> {
-            let client = self.connect().await?;
-            let row = client
-                .query_opt(lookup_sql(kind), &[&mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            row.map(|row| entity_from_row(kind, &row)).transpose()
+            let outcome: Result<Option<Entity>, RepoError> = async {
+                let client = self.connect().await?;
+                let row = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query_opt(lookup_sql(kind), &[&mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                row.map(|row| entity_from_row(kind, &row)).transpose()
+            }
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
 
         async fn search(
@@ -1228,36 +1371,59 @@ mod http_layer {
             limit: u32,
             offset: u32,
         ) -> Result<Vec<SearchHit>, RepoError> {
-            let client = self.connect().await?;
-            let sql = search_sql(kind, limit, offset);
-            let rows = client
-                .query(sql.as_str(), &[&normalized_q])
-                .await
-                .map_err(|_| RepoError)?;
-            rows.iter().map(hit_from_row).collect()
+            let outcome: Result<Vec<SearchHit>, RepoError> = async {
+                let client = self.connect().await?;
+                let sql = search_sql(kind, limit, offset);
+                let rows = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query(sql.as_str(), &[&normalized_q])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                rows.iter().map(hit_from_row).collect()
+            }
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
 
         async fn release_recordings(
             &self,
             release_mbid: &str,
         ) -> Result<Option<Vec<Recording>>, RepoError> {
-            let client = self.connect().await?;
-            let exists = client
-                .query_opt(RELEASE_EXISTS_SQL, &[&release_mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            if exists.is_none() {
-                return Ok(None);
+            let outcome: Result<Option<Vec<Recording>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query_opt(RELEASE_EXISTS_SQL, &[&release_mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query(RELEASE_RECORDINGS_SQL, &[&release_mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                let recordings = rows
+                    .iter()
+                    .map(recording_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(recordings))
             }
-            let rows = client
-                .query(RELEASE_RECORDINGS_SQL, &[&release_mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            let recordings = rows
-                .iter()
-                .map(recording_from_row)
-                .collect::<Result<_, _>>()?;
-            Ok(Some(recordings))
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
     }
 
@@ -1266,19 +1432,41 @@ mod http_layer {
         // server-side schema bug, reported as an opaque read failure.
         let entity = match kind {
             Kind::Artist => Entity::Artist(Artist {
-                mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-                name: row.try_get("name").map_err(|_| RepoError)?,
-                sort_name: row.try_get("sort_name").map_err(|_| RepoError)?,
-                artist_type: row.try_get("type").map_err(|_| RepoError)?,
-                country: row.try_get("country").map_err(|_| RepoError)?,
+                mbid: row
+                    .try_get("mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                name: row
+                    .try_get("name")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                sort_name: row
+                    .try_get("sort_name")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                artist_type: row
+                    .try_get("type")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                country: row
+                    .try_get("country")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
             }),
             Kind::Release => Entity::Release(Release {
-                mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-                artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
-                title: row.try_get("title").map_err(|_| RepoError)?,
-                release_type: row.try_get("release_type").map_err(|_| RepoError)?,
-                year: row.try_get("year").map_err(|_| RepoError)?,
-                caa_url: row.try_get("caa_url").map_err(|_| RepoError)?,
+                mbid: row
+                    .try_get("mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                artist_mbid: row
+                    .try_get("artist_mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                title: row
+                    .try_get("title")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                release_type: row
+                    .try_get("release_type")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                year: row
+                    .try_get("year")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                caa_url: row
+                    .try_get("caa_url")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
             }),
             Kind::Recording => Entity::Recording(recording_from_row(row)?),
         };
@@ -1287,22 +1475,44 @@ mod http_layer {
 
     fn recording_from_row(row: &tokio_postgres::Row) -> Result<Recording, RepoError> {
         Ok(Recording {
-            mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-            release_mbid: row.try_get("release_mbid").map_err(|_| RepoError)?,
-            title: row.try_get("title").map_err(|_| RepoError)?,
-            track_no: row.try_get("track_no").map_err(|_| RepoError)?,
-            duration_ms: row.try_get("duration_ms").map_err(|_| RepoError)?,
-            medium_no: row.try_get("medium_no").map_err(|_| RepoError)?,
+            mbid: row
+                .try_get("mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            release_mbid: row
+                .try_get("release_mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            title: row
+                .try_get("title")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            track_no: row
+                .try_get("track_no")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            duration_ms: row
+                .try_get("duration_ms")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            medium_no: row
+                .try_get("medium_no")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
         })
     }
 
     fn hit_from_row(row: &tokio_postgres::Row) -> Result<SearchHit, RepoError> {
         Ok(SearchHit {
-            mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-            label: row.try_get("label").map_err(|_| RepoError)?,
-            score: row.try_get("score").map_err(|_| RepoError)?,
-            artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
-            artist_name: row.try_get("artist_name").map_err(|_| RepoError)?,
+            mbid: row
+                .try_get("mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            label: row
+                .try_get("label")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            score: row
+                .try_get("score")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            artist_mbid: row
+                .try_get("artist_mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            artist_name: row
+                .try_get("artist_name")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
         })
     }
 
@@ -1582,7 +1792,7 @@ mod tests {
         async fn lookup(&self, _kind: Kind, _mbid: &str) -> Result<Option<Entity>, RepoError> {
             *self.lookup_calls.borrow_mut() += 1;
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             Ok(self.entity.clone())
         }
@@ -1597,7 +1807,7 @@ mod tests {
             *self.search_calls.borrow_mut() += 1;
             *self.last_search_q.borrow_mut() = q.to_string();
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             // Mirror SQL `LIMIT`/`OFFSET` so paging tests exercise the slice.
             let from = (offset as usize).min(self.hits.len());
@@ -1612,7 +1822,7 @@ mod tests {
             *self.recordings_calls.borrow_mut() += 1;
             *self.last_recordings_mbid.borrow_mut() = release_mbid.to_string();
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             Ok(self.recordings.clone())
         }
@@ -2464,9 +2674,11 @@ mod build_sha_tests {
         // `build_sha_from_env` needs a wasm Env, so pin the call sites in
         // source the way the healthz test pins the route shape: slice the
         // pre-test source so this test's own literals cannot satisfy it.
-        // All eight emit sites (three routes x2, detached connect failure,
-        // catch-all 404) must carry the normalized key — never a missing
-        // key or a raw var.
+        // All eight inline emit sites (three routes x2, detached connect
+        // failure, catch-all 404) must carry the normalized key — never a
+        // missing key or a raw var. The ninth line, the staged
+        // `mb.db.failed` failure, builds its fields through the shared
+        // `db_failed_fields` seam instead of an inline literal.
         let source = include_str!("lib.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -2485,18 +2697,24 @@ mod build_sha_tests {
             "mb.release_recordings.completed",
             "mb.search.completed",
             "mb.db.connect_failed",
+            "mb.db.failed",
             "mb.request.not_found",
         ] {
             assert!(production.contains(event), "mb entry must emit {event}");
         }
+        assert!(
+            production.contains("db_failed_fields("),
+            "the staged failure line must build its fields through the shared seam"
+        );
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // Eight emit sites carry the key, so a dropped key at any one of
-        // them drops the count below eight.
+        // Eight inline emit sites carry the key, plus the shared
+        // `db_failed_fields` seam that builds the ninth line's fields, so
+        // a dropped key at any one of them drops the count below nine.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            8,
-            "all eight mb lines must carry the build_sha key"
+            9,
+            "all eight inline mb lines plus the staged-failure seam must carry the build_sha key"
         );
     }
 }

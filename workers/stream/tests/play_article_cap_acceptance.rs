@@ -55,7 +55,7 @@ const NOW_UNIX: u64 = 1_700_000_000;
 // Within the grant TTL cap (`MAX_GRANT_TTL` = 900 s).
 const EXP_UNIX: u64 = NOW_UNIX + 900;
 const CIPHER_KEY: u8 = 0x5A;
-const BIG_MID: &str = "<big-seg0@synthetic.test>";
+const BIG_MID: &str = "big-seg0@synthetic.test";
 /// Bytes per streamed line. Client-side the line counts `LINE + 1`
 /// (data plus the LF it retains); wire-side it is `LINE + 2` (CRLF),
 /// comfortably under the 16 KiB line ceiling.
@@ -90,7 +90,7 @@ fn small_track(tag: &str, len: usize) -> (Vec<u8>, Vec<String>, HashMap<String, 
         plain.push(((i * 7919 + tag.len()) % 256) as u8);
     }
     let ciphered: Vec<u8> = plain.iter().map(|b| b ^ CIPHER_KEY).collect();
-    let mid = format!("<{tag}-seg0@synthetic.test>");
+    let mid = format!("{tag}-seg0@synthetic.test");
     let text = yenc::encode_part(
         &ciphered,
         &format!("{tag}.flac"),
@@ -154,7 +154,7 @@ impl CapNntp {
     /// stops serving this connection.
     fn serve_big(writer: &mut TcpStream) -> bool {
         if writer
-            .write_all(format!("222 0 {BIG_MID} follows\r\n").as_bytes())
+            .write_all(format!("222 0 <{BIG_MID}> follows\r\n").as_bytes())
             .is_err()
         {
             return false;
@@ -196,14 +196,14 @@ impl CapNntp {
                 continue;
             };
             let full_mid = format!("<{mid}>");
-            if full_mid == BIG_MID {
+            if mid == BIG_MID {
                 big_bodies.fetch_add(1, Ordering::SeqCst);
                 if !Self::serve_big(&mut writer) {
                     break;
                 }
                 continue;
             }
-            match articles.get(&full_mid) {
+            match articles.get(mid) {
                 Some(article) => {
                     let _ = writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
                     for raw_line in article.split(|&b| b == b'\n') {

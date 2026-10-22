@@ -25,6 +25,66 @@ use std::collections::HashSet;
 /// `wrangler.toml.example`.
 pub const LIBRARY_DB_BINDING: &str = "LIBRARY_DB";
 
+/// Shared finite deadline (ms) for one library-database operation: the
+/// Hyperdrive `connect_raw` in [`crate::library_db_client`], each
+/// admission-ledger method (whose whole multi-statement connect sequence
+/// shares one deadline), and the consumer's library upsert.
+///
+/// Sized for short-lived single-RTT autocommit statements plus a
+/// Hyperdrive connect: seconds of headroom over the nominal
+/// sub-second path, while a stalled socket fails closed as the
+/// caller's existing detail-free error instead of hanging the worker.
+pub const LIBRARY_DB_DEADLINE_MS: u64 = 10_000;
+
+/// Race a library-database operation against a deadline.
+///
+/// Returns the operation's own `Ok`/`Err` when it completes first
+/// (completed driver failures keep their existing classification), or
+/// `Err(on_expiry())` when the deadline fires first. The losing
+/// operation future is dropped, and `on_expiry` runs only on expiry.
+///
+/// Generic over both futures (neither needs `Unpin`) so native tests
+/// can drive it with deterministic fakes: production passes the real
+/// connect/query future plus a `worker::Delay` armed from
+/// [`LIBRARY_DB_DEADLINE_MS`]. Same polling shape as
+/// [`crate::pool_deadline::race_against_deadline`]: the deadline is
+/// polled first, so an already-fired deadline aborts even when the
+/// operation is also ready — but unlike that helper this race owns
+/// both futures, because the connect/query futures are `!Unpin`.
+pub async fn with_db_deadline<O, D, T, E>(
+    operation: O,
+    deadline: D,
+    on_expiry: impl FnOnce() -> E,
+) -> Result<T, E>
+where
+    O: std::future::Future<Output = Result<T, E>>,
+    D: std::future::Future<Output = ()>,
+{
+    use std::task::Poll;
+    let mut operation = Box::pin(operation);
+    let mut deadline = Box::pin(deadline);
+    // (The `.poll` calls below resolve through the generic `Future`
+    // bounds, which is why no trait import is needed here.)
+    match std::future::poll_fn(|cx| {
+        // Deadline first: an already-fired deadline aborts even when the
+        // operation is also ready. Returning here drops the pinned
+        // operation, so an expired connect/query cannot keep running
+        // detached; every return below drops the deadline's timer too.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        match operation.as_mut().poll(cx) {
+            Poll::Ready(output) => Poll::Ready(Some(output)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+    {
+        Some(output) => output,
+        None => Err(on_expiry()),
+    }
+}
+
 /// `$n` parameter order for [`upsert_library_sql`].
 pub const UPSERT_PARAM_ORDER: [&str; 5] = [
     "job_id",

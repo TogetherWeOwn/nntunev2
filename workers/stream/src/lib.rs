@@ -49,6 +49,7 @@ pub mod play;
 pub mod pool;
 pub mod prefetch;
 pub mod probe;
+pub mod provider_response;
 pub mod range;
 pub mod routes;
 pub mod trace;

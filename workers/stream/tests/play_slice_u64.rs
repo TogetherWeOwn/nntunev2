@@ -878,7 +878,7 @@ impl Server {
             {
                 bodies.fetch_add(1, Ordering::SeqCst);
                 let full_mid = format!("<{mid}>");
-                match articles.get(&full_mid) {
+                match articles.get(mid) {
                     Some(article) => {
                         let _ =
                             writer.write_all(format!("222 0 {full_mid} follows\r\n").as_bytes());
@@ -932,7 +932,7 @@ fn live_fixture() -> LiveFixture {
     let mut segments = Vec::new();
     for (i, chunk) in plain.chunks(SEG_LEN).enumerate() {
         let part = i as u32 + 1;
-        let mid = format!("<slice-u64-seg{i}@synthetic.test>");
+        let mid = format!("slice-u64-seg{i}@synthetic.test");
         articles.insert(
             mid.clone(),
             yenc::encode_part(

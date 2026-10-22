@@ -941,3 +941,378 @@ fn banned_key_lists_agree_with_shared_validator() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured-emission migration: every formerly raw console line in the
+// fetch paths (`src/lib.rs`) and the queue consumer
+// (`src/queue_consumer.rs`) must go through the existing structured
+// emitter with one of the stable event names below, the build SHA, and
+// the trace already in scope at the site (the fetch trace, or the queue
+// message's trace in the consumer). Failure detail (Debug payloads,
+// free-form error text, URLs, credentials, NZB content, provider hosts,
+// user input) must never reach an emitted field or a returned error
+// string: failures log names and categories only.
+//
+// `src/repair.rs` is owned by a separate slice and is excluded from the
+// scans below; every other production file in this crate is covered.
+// The production paths are wasm-only, so wiring is pinned by source scan
+// (the established pattern in this crate) and the envelope itself is
+// exercised behaviorally through the shared emitter the production
+// `emit()` renders with.
+// ---------------------------------------------------------------------------
+
+const MIGRATION_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+const MIGRATION_BUILD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const LIB_RS: &str = "src/lib.rs";
+const QUEUE_CONSUMER_RS: &str = "src/queue_consumer.rs";
+
+/// One stable event per migrated raw call site: (event, file that emits it).
+const MIGRATED_EVENTS: &[(&str, &str)] = &[
+    // Fetch paths.
+    ("ingest.queue.enqueue_failed", LIB_RS),
+    ("ingest.queue.binding_missing", LIB_RS),
+    ("ingest.meter.binding_missing", LIB_RS),
+    ("ingest.meter.write_failed", LIB_RS),
+    ("ingest.library_db.binding_missing", LIB_RS),
+    ("ingest.library_db.connection_failed", LIB_RS),
+    ("ingest.admission.commit_failed", LIB_RS),
+    ("ingest.admission_checkpoint.read_failed", LIB_RS),
+    ("ingest.admission_checkpoint.write_failed", LIB_RS),
+    ("ingest.admission_checkpoint.redrive_enqueue_failed", LIB_RS),
+    ("ingest.replay_checkpoint.read_failed", LIB_RS),
+    ("ingest.payload.write_failed", LIB_RS),
+    ("ingest.payload.put_failed", LIB_RS),
+    ("ingest.payload.binding_missing", LIB_RS),
+    // Queue consumer. `ingest.payload.binding_missing` is shared with the
+    // fetch payload store: same binding, same failure, same event.
+    ("ingest.payload.read_failed", QUEUE_CONSUMER_RS),
+    ("ingest.payload.binding_missing", QUEUE_CONSUMER_RS),
+    ("ingest.verify.size_refused_terminal", QUEUE_CONSUMER_RS),
+    ("ingest.verify_progress.read_failed", QUEUE_CONSUMER_RS),
+    ("ingest.scratch.binding_missing", QUEUE_CONSUMER_RS),
+    ("ingest.verify_progress.write_failed", QUEUE_CONSUMER_RS),
+    ("ingest.match_payload.read_failed", QUEUE_CONSUMER_RS),
+    ("ingest.library.upsert_failed", QUEUE_CONSUMER_RS),
+    ("ingest.checkpoint.write_failed", QUEUE_CONSUMER_RS),
+    ("ingest.checkpoint.read_failed", QUEUE_CONSUMER_RS),
+    ("ingest.continuation.enqueue_failed", QUEUE_CONSUMER_RS),
+    ("ingest.continuation.binding_missing", QUEUE_CONSUMER_RS),
+    ("ingest.dlq.send_failed", QUEUE_CONSUMER_RS),
+    ("ingest.dlq.binding_missing", QUEUE_CONSUMER_RS),
+];
+
+/// Migrated events whose only detail is a closed-set failure category:
+/// the database SQLSTATE code (or a fixed none-marker), never error text.
+const SQLSTATE_EVENTS: &[&str] = &[
+    "ingest.admission.commit_failed",
+    "ingest.library.upsert_failed",
+];
+
+/// Structured-emission call sites that predate the migration: four in the
+/// fetch paths and one in the consumer.
+const PREEXISTING_EMIT_CALLS: usize = 5;
+
+fn production_source(rel: &str) -> String {
+    let source = read_artifact(rel, "production source");
+    match source.split_once("\n#[cfg(test)]") {
+        Some((production, _)) => production.to_string(),
+        None => source,
+    }
+}
+
+fn window_from(source: &str, start: usize, max_len: usize) -> &str {
+    let mut end = (start + max_len).min(source.len());
+    while end > start && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    &source[start..end]
+}
+
+fn assert_event_emitted_from(event: &str, rel: &str, production: &str) {
+    assert!(
+        production.contains(&format!("\"{event}\"")),
+        "RED (expected before the build): {rel} must emit the stable event \
+         {event} through the structured emitter instead of a raw console line"
+    );
+}
+
+fn render_migrated_line(event: &str, fields: serde_json::Value) -> String {
+    let field_map = nntune_logging::fields_from_json(fields)
+        .unwrap_or_else(|e| panic!("synthetic fields for {event} must validate: {e}"));
+    let record = nntune_logging::LogRecord::new(
+        nntune_logging::Worker::Ingest,
+        nntune_logging::Level::Error,
+        MIGRATION_TRACE,
+        event,
+        field_map,
+        1_792_094_400_123,
+    )
+    .unwrap_or_else(|e| panic!("migrated event {event} must render: {e}"));
+    record.to_json_line()
+}
+
+#[test]
+fn migrated_events_are_emitted_and_render_the_six_key_envelope() {
+    let lib = production_source(LIB_RS);
+    let consumer = production_source(QUEUE_CONSUMER_RS);
+    let expected_keys: BTreeSet<_> = REQUIRED_FIELDS.iter().copied().collect();
+    for (event, rel) in MIGRATED_EVENTS {
+        let production = if *rel == LIB_RS { &lib } else { &consumer };
+        assert_event_emitted_from(event, rel, production);
+
+        let mut fields = serde_json::json!({
+            "job_id": "job_synthetic",
+            "build_sha": MIGRATION_BUILD_SHA,
+        });
+        if SQLSTATE_EVENTS.contains(event) {
+            fields["sqlstate"] = serde_json::Value::String("42P01".to_string());
+        }
+        let line = render_migrated_line(event, fields);
+        assert!(!line.contains('\n'), "{event} must render one line");
+        let object = parse_line(&line);
+        let actual_keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "{event} must carry exactly the six schema keys, with no detail text"
+        );
+        assert!(
+            matches!(object.get("ts"), Some(JsonValue::String(ts)) if timestamp_is_valid_utc(ts)),
+            "{event} ts must be RFC3339 UTC"
+        );
+        assert!(
+            matches!(object.get("worker"), Some(JsonValue::String(w)) if w == EXPECTED_WORKER),
+            "{event} worker must be ingest"
+        );
+        assert!(
+            matches!(object.get("trace_id"), Some(JsonValue::String(t)) if t == MIGRATION_TRACE),
+            "{event} must carry the trace in scope at the site, unchanged"
+        );
+        assert!(
+            matches!(object.get("event"), Some(JsonValue::String(e)) if e == event && valid_event(e)),
+            "{event} must be a valid stable ingest.* event name"
+        );
+        let Some(JsonValue::Object(fields)) = object.get("fields") else {
+            panic!("{event} fields must be a JSON object");
+        };
+        assert!(
+            matches!(fields.get("build_sha"), Some(JsonValue::String(s)) if s == MIGRATION_BUILD_SHA),
+            "{event} fields must carry the build SHA"
+        );
+        assert!(
+            has_banned_key(fields).is_none(),
+            "{event} fields contain a prohibited key"
+        );
+        if SQLSTATE_EVENTS.contains(event) {
+            assert!(
+                matches!(fields.get("sqlstate"), Some(JsonValue::String(s)) if s == "42P01"),
+                "{event} must log the failure category (sqlstate) only"
+            );
+        }
+    }
+}
+
+#[test]
+fn production_sources_have_no_raw_console_log() {
+    // The only permitted console emission is the structured sink shape
+    // `console_log!("{}", <rendered line>)` used by the emitter itself.
+    // `src/repair.rs` is excluded: a separate slice owns that file.
+    let src_dir = manifest_dir().join("src");
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let entries = std::fs::read_dir(&src_dir).expect("src directory must be readable");
+    for entry in entries {
+        let path = entry.expect("src entry must be readable").path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("source file must have a name")
+            .to_string_lossy()
+            .into_owned();
+        if name == "repair.rs" {
+            continue;
+        }
+        scanned += 1;
+        let production = production_source(&format!("src/{name}"));
+        for (index, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || !line.contains("console_log!") {
+                continue;
+            }
+            if !line.contains("console_log!(\"{}\"") {
+                violations.push(format!("src/{name}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(scanned >= 10, "scan must cover the crate sources");
+    assert!(
+        violations.is_empty(),
+        "RED (expected before the build): production code must emit structured \
+         events, never raw console lines; found:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn every_emit_call_carries_build_sha_and_trace_without_freeform_detail() {
+    // Each migrated site routes through the existing `emit()` directly
+    // (the established call shape in these files), so the number of emit
+    // calls grows by exactly the migrated sites, and every call window
+    // names the trace variable in scope, carries `build_sha`, and builds
+    // no free-form detail with `format!`.
+    let mut emit_calls = 0usize;
+    for rel in [LIB_RS, QUEUE_CONSUMER_RS] {
+        let production = production_source(rel);
+        for (index, _) in production.match_indices("emit(") {
+            let before = &production[..index];
+            // Skip the `emit` definition, the meter path (`meter_emit(`),
+            // and mentions inside comment lines.
+            let line_start = before.rfind('\n').map_or(0, |pos| pos + 1);
+            if before.ends_with("fn ")
+                || before.ends_with("meter_")
+                || production[line_start..index].trim_start().starts_with("//")
+            {
+                continue;
+            }
+            let window = window_from(&production, index, 1500);
+            let window = match window.find(");") {
+                Some(end) => &window[..end],
+                None => window,
+            };
+            emit_calls += 1;
+            assert!(
+                window.contains("\"build_sha\""),
+                "{rel}: every emit() call must carry the build SHA; window: {window}"
+            );
+            assert!(
+                window.contains("trace"),
+                "{rel}: every emit() call must pass the trace in scope at the site; window: {window}"
+            );
+            assert!(
+                !window.contains("format!"),
+                "{rel}: emit() fields must be names, categories and counters, never formatted detail; window: {window}"
+            );
+            assert!(
+                !window.contains(":?") && !window.contains("#?"),
+                "{rel}: emit() fields must never carry a Debug payload; window: {window}"
+            );
+        }
+    }
+    assert!(
+        emit_calls >= PREEXISTING_EMIT_CALLS + MIGRATED_EVENTS.len(),
+        "RED (expected before the build): expected at least {} structured emit() \
+         calls across the fetch and consumer files ({} pre-existing + {} migrated), \
+         found {emit_calls}",
+        PREEXISTING_EMIT_CALLS + MIGRATED_EVENTS.len(),
+        PREEXISTING_EMIT_CALLS,
+        MIGRATED_EVENTS.len()
+    );
+}
+
+#[test]
+fn migrated_files_have_no_debug_interpolation_anywhere_in_production() {
+    // Neither spelling may slip past: `:?` and the alternate `#?` are banned
+    // in production code (including comments) in the migrated files, so a
+    // Debug payload cannot reach a log line or a returned error string.
+    for rel in [LIB_RS, QUEUE_CONSUMER_RS] {
+        let production = production_source(rel);
+        for (index, line) in production.lines().enumerate() {
+            assert!(
+                !line.contains(":?") && !line.contains("#?"),
+                "RED (expected before the build): {rel}:{} interpolates a Debug \
+                 payload; failures log names/categories only: {}",
+                index + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn formatted_strings_in_migrated_files_never_embed_an_error_value() {
+    // Returned error strings are caller-visible surface: building one from
+    // an error value (`format!` over `e`/`error`, Debug or Display) leaks
+    // free-form provider/binding text. Categories and constants only.
+    for rel in [LIB_RS, QUEUE_CONSUMER_RS] {
+        let production = production_source(rel);
+        for (index, _) in production.match_indices("format!(") {
+            let window = window_from(&production, index, 240);
+            for needle in [
+                "{e}", "{e:", "{e#", "{error}", "{error:", "{error#", "{:?}", "{:#?}",
+            ] {
+                assert!(
+                    !window.contains(needle),
+                    "RED (expected before the build): {rel} builds a string from an \
+                     error value ({needle}); use a fixed category string: {window}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hostile_sentinels_never_reach_a_migrated_event_line() {
+    let lib = production_source(LIB_RS);
+    let consumer = production_source(QUEUE_CONSUMER_RS);
+    // Synthetic hostile inputs only: credential-shaped values, a URL with
+    // an embedded credential marker, personal data, and IP addresses must
+    // be refused at field validation (the production emitter drops the
+    // whole line), and a newline must never forge a second log line.
+    let hostile_values = [
+        "Bearer SENTINEL9f3a",
+        "tok_SENTINEL9f3a",
+        "provider replied password=SENTINEL9f3a",
+        "https://sentinel.invalid/fetch?api_key=SENTINEL9f3a",
+        "someone@sentinel.invalid",
+        "192.0.2.99",
+        "2001:db8::99",
+    ];
+    let mut checked: BTreeSet<&str> = BTreeSet::new();
+    for (event, rel) in MIGRATED_EVENTS {
+        if !checked.insert(event) {
+            continue;
+        }
+        let production = if *rel == LIB_RS { &lib } else { &consumer };
+        assert_event_emitted_from(event, rel, production);
+        for hostile in hostile_values {
+            let fields = serde_json::json!({
+                "job_id": hostile,
+                "build_sha": MIGRATION_BUILD_SHA,
+            });
+            assert!(
+                nntune_logging::fields_from_json(fields).is_err(),
+                "{event} must refuse a hostile field value instead of logging it: {hostile}"
+            );
+        }
+        for banned_key in ["nzb_contents", "authorization", "provider_api_key"] {
+            let fields = serde_json::json!({
+                banned_key: "SENTINEL9f3a",
+                "build_sha": MIGRATION_BUILD_SHA,
+            });
+            assert!(
+                nntune_logging::fields_from_json(fields).is_err(),
+                "{event} must refuse the banned field key {banned_key}"
+            );
+        }
+        // A newline-bearing value may only ever appear escaped inside the
+        // one JSON object; it must not split or forge log lines.
+        let line = render_migrated_line(
+            event,
+            serde_json::json!({
+                "stage": "ok\n{\"forged\":true}",
+                "build_sha": MIGRATION_BUILD_SHA,
+            }),
+        );
+        assert!(
+            !line.contains('\n'),
+            "{event} rendered a raw newline from field input"
+        );
+        let object = parse_line(&line);
+        assert_eq!(
+            object.len(),
+            REQUIRED_FIELDS.len(),
+            "{event} newline input must stay inside the single six-key object"
+        );
+    }
+}
