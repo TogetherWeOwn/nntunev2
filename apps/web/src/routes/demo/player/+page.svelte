@@ -5,10 +5,12 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { page } from '$app/state';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { SeekController } from '#lib/player/seekController.js';
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
+	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import {
 		addTrack,
 		clearQueue,
@@ -39,7 +41,20 @@
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 
-	const current = $derived(currentTrack(queue));
+	/**
+	 * Auto-continue radio: a seeded pass over the loaded catalogue that
+	 * starts on natural end of the queue. Null when radio is off. The queue
+	 * is untouched while radio plays, so stopping returns to the queue's
+	 * end state instead of a shuffled one.
+	 */
+	interface RadioState {
+		order: (typeof DEMO_TRACKS)[number][];
+		index: number;
+		seed: number;
+	}
+	let radio = $state<RadioState | null>(null);
+
+	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
 
 	const playback = createPlayback({
@@ -111,6 +126,12 @@
 	}
 
 	function goNext(): void {
+		// Explicit Next during radio moves through the mix (rolling into a
+		// new pass at its end). Only explicit Next past the queue end stops.
+		if (radio) {
+			advanceRadio();
+			return;
+		}
 		if (!current) return;
 		const advanced = nextTrack(queue);
 		if (advanced === queue) {
@@ -123,16 +144,58 @@
 		playCurrent();
 	}
 
+	// Natural end of the last queued track: continue with a seeded mix over
+	// the loaded catalogue. An empty library ends instead of starting radio.
+	function startRadio(): void {
+		startRadioPass(parseRadioSeed(page.url.searchParams.get('radio-seed')));
+	}
+
+	function startRadioPass(seed: number): void {
+		const order = createRadioOrder(DEMO_TRACKS, seed);
+		if (order.length === 0) {
+			playback.pause();
+			status = 'ended';
+			return;
+		}
+		radio = { order, index: 0, seed };
+		playCurrent();
+	}
+
+	// Advance within the radio mix; a finished pass rolls into a new one
+	// with the next seed, so radio never idles mid-listen.
+	function advanceRadio(): void {
+		if (!radio) return;
+		if (radio.index < radio.order.length - 1) {
+			radio = { ...radio, index: radio.index + 1 };
+			playCurrent();
+		} else {
+			startRadioPass(radio.seed + 1);
+		}
+	}
+
+	// Stop returns to the established end-of-queue idle state. Nothing
+	// restarts on its own: stray ends land on status 'ended', which
+	// handleEnded ignores.
+	function stopRadio(): void {
+		radio = null;
+		playback.pause();
+		status = 'ended';
+	}
+
 	function goPrevious(): void {
 		const previous = previousTrack(queue);
 		// Clamped at the first track: nothing changed, so a paused track must
-		// not be resumed by a no-op Previous.
+		// not be resumed by a no-op Previous (and radio, if on, keeps playing).
 		if (previous === queue) return;
+		// Stepping back leaves radio: the queue resumes from the previous track.
+		radio = null;
 		queue = previous;
 		playCurrent();
 	}
 
 	function selectAt(index: number): void {
+		// An explicit pick leaves radio: the queue resumes from the picked track.
+		radio = null;
 		queue = selectTrack(queue, index);
 		playCurrent();
 	}
@@ -146,6 +209,7 @@
 	}
 
 	function clearAll(): void {
+		radio = null;
 		queue = clearQueue(queue);
 		status = 'empty';
 		void playback.unload();
@@ -155,6 +219,17 @@
 	// late event from a superseded track must not skip the new one.
 	function handleEnded(event: Event): void {
 		if (!eventForCurrent(event) || status === 'paused' || status === 'ended') return;
+		// Only a natural end starts radio: explicit Next past the end stops
+		// in goNext, and pause (or a stale ended while paused) never gets here.
+		if (radio) {
+			advanceRadio();
+			return;
+		}
+		if (!current) return;
+		if (nextTrack(queue) === queue) {
+			startRadio();
+			return;
+		}
 		goNext();
 	}
 
@@ -250,6 +325,13 @@
 			Queue is empty
 		{/if}
 	</p>
+
+	{#if radio}
+		<p data-testid="radio-badge" role="status">Radio</p>
+		<button type="button" data-testid="radio-stop" onclick={stopRadio}>
+			Stop radio
+		</button>
+	{/if}
 
 	{#if status === 'error'}
 		<div data-testid="player-error" role="alert">
