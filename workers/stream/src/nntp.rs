@@ -550,7 +550,7 @@ mod tests {
         let mut client =
             NntpClient::connect_with_timeouts(&addr, timeouts).expect("greeting arrives");
         let err = client
-            .article("<hung-seg0@synthetic.test>")
+            .article("hung-seg0@synthetic.test")
             .expect_err("hung upstream must time out");
         let elapsed = t0.elapsed();
         assert!(
@@ -599,7 +599,7 @@ mod tests {
             NntpClient::connect_with_timeouts(&addr, timeouts).expect("greeting arrives");
         let started = std::time::Instant::now();
         let error = client
-            .article("<trickle-seg0@synthetic.test>")
+            .article("trickle-seg0@synthetic.test")
             .expect_err("a trickling article must hit its operation deadline");
         let elapsed = started.elapsed();
         stop.store(true, Ordering::Relaxed);
@@ -653,7 +653,7 @@ mod tests {
         let mut client = NntpClient::connect_with_deadline(&addr, timeouts, &deadline)
             .expect("greeting still arrives within budget");
         let err = client
-            .article_with_deadline("<delayed-seg0@synthetic.test>", &deadline)
+            .article_with_deadline("delayed-seg0@synthetic.test", &deadline)
             .expect_err("silent article after a delayed greeting must time out");
         let elapsed = t0.elapsed();
 

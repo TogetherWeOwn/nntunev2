@@ -58,7 +58,10 @@ fn fixture_track(tag: &str, declared_first_size: u64) -> (Vec<u8>, Vec<String>, 
     let mut segments = Vec::new();
     for (i, chunk) in ciphered.chunks(SEG_LEN).enumerate() {
         let part = i as u32 + 1;
+        // Bracketed spelling keys the fixture server's article map; play
+        // segments below carry the bare shared-rule identity.
         let mid = format!("<{tag}-seg{i}@synthetic.test>");
+        let bare = format!("{tag}-seg{i}@synthetic.test");
         articles.insert(
             mid.clone(),
             yenc::encode_part(
@@ -77,7 +80,7 @@ fn fixture_track(tag: &str, declared_first_size: u64) -> (Vec<u8>, Vec<String>, 
                 },
             ),
         );
-        segments.push(mid);
+        segments.push(bare);
     }
     (plain, segments, Server::start(articles))
 }
@@ -142,7 +145,7 @@ impl Server {
                 .map(|s| s.trim().trim_matches(|c| c == '<' || c == '>'))
             {
                 let full_mid = format!("<{mid}>");
-                fetched.lock().expect("fetched log").push(full_mid.clone());
+                fetched.lock().expect("fetched log").push(mid.to_string());
                 match articles.get(&full_mid) {
                     Some(article) => {
                         let _ =
