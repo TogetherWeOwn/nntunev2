@@ -47,3 +47,32 @@ Run the acceptance suite from the repository root with Node 24+:
 ```sh
 node --experimental-vm-modules --test workers/observability/tests/evaluate-error-window.test.mjs
 ```
+
+# Verdict-to-alert payloads
+
+`render-verdict-alert.mjs` exports a pure, deterministic
+`renderVerdictAlert(verdict, context)` that renders one `breach`/`breach`
+error-rate verdict plus caller context (`logsUrl`, `windowLabel`) into an
+alert payload object (`{content, embeds}`) shaped for a Discord webhook
+body. Any other verdict status, malformed verdict or context, or invalid
+input fails closed to `null` — never a fabricated alert, never a throw.
+
+Breach payloads carry the verdict status, the exact `failed/total`
+rational plus 4-decimal rate, the failed/total counts, every breached
+rule name, top breakdown entry keys per dimension, release SHAs, the logs
+URL, and the window label. Output stays within alert bounds (content <=
+2000 chars, one embed, 6000-char total, <= 25 fields): oversized strings
+truncate to a prefix plus "…" and oversized lists cap to a leading prefix
+with a "+N more" marker, so identical input always yields byte-identical
+output.
+
+This module is not wired or deployed: no consumer, schedule, delivery,
+dashboard, or live alerting reads from it. It performs no network,
+environment, clock, logging, or storage access and carries no webhook URL
+or secret.
+
+Run the acceptance suite from the repository root with Node 24+:
+
+```sh
+node --experimental-vm-modules --test workers/observability/tests/render-verdict-alert.test.mjs
+```
