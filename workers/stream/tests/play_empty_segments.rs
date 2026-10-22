@@ -76,9 +76,9 @@ fn empty_segments_fails_closed_without_touching_pool() {
             detail.contains("no segments"),
             "empty segments must name the no-segments diagnostic, got {detail:?}"
         ),
-        other => panic!(
-            "empty segments must fail with the no-segments InvalidSegment, got {other:?}"
-        ),
+        other => {
+            panic!("empty segments must fail with the no-segments InvalidSegment, got {other:?}")
+        }
     }
     // Final local verdict: 400, non-retryable, no Retry-After — an empty
     // track says nothing about the provider.

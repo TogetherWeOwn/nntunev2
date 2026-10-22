@@ -122,24 +122,24 @@ fn hostile_message_ids_rejected_before_any_wire_write() {
     // hostile ids: none is a bare identity and none is normalized into one,
     // so none may reach the socket.
     let hostile: &[&str] = &[
-        "",                             // empty
-        "   ",                          // whitespace-only
-        "<>",                           // bracket-only
-        "<<<>>>",                       // bracket-only, nested
-        "<   >",                        // bracket-wrapped whitespace
-        "<good-seg0@synthetic.test>",   // bracketed well-shaped: refused, never stripped
+        "",                               // empty
+        "   ",                            // whitespace-only
+        "<>",                             // bracket-only
+        "<<<>>>",                         // bracket-only, nested
+        "<   >",                          // bracket-wrapped whitespace
+        "<good-seg0@synthetic.test>",     // bracketed well-shaped: refused, never stripped
         "  <good-seg0@synthetic.test>  ", // padded bracketed
-        " good-seg0@synthetic.test",    // padded
-        "good-seg0@synthetic.test ",    // padded
-        "x>\r\nBODY <other@article>",   // CRLF command smuggle
-        "seg\r\nINJECT@synthetic.test", // CRLF injection
-        "a\nb@c",                       // LF
-        "a\rb@c",                       // CR
-        "a\0b@c",                       // NUL
-        "a b@c",                        // space
-        "a\tb@c",                       // tab
-        "a<b@c",                        // inner angle bracket
-        "a>b@c",                        // inner angle bracket
+        " good-seg0@synthetic.test",      // padded
+        "good-seg0@synthetic.test ",      // padded
+        "x>\r\nBODY <other@article>",     // CRLF command smuggle
+        "seg\r\nINJECT@synthetic.test",   // CRLF injection
+        "a\nb@c",                         // LF
+        "a\rb@c",                         // CR
+        "a\0b@c",                         // NUL
+        "a b@c",                          // space
+        "a\tb@c",                         // tab
+        "a<b@c",                          // inner angle bracket
+        "a>b@c",                          // inner angle bracket
     ];
     for id in hostile {
         assert_rejected_before_wire_write(id);
