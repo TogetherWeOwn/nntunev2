@@ -471,8 +471,10 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
-dependencies), so the asymmetry is intentional.
-Sources: `.github/workflows/ci.yml:271-296`.)
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:359-384`) and
+`fixture-check` (`.github/workflows/ci.yml:65-74`); `fmt` takes no
+`--locked` (it resolves no dependencies), so the asymmetry is
+intentional. `cargo test -p nntune-subsonic` also runs under
+`rust-test --workspace`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).

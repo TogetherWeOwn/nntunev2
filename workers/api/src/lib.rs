@@ -133,10 +133,37 @@ pub async fn main(
 /// True when this request targets the Subsonic `/rest/*` surface.
 #[cfg(target_arch = "wasm32")]
 fn is_subsonic_request(req: &Request) -> bool {
-    req.url().is_ok_and(|url| {
-        let path = url.path();
-        path == "/rest" || path.starts_with("/rest/")
-    })
+    req.url().is_ok_and(|url| is_subsonic_path(url.path()))
+}
+
+/// Pure path predicate behind [`is_subsonic_request`]. Compiled natively
+/// for tests so the routing boundary the wasm32 entry depends on is
+/// pinned without a Worker runtime.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn is_subsonic_path(path: &str) -> bool {
+    path == "/rest" || path.starts_with("/rest/")
+}
+
+#[cfg(test)]
+mod subsonic_routing_tests {
+    use super::is_subsonic_path;
+
+    #[test]
+    fn rest_prefix_claims_subsonic_paths_only() {
+        for claimed in ["/rest", "/rest/", "/rest/ping", "/rest/getArtists.view"] {
+            assert!(is_subsonic_path(claimed), "{claimed} routes to Subsonic");
+        }
+        for unclaimed in [
+            "/",
+            "/healthz",
+            "/v1/auth/magic/start",
+            "/restless",
+            "/api/rest/ping",
+            "/REST/ping",
+        ] {
+            assert!(!is_subsonic_path(unclaimed), "{unclaimed} keeps dispatch");
+        }
+    }
 }
 
 /// Serve one Subsonic request: v1 reads params from query plus POST form
