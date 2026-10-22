@@ -5,12 +5,11 @@
 //! generic (no user-enumeration oracle); challenges are single-use with
 //! short expiry and RP/origin pinning.
 //!
-//! Full WebAuthn attestation/assertion signature verification wires to a
-//! WebAuthn library in the follow-up slice (child card): this module owns
-//! the challenge lifecycle, origin/RP binding, expiry, single-use, and
-//! credential storage shapes, all enforced and tested here.
+//! WebAuthn attestation/assertion signature verification lives in
+//! `crate::webauthn`; this module owns the challenge lifecycle,
+//! origin/RP binding, expiry, single-use claims, and credential
+//! storage shapes, all enforced and tested here.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -25,38 +24,36 @@ pub enum AuthError {
     /// Generic: every login/consume failure maps here. Never distinguish
     /// "unknown user" from "bad token" (enumeration oracle).
     Invalid,
+    /// Invalid server-side RP/origin configuration; this is not a bad credential.
+    Misconfigured,
+    /// Secure randomness unavailable while minting a token, challenge id, or
+    /// invite code: HTTP 503 `service_unavailable`. Never a panic, fallback,
+    /// or reused value.
+    RandomnessUnavailable,
 }
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Same message the API returns for every auth failure.
+            // Keep credential failures indistinguishable.
             AuthError::Invalid => write!(f, "check your email and try again"),
+            AuthError::Misconfigured => write!(f, "authentication service unavailable"),
+            // Sealed public text: matches the `service_unavailable` envelope.
+            AuthError::RandomnessUnavailable => write!(f, "service unavailable"),
         }
     }
 }
 
-fn random_b64url_32() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    // Reuse the session module's alphabet via a local copy to avoid coupling.
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(43);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 63) as usize] as char);
-        }
+impl From<crate::random::CryptoError> for AuthError {
+    fn from(_: crate::random::CryptoError) -> Self {
+        AuthError::RandomnessUnavailable
     }
-    out
+}
+
+fn random_b64url_32() -> Result<String, AuthError> {
+    let bytes = crate::random::secure_random_bytes::<32>()?;
+    // Shared unpadded-base64url (F-HARD-01): no per-module copies.
+    Ok(crate::b64::encode(&bytes))
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -82,10 +79,26 @@ pub struct MagicLinkRecord {
     pub used: bool,
 }
 
+/// SHA-256 hex of a presented magic-link token, for record lookup by hash.
+/// The HTTP layer looks the record up with this, then still requires
+/// [`consume_magic_link_atomically`] — a hash lookup is not authentication.
+pub fn hash_magic_token(token: &str) -> String {
+    sha256_hex(token)
+}
+
 /// Issue a magic link: returns `(plaintext_token, stored_record)`.
 /// The plaintext goes into the emailed URL; only the hash is stored.
-pub fn issue_magic_link(user_id: &str, email: &str, now: u64) -> (String, MagicLinkRecord) {
-    let token = random_b64url_32();
+///
+/// Fail-closed: secure-randomness failure returns
+/// [`AuthError::RandomnessUnavailable`] (HTTP 503) so the caller sends no
+/// mail and stores nothing. The success path is byte-identical: the same 32
+/// entropy bytes through the same [`crate::b64::encode`].
+pub fn issue_magic_link(
+    user_id: &str,
+    email: &str,
+    now: u64,
+) -> Result<(String, MagicLinkRecord), AuthError> {
+    let token = random_b64url_32()?;
     let record = MagicLinkRecord {
         token_hash: sha256_hex(&token),
         user_id: user_id.to_string(),
@@ -94,7 +107,7 @@ pub fn issue_magic_link(user_id: &str, email: &str, now: u64) -> (String, MagicL
         expires_at: now.saturating_add(MAGIC_LINK_TTL_SECS),
         used: false,
     };
-    (token, record)
+    Ok((token, record))
 }
 
 /// Pure record validation/preparation, NOT authentication or a database claim.
@@ -161,15 +174,16 @@ pub struct PasskeyChallenge {
 
 /// Start a registration (or authentication) ceremony. Validates the RP/origin
 /// shape now so misconfiguration fails before any credential is created.
-/// Returns [`AuthError::Invalid`] (never panics): in a Worker a panic is a
-/// 500, and request-adjacent misconfiguration must stay a generic rejection.
+/// Returns [`AuthError::Misconfigured`] (never panics) when the server's
+/// configured RP/origin is invalid; credential and challenge failures remain
+/// [`AuthError::Invalid`].
 pub fn new_registration_challenge(
     rp_id: &str,
     origin: &str,
     now: u64,
 ) -> Result<PasskeyChallenge, AuthError> {
-    let parsed = url::Url::parse(origin).map_err(|_| AuthError::Invalid)?;
-    let host = parsed.host_str().ok_or(AuthError::Invalid)?;
+    let parsed = url::Url::parse(origin).map_err(|_| AuthError::Misconfigured)?;
+    let host = parsed.host_str().ok_or(AuthError::Misconfigured)?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let local = matches!(host, "localhost" | "127.0.0.1" | "::1");
     if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local))
@@ -186,10 +200,10 @@ pub fn new_registration_challenge(
         || rp_id != host
         || (!local && !host.contains('.'))
     {
-        return Err(AuthError::Invalid);
+        return Err(AuthError::Misconfigured);
     }
     Ok(PasskeyChallenge {
-        id: random_b64url_32(),
+        id: random_b64url_32()?,
         rp_id: rp_id.to_string(),
         origin: origin.to_string(),
         issued_at: now,
@@ -283,6 +297,60 @@ pub fn consume_invite(
     }
     record.used = true;
     Ok(record)
+}
+
+// --- Invite issuance + redemption throttle (F-HARD-01 item 4) -------------------
+
+/// Invite-code entropy: 128 bits, crypto-random, unpadded-base64url
+/// (22 chars). Returns the plaintext code; callers store only
+/// [`hash_invite_code`] of it and deliver the plaintext to the inviter
+/// once. Human-guessable or sequential codes are banned: at 128 bits
+/// enumeration is infeasible and the throttle below is defense in depth.
+///
+/// Fail-closed: secure-randomness failure returns
+/// [`AuthError::RandomnessUnavailable`] (HTTP 503). The success path is
+/// byte-identical: the same 16 entropy bytes through the same
+/// [`crate::b64::encode`].
+pub fn generate_invite_code() -> Result<String, AuthError> {
+    let bytes = crate::random::secure_random_bytes::<16>()?;
+    Ok(crate::b64::encode(&bytes))
+}
+
+/// Sliding window for the invite-redemption rate limit (seconds).
+pub const INVITE_REDEMPTION_WINDOW_SECS: u64 = 300;
+/// Max redemption attempts per key per [`INVITE_REDEMPTION_WINDOW_SECS`].
+/// Generous for humans retrying a pasted code, tight for scripts: 10
+/// attempts per 5 minutes per IP (or per account once authenticated).
+pub const INVITE_REDEMPTION_MAX_ATTEMPTS: u32 = 10;
+
+/// Cutoff for the sliding redemption window: attempts at or before this
+/// timestamp no longer count. The HTTP slice prunes stored attempt rows at
+/// or below it.
+pub fn invite_attempt_retention_cutoff(now_secs: u64) -> u64 {
+    now_secs.saturating_sub(INVITE_REDEMPTION_WINDOW_SECS)
+}
+
+/// Sliding-window gate for invite redemption.
+///
+/// `recent_attempt_secs` MUST come from a shared store (Postgres/KV) keyed
+/// by client IP (anonymous signup) or account — never an in-memory list:
+/// serverless isolates have no shared memory and a restart would wipe the
+/// counter. The HTTP slice MUST:
+/// - load the key's attempt timestamps,
+/// - deny with the generic [`AuthError::Invalid`] when this returns false
+///   (indistinguishable from a bad code — no throttle oracle),
+/// - otherwise persist the new attempt timestamp atomically BEFORE running
+///   the conditional invite claim (a check-then-insert race fails open
+///   under concurrency; use a conditional write / transaction).
+///
+/// Fail-closed on clock skew: timestamps in the future count against the
+/// caller.
+pub fn invite_attempt_allowed(recent_attempt_secs: &[u64], now_secs: u64) -> bool {
+    let in_window = recent_attempt_secs
+        .iter()
+        .filter(|ts| now_secs.saturating_sub(**ts) < INVITE_REDEMPTION_WINDOW_SECS)
+        .count();
+    in_window < INVITE_REDEMPTION_MAX_ATTEMPTS as usize
 }
 
 /// A validated candidate for one atomic, parameterized Postgres claim.
@@ -395,9 +463,56 @@ mod tests {
 
     #[test]
     fn magic_link_hash_is_sha256_hex() {
-        let (token, record) = issue_magic_link("u", "a@b.c", 0);
+        let (token, record) = issue_magic_link("u", "a@b.c", 0).expect("issue");
         assert_eq!(record.token_hash, sha256_hex(&token));
         assert_eq!(record.token_hash.len(), 64);
+    }
+
+    #[test]
+    fn magic_link_tokens_and_challenge_ids_are_random() {
+        // Pin the secure-randomness fill behind `random_b64url_32`: a
+        // dropped fill would make the magic-link token a constant login
+        // credential (43 'A's) and every passkey challenge id identical.
+        let (token_a, _) = issue_magic_link("u", "a@b.c", 0).expect("issue");
+        let (token_b, _) = issue_magic_link("u", "a@b.c", 0).expect("issue");
+        assert_ne!(token_a, token_b, "tokens must be unique per issue");
+        let zero_token = crate::b64::encode(&[0u8; 32]);
+        assert_ne!(token_a, zero_token);
+        assert_ne!(token_b, zero_token);
+        assert_eq!(
+            crate::b64::decode(&token_a).expect("token decodes").len(),
+            32,
+            "exactly 256 bits of entropy"
+        );
+
+        let challenge_a =
+            new_registration_challenge("nntune.example.com", "https://nntune.example.com", 0)
+                .expect("challenge");
+        let challenge_b =
+            new_registration_challenge("nntune.example.com", "https://nntune.example.com", 0)
+                .expect("challenge");
+        assert_ne!(
+            challenge_a.id, challenge_b.id,
+            "challenge ids must be unique per ceremony"
+        );
+        assert_ne!(challenge_a.id, zero_token);
+        assert_ne!(challenge_b.id, zero_token);
+    }
+
+    #[test]
+    fn malformed_origin_is_misconfigured() {
+        assert!(matches!(
+            new_registration_challenge("nntune.example.com", "https://", 0),
+            Err(AuthError::Misconfigured)
+        ));
+    }
+
+    #[test]
+    fn hostless_origin_is_misconfigured() {
+        assert!(matches!(
+            new_registration_challenge("nntune.example.com", "file:///", 0),
+            Err(AuthError::Misconfigured)
+        ));
     }
 
     #[test]
@@ -410,5 +525,76 @@ mod tests {
         let spent = consume_invite(record, "INVITE-1").unwrap();
         assert!(spent.used);
         assert!(consume_invite(spent, "INVITE-1").is_err());
+    }
+
+    #[test]
+    fn invite_codes_are_128_bit_random() {
+        let a = generate_invite_code().expect("issue");
+        let b = generate_invite_code().expect("issue");
+        for code in [&a, &b] {
+            assert_eq!(code.len(), 22, "16 bytes encode to 22 unpadded chars");
+            assert!(
+                code.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "url-safe alphabet only: {code:?}"
+            );
+            assert_eq!(
+                crate::b64::decode(code)
+                    .expect("generated code decodes")
+                    .len(),
+                16,
+                "exactly 128 bits of entropy"
+            );
+            // Generated codes round-trip through the at-rest hash.
+            assert_eq!(hash_invite_code(code).len(), 64);
+        }
+        assert_ne!(a, b, "codes must be unique per generation");
+    }
+
+    #[test]
+    fn invite_redemption_throttle_trips() {
+        let now = 1_700_000_000u64;
+        let full: Vec<u64> = (0..10).map(|i| now - i).collect();
+        assert!(
+            !invite_attempt_allowed(&full, now),
+            "10 attempts in the window must trip the limit"
+        );
+        let nine: Vec<u64> = (0..9).map(|i| now - i).collect();
+        assert!(
+            invite_attempt_allowed(&nine, now),
+            "9 attempts in the window must pass"
+        );
+        assert!(
+            invite_attempt_allowed(&[now - 300, now - 3_600], now),
+            "attempts at/outside the window edge must age out"
+        );
+        assert!(
+            !invite_attempt_allowed(&[now - 299; 10], now),
+            "attempts just inside the window must count"
+        );
+        assert!(invite_attempt_allowed(&[], now), "first attempt must pass");
+        assert!(
+            !invite_attempt_allowed(&[now + 1_000; 10], now),
+            "future timestamps must fail closed, not bypass"
+        );
+        assert_eq!(invite_attempt_retention_cutoff(now), now - 300);
+        assert_eq!(invite_attempt_retention_cutoff(30), 0);
+    }
+
+    #[test]
+    fn randomness_unavailable_is_503_service_unavailable() {
+        let err = AuthError::RandomnessUnavailable;
+        assert_eq!(err.to_string(), "service unavailable");
+        let api = crate::api_error::ApiError::from(err);
+        assert_eq!(
+            (api.code, api.status, api.retryable),
+            ("service_unavailable", 503, true)
+        );
+        assert_eq!(api.message, "service unavailable");
+        // The shared helper converts losslessly into this variant.
+        assert_eq!(
+            AuthError::from(crate::random::CryptoError::RandomnessUnavailable),
+            AuthError::RandomnessUnavailable
+        );
     }
 }

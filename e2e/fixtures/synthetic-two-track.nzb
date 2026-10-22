@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Two-track synthetic NZB fixture for the queue-order un-fixme path
+  (paired acceptance: e2e/helpers/two-track-fixture.ts,
+  e2e/tests/two-track-fixture.spec.ts; paired fixture build).
+
+  Staging leg stages THIS file alone through the ingest path
+  (NZB → ingest → library) as a fresh test account and requires ≥2
+  distinct synthetic tracks in the library. On current ingest one upload
+  is one job and one library row per idempotency key (per-file manifest
+  pending, see ADR 0002 accepted-audio-manifest), so THIS file alone
+  still yields a single row: the passing path is two single-file uploads
+  (synthetic.nzb plus synthetic-second-track.nzb) through the existing
+  staged loop — two jobs, two rows, valid under the current writer and
+  the future manifest alike. That staging-leg switch is the paired Test
+  Author follow-up on this branch; until it lands the leg keeps failing
+  with the precondition by name (red is the signal, never a timeout).
+
+  Contract (checked by e2e/fixtures/two-track-self-check.mjs; keep the
+  pinned values there in sync with any edit here):
+  - Exactly two <file> entries, each a COMPLETE corpus-grounded yEnc file:
+    file 1 is the existing synthetic audio body (660 Hz sine, 3 parts —
+    segment IDs and byte counts byte-identical to e2e/fixtures/synthetic.nzb),
+    file 2 is the existing 440 Hz single-part tone from the same synthetic
+    NNTP corpus (crates/nntune-test-nntp/src/fixtures.rs `default_corpus()`).
+    No invented message-IDs: every segment resolves in the default corpus,
+    so the staging NNTP server serves each part.
+  - File 1 keeps synthetic.nzb's subject verbatim, so `derive_upload_query`
+    (workers/ingest/src/matching.rs, first subject only) still yields the
+    plain-title query 'NNTune-Fixture sine-660' — the same query the
+    single-track fixture derives (see the FIXMEd recording-mbids leg in
+    e2e/tests/ingest-play-meter.spec.ts), so any future mirror seeding
+    applies to both fixtures alike. File order matters: 660 first.
+  - Deterministic IDs: fixed subjects, fixed segment message-IDs, fixed
+    bytes=, fixed group (alt.binaries.nntune.test), fixed poster/date —
+    no generated values anywhere.
+  - Idempotent re-run: static bytes → the upload's content sha (and its
+    ingest idempotency key) converges, so re-import upserts the same
+    single row on current ingest (two rows once the per-file manifest lands).
+  - No interference with the single-track meter fixture: synthetic.nzb is
+    untouched, and these bytes differ from it, so the meter job keeps its
+    own content-addressed idempotency key. Each spec mints a fresh test
+    account per run, so libraries never mix across specs.
+-->
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">nntune-e2e-synthetic-two-track</meta>
+    <meta type="tag">nntune-e2e</meta>
+  </head>
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-660 [01/03] - &quot;sine-660.wav&quot; yEnc">
+    <groups>
+      <group>alt.binaries.nntune.test</group>
+    </groups>
+    <segments>
+      <segment bytes="575" number="1">multi-660-part1-of-3@nntune.test</segment>
+      <segment bytes="575" number="2">multi-660-part2-of-3@nntune.test</segment>
+      <segment bytes="574" number="3">multi-660-part3-of-3@nntune.test</segment>
+    </segments>
+  </file>
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-440 [01/01] - &quot;sine-440.wav&quot; yEnc (1/1)">
+    <groups>
+      <group>alt.binaries.nntune.test</group>
+    </groups>
+    <segments>
+      <segment bytes="1004" number="1">single-yenc-001@nntune.test</segment>
+    </segments>
+  </file>
+</nzb>

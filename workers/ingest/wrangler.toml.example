@@ -5,32 +5,92 @@ name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
 
+[vars]
+# Search rate-limit tunables (src/rate_limit.rs). Unset/invalid values
+# keep the documented defaults: 10 searches per 60s (base plan quota).
+# SEARCH_RATE_LIMIT_MAX = "10"
+# SEARCH_RATE_LIMIT_WINDOW_SECS = "60"
+
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the deploy lane (for example
+# `--var BUILD_SHA:$GITHUB_SHA`). No workflow wires it for the ingest Worker
+# yet (backend Worker deploys are intentionally not wired; see
+# `.github/workflows/deploy.yml`), so until the future ingest deploy job adds
+# it every ingest line renders the explicit string "unknown".
+# Workers log it as the `build_sha` field on every record; an absent or
+# invalid value renders as "unknown" (never a missing key, never
+# fail-closed), which means the lane did not supply it. Leave unset for
+# local dev.
+# BUILD_SHA = "unknown"
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
-# only produce; nothing consumes yet (see below), so every accepted enqueue
-# waits in the queue until the consumer ships.
+# produce; the consumer below stays disabled, so every accepted enqueue
+# waits in the queue until it is enabled.
 [[queues.producers]]
 binding = "INGEST_QUEUE"
 queue = "nntune-ingest-jobs"
 
-# Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
-# handler — so declaring this worker a consumer would deliver every message
-# to a handler that does not exist (retried `max_retries` times, then
-# dropped, while callers saw 202 queued). Uncomment together with the Queue
-# handler and a dead-letter queue, e.g.:
+# Slice T2: DLQ producer (code: src/retry.rs). The consumer sends one
+# DlqEntry per quarantined message here — the original QueueMsg plus
+# `error_code` and `attempts` fields in the serialized body — then acks the
+# original so it is never redelivered. Producer-only: safe to declare before
+# the consumer ships.
+[[queues.producers]]
+binding = "INGEST_DLQ"
+queue = "nntune-ingest-dlq"
+
+# Consumer: handler exists (`event(queue)` in src/queue_consumer.rs) but
+# stays DISABLED. It validates each message, writes its checkpoint exactly
+# once per delivery (Workers KV allows 1 write/s per key), digest-checks
+# and parses upload payloads with the shared parser, probes their segments
+# through the NNTP_POOL binding below (folded batches ride that one
+# checkpoint write; the tally is keyed by batch index, so redelivery
+# resumes without double-counting), runs the Verifying step (pool BODY
+# fetches plus par2 judging over the INGEST_SCRATCH bucket below), and
+# settles per message via src/retry.rs (`decide_checkpoint`): persist the
+# mutated checkpoint before retry/ack, use `retry_with_options` while
+# budget remains, and persist Failed before DLQ send + ack. Never ack on
+# DLQ-send failure; Failed redelivery retries the send. A
+# send-success/ack-failure may duplicate entries, so DLQ processing must
+# be idempotent by job_id.
+# Probing is capped per delivery (4 batches / 30 s in
+# src/queue_consumer.rs, sized against max_batch_size = 10 below and the
+# 15-minute consumer invocation limit): a budget stop persists the
+# partial tally, enqueues a fresh copy of the message via the
+# INGEST_QUEUE producer above (5 s delay), and acks the original, so a
+# progressing job spends neither its attempt budget nor the max_retries
+# slots below. If that enqueue fails the handler falls back to a native
+# retry, which does spend a slot.
+# The search runtime step is not wired yet (verify, repair through
+# REPAIR_CONTAINER below, and match/write are), so enabling this now
+# would burn every valid search job's retry budget against an
+# unavailable boundary and quarantine it. Uncomment only when search
+# is executable. E.g.:
 #
 # [[queues.consumers]]
 # queue = "nntune-ingest-jobs"
 # max_batch_size = 10
-# Keep max_retries = PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs: the
-# payload-fetch backoff (5/15/30/60 s, 110 s cumulative) needs all four
-# retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
-# window (consumer reads with cacheTtl 30).
+# Keep max_retries = CONSUMER_MAX_RETRIES (4) in src/retry.rs: it equals
+# PAYLOAD_RETRY_ATTEMPTS in src/dispatch.rs and MAX_ATTEMPTS - 1 in
+# src/jobs.rs (a compile-time assert enforces this), and the retry backoff
+# (5/15/30/60 s, 110 s cumulative) needs all four retries to cover the ~60 s
+# KV lag plus the edge-cached negative-lookup window (consumer reads with
+# cacheTtl 30).
 # max_retries = 4
-# [[queues.consumers.dead_letter_queue]]
-# queue = "nntune-ingest-dlq"
+# On DLQ-send failure, the handler must call retry_with_options with a delay
+# (or return an error) for that message; merely skipping ack() and returning
+# implicitly acknowledges it. Each retry spends one of these four native
+# max_retries slots, after which Cloudflare moves the raw body to the configured
+# dead-letter queue; without dead_letter_queue, Cloudflare drops the message.
+# It is a safety net for messages the handler never settles
+# (panic, timeout): Cloudflare moves the untouched body with no reason envelope.
+# Both shapes redrive via src/retry.rs (`redrive` for DlqEntry,
+# `redrive_raw` for native bodies) after loading a matching Failed checkpoint;
+# see README "Redrive" for raw bodies whose checkpoint is nonterminal.
+# dead_letter_queue = "nntune-ingest-dlq"
 
-# Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
-# exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
+# Workflows: NOT YET. This crate exports no Workflow class, and
+# `[[workflows]]` requires a `class_name`, so
 # any entry here is rejected at deploy. Orchestration until then is Queue
 # redelivery + job checkpoints (src/jobs.rs). Re-add with `class_name` when
 # the Workflow class ships.
@@ -54,13 +114,39 @@ id = "<KV_NAMESPACE_ID>"
 binding = "INGEST_PAYLOADS"
 id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
 
+# Segment probe (code: src/pool_probe.rs). Cross-script binding to the stream
+# Worker's per-user `NntpPool` Durable Object, addressed by
+# `id_from_name(user_id)`; the object has no public route. Deploy the stream
+# Worker (which declares the class) before this one.
+[[durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+script_name = "nntune-stream"
+
+# Verifying scratch staging (code: src/verify.rs, src/queue_consumer.rs).
+# Fetched files are staged under `ingest-scratch/{job_id}/r{round}/in/…`
+# plus a `manifest.json` as the repair handoff; the provisioned bucket's
+# 7-day lifecycle rule on the `ingest-scratch/` prefix is the cleanup
+# backstop (see docs/ops.md). Never bind the archive or audio-cache
+# buckets here.
+[[r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "<INGEST_SCRATCH_BUCKET>"
+
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]
 binding = "INGEST_METER"
 dataset = "nntune_ingest_meter"
 
-# Slice 2: repair dispatch target (code: src/repair.rs). The Container service
-# name lands with the repair runtime; until then this stays a placeholder.
+# Repair dispatch target (code: src/repair.rs): the no-route repair
+# Worker in workers/repair, which fronts the par2 Container.
 [[services]]
 binding = "REPAIR_CONTAINER"
-service = "<REPAIR_CONTAINER_SERVICE>"
+service = "nntune-repair"
+
+# MusicBrainz read API for the Matching step (code: src/matching.rs,
+# src/queue_consumer.rs). The service is the workers/mb Worker
+# (`name = "nntune-mb"` in its wrangler example); deploy it before this one.
+[[services]]
+binding = "MB_API"
+service = "nntune-mb"

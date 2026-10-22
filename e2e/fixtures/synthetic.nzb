@@ -1,23 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Synthetic NZB fixture for the staging E2E (public-domain/CC0-style fake
-  payload: two tiny text segments, no real audio, no real provider data).
-  Segment message-ids match the synthetic NNTP fixture server corpus
-  (sibling card); each segment is 9 bytes so Range seeks are exact.
+  payload: the canonical 660 Hz sine WAV from the synthetic NNTP fixture
+  server corpus, no real audio, no real provider data). The three yEnc
+  segments below reconstruct that 1724-byte generated WAV exactly, so the
+  staging spec's Range seeks (bytes 0-8 and 9-17) stay in bounds.
 -->
-<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
   <head>
     <meta type="title">nntune-e2e-synthetic-track</meta>
     <meta type="tag">nntune-e2e</meta>
   </head>
-  <file poster="e2e@nntune.test" date="1798761600" subject="nntune-e2e-synthetic-track [1/2]">
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-660 [01/03] - &quot;sine-660.wav&quot; yEnc">
     <groups>
       <group>alt.binaries.nntune.test</group>
     </groups>
     <segments>
-      <segment bytes="9" number="1">synthetic-e2e-part1@nntune.test</segment>
-      <segment bytes="9" number="2">synthetic-e2e-part2@nntune.test</segment>
+      <segment bytes="575" number="1">multi-660-part1-of-3@nntune.test</segment>
+      <segment bytes="575" number="2">multi-660-part2-of-3@nntune.test</segment>
+      <segment bytes="574" number="3">multi-660-part3-of-3@nntune.test</segment>
     </segments>
   </file>
 </nzb>

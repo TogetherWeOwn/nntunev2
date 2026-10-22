@@ -1,0 +1,208 @@
+/**
+ * Plan matrix for NNTune v2 billing UI.
+ *
+ * Mirrors the `plans` table shape (ADR 0002) and the accepted tiers
+ * (ADR 0004: Free 14-day trial, Plus, Pro 5x, Pro 20x). Prices and caps are
+ * data here so the table can later be hydrated from `GET /v1/plans` without
+ * changing components. Changing numbers needs no deploy on the backend;
+ * this file is the frontend fallback + contract reference.
+ *
+ * Security: this module is display-only. Enforcement happens server-side
+ * (API worker reads `subscriptions` + `plans` + `usage_ledger` via
+ * Hyperdrive). Never gate access on these client values.
+ */
+
+export type CachePriority = 'low' | 'standard' | 'high' | 'highest';
+
+export interface Plan {
+	id: string;
+	name: string;
+	priceCents: number;
+	streamHoursMonth: number;
+	maxConcurrentStreams: number;
+	maxLibraryTracks: number;
+	ingestJobsDay: number;
+	cachePriority: CachePriority;
+	/** Display-only cache budget in bytes (integer, GiB-denominated). Not enforcement. */
+	cacheBytesBudget: number;
+	/** Display-only cache retention in days. Not enforcement. */
+	cacheRetentionDays: number;
+	blurb: string;
+}
+
+export const PLANS: Plan[] = [
+	{
+		id: 'free',
+		name: 'Free trial',
+		priceCents: 0,
+		streamHoursMonth: 10,
+		maxConcurrentStreams: 1,
+		maxLibraryTracks: 1000,
+		ingestJobsDay: 5,
+		cachePriority: 'low',
+		cacheBytesBudget: 2_147_483_648,
+		cacheRetentionDays: 7,
+		blurb: '14-day trial. Bring your own Usenet provider.'
+	},
+	{
+		id: 'plus',
+		name: 'Plus',
+		priceCents: 800,
+		streamHoursMonth: 100,
+		maxConcurrentStreams: 2,
+		maxLibraryTracks: 25000,
+		ingestJobsDay: 25,
+		cachePriority: 'standard',
+		cacheBytesBudget: 21_474_836_480,
+		cacheRetentionDays: 30,
+		blurb: 'Base paid tier for everyday listening.'
+	},
+	{
+		id: 'pro-5x',
+		name: 'Pro 5x',
+		priceCents: 3000,
+		streamHoursMonth: 500,
+		maxConcurrentStreams: 4,
+		maxLibraryTracks: 100000,
+		ingestJobsDay: 100,
+		cachePriority: 'high',
+		cacheBytesBudget: 107_374_182_400,
+		cacheRetentionDays: 90,
+		blurb: '5x usage for heavy listeners and big libraries.'
+	},
+	{
+		id: 'pro-20x',
+		name: 'Pro 20x',
+		priceCents: 10000,
+		streamHoursMonth: 2000,
+		maxConcurrentStreams: 8,
+		maxLibraryTracks: 500000,
+		ingestJobsDay: 400,
+		cachePriority: 'highest',
+		cacheBytesBudget: 429_496_729_600,
+		cacheRetentionDays: 90,
+		blurb: '20x usage for households and collectors.'
+	}
+];
+
+export function getPlan(id: string): Plan | undefined {
+	return PLANS.find((p) => p.id === id);
+}
+
+export function listPlans(): Plan[] {
+	return [...PLANS];
+}
+
+export function isTrialPlan(id: string): boolean {
+	return id === 'free';
+}
+
+export function formatPrice(plan: Plan): string {
+	if (plan.priceCents === 0) return '$0';
+	return `$${plan.priceCents / 100}`;
+}
+
+export function formatPricePerMonth(plan: Plan): string {
+	if (plan.priceCents === 0) return '$0 · 14 days, then pick a plan';
+	return `$${plan.priceCents / 100}/mo`;
+}
+
+/**
+ * Exposed accessible name for a paid plan's pricing-table button. The name
+ * always carries the plan, so assistive tech can tell the tiers apart even
+ * though the visible label stays a shared "Choose" / "Starting…".
+ */
+export function planButtonName(plan: Plan, pendingPlanId: string | null): string {
+	return pendingPlanId === plan.id ? `Starting ${plan.name}…` : `Choose ${plan.name}`;
+}
+
+/** Stream cap in seconds (plans table stores hours). */
+export function streamCapSeconds(plan: Plan): number {
+	return plan.streamHoursMonth * 3600;
+}
+
+/** Bytes in one GiB; cache budgets are GiB-denominated display metadata. */
+export const GIB_BYTES = 1_073_741_824;
+
+/** Readable cache budget for the pricing table (e.g. "20 GiB"). Display-only. */
+export function formatCacheBudget(plan: Plan): string {
+	return `${plan.cacheBytesBudget / GIB_BYTES} GiB`;
+}
+
+/** Readable cache retention for the pricing table (e.g. "30 days"). Display-only. */
+export function formatCacheRetention(plan: Plan): string {
+	return `${plan.cacheRetentionDays} days`;
+}
+
+/**
+ * Minimal subscription shape for plan resolution. Kept structural (instead
+ * of importing SubscriptionDTO) so this module stays dependency-free.
+ */
+export interface SubscriptionRef {
+	planId: string;
+	status: string;
+	/** Trial deadline (ADR 0004); null/omitted cannot confirm a trial. */
+	trialEndsAt?: string | null;
+	/** End of the past-due grace window (ADR 0002 rule 4); null/omitted when none. */
+	graceUntil?: string | null;
+}
+
+export interface EffectivePlan {
+	plan: Plan;
+	/**
+	 * True when the subscription is missing, unknown, or not entitlement-
+	 * granting: the caller is seeing trial defaults, not the user's real
+	 * plan, and must say so instead of naming a paid tier.
+	 */
+	planUnknown: boolean;
+}
+
+/** A trial is confirmed for display only before a known deadline (ADR 0004). */
+function inTrialWindow(subscription: SubscriptionRef, now: Date): boolean {
+	if (subscription.status !== 'trialing') return false;
+	if (!subscription.trialEndsAt) return false;
+	return new Date(subscription.trialEndsAt).getTime() > now.getTime();
+}
+
+/**
+ * True while a past-due subscription is still inside its grace window
+ * (ADR 0002 rule 4): the server keeps enforcing the real plan's caps, so
+ * the UI must score usage against them too. An unparseable or missing
+ * window fails closed to lapsed.
+ */
+function inGraceWindow(subscription: SubscriptionRef, now: Date): boolean {
+	if (subscription.status !== 'past_due') return false;
+	if (!subscription.graceUntil) return false;
+	return new Date(subscription.graceUntil).getTime() > now.getTime();
+}
+
+/**
+ * Display plan per ADR 0004: a known paid tier while active, a known
+ * trial tier strictly before its deadline, or `past_due` inside its grace
+ * window per ADR 0002 rule 4; the unconfirmed free-trial row otherwise.
+ * This does not enforce access: the server remains authoritative.
+ */
+export function resolveEffectivePlan(
+	subscription: SubscriptionRef | null,
+	now: Date = new Date()
+): EffectivePlan {
+	const plan = subscription ? getPlan(subscription.planId) : undefined;
+	if (
+		subscription &&
+		plan &&
+		((subscription.status === 'active' && plan.id !== 'free') ||
+			inTrialWindow(subscription, now) ||
+			inGraceWindow(subscription, now))
+	) {
+		return { plan, planUnknown: false };
+	}
+	return { plan: getPlan('free')!, planUnknown: true };
+}
+
+/** Next upgrade step for prompts, or null when already at the top. */
+export function nextPlan(id: string): Plan | undefined {
+	const order = ['free', 'plus', 'pro-5x', 'pro-20x'];
+	const idx = order.indexOf(id);
+	if (idx < 0 || idx >= order.length - 1) return undefined;
+	return getPlan(order[idx + 1]);
+}

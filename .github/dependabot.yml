@@ -1,0 +1,253 @@
+# Dependabot version-updates config.
+#
+# Alerts are not updates: Dependabot alerts only notify, they never open a
+# fix on their own. This file makes Dependabot open version-update PRs so
+# vulnerable Actions pins and dependencies actually get fixed.
+#
+# Pinned-checkout-SHA discipline stays: keep `uses: <action>@<full SHA>`
+# with a `# vX.Y.Z` version comment. Dependabot updates the SHA and the
+# comment together -- never replace a SHA pin with a bare tag.
+#
+# One entry per manifest directory: Dependabot takes no globs, and each
+# ecosystem looks only in its configured directory. The root workspace
+# (`Cargo.toml`, members: `crates/nntune-core`) does NOT cover
+# `workers/api`, `workers/ingest`, `workers/mb` or `workers/repair`
+# (excluded standalone crates), so they get their own cargo entries. The batch
+# import image (`containers/mb-import/Dockerfile`, FROM postgres) and the
+# repair image (`containers/repair/Dockerfile`, FROM debian/rust) each get
+# their own docker entry. Rolling codename tags (`debian:bookworm-slim`,
+# `rust:1-bookworm`) carry no numeric version for Dependabot to compare,
+# so a docker entry opens version-tag PRs plus digest-refresh PRs: every
+# FROM carries a tag+digest pin, so base rebuilds arrive as digest-update
+# PRs without changing the tag.
+# npm watches the SvelteKit app (`apps/web`) and the
+# e2e harness (`e2e`), not a top-level `web/`.
+#
+# Lockfiles: tracked at the root and for every standalone Worker crate (see
+# root `.gitignore` negations): `Cargo.lock`, `workers/api/Cargo.lock`,
+# `workers/ingest/Cargo.lock`, `workers/mb/Cargo.lock` and
+# `workers/repair/Cargo.lock`. Each cargo entry therefore sees transitive
+# dependencies and its updates are reviewed lockfile changes.
+#
+# First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
+# `pr-lint`, Paperclip Review) all appear on it before relying on them —
+# automated authorship may not trigger every check. If the review check
+# is missing, a maintainer mentions the reviewer on the PR.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Root workspace (covers crates/nntune-core; workers/* are excluded
+  # standalone crates and get their own entries below).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Standalone worker crates (vault crypto: aes-gcm, hmac; base64).
+  - package-ecosystem: "cargo"
+    directory: "/workers/api"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "cargo"
+    directory: "/workers/ingest"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # MusicBrainz mirror worker (standalone crate, built by the rust-mb job).
+  - package-ecosystem: "cargo"
+    directory: "/workers/mb"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Repair worker (standalone crate, streams staged scratch objects into
+  # the par2 repair Container and back).
+  - package-ecosystem: "cargo"
+    directory: "/workers/repair"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Batch import image (FROM postgres, tag+digest pinned).
+  - package-ecosystem: "docker"
+    directory: "/containers/mb-import"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Repair image (FROM debian, rust, both tag+digest pinned): rolling
+  # codename tags, so this entry tracks version-tag bumps plus digest
+  # refreshes for base rebuilds (see header). Pinned by .github/scripts/check_dependabot_coverage.py.
+  - package-ecosystem: "docker"
+    directory: "/containers/repair"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "npm"
+    directory: "/e2e"
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # @types/node major must track the Node runtime in ci.yml (e2e-lint)
+    # and e2e-staging.yml; bump it manually alongside node-version.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]

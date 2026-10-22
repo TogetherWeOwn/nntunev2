@@ -19,16 +19,20 @@ serverless; batch runs in Containers.
    replication bookkeeping). Full 30+ table MusicBrainz schema is out of
    scope; the mirror stores what lookup + search need.
 2. **Initial import** runs as a Cloudflare Container batch job (`mbdump`
-   dumps → Postgres `COPY`). It is idempotent and resumable by dump file.
+   dumps → Postgres `COPY`). It is idempotent and resumable by line-range
+   chunk (`mb_import_cursor`), with poison rows in `mb_import_dlq`.
 3. **Hourly replication** applies MusicBrainz replication packets via a
    scheduled Container/Workflow. SLO: **replication lag < 2 h** (packet
    applied within 2 h of publication); lag is recorded per packet.
 4. **Read API** lives in `workers/mb` (Rust `workers-rs`): MBID lookup for
    artist / release / recording plus trigram search, over Hyperdrive, with
    KV / Cache API caching. See `workers/mb/README.md`.
-5. **Cover art** is cached in R2 bucket `nntunev2-art` (derived renditions
-   per ADR 0003); the mirror stores only CAA URLs/hashes, never hotlinks
-   at request time without cache.
+5. **Cover art** is cached in the per-environment R2 art buckets
+   `nntunev2-art-staging` / `nntunev2-art-prod` (derived renditions per
+   ADR 0003; inventory in `docs/ops.md`); the mirror stores only CAA
+   URLs/hashes, never hotlinks at request time without cache. Env-correct
+   public URLs are deferred until the R2 bindings and public hosts are
+   activated.
 6. **Terms:** core data is CC0 (no attribution required, credit given
    anyway); commercial use notes the MetaBrainz support tier. CAA images
    follow upstream licence terms per image.

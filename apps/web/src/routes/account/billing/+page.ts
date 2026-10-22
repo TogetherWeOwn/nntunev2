@@ -1,0 +1,144 @@
+import type { PageLoad } from './$types';
+import {
+	BillingApiError,
+	fetchSubscription,
+	fetchUsage,
+	type SubscriptionDTO
+} from '#lib/billing/billingClient.js';
+import { getPlan, resolveEffectivePlan } from '#lib/billing/plans.js';
+import { evaluateUsage, type LimitStatus, type UsageSnapshot } from '#lib/billing/usage.js';
+
+export type UsageDTO = UsageSnapshot & { period: string };
+
+/**
+ * Stored subscription states without entitlement (ADR 0002 data-model,
+ * ADR 0005 billing table): portal, never checkout. `unpaid`/`paused` keep
+ * the reserved slot and `incomplete_expired` has released it, but all
+ * three still owe the portal — never a second subscription.
+ */
+const LAPSED = new Set([
+	'past_due',
+	'canceled',
+	'unpaid',
+	'paused',
+	'incomplete',
+	'incomplete_expired'
+]);
+
+interface LoadOutcome<T> {
+	value: T | null;
+	/** HTTP status when the call failed with one; null for network failures. */
+	status: number | null;
+	failed: boolean;
+}
+
+async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
+	try {
+		return { value: await read(), status: null, failed: false };
+	} catch (err) {
+		return {
+			value: null,
+			status: err instanceof BillingApiError ? err.status : null,
+			failed: true
+		};
+	}
+}
+
+/**
+ * Billing page loader. Backend endpoints are implemented by sibling cards.
+ *
+ * The plan is never invented: without an entitlement-granting subscription
+ * the page shows trial defaults and says so (ADR 0004). Usage is scored
+ * against caps only when the plan is confirmed — otherwise no usage alert
+ * or upgrade button is rendered, because the caps being compared against
+ * would be the wrong plan's. Lapsed subscriptions (past_due / canceled /
+ * unpaid / paused / incomplete / incomplete_expired) resolve to the
+ * billing portal, never to a new
+ * checkout, so a paying user can neither be downgraded nor double-subscribed.
+ * A 401 is reported as signed-out, not as an outage. No secrets here —
+ * session cookie only.
+ *
+ * Client-rendered on purpose (`ssr = false`): this page is session-gated,
+ * so SSR buys nothing, and a server-side `fetch('/v1/...')` never leaves
+ * the web worker (SvelteKit internal fetch) — it 404s against the app's
+ * own routes instead of reaching the API worker. In the browser the same
+ * relative URLs go over the network through the edge route table.
+ */
+export const ssr = false;
+
+export const load: PageLoad = async ({ fetch }) => {
+	// Independent reads share one deadline window; loadOne keeps failures isolated.
+	const [sub, use] = await Promise.all([
+		loadOne(() => fetchSubscription(fetch)),
+		loadOne(() => fetchUsage(fetch))
+	]);
+
+	// A 404 on the subscription is a failure, not "no record yet": signup
+	// always writes a trialing row (ADR 0002 rule 4), so a missing record
+	// means the backend didn't answer — surface the notice with a Retry.
+	// A 404 on usage stays non-fatal: a fresh account may genuinely have
+	// nothing metered yet, and the meters simply don't render.
+	const subscription: SubscriptionDTO | null = sub.value;
+	const usage: UsageDTO | null = use.status === 404 ? null : use.value;
+	// Limit statuses are already surfaced by the global paywall listener; do
+	// not stack a generic billing-outage notice beside it. A 429 still needs
+	// the page Retry control once its countdown allows another attempt.
+	const isLimitStatus = (status: number | null) => status === 402 || status === 429;
+	const retryableLimit = sub.status === 429 || use.status === 429;
+	const subFailed = sub.failed && !isLimitStatus(sub.status);
+	const usageFailed = use.failed && use.status !== 404 && !isLimitStatus(use.status);
+	const signedOut = sub.status === 401 || use.status === 401;
+
+	const { plan, planUnknown } = resolveEffectivePlan(subscription);
+	const manageBillingOnly = subscription !== null && LAPSED.has(subscription.status);
+	let usageStatus: LimitStatus | null =
+		!planUnknown && usage ? evaluateUsage(plan, usage) : null;
+	// Portal-only: clearing the upgrade target keeps usage scored for display
+	// while the page renders Manage billing as the sole action. A lapsed
+	// subscriber must never start a new checkout — that would double-subscribe
+	// them next to the invoice they already owe.
+	if (manageBillingOnly && usageStatus) usageStatus = { ...usageStatus, upgradeTo: null };
+
+	const notices: string[] = [];
+	if (signedOut) {
+		notices.push('You are signed out — sign in to see your billing.');
+	} else if (subFailed && usageFailed) {
+		notices.push('Billing backend is not reachable yet — showing trial defaults.');
+	} else {
+		if (subFailed)
+			notices.push('Could not load your subscription — showing trial defaults.');
+		else if (planUnknown && subscription) {
+			const unconfirmedTrial =
+				subscription.status === 'trialing' ||
+				(subscription.status === 'active' && subscription.planId === 'free');
+			notices.push(
+				unconfirmedTrial
+					? 'Your trial has ended or could not be confirmed — manage billing to confirm your plan; showing trial defaults.'
+					: `Subscription is ${subscription.status} — manage billing to resolve; showing trial limits meanwhile.`
+			);
+		} else if (manageBillingOnly && subscription)
+			// Only reachable for in-grace past_due: every other lapsed state
+			// is planUnknown, and only past_due has a grace window. The plan
+			// is confirmed so no other notice renders, yet the failed payment
+			// still needs attention before the window closes.
+			notices.push(
+				'Your last payment failed — manage billing to resolve; your plan stays active during the grace period.'
+			);
+		if (usageFailed) notices.push('Could not load usage.');
+	}
+
+	// Keep a known stored billing tier for portal-only states without granting
+	// entitlement or scoring usage against that tier.
+	const billingPlan = manageBillingOnly && subscription ? getPlan(subscription.planId) : undefined;
+	return {
+		planId: billingPlan?.id ?? plan.id,
+		planUnknown,
+		signedOut,
+		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),
+		manageBillingOnly,
+		subscription,
+		usage,
+		usageStatus,
+		loadError: notices.length > 0 ? notices.join(' ') : null
+	};
+};

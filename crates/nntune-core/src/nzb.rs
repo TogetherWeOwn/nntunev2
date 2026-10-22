@@ -15,11 +15,32 @@
 //!   shared core.
 //! - Timestamps are Unix seconds (`i64`), not calendar types: no `time`/`chrono`
 //!   dependency on wasm.
+//
+//! ## Subject metadata contract
+//!
+//! [`File::filename`], [`File::role`] and [`File::container`] all derive from
+//! one selected filename token, never from unrelated subject prose:
+//!
+//! - `filename` is the first complete, nonempty double-quoted span. Empty
+//!   quote pairs are skipped; a dangling quote ends the scan, so it can
+//!   neither extend a selected filename nor produce one. With no complete
+//!   nonempty span, `filename` is `None`.
+//! - `role`/`container` come from that filename's supported terminal
+//!   extension (case-insensitive), or — when `filename` is `None` — from the
+//!   first whitespace-separated token carrying a supported terminal
+//!   extension. Commentary mentioning another extension cannot reclassify
+//!   the file, and an earlier non-terminal suffix (e.g. the `.flac` in
+//!   `track.flac.par2`) is ignored.
+//! - Anything else yields `role = "unknown"`, `container = "other"`. The
+//!   supported set is fixed: `par2`, `rar`/`r00`/`7z`, `flac`/`opus`/`mp3`,
+//!   `nfo`, `cue`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 
-use quick_xml::events::Event;
+use quick_xml::escape::resolve_xml_entity;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
 use sha2::{Digest, Sha256};
 
@@ -107,11 +128,14 @@ pub struct File {
     pub ordinal: usize,
     /// Raw `subject=` attribute.
     pub subject: String,
-    /// Filename guessed from the first/last quoted span of the subject.
+    /// First complete, nonempty double-quoted span of the subject; `None`
+    /// when the subject carries no such span (see the module contract).
     pub filename: Option<String>,
-    /// Coarse role (`par2`, `nfo`, `archive`, `content`, `unknown`, …).
+    /// Coarse role from the selected filename token's terminal extension
+    /// (`par2`, `nfo`, `cue`, `archive`, `content`, `unknown`).
     pub role: String,
-    /// Container hint (`flac`, `mp3`, `rar`, `par2`, `other`, …).
+    /// Container hint from the same token (`flac`, `opus`, `mp3`, `rar`,
+    /// `7z`, `par2`, `other`).
     pub container: String,
     /// `date=` attribute as Unix seconds.
     pub posted_at_unix: i64,
@@ -404,11 +428,12 @@ impl Parser {
         if subject.trim().is_empty() {
             return Err(Error::Malformed(format!("file {ordinal} has no subject")));
         }
+        let (filename, role, container) = subject_metadata(&subject);
         let mut file = File {
             ordinal,
-            role: classify_role(&subject),
-            container: classify_container(&subject),
-            filename: filename_from_subject(&subject),
+            role,
+            container,
+            filename,
             subject,
             posted_at_unix: date,
             segments: Vec::new(),
@@ -669,22 +694,33 @@ fn parse_segment<R: BufRead>(
             ))
         })?;
 
+    // The reader trims each Text event independently, which would silently
+    // delete whitespace adjacent to a reference or CDATA section from the
+    // middle of the ID; the whitespace rejection must see the true
+    // resolved text. Accumulate untrimmed and let `normalize_message_id`
+    // refuse any padding. Error returns abort the whole parse, so the saved
+    // settings only need restoring on the success path below.
+    let saved_trim = (
+        reader.config().trim_text_start,
+        reader.config().trim_text_end,
+    );
+    reader.config_mut().trim_text(false);
     let mut text = String::new();
     loop {
         match reader.read_event_into(buf) {
             Ok(Event::Text(e)) => {
-                let chunk = e.xml10_content();
-                if text.len() + chunk.len() > MAX_SEGMENT_TEXT_BYTES {
-                    return Err(Error::Malformed("segment text is too large".into()));
-                }
-                text.push_str(&chunk);
+                push_segment_text(&mut text, &e.xml10_content())?;
             }
             Ok(Event::CData(e)) => {
                 let chunk: &str = e.as_ref();
-                if text.len() + chunk.len() > MAX_SEGMENT_TEXT_BYTES {
-                    return Err(Error::Malformed("segment text is too large".into()));
-                }
-                text.push_str(chunk);
+                push_segment_text(&mut text, chunk)?;
+            }
+            Ok(Event::GeneralRef(e)) => {
+                // Character/predefined references are part of the ID text:
+                // resolve them (expanded output counts against the same
+                // bound) instead of silently dropping them.
+                let resolved = resolve_segment_reference(&e)?;
+                push_segment_text(&mut text, &resolved)?;
             }
             Ok(Event::End(e)) => {
                 if local_name(&e.name()) != "segment" {
@@ -722,12 +758,79 @@ fn parse_segment<R: BufRead>(
         }
         buf.clear();
     }
+    reader.config_mut().trim_text_start = saved_trim.0;
+    reader.config_mut().trim_text_end = saved_trim.1;
     Ok(Segment {
         ordinal,
         number,
         message_id: normalize_message_id(&text)?,
         encoded_bytes,
     })
+}
+
+/// Appends one piece of `<segment>` character data, enforcing
+/// [`MAX_SEGMENT_TEXT_BYTES`] on the accumulated (already reference-expanded)
+/// text.
+fn push_segment_text(text: &mut String, chunk: &str) -> Result<()> {
+    if chunk.len() > MAX_SEGMENT_TEXT_BYTES - text.len() {
+        return Err(Error::Malformed("segment text is too large".into()));
+    }
+    text.push_str(chunk);
+    Ok(())
+}
+
+/// Resolves a `&...;` reference inside `<segment>` text.
+///
+/// Only decimal/hex character references and the five predefined XML
+/// entities (`lt`, `gt`, `amp`, `apos`, `quot`) resolve; DTDs are rejected
+/// before this point, so nothing else is defined — unknown names, malformed
+/// numbers, non-scalars and characters outside the XML 1.0 `Char`
+/// production are explicit errors, never empty text. No external or
+/// network resolution is ever attempted.
+fn resolve_segment_reference(reference: &BytesRef<'_>) -> Result<Cow<'static, str>> {
+    if reference.is_char_ref() {
+        // `resolve_char_ref` also errors on malformed numbers, surrogates,
+        // code points above U+10FFFF and NUL, but does not enforce the
+        // XML 1.0 legal-char production (e.g. U+FFFE).
+        let ch = reference
+            .resolve_char_ref()
+            .map_err(|e| {
+                Error::Malformed(format!(
+                    "invalid character reference &{}; in segment: {e}",
+                    reference.as_ref()
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "invalid character reference &{}; in segment",
+                    reference.as_ref()
+                ))
+            })?;
+        if !matches!(
+            ch,
+            '\u{9}'
+                | '\u{a}'
+                | '\u{d}'
+                | '\u{20}'..='\u{d7ff}'
+                | '\u{e000}'..='\u{fffd}'
+                | '\u{10000}'..='\u{10ffff}'
+        ) {
+            return Err(Error::Malformed(format!(
+                "character reference &{}; is not a valid XML 1.0 character",
+                reference.as_ref()
+            )));
+        }
+        let mut buf = [0u8; 4];
+        return Ok(Cow::Owned(ch.encode_utf8(&mut buf).to_string()));
+    }
+    resolve_xml_entity(reference.as_ref())
+        .map(Cow::Borrowed)
+        .ok_or_else(|| {
+            Error::Malformed(format!(
+                "unknown entity reference &{}; in segment",
+                reference.as_ref()
+            ))
+        })
 }
 
 fn local_name(name: &quick_xml::name::QName<'_>) -> String {
@@ -759,24 +862,30 @@ fn is_password_meta(name: &str, attrs: &HashMap<String, String>) -> bool {
             .is_some_and(|t| t.eq_ignore_ascii_case("password"))
 }
 
-/// Normalises a Message-ID to its bare form (no brackets, no surrounding
-/// whitespace). Mirrors v1's `NormalizeMessageID`.
+/// Accepts a Message-ID only when it is already bare: non-empty, at most
+/// 998 bytes, no `<`/`>`, and no whitespace or control bytes anywhere —
+/// never trimmed, unbracketed, or otherwise transformed, so a refused
+/// spelling can never become an accepted identity downstream.
+///
+/// This is the structural parse bound (it also admits shapes the wire
+/// rule refuses, such as `@`-less tokens and 251..=998-byte ids); the
+/// shared 250-byte wire-identity ceiling and the exactly-one-`@` shape
+/// are enforced after parsing by
+/// [`segment_identity::valid_segment_id`](crate::segment_identity::valid_segment_id).
+/// Use that for identity validation; this function only guards the
+/// parser's structural output.
 pub fn normalize_message_id(value: &str) -> Result<String> {
-    let mut id = value.trim().to_string();
-    if id.starts_with('<') && id.ends_with('>') && id.len() >= 2 {
-        id = id[1..id.len() - 1].trim().to_string();
-    }
-    if id.is_empty() || id.len() > 998 || id.contains(['<', '>']) {
+    if value.is_empty() || value.len() > 998 || value.contains(['<', '>']) {
         return Err(Error::Malformed(
             "Message-ID must be bare, non-empty, and at most 998 bytes".into(),
         ));
     }
-    if id.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if value.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(Error::Malformed(
             "Message-ID contains whitespace or a control byte".into(),
         ));
     }
-    Ok(id)
+    Ok(value.to_string())
 }
 
 /// SHA-256 over sorted Message-IDs with 4-byte big-endian length prefixes.
@@ -799,49 +908,183 @@ pub fn digest_message_ids(message_ids: &[String]) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
+/// Filename plus role/container hints from one selected subject token.
+///
+/// The quoted filename (first complete, nonempty `"…"` span) supplies the
+/// hints when present; otherwise the first whitespace-separated token with
+/// a supported terminal extension does. See the module contract.
+fn subject_metadata(subject: &str) -> (Option<String>, String, String) {
+    let filename = filename_from_subject(subject);
+    let hint_source = filename.as_deref().or_else(|| unquoted_hint_token(subject));
+    let (role, container) = hint_source
+        .and_then(terminal_extension)
+        .and_then(|ext| classify_extension(&ext))
+        .unwrap_or(("unknown", "other"));
+    (filename, role.to_string(), container.to_string())
+}
+
+/// First complete, nonempty double-quoted span. Empty pairs are skipped; a
+/// dangling quote ends the scan because no complete span can follow it.
 fn filename_from_subject(subject: &str) -> Option<String> {
-    let first = subject.find('"')?;
-    let last = subject.rfind('"')?;
-    if last <= first + 1 {
+    // `"` is one byte, so byte indexing around it is always on a boundary.
+    let mut rest = subject;
+    while let Some(open) = rest.find('"') {
+        let after_open = &rest[open + 1..];
+        let close = after_open.find('"')?;
+        let span = &after_open[..close];
+        if !span.is_empty() {
+            return Some(span.to_string());
+        }
+        rest = &after_open[close + 1..];
+    }
+    None
+}
+
+/// First token carrying a supported terminal extension. Quotes split tokens
+/// as well as whitespace so broken quoting cannot glue tokens together.
+fn unquoted_hint_token(subject: &str) -> Option<&str> {
+    subject
+        .split(|c: char| c.is_whitespace() || c == '"')
+        .filter(|token| !token.is_empty())
+        .find(|token| {
+            terminal_extension(token).is_some_and(|ext| classify_extension(&ext).is_some())
+        })
+}
+
+/// Lowercased text after the final `.`; `None` when there is no dot or the
+/// suffix is empty.
+fn terminal_extension(name: &str) -> Option<String> {
+    let dot = name.rfind('.')?;
+    let ext = &name[dot + 1..];
+    if ext.is_empty() {
         return None;
     }
-    Some(subject[first + 1..last].to_string())
+    Some(ext.to_lowercase())
 }
 
-fn classify_role(subject: &str) -> String {
-    let lower = subject.to_lowercase();
-    if lower.contains(".par2") {
-        "par2"
-    } else if lower.contains(".nfo") {
-        "nfo"
-    } else if lower.contains(".cue") {
-        "cue"
-    } else if lower.contains(".rar") || lower.contains(".7z") || lower.contains(".r00") {
-        "archive"
-    } else if lower.contains(".flac") || lower.contains(".opus") || lower.contains(".mp3") {
-        "content"
-    } else {
-        "unknown"
+/// Supported terminal extensions to `(role, container)`. The set is fixed:
+/// no new formats are implied by subject metadata.
+fn classify_extension(ext: &str) -> Option<(&'static str, &'static str)> {
+    match ext {
+        "par2" => Some(("par2", "par2")),
+        "rar" | "r00" => Some(("archive", "rar")),
+        "7z" => Some(("archive", "7z")),
+        "flac" => Some(("content", "flac")),
+        "opus" => Some(("content", "opus")),
+        "mp3" => Some(("content", "mp3")),
+        "nfo" => Some(("nfo", "other")),
+        "cue" => Some(("cue", "other")),
+        _ => None,
     }
-    .to_string()
 }
 
-fn classify_container(subject: &str) -> String {
-    let lower = subject.to_lowercase();
-    if lower.contains(".flac") {
-        "flac"
-    } else if lower.contains(".opus") {
-        "opus"
-    } else if lower.contains(".mp3") {
-        "mp3"
-    } else if lower.contains(".rar") || lower.contains(".r00") {
-        "rar"
-    } else if lower.contains(".7z") {
-        "7z"
-    } else if lower.contains(".par2") {
-        "par2"
-    } else {
-        "other"
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_extension, filename_from_subject, subject_metadata, terminal_extension,
+        unquoted_hint_token,
+    };
+
+    #[test]
+    fn filename_selects_first_complete_nonempty_span() {
+        assert_eq!(
+            filename_from_subject(r#"a "01 track.flac" yEnc "note" (1/3)"#),
+            Some("01 track.flac".to_string())
+        );
+        assert_eq!(
+            filename_from_subject(r#"a "" - "track.flac" yEnc"#),
+            Some("track.flac".to_string())
+        );
+        assert_eq!(
+            filename_from_subject(r#"a "track.flac" yEnc "unfinished"#),
+            Some("track.flac".to_string())
+        );
     }
-    .to_string()
+
+    #[test]
+    fn filename_falls_back_to_none_without_panicking() {
+        for subject in [
+            "no quotes at all",
+            r#"Album "" yEnc"#,
+            r#"Album "" yEnc """#,
+            r#"Album "unfinished"#,
+            r#"Album "" yEnc "unfinished"#,
+            r#""""#,
+            r#"" lone"#,
+        ] {
+            assert_eq!(filename_from_subject(subject), None, "{subject:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_extension_reads_only_the_final_suffix() {
+        assert_eq!(
+            terminal_extension("track.flac.par2"),
+            Some("par2".to_string())
+        );
+        assert_eq!(terminal_extension("Track.FlAc"), Some("flac".to_string()));
+        assert_eq!(terminal_extension("no-dot"), None);
+        assert_eq!(terminal_extension("trailing."), None);
+    }
+
+    #[test]
+    fn unquoted_scan_ignores_broken_quoting_and_segment_counts() {
+        assert_eq!(
+            unquoted_hint_token("Some Album - 01 track.flac (1/2)"),
+            Some("track.flac")
+        );
+        assert_eq!(unquoted_hint_token("Album without a filename"), None);
+        assert_eq!(unquoted_hint_token(r#"Album "" yEnc "unfinished"#), None);
+    }
+
+    #[test]
+    fn unquoted_hint_selects_first_supported_token() {
+        // Dotted prose (versions, site names) and later supported tokens must
+        // not win: the first token with a supported terminal extension does.
+        for (subject, token) in [
+            (
+                "Album v2.0 - track.flac repair.par2 (1/2)",
+                Some("track.flac"),
+            ),
+            ("www.example.com - track.flac (1/2)", Some("track.flac")),
+        ] {
+            assert_eq!(unquoted_hint_token(subject), token, "{subject:?}");
+            assert_eq!(
+                subject_metadata(subject),
+                (None, "content".to_string(), "flac".to_string()),
+                "{subject:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_set_is_closed() {
+        assert_eq!(classify_extension("par2"), Some(("par2", "par2")));
+        assert_eq!(classify_extension("rar"), Some(("archive", "rar")));
+        assert_eq!(classify_extension("r00"), Some(("archive", "rar")));
+        assert_eq!(classify_extension("7z"), Some(("archive", "7z")));
+        assert_eq!(classify_extension("flac"), Some(("content", "flac")));
+        assert_eq!(classify_extension("opus"), Some(("content", "opus")));
+        assert_eq!(classify_extension("mp3"), Some(("content", "mp3")));
+        assert_eq!(classify_extension("nfo"), Some(("nfo", "other")));
+        assert_eq!(classify_extension("cue"), Some(("cue", "other")));
+        assert_eq!(classify_extension("txt"), None);
+        assert_eq!(classify_extension("bak"), None);
+    }
+
+    #[test]
+    fn metadata_bundles_filename_role_and_container() {
+        assert_eq!(
+            subject_metadata(r#"Album - "track.flac.par2" yEnc"#),
+            (
+                Some("track.flac.par2".to_string()),
+                "par2".to_string(),
+                "par2".to_string()
+            )
+        );
+        assert_eq!(
+            subject_metadata("Some Album - track.flac.bak (1/3)"),
+            (None, "unknown".to_string(), "other".to_string())
+        );
+    }
 }

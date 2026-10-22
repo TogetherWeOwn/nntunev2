@@ -1,0 +1,111 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+	BillingApiError,
+	openPortal,
+	signupUrlForCheckoutFailure,
+	startCheckout
+} from './billingClient';
+
+function ok(body: unknown): Response {
+	return new Response(JSON.stringify(body), { status: 200 });
+}
+
+describe('billingClient redirects', () => {
+	it('returns the checkout url for a valid plan', async () => {
+		const fetchFn = vi.fn(async () => ok({ url: 'https://checkout.stripe.com/c/pay_123' }));
+		await expect(startCheckout('plus', fetchFn as typeof fetch)).resolves.toBe(
+			'https://checkout.stripe.com/c/pay_123'
+		);
+		expect(fetchFn).toHaveBeenCalledOnce();
+	});
+
+	it('rejects invalid plan ids before any request', async () => {
+		const fetchFn = vi.fn();
+		await expect(startCheckout('../etc', fetchFn as typeof fetch)).rejects.toThrow('Invalid plan');
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
+	it('rejects non-https redirect targets', async () => {
+		const fetchFn = vi.fn(async () => ok({ url: 'javascript:alert(1)' }));
+		await expect(startCheckout('plus', fetchFn as typeof fetch)).rejects.toThrow(
+			'Invalid checkout URL'
+		);
+	});
+
+	it('rejects scheme-without-authority URLs that parse to an allowlisted host', async () => {
+		// `new URL('https:checkout.stripe.com/...')` reports the allowlisted host,
+		// but assigning that string to location.href resolves against the app
+		// origin — so it must reject before any redirect assignment happens.
+		const fetchFn = vi.fn(async () => ok({ url: 'https:checkout.stripe.com/c/pay_1' }));
+		const location = { href: 'https://app.example/pricing' };
+		const attempt = (async () => {
+			location.href = await startCheckout('plus', fetchFn as typeof fetch);
+		})();
+		const failure: unknown = await attempt.then(
+			() => location.href,
+			(e: unknown) => e
+		);
+		expect(failure).toBeInstanceOf(BillingApiError);
+		expect((failure as BillingApiError).retryable).toBe(false);
+		expect((failure as BillingApiError).message).toContain('Invalid checkout URL');
+		expect(location.href).toBe('https://app.example/pricing');
+	});
+
+	it('rejects scheme-without-authority portal URLs', async () => {
+		const fetchFn = vi.fn(async () => ok({ url: 'https:billing.stripe.com/p/session_1' }));
+		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('Invalid portal URL');
+	});
+
+	it('returns the portal url', async () => {
+		const fetchFn = vi.fn(async () => ok({ url: 'https://billing.stripe.com/p/session_1' }));
+		await expect(openPortal(fetchFn as typeof fetch)).resolves.toBe(
+			'https://billing.stripe.com/p/session_1'
+		);
+	});
+
+	it('carries envelope code and retryable on billing failures', async () => {
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ code: 'plan_limit_exceeded', message: 'plan limit reached', retryable: false }),
+					{ status: 402 }
+				)
+		);
+		const failure = await openPortal(fetchFn as typeof fetch).catch((e: unknown) => e);
+		expect(failure).toBeInstanceOf(BillingApiError);
+		expect((failure as BillingApiError).code).toBe('plan_limit_exceeded');
+		expect((failure as BillingApiError).retryable).toBe(false);
+		expect((failure as BillingApiError).status).toBe(402);
+	});
+
+	it('surfaces server errors without leaking bodies', async () => {
+		const fetchFn = vi.fn(
+			async () => new Response(JSON.stringify({ error: 'no such subscription' }), { status: 404 })
+		);
+		await expect(openPortal(fetchFn as typeof fetch)).rejects.toThrow('404');
+	});
+
+	it('attaches the paywall model to limit errors for caller handling', async () => {
+		const fetchFn = vi.fn(
+			async () => new Response(JSON.stringify({ code: 'plan_limit_exceeded' }), { status: 402 })
+		);
+		const request = openPortal(fetchFn as typeof fetch);
+		await expect(request).rejects.toMatchObject({
+			status: 402,
+			paywall: { kind: 'terminal', code: 'plan_limit_exceeded' }
+		});
+	});
+});
+
+describe('signupUrlForCheckoutFailure', () => {
+	it('routes a 401 to signup with the chosen plan', () => {
+		expect(signupUrlForCheckoutFailure('pro-5x', new BillingApiError(401, 'Start checkout'))).toBe(
+			'/signup?plan=pro-5x'
+		);
+	});
+
+	it('returns null for non-401 failures and non-API errors', () => {
+		expect(signupUrlForCheckoutFailure('plus', new BillingApiError(500, 'Start checkout'))).toBeNull();
+		expect(signupUrlForCheckoutFailure('plus', new Error('nope'))).toBeNull();
+	});
+});

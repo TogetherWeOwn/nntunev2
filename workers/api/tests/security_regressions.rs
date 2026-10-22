@@ -5,8 +5,10 @@
 //! is contacted. These tests do not verify HTTP adapters, database concurrency,
 //! WebAuthn signatures, or connection-time DNS pinning.
 
-use hmac::{Hmac, Mac};
+use base64::Engine as _;
+use hmac::{Hmac, KeyInit, Mac};
 use nntune_api::{auth, session, vault};
+use nntune_ssrf_guard::{FORBIDDEN_VECTORS, PUBLIC_CONTROL_VECTORS};
 use sha2::Sha256;
 use std::{cell::RefCell, future::Future, net::IpAddr, task::Poll};
 
@@ -38,6 +40,7 @@ fn provider() -> vault::ProviderConfig {
         username: "synthetic-user".into(),
         password: "synthetic-password".into(),
         max_connections: 4,
+        allow_insecure_plaintext: false,
     }
 }
 
@@ -60,38 +63,66 @@ fn assert_rejected_targets(addresses: &[&str]) {
     );
 }
 
+/// Shared vectors (single owner `nntune_ssrf_guard`): every required
+/// family is rejected by both the provider and indexer validators, and
+/// every public control validates. No literal here may be copied from the
+/// shared table: forbidden and public addresses come from the imports
+/// above; the family-specific tests below keep only non-overlapping variants.
 #[test]
-fn targets_reject_six_to_four() {
-    for address in ["2002::1", "2002:a00:1::1", "2002:ffff:ffff:ffff::1"] {
-        assert_rejected_targets(&[address]);
+fn shared_vectors_reject_forbidden_and_allow_public() {
+    for raw in FORBIDDEN_VECTORS {
+        assert_rejected_targets(&[raw]);
+    }
+    for raw in PUBLIC_CONTROL_VECTORS {
+        let resolver = dns(&[raw]);
+        assert!(
+            provider().validate(&resolver).is_ok(),
+            "public control rejected: {raw}"
+        );
+        assert!(
+            indexer().validate(&resolver).is_ok(),
+            "public control rejected: {raw}"
+        );
     }
 }
 
 #[test]
+fn targets_reject_six_to_four() {
+    // The shared 6to4 vector (`FORBIDDEN_VECTORS`) is covered by
+    // `shared_vectors_reject_forbidden_and_allow_public`; keep only
+    // non-overlapping variants here.
+    for address in ["2002::1", "2002:ffff:ffff:ffff::1"] {
+        assert_rejected_targets(&[address]);
+    }
+    assert_rejected_targets(&[FORBIDDEN_VECTORS[1]]);
+}
+
+#[test]
 fn targets_reject_teredo_and_orchid_special_use_block() {
+    // The shared Teredo vector is covered by the shared test; keep only
+    // non-overlapping variants here.
     for address in [
         "2001::1",
-        "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         "2001:10::1",
         "2001:20::1",
         "2001:1ff:ffff:ffff::1",
     ] {
         assert_rejected_targets(&[address]);
     }
+    assert_rejected_targets(&[FORBIDDEN_VECTORS[3]]);
 }
 
 #[test]
 fn targets_reject_other_ipv6_transition_and_special_use_ranges() {
+    // Shared mapped / NAT64 / documentation vectors are covered by the
+    // shared test; keep only non-overlapping variants here.
     for address in [
-        "64:ff9b::5db8:d822",   // NAT64 well-known prefix, public IPv4 payload.
-        "64:ff9b:1::a00:1",     // NAT64 local-use prefix.
-        "::ffff:93.184.216.34", // IPv4-mapped, even with a public payload.
+        "64:ff9b:1::a00:1", // NAT64 local-use prefix.
         "::ffff:10.0.0.1",
         "::ffff:0:5db8:d822", // IPv4-translated.
         "::93.184.216.34",    // IPv4-compatible.
         "fec0::1",            // Deprecated site-local.
         "100::1",             // Discard-only.
-        "2001:db8::1",        // Documentation.
         "3fff::1",            // Documentation.
         "::",
         "::1",
@@ -101,16 +132,25 @@ fn targets_reject_other_ipv6_transition_and_special_use_ranges() {
     ] {
         assert_rejected_targets(&[address]);
     }
+    for raw in [
+        FORBIDDEN_VECTORS[0],
+        FORBIDDEN_VECTORS[2],
+        FORBIDDEN_VECTORS[4],
+    ] {
+        assert_rejected_targets(&[raw]);
+    }
 }
 
 #[test]
 fn targets_reject_mixed_public_and_private_dns_answers() {
+    // Public controls and the shared 6to4 vector come from the shared
+    // table (no literal copies); the private partners stay literal.
     for addresses in [
-        ["93.184.216.34", "10.0.0.5"],
-        ["10.0.0.5", "93.184.216.34"],
-        ["2606:4700:4700::1111", "fe80::1"],
-        ["fe80::1", "2606:4700:4700::1111"],
-        ["93.184.216.34", "2002:a00:1::1"],
+        [PUBLIC_CONTROL_VECTORS[0], "10.0.0.5"],
+        ["10.0.0.5", PUBLIC_CONTROL_VECTORS[0]],
+        [PUBLIC_CONTROL_VECTORS[1], "fe80::1"],
+        ["fe80::1", PUBLIC_CONTROL_VECTORS[1]],
+        [PUBLIC_CONTROL_VECTORS[0], FORBIDDEN_VECTORS[1]],
     ] {
         assert_rejected_targets(&addresses);
     }
@@ -122,12 +162,123 @@ fn targets_reject_empty_dns_answers() {
 }
 
 #[test]
+fn nntp_port_allowlist_rejects_non_allowlisted_public_ports() {
+    // F-VAULT-03 Gap 1: only 119/563 (plus documented alternates) may be
+    // saved or dialed. A public-host answer on any other port is Invalid
+    // at both save time (`validate`) and the pool dial site
+    // (`authorize_pool_dial`) — otherwise `test connection` is a port-scan
+    // primitive aimed at 22/25/3306/6379/....
+    let public = dns(&["93.184.216.34"]);
+    for port in [119u16, 563] {
+        let cfg = vault::ProviderConfig { port, ..provider() };
+        assert!(
+            cfg.validate(&public).is_ok(),
+            "allowlisted port rejected at save: {port}"
+        );
+        let target = vault::authorize_pool_dial(HOST, port, &public)
+            .expect("allowlisted port rejected at dial");
+        assert_eq!(target.port(), port, "dial pins the vetted port");
+        assert_eq!(target.host(), HOST);
+    }
+    for port in [
+        0u16, 1, 22, 25, 80, 443, 1190, 3306, 6379, 8080, 8443, 65535,
+    ] {
+        let cfg = vault::ProviderConfig { port, ..provider() };
+        assert!(
+            cfg.validate(&public).is_err(),
+            "non-allowlisted port saved: {port}"
+        );
+        assert!(
+            vault::authorize_pool_dial(HOST, port, &public).is_err(),
+            "non-allowlisted port dialed: {port}"
+        );
+    }
+}
+
+#[test]
+fn pool_dial_guard_rejects_bad_shape_and_private_targets_at_connect_time() {
+    // The dial-site guard re-enforces the full invariant: DNS that changed
+    // after save (now private) and malformed hosts fail even on allowlisted
+    // ports.
+    let public = dns(&["93.184.216.34"]);
+    assert!(vault::authorize_pool_dial("https://service.example.com/", 563, &public).is_err());
+    assert!(vault::authorize_pool_dial("", 563, &public).is_err());
+    // Shared 6to4 vector comes from the shared table (no literal copy).
+    for private in [["10.0.0.5"], ["127.0.0.1"], ["::1"], [FORBIDDEN_VECTORS[1]]] {
+        assert!(
+            vault::authorize_pool_dial(HOST, 119, &dns(&private)).is_err(),
+            "dial allowed a non-public target: {private:?}"
+        );
+    }
+    let target = vault::authorize_pool_dial(HOST, 119, &public).unwrap();
+    assert_eq!(target.addresses(), public.0);
+}
+
+#[test]
+fn test_connection_rate_limit_and_concurrency_trip() {
+    // F-VAULT-03 Gap 2: per-user sliding window + concurrency cap. The
+    // timestamps here stand in for rows from the shared store (Postgres/KV);
+    // the gate itself is pure so the Worker wiring stays thin.
+    let recent: Vec<u64> = (0..5).map(|i| NOW - i).collect();
+    assert!(
+        !vault::test_attempt_allowed(&recent, NOW),
+        "5 attempts in the window must trip the limit"
+    );
+    let four: Vec<u64> = (0..4).map(|i| NOW - i).collect();
+    assert!(
+        vault::test_attempt_allowed(&four, NOW),
+        "4 attempts in the window must pass"
+    );
+    assert!(
+        vault::test_attempt_allowed(&[NOW - 61, NOW - 3600], NOW),
+        "attempts outside the window must age out"
+    );
+    assert!(
+        vault::test_attempt_allowed(&[], NOW),
+        "first attempt must pass"
+    );
+    assert!(
+        !vault::test_attempt_allowed(&[NOW + 1000; 5], NOW),
+        "future timestamps must fail closed, not bypass"
+    );
+    assert_eq!(vault::test_attempt_retention_cutoff(NOW), NOW - 60);
+    assert_eq!(vault::test_attempt_retention_cutoff(30), 0);
+    assert!(vault::concurrent_test_allowed(0));
+    assert!(vault::concurrent_test_allowed(1));
+    assert!(!vault::concurrent_test_allowed(2));
+    assert!(!vault::concurrent_test_allowed(99));
+}
+
+#[test]
+fn test_connection_budget_fires_dial_and_total_timeouts() {
+    // F-VAULT-03 Gap 2: the dial/total constants must actually bound the
+    // attempt. The pool aborts the handshake at the dial deadline and the
+    // whole attempt at the total deadline.
+    let budget = vault::TestConnectionBudget::new(1_000);
+    assert_eq!(
+        budget.dial_deadline_ms - budget.start_ms,
+        vault::DIAL_TIMEOUT_MS
+    );
+    assert_eq!(
+        budget.total_deadline_ms - budget.start_ms,
+        vault::TOTAL_TIMEOUT_MS
+    );
+    assert!(!budget.dial_expired(1_000));
+    assert!(!budget.dial_expired(5_999));
+    assert!(budget.dial_expired(6_000));
+    assert!(!budget.total_expired(15_999));
+    assert!(budget.total_expired(16_000));
+}
+
+#[test]
 fn targets_preserve_hostname_and_every_vetted_public_address() {
+    // Shared public controls come from the shared table (no literal
+    // copies); the other two public addresses stay literal.
     let addresses = [
-        "93.184.216.34",
+        PUBLIC_CONTROL_VECTORS[0],
         "8.8.8.8",
         "2001:4860:4860::8888",
-        "2606:4700:4700::1111",
+        PUBLIC_CONTROL_VECTORS[1],
     ];
     let expected: Vec<IpAddr> = addresses.iter().map(|ip| ip.parse().unwrap()).collect();
     for target in [
@@ -142,17 +293,7 @@ fn targets_preserve_hostname_and_every_vetted_public_address() {
 // Independent HMAC fixture signer. It intentionally does not use the issuer,
 // which clamps TTLs and therefore cannot produce the over-age regression token.
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let word = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for shift in [18, 12, 6, 0].into_iter().take(chunk.len() + 1) {
-            result.push(ALPHABET[((word >> shift) & 63) as usize] as char);
-        }
-    }
-    result
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn signed_session(created_at: u64, issued_at: u64, expires_at: u64) -> String {
@@ -199,14 +340,26 @@ fn session_expiry_boundary_is_exclusive() {
         session::verify_session(SECRET, &token, NOW + ONE_DAY),
         Err(session::SessionError::Invalid)
     );
-    assert!(session::rotate_session(SECRET, &token, NOW + ONE_DAY, 3600).is_err());
+    assert!(session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY,
+        3600
+    )
+    .is_err());
 }
 
 #[test]
 fn session_in_bounds_rotation_preserves_authentication_time() {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600);
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600).expect("issue");
     let original = session::verify_session(SECRET, &token, NOW).unwrap();
-    let rotated = session::rotate_session(SECRET, &token, NOW + 60, 3600).unwrap();
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        3600,
+    )
+    .unwrap();
     let claims = session::verify_session(SECRET, &rotated, NOW + 60).unwrap();
     assert_eq!(claims.created_at, NOW);
     assert_eq!(claims.issued_at, NOW + 60);
@@ -218,8 +371,14 @@ fn session_in_bounds_rotation_preserves_authentication_time() {
 
 #[test]
 fn session_rotation_clamps_expiry_to_absolute_lifetime() {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY);
-    let rotated = session::rotate_session(SECRET, &token, NOW + ONE_DAY - 120, 3600).unwrap();
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY).expect("issue");
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY - 120,
+        3600,
+    )
+    .unwrap();
     let verified = session::verify_session(SECRET, &rotated, NOW + ONE_DAY - 120);
     assert!(verified.is_ok(), "rotation must not emit an over-age token");
     let claims = verified.unwrap();
@@ -229,9 +388,15 @@ fn session_rotation_clamps_expiry_to_absolute_lifetime() {
 
 #[test]
 fn session_repeated_rotations_cannot_extend_one_day_lifetime() {
-    let mut token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY);
+    let mut token = session::issue_session(SECRET, "user-acceptance", NOW, ONE_DAY).expect("issue");
     for (counter, offset) in [3600, 43_200, ONE_DAY - 1].into_iter().enumerate() {
-        token = session::rotate_session(SECRET, &token, NOW + offset, ONE_DAY).unwrap();
+        token = session::rotate_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + offset,
+            ONE_DAY,
+        )
+        .unwrap();
         let verified = session::verify_session(SECRET, &token, NOW + offset);
         assert!(verified.is_ok(), "refresh must emit an in-bounds token");
         let claims = verified.unwrap();
@@ -240,11 +405,17 @@ fn session_repeated_rotations_cannot_extend_one_day_lifetime() {
         assert_eq!(claims.rotation_counter, counter as u32 + 1);
     }
     assert!(session::verify_session(SECRET, &token, NOW + ONE_DAY).is_err());
-    assert!(session::rotate_session(SECRET, &token, NOW + ONE_DAY, ONE_DAY).is_err());
+    assert!(session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + ONE_DAY,
+        ONE_DAY
+    )
+    .is_err());
 }
 
 fn active_session() -> (String, session::SessionRecord) {
-    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600);
+    let token = session::issue_session(SECRET, "user-acceptance", NOW, 3600).expect("issue");
     let claims = session::verify_session(SECRET, &token, NOW).unwrap();
     let row = session::SessionRecord {
         id: claims.session_id,
@@ -260,7 +431,13 @@ fn active_session() -> (String, session::SessionRecord) {
 #[test]
 fn stored_session_accepts_matching_active_row() {
     let (token, row) = active_session();
-    let claims = session::verify_stored_session(SECRET, &token, NOW + 60, &row).unwrap();
+    let claims = session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        &row,
+    )
+    .unwrap();
     assert_eq!(claims.user_id, "user-acceptance");
     assert_eq!(claims.expires_at, NOW + 3600);
 }
@@ -270,7 +447,12 @@ fn stored_session_rejects_stale_rotation_counter() {
     let (token, mut row) = active_session();
     row.rotation_counter = 1;
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
 }
@@ -280,7 +462,12 @@ fn stored_session_rejects_revoked_row() {
     let (token, mut row) = active_session();
     row.revoked = true;
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
 }
@@ -311,7 +498,12 @@ fn stored_session_rejects_mismatched_identity_and_expiry() {
         },
     ] {
         assert_eq!(
-            session::verify_stored_session(SECRET, &token, NOW + 60, &changed),
+            session::verify_stored_session(
+                &session::SessionKeys::single(SECRET),
+                &token,
+                NOW + 60,
+                &changed
+            ),
             Err(session::SessionError::Invalid),
             "mismatched authoritative row: {changed:?}"
         );
@@ -321,16 +513,39 @@ fn stored_session_rejects_mismatched_identity_and_expiry() {
 #[test]
 fn stored_session_invalidates_pre_rotation_token_after_row_advances() {
     let (token, mut row) = active_session();
-    let rotated = session::rotate_session(SECRET, &token, NOW + 60, 3600).unwrap();
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(SECRET),
+        &token,
+        NOW + 60,
+        3600,
+    )
+    .unwrap();
     row.rotation_counter = 1;
     row.expires_at = NOW + 3660;
-    assert!(session::verify_stored_session(SECRET, &rotated, NOW + 60, &row).is_ok());
+    assert!(session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &rotated,
+        NOW + 60,
+        &row
+    )
+    .is_ok());
     assert_eq!(
-        session::verify_stored_session(SECRET, &token, NOW + 60, &row),
+        session::verify_stored_session(
+            &session::SessionKeys::single(SECRET),
+            &token,
+            NOW + 60,
+            &row
+        ),
         Err(session::SessionError::Invalid)
     );
     row.rotation_counter = 0;
-    assert!(session::verify_stored_session(SECRET, &rotated, NOW + 60, &row).is_err());
+    assert!(session::verify_stored_session(
+        &session::SessionKeys::single(SECRET),
+        &rotated,
+        NOW + 60,
+        &row
+    )
+    .is_err());
 }
 
 // Literal digests independently computed with SHA-256 over the UTF-8 fixtures.
@@ -716,7 +931,7 @@ fn origins_reject_noncanonical_forms_and_nonexact_rp_bindings() {
     ] {
         assert_eq!(
             auth::new_registration_challenge(rp, origin, NOW).unwrap_err(),
-            auth::AuthError::Invalid,
+            auth::AuthError::Misconfigured,
             "noncanonical origin/RP accepted: {rp:?}, {origin:?}"
         );
         // Present hostile origins/RP IDs against a valid, origin-bound

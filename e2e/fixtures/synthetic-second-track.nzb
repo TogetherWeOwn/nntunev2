@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Second single-file synthetic NZB: the 440 Hz tone as its own upload
+  (paired fixture build; staged alongside e2e/fixtures/synthetic.nzb).
+
+  Why a second file: on current ingest one upload is one job and one
+  library row per idempotency key, so the two-file
+  synthetic-two-track.nzb staged alone still yields a single row. Staging
+  synthetic.nzb plus THIS file through the existing staged loop is two
+  uploads (two jobs, two content-addressed keys, two rows) — it passes
+  under the current writer and stays valid once the per-file manifest
+  (ADR 0002 accepted-audio-manifest) lands. The staging-leg switch to
+  that path is the paired Test Author follow-up on this branch; until it
+  lands the live leg keeps staging the two-file NZB alone and failing
+  with the precondition by name (red is the signal, never a timeout).
+
+  Contract (checked by e2e/fixtures/two-track-self-check.mjs; keep the
+  pinned values there in sync with any edit here):
+  - Exactly one <file> entry: the 440 Hz single-part tone from the same
+    synthetic NNTP corpus (crates/nntune-test-nntp/src/fixtures.rs
+    `default_corpus()`), segment ID and byte count byte-identical to
+    file 2 of synthetic-two-track.nzb. No invented message-IDs: the part
+    resolves in the default corpus, so the staging NNTP server serves it.
+  - Subject derives the plain-title query 'NNTune-Fixture sine-440'
+    (workers/ingest/src/matching.rs `derive_upload_query`, first subject
+    only) — distinct from the 660 Hz query, so the two single-file
+    uploads never share a match query.
+  - Deterministic IDs: fixed subject, fixed segment message-ID, fixed
+    bytes=, fixed group (alt.binaries.nntune.test), fixed poster/date —
+    no generated values anywhere.
+  - Idempotent re-run: static bytes → stable content sha → re-import
+    upserts the same row. synthetic.nzb is untouched and these bytes
+    differ from it, so neither the single-track meter fixture nor the
+    two-file NZB changes its content-addressed key. Each spec mints a
+    fresh test account per run, so libraries never mix across specs.
+-->
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head>
+    <meta type="title">nntune-e2e-synthetic-second-track</meta>
+    <meta type="tag">nntune-e2e</meta>
+  </head>
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-440 [01/01] - &quot;sine-440.wav&quot; yEnc (1/1)">
+    <groups>
+      <group>alt.binaries.nntune.test</group>
+    </groups>
+    <segments>
+      <segment bytes="1004" number="1">single-yenc-001@nntune.test</segment>
+    </segments>
+  </file>
+</nzb>

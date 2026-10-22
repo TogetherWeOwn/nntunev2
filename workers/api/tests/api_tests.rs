@@ -5,6 +5,7 @@
 //! credentials only (public repo: never real secrets).
 
 use nntune_api::{auth, session, vault};
+use nntune_ssrf_guard::FORBIDDEN_VECTORS;
 use std::net::IpAddr;
 
 // --- Sessions: signed cookies, rotation ------------------------------------
@@ -17,7 +18,7 @@ fn test_secret() -> Vec<u8> {
 fn session_roundtrip_and_cookie_attributes() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&secret, "user-123", now, 3600);
+    let token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let claims = session::verify_session(&secret, &token, now + 60).expect("valid token");
     assert_eq!(claims.user_id, "user-123");
     assert_eq!(claims.rotation_counter, 0);
@@ -26,7 +27,7 @@ fn session_roundtrip_and_cookie_attributes() {
         !claims.session_id.is_empty(),
         "jti present for row revocation"
     );
-    let other = session::issue_session(&secret, "user-123", now, 3600);
+    let other = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let other_claims = session::verify_session(&secret, &other, now + 60).expect("valid token");
     assert_ne!(
         claims.session_id, other_claims.session_id,
@@ -34,20 +35,36 @@ fn session_roundtrip_and_cookie_attributes() {
     );
 
     let header = session::set_cookie_header(&token, 3600);
+    // F-HARD-01 item 2: `__Host-` prefix requirements — Path=/, Secure,
+    // no Domain — are enforced by construction, not convention.
+    assert!(
+        header.starts_with("__Host-nntune-session="),
+        "cookie must carry the __Host- prefix: {header}"
+    );
     assert!(header.contains("HttpOnly"), "cookie must be HttpOnly");
     assert!(header.contains("Secure"), "cookie must be Secure");
+    assert!(header.contains("Path=/"), "cookie must be Path=/");
+    assert!(
+        !header.contains("Domain="),
+        "__Host- cookies must never carry Domain="
+    );
     assert!(
         header.contains("SameSite=Lax"),
         "cookie must be SameSite=Lax"
     );
     assert!(!header.contains("SameSite=None"), "SameSite=None is banned");
+    let cleared = session::clear_cookie_header();
+    assert!(
+        cleared.starts_with("__Host-nntune-session=;"),
+        "logout must clear the same __Host- cookie: {cleared}"
+    );
 }
 
 #[test]
 fn session_tamper_rejected() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let mut token = session::issue_session(&secret, "user-123", now, 3600);
+    let mut token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     token.push('A');
     assert!(session::verify_session(&secret, &token, now + 60).is_err());
 }
@@ -55,7 +72,7 @@ fn session_tamper_rejected() {
 #[test]
 fn session_wrong_secret_and_expiry_rejected() {
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&test_secret(), "user-123", now, 60);
+    let token = session::issue_session(&test_secret(), "user-123", now, 60).expect("issue");
     assert!(
         session::verify_session(b"wrong-secret-00000000000000000000", &token, now + 1).is_err()
     );
@@ -66,11 +83,17 @@ fn session_wrong_secret_and_expiry_rejected() {
 fn session_rotation_bumps_counter_and_stays_valid() {
     let secret = test_secret();
     let now = 1_700_000_000u64;
-    let token = session::issue_session(&secret, "user-123", now, 3600);
+    let token = session::issue_session(&secret, "user-123", now, 3600).expect("issue");
     let old_id = session::verify_session(&secret, &token, now + 5)
         .expect("valid token")
         .session_id;
-    let rotated = session::rotate_session(&secret, &token, now + 10, 3600).expect("rotation works");
+    let rotated = session::rotate_session(
+        &session::SessionKeys::single(&secret),
+        &token,
+        now + 10,
+        3600,
+    )
+    .expect("rotation works");
     let claims = session::verify_session(&secret, &rotated, now + 20).expect("rotated valid");
     assert_eq!(claims.rotation_counter, 1);
     assert_eq!(claims.user_id, "user-123");
@@ -82,7 +105,8 @@ fn session_rotation_bumps_counter_and_stays_valid() {
 #[test]
 fn magic_link_issue_consume_and_replay_rejected() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     // Hash at rest: the stored record must not contain the plaintext token.
     assert!(!record.token_hash.contains(&plaintext));
     let consumed = auth::consume_magic_link(record, &plaintext, now + 60).expect("first use works");
@@ -92,7 +116,8 @@ fn magic_link_issue_consume_and_replay_rejected() {
 #[test]
 fn magic_link_replay_rejected() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     let record2 = auth::consume_magic_link(record, &plaintext, now + 60)
         .expect("first use works")
         .into_record_for_replay_test();
@@ -102,11 +127,12 @@ fn magic_link_replay_rejected() {
 #[test]
 fn magic_link_expired_and_wrong_token_rejected_with_generic_error() {
     let now = 1_700_000_000u64;
-    let (plaintext, record) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     // >15 min: expired.
     let err = auth::consume_magic_link(record, &plaintext, now + 901).unwrap_err();
     assert_eq!(err, auth::AuthError::Invalid, "login errors stay generic");
-    let (_, record2) = auth::issue_magic_link("user-1", "alice@example.com", now);
+    let (_, record2) = auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
     let err2 = auth::consume_magic_link(record2, "wrong-token", now + 60).unwrap_err();
     assert_eq!(err2, auth::AuthError::Invalid, "no user-enumeration oracle");
 }
@@ -227,7 +253,9 @@ impl vault::DnsResolver for FakeDns {
             // Attacker-controlled name resolving to an IPv4-mapped IPv6
             // address hiding a private target: must still be rejected.
             "mapped.example.com" => vec!["::ffff:10.0.0.5".parse().unwrap()],
-            "doc.example.com" => vec!["2001:db8::1".parse().unwrap()],
+            // Shared documentation vector (single owner:
+            // `nntune_ssrf_guard::FORBIDDEN_VECTORS`): no literal copy.
+            "doc.example.com" => vec![FORBIDDEN_VECTORS[2].parse().unwrap()],
             _ => vec![],
         }
     }
@@ -242,6 +270,7 @@ fn vault_config_validation() {
         username: "alice".into(),
         password: "s3cret".into(),
         max_connections: 10,
+        allow_insecure_plaintext: false,
     };
     assert!(good.validate(&FakeDns).is_ok());
     let bad_port = vault::ProviderConfig {
@@ -270,6 +299,7 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
         username: "alice".into(),
         password: "s3cret".into(),
         max_connections: 4,
+        allow_insecure_plaintext: false,
     };
     assert!(base.validate(&FakeDns).is_ok());
     for host in [
@@ -298,6 +328,36 @@ fn vault_ssrf_guard_rejects_private_and_loopback() {
     }
 }
 
+/// Shared transition/special vectors (single owner:
+/// `nntune_ssrf_guard::FORBIDDEN_VECTORS`): every required family is
+/// rejected by the vault provider guard. No literal here may be copied
+/// from the shared table.
+#[test]
+fn vault_ssrf_guard_rejects_shared_transition_vectors() {
+    struct SharedDns(IpAddr);
+    impl vault::DnsResolver for SharedDns {
+        fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+            vec![self.0]
+        }
+    }
+    for raw in FORBIDDEN_VECTORS {
+        let ip: IpAddr = raw.parse().expect("shared vector must parse");
+        let cfg = vault::ProviderConfig {
+            host: "service.example.com".into(),
+            port: 563,
+            tls: true,
+            username: "alice".into(),
+            password: "s3cret".into(),
+            max_connections: 4,
+            allow_insecure_plaintext: false,
+        };
+        assert!(
+            cfg.validate(&SharedDns(ip)).is_err(),
+            "shared vector must be rejected: {raw}"
+        );
+    }
+}
+
 #[test]
 fn vault_indexer_url_has_ssrf_guard() {
     let good = vault::IndexerConfig {
@@ -320,6 +380,66 @@ fn vault_indexer_url_has_ssrf_guard() {
         };
         assert!(c.validate(&FakeDns).is_err(), "indexer url rejected: {url}");
     }
+}
+
+#[test]
+fn vault_indexer_requires_https_even_for_public_host() {
+    // F-TRANS-01 Gap 1 (RED): `http://` to a public host must be Invalid —
+    // the indexer API key would otherwise travel in cleartext.
+    let plaintext = vault::IndexerConfig {
+        url: "http://index.example.com/api".into(),
+        api_key: "idx-key".into(),
+    };
+    assert!(
+        plaintext.validate(&FakeDns).is_err(),
+        "http indexer URL to a public host must be rejected"
+    );
+    let encrypted = vault::IndexerConfig {
+        url: "https://index.example.com/api".into(),
+        api_key: "idx-key".into(),
+    };
+    assert!(encrypted.validate(&FakeDns).is_ok());
+}
+
+#[test]
+fn vault_provider_plaintext_password_requires_explicit_opt_in() {
+    // F-TRANS-01 Gap 2: password auth with `tls: false` sends the password
+    // in cleartext — rejected by default, accepted only with the explicit
+    // per-row opt-in (flagged for the UI warning + audit log).
+    let denied = vault::ProviderConfig {
+        host: "news.example.com".into(),
+        port: 119,
+        tls: false,
+        username: "alice".into(),
+        password: "s3cret".into(),
+        max_connections: 4,
+        allow_insecure_plaintext: false,
+    };
+    assert!(
+        denied.validate(&FakeDns).is_err(),
+        "password auth without TLS must be rejected without the opt-in"
+    );
+    let acknowledged = vault::ProviderConfig {
+        allow_insecure_plaintext: true,
+        ..denied.clone()
+    };
+    assert!(
+        acknowledged.validate(&FakeDns).is_ok(),
+        "explicit opt-in passes validation"
+    );
+    assert!(acknowledged.insecure_plaintext_acknowledged());
+    assert_eq!(
+        acknowledged.audit_action(),
+        vault::INSECURE_PLAINTEXT_AUDIT_ACTION
+    );
+    // TLS default stays unflagged.
+    let tls = vault::ProviderConfig {
+        tls: true,
+        allow_insecure_plaintext: false,
+        ..denied.clone()
+    };
+    assert!(tls.validate(&FakeDns).is_ok());
+    assert!(!tls.insecure_plaintext_acknowledged());
 }
 
 #[test]

@@ -27,6 +27,8 @@ fn parsed_from(ids: &[&str]) -> ParsedNzb {
         file_count: 1,
         segment_count: ids.len(),
         message_ids: ids.iter().map(|s| s.to_string()).collect(),
+        segment_bytes: vec![None; ids.len()],
+        file_segment_bytes: vec![vec![None; ids.len()]],
     }
 }
 
@@ -53,7 +55,7 @@ fn happy_path_reaches_done_with_one_library_row() {
 
     // No repair: walk the state machine to Done.
     assert!(
-        decide_repair(&msg.job_id, &msg.user_id, &msg.idempotency_key, "", 0)
+        decide_repair(&msg.job_id, &msg.user_id, &msg.idempotency_key, "", 0, 1)
             .unwrap()
             .is_none()
     );
@@ -103,6 +105,7 @@ fn gapped_set_repairs_then_reaches_done() {
         &msg.idempotency_key,
         GAPPED_PAR2_SET,
         missing,
+        1,
     )
     .unwrap()
     .expect("gapped set must dispatch repair");
@@ -141,7 +144,9 @@ fn multi_batch_probe_keeps_middle_gap_to_verify() {
     let parsed = ParsedNzb {
         file_count: 1,
         segment_count: ids.len(),
-        message_ids: ids,
+        message_ids: ids.clone(),
+        segment_bytes: vec![None; ids.len()],
+        file_segment_bytes: vec![vec![None; ids.len()]],
     };
     let batches = probe_batches(&parsed);
     assert_eq!(batches.len(), 2);

@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""Unit tests for check_archive_bindings.py. Run: python3 <this file>."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from check_archive_bindings import ManifestError, _bucket_names, archive_bindings, main
+
+CLEAN_MANIFEST = """\
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+"""
+
+ARCHIVE_MANIFEST = """\
+name = "nntune-evil"
+
+[[r2_buckets]]
+binding = "DUMP"
+bucket_name = "nntunev2-archive-staging"
+"""
+
+ARCHIVE_ENV_OVERRIDE = """\
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+
+[[env.production.r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-archive-prod"
+"""
+
+PREVIEW_ARCHIVE_MANIFEST = """\
+name = "nntune-stream"
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntunev2-audio-staging"
+preview_bucket_name = "nntunev2-archive-staging"
+"""
+
+
+def _repo_with(manifests: dict[str, str]) -> Path:
+    tmp = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    for rel, body in manifests.items():
+        path = tmp / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    subprocess.run(["git", "-C", str(tmp), "add", "--all"], check=True)
+    return tmp
+
+
+def test_clean_manifests_pass():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    assert archive_bindings(repo) == [], "clean manifest must pass"
+
+
+def test_archive_binding_fails():
+    repo = _repo_with({"workers/stream/wrangler.toml": ARCHIVE_MANIFEST})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_archive_env_override_fails():
+    repo = _repo_with({"workers/stream/wrangler.toml": ARCHIVE_ENV_OVERRIDE})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-prod"
+
+
+def test_preview_archive_binding_fails():
+    repo = _repo_with({"workers/stream/wrangler.toml": PREVIEW_ARCHIVE_MANIFEST})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_staged_manifest_archive_binding_fails():
+    repo = _repo_with(
+        {"workers/stream/wrangler.staging.toml": ARCHIVE_MANIFEST}
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_custom_toml_config_filename_is_scanned():
+    repo = _repo_with({"infra/archive.toml": ARCHIVE_MANIFEST})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_bom_prefixed_toml_is_scanned():
+    repo = _repo_with({"workers/stream/wrangler.toml": "\ufeff" + CLEAN_MANIFEST})
+    assert archive_bindings(repo) == []
+
+
+def test_custom_json_path_with_archive_binding_is_rejected():
+    body = '{"r2_buckets":[{"bucket_name":"nntunev2-archive-prod"}]}'
+    repo = _repo_with({"config/worker.json": body})
+    _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_non_worker_toml_without_r2_binding_is_ignored():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "workers/tool/deny.toml": 'env = "staging"',
+            "infra/malformed.toml": (
+                'description = "r2_buckets" # not a binding\n'
+                "not = [valid TOML"
+            ),
+        }
+    )
+    assert archive_bindings(repo) == []
+
+
+def test_malformed_custom_toml_with_binding_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '[[env."pro#d".r2_buckets]\nbucket_name = \'archive\''
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_top_level_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '[[r2_buckets]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_bom_malformed_custom_toml_top_level_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '﻿[[r2_buckets]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_spaced_array_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                '[[ r2_buckets ]]\nbucket_name = "nntunev2-archive-prod"\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_dotted_assignment_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                'env.production.r2_buckets = [{ bucket_name = "nntunev2-archive-prod" }]\n'
+                "invalid = [TOML"
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_malformed_custom_toml_inline_environment_table_fails_closed():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "infra/malformed-binding.toml": (
+                'env = { production = { r2_buckets = [{ bucket_name = '
+                '"nntunev2-archive-prod" }] } }\ninvalid = [TOML'
+            ),
+        }
+    )
+    _assert_rejected(repo, "cannot parse TOML config")
+
+
+def test_uppercase_toml_extension_is_scanned():
+    repo = _repo_with({"workers/stream/wrangler.TOML": ARCHIVE_MANIFEST})
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_manifest_outside_scan_roots_fails():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "wrangler.toml": ARCHIVE_MANIFEST,
+        }
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+    assert hits[0][0] == repo / "wrangler.toml"
+
+
+def test_nested_manifest_outside_scan_roots_fails():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "crates/x/wrangler.toml": ARCHIVE_MANIFEST,
+        }
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][1] == "nntunev2-archive-staging"
+
+
+def test_manifest_in_git_named_directory_is_scanned():
+    repo = _repo_with(
+        {
+            "workers/foo.git/wrangler.toml": ARCHIVE_MANIFEST,
+            "apps/web/wrangler.toml": CLEAN_MANIFEST,
+        }
+    )
+    hits = archive_bindings(repo)
+    assert len(hits) == 1, f"expected one hit, got {hits}"
+    assert hits[0][0] == repo / "workers/foo.git/wrangler.toml"
+
+
+def test_untracked_dependency_manifest_is_ignored():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    dependency = repo / "node_modules/wrangler.toml"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text(ARCHIVE_MANIFEST)
+    assert archive_bindings(repo) == [], "untracked dependency manifest must be ignored"
+
+
+def test_unrelated_bucket_name_is_ignored():
+    manifest = CLEAN_MANIFEST + '\n[vars]\nbucket_name = "archive notes"\n'
+    repo = _repo_with({"apps/web/wrangler.toml": manifest})
+    assert archive_bindings(repo) == [], "unrelated variable must not fail"
+
+
+def test_commented_example_binding_ignored():
+    body = (
+        "# [[r2_buckets]]\n"
+        '# binding = "ART_CACHE"\n'
+        '# bucket_name = "nntunev2-archive-staging"\n'
+    )
+    repo = _repo_with({"workers/mb/wrangler.toml.example": body})
+    assert archive_bindings(repo) == [], "commented bindings must not fail"
+
+
+def _assert_rejected(repo: Path, message: str) -> None:
+    try:
+        archive_bindings(repo)
+    except ManifestError as exc:
+        assert message in str(exc), f"expected {message!r} in {exc!r}"
+    else:
+        raise AssertionError(f"expected scan to fail with {message!r}")
+
+
+def test_malformed_manifest_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": "[[r2_buckets]\n"})
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert main(repo) == 1, "malformed manifest must fail the guard"
+    assert "FAIL: cannot parse TOML config" in output.getvalue()
+
+
+def test_missing_scan_root_fails():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    (repo / "apps").rmdir()
+    _assert_rejected(repo, "required scan root is missing")
+
+
+def test_empty_scan_fails():
+    repo = _repo_with({})
+    _assert_rejected(repo, "no Wrangler TOML manifests were scanned")
+
+
+def test_json_manifests_are_rejected():
+    for name in ("wrangler.json", "wrangler.jsonc"):
+        repo = _repo_with(
+            {f"workers/stream/{name}": '{"name":"stream","compatibility_date":"2025-01-01"}'}
+        )
+        _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_jsonc_manifest_with_leading_comment_is_rejected():
+    body = '// Wrangler config\n{"name":"stream","r2_buckets":[]}'
+    repo = _repo_with({"workers/stream/wrangler.jsonc": body})
+    _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_malformed_wrangler_named_document_without_config_markers_is_ignored():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "docs/wrangler-notes.json": '{"note": "documentation only",',
+            "docs/wrangler.json": '{"note": "documentation only",',
+        }
+    )
+    assert archive_bindings(repo) == []
+
+
+def test_json_env_archive_binding_is_rejected_as_unsupported():
+    body = (
+        '{"name":"stream","env":{"production":{"r2_buckets":'
+        '[{"bucket_name":"nntunev2-archive-prod"}]}}}'
+    )
+    repo = _repo_with({"workers/stream/wrangler-staging.json": body})
+    _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_nonstandard_json_manifest_is_rejected():
+    repo = _repo_with(
+        {"workers/stream/wrangler-staging.json": '{"name":"stream","compatibility_date":"2025-01-01"}'}
+    )
+    _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_nonstandard_json_config_outside_worker_roots_is_rejected():
+    repo = _repo_with({"crates/worker/wrangler.json": '{"name":"worker","compatibility_date":"2025-01-01"}'})
+    _assert_rejected(repo, "unsupported Wrangler manifest")
+
+
+def test_wrangler_named_document_is_not_treated_as_a_manifest():
+    repo = _repo_with(
+        {
+            "workers/stream/wrangler.toml": CLEAN_MANIFEST,
+            "docs/wrangler-notes.md": "archive references are documentation, not bindings",
+            "docs/wrangler-notes.json": '{"note":"not a Wrangler config"}',
+            "docs/wrangler.toml": CLEAN_MANIFEST,
+            "workers/config/wrangler.schema.json": '{"type":"object"}',
+            "workers/config/wrangler-notes.json": '{"note":"archive bucket examples","main":"entry notes"}',
+            "workers/config/wrangler-list.json": '[{"name":"not a config"}]',
+        }
+    )
+    assert archive_bindings(repo) == []
+
+
+def test_array_environment_table_fails_closed():
+    manifest = """\
+[[env]]
+[[env.r2_buckets]]
+binding = "ARCHIVE"
+bucket_name = "nntunev2-archive-staging"
+"""
+    repo = _repo_with({"workers/stream/wrangler.toml": manifest})
+    _assert_rejected(repo, "invalid env table")
+
+
+def test_invalid_env_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'env = "oops"'})
+    _assert_rejected(repo, "invalid env table")
+
+
+def test_string_r2_buckets_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = "oops"\n'})
+    _assert_rejected(repo, "invalid r2_buckets table")
+
+
+def test_non_dict_toml_document_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.tomllib.loads",
+        return_value=["not", "a", "dict"],
+    ):
+        _assert_rejected(repo, "invalid TOML document")
+
+
+def test_integer_env_table_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": "env = 42\n"})
+    _assert_rejected(repo, "invalid env table")
+
+
+def test_string_env_entry_fails_closed():
+    repo = _repo_with(
+        {"workers/stream/wrangler.toml": 'env = { production = "oops" }\n'}
+    )
+    _assert_rejected(repo, "invalid env entry")
+
+
+def test_string_r2_buckets_entry_fails_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": 'r2_buckets = ["oops"]\n'})
+    _assert_rejected(repo, "invalid r2_buckets entry")
+
+
+def test_non_utf8_unrelated_path_does_not_break_scan():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    bad_path = os.fsencode(repo) + b"/workers/\xff-not-a-config.txt"
+    with open(bad_path, "wb") as unrelated:
+        unrelated.write(b"ordinary tracked file")
+    subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+    assert archive_bindings(repo) == []
+
+
+def test_non_git_directory_fails_listing_closed():
+    tmp = Path(tempfile.mkdtemp())
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    stream = tmp / "workers" / "stream"
+    stream.mkdir(parents=True)
+    (stream / "wrangler.toml").write_text(CLEAN_MANIFEST)
+    _assert_rejected(tmp, "cannot list tracked repository files")
+
+
+def test_failing_git_binary_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=OSError("git binary missing"),
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_git_nonzero_exit_fails_listing_closed():
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    failure = subprocess.CalledProcessError(128, ["git", "ls-files", "-z"])
+    with mock.patch(
+        "check_archive_bindings.subprocess.run",
+        side_effect=failure,
+    ):
+        _assert_rejected(repo, "cannot list tracked repository files")
+
+
+def test_malformed_tracked_paths_fail_decode_closed():
+    # os.fsdecode uses surrogateescape on Linux so real undecodable bytes
+    # never raise there (see test_non_utf8_unrelated_path_does_not_break_scan);
+    # pin the defensive decode-failure diagnostic by failing the decode step
+    # for the malformed entry only, with a real `git ls-files -z` byte stream.
+    repo = _repo_with({"workers/stream/wrangler.toml": CLEAN_MANIFEST})
+    bad_stdout = b"workers/stream/wrangler.toml\x00workers/\xff-bad.txt\x00"
+    real_fsdecode = os.fsdecode
+
+    def _fail_bad_entry(entry):
+        if b"\xff" in bytes(entry):
+            raise UnicodeDecodeError("utf-8", bytes(entry), 8, 9, "invalid start byte")
+        return real_fsdecode(entry)
+
+    with (
+        mock.patch(
+            "check_archive_bindings.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["git", "ls-files", "-z"], 0, stdout=bad_stdout, stderr=""
+            ),
+        ),
+        mock.patch(
+            "check_archive_bindings.os.fsdecode",
+            side_effect=_fail_bad_entry,
+        ),
+    ):
+        try:
+            archive_bindings(repo)
+        except ManifestError as exc:
+            assert "cannot decode tracked repository paths" in str(exc), (
+                f"unexpected error: {exc!r}"
+            )
+            assert exc.__cause__ is not None, "decode failure must chain its cause"
+            assert isinstance(exc.__cause__, UnicodeDecodeError), (
+                f"unexpected cause: {exc.__cause__!r}"
+            )
+        else:
+            raise AssertionError("expected malformed tracked paths to fail")
+
+
+def test_manifest_directory_fails_read_closed():
+    # A directory can never survive the is_file() candidate filter in
+    # archive_bindings, so pin the read failure at the _bucket_names level.
+    tmp = Path(tempfile.mkdtemp())
+    manifest_dir = tmp / "wrangler.toml"
+    manifest_dir.mkdir()
+    try:
+        _bucket_names(manifest_dir)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert str(manifest_dir) in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected directory manifest to fail")
+
+
+def test_invalid_utf8_manifest_fails_read_closed():
+    tmp = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+    for root in ("workers", "apps"):
+        (tmp / root).mkdir()
+    manifest = tmp / "workers" / "stream" / "wrangler.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_bytes(b"\xff\xfe\x00not-utf8 \x80\x81")
+    subprocess.run(["git", "-C", str(tmp), "add", "--all"], check=True)
+    try:
+        archive_bindings(tmp)
+    except ManifestError as exc:
+        assert "cannot read TOML config" in str(exc), f"unexpected error: {exc!r}"
+        assert "wrangler.toml" in str(exc), f"manifest not named: {exc!r}"
+    else:
+        raise AssertionError("expected invalid-UTF8 manifest to fail")
+
+
+def test_current_repo_manifests_pass():
+    repo = Path(__file__).resolve().parent.parent.parent
+    hits = archive_bindings(repo)
+    assert hits == [], f"current manifests must pass, got {hits}"
+
+
+if __name__ == "__main__":
+    test_clean_manifests_pass()
+    test_archive_binding_fails()
+    test_archive_env_override_fails()
+    test_preview_archive_binding_fails()
+    test_staged_manifest_archive_binding_fails()
+    test_custom_toml_config_filename_is_scanned()
+    test_bom_prefixed_toml_is_scanned()
+    test_custom_json_path_with_archive_binding_is_rejected()
+    test_non_worker_toml_without_r2_binding_is_ignored()
+    test_malformed_custom_toml_with_binding_table_fails_closed()
+    test_malformed_custom_toml_top_level_array_table_fails_closed()
+    test_bom_malformed_custom_toml_top_level_array_table_fails_closed()
+    test_malformed_custom_toml_spaced_array_table_fails_closed()
+    test_malformed_custom_toml_dotted_assignment_fails_closed()
+    test_malformed_custom_toml_inline_environment_table_fails_closed()
+    test_uppercase_toml_extension_is_scanned()
+    test_manifest_outside_scan_roots_fails()
+    test_nested_manifest_outside_scan_roots_fails()
+    test_manifest_in_git_named_directory_is_scanned()
+    test_untracked_dependency_manifest_is_ignored()
+    test_unrelated_bucket_name_is_ignored()
+    test_commented_example_binding_ignored()
+    test_malformed_manifest_fails_closed()
+    test_missing_scan_root_fails()
+    test_empty_scan_fails()
+    test_json_manifests_are_rejected()
+    test_jsonc_manifest_with_leading_comment_is_rejected()
+    test_malformed_wrangler_named_document_without_config_markers_is_ignored()
+    test_json_env_archive_binding_is_rejected_as_unsupported()
+    test_nonstandard_json_manifest_is_rejected()
+    test_nonstandard_json_config_outside_worker_roots_is_rejected()
+    test_wrangler_named_document_is_not_treated_as_a_manifest()
+    test_array_environment_table_fails_closed()
+    test_invalid_env_table_fails_closed()
+    test_string_r2_buckets_table_fails_closed()
+    test_non_dict_toml_document_fails_closed()
+    test_integer_env_table_fails_closed()
+    test_string_env_entry_fails_closed()
+    test_string_r2_buckets_entry_fails_closed()
+    test_non_utf8_unrelated_path_does_not_break_scan()
+    test_non_git_directory_fails_listing_closed()
+    test_failing_git_binary_fails_listing_closed()
+    test_git_nonzero_exit_fails_listing_closed()
+    test_malformed_tracked_paths_fail_decode_closed()
+    test_manifest_directory_fails_read_closed()
+    test_invalid_utf8_manifest_fails_read_closed()
+    test_current_repo_manifests_pass()
+    print("check_archive_bindings: all tests passed")

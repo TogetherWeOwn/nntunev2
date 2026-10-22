@@ -1,0 +1,242 @@
+# ADR 0010: Scoped Native REST Credentials
+
+- **Status:** Accepted design; implementation and independent review gates remain.
+- **Date:** 2026-10-17
+- **Roadmap:** resolves the ADR 0006 deferral
+  ("Native REST bearer keys are deferred to a separate scoped-credential
+  design, not borrowed from Subsonic").
+
+## Context
+
+Native REST (`/v1`) is the canonical API and the only surface `apps/web`
+uses (ADR 0006). At launch it authenticates one way: the session cookie
+(ADR 0008). That leaves no programmatic access path: scripts, CLI tooling,
+and integrations cannot hold a cookie session, and ADR 0006 explicitly
+forbids borrowing Subsonic credentials for native access
+(`scope='subsonic'` reaches only `/rest/*` — never `/v1`). The gap will
+otherwise be filled ad hoc (shared sessions, credential reuse across
+surfaces), which is worse than a designed credential.
+
+## Decision
+
+**Native REST credentials are IN scope for NNTune v2** as a bounded,
+least-privilege bearer credential (`Authorization: Bearer`), reusing the
+storage and lifecycle patterns already accepted for Subsonic `apiKey`
+credentials (ADR 0002 §2, ADR 0006 rules). This ADR defines the design
+only; it does not authorize issuance code, storage, or any production
+secret — implementation needs its own CISO-gated card (threat-model §8:
+this touches `credential`/`auth`, so the standing vault/auth review gate
+applies to the implementation PR).
+
+### Credential shape
+
+- Opaque 256-bit CSPRNG secret (minimum entropy 128 bits), server-generated
+  only — never caller-selected. Display form `ntk_<base62>`; the `ntk_`
+  prefix identifies the credential class at a glance and in logs.
+- **One-time display:** plaintext is shown once at creation and never
+  stored, never returned again. What persists is an HMAC-SHA256 of the key
+  plus a short non-secret prefix (for "which key is this" listing).
+- **Storage/hash model:** versioned HMAC lookup identical in structure to
+  the Subsonic key form — composite `UNIQUE (pepper_version, key_hmac)`,
+  keyed by the exact version in a dedicated `NATIVE_REST_PEPPER`
+  Worker-secret keyring (separate from `SUBSONIC_INDEX_PEPPER` so either
+  surface rotates without forcing the other). Dual-version lookup (at most
+  current + previous) during a transition; old-version match is re-HMACed
+  to current using the presented key, atomically, without storing
+  plaintext. The ADR 0002 retirement precondition applies unchanged: a
+  stored HMAC cannot be migrated without the key, so an old pepper retires
+  only when no unrevoked credential still uses it — dormant clients must
+  authenticate/migrate or explicitly reissue first. No time-based silent
+  retirement.
+
+  **Implementation status: pepper rotation currently means reissuing
+  credentials.** The dual-version lookup above is design, not code: the
+  Worker wires exactly one pepper pair (`NATIVE_REST_PEPPER_BASE64` +
+  `NATIVE_REST_PEPPER_VERSION`, `workers/api/src/worker_entry.rs`) —
+  `authorize` accepts a pepper slice, but `Config::native_rest_peppers`
+  returns at most that single entry, so a running Worker has no
+  current+previous window. Replacing the pair orphans every row pinned
+  to the old `pepper_version` (exact-version lookup fails closed), so
+  operators rotate by provisioning a new pair and having holders reissue
+  (revoke + create), not by a dual-pepper transition.
+
+### Additive schema (target; implementation work remains)
+
+```text
+native_rest_credentials  id UUID PK, user_id TEXT NOT NULL FK → users(id),
+                         label TEXT, key_prefix TEXT, key_hmac TEXT NOT NULL,
+                         pepper_version INTEGER NOT NULL,
+                         UNIQUE (pepper_version, key_hmac),
+                         scopes TEXT[] NOT NULL, expires_at timestamptz NOT NULL,
+                         created_at timestamptz NOT NULL, last_used_at timestamptz NULL,
+                         revoked_at timestamptz NULL, created_from_ip TEXT NOT NULL
+```
+
+New table only. No applied migration is edited; no Subsonic, session, or
+vault row changes. The `user_id` type follows the retained auth schema's
+`users.id TEXT`; new ids are UUID and timestamps are `timestamptz`, per
+ADR 0002 conventions.
+
+### Scopes (allowlist, checked before handler access)
+
+Minimal enumerated vocabulary mapped onto the `/v1` resources in
+ADR 0006; default issuance is `library:read` only:
+
+- `library:read` — catalog reads: artists, releases, tracks, search,
+  library, playlist reads, cover art.
+- `playlists:write` — playlist create/edit/delete (dormant-tombstone and
+  restore rules in ADR 0006 apply unchanged).
+- `plays:write` — scrobble / play events.
+- `stream:read` — playback via the signed-grant transport in the threat
+  model §5 (cost-bearing: drives provider egress and metering like any other grant).
+- `ingest:submit` — ingest job submission (cost-bearing: plan-capped per
+  ADR 0004).
+
+**Route map is exhaustive and default-deny.** A bearer key is accepted only
+for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
+`/v1/releases`, `/v1/tracks`, `/v1/search`, and read operations on
+`/v1/playlists` require `library:read`; playlist create/edit/delete require
+`playlists:write`; play-event writes on `/v1/plays` require `plays:write`;
+playback on `/v1/stream` requires `stream:read`; ingest submission requires
+`ingest:submit`. Every other operation, including an unlisted method on a
+listed route, is denied to bearer keys and must use session auth. In
+particular, `/v1/me`, `/v1/indexers`,
+`GET /v1/operations/{operation_id}`, library membership writes,
+`DELETE /v1/libraries/{id}`, and every provider-vault operation (including
+test-connection) are session-only. Provider-vault mutations retain the
+600 s fresh-session gate; test-connection requires a session but does not
+use that privileged-action freshness gate. No bearer credential can
+provide or extend the mutation step-up. An endpoint or operation added
+after this ADR is also denied to bearer keys until this map is explicitly
+updated; no implementation may infer a scope from a resource name or a
+similar operation.
+
+**Never grantable to a bearer key (session-only, enforced by the auth
+layer, not by scope strings):** account deletion / cancel-deletion,
+email change, passkey add/remove, issuance or revocation of any
+credential (native or Subsonic), provider-vault create/update/delete and
+test-connection operations, billing operations, and step-up proof
+begin/complete. Provider-vault mutations keep their 600 s fresh-session
+gate; test-connection requires a session but not that privileged-action
+gate. A bearer key also cannot mint stream grants for
+another user or read another user's vault rows — owner checks apply
+inside every path (threat-model §6 defense in depth).
+
+### Issuance, expiry, revocation
+
+- Issuance requires an authenticated session passing the privilege-freshness
+  gate (immutable auth age within 600 s, F-SESS-01 contract): stale sessions
+  are denied without issuing a key. The CISO-approved stale-session response
+  is already pinned in `docs/api-errors.md` (`reauth_required`, 401);
+  issuance reuses it, and clients depend on that row. Issuance writes an
+  `audit_log` row and records `created_from_ip`.
+- Expiry is mandatory: user-chosen up to a **365-day maximum**; no
+  never-expiring keys. Expired keys fail closed with the generic
+  unauthenticated response (no existence oracle).
+- Revocation is immediate (`revoked_at` timestamp; checked on every
+  request alongside expiry and scope). Users can list (prefix, label,
+  scopes, expiry, `last_used_at` — never secret material) and revoke
+  their own keys from a session-authenticated endpoint. Every account
+  recovery/revoke-all event also revokes all of that user's unrevoked native
+  REST credentials in the same transaction: email change or revert,
+  passkey add/remove, and the §6 session-compromise response in
+  `docs/security/session-secret-rotation.md`. On email change, notify the
+  old address that native REST credentials were revoked, in addition to
+  the existing change/revert notification. These bulk revocations are
+  audited without recording key material.
+- Per-credential rate limits apply; requests also use the same plan
+  entitlements and usage caps as session calls under ADR 0004, with no
+  bearer-key bypass. `last_used_at` anomalies (such as a burst from a new
+  IP/ASN) alert, mirroring the Subsonic rule.
+
+### Step-up
+
+Issuance-time freshness (above) is the step-up for this credential class:
+there is no standing bearer privilege to escalate because high-impact
+actions are session-only by construction. If a future scope is judged
+privilege-equivalent to today's session-only set, it needs a new ADR —
+scope creep by code change is denied.
+
+### Audit
+
+`audit_log` rows for create and revoke carry the credential id in the
+existing `action` text field (for example, `native_credential_created:<id>`),
+plus user, timestamp, source IP, and result — never secret material. Successful
+use updates `last_used_at`; failed-auth spikes are aggregated/rate-limited in
+the shared store before an audit alert is emitted, not written once per request.
+Account completion pseudonymizes retained rows under ADR 0002 rule 3.
+
+### Client transport requirements
+
+- `Authorization: Bearer` header only. A bearer secret in a query string
+  is rejected (same rationale as the `p=` rejection: query strings land
+  in logs; threat-model §5).
+- TLS everywhere (assumption 4 of the threat model). No key material in
+  error bodies, access logs, traces, or Analytics Engine events; server
+  logs redact the header the way `/rest/*` logging redacts `u/p/t/s/apiKey`.
+- Keys authenticate `/v1` only. They never authenticate `/rest/*`
+  (Subsonic), provider dials, or ingest fetches directly — those paths
+  keep their own credentials (ADR 0006, threat-model §§3, 6).
+
+## Threat model (delta; threat-model §8 gate still applies)
+
+New asset: **native REST bearer secrets** (client-held) alongside A3
+(session tokens). STRIDE coverage reuses existing mitigations:
+
+- **Spoofing** (stolen key): blast radius bounded by scopes + expiry;
+  provider-vault operations cannot be performed by bearer keys, and
+  mutations remain behind the session's 600 s freshness gate.
+- **Tampering** (credential row changed): the HMAC verifies the presented
+  secret, not row metadata such as owner or scopes. A database writer could
+  alter that metadata; preventing unauthorized database writes is a
+  deployment boundary, not a property of this credential hash. Composite
+  uniqueness prevents duplicate lookup identities.
+- **Repudiation**: issuance and revocation audit rows; `last_used_at` and
+  anomaly alerts record use without logging every request.
+- **Information disclosure** (SQL dump, log leak): HMAC-only at rest;
+  one-time display; header-only transport; generic failures.
+- **Denial of service**: per-credential rate limits; shared-store
+  (serverless-safe) counters.
+- **Elevation**: scope allowlist + session-only action set; owner checks
+  on every path; no existence oracles (non-owner/non-member reads stay
+  404/70-shaped per ADR 0006).
+
+The implementation PR updates `docs/security/threat-model.md` §§2/4–5,
+adds a row to its §9 findings index, and re-requests CISO review; this ADR
+alone changes no code or model text.
+
+## Migration compatibility
+
+- Additive table; existing sessions, Subsonic credentials, and vault rows
+  are untouched and keep working. Account erasure deletes native credential
+  rows before deleting the user, alongside Subsonic credentials, in the
+  forward migration's user-FK child order. No backfill or plaintext handling.
+- Cross-surface use is denied in both directions: Subsonic credentials
+  cannot authenticate `/v1` (ADR 0006, unchanged), native keys cannot
+  authenticate `/rest/*` (this ADR). Rotation on either keyring never
+  forces rotation on the other.
+- Clients that only hold session cookies see no behavior change.
+
+## Non-goals
+
+No OAuth/OIDC third-party delegation, no per-row ACLs beyond scopes, no
+service-to-service auth change, no token exchange or impersonation, no
+widening of the Subsonic subset, no implementation in this card.
+
+## Consequences
+
+- Programmatic `/v1` access has a designed, least-privilege path whenever
+  the implementation card lands; until then the deferral stands in code
+  (session cookie only) and this ADR is the contract the implementation
+  PR is reviewed against.
+- Fuzz/contract tests for the implementation PR cover: header-only
+  transport (query-string bearer rejected), unknown/revoked/expired key
+  vectors, every declared route/scope pair plus default-deny for unmapped
+  routes and methods, session-only action denials, dual-pepper lookup,
+  dormant-key retirement refusal, redaction of bearer material in emitted
+  logs, and rate-limit/anomaly behavior. Recovery-path tests must prove
+  that email change/revert, passkey add/remove, and the §6 session-compromise
+  response atomically revoke every unrevoked native REST credential, and
+  that email change sends the revocation notice to the old address.
+- Widening scopes, raising the 365-day cap, or granting bearer keys any
+  session-only action needs a new ADR.

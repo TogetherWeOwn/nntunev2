@@ -1,7 +1,7 @@
 //! User-scoped ingest job state machine: idempotent and resumable.
 //!
 //! A job moves `Queued -> Searching|Parsing -> Probing -> Verifying
-//! -> (Repairing -> Verifying)? -> Matching -> Writing -> Done`.
+//! -> (Repairing -> Verifying)? -> Matching -> Transcoding -> Writing -> Done`.
 //! Any step may move to `Failed` with a reason; `Done`/`Failed` are
 //! terminal. Workers persist the [`JobCheckpoint`] after every step, so a
 //! crashed or evicted run resumes from the last checkpoint instead of
@@ -30,6 +30,7 @@ pub enum JobState {
     Verifying,
     Repairing,
     Matching,
+    Transcoding,
     Writing,
     Done,
     Failed,
@@ -45,10 +46,10 @@ pub enum JobSource {
 
 /// Durable resume point written after every completed step.
 ///
-/// `attempt` is the Queue-delivery attempt (1-based): the consumer increments
-/// it on redelivery and [`can_retry`] gates another try. [`advance`] never
-/// touches it, so per-state retries cannot silently reset the job-level
-/// budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
+/// `attempt` is the Queue-delivery attempt (1-based), persisted by the
+/// consumer in `INGEST_STATE`; Queue message bodies are immutable on redelivery.
+/// [`advance`] never touches it, so per-state retries cannot silently reset the
+/// job-level budget. `repair_rounds` counts started `Verifying -> Repairing` rounds and
 /// bounds the verify↔repair loop (see [`advance_checkpoint`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCheckpoint {
@@ -63,12 +64,34 @@ pub struct JobCheckpoint {
     #[serde(default)]
     pub repair_rounds: u32,
     /// Probe answers collected while `Probing`, keyed by batch index (see
-    /// [`ProbeTally`](crate::probe::ProbeTally)). `None` outside `Probing`;
-    /// `#[serde(default)]` keeps pre-tally checkpoints readable (a crash
-    /// before this field existed resumes probing from batch zero).
+    /// [`ProbeTally`](crate::probe::ProbeTally)). The completed tally is
+    /// retained into `Verifying` (its missing-segment total is that step's
+    /// input) and cleared on redrive; `None` before `Probing` is first
+    /// entered. `#[serde(default)]` keeps pre-tally checkpoints readable
+    /// (a crash before this field existed resumes probing from batch zero).
     #[serde(default)]
     pub probe_tally: Option<ProbeTally>,
+    /// PAR2 set covering the damaged files, recorded by `Verifying`
+    /// before it hands off to `Repairing`. `None` until verify runs;
+    /// `#[serde(default)]` keeps pre-existing checkpoints readable.
+    #[serde(default)]
+    pub par2_set_id: Option<String>,
+    /// Blocks verify found missing, recorded alongside `par2_set_id`;
+    /// the `Repairing` step dispatches exactly this repair request.
+    #[serde(default)]
+    pub missing_blocks: u32,
+    /// Stable machine-readable failure category, retained for DLQ redelivery.
+    #[serde(default)]
+    pub failure_code: Option<String>,
     pub failure_reason: Option<String>,
+    /// Pool-fetch attribution (see [`QueueMsg::provider_id`](crate::queue::QueueMsg::provider_id)).
+    /// Projected from the message at admission and carried as the live
+    /// copy thereafter: Queue bodies are immutable on redelivery, so the
+    /// checkpoint — not the redelivered message — is what the grant
+    /// publication reads. `#[serde(default)]` keeps pre-attribution
+    /// checkpoints readable (they resume unattributed).
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 /// Advance one step on success. `repair_needed` is only read in `Verifying`.
@@ -89,7 +112,8 @@ pub fn advance(state: JobState, source: JobSource, repair_needed: bool) -> JobSt
             }
         }
         JobState::Repairing => JobState::Verifying,
-        JobState::Matching => JobState::Writing,
+        JobState::Matching => JobState::Transcoding,
+        JobState::Transcoding => JobState::Writing,
         JobState::Writing => JobState::Done,
         JobState::Done => JobState::Done,
         JobState::Failed => JobState::Failed,
@@ -109,6 +133,7 @@ pub fn advance_checkpoint(cp: &mut JobCheckpoint, repair_needed: bool) -> JobSta
     match cp.state {
         JobState::Verifying if repair_needed => {
             if cp.repair_rounds >= MAX_REPAIR_ROUNDS {
+                cp.failure_code = Some("repair_budget_exhausted".to_string());
                 cp.failure_reason = Some("repair budget exhausted".to_string());
                 cp.state = JobState::Failed;
             } else {
@@ -233,6 +258,18 @@ mod tests {
     }
 
     #[test]
+    fn matching_advances_through_transcoding_to_writing() {
+        assert_eq!(
+            advance(JobState::Matching, JobSource::NzbUpload, false),
+            JobState::Transcoding
+        );
+        assert_eq!(
+            advance(JobState::Transcoding, JobSource::NzbUpload, false),
+            JobState::Writing
+        );
+    }
+
+    #[test]
     fn fail_sticks_terminal_states() {
         assert_eq!(fail(JobState::Probing), JobState::Failed);
         assert!(is_terminal(JobState::Failed));
@@ -292,7 +329,11 @@ mod tests {
             attempt: 1,
             repair_rounds: 0,
             probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
+            failure_code: None,
             failure_reason: None,
+            provider_id: None,
         }
     }
 
@@ -309,6 +350,7 @@ mod tests {
         assert_eq!(cp.attempt, 1);
         assert_eq!(cp.repair_rounds, MAX_REPAIR_ROUNDS);
         assert!(is_terminal(cp.state));
+        assert_eq!(cp.failure_code.as_deref(), Some("repair_budget_exhausted"));
         assert_eq!(
             cp.failure_reason.as_deref(),
             Some("repair budget exhausted")
@@ -351,6 +393,36 @@ mod tests {
         let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(legacy_cp.probe_tally.is_none());
         assert_eq!(legacy_cp.repair_rounds, 0);
+    }
+
+    #[test]
+    fn checkpoint_carries_provider_attribution_with_legacy_default() {
+        // Attribution rides the checkpoint as the live copy (the grant
+        // publication reads it from here, not from the immutable Queue
+        // body), and checkpoints written before the field existed still
+        // decode (unattributed).
+        let mut cp = checkpoint_at(JobState::Verifying);
+        assert!(cp.provider_id.is_none());
+        cp.provider_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        let back: JobCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(back, cp);
+        assert_eq!(
+            back.provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+
+        let legacy = serde_json::json!({
+            "job_id": "job_0123456789abcdef",
+            "user_id": "user_01",
+            "idempotency_key": format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            "source": "nzb_upload",
+            "state": "verifying",
+            "attempt": 1,
+            "failure_reason": null,
+        });
+        let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_cp.provider_id.is_none());
     }
 
     #[test]

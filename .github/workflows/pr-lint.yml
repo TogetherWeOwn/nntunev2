@@ -10,7 +10,7 @@ name: pr-lint
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
-  # Merge queue validation (TOG-24374): `pr-lint` is a required check, so it
+  # Merge queue validation: `pr-lint` is a required check, so it
   # must report on merge_group. The queue run has no PR title and no
   # commits array, so it takes the explicit merge_group branch in the run
   # step and passes vacuously (the title was already linted on the PR).

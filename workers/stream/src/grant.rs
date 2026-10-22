@@ -1,0 +1,402 @@
+//! Signed play grants: the `api` Worker issues them, the `stream` Worker
+//! verifies one per play before touching the pool or R2.
+//!
+//! Token shape: `v1.<base64url(payload)>.<base64url(hmac-sha256)>` where the
+//! payload is `user_id|track_id|exp_unix`. Crypto is dependency-free
+//! (minimal SHA-256 + HMAC below) so `cargo test` runs anywhere; the Worker
+//! uses the same byte-exact scheme.
+//!
+//! Note: `user_id` and `track_id` must not contain `|` (our IDs never do);
+//! anything else that fails to parse is rejected as [`GrantError::Malformed`].
+//!
+//! Grants are short-lived: [`MAX_GRANT_TTL`] caps the lifetime at 15 minutes
+//! (900 s). The production issuer [`issue_at`] clamps longer requests to the
+//! cap, and [`verify`] rejects any grant with `exp - now` beyond
+//! `MAX_GRANT_TTL + CLOCK_SKEW_SECS` as [`GrantError::TtlTooLong`] so a
+//! captured grant stops replaying soon after issuance.
+
+/// Maximum grant lifetime: 15 minutes, in seconds.
+///
+/// Enforced at issuance (requests beyond the cap are clamped by [`issue_at`])
+/// and at verification ([`verify`] rejects over-cap grants even when the
+/// signature is valid).
+pub const MAX_GRANT_TTL: u64 = 900;
+
+/// Clock skew tolerated on top of [`MAX_GRANT_TTL`] when verifying, in
+/// seconds: an at-cap grant minted by an issuer whose clock runs ahead of
+/// the verifier's still verifies, up to 60 s over the cap.
+pub const CLOCK_SKEW_SECS: u64 = 60;
+
+/// A verified play grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub user_id: String,
+    pub track_id: String,
+    pub exp_unix: u64,
+}
+
+/// Why a token was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrantError {
+    Malformed,
+    BadSignature,
+    Expired,
+    /// The grant's remaining lifetime (`exp - now`) exceeds
+    /// `MAX_GRANT_TTL + CLOCK_SKEW_SECS`. Returned even for a validly-signed
+    /// token, so callers can tell "minted too long" apart from expiry.
+    TtlTooLong,
+}
+
+/// Issue a grant for (`user_id`, `track_id`) expiring at `exp_unix`.
+///
+/// This is the raw signer: it mints exactly the requested expiry so tests
+/// and offline tooling can construct arbitrary tokens. Production code must
+/// use [`issue_at`], which clamps the requested lifetime to
+/// [`MAX_GRANT_TTL`]; [`verify`] rejects over-cap grants regardless of
+/// which issuer minted them.
+pub fn issue(user_id: &str, track_id: &str, exp_unix: u64, secret: &[u8]) -> String {
+    let payload = format!("{user_id}|{track_id}|{exp_unix}");
+    let payload_b64 = base64url_encode(payload.as_bytes());
+    let sig = hmac_sha256(secret, payload_b64.as_bytes());
+    format!("v1.{payload_b64}.{}", base64url_encode(&sig))
+}
+
+/// Issue a grant for (`user_id`, `track_id`) with a requested lifetime of
+/// `ttl_secs` seconds from `now_unix`.
+///
+/// Requests beyond [`MAX_GRANT_TTL`] are clamped to the cap: the minted
+/// grant expires at `now_unix + min(ttl_secs, MAX_GRANT_TTL)` (saturating,
+/// so issuance near `u64::MAX` yields `u64::MAX` instead of wrapping).
+pub fn issue_at(
+    user_id: &str,
+    track_id: &str,
+    now_unix: u64,
+    ttl_secs: u64,
+    secret: &[u8],
+) -> String {
+    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    issue(user_id, track_id, exp_unix, secret)
+}
+
+/// Verify `token` against `secret` at time `now_unix`.
+pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantError> {
+    verify_with_user(token, secret, now_unix).map_err(|(err, _)| err)
+}
+
+/// Verify a grant and retain its signed user for rejection metering.
+///
+/// Only expiry and TTL-cap rejections carry a user; malformed and
+/// bad-signature tokens never produce an attribution candidate.
+pub(crate) fn verify_with_user(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<Grant, (GrantError, Option<String>)> {
+    let rest = token
+        .strip_prefix("v1.")
+        .ok_or((GrantError::Malformed, None))?;
+    let (payload_b64, sig_b64) = rest.split_once('.').ok_or((GrantError::Malformed, None))?;
+    if payload_b64.is_empty() || sig_b64.is_empty() {
+        return Err((GrantError::Malformed, None));
+    }
+    let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
+    let expected = hmac_sha256(secret, payload_b64.as_bytes());
+    if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
+        return Err((GrantError::BadSignature, None));
+    }
+    let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
+    let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
+    let mut parts = payload.split('|');
+    let (user_id, track_id, exp) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(u), Some(t), Some(e), None) => (u, t, e),
+        _ => return Err((GrantError::Malformed, None)),
+    };
+    let exp_unix: u64 = exp.parse().map_err(|_| (GrantError::Malformed, None))?;
+    let user_id = user_id.to_string();
+    if now_unix >= exp_unix {
+        return Err((GrantError::Expired, Some(user_id)));
+    }
+    // `now_unix < exp_unix` here, so the subtraction cannot underflow;
+    // comparing the difference (rather than `now + cap + skew`) also
+    // cannot overflow near `u64::MAX`.
+    if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
+        return Err((GrantError::TtlTooLong, Some(user_id)));
+    }
+    Ok(Grant {
+        user_id,
+        track_id: track_id.to_string(),
+        exp_unix,
+    })
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let key_block: [u8; 64] = if key.len() > 64 {
+        let digest = sha256(key);
+        let mut block = [0u8; 64];
+        block[..32].copy_from_slice(&digest);
+        block
+    } else {
+        let mut block = [0u8; 64];
+        block[..key.len()].copy_from_slice(key);
+        block
+    };
+    let mut inner = [0u8; 64];
+    let mut outer = [0u8; 64];
+    for (i, k) in key_block.iter().enumerate() {
+        inner[i] = k ^ 0x36;
+        outer[i] = k ^ 0x5c;
+    }
+    let mut inner_msg = Vec::with_capacity(64 + msg.len());
+    inner_msg.extend_from_slice(&inner);
+    inner_msg.extend_from_slice(msg);
+    let inner_digest = sha256(&inner_msg);
+    let mut outer_msg = Vec::with_capacity(64 + 32);
+    outer_msg.extend_from_slice(&outer);
+    outer_msg.extend_from_slice(&inner_digest);
+    sha256(&outer_msg)
+}
+
+/// Minimal SHA-256 (FIPS 180-4). Kept dependency-free on purpose.
+/// `pub(crate)` so [`crate::cache`] can content-address without a new dep.
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, slot) in w.iter_mut().enumerate().take(16) {
+            *slot = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64url_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let mut n: u32 = 0;
+        for (i, b) in chunk.iter().enumerate() {
+            n |= (*b as u32) << (16 - 8 * i);
+        }
+        let chars = if chunk.len() == 3 { 4 } else { chunk.len() + 1 };
+        for i in 0..chars {
+            out.push(B64URL[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    if s.is_empty() || !s.is_ascii() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut n: u32 = 0;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= val(*c)? << (18 - 6 * i);
+        }
+        // A short final quantum must have zero padding bits.
+        match chunk.len() {
+            4 => {
+                out.push((n >> 16) as u8);
+                out.push((n >> 8) as u8);
+                out.push(n as u8);
+            }
+            3 => {
+                if n & 0xff != 0 {
+                    return None;
+                }
+                out.push((n >> 16) as u8);
+                out.push((n >> 8) as u8);
+            }
+            2 => {
+                if n & 0xffff != 0 {
+                    return None;
+                }
+                out.push((n >> 16) as u8);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &[u8] = b"test-secret-please-ignore";
+    const OTHER_SECRET: &[u8] = b"another-secret";
+
+    #[test]
+    fn sha256_matches_published_test_vector() {
+        // "abc" -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let digest = sha256(b"abc");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231_test_case_1() {
+        // Key = 20 x 0x0b, data = "Hi There".
+        let digest = hmac_sha256(&[0x0bu8; 20], b"Hi There");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn round_trip_verifies() {
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        let grant = verify(&token, SECRET, 1_699_999_999).expect("verify");
+        assert_eq!(
+            grant,
+            Grant {
+                user_id: "user-1".to_string(),
+                track_id: "track-9".to_string(),
+                exp_unix: 1_700_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn expired_grant_is_rejected() {
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        assert_eq!(
+            verify(&token, SECRET, 1_700_000_000),
+            Err(GrantError::Expired)
+        );
+        assert_eq!(
+            verify(&token, SECRET, 1_800_000_000),
+            Err(GrantError::Expired)
+        );
+    }
+
+    #[test]
+    fn tampered_payload_fails_signature() {
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        // Flip one payload character while keeping the shape valid.
+        let mut tampered = token.clone();
+        let dot = tampered.find('.').unwrap();
+        let bytes = unsafe { tampered.as_bytes_mut() };
+        bytes[dot + 1] = if bytes[dot + 1] == b'A' { b'B' } else { b'A' };
+        assert_eq!(verify(&tampered, SECRET, 1), Err(GrantError::BadSignature));
+    }
+
+    #[test]
+    fn wrong_secret_fails_signature() {
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        assert_eq!(
+            verify(&token, OTHER_SECRET, 1),
+            Err(GrantError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn garbage_is_malformed() {
+        for bad in ["", "v1", "v1..", "v2.a.b", "not a token"] {
+            assert_eq!(
+                verify(bad, SECRET, 1),
+                Err(GrantError::Malformed),
+                "{bad:?}"
+            );
+        }
+    }
+}

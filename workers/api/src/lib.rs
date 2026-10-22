@@ -1,18 +1,107 @@
-//! NNTune v2 API: accounts/auth/session/vault core and Subsonic Worker shell.
+//! NNTune v2 accounts/auth/session/vault/library: security-critical core
+//! (`auth`, `session`, `vault`, `webauthn`, `library`), the
+//! framework-agnostic HTTP handlers (`handlers`, native-tested against
+//! fake stores), the Worker + Hyperdrive entry (`worker_entry`), and the
+//! Subsonic-compatible `/rest/*` surface (wasm32 only), which adapts to
+//! the transport-free `nntune-subsonic` dispatcher.
 //!
-//! The auth, session and vault modules are native + wasm32 compatible. Their
-//! HTTP + Hyperdrive wiring remains a follow-up. The wasm32 entry adapts
-//! `/rest/*` to the transport-free `nntune-subsonic` dispatcher.
-//!
-//! The production `Library` (PlanetScale via Hyperdrive, R2 audio/artwork via
-//! the stream worker) plugs in behind the `Library` seam. Until then the
-//! Worker uses `MemStore::empty()`, which holds no credentials and rejects
-//! every auth attempt. Per-client `apiKey` credentials will resolve against
-//! `subsonic_clients` (`migrations/0001_subsonic_clients.sql`).
+//! The production Subsonic `Library` (PlanetScale via Hyperdrive, R2
+//! audio/artwork via the stream worker) plugs in behind the `Library`
+//! seam. Until then the Worker uses `MemStore::empty()`, which holds no
+//! credentials and rejects every auth attempt. Per-client `apiKey`
+//! credentials will resolve against `subsonic_clients`
+//! (`migrations/0001_subsonic_clients.sql`).
 
+pub mod account_deletion;
+pub mod api_error;
 pub mod auth;
+pub mod b64;
+pub mod billing;
+pub mod handlers;
+pub mod ledger;
+pub mod legacy_playlist_fixtures;
+pub mod library;
+pub mod native_rest;
+pub mod plan_limits;
+pub mod random;
+pub mod rate_limit;
 pub mod session;
 pub mod vault;
+pub mod webauthn;
+pub mod worker_entry;
+
+/// Structured log emitter and trace-ID propagation shared with the other
+/// workers (`docs/logging-standard.md`). The api Worker's HTTP entry
+/// (`worker_entry::dispatch`) resolves inbound `x-trace-id`s through this
+/// emitter and records every served request plus startup/database failures;
+/// the contract tests below pin the envelope this entry programs against.
+pub use nntune_logging as logging;
+
+#[cfg(test)]
+mod logging_tests {
+    use super::logging::{fields_from_json, Level, LogRecord, Worker};
+
+    const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+
+    /// The api emitter renders the standard six-key envelope through the
+    /// REAL constructor, not a hand-written fixture.
+    #[test]
+    fn api_emitter_renders_standard_record() {
+        let record = LogRecord::new(
+            Worker::Api,
+            Level::Info,
+            TRACE,
+            "api.auth.login",
+            fields_from_json(serde_json::json!({"status_code": 200, "duration_ms": 12})).unwrap(),
+            1_792_094_400_123,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+        let object = parsed.as_object().unwrap();
+        assert_eq!(object.len(), 6);
+        assert_eq!(object["worker"], "api");
+        assert_eq!(object["trace_id"], TRACE);
+        assert_eq!(object["event"], "api.auth.login");
+        assert_eq!(object["ts"], "2026-10-15T20:00:00.123Z");
+        assert_eq!(record.trace_id(), TRACE);
+        assert_eq!(record.event(), "api.auth.login");
+    }
+
+    /// Negative coverage: unscoped events, invalid traces, and credential
+    /// shapes never become api log lines.
+    #[test]
+    fn api_emitter_rejects_unscoped_events_and_secrets() {
+        let ok_fields = || fields_from_json(serde_json::json!({"status_code": 200})).unwrap();
+        assert!(LogRecord::new(
+            Worker::Api,
+            Level::Info,
+            TRACE,
+            "ingest.job.queued",
+            ok_fields(),
+            0,
+        )
+        .is_err());
+        assert!(LogRecord::new(
+            Worker::Api,
+            Level::Info,
+            "short",
+            "api.auth.login",
+            ok_fields(),
+            0
+        )
+        .is_err());
+        for value in [
+            serde_json::json!({"session_id": "s"}),
+            serde_json::json!({"password": "hunter2"}),
+            serde_json::json!({"email": "a@example.com"}),
+        ] {
+            assert!(
+                fields_from_json(value).is_err(),
+                "emitter accepted a credential shape"
+            );
+        }
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
@@ -23,9 +112,37 @@ use nntune_subsonic::{
 #[cfg(target_arch = "wasm32")]
 use worker::*;
 
+#[worker::event(fetch)]
+pub async fn main(
+    req: worker::Request,
+    env: worker::Env,
+    _ctx: worker::Context,
+) -> worker::Result<worker::Response> {
+    // The Subsonic `/rest/*` surface (wasm32 only) adapts to the
+    // transport-free `nntune-subsonic` dispatcher. Every other path keeps
+    // `worker_entry::dispatch` behavior; the path peek only borrows, so an
+    // unclaimed request still moves into dispatch untouched.
+    #[cfg(target_arch = "wasm32")]
+    if is_subsonic_request(&req) {
+        let mut req = req;
+        return subsonic_response(&mut req).await;
+    }
+    worker_entry::dispatch(req, env).await
+}
+
+/// True when this request targets the Subsonic `/rest/*` surface.
 #[cfg(target_arch = "wasm32")]
-#[event(fetch)]
-pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response> {
+fn is_subsonic_request(req: &Request) -> bool {
+    req.url().is_ok_and(|url| {
+        let path = url.path();
+        path == "/rest" || path.starts_with("/rest/")
+    })
+}
+
+/// Serve one Subsonic request: v1 reads params from query plus POST form
+/// body (`$request->input()`), refusing bodies over 10 MB with error 10.
+#[cfg(target_arch = "wasm32")]
+async fn subsonic_response(req: &mut Request) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().to_string();
     let query = url.query().unwrap_or("").to_string();

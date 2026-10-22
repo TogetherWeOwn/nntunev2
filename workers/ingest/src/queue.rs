@@ -12,8 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::{JobSource, JobState};
 
 /// Ordered Workflow steps; `repair` runs only when verify asks for it.
-pub const WORKFLOW_STEPS: [&str; 7] = [
-    "search", "parse", "probe", "verify", "repair", "match", "write",
+pub const WORKFLOW_STEPS: [&str; 8] = [
+    "search",
+    "parse",
+    "probe",
+    "verify",
+    "repair",
+    "match",
+    "transcode",
+    "write",
 ];
 
 /// One unit of ingest work on the Queue.
@@ -50,6 +57,14 @@ pub struct QueueMsg {
     pub limit: Option<u32>,
     #[serde(default)]
     pub page: Option<u32>,
+    /// Request trace for structured logging (`docs/logging-standard.md`):
+    /// the validated inbound `x-trace-id` (32 lowercase hex), carried from
+    /// the HTTP route through the consumer and any downstream worker call. A
+    /// consumer receiving a valid ID MUST NOT replace it. `#[serde(default)]`
+    /// so messages enqueued before this field existed still decode (as
+    /// untraced); the consumer then generates one and treats it as the root.
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// Content-addressed handle (`nzb:sha256:<hex>`) for the uploaded NZB
     /// bytes of `NzbUpload` jobs, as stored in the payload KV under a
     /// [`PAYLOAD_TTL_SECS`](crate::dispatch::PAYLOAD_TTL_SECS) expiry. The
@@ -62,9 +77,25 @@ pub struct QueueMsg {
     /// the later retries.
     #[serde(default)]
     pub payload_ref: Option<String>,
+    /// Pool-fetch attribution: the `providers.id` (UUID text) whose
+    /// connection served this job's bytes, carried for the §4.2 grant
+    /// publication (`user_cache_grants` needs the fetching provider).
+    /// Ingest never mints it — the only future source is the stream
+    /// pool's provider wiring, which does not exist yet (the pool
+    /// answers `provider_unavailable` until then), so admission always
+    /// sends `None`. `#[serde(default)]` so older messages still decode.
+    /// The checkpoint is the live copy after admission: Queue bodies are
+    /// immutable on redelivery, so a redelivered `None` must never
+    /// clobber a checkpoint that already carries an id.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
-/// Native par2 repair dispatched to the Container batch job.
+/// Native par2 repair dispatched to the Container batch job via the
+/// no-route repair Worker. `scratch_prefix` must be exactly
+/// `ingest-scratch/{job_id}/r{round}/` (see
+/// `nntune_core::par2::scratch`); the repair Worker rebuilds it from
+/// `(job_id, round)` and rejects anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairRequest {
     pub job_id: String,
@@ -72,6 +103,12 @@ pub struct RepairRequest {
     pub idempotency_key: String,
     pub par2_set_id: String,
     pub missing_blocks: u32,
+    /// 1-based repair round, bounded by `jobs::MAX_REPAIR_ROUNDS`.
+    #[serde(default)]
+    pub round: u32,
+    /// Canonical scratch prefix the staged inputs live under.
+    #[serde(default)]
+    pub scratch_prefix: String,
 }
 
 /// Final library write after tag/fingerprint + MusicBrainz match.
@@ -130,6 +167,23 @@ pub fn validate_indexer_ref(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Provider identity shape: `8-4-4-4-12` hex, the text form of the
+/// `providers.id` UUID the grant publication binds to. Case-insensitive
+/// like [`validate_mbid`] (the `::uuid` cast normalizes anyway) with no
+/// version/variant pin: the pool's future attribution format is not
+/// ours to constrain beyond the UUID shape.
+pub fn validate_provider_id(raw: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = raw.split('-').collect();
+    if parts.len() != GROUPS.len() {
+        return false;
+    }
+    parts
+        .iter()
+        .zip(GROUPS)
+        .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +195,11 @@ mod tests {
         assert!(pipeline.starts_with("search>"));
         assert!(pipeline.ends_with(">write"));
         assert!(pipeline.contains(">repair>"));
+        // Transcoding sits between match and write (spec §4.2: the match
+        // assigns track identity first; the artifact publishes before
+        // the library write). Metering allowlists every step, so the
+        // transcode meter stage resolves here too.
+        assert!(pipeline.contains(">match>transcode>write"));
     }
 
     #[test]
@@ -153,15 +212,76 @@ mod tests {
             state: JobState::Queued,
             attempt: 1,
             repair_rounds: 0,
+            trace_id: Some("9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c".into()),
             query: None,
             indexer_ref: None,
             categories: vec![],
             limit: None,
             page: None,
             payload_ref: Some("nzb:sha256:abc".into()),
+            provider_id: Some("11111111-1111-4111-8111-111111111111".into()),
         };
         let back: QueueMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
+        assert_eq!(
+            back.trace_id.as_deref(),
+            Some("9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c")
+        );
+        assert_eq!(
+            back.provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    #[test]
+    fn provider_id_pins_the_uuid_shape() {
+        assert!(validate_provider_id("11111111-1111-4111-8111-111111111111"));
+        // Case-insensitive: the ::uuid cast normalizes.
+        assert!(validate_provider_id("AAAAAAAA-1111-4111-8111-111111111111"));
+        for bad in [
+            "",
+            "not-a-uuid",
+            "11111111-1111-4111-8111-11111111111",
+            "11111111-1111-4111-8111-1111111111111",
+            "11111111111141118111111111111111",
+            "zzzzzzzz-1111-4111-8111-111111111111",
+            "11111111_1111_4111_8111_111111111111",
+            "11111111-1111-4111-8111-111111111111-extra",
+        ] {
+            assert!(!validate_provider_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn queue_msg_reads_pre_attribution_messages_as_unattributed() {
+        // Messages enqueued before `provider_id` existed still decode;
+        // the job simply has no pool attribution yet.
+        let legacy = serde_json::json!({
+            "job_id": "job_1",
+            "user_id": "u1",
+            "idempotency_key": "ingest:u1:abc:upload",
+            "source": "nzb_upload",
+            "state": "queued",
+            "attempt": 1,
+        });
+        let back: QueueMsg = serde_json::from_value(legacy).unwrap();
+        assert!(back.provider_id.is_none());
+    }
+
+    #[test]
+    fn queue_msg_reads_pre_trace_messages_as_untraced() {
+        // Messages enqueued before `trace_id` existed still decode; the
+        // consumer generates a root trace for them instead of failing.
+        let legacy = serde_json::json!({
+            "job_id": "job_1",
+            "user_id": "u1",
+            "idempotency_key": "ingest:u1:abc:upload",
+            "source": "nzb_upload",
+            "state": "queued",
+            "attempt": 1,
+        });
+        let msg: QueueMsg = serde_json::from_value(legacy).unwrap();
+        assert_eq!(msg.trace_id, None);
     }
 
     #[test]
