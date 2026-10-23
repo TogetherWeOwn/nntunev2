@@ -816,6 +816,22 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
     }
 }
 
+/// Filter an edge response without consuming the copy returned to the caller.
+/// The body-read future is separate so read failures and legacy payloads can be
+/// exercised natively, without constructing Workers' JavaScript response types.
+async fn validated_edge_response<T, E>(
+    response: T,
+    status: u16,
+    body: impl std::future::Future<Output = Result<String, E>>,
+    validate: impl FnOnce(&str) -> bool,
+) -> Option<T> {
+    if status != 200 {
+        return None;
+    }
+    let body = body.await.ok()?;
+    validate(&body).then_some(response)
+}
+
 fn health_response() -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(http::StatusCode::OK)
@@ -1596,13 +1612,19 @@ mod http_layer {
         Ok(response)
     }
 
-    async fn edge_hit(req: &Request) -> Option<Response> {
+    async fn edge_hit(req: &Request, validate: impl FnOnce(&str) -> bool) -> Option<Response> {
         let url = req.url().ok()?.to_string();
-        Cache::default()
+        let mut hit = Cache::default()
             .get(canonical_edge_url(&url), false)
             .await
             .ok()
-            .flatten()
+            .flatten()?;
+        let status = hit.status_code();
+        // Deploys need not evict old edge entries. Apply the same DTO check as
+        // KV before serving them; read a clone so valid responses keep their
+        // body, headers and remaining edge TTL unchanged.
+        let mut copy = hit.cloned().ok()?;
+        validated_edge_response(hit, status, copy.text(), validate).await
     }
 
     pub async fn lookup_route(
@@ -1617,7 +1639,12 @@ mod http_layer {
         // Build identity rides every line (mirrors the api worker): the deploy
         // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
         let build_sha = build_sha_from_env(&ctx.env);
-        if let Some(hit) = edge_hit(req).await {
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && cached_lookup_body_is_fresh_shape(kind, mbid, body)
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1626,7 +1653,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1654,7 +1680,12 @@ mod http_layer {
         // Build identity rides every line (mirrors the api worker): the deploy
         // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
         let build_sha = build_sha_from_env(&ctx.env);
-        if let Some(hit) = edge_hit(req).await {
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_recordings(body, mbid)
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1663,7 +1694,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1706,10 +1736,38 @@ mod http_layer {
                 .map(|kind| kind.as_str())
                 .unwrap_or("unknown")
         };
-        if let Some(hit) = edge_hit(req).await {
-            let url = req.url()?;
-            let query: std::collections::HashMap<String, String> =
-                url.query_pairs().into_owned().collect();
+        let url = req.url()?;
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
+        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
+        let raw_q = query.get("q").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            let Some(kind) = Kind::parse(query.get("type").cloned()) else {
+                return false;
+            };
+            let q = raw_q.trim();
+            // Match the core's request bounds too: an edge body cannot turn
+            // an invalid request or an above-cap page into a cached success.
+            if !(2..=MAX_QUERY_CHARS).contains(&q.chars().count())
+                || q.chars().any(char::is_control)
+                || limit == Some(0)
+                || offset.unwrap_or(0) > MAX_SEARCH_OFFSET
+            {
+                return false;
+            }
+            is_valid_cached_search(
+                body,
+                kind,
+                &normalize_query(q),
+                limit
+                    .unwrap_or(MAX_PAGE_SIZE as u32)
+                    .min(MAX_PAGE_SIZE as u32),
+                offset.unwrap_or(0),
+            )
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1718,9 +1776,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let url = req.url()?;
-        let query: std::collections::HashMap<String, String> =
-            url.query_pairs().into_owned().collect();
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1729,13 +1784,11 @@ mod http_layer {
         // Unparsable `limit`/`offset` fall back to the defaults (`None`):
         // a full first page. An explicit `limit=0` still reaches the handler
         // as `Some(0)` and is rejected there, never silently defaulted.
-        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
-        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
         let api = handle_search_paged(
             &repo,
             &cache,
             query.get("type").cloned(),
-            query.get("q").map(String::as_str).unwrap_or(""),
+            raw_q,
             limit,
             offset,
         )
@@ -1914,6 +1967,106 @@ mod tests {
             artist_mbid: None,
             artist_name: None,
         }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_lookup_width_but_preserves_valid_response() {
+        let body = serde_json::json!({
+            "kind": "release", "mbid": MBID.to_uppercase(), "title": "Album",
+            "artist_mbid": null, "release_type": null, "year": 32767,
+            "caa_url": null, "extra": true,
+        });
+        for (year, servable) in [
+            (32767, true),
+            (-32768, true),
+            (32768, false),
+            (-32769, false),
+        ] {
+            let mut payload = body.clone();
+            payload["year"] = year.into();
+            let raw = payload.to_string();
+            let response = success_response(raw.clone(), LOOKUP_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| cached_lookup_body_is_fresh_shape(Kind::Release, MBID, body),
+            ));
+            if servable {
+                assert_eq!(result, Some(success_response(raw, LOOKUP_CACHE_TTL_S)));
+            } else {
+                assert_eq!(result, None, "legacy year {year} must miss at the edge");
+            }
+        }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_recordings_width() {
+        for (duration, servable) in [(2147483647_i64, true), (2147483648, false)] {
+            let raw = serde_json::json!({
+                "release_mbid": MBID,
+                "recordings": [{"mbid": MBID, "title": "Track", "duration_ms": duration}],
+            })
+            .to_string();
+            let response = success_response(raw.clone(), LOOKUP_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| is_valid_cached_recordings(body, MBID),
+            ));
+            assert_eq!(result.is_some(), servable, "duration {duration}");
+        }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_release_search_artist_fields() {
+        for (artist, servable) in [
+            (serde_json::json!("Artist"), true),
+            (serde_json::Value::Null, true),
+            (serde_json::json!({"name": "Artist"}), false),
+            (serde_json::json!(42), false),
+        ] {
+            let raw = serde_json::json!({
+                "q": "album", "type": "release", "limit": 25, "offset": 10,
+                "results": [{"mbid": MBID, "title": "Album", "score": 0.75,
+                             "artist_name": artist}],
+            })
+            .to_string();
+            let response = success_response(raw.clone(), SEARCH_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| is_valid_cached_search(body, Kind::Release, "album", 25, 10),
+            ));
+            assert_eq!(result.is_some(), servable, "artist field {artist}");
+        }
+    }
+
+    #[test]
+    fn edge_response_read_error_is_a_miss() {
+        let result = block_on(validated_edge_response(
+            "cached response",
+            200,
+            async { Err::<String, _>(()) },
+            |_| panic!("a failed body read must not reach validation"),
+        ));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn edge_response_non_success_is_a_miss_without_reading_body() {
+        let result = block_on(validated_edge_response(
+            "cached error",
+            500,
+            std::future::pending::<Result<String, ()>>(),
+            |_| panic!("cached errors must not reach validation"),
+        ));
+        assert_eq!(result, None);
     }
 
     #[test]

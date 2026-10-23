@@ -101,8 +101,12 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   zero, null, uppercase UUIDs and extra fields stay hits, and
   artist/recording hits never require release fields. Absent optionals
   stay hits on release-recordings rows and release-search artist fields;
-  lookups still require every always-emitted key present. A healthy fresh
-  result replaces the rejected body; a DB miss/error stays non-cacheable.
+  lookups still require every always-emitted key present. Both edge Cache
+  API hits (including entries written before a deployment) and KV hits use
+  these validators. An unreadable or incompatible edge body falls through
+  to KV, then the repository; a healthy result replaces the rejected edge
+  entry without flushing caches or changing keys/TTLs. A DB miss/error
+  stays non-cacheable. Valid edge responses retain their body and headers.
 - Release responses currently preserve the stored `caa_url` unchanged, so
   lookup cache keys remain environment-independent. When public R2 hosts are
   activated and URLs become environment-specific, include the environment in
