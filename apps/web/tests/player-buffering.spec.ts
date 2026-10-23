@@ -346,9 +346,12 @@ test('BUF-B10 clearing buffering leaves empty state immune to detached events', 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('player-error')).toHaveCount(0);
 	await page.getByTestId('queue-add-third-light').click();
-	await status(page, 'selected');
+	// First add to an empty queue auto-starts it (addToQueue calls
+	// playCurrent): the repopulated track is loading on the pending
+	// mocked play, and a pre-playing wait must not enter buffering.
+	await status(page, 'loading');
 	await event(page, 'waiting');
-	await status(page, 'selected');
+	await status(page, 'loading');
 });
 
 test('BUF-B11 natural end from buffering advances once, while end-of-track sleep still pauses', async ({ page }) => {
