@@ -82,6 +82,10 @@
 		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 	}
 
+	function trackCountLabel(count: number): string {
+		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
+	}
+
 	function selectTrack(id: string): void {
 		const item = items.find((track) => track.id === id);
 		if (!item) return;
@@ -158,20 +162,26 @@
 		{:else if items.length === 0}
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
+			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
 			<ul data-testid="library-list">
 				{#each items as track (track.id)}
+					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
 							type="button"
 							class="nt-library-row"
-							aria-label={queuedIds.has(track.id)
+							aria-label={queued
 								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 								: undefined}
+							aria-pressed={queued ? true : undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
 							{#if displayArtist(track)}
 								<span> — {displayArtist(track)}</span>
+							{/if}
+							{#if queued}
+								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
 							{/if}
 						</button>
 					</li>
@@ -227,5 +237,16 @@
 		cursor: pointer;
 		font: inherit;
 		color: inherit;
+	}
+	.nt-queued-badge {
+		display: inline-block;
+		margin-left: var(--nt-space-2);
+		padding: 0 var(--nt-space-2);
+		border-radius: var(--nt-radius);
+		background: var(--nt-accent);
+		color: var(--nt-accent-fg);
+		font-size: 0.75rem;
+		line-height: 1.6;
+		white-space: nowrap;
 	}
 </style>

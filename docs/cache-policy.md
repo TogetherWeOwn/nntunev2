@@ -77,11 +77,14 @@ which buckets a Worker may never consume.
   `archive` `bucket_name` appears in `workers/stream/wrangler.toml`,
   `workers/mb/wrangler.toml.example` (commented art names only),
   `workers/repair/wrangler.toml` (`INGEST_SCRATCH` only),
-  `workers/ingest/wrangler.toml.example` (`INGEST_SCRATCH` placeholder plus
-  its never-bind-archive comment), or `apps/web/wrangler.toml` (no R2
-  bindings); `docs/ops.md` lists both as reserved with no consumer and the
-  binding manifest intentionally leaves archive unmapped. No reads, no
-  bucket lock, and no object expiry per the TTL and guard sections.
+  `workers/transcode/wrangler.toml` (`INGEST_SCRATCH` only),
+  `workers/ingest/wrangler.toml.example` (`INGEST_SCRATCH` and
+  `AUDIO_PUBLISH` placeholders plus its never-bind-archive comment with
+  the documented §4.2 audio-publication exception), or
+  `apps/web/wrangler.toml` (no R2 bindings); `docs/ops.md` lists both as
+  reserved with no consumer and the binding manifest intentionally leaves
+  archive unmapped. No reads, no bucket lock, and no object expiry per
+  the TTL and guard sections.
 
 ## What "TTL" means here
 
