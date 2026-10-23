@@ -587,8 +587,8 @@
 	function updateSound(preference: SoundPreference, element = audioEl, persist = true): void {
 		if (!element) return;
 		const actual = applySoundPreference(element, preference);
+		actual.restricted ||= sound.restricted ?? false;
 		if (persist) {
-			actual.restricted ||= sound.restricted ?? false;
 			if (sound.volume !== actual.volume || sound.muted !== actual.muted) {
 				saveSoundPreference(safeStorage(), actual);
 			}

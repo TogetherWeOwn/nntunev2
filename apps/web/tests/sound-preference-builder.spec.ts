@@ -26,6 +26,8 @@ for (const mode of ['throw', 'ignore']) {
 		await page.getByTestId('player-next').click();
 		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
 		await expectSound(page, 1, true);
+		await expect(volumeControl(page)).toBeDisabled();
+		await expect(page.getByRole('status').filter({ hasText: "Use system volume controls." })).toBeVisible();
 		expect(await playCount(page)).toBe(1);
 		expect(errors).toEqual([]);
 	});
