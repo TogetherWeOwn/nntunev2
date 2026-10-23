@@ -61,6 +61,23 @@ the activation checklist is accurate:
   still depend on their venture slices; the journey specs expose those missing
   backend behaviors directly.
 
+## Bot-contract conformance vectors (feeds B8)
+
+The TWO-bot consumption contract (spec section 5) is banked as a JSON
+fixture corpus plus an offline checker, ahead of the B-chain runtime work:
+
+- Corpus: `e2e/fixtures/bot-contract/` (`grants.json`, `signed-url.json`,
+  `profile-matrix.json`, documented in its `README.md`).
+- Checker: `e2e/helpers/bot-contract.ts` — import `checkGrantVector`,
+  `checkSignedUrlVector`, `checkMatrixRow` from a staging spec.
+- Pins: `e2e/tests/bot-contract.spec.ts` (runs in `npm run test:unit`,
+  no staging): the checker passes the corpus, fails each mutated shape by
+  name, and the stable IDs + typed codes match their pinned sources.
+
+B8 feeds the signed-URL vectors to staging and compares the wire verdicts
+against the matrix expectations. Vector ids (`botgrant-NNN`, `boturl-NNN`,
+`botmx-NNN`) are stable and citable; fixtures name secrets only.
+
 ## Run locally
 
 ```sh
