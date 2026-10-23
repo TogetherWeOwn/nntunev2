@@ -30,7 +30,11 @@
 //! Source bytes are only ever read, never modified.
 //!
 //! Publication (spec §4.2, ADR 0002 rule 3 / ADR 0003 §writers), one
-//! idempotent statement each, all converging on redelivery:
+//! idempotent statement each, all converging on redelivery. This step
+//! publishes the content-global row only; the two user rows stay
+//! pinned here but unwired until the tracks/providers writers land
+//! (a follow-up wires them, with the §8 proof, once their FK targets
+//! exist — publishing them today would fail closed on every job):
 //!
 //! - [`upsert_cache_object_sql`] — the content-global blob row. No
 //!   writer fence: the row carries no user identity and an orphaned
@@ -52,19 +56,26 @@
 //! consumer separates them with the PK selects plus
 //! [`classify_publish_zero_rows`], never by assuming.
 //!
-//! Enablement (this module is pure and tested; the runtime path lands
-//! with the rest of the B6 PR): the transcode Container image +
-//! front Worker, the `TRANSCODE_CONTAINER` binding, the
-//! audio-bucket publication binding (a deliberate, documented
-//! exception to the "never bind the audio-cache buckets here" rule
-//! in `wrangler.toml.example`, which predates the e2e spec's §4.2
-//! publication assignment), the `Transcoding` state wiring, and the
-//! artifact-table migration. Missing-table SQLSTATEs map through
+//! Runtime: the `Transcoding` step (`run_transcode_step` in
+//! `queue_consumer.rs`) dispatches one recorded input per delivery through
+//! [`call_transcode`], fetches `out/artifact.ogg` from scratch,
+//! verifies its SHA-256, puts the bytes to the audio bucket, and
+//! publishes the [`upsert_cache_object_sql`] row — then advances the
+//! cursor, or to `Writing` past the last input. Enablement outside
+//! this repo slice: the `TRANSCODE_CONTAINER` service binding, the
+//! `AUDIO_PUBLISH` audio-bucket binding plus the `AUDIO_BUCKET_NAME`
+//! var (a deliberate, documented exception to the "never bind the
+//! audio-cache buckets here" rule in `wrangler.toml.example`, which
+//! predates the e2e spec's §4.2 publication assignment), and the
+//! deployed Container image + front Worker (both live in-repo under
+//! `containers/transcode` and `workers/transcode`; deploy itself is
+//! an operator action). Missing-table SQLSTATEs map through
 //! `crate::library::is_deterministic_sqlstate` to permanent
 //! failures, so jobs quarantine at once instead of burning budget.
-//! Grant publication makes the B6 PR subject to the standing
-//! CISO/threat-model §8 gate.
+//! Grant publication (the follow-up, not this step) carries the
+//! standing threat-model §8 gate with it.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -72,11 +83,13 @@ use worker::{wasm_bindgen::JsValue, Delay, Env, Headers, Method, Request, Reques
 
 use futures_util::StreamExt;
 
-use nntune_core::par2::scratch::{validate_object_key, validate_staging_id};
-use nntune_core::transcode::canonical_sha256_hex;
+use nntune_core::par2::scratch::{sha256_hex, validate_staging_id};
+use nntune_core::transcode::{canonical_sha256_hex, validate_transcode_input_key};
 
 use crate::dispatch::validate_user_id;
 use crate::jobs::validate_job_id;
+use crate::parse::ParsedFile;
+use crate::verify::{StagedFile, VerifyProgress};
 
 /// Service binding name for the transcode Worker (wrangler `[[services]]`).
 pub const TRANSCODE_SERVICE_BINDING: &str = "TRANSCODE_CONTAINER";
@@ -93,6 +106,17 @@ pub const TRANSCODE_URL: &str = "https://transcode-worker/transcode";
 /// is ~1.9 MB per 4-minute track) — the budget covers staging
 /// transfers and a slow Container start, not a slow codec.
 pub const TRANSCODE_CALL_DEADLINE_MS: u64 = 660_000;
+/// R2 binding carrying artifact publication: the environment's audio
+/// bucket (wrangler `[[r2_buckets]]`). A deliberate, documented
+/// exception to the "never bind the audio-cache buckets here" rule in
+/// `wrangler.toml.example`, assigned by the e2e spec's §4.2
+/// publication step; the bucket name rides
+/// [`AUDIO_BUCKET_NAME_VAR`].
+pub const AUDIO_PUBLISH_BINDING: &str = "AUDIO_PUBLISH";
+/// Worker var (or secret) naming the audio bucket behind
+/// [`AUDIO_PUBLISH_BINDING`] (`nntunev2-audio-{staging,prod}`), bound
+/// into the [`upsert_cache_object_sql`] row's `r2_bucket` column.
+pub const AUDIO_BUCKET_NAME_VAR: &str = "AUDIO_BUCKET_NAME";
 /// The front replies with a small status document
 /// (`{status, artifact_sha256, byte_size}`; the artifact bytes stay in
 /// `out/artifact.ogg` in scratch for ingest to fetch), so anything
@@ -102,22 +126,20 @@ pub const MAX_TRANSCODE_REPLY_BYTES: usize = 64 << 10;
 /// track is ~28.8 MB, plus Ogg framing. Anything larger is not this
 /// profile's output and is refused rather than published.
 pub const MAX_ARTIFACT_BYTES: u64 = 32 << 20;
-/// Scratch round-dir prefixes are short by construction
-/// (`ingest-scratch/{job_id}/r{round}/`); anything longer is not one.
-pub const MAX_SCRATCH_PREFIX_BYTES: usize = 256;
 /// Idempotency keys are `ingest:{user}:{sha}:{ref}` with bounded
 /// fields (see `jobs::derive_idempotency_key`); 768 covers the
 /// longest constructible key with headroom.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 768;
 
 /// One verified audio file to encode, mirrored field-for-field by the
-/// transcode front's contract. `input_key` is the 64-hex scratch
-/// object name under `{scratch_prefix}in/`; `source_sha256` is the
-/// verified bytes' hash (the content identity the front memoises on);
-/// `staging_id` is the manifest digest binding this exact input set,
-/// so a redrive that re-stages different bytes under the same names
-/// cannot replay the previous generation's artifact (the repair
-/// `staging_id` lesson).
+/// transcode front's contract. `input_key` is the verify-staged
+/// object name (`{index:04}-{sha256(file_name)}`) under
+/// `{scratch_prefix}in/`; `source_sha256` is the verified bytes'
+/// hash (the content identity the front memoises on);
+/// `staging_id` binds the profile, job, verify-round scratch prefix,
+/// input key and verified content hash (see [`derive_transcode_staging`]).
+/// It identifies one file's encode generation, not the full manifest;
+/// another job, round, key or source cannot replay its artifact.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranscodeRequest {
     pub job_id: String,
@@ -129,21 +151,12 @@ pub struct TranscodeRequest {
     pub staging_id: String,
 }
 
-/// True only for the round dir the job's verify staging lives in:
-/// `ingest-scratch/{job_id}/.../` with a trailing slash, a safe
-/// charset, and the length cap. The job containment is the point: a
-/// forged prefix must never address another job's staged bytes.
+/// True only for the round dir the job's verify staging lives in.
+/// The rule is shared with the transcode front parse
+/// (`nntune_core::transcode::validate_transcode_prefix`) so dispatch
+/// and front can never disagree on job containment.
 pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
-    if prefix.len() > MAX_SCRATCH_PREFIX_BYTES || !prefix.ends_with('/') {
-        return false;
-    }
-    let root = format!("ingest-scratch/{job_id}/");
-    if !prefix.starts_with(&root) {
-        return false;
-    }
-    prefix
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+    nntune_core::transcode::validate_transcode_prefix(prefix, job_id)
 }
 
 /// Decide one file's transcode dispatch: `Ok` carries the validated
@@ -172,7 +185,7 @@ pub fn decide_transcode(
     {
         return Err("idempotency key outside the ingest key shape");
     }
-    if !validate_object_key(input_key) {
+    if !validate_transcode_input_key(input_key) {
         return Err("input key is not a staged object key");
     }
     let Ok(source_sha256) = canonical_sha256_hex(source_sha256_hex) else {
@@ -497,6 +510,213 @@ pub const fn classify_publish_zero_rows(row_exists: bool) -> PublishOutcome {
     }
 }
 
+/// Classify a [`upsert_cache_object_sql`] write by its affected-row
+/// count. `ON CONFLICT DO NOTHING` yields at most one row: 1 is the
+/// first writer's publication, 0 is a redelivery converging on it
+/// (same hash means same bytes, so there is no third case — the
+/// statement carries no fence to refuse through).
+pub const fn classify_cache_object_rows(affected: u64) -> PublishOutcome {
+    if affected == 1 {
+        PublishOutcome::Published
+    } else {
+        PublishOutcome::Duplicate
+    }
+}
+
+/// One verified audio input awaiting `Transcoding`, recorded on the
+/// checkpoint by `Verifying` on `Complete`. `key` is the full staged
+/// object key; `sha256` the canonical content hash; `size` the
+/// staged byte count; `scratch_prefix` the round dir the key lives
+/// under (recomputed rounds stage under a new dir, so the prefix is
+/// recorded per input, never re-derived at encode time).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TranscodeInput {
+    pub file_index: usize,
+    pub key: String,
+    pub sha256: String,
+    pub size: u64,
+    pub scratch_prefix: String,
+}
+
+/// Audio containers the profile accepts, matched case-insensitively
+/// against the extension after the final dot. Everything here is an
+/// ffmpeg-decodable audio shape (`-map 0:a:0` selects the first audio
+/// stream out of containers that may also carry video or images);
+/// anything else is never worth encoding. Pinned by tests: extending
+/// the list changes which releases transcode.
+pub const AUDIO_EXTENSIONS: [&str; 16] = [
+    "flac", "mp3", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "wave", "aiff", "aif", "wma",
+    "ape", "mpc", "wv",
+];
+
+/// True for parsed file names worth encoding: a non-par2 data file
+/// whose extension (after the final dot) is in
+/// [`AUDIO_EXTENSIONS`]. Display-name only — storage keys never
+/// derive from it.
+pub fn is_audio_name(name: &str) -> bool {
+    if !name.contains('.') {
+        return false;
+    }
+    let ext = name.rsplit('.').next().unwrap_or("");
+    if ext.is_empty() {
+        return false;
+    }
+    AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+/// Select the verified audio inputs from a completed verify round:
+/// every staged, intact, single-object, non-par2 audio file, in NZB
+/// file order. Pure over the parse plus the staged records so the
+/// selection is unit-tested without bindings.
+///
+/// Skips are silent only when they are structurally not audio (par2
+/// files, `.nfo`/`.sfv`/artwork). Everything else fails the job with
+/// a stable reason: a staged index outside the parse, a key outside
+/// the derived layout, damage on a supposedly complete round, a
+/// spooled (multi-object) audio file this input cannot consume, a
+/// non-content hash, or an empty audio object are all pipeline bugs
+/// or corrupt progress — never something a redelivery could fix, and
+/// never silently droppable (a release that encodes some tracks but
+/// not others is incorrect output, not a partial success).
+pub fn select_transcode_inputs(
+    files: &[ParsedFile],
+    staged: &BTreeMap<usize, StagedFile>,
+    job_id: &str,
+    round: u32,
+) -> Result<Vec<TranscodeInput>, &'static str> {
+    let mut inputs = Vec::new();
+    for (index, rec) in staged {
+        let file = files
+            .get(*index)
+            .ok_or("staged index outside parsed files")?;
+        if file.is_par2 || !is_audio_name(&file.name) {
+            continue;
+        }
+        if rec.key != VerifyProgress::file_key(job_id, round, *index, &file.name) {
+            return Err("staged key outside derived layout");
+        }
+        if rec.missing || rec.missing_blocks != 0 {
+            return Err("damaged file reached transcode selection");
+        }
+        if !rec.spool.is_empty() {
+            return Err("spooled audio has no single-object encode input");
+        }
+        let sha256 = canonical_sha256_hex(&rec.sha256)
+            .map_err(|_| "staged hash outside content identity")?;
+        if rec.size == 0 {
+            return Err("empty staged audio file");
+        }
+        inputs.push(TranscodeInput {
+            file_index: *index,
+            key: rec.key.clone(),
+            sha256,
+            size: rec.size,
+            scratch_prefix: VerifyProgress::scratch_prefix(job_id, round),
+        });
+    }
+    Ok(inputs)
+}
+
+/// Record a completed verify round's transcode inputs on the
+/// checkpoint and reset the encode cursor. Pure over the checkpoint
+/// plus the selection inputs; the caller (`run_verifying`, on
+/// `Complete`) owns the failure mapping.
+pub fn record_transcode_inputs(
+    cp: &mut crate::jobs::JobCheckpoint,
+    files: &[ParsedFile],
+    staged: &BTreeMap<usize, StagedFile>,
+    job_id: &str,
+    round: u32,
+) -> Result<(), &'static str> {
+    cp.transcode_inputs = select_transcode_inputs(files, staged, job_id, round)?;
+    cp.transcode_next = 0;
+    Ok(())
+}
+
+/// Generation-bound staging id for one encode request: sha256 over
+/// the profile tag, job, verify-round scratch prefix, verified content
+/// hash and staged input key. Redeliveries of the same recorded input
+/// replay the memoised artifact; another job or round never does, even
+/// for identical bytes. All fields are validated before hashing, and
+/// their alphabets exclude the `:` separator.
+pub fn derive_transcode_staging(
+    source_sha256_hex: &str,
+    input_key: &str,
+    job_id: &str,
+    scratch_prefix: &str,
+) -> Result<String, &'static str> {
+    if !validate_job_id(job_id) {
+        return Err("job id outside the pipeline alphabet");
+    }
+    if !validate_transcode_prefix(scratch_prefix, job_id) {
+        return Err("scratch prefix outside the job round dir");
+    }
+    if !validate_transcode_input_key(input_key) {
+        return Err("input key is not a staged object key");
+    }
+    let sha = canonical_sha256_hex(source_sha256_hex)
+        .map_err(|_| "source sha256 must be 64 hex chars")?;
+    Ok(sha256_hex(
+        format!("opus-64:v2:{job_id}:{scratch_prefix}:{sha}:{input_key}").as_bytes(),
+    ))
+}
+
+/// Verify fetched artifact bytes against a `Completed` reply's claims:
+/// exact size plus exact SHA-256 (either case on the claimed hash).
+/// Pure so the gate is unit-tested without bindings; the caller
+/// fails a mismatch permanently (complete-but-wrong bytes are
+/// deterministic — transport damage fails earlier, at the fetch).
+pub fn verify_transcode_artifact(
+    bytes: &[u8],
+    artifact_sha256_hex: &str,
+    byte_size: u64,
+) -> Result<(), &'static str> {
+    if bytes.len() as u64 != byte_size {
+        return Err("artifact size mismatch");
+    }
+    let claimed =
+        canonical_sha256_hex(artifact_sha256_hex).map_err(|_| "artifact hash mismatch")?;
+    if sha256_hex(bytes) != claimed {
+        return Err("artifact hash mismatch");
+    }
+    Ok(())
+}
+
+/// Why a scratch artifact fetch failed. Neutral (no job codes): the
+/// consumer maps `Missing`/`Transport` to transient retries and
+/// `Oversize` to permanent (only this pipeline writes the artifact
+/// key, always within the profile ceiling, so an oversize object is
+/// deterministic corruption, never a lagging write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactFetchError {
+    Missing,
+    Oversize,
+    Transport,
+}
+
+/// Why a [`upsert_cache_object_sql`] write failed. Neutral: the
+/// consumer maps `Deterministic` (missing table, constraint
+/// violation — replays identically) to permanent quarantine and
+/// `Transient` to the shared attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishError {
+    Deterministic,
+    Transient,
+}
+
+/// One [`upsert_cache_object_sql`] write's bound values, in
+/// [`CACHE_OBJECT_PARAM_ORDER`]: the verified content hash, the
+/// artifact byte count, the audio bucket name and content-addressed
+/// key, and the verification epoch seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscodePublication {
+    pub content_hash: String,
+    pub byte_size: u64,
+    pub r2_bucket: String,
+    pub r2_key: String,
+    pub verified_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +725,7 @@ mod tests {
     const USER: &str = "user_01";
     const KEY: &str =
         "ingest:user_01:9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734:upload";
-    const INPUT: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+    const INPUT: &str = "0007-9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
     const SOURCE_SHA: &str = "1b0b44a2c0f2e9d5b6a7c8d9e0f1a2b31b0b44a2c0f2e9d5b6a7c8d9e0f1a2b3";
     const PREFIX: &str = "ingest-scratch/job_01J9ZQ8K2M/r1/";
     const STAGING: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
@@ -547,6 +767,18 @@ mod tests {
         );
         assert!(decide_transcode(JOB, USER, "nope", INPUT, SOURCE_SHA, PREFIX, STAGING).is_err());
         assert!(decide_transcode(JOB, USER, KEY, "ZZZ", SOURCE_SHA, PREFIX, STAGING).is_err());
+        // The bare 64-hex core-contract shape has no producer: only the
+        // indexed verify-staged name dispatches.
+        assert!(decide_transcode(
+            JOB,
+            USER,
+            KEY,
+            "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+            SOURCE_SHA,
+            PREFIX,
+            STAGING
+        )
+        .is_err());
         assert!(decide_transcode(JOB, USER, KEY, INPUT, "short", PREFIX, STAGING).is_err());
         // Uppercase source hash canonicalises instead of rejecting.
         let upper = decide_transcode(
@@ -866,5 +1098,387 @@ mod tests {
         assert_eq!(body["staging_id"], STAGING);
         assert_eq!(TRANSCODE_ENDPOINT, "/transcode");
         assert_eq!(TRANSCODE_SERVICE_BINDING, "TRANSCODE_CONTAINER");
+    }
+
+    #[test]
+    fn audio_names_match_the_pinned_extension_list() {
+        for name in [
+            "track01.flac",
+            "track02.MP3",
+            "a.m4a",
+            "b.mp4",
+            "c.aac",
+            "d.ogg",
+            "e.oga",
+            "f.opus",
+            "g.wav",
+            "h.WAVE",
+            "i.aiff",
+            "j.aif",
+            "k.wma",
+            "l.ape",
+            "m.mpc",
+            "n.wv",
+            "deep.name.with.dots.flac",
+        ] {
+            assert!(is_audio_name(name), "{name} must be audio");
+        }
+        for name in [
+            "track01.nfo",
+            "track01.sfv",
+            "cover.jpg",
+            "set.par2",
+            "noextension",
+            "trailing-dot.",
+            ".",
+            "",
+        ] {
+            assert!(!is_audio_name(name), "{name} must not be audio");
+        }
+        // The allowlist is closed: every entry is exercised above, and
+        // the count pins the list against silent extension.
+        assert_eq!(AUDIO_EXTENSIONS.len(), 16);
+    }
+
+    fn parsed_file(name: &str, is_par2: bool) -> ParsedFile {
+        ParsedFile {
+            name: name.to_string(),
+            is_par2,
+            segment_ids: Vec::new(),
+            segment_bytes: Vec::new(),
+        }
+    }
+
+    fn staged_audio(key: String, sha256: &str, size: u64) -> StagedFile {
+        StagedFile {
+            key,
+            size,
+            sha256: sha256.to_string(),
+            missing_blocks: 0,
+            size_refused_blocks: 0,
+            par2_set_id: None,
+            spool: Vec::new(),
+            crc32: 0,
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn selection_picks_intact_audio_in_file_order() {
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let files = vec![
+            parsed_file("track02.mp3", false),
+            parsed_file("release.nfo", false),
+            parsed_file("track01.flac", false),
+            parsed_file("set.par2", true),
+        ];
+        let staged: BTreeMap<usize, StagedFile> = [0, 1, 2, 3]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    staged_audio(
+                        VerifyProgress::file_key(JOB, 1, index, &files[index].name),
+                        SHA,
+                        512,
+                    ),
+                )
+            })
+            .collect();
+        let inputs = select_transcode_inputs(&files, &staged, JOB, 1).unwrap();
+        // Audio only, in NZB file order (index 0 before 2); the .nfo
+        // and the par2 row skip silently.
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].file_index, 0);
+        assert_eq!(inputs[1].file_index, 2);
+        assert_eq!(inputs[0].sha256, SHA);
+        assert_eq!(inputs[0].size, 512);
+        assert_eq!(inputs[0].scratch_prefix, PREFIX);
+        assert_eq!(
+            inputs[0].key,
+            VerifyProgress::file_key(JOB, 1, 0, "track02.mp3")
+        );
+    }
+
+    #[test]
+    fn selection_fails_each_corrupt_shape() {
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let files = vec![parsed_file("track01.flac", false)];
+        let staged_one = |rec: StagedFile| BTreeMap::from([(0usize, rec)]);
+        let key = VerifyProgress::file_key(JOB, 1, 0, "track01.flac");
+        // Index outside the parse.
+        let mut staged = staged_one(staged_audio(key.clone(), SHA, 512));
+        staged.insert(7, staged_audio(key.clone(), SHA, 512));
+        assert!(select_transcode_inputs(&files, &staged, JOB, 1).is_err());
+        // Key outside the derived layout.
+        assert!(select_transcode_inputs(
+            &files,
+            &staged_one(staged_audio(
+                "ingest-scratch/job_01J9ZQ8K2M/r1/in/0000-evil".to_string(),
+                SHA,
+                512
+            )),
+            JOB,
+            1
+        )
+        .is_err());
+        // Damage on a supposedly complete round.
+        let mut damaged = staged_audio(key.clone(), SHA, 512);
+        damaged.missing_blocks = 2;
+        assert!(select_transcode_inputs(&files, &staged_one(damaged), JOB, 1).is_err());
+        // Spooled audio has no single-object input (never silently
+        // dropped: a release that encodes some tracks but not others
+        // is incorrect output).
+        let mut spooled = staged_audio(key.clone(), SHA, 512);
+        spooled.spool = vec![crate::verify::StagedSpoolSegment {
+            key: "seg".to_string(),
+            size: 1,
+            crc32: 0,
+            missing: false,
+            size_refused: false,
+        }];
+        assert!(select_transcode_inputs(&files, &staged_one(spooled), JOB, 1).is_err());
+        // Non-content hash and empty audio.
+        assert!(select_transcode_inputs(
+            &files,
+            &staged_one(staged_audio(key.clone(), "xyz", 512)),
+            JOB,
+            1
+        )
+        .is_err());
+        assert!(select_transcode_inputs(
+            &files,
+            &staged_one(staged_audio(key.clone(), SHA, 0)),
+            JOB,
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn selection_without_audio_selects_nothing() {
+        let files = vec![
+            parsed_file("release.nfo", false),
+            parsed_file("set.par2", true),
+        ];
+        let staged: BTreeMap<usize, StagedFile> = [0, 1]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    staged_audio(
+                        VerifyProgress::file_key(JOB, 1, index, &files[index].name),
+                        "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+                        512,
+                    ),
+                )
+            })
+            .collect();
+        // Empty is a valid selection: the step fails it permanently
+        // with "no verified audio", naming the input instead of the
+        // verify that recorded it.
+        assert!(select_transcode_inputs(&files, &staged, JOB, 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn record_stores_inputs_and_resets_the_cursor() {
+        use crate::jobs::{JobCheckpoint, JobSource, JobState};
+
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let files = vec![parsed_file("track01.flac", false)];
+        let staged = BTreeMap::from([(
+            0usize,
+            staged_audio(
+                VerifyProgress::file_key(JOB, 2, 0, "track01.flac"),
+                SHA,
+                512,
+            ),
+        )]);
+        let mut cp = JobCheckpoint {
+            job_id: JOB.to_string(),
+            user_id: USER.to_string(),
+            idempotency_key: KEY.to_string(),
+            source: JobSource::NzbUpload,
+            state: JobState::Verifying,
+            attempt: 1,
+            repair_rounds: 1,
+            probe_tally: None,
+            par2_set_id: None,
+            missing_blocks: 0,
+            failure_code: None,
+            failure_reason: None,
+            provider_id: None,
+            transcode_inputs: Vec::new(),
+            transcode_next: 7,
+        };
+        record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
+        assert_eq!(cp.transcode_inputs.len(), 1);
+        assert_eq!(cp.transcode_next, 0);
+        // The re-verify round's own prefix is recorded, never the
+        // previous round's: inputs always address their own staging.
+        assert_eq!(
+            cp.transcode_inputs[0].scratch_prefix,
+            "ingest-scratch/job_01J9ZQ8K2M/r2/"
+        );
+    }
+
+    #[test]
+    fn staging_id_is_deterministic_and_content_sensitive() {
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let first = derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap();
+        // Independent SHA-256 fixture for the specified v2 domain and scope.
+        assert_eq!(
+            first,
+            "64e7ca9681a8c87e6d2acc5629774dcdfd27387c9b64b71d81273e075f923a9e"
+        );
+        assert_eq!(
+            derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap(),
+            first
+        );
+        assert_eq!(
+            derive_transcode_staging(&SHA.to_ascii_uppercase(), INPUT, JOB, PREFIX).unwrap(),
+            first
+        );
+        assert_ne!(
+            derive_transcode_staging(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                INPUT,
+                JOB,
+                PREFIX,
+            )
+            .unwrap(),
+            first
+        );
+        assert_ne!(
+            derive_transcode_staging(
+                SHA,
+                "0008-9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+                JOB,
+                PREFIX,
+            )
+            .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn staging_id_separates_jobs_with_valid_matching_prefixes_and_rounds() {
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let first = derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap();
+        let other_job =
+            derive_transcode_staging(SHA, INPUT, "job_OTHER", "ingest-scratch/job_OTHER/r1/")
+                .unwrap();
+        assert_eq!(
+            other_job,
+            "1dde7b664004ae89588f5a23862a6c0bb5dbd4d9d6b1a25ecec95487bee1bee2"
+        );
+        let other_round =
+            derive_transcode_staging(SHA, INPUT, JOB, "ingest-scratch/job_01J9ZQ8K2M/r2/").unwrap();
+        assert_eq!(
+            other_round,
+            "e1e734e2df252e228387255e6008ff79cf1b6c84d2d66b1c29d92827bd991cde"
+        );
+        assert_ne!(first, other_job);
+        assert_ne!(first, other_round);
+        assert_ne!(other_job, other_round);
+    }
+
+    #[test]
+    fn staging_id_rejects_invalid_source_key_job_and_prefix() {
+        for sha in ["", "short", &"z".repeat(64)] {
+            assert!(derive_transcode_staging(sha, INPUT, JOB, PREFIX).is_err());
+        }
+        for key in ["", "../input", "0007-short", "0007/invalid", STAGING] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, key, JOB, PREFIX).is_err(),
+                "key {key}"
+            );
+        }
+        for job in ["", "bad job!", "../job", "job/other"] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, INPUT, job, PREFIX).is_err(),
+                "job {job}"
+            );
+        }
+        for prefix in [
+            "",
+            "ingest-scratch/",
+            "ingest-scratch/job_OTHER/r1/",
+            "ingest-scratch/job_01J9ZQ8K2M/r1",
+            "ingest-scratch/job_01J9ZQ8K2M/r1:/",
+            "ingest-scratch/job_01J9ZQ8K2M/r1 /",
+        ] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, INPUT, JOB, prefix).is_err(),
+                "prefix {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_derives_staging_from_the_recorded_job_and_verify_round() {
+        let source = include_str!("queue_consumer.rs");
+        let start = source.find("async fn run_transcode_step_with<").unwrap();
+        let function = &source[start..];
+        let end = function[10..]
+            .find("async fn ")
+            .map(|offset| offset + 10)
+            .unwrap_or(function.len());
+        let function = function[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            function.contains("crate::transcode::derive_transcode_staging( &input.sha256, input_key, &msg.job_id, &input.scratch_prefix, )"),
+            "queue caller must derive from the recorded job and scratch prefix, not a reconstructed default round"
+        );
+    }
+
+    #[test]
+    fn stored_marker_fault_retries_but_request_size_fault_is_permanent() {
+        assert_eq!(
+            classify_transcode_reply(500, br#"{"error":"transcode_unavailable"}"#),
+            TranscodeCall::Retry,
+        );
+        assert_eq!(
+            classify_transcode_reply(413, br#"{"error":"payload_too_large"}"#),
+            TranscodeCall::Untranscodable,
+        );
+    }
+
+    #[test]
+    fn artifact_verification_checks_size_then_hash() {
+        use nntune_core::par2::scratch::sha256_hex;
+
+        let bytes = b"artifact-bytes";
+        let sha = sha256_hex(bytes);
+        assert!(verify_transcode_artifact(bytes, &sha, bytes.len() as u64).is_ok());
+        assert!(
+            verify_transcode_artifact(bytes, &sha.to_ascii_uppercase(), bytes.len() as u64).is_ok()
+        );
+        assert_eq!(
+            verify_transcode_artifact(bytes, &sha, bytes.len() as u64 + 1),
+            Err("artifact size mismatch")
+        );
+        assert_eq!(
+            verify_transcode_artifact(
+                bytes,
+                "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+                bytes.len() as u64
+            ),
+            Err("artifact hash mismatch")
+        );
+        assert_eq!(
+            verify_transcode_artifact(bytes, "xyz", bytes.len() as u64),
+            Err("artifact hash mismatch")
+        );
+    }
+
+    #[test]
+    fn cache_object_rows_classify_first_writer_vs_replay() {
+        assert_eq!(classify_cache_object_rows(1), PublishOutcome::Published);
+        assert_eq!(classify_cache_object_rows(0), PublishOutcome::Duplicate);
     }
 }

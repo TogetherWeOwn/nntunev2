@@ -1,0 +1,88 @@
+# NNTune v2 transcode Worker + per-job opus-64 transcode Container.
+#
+# No public surface: `workers_dev = false` and no routes. The only
+# caller is the ingest Worker's `TRANSCODE_CONTAINER` service binding,
+# which must name this Worker's per-environment service name
+# (`nntune-transcode` in production, `nntune-transcode-staging` in staging).
+# One Durable Object per ingest job (`TranscodeContainer`, id = job id)
+# owns the Container, streams the staged scratch input in and the
+# encoded artifact back, and is the only path to the Container's port.
+#
+# NOT YET DEPLOYED: shipping this config requires Cloudflare Containers
+# enabled on the existing plan (no new spend); deploy is an operator
+# action after that confirmation.
+
+name = "nntune-transcode"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
+[[containers]]
+class_name = "TranscodeContainer"
+image = "../../containers/transcode/Dockerfile"
+# Sized to the transcode budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): one input (at most 64 MiB staged) plus
+# its artifact (at most 32 MiB) with crash leftovers needs 5 GB disk;
+# ffmpeg multithreaded encode of a long track inside a 300 s wall
+# clock takes a full vCPU with 2 GiB of address space.
+instance_type = { vcpu = 1, memory_mib = 2048, disk_mb = 5000 }
+max_instances = 5
+
+[[durable_objects.bindings]]
+name = "TRANSCODE_JOBS"
+class_name = "TranscodeContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TranscodeContainer"]
+
+# Top-level target is the default `wrangler deploy` (production). Named
+# environments below restate their own bindings (Cloudflare does not
+# inherit them); production keeps the top-level worker name so the
+# ingest service-binding contract resolves.
+[[r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"
+
+[env.staging]
+name = "nntune-transcode-staging"
+workers_dev = false
+[[env.staging.containers]]
+class_name = "TranscodeContainer"
+image = "../../containers/transcode/Dockerfile"
+# Sized to the transcode budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): one input (at most 64 MiB staged) plus
+# its artifact (at most 32 MiB) with crash leftovers needs 5 GB disk;
+# ffmpeg multithreaded encode of a long track inside a 300 s wall
+# clock takes a full vCPU with 2 GiB of address space.
+instance_type = { vcpu = 1, memory_mib = 2048, disk_mb = 5000 }
+max_instances = 5
+[[env.staging.durable_objects.bindings]]
+name = "TRANSCODE_JOBS"
+class_name = "TranscodeContainer"
+[[env.staging.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-staging"
+
+[env.production]
+name = "nntune-transcode"
+workers_dev = false
+[[env.production.containers]]
+class_name = "TranscodeContainer"
+image = "../../containers/transcode/Dockerfile"
+# Sized to the transcode budgets, not the default lite instance
+# (1/16 vCPU, 256 MiB, 2 GB): one input (at most 64 MiB staged) plus
+# its artifact (at most 32 MiB) with crash leftovers needs 5 GB disk;
+# ffmpeg multithreaded encode of a long track inside a 300 s wall
+# clock takes a full vCPU with 2 GiB of address space.
+instance_type = { vcpu = 1, memory_mib = 2048, disk_mb = 5000 }
+max_instances = 5
+[[env.production.durable_objects.bindings]]
+name = "TRANSCODE_JOBS"
+class_name = "TranscodeContainer"
+[[env.production.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"

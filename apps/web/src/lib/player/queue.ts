@@ -149,6 +149,49 @@ export function moveTrack(state: QueueState, from: number, to: number): QueueSta
 	};
 }
 
+/** One-shot Fisher–Yates over the upcoming suffix; prefix/current stay fixed. */
+export function shuffleUpcoming(state: QueueState, random: () => number = Math.random): QueueState {
+	const start = state.currentIndex + 1;
+	if (state.currentIndex < 0 || state.tracks.length - start < 2) return state;
+	const tracks = [...state.tracks];
+	for (let i = tracks.length - 1; i > start; i -= 1) {
+		const j = start + Math.floor(random() * (i - start + 1));
+		[tracks[i], tracks[j]] = [tracks[j]!, tracks[i]!];
+	}
+	return { ...state, tracks };
+}
+
+/**
+ * Remove the track at `index`. The current *track* (not the slot) stays
+ * current: removing ahead of it shifts the index down, removing it advances
+ * playback to the following track (or the new last track when the tail
+ * played), and removing the only track empties the queue.
+ */
+export function removeTrack(state: QueueState, index: number): QueueState {
+	const len = state.tracks.length;
+	if (!Number.isInteger(index) || index < 0 || index >= len) return state;
+	const tracks = [...state.tracks];
+	tracks.splice(index, 1);
+	if (tracks.length === 0) return { tracks, currentIndex: -1 };
+	let currentIndex = state.currentIndex;
+	if (index < currentIndex) currentIndex -= 1;
+	else if (index === currentIndex) currentIndex = Math.min(currentIndex, tracks.length - 1);
+	return { tracks, currentIndex };
+}
+
+/**
+ * Move the track at `index` to play immediately after the current track,
+ * reusing `moveTrack` so the current track identity is preserved and the
+ * track is never duplicated. A no-op on the current track itself.
+ */
+export function playNext(state: QueueState, index: number): QueueState {
+	const len = state.tracks.length;
+	if (!Number.isInteger(index) || index < 0 || index >= len) return state;
+	if (state.currentIndex < 0 || index === state.currentIndex) return state;
+	const to = index < state.currentIndex ? state.currentIndex : state.currentIndex + 1;
+	return moveTrack(state, index, to);
+}
+
 /** In-session persistence (sessionStorage): order + current track id only. */
 export function serializeQueue(state: QueueState): string {
 	return JSON.stringify({

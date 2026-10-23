@@ -1,0 +1,26 @@
+[package]
+name = "nntune-transcode"
+version = "0.1.0"
+edition = "2021"
+description = "NNTune v2 transcode Worker (no public routes): streams one staged scratch object into the opus-64 transcode Container and back"
+license = "MIT"
+
+[lib]
+# cdylib for the worker; rlib so tests/ integration targets can link the crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = "0.8"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `#[durable_object]` expands to `#[wasm_bindgen]` items resolved by name.
+wasm-bindgen = "0.2.129"
+
+[dev-dependencies]
+nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
+serde_json = "1"
