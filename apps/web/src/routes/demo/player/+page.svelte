@@ -45,6 +45,7 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
+	let muted = $state(false);
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -188,8 +189,21 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
+	// Mute lives in player state, not on the element: the keyed <audio>
+	// is recreated on every track change, and native controls can mute
+	// behind the shortcut's back. The effect re-applies state to each
+	// new element; volumechange absorbs native-side changes.
+	$effect(() => {
+		if (audioEl) audioEl.muted = muted;
+	});
+
+	function handleVolumeChange(event: Event): void {
+		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	}
+
 	function toggleMuteShortcut(): void {
-		if (audioEl) audioEl.muted = !audioEl.muted;
+		muted = !muted;
+		if (audioEl) audioEl.muted = muted;
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -354,6 +368,7 @@
 			onpause={handlePause}
 			onerror={handleError}
 			onended={handleEnded}
+			onvolumechange={handleVolumeChange}
 		></audio>
 	{/key}
 

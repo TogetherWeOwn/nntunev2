@@ -3,7 +3,8 @@ import { expect, test, type Page } from '@playwright/test';
 /**
  * Builder-owned pins around the protected `player-shortcuts.spec.ts` suite:
  * modified keys stay inert, lone Escape is a no-op, the dialog never
- * duplicates, transport works from queue controls, and seeks clamp at the
+ * duplicates, transport works from queue controls, mute survives track
+ * changes and follows native control changes, and seeks clamp at the
  * media bounds. Same pending-media harness as the acceptance suite.
  */
 
@@ -182,4 +183,43 @@ test('seek clamps at the media bounds instead of overshooting', async ({ page })
 	await expect
 		.poll(async () => audio.evaluate((el: HTMLAudioElement) => el.currentTime), { timeout: 5_000 })
 		.toBeCloseTo(0, 0);
+});
+
+test('mute persists across track changes', async ({ page }) => {
+	await openPlayer(page);
+	await page.evaluate(() => {
+		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+	});
+	const audio = page.getByTestId('demo-audio');
+
+	await page.keyboard.press('m');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(true);
+
+	// The track change recreates the keyed audio element; the now-playing
+	// assertion proves the new track rendered before mute is re-checked.
+	await page.keyboard.press('n');
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(true);
+
+	await page.keyboard.press('m');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(false);
+});
+
+test('mute shortcut follows native control changes', async ({ page }) => {
+	await openPlayer(page);
+	await page.evaluate(() => {
+		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+	});
+	const audio = page.getByTestId('demo-audio');
+
+	// Muting through native controls fires volumechange, which the
+	// shortcut state must absorb so the next `m` unmutes instead of
+	// re-applying stale state.
+	await audio.evaluate((el: HTMLAudioElement) => {
+		el.muted = true;
+	});
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(true);
+
+	await page.keyboard.press('m');
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => el.muted)).toBe(false);
 });
