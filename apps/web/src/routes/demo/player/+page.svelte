@@ -573,6 +573,31 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
+	// Visible jump controls share the keyboard relative-seek path above:
+	// the current element is read at activation and SEEK_SECONDS stays the
+	// single step source. Unusable media (no current track, non-finite or
+	// negative time, non-finite duration) refuses quietly instead of
+	// throwing through the UI or reporting a seek that never happened.
+	function seekButton(deltaSeconds: number): void {
+		const el = audioEl;
+		if (!el || !current) return;
+		let position = Number.NaN;
+		let bound = Number.NaN;
+		try {
+			position = el.currentTime;
+			bound = el.duration;
+		} catch {
+			// An unreadable element is unusable media: refuse below.
+		}
+		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return;
+		try {
+			seekShortcut(deltaSeconds);
+		} catch {
+			// A non-seekable element refuses the assignment; keep the
+			// previous position instead of throwing through the UI.
+		}
+	}
+
 	// Mute lives in player state, not on the element: the keyed <audio>
 	// is recreated on every track change, and native controls can mute
 	// behind the shortcut's back. The effect re-applies state to each
@@ -891,6 +916,26 @@
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<!-- Own row so the pair stays side by side at 360px instead of
+		     wrapping around Previous/Next into overlapping lines. -->
+		<div>
+			<button
+				type="button"
+				data-testid="player-seek-back"
+				onclick={() => seekButton(-SEEK_SECONDS)}
+				disabled={!current}
+			>
+				Back 10 seconds
+			</button>
+			<button
+				type="button"
+				data-testid="player-seek-forward"
+				onclick={() => seekButton(SEEK_SECONDS)}
+				disabled={!current}
+			>
+				Forward 10 seconds
+			</button>
+		</div>
 		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
 		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
 			Keyboard shortcuts
