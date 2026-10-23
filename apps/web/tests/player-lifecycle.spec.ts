@@ -150,7 +150,7 @@ async function naturalEnd(page: Page) {
 	});
 }
 
-test('natural pause-before-ended advances each track and ends the queue', async ({ page }) => {
+test('natural pause-before-ended advances each track and starts radio at the end', async ({ page }) => {
 	await openPlayer(page);
 	await page.getByTestId('queue-select-demo-track').click();
 	await settle(page, 'resolve');
@@ -162,10 +162,19 @@ test('natural pause-before-ended advances each track and ends the queue', async 
 		await settle(page, 'resolve');
 		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
 	}
+	// Queue exhausted by natural ends: radio continues with a seeded mix
+	// (auto-continue radio intentionally replaced end-of-queue idling here;
+	// explicit Next past the end still stops — see player-queue.spec.ts).
 	await naturalEnd(page);
+	await expect(page.getByTestId('radio-badge')).toBeVisible();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: loading');
+	await settle(page, 'resolve');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect.poll(() => playCalls(page)).toBe(4);
+	// Stopping radio returns to the established end-of-queue idle state.
+	await page.getByTestId('radio-stop').click();
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
 	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
-	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
-	await expect.poll(() => playCalls(page)).toBe(3);
 	await mediaAction(page, 'pause');
 	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
 });
@@ -222,7 +231,8 @@ test('seek readiness never replaces an active transport state', async ({ page })
 		if (state === 'ended') {
 			await page.getByTestId('queue-select-third-light').click();
 			await settle(page, 'resolve');
-			await naturalEnd(page);
+			// Explicit Next past the end stops (a natural end starts radio).
+			await page.getByTestId('player-next').click();
 		}
 		if (state === 'empty') await page.getByTestId('queue-clear').click();
 		await expect(page.getByTestId('player-status')).toHaveText(`Status: ${state}`);
