@@ -40,3 +40,38 @@
 		--nt-bad: #c0262d;
 	}
 }
+
+/* Explicit appearance override (root layout): the same two palettes,
+ * forced regardless of the OS setting. The attribute selector outranks
+ * the media query above, so Light under a dark OS (and vice versa)
+ * resolves every token — not just the page background. Absent the
+ * attribute, System keeps following the OS. color-scheme is inherited,
+ * so native controls (including the selector itself) match the palette.
+ */
+:root[data-appearance='light'] {
+	color-scheme: light;
+
+	--nt-bg: #f7f8fb;
+	--nt-bg-raised: #ffffff;
+	--nt-fg: #141824;
+	--nt-fg-muted: #4d5670;
+	--nt-accent: #2f4fe0;
+	--nt-accent-fg: #ffffff;
+	--nt-border: #dfe3ee;
+	--nt-good: #1a7f45;
+	--nt-bad: #c0262d;
+}
+
+:root[data-appearance='dark'] {
+	color-scheme: dark;
+
+	--nt-bg: #0b0d12;
+	--nt-bg-raised: #141824;
+	--nt-fg: #f2f4f8;
+	--nt-fg-muted: #a7b0c2;
+	--nt-accent: #7c9aff;
+	--nt-accent-fg: #0b0d12;
+	--nt-border: #2a3247;
+	--nt-good: #57d98d;
+	--nt-bad: #ff7a7a;
+}

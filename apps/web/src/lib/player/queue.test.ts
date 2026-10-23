@@ -7,7 +7,9 @@ import {
 	DEMO_TRACKS,
 	moveTrack,
 	nextTrack,
+	playNext,
 	previousTrack,
+	removeTrack,
 	restoreQueue,
 	selectTrack,
 	serializeQueue
@@ -94,6 +96,85 @@ describe('queue editing', () => {
 		expect(moveTrack(q, -1, 1)).toEqual(q);
 		expect(moveTrack(q, 0, 3)).toEqual(q);
 		expect(moveTrack(q, 1, 1)).toEqual(q);
+	});
+});
+
+describe('queue management', () => {
+	it('removes a non-current track and keeps the current track playing', () => {
+		const q = removeTrack(createQueue(DEMO_TRACKS), 1);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([DEMO_TRACKS[0]?.id, DEMO_TRACKS[2]?.id]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[0]?.id);
+		expect(q.currentIndex).toBe(0);
+	});
+
+	it('shifts the current index down when a track before it is removed', () => {
+		const q = removeTrack(selectTrack(createQueue(DEMO_TRACKS), 2), 0);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([DEMO_TRACKS[1]?.id, DEMO_TRACKS[2]?.id]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[2]?.id);
+		expect(q.currentIndex).toBe(1);
+	});
+
+	it('advances to the following track when the current track is removed', () => {
+		const q = removeTrack(createQueue(DEMO_TRACKS), 0);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([DEMO_TRACKS[1]?.id, DEMO_TRACKS[2]?.id]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[1]?.id);
+		expect(q.currentIndex).toBe(0);
+	});
+
+	it('falls back to the new last track when the current tail is removed', () => {
+		const q = removeTrack(selectTrack(createQueue(DEMO_TRACKS), 2), 2);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([DEMO_TRACKS[0]?.id, DEMO_TRACKS[1]?.id]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[1]?.id);
+		expect(q.currentIndex).toBe(1);
+	});
+
+	it('empties the queue when its only track is removed', () => {
+		const q = removeTrack(createQueue([DEMO_TRACKS[0]!]), 0);
+
+		expect(q.tracks).toEqual([]);
+		expect(q.currentIndex).toBe(-1);
+		expect(currentTrack(q)).toBeNull();
+	});
+
+	it('ignores out-of-range removals', () => {
+		const q = createQueue(DEMO_TRACKS);
+		expect(removeTrack(q, -1)).toEqual(q);
+		expect(removeTrack(q, 3)).toEqual(q);
+	});
+
+	it('inserts the track immediately after the current one without duplicating', () => {
+		const q = playNext(createQueue(DEMO_TRACKS), 2);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([
+			DEMO_TRACKS[0]?.id,
+			DEMO_TRACKS[2]?.id,
+			DEMO_TRACKS[1]?.id
+		]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[0]?.id);
+		expect(q.currentIndex).toBe(0);
+	});
+
+	it('moves a track from before the current one to right after it', () => {
+		const q = playNext(selectTrack(createQueue(DEMO_TRACKS), 2), 0);
+
+		expect(q.tracks.map((t) => t.id)).toEqual([
+			DEMO_TRACKS[1]?.id,
+			DEMO_TRACKS[2]?.id,
+			DEMO_TRACKS[0]?.id
+		]);
+		expect(currentTrack(q)?.id).toBe(DEMO_TRACKS[2]?.id);
+		expect(q.currentIndex).toBe(1);
+	});
+
+	it('is a no-op on the current track and on out-of-range indexes', () => {
+		const q = createQueue(DEMO_TRACKS);
+		expect(playNext(q, 0)).toBe(q);
+		expect(playNext(q, -1)).toEqual(q);
+		expect(playNext(q, 3)).toEqual(q);
 	});
 });
 
