@@ -219,11 +219,11 @@ pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<Strin
 /// would interleave the discs of a multi-medium release (disc 1
 /// track 1, disc 2 track 1, disc 1 track 2, ...). A response cached
 /// before `medium_no` existed has it missing on every entry, which
-/// ties and falls back to track order. Malformed MBIDs are dropped,
-/// duplicates keep their first position, and the list is capped at
-/// [`MAX_RECORDING_MBIDS`]. Titles and positions pass through
-/// untouched: the `tracks` derivation (`crate::track_writers`)
-/// validates them per position with its own skip reasons.
+/// ties and falls back to track order. Malformed MBIDs are dropped.
+/// Each projection deduplicates and caps its own output: distinct MBIDs
+/// for the library, distinct occurrences for the tracks writer. Titles
+/// and positions pass through untouched: the `tracks` derivation
+/// (`crate::track_writers`) validates them with its own skip reasons.
 fn recordings_in_track_order(recordings: &[MbRecording]) -> Vec<&MbRecording> {
     let mut valid: Vec<&MbRecording> = recordings
         .iter()
@@ -240,24 +240,17 @@ fn recordings_in_track_order(recordings: &[MbRecording]) -> Vec<&MbRecording> {
             })
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    let mut seen = std::collections::HashSet::with_capacity(valid.len());
-    let mut ordered: Vec<&MbRecording> = Vec::with_capacity(valid.len().min(MAX_RECORDING_MBIDS));
-    for recording in valid {
-        if seen.insert(recording.mbid.as_str()) {
-            ordered.push(recording);
-        }
-        if ordered.len() == MAX_RECORDING_MBIDS {
-            break;
-        }
-    }
-    ordered
+    valid
 }
 
-/// Recording MBIDs in [`recordings_in_track_order`]: the library write
-/// carries bare MBIDs only.
+/// Distinct recording MBIDs in [`recordings_in_track_order`]: the library
+/// write carries bare MBIDs only, retaining each one's first position.
 fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     recordings_in_track_order(recordings)
         .into_iter()
+        .filter(|recording| seen.insert(recording.mbid.as_str()))
+        .take(MAX_RECORDING_MBIDS)
         .map(|recording| recording.mbid.clone())
         .collect()
 }
@@ -267,8 +260,10 @@ fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
 /// classification as [`parse_mb_recordings_response`] (a 404 is
 /// `Transient`, every other 4xx is `Permanent`); the difference is the
 /// payload: the `tracks` writer needs titles and positions alongside
-/// the MBIDs, which the bare-MBID parse drops. Sort, dedup and cap are
-/// shared, so both parses agree on membership and order.
+/// the MBIDs, which the bare-MBID parse drops. Sorting is shared, but
+/// deduplication is by `(mbid, medium_no, track_no)`: one recording can
+/// occur at multiple positions on a release. Exact duplicate occurrences
+/// retain their first wire row; the cap counts occurrences, not MBIDs.
 pub fn parse_mb_recordings_detailed(
     status: u16,
     body: &str,
@@ -276,8 +271,17 @@ pub fn parse_mb_recordings_detailed(
     match status {
         200 => serde_json::from_str::<MbRecordingsBody>(body)
             .map(|parsed| {
+                let mut seen = std::collections::HashSet::new();
                 recordings_in_track_order(&parsed.recordings)
                     .into_iter()
+                    .filter(|recording| {
+                        seen.insert((
+                            recording.mbid.as_str(),
+                            recording.medium_no,
+                            recording.track_no,
+                        ))
+                    })
+                    .take(MAX_RECORDING_MBIDS)
                     .cloned()
                     .collect()
             })
@@ -1037,6 +1041,73 @@ mod tests {
         assert_eq!(
             mbids,
             detailed.iter().map(|r| r.mbid.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn detailed_parse_keeps_repeated_recording_occurrences() {
+        let body = format!(
+            r#"{{"recordings":[
+                {{"mbid":"{MBID_A}","title":"Reprise","medium_no":1,"track_no":2}},
+                {{"mbid":"{MBID_A}","title":"Disc two","medium_no":2,"track_no":1}},
+                {{"mbid":"{MBID_B}","title":"Next","medium_no":1,"track_no":3}},
+                {{"mbid":"{MBID_A}","title":"Opening","medium_no":1,"track_no":1}},
+                {{"mbid":"{MBID_A}","title":"Duplicate","medium_no":1,"track_no":2}}
+            ]}}"#
+        );
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        let occurrences: Vec<_> = detailed
+            .iter()
+            .map(|r| (r.mbid.as_str(), r.medium_no, r.track_no, r.title.as_str()))
+            .collect();
+        // An MBID can recur at another track or on another disc. Only the
+        // identical occurrence collapses, keeping its first wire row.
+        assert_eq!(
+            occurrences,
+            vec![
+                (MBID_A, Some(1), Some(1), "Opening"),
+                (MBID_A, Some(1), Some(2), "Reprise"),
+                (MBID_B, Some(1), Some(3), "Next"),
+                (MBID_A, Some(2), Some(1), "Disc two"),
+            ]
+        );
+        assert_eq!(
+            parse_mb_recordings_response(200, &body).unwrap(),
+            vec![MBID_A, MBID_B]
+        );
+    }
+
+    #[test]
+    fn recordings_caps_apply_to_each_projection_after_dedup() {
+        let mut recordings: Vec<_> = (1..=MAX_RECORDING_MBIDS + 1)
+            .map(|track| MbRecording {
+                mbid: MBID_A.to_string(),
+                title: "Recurring".to_string(),
+                medium_no: Some(1),
+                track_no: Some(i16::try_from(track).unwrap()),
+            })
+            .collect();
+        recordings.push(MbRecording {
+            mbid: MBID_B.to_string(),
+            title: "Later distinct recording".to_string(),
+            medium_no: Some(2),
+            track_no: Some(1),
+        });
+        let body = serde_json::json!({
+            "recordings": recordings.iter().map(|r| serde_json::json!({
+                "mbid": r.mbid, "title": r.title,
+                "medium_no": r.medium_no, "track_no": r.track_no,
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        assert_eq!(detailed.len(), MAX_RECORDING_MBIDS);
+        assert_eq!(detailed.last().unwrap().track_no, Some(10_000));
+        // The occurrence cap must not hide a distinct MBID from the library
+        // projection: its independent cap counts distinct recordings.
+        assert_eq!(
+            parse_mb_recordings_response(200, &body).unwrap(),
+            vec![MBID_A, MBID_B]
         );
     }
 

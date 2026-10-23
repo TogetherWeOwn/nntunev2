@@ -141,7 +141,10 @@ pub struct TrackDerivation<'a> {
 /// ordinal here so pairing stays deterministic even if a caller passes
 /// them out of order. Non-content files (`par2`, `nfo`, `archive`,
 /// `unknown` roles) are silently excluded — they are not audio, so their
-/// absence from the derivation is not a skip.
+/// absence from the derivation is not a skip. Only the first valid row
+/// for a `(medium_no, track_no)` position wins (matching the SQL conflict
+/// target); later duplicates skip their paired file without shifting any
+/// subsequent pair.
 ///
 /// `Ok` with `matched: false` is the unmatched outcome (zero rows, zero
 /// skips). `Err` is a caller bug only: a `Some` release MBID that is not
@@ -169,10 +172,16 @@ pub fn derive_track_rows<'a>(
     audio.sort_by_key(|file| file.ordinal);
     let mut rows = Vec::new();
     let mut skips = Vec::new();
+    let mut seen_positions = std::collections::HashSet::new();
     let paired = audio.len().min(recordings.len());
     for (index, (file, recording)) in audio.iter().zip(recordings.iter()).enumerate() {
         match track_row_for(release_mbid, recording, file.ordinal) {
-            Ok(row) => rows.push(row),
+            Ok(row) if seen_positions.insert((row.medium_no, row.track_no)) => rows.push(row),
+            Ok(_) => skips.push(TrackSkip {
+                index,
+                kind: TrackSkipKind::Recording,
+                reason: "duplicate recording medium/track position",
+            }),
             Err(reason) => skips.push(TrackSkip {
                 index,
                 kind: TrackSkipKind::Recording,
@@ -242,6 +251,9 @@ pub fn validate_track_row(row: &TrackRow) -> Result<(), &'static str> {
     }
     if row.title.trim().is_empty() {
         return Err("recording title missing from match");
+    }
+    if row.title.contains('\0') {
+        return Err("recording title must not contain NUL");
     }
     Ok(())
 }
@@ -663,6 +675,86 @@ mod tests {
     }
 
     #[test]
+    fn detailed_occurrences_keep_their_backing_files() {
+        let body = format!(
+            r#"{{"recordings":[
+                {{"mbid":"{REC2}","title":"Third","medium_no":1,"track_no":3}},
+                {{"mbid":"{REC1}","title":"Reprise","medium_no":1,"track_no":2}},
+                {{"mbid":"{REC1}","title":"Opening","medium_no":1,"track_no":1}}
+            ]}}"#
+        );
+        let recordings = crate::matching::parse_mb_recordings_detailed(200, &body).unwrap();
+        let files = [file(0, "content"), file(1, "content"), file(2, "content")];
+        let derived = derive_track_rows(Some(RELEASE), &files, &recordings).unwrap();
+        assert!(derived.skips.is_empty());
+        assert_eq!(
+            derived
+                .rows
+                .iter()
+                .map(|row| (row.mbid, row.track_no, row.file_ordinal))
+                .collect::<Vec<_>>(),
+            vec![(REC1, 1, 0), (REC1, 2, 1), (REC2, 3, 2)]
+        );
+    }
+
+    #[test]
+    fn derivation_skips_duplicate_positions_without_shifting_pairs() {
+        let files: Vec<_> = (0..5).map(|ordinal| file(ordinal, "content")).collect();
+        let recordings = [
+            recording(REC1, "First", Some(1), Some(1)),
+            recording(REC2, "Conflicting recording", Some(1), Some(1)),
+            recording(REC1, "Repeated occurrence", Some(1), Some(1)),
+            recording(REC2, "Next", Some(1), Some(2)),
+            recording(REC1, "Disc two", Some(2), Some(1)),
+        ];
+        let derived = derive_track_rows(Some(RELEASE), &files, &recordings).unwrap();
+        assert_eq!(
+            derived
+                .rows
+                .iter()
+                .map(|row| (row.mbid, row.medium_no, row.track_no, row.file_ordinal))
+                .collect::<Vec<_>>(),
+            vec![(REC1, 1, 1, 0), (REC2, 1, 2, 3), (REC1, 2, 1, 4)]
+        );
+        assert_eq!(
+            derived.skips,
+            vec![
+                TrackSkip {
+                    index: 1,
+                    kind: TrackSkipKind::Recording,
+                    reason: "duplicate recording medium/track position",
+                },
+                TrackSkip {
+                    index: 2,
+                    kind: TrackSkipKind::Recording,
+                    reason: "duplicate recording medium/track position",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_row_does_not_claim_a_position() {
+        let files = [file(0, "content"), file(1, "content")];
+        let recordings = [
+            recording(REC1, "", Some(1), Some(1)),
+            recording(REC2, "Valid", Some(1), Some(1)),
+        ];
+        let derived = derive_track_rows(Some(RELEASE), &files, &recordings).unwrap();
+        assert_eq!(derived.rows.len(), 1);
+        assert_eq!(derived.rows[0].mbid, REC2);
+        assert_eq!(derived.rows[0].file_ordinal, 1);
+        assert_eq!(
+            derived.skips,
+            vec![TrackSkip {
+                index: 0,
+                kind: TrackSkipKind::Recording,
+                reason: "recording title missing from match",
+            }]
+        );
+    }
+
+    #[test]
     fn derivation_reports_unpaired_tails_with_reason() {
         // More recordings than files: the extra recording has no bytes.
         let files = vec![file(0, "content")];
@@ -729,6 +821,10 @@ mod tests {
             (
                 recording(REC1, "   ", Some(1), Some(1)),
                 "recording title missing from match",
+            ),
+            (
+                recording(REC1, "First\0track", Some(1), Some(1)),
+                "recording title must not contain NUL",
             ),
         ] {
             let recordings = [recording];
@@ -820,6 +916,13 @@ mod tests {
                     ..good.clone()
                 },
                 "recording title missing from match",
+            ),
+            (
+                TrackRow {
+                    title: "First\0track",
+                    ..good.clone()
+                },
+                "recording title must not contain NUL",
             ),
         ] {
             assert_eq!(validate_track_row(&row), Err(reason), "{reason}");
