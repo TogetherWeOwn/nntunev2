@@ -1,8 +1,8 @@
 /**
  * Playback queue: pure, immutable state transitions so the panel, the
  * transport buttons and the MediaSession handlers all share one model.
- * Navigation clamps at both ends (no wrap): `next` on the last track is
- * where playback ends, which is what the `ended` event relies on.
+ * Explicit navigation clamps at both ends (no wrap). Natural completion
+ * uses its own policy so repeat never traps a deliberate Next.
  */
 
 export interface Track {
@@ -62,6 +62,40 @@ export function currentTrack(state: QueueState): Track | null {
 export function nextTrack(state: QueueState): QueueState {
 	if (state.currentIndex < 0 || state.currentIndex >= state.tracks.length - 1) return state;
 	return { ...state, currentIndex: state.currentIndex + 1 };
+}
+
+export type RepeatMode = 'off' | 'one' | 'queue';
+
+export interface NaturalEndContext {
+	repeat: RepeatMode;
+	radioActive: boolean;
+	continueRadio: boolean;
+	/** Playback intent before completion, not the native element's paused flag. */
+	playing: boolean;
+	validEnd: boolean;
+	sleepComplete: boolean;
+}
+
+export interface NaturalEndResult {
+	queue: QueueState;
+	/** `play` starts from zero; `radio` delegates to the existing radio pass. */
+	action: 'play' | 'stop' | 'radio' | 'ignore';
+}
+
+/** Natural completion may replay/wrap; explicit navigation remains clamped. */
+export function naturalEndPolicy(state: QueueState, context: NaturalEndContext): NaturalEndResult {
+	if (!context.validEnd || !context.playing || !currentTrack(state)) {
+		return { queue: state, action: 'ignore' };
+	}
+	if (context.sleepComplete) return { queue: state, action: 'stop' };
+	if (context.radioActive) return { queue: state, action: 'radio' };
+	if (context.repeat === 'one') return { queue: state, action: 'play' };
+	const advanced = nextTrack(state);
+	if (advanced !== state) return { queue: advanced, action: 'play' };
+	if (context.repeat === 'queue') {
+		return { queue: selectTrack(state, 0), action: 'play' };
+	}
+	return { queue: state, action: context.continueRadio ? 'radio' : 'stop' };
 }
 
 export function previousTrack(state: QueueState): QueueState {
