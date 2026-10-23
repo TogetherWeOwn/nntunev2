@@ -332,7 +332,7 @@
 	function timeEventForCurrent(element: HTMLAudioElement): boolean {
 		if (element !== audioEl || !element.isConnected) return false;
 		const expected = current?.streamUrl;
-		if (expected === undefined) return false;
+		if (!expected) return false;
 		try {
 			return element.currentSrc === new URL(expected, document.baseURI).href;
 		} catch {
@@ -341,14 +341,12 @@
 	}
 
 	function handleTrackTime(event: Event): void {
-		const target = event.currentTarget;
-		if (!(target instanceof HTMLAudioElement) || !timeEventForCurrent(target)) return;
+		// Bound directly to the audio element, currentTarget is always that
+		// element during dispatch; the identity check below fences the rest.
+		const target = event.currentTarget as HTMLAudioElement;
+		if (!timeEventForCurrent(target)) return;
 		trackTime = target.currentTime;
 		trackDuration = target.duration;
-	}
-
-	function handleTimeModeChange(value: string): void {
-		timeMode = value === 'remaining' ? 'remaining' : 'elapsed';
 	}
 
 	// Any source replacement (track change, retry revision, queue clear or
@@ -363,14 +361,12 @@
 	const trackTimeSummary = $derived.by(() => {
 		if (!current) return 'No track selected';
 		const derived = deriveTrackTime(trackTime, trackDuration);
-		if (timeMode === 'remaining') {
-			if (derived.remaining === null || derived.duration === null) {
-				return 'Remaining unavailable — Duration unavailable';
-			}
-			return `Remaining ${derived.remaining} of ${derived.duration}`;
-		}
-		if (derived.duration === null) return `Elapsed ${derived.elapsed} — Duration unavailable`;
-		return `Elapsed ${derived.elapsed} of ${derived.duration}`;
+		// Both modes share one total fragment: a known duration reads
+		// "of <total>", an unknown one names the missing coordinate.
+		const total = derived.duration === null ? '— Duration unavailable' : `of ${derived.duration}`;
+		if (timeMode !== 'remaining') return `Elapsed ${derived.elapsed} ${total}`;
+		if (derived.remaining === null) return `Remaining unavailable ${total}`;
+		return `Remaining ${derived.remaining} ${total}`;
 	});
 
 	function handlePlay(event: Event): void {
@@ -852,12 +848,7 @@
 
 	<div>
 		<label for="track-time-mode">Time display</label>
-		<select
-			id="track-time-mode"
-			data-testid="track-time-mode"
-			value={timeMode}
-			onchange={(event) => handleTimeModeChange(event.currentTarget.value)}
-		>
+		<select id="track-time-mode" data-testid="track-time-mode" bind:value={timeMode}>
 			<option value="elapsed">Elapsed</option>
 			<option value="remaining">Remaining</option>
 		</select>

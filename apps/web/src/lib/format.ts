@@ -25,14 +25,12 @@ export interface TrackTime {
  */
 export function deriveTrackTime(currentTime: number, duration: number): TrackTime {
 	const elapsedRaw = Number.isFinite(currentTime) ? currentTime : 0;
-	if (!Number.isFinite(duration) || duration < 0) {
-		return { elapsed: formatDuration(elapsedRaw), remaining: null, duration: null };
-	}
-	const clamped = Math.min(Math.max(0, elapsedRaw), duration);
+	const known = Number.isFinite(duration) && duration >= 0;
+	const clamped = known ? Math.min(Math.max(0, elapsedRaw), duration) : elapsedRaw;
 	return {
 		elapsed: formatDuration(clamped),
-		remaining: formatDuration(duration - clamped),
-		duration: formatDuration(duration)
+		remaining: known ? formatDuration(duration - clamped) : null,
+		duration: known ? formatDuration(duration) : null
 	};
 }
 
