@@ -10,6 +10,12 @@
 	} from '#lib/library/cache.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import {
+		displayArtist,
+		displayTitle,
+		orderLibraryItems,
+		type LibraryOrder
+	} from '#lib/library/order.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
@@ -28,6 +34,8 @@
 	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
+	let order: LibraryOrder = $state('original');
+	const orderedItems = $derived(orderLibraryItems(items, order));
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -74,17 +82,6 @@
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
-
-	function displayTitle(track: LibraryItem): string {
-		const title = track.title;
-		if (typeof title === 'string' && title.trim().length > 0) return title;
-		return track.id;
-	}
-
-	function displayArtist(track: LibraryItem): string | null {
-		const artist = track.artist;
-		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
-	}
 
 	function trackCountLabel(count: number): string {
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
@@ -191,8 +188,17 @@
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
+			<div class="nt-library-order">
+				<label for="library-order">Order tracks</label>
+				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
+					<option value="original">Original order</option>
+					<option value="title">Title A–Z</option>
+					<option value="artist">Artist A–Z</option>
+				</select>
+				<span id="library-order-hint">Changes this list only, not your queue.</span>
+			</div>
 			<ul data-testid="library-list">
-				{#each items as track (track.id)}
+				{#each orderedItems as track (track.id)}
 					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
@@ -257,6 +263,25 @@
 </main>
 
 <style>
+	.nt-library-order {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-order select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-order span {
+		color: var(--nt-fg-muted);
+	}
 	.nt-library-item {
 		padding: 0;
 	}
