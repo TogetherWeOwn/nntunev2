@@ -23,8 +23,12 @@
 		clearQueue,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		moveTrack,
 		nextTrack,
+		playNext,
+		removeTrack,
 		selectTrack as selectQueueIndex,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
@@ -36,6 +40,7 @@
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
 	let favorites: string[] = $state([]);
+	let queueAnnouncement = $state('');
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -59,7 +64,7 @@
 					const rebuilt = createQueue(kept);
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
 			}
 			// Favorites are storage truth re-read once the refresher settles:
@@ -103,18 +108,46 @@
 		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 	}
 
+	function trackCountLabel(count: number): string {
+		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
+	}
+
 	function selectTrack(id: string): void {
 		const item = items.find((track) => track.id === id);
 		if (!item) return;
 		// No stream URL until the streaming slice: playback wiring is out of
 		// scope, so the queue carries library display fields only. addTrack
 		// dedupes, so re-selecting a queued row is a no-op.
-		queue = addTrack(queue, {
-			id: item.id,
-			title: displayTitle(item),
-			artist: displayArtist(item) ?? '',
-			streamUrl: ''
-		});
+		replaceQueue(
+			addTrack(queue, {
+				id: item.id,
+				title: displayTitle(item),
+				artist: displayArtist(item) ?? '',
+				streamUrl: ''
+			})
+		);
+	}
+
+	/**
+	 * Swap the queue for any change that is not a move. The move
+	 * announcement names a track and its position, so every other edit
+	 * invalidates it; clearing it here also keeps a previous account's
+	 * track title from lingering across the auth-boundary clears below.
+	 */
+	function replaceQueue(next: QueueState): void {
+		queue = next;
+		queueAnnouncement = '';
+	}
+
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (moved === undefined) return;
+		const reordered = moveTrack(queue, from, to);
+		// Announce real moves only: a no-op reorder must not chatter the
+		// live region.
+		if (reordered === queue) return;
+		queue = reordered;
+		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
 	function toggleFavorite(id: string): void {
@@ -144,7 +177,7 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
-			queue = clearQueue(queue);
+			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
@@ -155,7 +188,7 @@
 	}
 
 	function handleLocalAuthTransition(): void {
-		queue = clearQueue(queue);
+		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
@@ -224,20 +257,26 @@
 		{:else if items.length === 0}
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
+			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
 			<ul data-testid="library-list">
 				{#each items as track (track.id)}
+					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
 							type="button"
 							class="nt-library-row"
-							aria-label={queuedIds.has(track.id)
+							aria-label={queued
 								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 								: undefined}
+							aria-pressed={queued ? true : undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
 							{#if displayArtist(track)}
 								<span> — {displayArtist(track)}</span>
+							{/if}
+							{#if queued}
+								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
 							{/if}
 						</button>
 						<button
@@ -252,7 +291,16 @@
 					</li>
 				{/each}
 			</ul>
-			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
+			<PlayerQueue
+				state={queue}
+				announcement={queueAnnouncement}
+				onnext={() => replaceQueue(nextTrack(queue))}
+				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
+				onmove={moveQueuedTrack}
+				onplaynext={(index) => replaceQueue(playNext(queue, index))}
+				onremove={(index) => replaceQueue(removeTrack(queue, index))}
+				onclear={() => replaceQueue(clearQueue(queue))}
+			/>
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
@@ -310,5 +358,16 @@
 		cursor: pointer;
 		font: inherit;
 		color: inherit;
+	}
+	.nt-queued-badge {
+		display: inline-block;
+		margin-left: var(--nt-space-2);
+		padding: 0 var(--nt-space-2);
+		border-radius: var(--nt-radius);
+		background: var(--nt-accent);
+		color: var(--nt-accent-fg);
+		font-size: 0.75rem;
+		line-height: 1.6;
+		white-space: nowrap;
 	}
 </style>
