@@ -298,9 +298,11 @@ test('UP-SHUF-B06: manual moves still work after shuffle and transport remains c
 	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
 	await page.getByTestId('player-next').click();
 	await page.getByTestId('player-next').click();
-	const atEnd = await page.getByTestId('now-playing').textContent();
+	// Terminal Next changes the status label, not the selected queue entry.
+	const atEnd = page.getByTestId(`queue-select-${order[1]}`);
+	await expect(atEnd).toHaveAttribute('aria-current', 'true');
 	await page.getByTestId('player-next').click();
-	await expect(page.getByTestId('now-playing')).toHaveText(atEnd!);
+	await expect(atEnd).toHaveAttribute('aria-current', 'true');
 	await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
 	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
 	await page.getByTestId('queue-clear').click();
