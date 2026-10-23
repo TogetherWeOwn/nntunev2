@@ -822,6 +822,60 @@ mod tests {
     }
 
     #[test]
+    fn empty_body_reader_buffer_returns_zero_without_reading_the_socket() {
+        struct NoRead;
+        impl Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("an empty output buffer must not read the socket");
+            }
+        }
+        for (mode, remaining, chunk_left, done) in [
+            (BodyMode::Fixed, 5, 0, false),
+            (BodyMode::Fixed, 0, 0, false),
+            (BodyMode::Chunked, 0, 0, false),
+            (BodyMode::Chunked, 0, 5, false),
+            (BodyMode::Chunked, 0, 0, true),
+        ] {
+            let mut socket = NoRead;
+            let mut reader = BodyReader {
+                stream: &mut socket,
+                mode,
+                remaining,
+                chunk_left,
+                done,
+            };
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            assert_eq!(reader.remaining, remaining);
+            assert_eq!(reader.chunk_left, chunk_left);
+            assert_eq!(reader.done, done);
+        }
+    }
+
+    #[test]
+    fn incomplete_body_reader_returns_unexpected_eof_not_clean_eof() {
+        for (mode, body) in [
+            (BodyMode::Fixed, b"".as_slice()),
+            (BodyMode::Fixed, b"he"),
+            (BodyMode::Chunked, b"5\r\n"),
+            (BodyMode::Chunked, b"5\r\nhe"),
+        ] {
+            let mut socket = io::Cursor::new(body);
+            let mut reader = BodyReader {
+                stream: &mut socket,
+                mode,
+                remaining: 5,
+                chunk_left: 0,
+                done: false,
+            };
+            let mut bytes = Vec::new();
+            let error = reader
+                .read_to_end(&mut bytes)
+                .expect_err("body advertised five bytes");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
     fn valid_request_passes() {
         assert!(validate_request(&valid_request()).is_ok());
     }

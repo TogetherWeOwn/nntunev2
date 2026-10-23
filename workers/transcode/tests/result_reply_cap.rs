@@ -65,4 +65,27 @@ fn scratch_marker_read_checks_metadata_before_materialising() {
         check < materialise,
         "the metadata size check must precede .bytes()"
     );
+    let branch_start = helper[check..].find('{').unwrap() + check + 1;
+    let mut depth = 1;
+    let branch_end = helper[branch_start..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(branch_start + offset)
+        })
+        .expect("metadata oversize branch must close");
+    let branch = &helper[branch_start..branch_end];
+    assert!(
+        branch_end < materialise,
+        "oversize marker must return before .bytes()"
+    );
+    assert_eq!(
+        branch.trim(),
+        "return Err(ApiFault::new(500, \"transcode_unavailable\"));",
+        "stored-marker oversize is a retryable server fault, not a permanent request-body 413"
+    );
 }

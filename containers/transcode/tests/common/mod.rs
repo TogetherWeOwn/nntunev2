@@ -122,6 +122,24 @@ impl Harness {
             .count()
     }
 
+    /// Inspect every scratch file, including temporary inputs and outputs.
+    pub fn scratch_files(&self) -> Vec<PathBuf> {
+        fn visit(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        visit(&self.root.join("scratch"), &mut files);
+        files.sort();
+        files
+    }
+
     /// A bounded connection for tests that deliberately leave the write
     /// side open or half-close it to signal a truncated request.
     pub fn connect(&self) -> TcpStream {
