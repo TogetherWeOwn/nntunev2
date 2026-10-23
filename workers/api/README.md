@@ -1,8 +1,9 @@
-# nntune-api: accounts, auth, sessions, BYOP vault, library
+# nntune-api: Subsonic, accounts, auth, sessions, BYOP vault, library
 
 Rust core + Worker HTTP entry for NNTune v2 accounts/auth (passkeys +
 email magic link), signed-cookie sessions, the BYOP credential
-vault, and the genre/playlist library. Compiles to native (tests)
+vault, and the genre/playlist library, with a Subsonic-compatible
+Worker entry on `/rest/*`. Compiles to native (tests)
 and `wasm32` (Cloudflare Worker).
 
 ## Layout
@@ -202,6 +203,17 @@ behavior changes here.
   gate test (`src/handlers.rs`). The E2E returns null without
   `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
   is set (`e2e/helpers/accounts.ts`).
+
+The Subsonic-compatible `/rest/*` surface (wasm32 only) is routed in
+`src/lib.rs` and delegates to `crates/nntune-subsonic`. Its
+`MemStore::empty()` contains no credentials and refuses all
+authentication; PlanetScale `Library` and stream Worker wiring are
+still pending. This is not a deployed, usable music API yet. See
+[`docs/subsonic-client-smoke.md`](../../docs/subsonic-client-smoke.md)
+for the client verification procedure.
+
+This crate remains standalone (excluded from the root workspace), so use
+`--manifest-path workers/api/Cargo.toml` for its checks.
 
 ## Security contract (threat-model §3–§4)
 
@@ -447,16 +459,22 @@ behavior changes here.
 
 ## Test
 
+Run these commands from the repository root:
+
 ```sh
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
 cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
 bash workers/api/check_hyperdrive_cache.sh --self-test
+cargo test -p nntune-subsonic --locked
+python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
-dependencies), so the asymmetry is intentional.
-Sources: `.github/workflows/ci.yml:271-296`.)
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:359-384`) and
+`fixture-check` (`.github/workflows/ci.yml:65-74`); `fmt` takes no
+`--locked` (it resolves no dependencies), so the asymmetry is
+intentional. `cargo test -p nntune-subsonic` also runs under
+`rust-test --workspace`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).
