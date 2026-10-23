@@ -5,14 +5,24 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { page } from '$app/state';
 	import Artwork from '#lib/player/Artwork.svelte';
+	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import {
+		applyGainToNode,
+		loadLevelingEnabled,
+		resolveTrackLinearGain,
+		saveLevelingEnabled,
+		type LevelingTags
+	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
-import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
-import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
-import { parseTimestampParam } from '#lib/player/shareTimestamp.js';
-import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
+	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
+	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
+	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
+	import { parseTimestampParam } from '#lib/player/shareTimestamp.js';
+	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
 	import {
 		actionForKey,
 		isModalOpen,
@@ -38,6 +48,17 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
 
+	/**
+	 * Fixture ReplayGain tags for the demo tracks: synthetic metadata for
+	 * synthetic audio (no backend). Peaks keep the clipping guard inert by
+	 * construction, so the gain node pins leveling, not limiting.
+	 */
+	const DEMO_LEVELING_TAGS: Readonly<Record<string, LevelingTags>> = {
+		'demo-track': { trackGainDb: '-3.00 dB', trackPeak: 0.42 },
+		'second-signal': { trackGainDb: '+4.00 dB', trackPeak: 0.3 },
+		'third-light': { trackGainDb: '-1.50 dB', trackPeak: 0.48 }
+	};
+
 	type TransportState = 'selected' | 'loading' | 'playing' | 'paused' | 'error' | 'ended' | 'empty';
 	let status = $state<TransportState>('selected');
 	let seekReady = $state(false);
@@ -54,7 +75,20 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
 
-	const current = $derived(currentTrack(queue));
+	/**
+	 * Auto-continue radio: a seeded pass over the loaded catalogue that
+	 * starts on natural end of the queue. Null when radio is off. The queue
+	 * is untouched while radio plays, so stopping returns to the queue's
+	 * end state instead of a shuffled one.
+	 */
+	interface RadioState {
+		order: (typeof DEMO_TRACKS)[number][];
+		index: number;
+		seed: number;
+	}
+	let radio = $state<RadioState | null>(null);
+
+	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
 
 	const playback = createPlayback({
@@ -68,8 +102,81 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		}
 	});
 
+	// Loudness leveling: the toggle persists across reloads (default ON) and
+	// each track's fixture tags resolve to a gain-node multiplier.
+	let levelingEnabled = $state(true);
+	let levelingLinear = $state(1);
+	let levelingCtx: AudioContext | null = null;
+	let levelingSource: MediaElementAudioSourceNode | null = null;
+	let levelingGain: GainNode | null = null;
+	let wiredEl: HTMLAudioElement | null = null;
+
+	function safeStorage(): Storage | null {
+		try {
+			return localStorage;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * One AudioContext per page; each keyed `<audio>` element gets its own
+	 * MediaElementSource (an element can only be captured once). Leveling
+	 * failure never breaks playback: unwired elements play at natural volume.
+	 */
+	function ensureLevelingGraph(): GainNode | null {
+		try {
+			if (typeof AudioContext === 'undefined' || !audioEl) return null;
+			if (wiredEl !== audioEl) {
+				levelingSource?.disconnect();
+				levelingGain?.disconnect();
+				levelingCtx ??= new AudioContext();
+				levelingSource = levelingCtx.createMediaElementSource(audioEl);
+				levelingGain = levelingCtx.createGain();
+				levelingSource.connect(levelingGain);
+				levelingGain.connect(levelingCtx.destination);
+				wiredEl = audioEl;
+			}
+			return levelingGain;
+		} catch {
+			return null;
+		}
+	}
+
+	function applyLeveling(): void {
+		const tags = (current && DEMO_LEVELING_TAGS[current.id]) ?? {};
+		const linear = resolveTrackLinearGain(tags, { enabled: levelingEnabled });
+		levelingLinear = linear;
+		const node = ensureLevelingGraph();
+		if (node) {
+			applyGainToNode(node, linear);
+			resumeLevelingContext();
+		}
+	}
+
+	/**
+	 * Best-effort resume of the page-local leveling context. The mount-time
+	 * resume can reject under autoplay policy (no user activation yet), and
+	 * a suspended context renders routed playback silent — so every play
+	 * path retries it inside the user's gesture.
+	 */
+	function resumeLevelingContext(): void {
+		if (!levelingCtx || levelingCtx.state === 'running') return;
+		void levelingCtx.resume().catch(() => {
+			// Still suspended; the next user-initiated play retries.
+		});
+	}
+
+	function setLevelingEnabled(enabled: boolean): void {
+		levelingEnabled = enabled;
+		saveLevelingEnabled(safeStorage(), enabled);
+	}
+
 	function playCurrent(reload = false): void {
 		if (!current) return;
+		// A play press is a user gesture: retry the mount-time resume so a
+		// suspended leveling context cannot mute this playback.
+		resumeLevelingContext();
 		// A failed media resource needs a fresh load even when its URL is
 		// unchanged. A keyed element also fences queued events from that load.
 		if (reload || status === 'error') sourceRevision += 1;
@@ -215,12 +322,18 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		// A queued play event can arrive after a newer pause. The element's
 		// current paused flag distinguishes that from an explicit native resume.
 		if (!eventForCurrent(event) || (event.currentTarget as HTMLAudioElement).paused) return;
+		// Native controls bypass playCurrent: retry the resume on the gesture.
+		resumeLevelingContext();
 		if (status === 'error') playCurrent(true);
 		else if (status !== 'playing') status = 'loading';
 	}
 
 	function handlePlaying(event: Event): void {
-		if (eventForCurrent(event) && (status === 'loading' || status === 'playing')) status = 'playing';
+		if (!eventForCurrent(event)) return;
+		// Media Session and programmatic plays also land here; retry the
+		// resume so routed playback is never stuck silent.
+		resumeLevelingContext();
+		if (status === 'loading' || status === 'playing') status = 'playing';
 	}
 
 	function handlePause(event: Event): void {
@@ -238,6 +351,12 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	}
 
 	function goNext(): void {
+		// Explicit Next during radio moves through the mix (rolling into a
+		// new pass at its end). Only explicit Next past the queue end stops.
+		if (radio) {
+			advanceRadio();
+			return;
+		}
 		if (!current) return;
 		const advanced = nextTrack(queue);
 		if (advanced === queue) {
@@ -250,11 +369,51 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		playCurrent();
 	}
 
+	// Natural end of the last queued track: continue with a seeded mix over
+	// the loaded catalogue. An empty library ends instead of starting radio.
+	function startRadio(): void {
+		startRadioPass(parseRadioSeed(page.url.searchParams.get('radio-seed')));
+	}
+
+	function startRadioPass(seed: number): void {
+		const order = createRadioOrder(DEMO_TRACKS, seed);
+		if (order.length === 0) {
+			playback.pause();
+			status = 'ended';
+			return;
+		}
+		radio = { order, index: 0, seed };
+		playCurrent();
+	}
+
+	// Advance within the radio mix; a finished pass rolls into a new one
+	// with the next seed, so radio never idles mid-listen.
+	function advanceRadio(): void {
+		if (!radio) return;
+		if (radio.index < radio.order.length - 1) {
+			radio = { ...radio, index: radio.index + 1 };
+			playCurrent();
+		} else {
+			startRadioPass(radio.seed + 1);
+		}
+	}
+
+	// Stop returns to the established end-of-queue idle state. Nothing
+	// restarts on its own: stray ends land on status 'ended', which
+	// handleEnded ignores.
+	function stopRadio(): void {
+		radio = null;
+		playback.pause();
+		status = 'ended';
+	}
+
 	function goPrevious(): void {
 		const previous = previousTrack(queue);
 		// Clamped at the first track: nothing changed, so a paused track must
-		// not be resumed by a no-op Previous.
+		// not be resumed by a no-op Previous (and radio, if on, keeps playing).
 		if (previous === queue) return;
+		// Stepping back leaves radio: the queue resumes from the previous track.
+		radio = null;
 		queue = previous;
 		playCurrent();
 	}
@@ -283,6 +442,8 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		// still load a seeded resume entry under the selection contract.
 		const shouldResume = nextId !== current?.id || !audioEl?.currentTime;
 		if (nextId !== undefined && nextId !== current?.id) persistPosition(current?.id);
+		// An explicit pick leaves radio: the queue resumes from the picked track.
+		radio = null;
 		queue = next;
 		playCurrent();
 		if (nextId !== undefined && shouldResume) seekToResume(nextId);
@@ -300,6 +461,7 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	}
 
 	function clearAll(): void {
+		radio = null;
 		queue = clearQueue(queue);
 		status = 'empty';
 		void playback.unload();
@@ -398,7 +560,15 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		if (endedId !== null) resumeStore?.clear(endedId);
 		// A fired timer already paused via onFire; the queue stays untouched.
 		if (fired) return;
-		goNext();
+		// Only a natural end starts radio: explicit Next past the end stops
+		// in goNext, and pause (or a stale ended while paused) never gets here.
+		if (radio) {
+			advanceRadio();
+		} else {
+			if (!current) return;
+			if (nextTrack(queue) === queue) startRadio();
+			else goNext();
+		}
 		seekCurrentResume();
 	}
 
@@ -418,6 +588,12 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 				// Storage can be unavailable (private mode); queue still works.
 			}
 		}
+	});
+
+	// Leveling follows the current track, the toggle, and the wired element
+	// (the keyed `<audio>` is recreated per source, so a track change rewires).
+	$effect(() => {
+		applyLeveling();
 	});
 
 	/**
@@ -453,6 +629,22 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
+		levelingEnabled = loadLevelingEnabled(safeStorage());
+		(
+			window as unknown as {
+				__levelingProbe?: () => {
+					enabled: boolean;
+					trackId: string | null;
+					linear: number;
+					contextState: AudioContextState | 'unavailable';
+				};
+			}
+		).__levelingProbe = () => ({
+			enabled: levelingEnabled,
+			trackId: current?.id ?? null,
+			linear: levelingLinear,
+			contextState: levelingCtx?.state ?? 'unavailable'
+		});
 		(window as unknown as { __comforts?: { advanceSleep: typeof advanceSleep } }).__comforts = {
 			advanceSleep
 		};
@@ -518,6 +710,15 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
+			// The leveling graph is page-local: close the context so repeat
+			// visits cannot exhaust the browser's context limit, and drop
+			// the probe so later visits never read stale state.
+			void levelingCtx?.close().catch(() => {});
+			levelingCtx = null;
+			levelingSource = null;
+			levelingGain = null;
+			wiredEl = null;
+			delete (window as unknown as { __levelingProbe?: unknown }).__levelingProbe;
 		};
 	});
 </script>
@@ -558,6 +759,13 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		{/if}
 	</p>
 
+	{#if radio}
+		<p data-testid="radio-badge" role="status">Radio</p>
+		<button type="button" data-testid="radio-stop" onclick={stopRadio}>
+			Stop radio
+		</button>
+	{/if}
+
 	{#if status === 'error'}
 		<div data-testid="player-error" role="alert">
 			<p>Could not play this track. Retry playback or choose another track.</p>
@@ -591,6 +799,7 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
 		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
 			Keyboard shortcuts
 		</button>

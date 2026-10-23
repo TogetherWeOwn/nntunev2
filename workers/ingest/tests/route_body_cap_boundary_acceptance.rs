@@ -1,8 +1,8 @@
 //! Search/upload route body-cap boundary pins (tests-only).
 //!
-//! Contract under test (`workers/ingest/src/lib.rs:67,71`, enforced at
-//! `:1156`/`:1219` via `read_capped_text` → `check_declared_len` + `push_chunk`
-//! at `:352-376`):
+//! Contract under test (`workers/ingest/src/lib.rs:68,72`, enforced at
+//! `:1157`/`:1220` via `read_capped_text` → `check_declared_len` + `push_chunk`
+//! at `:353-377`):
 //!
 //! - `MAX_SEARCH_BODY_BYTES == 16_384` (16 KiB: a search body is a query plus
 //!   a short category list, never content);
