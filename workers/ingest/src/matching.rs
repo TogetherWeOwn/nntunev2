@@ -1087,6 +1087,9 @@ mod tests {
                 track_no: Some(i16::try_from(track).unwrap()),
             })
             .collect();
+        // An early exact duplicate must not consume the occurrence cap:
+        // taking before dedup would return 9,999 rows ending at track 9,999.
+        recordings.insert(0, recordings[0].clone());
         recordings.push(MbRecording {
             mbid: MBID_B.to_string(),
             title: "Later distinct recording".to_string(),
