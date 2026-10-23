@@ -5,10 +5,22 @@
 		state: QueueState;
 		/** Transport stays with the host page: called when Next is activated. */
 		onnext?: () => void;
+		/** Queue management stays with the host page too: the panel reports intent, never mutates. */
+		onmove?: (from: number, to: number) => void;
+		onplaynext?: (index: number) => void;
+		onremove?: (index: number) => void;
+		onclear?: () => void;
+		/**
+		 * Polite move announcements, owned by the host: the host sets the
+		 * moved track and its new position after each move; the panel only
+		 * renders the region.
+		 */
+		announcement?: string;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
-	let { state: queue, onnext }: Props = $props();
+	let { state: queue, onnext, onmove, onplaynext, onremove, onclear, announcement = '' }: Props =
+		$props();
 
 	let current = $derived(currentTrack(queue));
 
@@ -51,8 +63,9 @@
 <!--
 	Reusable queue panel: renders a `QueueState` from the queue store with
 	the same hooks the demo player and the queue-order specs rely on.
-	The host page owns selection and transport (via `onnext`); the panel
-	itself never mutates state.
+	The host page owns selection, transport (via `onnext`) and management
+	(via `onmove`/`onplaynext`/`onremove`/`onclear`); the panel itself never
+	mutates state.
 -->
 <p data-testid="now-playing" role="status">
 	{#if current}
@@ -73,6 +86,8 @@
 	{/if}
 </p>
 
+<p data-testid="queue-announcement" role="status">{announcement}</p>
+
 <button
 	type="button"
 	data-testid="player-next"
@@ -92,9 +107,9 @@
 </button>
 
 <ol aria-label="Playback queue" bind:this={list}>
-	<!-- Keyed by queue position. Uniqueness comes from the store: addTrack
-		dedupes and restoreQueue rejects duplicates. -->
-	{#each queue.tracks as track, i (i)}
+	<!-- Stable track identity preserves keyboard focus through reorders. The
+		store guarantees uniqueness: addTrack dedupes and restoreQueue rejects duplicates. -->
+	{#each queue.tracks as track, i (track.id)}
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex: tabindex is provably -1-or-absent (QO-U14); the current row is a programmatic focus target, never a tab stop. -->
 		<li
 			class="queue-row"
@@ -104,9 +119,47 @@
 			tabindex={i === selectedIndex ? -1 : undefined}
 		>
 			{track.title}{#if track.artist} — {track.artist}{/if}
+			<button
+				type="button"
+				aria-label="Move {track.title} up"
+				disabled={i === 0}
+				onclick={() => onmove?.(i, i - 1)}
+			>
+				Up
+			</button>
+			<button
+				type="button"
+				aria-label="Move {track.title} down"
+				disabled={i === queue.tracks.length - 1}
+				onclick={() => onmove?.(i, i + 1)}
+			>
+				Down
+			</button>
+			<button
+				type="button"
+				aria-label="Play {track.title} next"
+				onclick={() => onplaynext?.(i)}
+			>
+				Next
+			</button>
+			<button
+				type="button"
+				aria-label="Remove {track.title} from queue"
+				onclick={() => onremove?.(i)}
+			>
+				Remove
+			</button>
 		</li>
 	{/each}
 </ol>
+
+<button
+	type="button"
+	disabled={queue.tracks.length === 0}
+	onclick={() => onclear?.()}
+>
+	Clear queue
+</button>
 
 <style>
 	.queue-row {
