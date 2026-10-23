@@ -1,0 +1,200 @@
+{
+  "version": 1,
+  "about": "Bot play verdict matrix for spec section 5: one bot byte-fetch attempt per row, mapping bearer/membership/grant/profile/artifact/range/provider state to the wire verdict (HTTP status + typed code + retryable). The checker enforces the banked precedence in README.md. Source rows use body_len 1724 (the staging WAV byte count from the spec test plan); opus-64 rows use a synthetic 4096-byte artifact.",
+  "vectors": [
+    {
+      "id": "botmx-001",
+      "title": "source full play serves 200",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-002",
+      "title": "source range bytes=0-8 serves 206 with Content-Range",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=0-8", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 206, "code": null, "retryable": null, "content_range": "bytes 0-8/1724" }
+    },
+    {
+      "id": "botmx-003",
+      "title": "opus-64 full play serves 200 when the artifact exists",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "opus-64", "artifact": { "format": "opus", "bitrate_kbps": 64, "sample_rate_hz": 48000, "channels": 2, "sha256": "0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e", "r2_key": "audio/0b/3c/0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e" }, "range": null, "body_len": 4096, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-004",
+      "title": "opus-64 range bytes=9-17 serves 206 with Content-Range",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "opus-64", "artifact": { "format": "opus", "bitrate_kbps": 64, "sample_rate_hz": 48000, "channels": 2, "sha256": "0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e", "r2_key": "audio/0b/3c/0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e" }, "range": "bytes=9-17", "body_len": 4096, "provider_auth": "ok" },
+      "expect": { "status": 206, "code": null, "retryable": null, "content_range": "bytes 9-17/4096" }
+    },
+    {
+      "id": "botmx-005",
+      "title": "suffix range serves the tail as 206",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=-20", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 206, "code": null, "retryable": null, "content_range": "bytes 1704-1723/1724" }
+    },
+    {
+      "id": "botmx-006",
+      "title": "garbage Range falls back to a 200 full body",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=abc-def", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-007",
+      "title": "multi-range falls back to a 200 full body",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=0-8,9-17", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-008",
+      "title": "uppercase artifact sha canonicalizes to the same key and serves 200",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "opus-64", "artifact": { "format": "opus", "bitrate_kbps": 64, "sample_rate_hz": 48000, "channels": 2, "sha256": "0B3CF7E37F87C543FB6D8E129F3778F59D8529191B27B9C7D310309F8BD67E4E", "r2_key": "audio/0b/3c/0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e" }, "range": null, "body_len": 4096, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-009",
+      "title": "v1 unbound grant serves opus-64 (profile binding lands with B1)",
+      "note": "v1 grants carry no profile, so the profile-replay rule cannot apply to them; B1 binds profile on the v2 wire and B8 re-runs this row against it.",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "opus-64", "artifact": { "format": "opus", "bitrate_kbps": 64, "sample_rate_hz": 48000, "channels": 2, "sha256": "0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e", "r2_key": "audio/0b/3c/0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e" }, "range": null, "body_len": 4096, "provider_auth": "ok" },
+      "expect": { "status": 200, "code": null, "retryable": null }
+    },
+    {
+      "id": "botmx-010",
+      "title": "unknown profile value is a 400 invalid_request",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "flac", "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 400, "code": "invalid_request", "retryable": false }
+    },
+    {
+      "id": "botmx-011",
+      "title": "opus-64 with no artifact is a 404 not_found",
+      "note": "Absent artifact reads as no such resource; the conditional on-demand transcode fallback may later turn this wait-then-serve instead of 404.",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "opus-64", "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 404, "code": "not_found", "retryable": false }
+    },
+    {
+      "id": "botmx-012",
+      "title": "opus-64-bound grant replayed for source is a 403 forbidden",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": "opus-64", "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    },
+    {
+      "id": "botmx-013",
+      "title": "source-bound grant replayed for opus-64 is a 403 forbidden",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": "source", "profile_param": "opus-64", "artifact": { "format": "opus", "bitrate_kbps": 64, "sample_rate_hz": 48000, "channels": 2, "sha256": "0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e", "r2_key": "audio/0b/3c/0b3cf7e37f87c543fb6d8e129f3778f59d8529191b27b9c7d310309f8bd67e4e" }, "range": null, "body_len": 4096, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    },
+    {
+      "id": "botmx-014",
+      "title": "expired grant is a generic 401 unauthorized",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "expired", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-015",
+      "title": "tampered grant is a generic 401 unauthorized",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "tampered", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-016",
+      "title": "grant naming another track is a 403 forbidden",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": false, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    },
+    {
+      "id": "botmx-017",
+      "title": "revoked bearer is a generic 401 unauthorized",
+      "request": { "bearer": "revoked", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-018",
+      "title": "non-member track is a 404 not_found, never 403",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": false, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 404, "code": "not_found", "retryable": false }
+    },
+    {
+      "id": "botmx-019",
+      "title": "unsatisfiable range is a 416 range_not_satisfiable",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=99999-", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 416, "code": "range_not_satisfiable", "retryable": false }
+    },
+    {
+      "id": "botmx-020",
+      "title": "expired provider credentials are a 401 provider_auth_expired",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "expired" },
+      "expect": { "status": 401, "code": "provider_auth_expired", "retryable": false }
+    },
+    {
+      "id": "botmx-021",
+      "title": "library:read-only bearer on the stream route is a 403 forbidden",
+      "request": { "bearer": "ok", "scopes": ["library:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    },
+    {
+      "id": "botmx-022",
+      "title": "malformed grant is a generic 401 unauthorized",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "malformed", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-023",
+      "title": "over-TTL grant is a generic 401 unauthorized",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "over-ttl", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-024",
+      "title": "malformed bearer is a generic 401 unauthorized",
+      "request": { "bearer": "malformed", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-025",
+      "title": "missing bearer is a generic 401 unauthorized",
+      "request": { "bearer": "missing", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-030",
+      "title": "precedence: revoked bearer wins over grant, profile and range faults",
+      "request": { "bearer": "revoked", "scopes": ["library:read", "stream:read"], "member": true, "grant": "expired", "grant_track_match": true, "grant_profile": null, "profile_param": "flac", "artifact": null, "range": "bytes=99999-", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-031",
+      "title": "precedence: expired grant wins over profile and range faults",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "expired", "grant_track_match": true, "grant_profile": null, "profile_param": "flac", "artifact": null, "range": "bytes=99999-", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 401, "code": "unauthorized", "retryable": false }
+    },
+    {
+      "id": "botmx-032",
+      "title": "precedence: unknown profile wins over an unsatisfiable range",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": "flac", "artifact": null, "range": "bytes=99999-", "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 400, "code": "invalid_request", "retryable": false }
+    },
+    {
+      "id": "botmx-033",
+      "title": "precedence: unsatisfiable range wins over expired provider auth",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": "bytes=99999-", "body_len": 1724, "provider_auth": "expired" },
+      "expect": { "status": 416, "code": "range_not_satisfiable", "retryable": false }
+    },
+    {
+      "id": "botmx-034",
+      "title": "precedence: non-member wins over an expired grant",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": false, "grant": "expired", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 404, "code": "not_found", "retryable": false }
+    },
+    {
+      "id": "botmx-035",
+      "title": "precedence: grant track mismatch wins over an unknown profile",
+      "request": { "bearer": "ok", "scopes": ["library:read", "stream:read"], "member": true, "grant": "ok", "grant_track_match": false, "grant_profile": null, "profile_param": "flac", "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    },
+    {
+      "id": "botmx-036",
+      "title": "precedence: wrong scope wins over non-member",
+      "request": { "bearer": "ok", "scopes": ["library:read"], "member": false, "grant": "ok", "grant_track_match": true, "grant_profile": null, "profile_param": null, "artifact": null, "range": null, "body_len": 1724, "provider_auth": "ok" },
+      "expect": { "status": 403, "code": "forbidden", "retryable": false }
+    }
+  ]
+}

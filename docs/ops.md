@@ -93,7 +93,8 @@ bucket:
 
 No `lifecycle` field appears in the checked-in Worker/app Wrangler manifests
 (`workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`,
-`workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml.example`,
+`workers/repair/wrangler.toml`, `workers/transcode/wrangler.toml`,
+`workers/ingest/wrangler.toml.example`,
 `workers/api/wrangler.toml.example`, `apps/web/wrangler.toml`) — lifecycle is
 Cloudflare-side, not a Wrangler field, per the audio bucket sources in
 `docs/cache-policy.md` — and the only `lifecycle` string in those manifests is
@@ -411,10 +412,12 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Config KV | `nntunev2-config-staging` | `nntunev2-config-prod` |
 | Stream NNTP pool (DO class) | `NntpPool` | `NntpPool` |
 | Repair jobs (DO class) | `RepairContainer` | `RepairContainer` |
+| Transcode jobs (DO class) | `TranscodeContainer` | `TranscodeContainer` |
 | Stream meter (AE dataset) | `nntune_meter` | `nntune_meter` |
 | Ingest meter (AE dataset) | `nntune_ingest_meter` | `nntune_ingest_meter` |
 | Stream service (ingest `NNTP_POOL` cross-script target) | `nntune-stream-staging` | `nntune-stream` |
 | Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
+| Transcode service (ingest `TRANSCODE_CONTAINER` target) | `nntune-transcode-staging` | `nntune-transcode` |
 | MB service (ingest `MB_API` target; Wrangler default-suffixed, no per-env `name` committed) | `nntune-mb-staging` | `nntune-mb-production` |
 | Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
@@ -454,6 +457,7 @@ config sources in the Non-storage bindings inventory below.
 | Worker (config source) | Binding | Type | staging | prod | ID / variable |
 |---|---|---|---|---|---|
 | `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
+| `ingest` (`workers/ingest/wrangler.toml.example`) | `AUDIO_PUBLISH` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID; write-only publication binding (same buckets as `AUDIO_CACHE`), bucket name mirrored in the `AUDIO_BUCKET_NAME` var |
 | `mb` (`workers/mb/wrangler.toml.example`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID |
 | `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
@@ -486,15 +490,18 @@ worker and the exact config source for each row.
 | `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:105-112` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
 | `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
 | `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:124-127`; code `workers/ingest/src/metering.rs:16-18` |
-| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:129-133` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
-| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:135-140` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:157-161` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
+| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | `workers/ingest/wrangler.toml.example:163-168` (pins the prod service name); target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:170-175` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
 | `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:122` |
+| `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:128` |
 
 Notes, all referencing (not changing) owning-lane state:
 
 - The committed ingest example carries single (non-env-split) values for
   its cross-script and service targets (`script_name = "nntune-stream"`,
-  `service = "nntune-repair"`, `service = "nntune-mb"`). Stream and repair
+  `service = "nntune-repair"`, `service = "nntune-transcode"`,
+  `service = "nntune-mb"`). Stream, repair and transcode
   have explicit per-env `name` overrides committed in their configs, so
   their per-environment resolution follows the target workers' committed
   names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
@@ -503,19 +510,21 @@ Notes, all referencing (not changing) owning-lane state:
   `service = "nntune-mb"` needs the same env split. Wiring the env split is
   owned by the integration lane, like the ingest queue-name drift recorded
   in the R2 reconciliation table and the paragraph above.
-- The repair Worker is not yet deployed: its config header
-  (`workers/repair/wrangler.toml:11-13`) requires Cloudflare Containers on
+- The repair and transcode Workers are not yet deployed: their config
+  headers (`workers/repair/wrangler.toml:11-13`,
+  `workers/transcode/wrangler.toml:11-13`) require Cloudflare Containers on
   the existing plan (no new spend) with deploy as a later operator action.
-  Until then the `REPAIR_CONTAINER` target names are reserved, not live —
-  and ingest cannot deploy with the committed example until the repair
-  target exists, because Cloudflare fails a deploy whose service-binding
-  target does not exist.
-- Deploy order is stream, mb, and repair (once Containers are enabled)
-  before ingest. Ingest reaches the per-user `NntpPool` object through the
-  cross-script `NNTP_POOL` binding (`workers/stream/wrangler.toml:4-8`),
-  and it declares unconditional `[[services]]` bindings to `nntune-repair`
-  and `nntune-mb` (`workers/ingest/wrangler.toml.example:129-140`; mb-first
-  is also stated at `:135-137`). Ingest cannot deploy with the committed
+  Until then the `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` target names
+  are reserved, not live — and ingest cannot deploy with the committed
+  example until those targets exist, because Cloudflare fails a deploy
+  whose service-binding target does not exist.
+- Deploy order is stream, mb, repair and transcode (once Containers are
+  enabled) before ingest. Ingest reaches the per-user `NntpPool` object
+  through the cross-script `NNTP_POOL` binding
+  (`workers/stream/wrangler.toml:4-8`), and it declares unconditional
+  `[[services]]` bindings to `nntune-repair`, `nntune-transcode`
+  and `nntune-mb` (`workers/ingest/wrangler.toml.example:157-175`; mb-first
+  is also stated at `:170-172`). Ingest cannot deploy with the committed
   example until those service targets exist.
 
 ## Staging promotion checklist

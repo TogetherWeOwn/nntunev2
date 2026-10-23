@@ -80,10 +80,16 @@ struct MbSearchBody {
 }
 
 /// One entry of `GET /v1/mb/release/:mbid/recordings`. Only the fields
-/// the library write needs are decoded; extra fields are ignored.
+/// the library write needs are decoded; extra fields are ignored. `title`
+/// feeds the `tracks` writer (`crate::track_writers`); the MB mirror holds
+/// it NOT NULL, so an empty title means a stale cached response and the
+/// tracks derivation fails that position closed (skip with reason, replay
+/// converges) rather than storing a placeholder.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MbRecording {
     pub mbid: String,
+    #[serde(default)]
+    pub title: String,
     #[serde(default)]
     pub track_no: Option<i16>,
     /// Medium (disc) position within the release. Absent in responses
@@ -207,14 +213,18 @@ pub fn parse_mb_recordings_response(status: u16, body: &str) -> Result<Vec<Strin
     }
 }
 
-/// Recording MBIDs ordered by medium (disc) number, then track number
+/// Recordings ordered by medium (disc) number, then track number
 /// within the medium (missing numbers last), ties broken by the
 /// lexicographically smallest MBID. Sorting by track number alone
 /// would interleave the discs of a multi-medium release (disc 1
 /// track 1, disc 2 track 1, disc 1 track 2, ...). A response cached
 /// before `medium_no` existed has it missing on every entry, which
-/// ties and falls back to track order.
-fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
+/// ties and falls back to track order. Malformed MBIDs are dropped.
+/// Each projection deduplicates and caps its own output: distinct MBIDs
+/// for the library, distinct occurrences for the tracks writer. Titles
+/// and positions pass through untouched: the `tracks` derivation
+/// (`crate::track_writers`) validates them with its own skip reasons.
+fn recordings_in_track_order(recordings: &[MbRecording]) -> Vec<&MbRecording> {
     let mut valid: Vec<&MbRecording> = recordings
         .iter()
         .filter(|recording| validate_mbid(&recording.mbid))
@@ -230,17 +240,56 @@ fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
             })
             .then_with(|| a.mbid.cmp(&b.mbid))
     });
-    let mut seen = std::collections::HashSet::with_capacity(valid.len());
-    let mut mbids: Vec<String> = Vec::with_capacity(valid.len().min(MAX_RECORDING_MBIDS));
-    for recording in valid {
-        if seen.insert(recording.mbid.as_str()) {
-            mbids.push(recording.mbid.clone());
-        }
-        if mbids.len() == MAX_RECORDING_MBIDS {
-            break;
-        }
+    valid
+}
+
+/// Distinct recording MBIDs in [`recordings_in_track_order`]: the library
+/// write carries bare MBIDs only, retaining each one's first position.
+fn recording_mbids_in_track_order(recordings: &[MbRecording]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    recordings_in_track_order(recordings)
+        .into_iter()
+        .filter(|recording| seen.insert(recording.mbid.as_str()))
+        .take(MAX_RECORDING_MBIDS)
+        .map(|recording| recording.mbid.clone())
+        .collect()
+}
+
+/// Classify one MB release-recordings response into full recording rows
+/// in [`recordings_in_track_order`]. Same wire contract and status
+/// classification as [`parse_mb_recordings_response`] (a 404 is
+/// `Transient`, every other 4xx is `Permanent`); the difference is the
+/// payload: the `tracks` writer needs titles and positions alongside
+/// the MBIDs, which the bare-MBID parse drops. Sorting is shared, but
+/// deduplication is by `(mbid, medium_no, track_no)`: one recording can
+/// occur at multiple positions on a release. Exact duplicate occurrences
+/// retain their first wire row; the cap counts occurrences, not MBIDs.
+pub fn parse_mb_recordings_detailed(
+    status: u16,
+    body: &str,
+) -> Result<Vec<MbRecording>, MatchFailure> {
+    match status {
+        200 => serde_json::from_str::<MbRecordingsBody>(body)
+            .map(|parsed| {
+                let mut seen = std::collections::HashSet::new();
+                recordings_in_track_order(&parsed.recordings)
+                    .into_iter()
+                    .filter(|recording| {
+                        seen.insert((
+                            recording.mbid.as_str(),
+                            recording.medium_no,
+                            recording.track_no,
+                        ))
+                    })
+                    .take(MAX_RECORDING_MBIDS)
+                    .cloned()
+                    .collect()
+            })
+            .map_err(|_| MatchFailure::Transient),
+        404 => Err(MatchFailure::Transient),
+        400..=499 => Err(MatchFailure::Permanent),
+        _ => Err(MatchFailure::Transient),
     }
-    mbids
 }
 
 /// Decide the `recording_mbids` for a matched write from the recordings
@@ -952,5 +1001,152 @@ mod tests {
         let unmatched = library_write_for(&msg, None, vec![REC1.to_string()]);
         assert!(unmatched.recording_mbids.is_empty());
         assert!(crate::library::validate_library_write(&unmatched).is_ok());
+    }
+
+    #[test]
+    fn detailed_parse_keeps_titles_and_positions_in_album_order() {
+        // Same wire disorder as `recordings_response_is_sorted_into_track_order`,
+        // asserting the full rows the tracks writer needs, not bare MBIDs.
+        const REC1: &str = "11111111-1111-4111-8111-111111111111";
+        const REC2: &str = "22222222-2222-4222-8222-222222222222";
+        let body = format!(
+            r#"{{"release_mbid":"{MBID_A}","recordings":[
+                {{"mbid":"{REC2}","title":"Second","track_no":2,"medium_no":1}},
+                {{"mbid":"not-an-mbid","title":"Bogus","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First","track_no":1,"medium_no":1}},
+                {{"mbid":"{REC1}","title":"First again","track_no":1,"medium_no":1}}
+            ]}}"#
+        );
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        assert_eq!(
+            detailed,
+            vec![
+                MbRecording {
+                    mbid: REC1.to_string(),
+                    title: "First".to_string(),
+                    track_no: Some(1),
+                    medium_no: Some(1),
+                },
+                MbRecording {
+                    mbid: REC2.to_string(),
+                    title: "Second".to_string(),
+                    track_no: Some(2),
+                    medium_no: Some(1),
+                },
+            ]
+        );
+        // Both parses agree on membership and order: the MBID list is the
+        // detailed rows' MBIDs.
+        let mbids = parse_mb_recordings_response(200, &body).unwrap();
+        assert_eq!(
+            mbids,
+            detailed.iter().map(|r| r.mbid.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn detailed_parse_keeps_repeated_recording_occurrences() {
+        let body = format!(
+            r#"{{"recordings":[
+                {{"mbid":"{MBID_A}","title":"Reprise","medium_no":1,"track_no":2}},
+                {{"mbid":"{MBID_A}","title":"Disc two","medium_no":2,"track_no":1}},
+                {{"mbid":"{MBID_B}","title":"Next","medium_no":1,"track_no":3}},
+                {{"mbid":"{MBID_A}","title":"Opening","medium_no":1,"track_no":1}},
+                {{"mbid":"{MBID_A}","title":"Duplicate","medium_no":1,"track_no":2}}
+            ]}}"#
+        );
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        let occurrences: Vec<_> = detailed
+            .iter()
+            .map(|r| (r.mbid.as_str(), r.medium_no, r.track_no, r.title.as_str()))
+            .collect();
+        // An MBID can recur at another track or on another disc. Only the
+        // identical occurrence collapses, keeping its first wire row.
+        assert_eq!(
+            occurrences,
+            vec![
+                (MBID_A, Some(1), Some(1), "Opening"),
+                (MBID_A, Some(1), Some(2), "Reprise"),
+                (MBID_B, Some(1), Some(3), "Next"),
+                (MBID_A, Some(2), Some(1), "Disc two"),
+            ]
+        );
+        assert_eq!(
+            parse_mb_recordings_response(200, &body).unwrap(),
+            vec![MBID_A, MBID_B]
+        );
+    }
+
+    #[test]
+    fn recordings_caps_apply_to_each_projection_after_dedup() {
+        let mut recordings: Vec<_> = (1..=MAX_RECORDING_MBIDS + 1)
+            .map(|track| MbRecording {
+                mbid: MBID_A.to_string(),
+                title: "Recurring".to_string(),
+                medium_no: Some(1),
+                track_no: Some(i16::try_from(track).unwrap()),
+            })
+            .collect();
+        // An early exact duplicate must not consume the occurrence cap:
+        // taking before dedup would return 9,999 rows ending at track 9,999.
+        recordings.insert(0, recordings[0].clone());
+        recordings.push(MbRecording {
+            mbid: MBID_B.to_string(),
+            title: "Later distinct recording".to_string(),
+            medium_no: Some(2),
+            track_no: Some(1),
+        });
+        let body = serde_json::json!({
+            "recordings": recordings.iter().map(|r| serde_json::json!({
+                "mbid": r.mbid, "title": r.title,
+                "medium_no": r.medium_no, "track_no": r.track_no,
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        assert_eq!(detailed.len(), MAX_RECORDING_MBIDS);
+        assert_eq!(detailed.last().unwrap().track_no, Some(10_000));
+        // The occurrence cap must not hide a distinct MBID from the library
+        // projection: its independent cap counts distinct recordings.
+        assert_eq!(
+            parse_mb_recordings_response(200, &body).unwrap(),
+            vec![MBID_A, MBID_B]
+        );
+    }
+
+    #[test]
+    fn detailed_parse_defaults_a_missing_title_and_mirrors_classification() {
+        // A response cached before the route returned titles decodes with
+        // an empty title (the tracks derivation skips that position with
+        // reason; the parse itself never fails on it).
+        let body = format!(
+            r#"{{"release_mbid":"{MBID_A}","recordings":[{{"mbid":"{MBID_B}","track_no":1,"medium_no":1}}]}}"#
+        );
+        let detailed = parse_mb_recordings_detailed(200, &body).unwrap();
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(detailed[0].title, "");
+        // Status classification mirrors the bare-MBID parse exactly.
+        assert!(parse_mb_recordings_detailed(
+            200,
+            &format!(r#"{{"release_mbid":"{MBID_A}","recordings":[]}}"#)
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            parse_mb_recordings_detailed(404, "{}"),
+            Err(MatchFailure::Transient)
+        );
+        assert_eq!(
+            parse_mb_recordings_detailed(400, "{}"),
+            Err(MatchFailure::Permanent)
+        );
+        assert_eq!(
+            parse_mb_recordings_detailed(500, "{}"),
+            Err(MatchFailure::Transient)
+        );
+        assert_eq!(
+            parse_mb_recordings_detailed(200, "not json"),
+            Err(MatchFailure::Transient)
+        );
     }
 }

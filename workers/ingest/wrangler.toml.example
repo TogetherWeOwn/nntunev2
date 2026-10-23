@@ -23,6 +23,13 @@ compatibility_date = "2026-10-01"
 # local dev.
 # BUILD_SHA = "unknown"
 
+# Audio bucket name behind the AUDIO_PUBLISH binding below (code:
+# src/transcode.rs, src/queue_consumer.rs), bound into the published
+# `cache_objects` row's `r2_bucket` column. Staging:
+# `nntunev2-audio-staging`; production: `nntunev2-audio-prod`. Absent
+# means the Transcoding step fails transiently (a redeploy heals it).
+# AUDIO_BUCKET_NAME = "<AUDIO_BUCKET>"
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
 # produce; the consumer below stays disabled, so every accepted enqueue
 # waits in the queue until it is enabled.
@@ -127,11 +134,20 @@ script_name = "nntune-stream"
 # Fetched files are staged under `ingest-scratch/{job_id}/r{round}/in/…`
 # plus a `manifest.json` as the repair handoff; the provisioned bucket's
 # 7-day lifecycle rule on the `ingest-scratch/` prefix is the cleanup
-# backstop (see docs/ops.md). Never bind the archive or audio-cache
-# buckets here.
+# backstop (see docs/ops.md). Never bind the archive buckets here.
+# The audio-cache buckets below are the one deliberate exception: the
+# e2e spec's §4.2 publication step assigns artifact publication
+# (content-addressed `audio/` keys plus the `cache_objects` row) to
+# the ingest `Transcoding` step, so this Worker writes artifacts to
+# the audio bucket through AUDIO_PUBLISH. It never reads the bucket
+# and never touches archive keys.
 [[r2_buckets]]
 binding = "INGEST_SCRATCH"
 bucket_name = "<INGEST_SCRATCH_BUCKET>"
+
+[[r2_buckets]]
+binding = "AUDIO_PUBLISH"
+bucket_name = "<AUDIO_BUCKET>"
 
 # Slice 2: usage metering (code: src/metering.rs).
 [[analytics_engine_datasets]]
@@ -143,6 +159,13 @@ dataset = "nntune_ingest_meter"
 [[services]]
 binding = "REPAIR_CONTAINER"
 service = "nntune-repair"
+
+# Transcode dispatch target (code: src/transcode.rs): the no-route
+# transcode Worker in workers/transcode, which fronts the opus-64
+# Container. Deploy that Worker before enabling the consumer.
+[[services]]
+binding = "TRANSCODE_CONTAINER"
+service = "nntune-transcode"
 
 # MusicBrainz read API for the Matching step (code: src/matching.rs,
 # src/queue_consumer.rs). The service is the workers/mb Worker

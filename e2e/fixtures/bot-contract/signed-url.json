@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "about": "Signed stream URL shape vectors for spec section 5 step 3. Banked shape: https://<stream-host>/play/<track_id>?grant=<v1 token>[&profile=opus-64]. Hosts are .test placeholders, never real staging origins. See README.md in this directory.",
+  "vectors": [
+    {
+      "id": "boturl-001",
+      "title": "opus-64 play URL verifies and selects the bot profile",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA2MDA.jmcXgW3xRioL0Ddzp3-7-nwVRpu_YUFexH9pizZ_944&profile=opus-64",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": true, "track_id": "track-synth-1724", "profile": "opus-64", "user_id": "user-bot-7", "exp_unix": 1700000600 }
+    },
+    {
+      "id": "boturl-002",
+      "title": "play URL without a profile verifies and selects source bytes",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": true, "track_id": "track-synth-1724", "profile": "source", "user_id": "user-bot-7", "exp_unix": 1700000300 }
+    },
+    {
+      "id": "boturl-003",
+      "title": "play URL with an at-cap grant verifies",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA5MDA.O3o2W5R29GN3sbvZOTXggSAUbegdZci_Ran6E1TKa5o&profile=opus-64",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": true, "track_id": "track-synth-1724", "profile": "opus-64", "user_id": "user-bot-7", "exp_unix": 1700000900 }
+    },
+    {
+      "id": "boturl-004",
+      "title": "plain-http play URL rejects (https only)",
+      "url": "http://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "not-https" }
+    },
+    {
+      "id": "boturl-005",
+      "title": "play URL without a grant rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?profile=opus-64",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "missing-grant" }
+    },
+    {
+      "id": "boturl-006",
+      "title": "play URL with two grants rejects (no ambiguous binding)",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4&grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA2MDA.jmcXgW3xRioL0Ddzp3-7-nwVRpu_YUFexH9pizZ_944",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "duplicate-grant" }
+    },
+    {
+      "id": "boturl-007",
+      "title": "play URL with an empty grant rejects as malformed",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-malformed" }
+    },
+    {
+      "id": "boturl-008",
+      "title": "play URL with an expired grant rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAwMDA.LhgqK8ejoaR8wpR6M8633Ht3PM8vxdJTk9wwaqF_OTw",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-expired" }
+    },
+    {
+      "id": "boturl-009",
+      "title": "play URL with a tampered grant rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.BXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-bad-signature" }
+    },
+    {
+      "id": "boturl-010",
+      "title": "play URL with an over-TTL grant rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDA5NjE.ajX1RJ0c7zE1QUA0TQsgSF2PIbQXJcbAh4f2-S24EPg",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-ttl-too-long" }
+    },
+    {
+      "id": "boturl-011",
+      "title": "play URL whose grant names another track rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1vdGhlci05OXwxNzAwMDAwNjAw.1hvVgs7_1rC35wmTdWvkBcJoxGuGp2ivx3q73Adyq18",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-wrong-track" }
+    },
+    {
+      "id": "boturl-012",
+      "title": "play URL with an unknown profile value rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4&profile=flac",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "unknown-profile" }
+    },
+    {
+      "id": "boturl-013",
+      "title": "play URL on the API path shape rejects (wrong worker surface)",
+      "url": "https://stream.staging.test/v1/stream/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "bad-path" }
+    },
+    {
+      "id": "boturl-014",
+      "title": "play URL with an empty track segment rejects",
+      "url": "https://stream.staging.test/play/?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "bad-path" }
+    },
+    {
+      "id": "boturl-015",
+      "title": "play URL with a nested track path rejects",
+      "url": "https://stream.staging.test/play/track-synth-1724/extra?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "bad-path" }
+    },
+    {
+      "id": "boturl-016",
+      "title": "play URL with a wrong-version grant envelope rejects as malformed",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v2.a.b",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "grant-malformed" }
+    },
+    {
+      "id": "boturl-017",
+      "title": "play URL with an empty profile value rejects as unknown",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4&profile=",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "unknown-profile" }
+    },
+    {
+      "id": "boturl-018",
+      "title": "non-URL garbage rejects before any shape check",
+      "url": "not a url at all",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "bad-url" }
+    },
+    {
+      "id": "boturl-019",
+      "title": "play URL with two profile params rejects (no ambiguous selection)",
+      "url": "https://stream.staging.test/play/track-synth-1724?grant=v1.dXNlci1ib3QtN3x0cmFjay1zeW50aC0xNzI0fDE3MDAwMDAzMDA.w4Bh9llQrGPA-D-NqIbYGfBn_p453ckrk3Duc-USwh4&profile=opus-64&profile=opus-64",
+      "secret": "corpus",
+      "now_unix": 1700000000,
+      "expect": { "ok": false, "reason": "duplicate-profile" }
+    }
+  ]
+}
