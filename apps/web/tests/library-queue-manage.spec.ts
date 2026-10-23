@@ -321,6 +321,22 @@ test('queue controls are labeled and keyboard operable', async ({ page }) => {
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha', 'row-zulu']);
 });
 
+test('keyboard moves keep focus on the same track for consecutive Enter presses', async ({ page }) => {
+	await seedQueue(page);
+
+	const moveAlpha = rowButton(page, 'row-alpha', 'Move Alpha Song up');
+	await expect(moveAlpha).toBeVisible();
+	await moveAlpha.focus();
+	await expect(moveAlpha).toBeFocused();
+	await page.keyboard.press('Enter');
+
+	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha', 'row-zulu']);
+	// Check before Alpha reaches the top and its up control becomes disabled.
+	await expect(moveAlpha).toBeFocused();
+	await page.keyboard.press('Enter');
+	expect(await queueOrder(page)).toEqual(['row-alpha', 'row-mike', 'row-zulu']);
+});
+
 test('moves are announced in a polite live region', async ({ page }) => {
 	await seedQueue(page);
 
