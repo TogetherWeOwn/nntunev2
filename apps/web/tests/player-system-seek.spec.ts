@@ -6,9 +6,10 @@ import { expect, test, type Page } from '@playwright/test';
  * src/lib/player/mediaSession.system-seek.acceptance.test.ts (canonical note).
  *
  * Real demo HTMLAudioElement/currentTime and local deterministic PCM fixture;
- * only the OS Media Session boundary is recorded. play() remains pending so
- * intent/seek assertions cannot advance with wall clock. No currentTime mock,
- * no hardware, provider, live stream, or physical lock-screen acceptance.
+ * the OS Media Session boundary is recorded. By default play() is deferred for
+ * deterministic intent/seek checks; explicit nativePlayback cases call through
+ * to real playback, including a timeline test with no currentTime assignment.
+ * No currentTime mock, hardware, provider, or physical lock-screen acceptance.
  * Invalid duration branches use an explicit duration-only override; normal
  * seek/rate/metadata cases use decoded native duration and native currentTime.
  *
@@ -27,6 +28,9 @@ type Probe = {
 	attempts: string[];
 	positions: (Position | null)[];
 	playCalls: number;
+	pendingPlays: (() => void)[];
+	settledPlays: number;
+	timeupdates: { time: number; trusted: boolean; positions: (Position | null)[] }[];
 	retired: Callback[];
 	oldAudio: HTMLAudioElement | null;
 };
@@ -34,7 +38,7 @@ declare global {
 	interface Window { __systemMediaAcceptance: Probe; }
 }
 
-type Mode = { rejectAction?: string; positionApi?: 'missing' | 'throwing'; noSession?: boolean };
+type Mode = { rejectAction?: string; positionApi?: 'missing' | 'throwing'; noSession?: boolean; nativePlayback?: boolean };
 const SEEK_ACTIONS = ['seekto', 'seekforward', 'seekbackward'];
 const ACTIONS = ['nexttrack', 'previoustrack', 'play', 'pause', ...SEEK_ACTIONS];
 
@@ -48,12 +52,17 @@ async function openPlayer(page: Page, mode: Mode = {}, loadMedia = true) {
 		localStorage.removeItem('nntune:resume:v1');
 		localStorage.removeItem('nntune:playback-speed:v1');
 		const probe: Probe = {
-			handlers: {}, attempts: [], positions: [], playCalls: 0, retired: [], oldAudio: null
+			handlers: {}, attempts: [], positions: [], playCalls: 0, pendingPlays: [],
+			settledPlays: 0, timeupdates: [], retired: [], oldAudio: null
 		};
 		window.__systemMediaAcceptance = probe;
+		const nativePlay = HTMLMediaElement.prototype.play;
 		HTMLMediaElement.prototype.play = function () {
 			probe.playCalls += 1;
-			return new Promise<void>(() => {});
+			if (config.nativePlayback) return nativePlay.call(this);
+			return new Promise<void>((resolve) => {
+				probe.pendingPlays.push(() => { probe.settledPlays += 1; resolve(); });
+			});
 		};
 		if (config.noSession) {
 			// Truly absent, not an own property returning undefined.
@@ -429,6 +438,126 @@ test('MS-B11 whole Media Session absent does not break page, speed, or keyboard 
 	await expect.poll(() => page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => el.duration)).toBeGreaterThan(13);
 	await setTime(page, 5);
 	expect(await page.evaluate(() => window.__systemMediaAcceptance.oldAudio?.isConnected)).toBe(false);
+	expect(errors).toEqual([]);
+});
+
+// Removing the endpoint pause must fail while play intent is active, not just
+// when the fixture was already paused. Exercise both clamped endpoint inputs.
+for (const nativePlayback of [false, true]) {
+	for (const beyond of [false, true]) {
+		test(`MS-B13 seekto ${beyond ? 'beyond' : 'exact'} duration pauses ${nativePlayback ? 'native playing' : 'pending play'} and fences late completion`, async ({ page }) => {
+			const errors = await openPlayer(page, { nativePlayback });
+			await requireSeek(page, ['seekto']);
+			const audio = page.getByTestId('demo-audio');
+			const nowPlaying = await page.getByTestId('now-playing').textContent();
+			const queue = await page.getByTestId('queue-item').allTextContents();
+			const duration = await audio.evaluate((el: HTMLAudioElement) => el.duration);
+			await page.getByRole('heading', { name: 'Player resilience demo' }).click();
+			await dispatch(page, { action: 'play' });
+			await expect(page.getByTestId('player-status')).toHaveText(nativePlayback ? 'Status: playing' : 'Status: loading');
+			if (nativePlayback) {
+				await expect.poll(() => time(page)).toBeGreaterThan(0);
+				expect(await audio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
+			} else {
+				expect(await page.evaluate(() => window.__systemMediaAcceptance.pendingPlays.length)).toBe(1);
+			}
+			await dispatch(page, { action: 'seekto', seekTime: duration + (beyond ? 1000 : 0) });
+			await expectPausedUnchanged(page, 1);
+			await expect.poll(() => time(page)).toBeCloseTo(duration, 3);
+			await expectPosition(page, duration);
+			if (!nativePlayback) {
+				// Settle the actual earlier promise, not a new/vacuous Promise.resolve.
+				await page.evaluate(async () => {
+					const p = window.__systemMediaAcceptance;
+					p.pendingPlays.shift()!();
+					await Promise.resolve();
+				});
+				expect(await page.evaluate(() => ({
+					pending: window.__systemMediaAcceptance.pendingPlays.length,
+					settled: window.__systemMediaAcceptance.settledPlays
+				}))).toEqual({ pending: 0, settled: 1 });
+				await expectPausedUnchanged(page, 1);
+			}
+			await audio.evaluate((el) => el.dispatchEvent(new Event('ended')));
+			await expectPausedUnchanged(page, 1);
+			await expect.poll(() => time(page)).toBeCloseTo(duration, 3);
+			await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying!);
+			expect(await page.getByTestId('queue-item').allTextContents()).toEqual(queue);
+			expect(errors).toEqual([]);
+		});
+	}
+}
+
+test('MS-B14 an interior system seek preserves native playing intent and time continues advancing', async ({ page }) => {
+	const errors = await openPlayer(page, { nativePlayback: true });
+	await requireSeek(page, ['seekto']);
+	const audio = page.getByTestId('demo-audio');
+	await page.getByRole('heading', { name: 'Player resilience demo' }).click();
+	await dispatch(page, { action: 'play' });
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	const queue = await page.getByTestId('queue-item').allTextContents();
+	await expect.poll(() => time(page)).toBeGreaterThan(0);
+	await dispatch(page, { action: 'seekto', seekTime: 4 });
+	await expect.poll(() => time(page)).toBeGreaterThanOrEqual(4);
+	expect(await time(page)).toBeLessThan(6);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	expect(await audio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
+	await expect.poll(() => time(page)).toBeGreaterThan(4.5);
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+	expect(await page.getByTestId('queue-item').allTextContents()).toEqual(queue);
+	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	expect(await page.evaluate(() => window.__systemMediaAcceptance.playCalls)).toBe(1);
+	expect(errors).toEqual([]);
+});
+
+test('MS-B15 native timeupdate publishes an advancing timeline without any seek', async ({ page }) => {
+	const errors = await openPlayer(page, { nativePlayback: true });
+	const audio = page.getByTestId('demo-audio');
+	await page.getByRole('heading', { name: 'Player resilience demo' }).click();
+	await dispatch(page, { action: 'play' });
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await expect.poll(() => time(page)).toBeGreaterThan(0.1);
+	const start = await audio.evaluate((el: HTMLAudioElement) => {
+		const p = window.__systemMediaAcceptance;
+		// Isolate timeupdate: queued metadata/seeked/rate events cannot supply a
+		// passing snapshot. No currentTime write, synthetic event, or fake clock.
+		for (const type of ['loadedmetadata', 'durationchange', 'seeked', 'ratechange']) {
+			el.addEventListener(type, (event) => event.stopImmediatePropagation(), { capture: true });
+		}
+		p.positions = [];
+		let before = 0;
+		let time = 0;
+		el.addEventListener('timeupdate', () => {
+			before = p.positions.length;
+			time = el.currentTime;
+		}, { capture: true });
+		// Registered after the host's listener: bracket that synchronous publish.
+		el.addEventListener('timeupdate', (event) => p.timeupdates.push({
+			time, trusted: event.isTrusted, positions: p.positions.slice(before)
+		}));
+		return el.currentTime;
+	});
+	await expect.poll(() => time(page)).toBeGreaterThan(start + 0.75);
+	await expect.poll(() => page.evaluate(() => window.__systemMediaAcceptance.timeupdates.filter(
+		(sample) => sample.positions.length === 1
+	).length), { message: 'native timeupdate must publish fresh position snapshots' }).toBeGreaterThanOrEqual(3);
+	const samples = await page.evaluate(() => window.__systemMediaAcceptance.timeupdates);
+	const duration = await audio.evaluate((el: HTMLAudioElement) => el.duration);
+	for (const sample of samples) {
+		expect(sample.trusted).toBe(true);
+		expect(sample.positions).toHaveLength(1);
+		const state = sample.positions[0]!;
+		expect(state).not.toBeNull();
+		expect(state!.duration).toBe(duration);
+		expect(state!.playbackRate).toBe(1);
+		expect(Number.isFinite(state!.position)).toBe(true);
+		expect(state!.position).toBeGreaterThanOrEqual(0);
+		expect(state!.position).toBeLessThanOrEqual(duration);
+		expect(state!.position).toBeCloseTo(sample.time, 2);
+	}
+	expect(samples.at(-1)!.positions[0]!.position - samples[0]!.positions[0]!.position).toBeGreaterThan(0.4);
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	expect(await audio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
 	expect(errors).toEqual([]);
 });
 
