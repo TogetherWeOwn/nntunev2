@@ -40,11 +40,16 @@
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
 	let favorites: string[] = $state([]);
+	let favoritesInitialized = false;
 	let queueAnnouncement = $state('');
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
-		invalidateLibraryCache,
+		invalidateLibraryCache: () => {
+			favorites = [];
+			favoritesInitialized = false;
+			invalidateLibraryCache();
+		},
 		onStateChange: (state) => {
 			items = state.items;
 			staleAt = state.staleAt;
@@ -67,13 +72,13 @@
 					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
 			}
-			// Favorites are storage truth re-read once the refresher settles:
-			// a completed refresh may have minted the auth context, while an
-			// auth boundary or 401 revokes it (empty until the next account
-			// stars something). Skipped mid-flight so Refresh never flickers
-			// the stars.
-			if (!state.loading) {
+			// Bootstrap once after an authenticated load has minted the context.
+			// Memory stays authoritative for this visit, even if persistence
+			// fails; Refresh must not overwrite pending edits with stale storage.
+			// Auth transitions and access refusals reset both memory and bootstrap.
+			if (!state.loading && !state.loadError && !state.libraryUnavailable && !favoritesInitialized) {
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+				favoritesInitialized = true;
 			}
 		}
 	});
@@ -151,16 +156,13 @@
 	}
 
 	function toggleFavorite(id: string): void {
-		// Storage is the source of truth: re-read, flip one id, write back.
-		// Idempotent, instant, and never touches the queue or the network.
-		const session = browserStorage('session');
-		const local = browserStorage('local');
-		const current = loadFavorites(session, local);
-		const next = current.includes(id)
-			? current.filter((favorite) => favorite !== id)
-			: [...current, id];
-		saveFavorites(session, local, next);
+		// Toggle visible state, not the last successful write. The next write
+		// persists the full set, including edits made while storage failed.
+		const next = favorites.includes(id)
+			? favorites.filter((favorite) => favorite !== id)
+			: [...favorites, id];
 		favorites = next;
+		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 	}
 
 	function starLabel(track: LibraryItem): string {
@@ -183,6 +185,7 @@
 			// session auth context the scoped key derives from.
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
+			favoritesInitialized = false;
 		}
 		refresher.handleAuthTransition(event);
 	}
@@ -192,6 +195,7 @@
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
+		favoritesInitialized = false;
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -200,7 +204,6 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
-		favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 		void refresh();
 		return () => {
 			refresher.dispose();

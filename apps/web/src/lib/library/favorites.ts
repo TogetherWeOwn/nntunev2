@@ -48,7 +48,7 @@ export function loadFavorites(
 		if (!raw) return [];
 		const parsed: unknown = JSON.parse(raw);
 		if (!Array.isArray(parsed)) return [];
-		return parsed.filter(isStoredId);
+		return [...new Set(parsed.filter(isStoredId))];
 	} catch {
 		return [];
 	}
@@ -65,8 +65,8 @@ export function saveFavorites(
 	try {
 		local.setItem(key, JSON.stringify(ids.filter(isStoredId)));
 	} catch {
-		// Quota or privacy mode: the in-memory favorites still render this
-		// visit; the next load simply starts empty.
+		// Quota or privacy mode: memory remains authoritative this visit.
+		// A later toggle retries the full set; reload reads the last saved set.
 	}
 }
 
