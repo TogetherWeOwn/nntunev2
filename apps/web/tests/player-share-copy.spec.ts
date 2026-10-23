@@ -676,3 +676,63 @@ test('[COPY-TIME-17] copy scope stays within the synthetic demo ids on /demo/pla
 		expect(calls[i] ?? '', 'result must not point at the library').not.toContain('/library');
 	}
 });
+
+test('[COPY-TIME-18] invalid activation clears a prior success instead of leaving it stale', async ({
+	page
+}) => {
+	await openPlayer(page);
+	const copy = await expectCopyButton(page, 'COPY-TIME-18');
+
+	// A valid activation first: success is visible.
+	await setCurrentTime(page, 20.4);
+	await copy.click();
+	await expect(page.getByTestId('share-copy-status')).toContainText(/copied/i);
+
+	// The track stays recognized so the action stays enabled; only the media
+	// time turns invalid, so activation must refuse AND clear the prior result.
+	await mockCurrentTime(page, Number.NaN);
+	await expect(copy, 'COPY-TIME-18: the action stays enabled with a recognized track').toBeEnabled();
+	await copy.click();
+	await page.waitForTimeout(200);
+	expect(
+		await clipboardCalls(page),
+		'COPY-TIME-18: the refusing activation must not write the clipboard'
+	).toHaveLength(1);
+	await expect(page.getByTestId('share-copy-status')).not.toContainText(/copied|success/i);
+	expect(
+		await page.getByTestId('share-copy-fallback').count(),
+		'COPY-TIME-18: refusal must not leave a fallback behind'
+	).toBe(0);
+});
+
+test('[COPY-TIME-19] a refusing activation supersedes a pending write: late completion stays ignored', async ({
+	page
+}) => {
+	await openPlayer(page, { clipboard: 'delayed' });
+	const copy = await expectCopyButton(page, 'COPY-TIME-19');
+
+	// A valid activation with a pending clipboard write: no success yet.
+	await setCurrentTime(page, 10);
+	await copy.click();
+	await expect(page.getByTestId('share-copy-status')).not.toContainText(/copied/i);
+
+	// A refusing activation (invalid time, recognized track) must supersede
+	// the pending write, so its late completion is ignored.
+	await mockCurrentTime(page, Number.NaN);
+	await expect(copy, 'COPY-TIME-19: the action stays enabled with a recognized track').toBeEnabled();
+	await copy.click();
+	await resolveDelayedWrite(page);
+	await page.waitForTimeout(200);
+	await expect(
+		page.getByTestId('share-copy-status'),
+		'late completion from a write superseded by a refusal must be ignored'
+	).not.toContainText(/copied|success/i);
+	expect(
+		await page.getByTestId('share-copy-fallback').count(),
+		'COPY-TIME-19: no stale fallback from the superseded write'
+	).toBe(0);
+	expect(
+		await clipboardCalls(page),
+		'COPY-TIME-19: the refusing activation must not write the clipboard'
+	).toHaveLength(1);
+});
