@@ -304,3 +304,215 @@ test('[FAV-08] starring, unstarring and favorites queue-add issue zero network m
 	const mutations = requests.filter((request) => request.method !== 'GET');
 	expect(mutations, 'starring flows must not mutate over the network').toEqual([]);
 });
+
+// Fail only the favorites boundary, not auth-context/snapshot storage. Installing
+// after the initial load also exercises a device losing storage during a visit.
+async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'): Promise<void> {
+	await page.evaluate(
+		({ base, operation }) => {
+			const getItem = Storage.prototype.getItem;
+			const setItem = Storage.prototype.setItem;
+			if (operation === 'getItem') {
+				Storage.prototype.getItem = function (key) {
+					if (this === window.localStorage && key.startsWith(`${base}.`)) {
+						throw new DOMException('Favorites reads unavailable', 'SecurityError');
+					}
+					return getItem.call(this, key);
+				};
+			} else {
+				Storage.prototype.setItem = function (key, value) {
+					if (this === window.localStorage && key.startsWith(`${base}.`)) {
+						throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
+					}
+					setItem.call(this, key, value);
+				};
+			}
+			Reflect.set(window, '__restoreFavoritesStorage', () => {
+				Storage.prototype.getItem = getItem;
+				Storage.prototype.setItem = setItem;
+			});
+		},
+		{ base: FAVORITES_KEY_BASE, operation }
+	);
+	const context = await readAuthContext(page);
+	expect(context, 'favorites faults must leave the session auth context available').not.toBeNull();
+	expect(
+		await page.evaluate(() => {
+			window.localStorage.setItem('test.unrelated-storage', 'available');
+			return window.localStorage.getItem('test.unrelated-storage');
+		})
+	).toBe('available');
+}
+
+async function restoreFavoritesStorage(page: Page): Promise<void> {
+	await page.evaluate(() => Reflect.get(window, '__restoreFavoritesStorage')());
+}
+
+async function expectFavoriteIds(page: Page, ids: string[]): Promise<void> {
+	await expect
+		.poll(() =>
+			page.getByTestId('favorite-item').evaluateAll((items) =>
+				items.map((item) => item.getAttribute('data-id')).sort()
+			)
+		)
+		.toEqual([...ids].sort());
+}
+
+test.describe('favorites storage regressions', () => {
+	let mutations: string[];
+	let pageErrors: string[];
+
+	test.beforeEach(async ({ page }) => {
+		mutations = [];
+		pageErrors = [];
+		page.on('request', (request) => {
+			if (request.method() !== 'GET') mutations.push(`${request.method()} ${request.url()}`);
+		});
+		page.on('pageerror', (error) => pageErrors.push(error.message));
+		page.on('console', (message) => {
+			if (message.type() === 'error') pageErrors.push(message.text());
+		});
+		// Unexpected API requests cannot reach a backend. seedLibrary registers
+		// the only allowed response after this catch-all (Playwright is LIFO).
+		await page.route('**/api/**', (route) => route.abort('blockedbyclient'));
+	});
+
+	test.afterEach(async ({ page }) => {
+		// These gates still execute when a state assertion fails earlier.
+		await expect.soft(page.getByTestId('queue-item')).toHaveCount(0);
+		expect.soft(mutations, 'favorites must remain local even when storage fails').toEqual([]);
+		expect.soft(pageErrors, 'favorites must not cause browser runtime errors').toEqual([]);
+	});
+
+	test('[FAV-R01] duplicate stored IDs render once or fall back to empty without a keyed-list error', async ({
+		page
+	}) => {
+		await page.addInitScript(
+			({ contextKey, scopedKey }) => {
+				window.sessionStorage.setItem(contextKey, 'test-duplicate-account');
+				window.localStorage.setItem(scopedKey, JSON.stringify(['fav-zulu', 'fav-zulu', 'fav-alpha']));
+			},
+			{
+				contextKey: AUTH_CONTEXT_KEY,
+				scopedKey: `${FAVORITES_KEY_BASE}.test-duplicate-account`
+			}
+		);
+		await seedLibrary(page);
+		await expect(page.getByTestId('favorites-section')).toBeVisible();
+		const ids = await page.getByTestId('favorite-item').evaluateAll((items) =>
+			items.map((item) => item.getAttribute('data-id')).sort()
+		);
+		// Both malformed-data fallback and stable deduplication satisfy the
+		// public contract; never require an internal load/save helper signature.
+		expect(ids).toEqual(ids.length === 0 ? [] : ['fav-alpha', 'fav-zulu']);
+		if (ids.length === 0) await expect(page.getByTestId('favorites-empty')).toBeVisible();
+		await starButton(page, 'fav-mike').click();
+		await expect(starButton(page, 'fav-mike')).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByTestId('favorite-item')).toHaveCount(ids.length + 1);
+	});
+
+	for (const operation of ['getItem', 'setItem'] as const) {
+		test(`[FAV-R02:${operation}] repeated star/unstar uses the visible state when favorites storage fails`, async ({
+			page
+		}) => {
+			await seedLibrary(page);
+			await failFavoritesStorage(page, operation);
+			for (const pressed of [true, false, true, false]) {
+				await starButton(page, 'fav-zulu').click();
+				await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', String(pressed));
+				await expectFavoriteIds(page, pressed ? ['fav-zulu'] : []);
+			}
+		});
+
+		test(`[FAV-R03:${operation}] toggling another track preserves pending favorites while storage fails`, async ({
+			page
+		}) => {
+			await seedLibrary(page);
+			await failFavoritesStorage(page, operation);
+			await starButton(page, 'fav-zulu').click();
+			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+			await starButton(page, 'fav-alpha').click();
+			await expectFavoriteIds(page, ['fav-zulu', 'fav-alpha']);
+			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+			await starButton(page, 'fav-zulu').click();
+			await expectFavoriteIds(page, ['fav-alpha']);
+			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
+			await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
+		});
+
+		test(`[FAV-R04:${operation}] a successful library refresh retains favorites pending during storage failure`, async ({
+			page
+		}) => {
+			await seedLibrary(page);
+			await failFavoritesStorage(page, operation);
+			await starButton(page, 'fav-zulu').click();
+			await expectFavoriteIds(page, ['fav-zulu']);
+			await page.route('**/api/library', (route) =>
+				route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify(ITEMS.map((item) =>
+						item.id === 'fav-mike' ? { ...item, title: 'Mike Song refreshed' } : item
+					))
+				})
+			);
+			await page.getByRole('button', { name: 'Refresh' }).click();
+			// Changed server text proves the response was committed, not merely
+			// requested while we were still asserting the pre-refresh DOM.
+			await expect(row(page, 'fav-mike')).toContainText('Mike Song refreshed');
+			await expectFavoriteIds(page, ['fav-zulu']);
+			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+		});
+
+		test(`[FAV-R05:${operation}] auth transition clears pending favorites before retry under continued storage failure`, async ({
+			page
+		}) => {
+			await seedLibrary(page);
+			const oldContext = await readAuthContext(page);
+			await failFavoritesStorage(page, operation);
+			await starButton(page, 'fav-zulu').click();
+			await expectFavoriteIds(page, ['fav-zulu']);
+			const otherTab = await page.context().newPage();
+			await otherTab.goto('/login');
+			await otherTab.evaluate((key) => {
+				window.localStorage.setItem(key, 'test-pending-favorites-auth-transition');
+				window.localStorage.removeItem(key);
+			}, AUTH_TRANSITION_KEY);
+			await expect(page.getByRole('alert')).toContainText(/session changed/i);
+			await expect(page.getByTestId('favorite-item')).toHaveCount(0);
+			await otherTab.close();
+			await page.getByRole('button', { name: 'Retry' }).click();
+			await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+			const newContext = await readAuthContext(page);
+			expect(newContext).not.toBeNull();
+			expect(newContext).not.toBe(oldContext);
+			await expect(page.getByTestId('favorites-empty')).toBeVisible();
+			await expectFavoriteIds(page, []);
+			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
+			await starButton(page, 'fav-alpha').click();
+			await expectFavoriteIds(page, ['fav-alpha']);
+			await restoreFavoritesStorage(page);
+			expect(await readFavoritesRaw(page, oldContext)).toBeNull();
+		});
+	}
+
+	test('[FAV-R06] recovered writes persist the full pending set and survive reload', async ({ page }) => {
+		await seedLibrary(page);
+		await failFavoritesStorage(page, 'setItem');
+		await starButton(page, 'fav-zulu').click();
+		await expectFavoriteIds(page, ['fav-zulu']);
+		await restoreFavoritesStorage(page);
+		// The next successful write must include the unpersisted first star,
+		// rather than rebuilding from the stale (empty) stored value.
+		await starButton(page, 'fav-alpha').click();
+		expect(storedIds(await readFavoritesRaw(page, await readAuthContext(page))).sort()).toEqual([
+			'fav-alpha', 'fav-zulu'
+		]);
+		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
+		await page.reload();
+		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
+		await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+		await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
+	});
+});
