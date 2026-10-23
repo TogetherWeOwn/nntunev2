@@ -20,6 +20,7 @@
 		currentTrack as queueCurrentTrack,
 		nextTrack,
 		selectTrack as selectQueueIndex,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
@@ -176,7 +177,11 @@
 					</li>
 				{/each}
 			</ul>
-			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
+			<PlayerQueue
+				state={queue}
+				onnext={() => (queue = nextTrack(queue))}
+				onshuffle={() => (queue = shuffleUpcoming(queue))}
+			/>
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>

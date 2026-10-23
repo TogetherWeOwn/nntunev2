@@ -1,13 +1,17 @@
 <script lang="ts">
 	import { currentTrack, type QueueState } from './queue.js';
+	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 
 	interface Props {
 		state: QueueState;
 		/** Transport stays with the host page: called when Next is activated. */
 		onnext?: () => void;
+		/** Queue-only edit: the host must not restart playback. */
+		onshuffle?: () => void;
+		radioActive?: boolean;
 	}
 
-	let { state, onnext }: Props = $props();
+	let { state, onnext, onshuffle, radioActive = false }: Props = $props();
 
 	let current = $derived(currentTrack(state));
 </script>
@@ -34,6 +38,8 @@
 >
 	Next
 </button>
+
+<ShuffleUpcoming {state} {onshuffle} {radioActive} />
 
 <ol aria-label="Playback queue">
 	<!-- Keyed by queue position. Uniqueness comes from the store: addTrack

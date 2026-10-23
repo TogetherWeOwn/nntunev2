@@ -8,6 +8,7 @@
 	import { page } from '$app/state';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
 	import {
 		applyGainToNode,
 		loadLevelingEnabled,
@@ -42,6 +43,7 @@
 		restoreQueue,
 		selectTrack,
 		serializeQueue,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
@@ -829,6 +831,13 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<ShuffleUpcoming
+			state={queue}
+			radioActive={radio !== null}
+			onshuffle={() => {
+				if (!radio) queue = shuffleUpcoming(queue);
+			}}
+		/>
 		<ol>
 			{#each queue.tracks as track, i (track.id)}
 				<li data-testid="queue-item" data-track-id={track.id}>
