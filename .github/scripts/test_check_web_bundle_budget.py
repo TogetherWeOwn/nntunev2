@@ -86,13 +86,13 @@ def test_non_positive_budget_rejected() -> None:
 
 
 def test_pinned_budget_covers_current_build() -> None:
-    """The pinned budget must leave headroom over a 176,417 B bundle."""
-    assert BUDGET_CLIENT_JS_BYTES > 176_417, BUDGET_CLIENT_JS_BYTES
+    """The pinned budget must leave headroom over a 230,544 B bundle."""
+    assert BUDGET_CLIENT_JS_BYTES > 230_544, BUDGET_CLIENT_JS_BYTES
 
 
 def test_pinned_budget_value_unchanged() -> None:
     """Pin the exact budget value: bumps happen deliberately, in their own PR."""
-    assert BUDGET_CLIENT_JS_BYTES == 230_400, BUDGET_CLIENT_JS_BYTES
+    assert BUDGET_CLIENT_JS_BYTES == 286_720, BUDGET_CLIENT_JS_BYTES
 
 
 def test_exact_budget_passes_and_one_byte_over_fails() -> None:

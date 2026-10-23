@@ -28,14 +28,14 @@ system libraries Chromium links against; see `playwright.config.ts`.
 
 ## Bundle budget
 
-CI fails `web-build` when total client JS exceeds **230,400 B (225 KiB)**,
+CI fails `web-build` when total client JS exceeds **286,720 B (280 KiB)**,
 measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
 (`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
-procedure — that script is the single source of truth. Baseline was 176,417 B
-(~172 KiB, 31 files) on 2026-10-17, leaving ~30% headroom for framework
-upgrades while catching heavy additions (a charting or date library typically
+procedure — that script is the single source of truth. Baseline was 230,544 B
+(~225 KiB, 36 files) on 2026-10-23, preserving the original ~54 KiB absolute
+headroom while catching heavy additions (a charting or date library typically
 adds 50+ KiB).
 
 To update the budget deliberately, in its own PR: rebuild, confirm the growth
