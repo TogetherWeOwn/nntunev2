@@ -140,6 +140,51 @@ export const chromium = { async launch() {
         self.assertIn("ERR_MODULE_NOT_FOUND", result.stderr)
         self.assertNotIn("HELPERS_REACHED", result.stdout)
 
+    def test_python_launcher_works_when_helpers_preserve_only_path(self):
+        step = next(s for s in split_steps(self.job) if step_field(s, "name") ==
+                    "Preserve Python runtime for isolated helper subprocesses")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            root = Path(tmp) / "path with space and 'quote"
+            runtime = root / "python"
+            binary = runtime / "bin/python3"
+            binary.parent.mkdir(parents=True)
+            # Model a setup-python interpreter whose shared library is only
+            # discoverable through its exported LD_LIBRARY_PATH. The existing
+            # helper deliberately forwards PATH alone to subprocesses.
+            binary.write_text("#!/bin/bash\n" +
+                              'test "${LD_LIBRARY_PATH-}" = ' +
+                              "\"$(dirname \"$0\")/../lib\" || exit 127\n" +
+                              "printf 'PYTHON_READY\\n'\n")
+            binary.chmod(0o755)
+            runner = root / "runner"
+            runner.mkdir()
+            env = {"PATH": str(binary.parent) + ":/usr/bin:/bin",
+                   "pythonLocation": str(runtime / "bin/.."),
+                   "RUNNER_TEMP": str(runner), "GITHUB_PATH": str(root / "github-path")}
+            control = subprocess.run([str(binary)], env={"PATH": env["PATH"]},
+                                     text=True, capture_output=True, timeout=10)
+            self.assertEqual(control.returncode, 127)
+            provision = subprocess.run(["bash", "-eo", "pipefail", "-c", run_body(step)],
+                                       env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(provision.returncode, 0, provision.stderr)
+            tools = runner / "e2e-tools"
+            self.assertEqual((root / "github-path").read_text().strip(), str(tools))
+            result = subprocess.run([str(tools / "python3")], env={"PATH": env["PATH"]},
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "PYTHON_READY\n")
+
+    def test_jq_provisioning_is_pinned_bounded_and_required(self):
+        step = next(s for s in split_steps(self.job) if step_field(s, "name") ==
+                    "Install pinned standalone jq for shell-contract helpers")
+        body = run_body(step)
+        self.assertIn("https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64", body)
+        self.assertIn("b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f", body)
+        self.assertIn("--connect-timeout 10 --max-time 30 --retry 3", body)
+        self.assertIn("sha256sum -c -", body)
+        self.assertIsNone(step_field(step, "continue-on-error"))
+        self.assertIsNone(step_field(step, "if"))
+
 
 if __name__ == "__main__":
     unittest.main()
