@@ -69,7 +69,7 @@
 		);
 		if (!row) return;
 		row.focus({ preventScroll: true });
-		row.scrollIntoView({ block: 'nearest' });
+		row.scrollIntoView({ block: 'nearest', behavior: 'instant' });
 	}
 </script>
 
@@ -185,7 +185,7 @@
 
 	/* Programmatic focus target for explicit reveal: the ring must hold
 	 * even where the app stylesheet is absent (mounted test parent). */
-	.queue-row:focus-visible {
+	.queue-row:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}
