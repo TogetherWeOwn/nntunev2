@@ -368,7 +368,8 @@ test('TT-B10 queue clear removes old time; detached events cannot restore it; re
 	await known(page, '1:01', '4:00');
 	const old = await page.getByTestId('demo-audio').elementHandle();
 	await page.getByTestId('queue-clear').click();
-	await expect(page.getByTestId('demo-audio')).toHaveCount(0);
+	await expect(page.getByTestId('demo-audio')).toHaveCount(1);
+	expect(await old!.evaluate((el) => el.isConnected)).toBe(false);
 	await expect(summary(page)).toHaveText('No track selected');
 	for (const event of ['timeupdate', 'loadedmetadata', 'durationchange']) {
 		await staleSample(old!, { time: 777, duration: 999, event });
