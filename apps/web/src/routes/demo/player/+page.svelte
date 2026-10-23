@@ -212,6 +212,13 @@
 	 * instead of claiming success. Never touches transport, queue, or storage.
 	 */
 	async function copyShareLink(): Promise<void> {
+		// Every activation supersedes prior results, even one that refuses
+		// below: clear stale success/fallback state up front so an invalid
+		// activation cannot leave a misleading success message or a live
+		// pending write behind.
+		const generation = (shareCopyGeneration += 1);
+		shareCopyStatus = '';
+		shareCopyFallbackUrl = null;
 		const trackId = current?.id ?? null;
 		if (trackId === null || !DEMO_TRACKS.some((track) => track.id === trackId)) return;
 		const position = audioEl?.currentTime;
@@ -223,7 +230,6 @@
 			return;
 		}
 		const url = `${window.location.origin}/demo/player?${query}`;
-		const generation = (shareCopyGeneration += 1);
 		const revision = sourceRevision;
 		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
 		let clipboard: ClipboardWriter | undefined;
