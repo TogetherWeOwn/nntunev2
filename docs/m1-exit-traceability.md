@@ -26,8 +26,10 @@ disabled-production-lane gate pins
 staging spec (`e2e/tests/served-routes.spec.ts`, #563), and the
 production secret-shape gate pin (`e2e/tests/deploy-production.spec.ts`,
 #587) added, and the queue-order live leg un-fixed with two uploads in
-its own account and the journey skip budget tightened to recording_mbids only:
-`npm --prefix e2e run e2e:list` lists 446 tests in 28 files, including
+its own account and the journey skip budget tightened to recording_mbids only,
+plus the bot-contract conformance corpus spec
+(`e2e/tests/bot-contract.spec.ts`, offline only, feeding B8):
+`npm --prefix e2e run e2e:list` lists 501 tests in 30 files, including
 3 queue-order integration pins and 2 new journey-gate pins.
 The previously verified web inventory remains 151 tests in 32 files
 (`pnpm --dir apps/web exec playwright test --list`, including the 5-test
@@ -190,6 +192,16 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   denial), the cross-scope denials, the header-only transport and the
   secret-free list surface — skipping green without staging and failing
   closed once configured. Credential hardening, not journey coverage.
+- `e2e/tests/bot-contract.spec.ts` pins the bot-contract conformance
+  corpus (spec section 5) offline on every PR via `test:unit`: the checker
+  passes each corpus (`:82` "checker passes every grant vector", `:190`
+  "checker passes every signed-url vector", `:282` "checker passes every
+  matrix row"), each mutation battery fails its broken shapes by name
+  (`:130` "grant mutants fail by name", `:200` "signed-url mutants fail by
+  name", `:292` "matrix mutants fail by name"), and the stable IDs plus
+  typed codes match their pinned sources (`:447`, `:469`, `:483`, `:493`).
+  No live legs: the B8 staging harness feeds these vectors to staging
+  later (`e2e/fixtures/bot-contract/`). Test infra, not journey coverage.
 - `e2e/tests/security-sign-out-everywhere.spec.ts:135`
   "sign-out-everywhere revokes the session and closes follow-up checks" pins
   live sign-out-everywhere revocation behind the security page: it mints via
