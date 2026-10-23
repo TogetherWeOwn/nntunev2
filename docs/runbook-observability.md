@@ -2,6 +2,44 @@
 
 This runbook covers the Cloudflare-hosted NNTune v2 app. It does not cover the legacy service or use an external uptime monitor. **The escape-detection kit is not live yet.** The current repository does not configure Discord alert rules, a two-minute health alert, five-minute user-flow synthetics, production synthetics, release-tagged error tracking, or a gradual-rollout/error-rate rollback action. Do not treat this runbook or a green CI run as proof of deployed monitoring.
 
+## Integrated error-rate runtime: source only, not activated
+
+[`workers/observability/runtime.mjs`](../workers/observability/runtime.mjs)
+integrates the staging API Tail projector, durable receive-time error windows,
+reducer, renderer and secret-bound Discord delivery. Its only configuration is an
+inactive [example](../workers/observability/wrangler.toml.example); **there is no
+live consumer, Tail attachment or provisioned alert secret in this slice**.
+Producer deployment settings are unchanged. The [runtime contract and local
+verification](../workers/observability/README.md#runtime-contract) describe the
+frozen interfaces, retention caps and deterministic local tests. A green local
+suite is not Cloudflare/Discord delivery evidence.
+
+Complete 60-second DO receipt-time windows alert only above a 1/20 failure rate
+with at least 20 invocations. Incomplete/overloaded windows are **lost coverage**,
+not healthy monitoring: they emit neither a sampled-rate alert nor a pass verdict.
+The renderer includes the configured logs link, original receive-time boundaries
+and producer release identity (or honest `unknown`), never a consumer build SHA.
+Only `GET /health` / `upstream` grouping is currently allowlisted; other grouping
+values remain unknown. This is not the separate two-minute sustained-health rule.
+
+Delivery reserves one durable 300000ms global cooldown before any POST, including
+failed delivery. This is **at-most-once attempt**, not exactly-once delivery: a
+crash after reservation can lose the message; 429/5xx, redirect, network and
+5000ms timeout failures have no retry. Response bodies are cancelled without
+retaining text. `OPS_ALERT_WEBHOOK_URL` is a secret binding name, not a value to
+inspect or paste. A missing/invalid webhook or `LOGS_URL` disables delivery while
+cleanup continues. Consumer logs/traces must stay disabled to avoid secret URL
+capture in automatic subrequest spans. Public HTTP is always empty 404.
+
+Later activation is a separate staging-first machine contract: exact-head CI and
+review, existing-plan/cost and secret-version checks, approved consumer/attachment,
+controlled staging breach plus real message/log-link evidence, health and recorded
+rollback. Do not run live delivery, provision secrets, attach Tail or deploy from
+this source-only change. Source undo is a normal gated revert PR; no live runtime
+rollback was exercised here. Any later live rollback must remove/restore the
+approved consumer attachment and serving version without changing producer data;
+never delete durable history as a diagnostic shortcut. Production stays passive.
+
 ## Current baseline and gaps
 
 - **Cloudflare Logs:** use the Cloudflare dashboard under **Workers & Pages → [service] → Observability → Logs** only if Workers Logs are enabled for that deployed service. The `staging-api` lane's generated config sets `[env.staging.observability] enabled = true`; a deploy from before that setting left `nntune-api-staging` with `observability: null`, which persists no records, so confirm the Worker's settings show observability enabled before expecting any record. The logging contract is implemented in code but not yet emitted by any deployed Worker: [`docs/logging-standard.md`](logging-standard.md) specifies the six-key target envelope (`ts`, `level`, `worker`, `trace_id`, `event`, `fields`) with `x-trace-id` propagation, and [`docs/api-errors.md`](api-errors.md) defines the shared `{code, message, retryable}` taxonomy whose `code` is the `error_class` grouping key. `api`/`ingest`/`mb` emit the envelope in code via `crates/nntune-logging`, each record carrying `build_sha` in `fields` (40-hex commit from the public `BUILD_SHA` var, explicit `"unknown"` until a lane wires it; `stream` has only the build-SHA normalizer mirror, no emission yet), but `deploy.yml` carries only the api staging lane (`staging-api`, skipped until the Operator wires staging) so no backend Worker is proven serving; until its first `success` no release/`build_sha` field is deployed, so do not expect `trace_id`/`request_id`, `build_sha`, `release`, `route`/`job`, or `error_class` filters to return results. Cloudflare's native issue grouping is platform-generated; group application errors by the registry `code` in the configured structured-log or tail-consumer/error-tracking view rather than assuming the native grouping key.
