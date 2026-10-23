@@ -257,7 +257,7 @@ test('UP-SHUF-B05: existing session schema persists the resulting order/current 
 	await expect.poll(() => page.evaluate((key) => JSON.parse(sessionStorage.getItem(key) ?? 'null'), QUEUE_KEY))
 		.toEqual({ orderIds: order, currentId: 'demo-track' });
 	const after = await storage(page);
-	expect(after.local).toEqual(before.local);
+	expect(after['local']).toEqual(before['local']);
 	expect(Object.keys(after.session).sort()).toEqual(Object.keys(before.session).sort());
 	for (const key of Object.keys(before.session).filter((key) => key !== QUEUE_KEY)) {
 		expect(after.session[key]).toBe(before.session[key]);
