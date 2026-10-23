@@ -61,6 +61,9 @@
 
 	type TransportState = 'selected' | 'loading' | 'playing' | 'paused' | 'error' | 'ended' | 'empty';
 	let status = $state<TransportState>('selected');
+	// Buffering describes audibility, not a new transport intent.
+	let buffering = $state(false);
+	const visibleStatus = $derived(status === 'playing' && buffering ? 'buffering' : status);
 	let seekReady = $state(false);
 	let sourceRevision = $state(0);
 	let completedSeeks = $state(0);
@@ -99,6 +102,9 @@
 		},
 		onPlaybackStarted: () => {
 			status = 'playing';
+		},
+		onBufferingChange: (value) => {
+			buffering = value;
 		}
 	});
 
@@ -301,8 +307,10 @@
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
+		const stopObserving = playback.observe(node);
 		return {
 			destroy() {
+				stopObserving();
 				// The action tears down on every swap and on unmount, before
 				// the source unloads: persist from this node while it holds time.
 				persistPosition(trackId, node);
@@ -727,7 +735,7 @@
 
 <main class="nt-wrap">
 	<h1>Player resilience demo</h1>
-	<p data-testid="player-status" aria-live="polite">Status: {status === 'selected' && seekReady ? 'ready' : status}</p>
+	<p data-testid="player-status" role="status" aria-live="polite" aria-atomic="true">Status: {visibleStatus === 'selected' && seekReady ? 'ready' : visibleStatus}</p>
 
 	<!-- Artwork reuse: the shared Artwork component's placeholder fallback
 	     renders for the current track when its art is missing (track 1). -->
@@ -753,7 +761,7 @@
 
 	<p data-testid="now-playing">
 		{#if current}
-			{status === 'playing' ? 'Now playing' : 'Selected'}: {current.title} — {current.artist}
+			{visibleStatus === 'playing' ? 'Now playing' : 'Selected'}: {current.title} — {current.artist}
 		{:else}
 			Queue is empty
 		{/if}
@@ -838,7 +846,7 @@
 						aria-current={i === queue.currentIndex ? 'true' : undefined}
 						onclick={() => selectAt(i)}
 					>
-						{track.title} — {track.artist}{i === queue.currentIndex ? (status === 'playing' ? ' (playing)' : ' (selected)') : ''}
+						{track.title} — {track.artist}{i === queue.currentIndex ? (visibleStatus === 'playing' ? ' (playing)' : ' (selected)') : ''}
 					</button>
 					<button
 						type="button"
