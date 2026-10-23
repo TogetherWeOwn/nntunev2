@@ -50,10 +50,10 @@ class FormatBytesTests(unittest.TestCase):
 
 
 class WorkerTableTests(unittest.TestCase):
-    def test_covers_all_six_workers(self):
+    def test_covers_all_seven_workers(self):
         self.assertEqual(
             [spec["worker"] for spec in WORKERS],
-            ["api", "ingest", "mb", "repair", "stream", "youtube"],
+            ["api", "ingest", "mb", "repair", "transcode", "stream", "youtube"],
         )
 
     def test_wasm_names(self):
@@ -63,7 +63,7 @@ class WorkerTableTests(unittest.TestCase):
     def test_audited_workers_build_locked(self):
         locked = [spec["worker"] for spec in WORKERS if spec.get("locked")]
         self.assertEqual(
-            locked, ["api", "ingest", "mb", "repair", "stream", "youtube"]
+            locked, ["api", "ingest", "mb", "repair", "transcode", "stream", "youtube"]
         )
 
     def test_repair_builds_locked_with_committed_lockfile(self):
