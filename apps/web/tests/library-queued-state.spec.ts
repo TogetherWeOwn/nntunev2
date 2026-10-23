@@ -42,7 +42,9 @@ function row(page: Page, id: string): Locator {
 }
 
 function rowButton(page: Page, id: string): Locator {
-	return row(page, id).getByRole('button');
+	// Queue control only: each row also carries a star toggle button, so an
+	// unfiltered query resolves to 2 elements and trips strict mode.
+	return row(page, id).locator('button.nt-library-row');
 }
 
 /** True when the row button exposes queued state through any channel. */
