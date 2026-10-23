@@ -5,6 +5,12 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import {
+		applySoundPreference,
+		loadSoundPreference,
+		saveSoundPreference,
+		type SoundPreference
+	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
 	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
@@ -81,7 +87,7 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
-	let muted = $state(false);
+	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -386,6 +392,7 @@
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
+		if (restored) updateSound(sound, node, false);
 		const stopObserving = playback.observe(node);
 		return {
 			destroy() {
@@ -631,6 +638,20 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
+	// Mount and keyed replacements apply before playback's tick resolves.
+	// Native events use the same equality-guarded path: no setter feedback.
+	function updateSound(preference: SoundPreference, element = audioEl, persist = true): void {
+		if (!element) return;
+		const actual = applySoundPreference(element, preference);
+		actual.restricted ||= sound.restricted ?? false;
+		if (persist) {
+			if (sound.volume !== actual.volume || sound.muted !== actual.muted) {
+				saveSoundPreference(safeStorage(), actual);
+			}
+		}
+		sound = actual;
+	}
+
 	// Visible jump controls share the keyboard relative-seek path above:
 	// the current element is read at activation and SEEK_SECONDS stays the
 	// single step source. Unusable media (no current track, non-finite or
@@ -656,21 +677,21 @@
 		}
 	}
 
-	// Mute lives in player state, not on the element: the keyed <audio>
-	// is recreated on every track change, and native controls can mute
-	// behind the shortcut's back. The effect re-applies state to each
-	// new element; volumechange absorbs native-side changes.
-	$effect(() => {
-		if (audioEl) audioEl.muted = muted;
-	});
 
-	function handleVolumeChange(event: Event): void {
-		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
+		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
+	}
+
+	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
+		if (!audioEl || !restored) return;
+		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
+		// A rejected setter leaves state unchanged: undo the range's own edit.
+		event.currentTarget.value = String(sound.volume * 100);
 	}
 
 	function toggleMuteShortcut(): void {
-		muted = !muted;
-		if (audioEl) audioEl.muted = muted;
+		if (!audioEl || !restored) return;
+		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -867,6 +888,8 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
+		sound = loadSoundPreference(safeStorage());
+		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		(
@@ -1036,6 +1059,24 @@
 			ondurationchange={handleTrackTime}
 		></audio>
 	{/key}
+
+	<div class="nt-sound">
+		<label>
+			Volume {Math.round(sound.volume * 100)}%
+			<input
+				type="range"
+				min="0"
+				max="100"
+				value={sound.volume * 100}
+				disabled={!restored || sound.restricted}
+				oninput={handleVolumeInput}
+			/>
+		</label>
+		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
+			Mute
+		</button>
+	</div>
+	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
 
 	<div>
 		<label for="track-time-mode">Time display</label>

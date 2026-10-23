@@ -64,6 +64,24 @@ a {
 	border: 1px solid var(--nt-border);
 }
 
+.nt-sound {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--nt-space-2);
+	margin-block: var(--nt-space-3);
+}
+
+.nt-sound input {
+	width: 8rem;
+	accent-color: var(--nt-accent);
+}
+
+.nt-sound button[aria-pressed='true'] {
+	background: var(--nt-accent);
+	color: var(--nt-accent-fg);
+}
+
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,
