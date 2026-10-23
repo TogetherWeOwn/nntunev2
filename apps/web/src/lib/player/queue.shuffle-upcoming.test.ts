@@ -151,8 +151,13 @@ describe('shuffle upcoming acceptance', () => {
 			const html = render(PlayerQueue, { props }).body;
 			// Inspect actual rendered native buttons, never component source text.
 			const buttons = [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].filter(
-				(match) => /aria-label=["']Shuffle upcoming["']/i.test(match[1]!) ||
-					/Shuffle\s+upcoming/i.test(match[2]!.replace(/<!--[\s\S]*?-->|<[^>]*>/g, ''))
+				(match) => {
+					const label = [...match[2]!.matchAll(/<!--[\s\S]*?-->|<[^>]*>|([^<]+)/g)]
+						.map((token) => token[1] ?? '')
+						.join('');
+					return /aria-label=["']Shuffle upcoming["']/i.test(match[1]!) ||
+						/Shuffle\s+upcoming/i.test(label);
+				}
 			);
 			expect(buttons, 'shared player exposes the labeled one-shot shuffle button').toHaveLength(1);
 			expect(/\bdisabled(?:\s|=|$)/.test(buttons[0]![1]!)).toBe(radioActive);
