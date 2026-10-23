@@ -1027,7 +1027,9 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Slow Ubuntu dependency downloads can consume 17 minutes; leave room
+    # for the full browser suite (normally about five minutes) after setup.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/web
