@@ -30,6 +30,24 @@ a {
 	padding-inline: var(--nt-space-3);
 }
 
+.nt-appearance {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: var(--nt-space-2);
+	padding-block: var(--nt-space-2);
+	font-size: 0.875rem;
+}
+
+.nt-appearance select {
+	background: var(--nt-bg-raised);
+	color: var(--nt-fg);
+	border: 1px solid var(--nt-border);
+	border-radius: var(--nt-radius);
+	padding: var(--nt-space-1) var(--nt-space-2);
+	font: inherit;
+}
+
 .nt-button {
 	display: inline-block;
 	padding: var(--nt-space-2) var(--nt-space-4);
@@ -44,6 +62,24 @@ a {
 	background: transparent;
 	color: var(--nt-fg);
 	border: 1px solid var(--nt-border);
+}
+
+.nt-sound {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--nt-space-2);
+	margin-block: var(--nt-space-3);
+}
+
+.nt-sound input {
+	width: 8rem;
+	accent-color: var(--nt-accent);
+}
+
+.nt-sound button[aria-pressed='true'] {
+	background: var(--nt-accent);
+	color: var(--nt-accent-fg);
 }
 
 @media (prefers-reduced-motion: reduce) {

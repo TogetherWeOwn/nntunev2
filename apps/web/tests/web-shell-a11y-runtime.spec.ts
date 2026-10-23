@@ -56,7 +56,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 			await expect(mangoButton).not.toHaveAttribute('aria-pressed');
 			await mangoButton.click();
 			await expect(mangoButton).toHaveAccessibleName('Mango Season — Acceptance Band — Queued');
-			await expect(mangoButton).not.toHaveAttribute('aria-pressed');
+			await expect(mangoButton).toHaveAttribute('aria-pressed', 'true');
 			await mangoButton.click();
 			await expect(page.getByTestId('queue-item')).toHaveCount(1);
 			await expect(mangoButton).toHaveAccessibleName('Mango Season — Acceptance Band — Queued');
@@ -85,7 +85,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 				return observed.mutations.length;
 			})).toBeGreaterThan(0);
 			await expect(mangoButton).toHaveAccessibleName('Mango Season — Acceptance Band — Queued');
-			await expect(mangoButton).not.toHaveAttribute('aria-pressed');
+			await expect(mangoButton).toHaveAttribute('aria-pressed', 'true');
 			await page.screenshot({ path: testInfo.outputPath('queue-advanced.png'), fullPage: true });
 		});
 

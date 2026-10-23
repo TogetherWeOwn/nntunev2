@@ -591,6 +591,70 @@ jobs:
           docker exec repair-smoke /usr/local/bin/par2 --version | head -1
           docker rm -f repair-smoke
 
+  rust-transcode:
+    name: rust (workers/transcode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate (including the Container
+      # Durable Object runtime) must check and lint on that target.
+      - run: cargo check --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+  # Transcode container image: the server's native tests ride the workspace
+  # `rust-test` job (containers/transcode is a member); this job proves the
+  # shipped image (Debian ffmpeg + server) builds from a clean checkout,
+  # carries libopus, and encodes deterministically. Keep this job id in
+  # ci-ok's needs.
+  transcode-container:
+    name: transcode-container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pin the RUN line itself (anchored ^RUN): the comments above the COPY
+      # also name --locked, so a file-wide contains check would stay green
+      # after a revert that drops the flag from the build command.
+      - name: Pin transcode image build uses --locked
+        run: grep -q '^RUN cargo build --locked --release -p nntune-transcode-server' containers/transcode/Dockerfile
+      - name: Run transcode runtime-user pin test
+        run: bash containers/transcode/tests/test_runtime_user.sh
+      - name: Run transcode runtime-user pin self-test
+        run: bash containers/transcode/tests/test_runtime_user.sh --self-test
+      - name: Build transcode image from clean checkout
+        run: docker build -f containers/transcode/Dockerfile -t nntune-transcode:ci .
+      - name: Smoke the shipped server and pinned ffmpeg binary
+        run: |
+          docker run -d --name transcode-smoke -p 18082:8080 nntune-transcode:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18082/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18082/health | grep -q '"ok":true'
+          docker exec transcode-smoke ffmpeg -version
+          # Consume the listing before matching so pipefail cannot mistake
+          # grep's early pipe close for an ffmpeg capability failure.
+          docker exec transcode-smoke ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/transcode-encoders.txt"
+          grep -Eq '^[[:space:]]*A[^[:space:]]{5}[[:space:]]+libopus[[:space:]]' "$RUNNER_TEMP/transcode-encoders.txt"
+          docker rm -f transcode-smoke
+      - name: Run transcode determinism self-test
+        run: bash containers/transcode/tests/determinism_self_test.sh nntune-transcode:ci 18081
+
   # mb-import container job: unit tests ride the workspace `rust-test` job
   # (mb-import-validate is a member); this job runs the migrations plus the
   # shell integration suite (chunked import, kill-resume, dupe-rerun, DLQ,
@@ -797,6 +861,10 @@ jobs:
   e2e-lint:
     name: e2e-lint
     runs-on: ubuntu-latest
+    # Preinstalled browsers + OS libraries avoid per-job apt mirror stalls.
+    # linux/amd64 v1.64.1-noble manifest verified 2026-10-23. Re-pin with
+    # e2e/package-lock.json; the offline image test rejects version drift.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -810,6 +878,39 @@ jobs:
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 
+      # The Node browser image does not promise Python; provision it for the
+      # existing traceability gate and the offline browser-image regression test.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      # The existing workflow helpers intentionally retain PATH alone. A
+      # setup-python interpreter also needs its private shared-library path;
+      # carry that in a launcher rather than weakening helper isolation.
+      - name: Preserve Python runtime for isolated helper subprocesses
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/e2e-tools"
+          mkdir -p "$tools"
+          printf '#!/bin/bash\nexport LD_LIBRARY_PATH=%q\nexec %q "$@"\n' \
+            "$pythonLocation/lib" "$(command -v python3)" > "$tools/python3"
+          chmod +x "$tools/python3"
+          echo "$tools" >> "$GITHUB_PATH"
+          env -i PATH="$tools:$PATH" python3 --version
+
+      - name: Install pinned standalone jq for shell-contract helpers
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/e2e-tools"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "$tools/jq" https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  $tools/jq" | sha256sum -c -
+          chmod +x "$tools/jq"
+          env -i PATH="$tools:$PATH" jq --version
+
+      - name: Browser image and preflight self-tests (offline doubles only)
+        run: python3 .github/scripts/test_ci_playwright_image.py
+
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
 
@@ -817,9 +918,16 @@ jobs:
         working-directory: e2e
         run: npm ci
 
-      - name: Install Playwright chromium (browser-level self-tests)
+      - name: Verify preinstalled Playwright chromium (browser-level self-tests)
         working-directory: e2e
-        run: npx playwright install --with-deps chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
 
       - name: Typecheck
         working-directory: e2e
@@ -963,7 +1071,9 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Slow Ubuntu dependency downloads can consume 17 minutes; leave room
+    # for the full browser suite (normally about five minutes) after setup.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/web
@@ -1043,7 +1153,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

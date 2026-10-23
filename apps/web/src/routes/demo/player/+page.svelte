@@ -5,9 +5,17 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import {
+		applySoundPreference,
+		loadSoundPreference,
+		saveSoundPreference,
+		type SoundPreference
+	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
+	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
 	import {
 		applyGainToNode,
 		loadLevelingEnabled,
@@ -16,12 +24,17 @@
 		type LevelingTags
 	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
-	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
+	import {
+		applyMediaSession,
+		clearMediaSession,
+		setMediaSessionPosition,
+		type MediaSessionSeekDetails
+	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
-	import { parseTimestampParam } from '#lib/player/shareTimestamp.js';
+	import { buildShareQuery, parseTimestampParam } from '#lib/player/shareTimestamp.js';
 	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
 	import {
 		actionForKey,
@@ -42,6 +55,7 @@
 		restoreQueue,
 		selectTrack,
 		serializeQueue,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
@@ -62,6 +76,9 @@
 
 	type TransportState = 'selected' | 'loading' | 'playing' | 'paused' | 'error' | 'ended' | 'empty';
 	let status = $state<TransportState>('selected');
+	// Buffering describes audibility, not a new transport intent.
+	let buffering = $state(false);
+	const visibleStatus = $derived(status === 'playing' && buffering ? 'buffering' : status);
 	let seekReady = $state(false);
 	let sourceRevision = $state(0);
 	let completedSeeks = $state(0);
@@ -71,7 +88,7 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
-	let muted = $state(false);
+	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -93,6 +110,21 @@
 	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
 
+	// Copy link at current time (synthetic demo ids only): explicit button
+	// activation copies a fresh same-origin `/demo/player?track=&t=` URL
+	// built with buildShareQuery. No clipboard access happens on load,
+	// track change, seek, or timeupdate.
+	const SHARE_COPY_DONE = 'Copied link at current time.';
+	let shareCopyStatus = $state('');
+	let shareCopyFallbackUrl = $state<string | null>(null);
+	// Bumped on every activation and every track/source switch so a late
+	// clipboard settlement from a superseded action is ignored.
+	let shareCopyGeneration = 0;
+	let shareCopyAlive = true;
+	const shareCopyEnabled = $derived(
+		current !== null && DEMO_TRACKS.some((track) => track.id === (current?.id ?? ''))
+	);
+
 	const playback = createPlayback({
 		audio: () => audioEl,
 		flush: tick,
@@ -101,6 +133,9 @@
 		},
 		onPlaybackStarted: () => {
 			status = 'playing';
+		},
+		onBufferingChange: (value) => {
+			buffering = value;
 		}
 	});
 
@@ -210,6 +245,62 @@
 	function pauseCurrent(): void {
 		playback.pause();
 		if (current && status !== 'error' && status !== 'ended') status = 'paused';
+	}
+
+	/**
+	 * Explicit-activation copy: reads the live audio element's time at click
+	 * time and writes a fresh same-origin share URL (only `track` + `t`).
+	 * Refuses silently for no recognized demo track or unusable media time.
+	 * A missing/rejected clipboard shows a labeled readonly fallback URL
+	 * instead of claiming success. Never touches transport, queue, or storage.
+	 */
+	async function copyShareLink(): Promise<void> {
+		// Every activation supersedes prior results, even one that refuses
+		// below: clear stale success/fallback state up front so an invalid
+		// activation cannot leave a misleading success message or a live
+		// pending write behind.
+		const generation = (shareCopyGeneration += 1);
+		shareCopyStatus = '';
+		shareCopyFallbackUrl = null;
+		const trackId = current?.id ?? null;
+		if (trackId === null || !DEMO_TRACKS.some((track) => track.id === trackId)) return;
+		const position = audioEl?.currentTime;
+		if (typeof position !== 'number' || !Number.isFinite(position) || position < 0) return;
+		let query: string;
+		try {
+			query = buildShareQuery(trackId, position);
+		} catch {
+			return;
+		}
+		const url = `${window.location.origin}/demo/player?${query}`;
+		const revision = sourceRevision;
+		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
+		let clipboard: ClipboardWriter | undefined;
+		try {
+			const candidate = (navigator as Navigator & { clipboard?: ClipboardWriter }).clipboard;
+			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
+		} catch {
+			clipboard = undefined;
+		}
+		if (!clipboard) {
+			shareCopyStatus = '';
+			shareCopyFallbackUrl = url;
+			return;
+		}
+		try {
+			await clipboard.writeText(url);
+		} catch {
+			// Denied or failed write: same fallback, no success claim.
+			if (!shareCopyAlive || generation !== shareCopyGeneration) return;
+			if (current?.id !== trackId || sourceRevision !== revision) return;
+			shareCopyStatus = '';
+			shareCopyFallbackUrl = url;
+			return;
+		}
+		if (!shareCopyAlive || generation !== shareCopyGeneration) return;
+		if (current?.id !== trackId || sourceRevision !== revision) return;
+		shareCopyFallbackUrl = null;
+		shareCopyStatus = SHARE_COPY_DONE;
 	}
 
 	// Player comforts: sleep timer, playback speed, per-track resume.
@@ -324,8 +415,11 @@
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
+		if (restored) updateSound(sound, node, false);
+		const stopObserving = playback.observe(node);
 		return {
 			destroy() {
+				stopObserving();
 				// The action tears down on every swap and on unmount, before
 				// the source unloads: persist from this node while it holds time.
 				persistPosition(trackId, node);
@@ -340,6 +434,56 @@
 		return event.currentTarget === audioEl &&
 			endedForCurrent(event.currentTarget as HTMLAudioElement, current?.streamUrl);
 	}
+
+	// Current-track time display: a page-session elapsed/remaining choice plus
+	// coordinates read only from the current matching audio element. No
+	// persistence, no transport calls, no live region for per-second updates.
+	let timeMode = $state<'elapsed' | 'remaining'>('elapsed');
+	let trackTime = $state(0);
+	let trackDuration = $state(NaN);
+
+	// Time events are honoured only from the mounted element whose current
+	// resource is still the queue's track. A connected element reporting a
+	// different currentSrc (or a detached one) cannot supply coordinates.
+	function timeEventForCurrent(element: HTMLAudioElement): boolean {
+		if (element !== audioEl || !element.isConnected) return false;
+		const expected = current?.streamUrl;
+		if (!expected) return false;
+		try {
+			return element.currentSrc === new URL(expected, document.baseURI).href;
+		} catch {
+			return false;
+		}
+	}
+
+	function handleTrackTime(event: Event): void {
+		// Bound directly to the audio element, currentTarget is always that
+		// element during dispatch; the identity check below fences the rest.
+		const target = event.currentTarget as HTMLAudioElement;
+		if (!timeEventForCurrent(target)) return;
+		trackTime = target.currentTime;
+		trackDuration = target.duration;
+	}
+
+	// Any source replacement (track change, retry revision, queue clear or
+	// re-add) resets the coordinates; the mode choice survives within the page.
+	$effect(() => {
+		current?.streamUrl;
+		sourceRevision;
+		trackTime = 0;
+		trackDuration = NaN;
+	});
+
+	const trackTimeSummary = $derived.by(() => {
+		if (!current) return 'No track selected';
+		const derived = deriveTrackTime(trackTime, trackDuration);
+		// Both modes share one total fragment: a known duration reads
+		// "of <total>", an unknown one names the missing coordinate.
+		const total = derived.duration === null ? '— Duration unavailable' : `of ${derived.duration}`;
+		if (timeMode !== 'remaining') return `Elapsed ${derived.elapsed} ${total}`;
+		if (derived.remaining === null) return `Remaining unavailable ${total}`;
+		return `Remaining ${derived.remaining} ${total}`;
+	});
 
 	function handlePlay(event: Event): void {
 		// A queued play event can arrive after a newer pause. The element's
@@ -517,21 +661,60 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
-	// Mute lives in player state, not on the element: the keyed <audio>
-	// is recreated on every track change, and native controls can mute
-	// behind the shortcut's back. The effect re-applies state to each
-	// new element; volumechange absorbs native-side changes.
-	$effect(() => {
-		if (audioEl) audioEl.muted = muted;
-	});
+	// Mount and keyed replacements apply before playback's tick resolves.
+	// Native events use the same equality-guarded path: no setter feedback.
+	function updateSound(preference: SoundPreference, element = audioEl, persist = true): void {
+		if (!element) return;
+		const actual = applySoundPreference(element, preference);
+		actual.restricted ||= sound.restricted ?? false;
+		if (persist) {
+			if (sound.volume !== actual.volume || sound.muted !== actual.muted) {
+				saveSoundPreference(safeStorage(), actual);
+			}
+		}
+		sound = actual;
+	}
 
-	function handleVolumeChange(event: Event): void {
-		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	// Visible jump controls share the keyboard relative-seek path above:
+	// the current element is read at activation and SEEK_SECONDS stays the
+	// single step source. Unusable media (no current track, non-finite or
+	// negative time, non-finite duration) refuses quietly instead of
+	// throwing through the UI or reporting a seek that never happened.
+	function seekButton(deltaSeconds: number): void {
+		const el = audioEl;
+		if (!el || !current) return;
+		let position = Number.NaN;
+		let bound = Number.NaN;
+		try {
+			position = el.currentTime;
+			bound = el.duration;
+		} catch {
+			// An unreadable element is unusable media: refuse below.
+		}
+		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return;
+		try {
+			seekShortcut(deltaSeconds);
+		} catch {
+			// A non-seekable element refuses the assignment; keep the
+			// previous position instead of throwing through the UI.
+		}
+	}
+
+
+	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
+		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
+	}
+
+	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
+		if (!audioEl || !restored) return;
+		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
+		// A rejected setter leaves state unchanged: undo the range's own edit.
+		event.currentTarget.value = String(sound.volume * 100);
 	}
 
 	function toggleMuteShortcut(): void {
-		muted = !muted;
-		if (audioEl) audioEl.muted = muted;
+		if (!audioEl || !restored) return;
+		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -595,15 +778,82 @@
 		seekCurrentResume();
 	}
 
-	// MediaSession follows the current track; queue order + current track
-	// persist for the tab session (sessionStorage, restored on mount).
+	// Scope OS callbacks and timeline events to this exact source/element.
+	// Cleanup fences retained callbacks as well as removing event listeners.
 	$effect(() => {
-		applyMediaSession(current, {
-			onNext: userNext,
-			onPrevious: userPrevious,
-			onPlay: () => playCurrent(),
-			onPause: pauseCurrent
+		const track = current;
+		const el = audioEl;
+		const revision = sourceRevision;
+		let active = true;
+		const isCurrent = () =>
+			active && current === track && audioEl === el && sourceRevision === revision &&
+			!!el && endedForCurrent(el, track?.streamUrl);
+		const publishPosition = () => {
+			if (!isCurrent() || !el) return;
+			setMediaSessionPosition({
+				duration: el.duration,
+				position: el.currentTime,
+				playbackRate: el.playbackRate
+			});
+		};
+		const seek = (details: MediaSessionSeekDetails, direction: -1 | 0 | 1) => {
+			if (!isCurrent() || !el) return;
+			const duration = el.duration;
+			if (!Number.isFinite(duration) || duration <= 0) return;
+			let target: number;
+			if (direction === 0) {
+				const time = details?.seekTime;
+				if (typeof time !== 'number' || !Number.isFinite(time) || time < 0) return;
+				target = time;
+			} else {
+				const offset = details?.seekOffset === undefined ? 10 : details.seekOffset;
+				if (
+					typeof offset !== 'number' || !Number.isFinite(offset) || offset <= 0 ||
+					!Number.isFinite(el.currentTime)
+				) return;
+				target = el.currentTime + direction * offset;
+			}
+			try {
+				el.currentTime = Math.min(duration, Math.max(0, target));
+				// Seeking to the end must not synthesize natural completion and
+				// advance the queue/start radio, including while play() is pending.
+				if (target >= duration) pauseCurrent();
+			} catch {
+				// Some resources reject a seek despite having loaded metadata.
+				return;
+			}
+			publishPosition();
+		};
+		applyMediaSession(track, {
+			onNext: () => {
+				if (isCurrent()) userNext();
+			},
+			onPrevious: () => {
+				if (isCurrent()) userPrevious();
+			},
+			onPlay: () => {
+				if (isCurrent()) playCurrent();
+			},
+			onPause: () => {
+				if (isCurrent()) pauseCurrent();
+			},
+			onSeekTo: (details) => seek(details, 0),
+			onSeekForward: (details) => seek(details, 1),
+			onSeekBackward: (details) => seek(details, -1)
 		});
+		const events = ['loadedmetadata', 'durationchange', 'timeupdate', 'seeked', 'ratechange'];
+		for (const event of events) el?.addEventListener(event, publishPosition);
+		// Clear first on a track change; metadata may already be available if
+		// the source came from cache, otherwise its events repopulate state.
+		publishPosition();
+		return () => {
+			active = false;
+			for (const event of events) el?.removeEventListener(event, publishPosition);
+		};
+	});
+
+	// Queue order + current track persist for the tab session.
+	$effect(() => {
 		if (restored) {
 			try {
 				sessionStorage.setItem(QUEUE_STORAGE_KEY, serializeQueue(queue));
@@ -617,6 +867,16 @@
 	// (the keyed `<audio>` is recreated per source, so a track change rewires).
 	$effect(() => {
 		applyLeveling();
+	});
+
+	// A new track or source invalidates any pending copy and clears its
+	// outcome, so stale confirmations never linger past a switch.
+	$effect(() => {
+		const sourceIdentity = `${current?.id ?? ''}:${current?.streamUrl ?? ''}:${sourceRevision}`;
+		void sourceIdentity;
+		shareCopyGeneration += 1;
+		shareCopyStatus = '';
+		shareCopyFallbackUrl = null;
 	});
 
 	/**
@@ -651,6 +911,8 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
+		sound = loadSoundPreference(safeStorage());
+		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		radioContinueEnabled = loadRadioContinueEnabled();
@@ -731,6 +993,9 @@
 		window.addEventListener('pagehide', persistOnPageHide);
 		// OS media controls are global: release them when the page goes away.
 		return () => {
+			// A copy settling after teardown must not resurrect state.
+			shareCopyAlive = false;
+			shareCopyGeneration += 1;
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
@@ -751,7 +1016,7 @@
 
 <main class="nt-wrap">
 	<h1>Player resilience demo</h1>
-	<p data-testid="player-status" aria-live="polite">Status: {status === 'selected' && seekReady ? 'ready' : status}</p>
+	<p data-testid="player-status" role="status" aria-live="polite" aria-atomic="true">Status: {visibleStatus === 'selected' && seekReady ? 'ready' : visibleStatus}</p>
 
 	<!-- Artwork reuse: the shared Artwork component's placeholder fallback
 	     renders for the current track when its art is missing (track 1). -->
@@ -777,7 +1042,7 @@
 
 	<p data-testid="now-playing">
 		{#if current}
-			{status === 'playing' ? 'Now playing' : 'Selected'}: {current.title} — {current.artist}
+			{visibleStatus === 'playing' ? 'Now playing' : 'Selected'}: {current.title} — {current.artist}
 		{:else}
 			Queue is empty
 		{/if}
@@ -827,8 +1092,38 @@
 			onerror={handleError}
 			onended={handleEnded}
 			onvolumechange={handleVolumeChange}
+			ontimeupdate={handleTrackTime}
+			onloadedmetadata={handleTrackTime}
+			ondurationchange={handleTrackTime}
 		></audio>
 	{/key}
+
+	<div class="nt-sound">
+		<label>
+			Volume {Math.round(sound.volume * 100)}%
+			<input
+				type="range"
+				min="0"
+				max="100"
+				value={sound.volume * 100}
+				disabled={!restored || sound.restricted}
+				oninput={handleVolumeInput}
+			/>
+		</label>
+		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
+			Mute
+		</button>
+	</div>
+	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
+
+	<div>
+		<label for="track-time-mode">Time display</label>
+		<select id="track-time-mode" data-testid="track-time-mode" bind:value={timeMode}>
+			<option value="elapsed">Elapsed</option>
+			<option value="remaining">Remaining</option>
+		</select>
+	</div>
+	<p data-testid="track-time-summary">{trackTimeSummary}</p>
 
 	<div>
 		<button type="button" data-testid="player-prev" onclick={userPrevious} disabled={!current}>
@@ -837,10 +1132,60 @@
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<!-- Own row so the pair stays side by side at 360px instead of
+		     wrapping around Previous/Next into overlapping lines. -->
+		<div>
+			<button
+				type="button"
+				data-testid="player-seek-back"
+				onclick={() => seekButton(-SEEK_SECONDS)}
+				disabled={!current}
+			>
+				Back 10 seconds
+			</button>
+			<button
+				type="button"
+				data-testid="player-seek-forward"
+				onclick={() => seekButton(SEEK_SECONDS)}
+				disabled={!current}
+			>
+				Forward 10 seconds
+			</button>
+		</div>
 		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
 		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
 			Keyboard shortcuts
 		</button>
+	</div>
+
+	<div>
+		<button
+			type="button"
+			data-testid="share-copy"
+			disabled={!shareCopyEnabled}
+			onclick={(event) => {
+				event.currentTarget.focus();
+				void copyShareLink();
+			}}
+		>
+			Copy link at current time
+		</button>
+		<p data-testid="share-copy-status" aria-live="polite">{shareCopyStatus}</p>
+		{#if shareCopyFallbackUrl !== null}
+			<div>
+				<label for="share-copy-fallback-field">Share link</label>
+				<input
+					id="share-copy-fallback-field"
+					type="text"
+					readonly
+					data-testid="share-copy-fallback"
+					value={shareCopyFallbackUrl}
+				/>
+				<p data-testid="share-copy-instructions">
+					Copy the link manually: focus the field and press Ctrl+C (or Cmd+C on Mac).
+				</p>
+			</div>
+		{/if}
 	</div>
 
 	{#if shortcutsOpen}
@@ -867,6 +1212,13 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<ShuffleUpcoming
+			state={queue}
+			radioActive={radio !== null}
+			onshuffle={() => {
+				if (!radio) queue = shuffleUpcoming(queue);
+			}}
+		/>
 		<ol>
 			{#each queue.tracks as track, i (track.id)}
 				<li data-testid="queue-item" data-track-id={track.id}>
@@ -876,7 +1228,7 @@
 						aria-current={i === queue.currentIndex ? 'true' : undefined}
 						onclick={() => selectAt(i)}
 					>
-						{track.title} — {track.artist}{i === queue.currentIndex ? (status === 'playing' ? ' (playing)' : ' (selected)') : ''}
+						{track.title} — {track.artist}{i === queue.currentIndex ? (visibleStatus === 'playing' ? ' (playing)' : ' (selected)') : ''}
 					</button>
 					<button
 						type="button"
@@ -996,3 +1348,12 @@
 	</button>
 	<p data-testid="seek-stats">completed {completedSeeks}, aborted {abortedSeeks}, last {lastBytes} bytes</p>
 </main>
+
+<style>
+	/* The mode choice keeps a visible focus ring under programmatic focus
+	   too, where the global :focus-visible rule does not apply. */
+	#track-time-mode:focus {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+</style>

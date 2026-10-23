@@ -68,10 +68,20 @@ binding = "REPAIR_CONTAINER"
 type = "service"
 
 [[worker.binding]]
+binding = "TRANSCODE_CONTAINER"
+type = "service"
+
+[[worker.binding]]
 binding = "INGEST_SCRATCH"
 type = "r2"
 staging = "nntunev2-ingest-scratch-staging"
 prod = "nntunev2-ingest-scratch-prod"
+
+[[worker.binding]]
+binding = "AUDIO_PUBLISH"
+type = "r2"
+staging = "nntunev2-audio-staging"
+prod = "nntunev2-audio-prod"
 
 [[worker.binding]]
 binding = "MB_API"
@@ -123,6 +133,20 @@ config = "workers/repair/wrangler.toml"
 
 [[worker.binding]]
 binding = "REPAIR_JOBS"
+type = "durable_object"
+
+[[worker.binding]]
+binding = "INGEST_SCRATCH"
+type = "r2"
+staging = "nntunev2-ingest-scratch-staging"
+prod = "nntunev2-ingest-scratch-prod"
+
+[[worker]]
+name = "transcode"
+config = "workers/transcode/wrangler.toml"
+
+[[worker.binding]]
+binding = "TRANSCODE_JOBS"
 type = "durable_object"
 
 [[worker.binding]]

@@ -47,6 +47,8 @@ fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
         failure_code: None,
         failure_reason: None,
         provider_id: msg.provider_id.clone(),
+        transcode_inputs: Vec::new(),
+        transcode_next: 0,
     }
 }
 
