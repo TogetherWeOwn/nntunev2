@@ -2,6 +2,7 @@
 import adapter from '@sveltejs/adapter-cloudflare';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, loadEnv } from 'vite';
+import { minify } from 'terser';
 
 import { cspSources } from './src/lib/security/headers.js';
 
@@ -49,6 +50,30 @@ export default defineConfig(({ command, mode }) => {
 			__BUILD_SHA__: JSON.stringify(buildSha)
 		},
 		plugins: [
+			// Compress before final chunk hashes are computed. The complementary
+			// Terser/Oxc passes save raw bytes without changing the bundle budget,
+			// removing features, or enabling unsafe/property-mangling transforms.
+			{
+				name: 'compress-production-chunks',
+				apply: 'build',
+				enforce: 'post',
+				renderChunk: {
+					order: 'post',
+					async handler(code, _chunk, options) {
+						if (options.format !== 'es') return null;
+						const result = await minify(code, {
+							module: true,
+							ecma: 2020,
+							compress: { passes: 3 },
+							sourceMap: { asObject: true }
+						});
+						if (result.code === undefined) {
+							throw new Error('Production compression returned no code');
+						}
+						return { code: result.code, map: result.map ? JSON.stringify(result.map) : null };
+					}
+				}
+			},
 			sveltekit({
 				compilerOptions: {
 					// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
