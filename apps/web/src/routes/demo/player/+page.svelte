@@ -21,7 +21,7 @@
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
-	import { parseTimestampParam } from '#lib/player/shareTimestamp.js';
+	import { buildShareQuery, parseTimestampParam } from '#lib/player/shareTimestamp.js';
 	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
 	import {
 		actionForKey,
@@ -93,6 +93,21 @@
 
 	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
+
+	// Copy link at current time (synthetic demo ids only): explicit button
+	// activation copies a fresh same-origin `/demo/player?track=&t=` URL
+	// built with buildShareQuery. No clipboard access happens on load,
+	// track change, seek, or timeupdate.
+	const SHARE_COPY_DONE = 'Copied link at current time.';
+	let shareCopyStatus = $state('');
+	let shareCopyFallbackUrl = $state<string | null>(null);
+	// Bumped on every activation and every track/source switch so a late
+	// clipboard settlement from a superseded action is ignored.
+	let shareCopyGeneration = 0;
+	let shareCopyAlive = true;
+	const shareCopyEnabled = $derived(
+		current !== null && DEMO_TRACKS.some((track) => track.id === (current?.id ?? ''))
+	);
 
 	const playback = createPlayback({
 		audio: () => audioEl,
@@ -193,6 +208,62 @@
 	function pauseCurrent(): void {
 		playback.pause();
 		if (current && status !== 'error' && status !== 'ended') status = 'paused';
+	}
+
+	/**
+	 * Explicit-activation copy: reads the live audio element's time at click
+	 * time and writes a fresh same-origin share URL (only `track` + `t`).
+	 * Refuses silently for no recognized demo track or unusable media time.
+	 * A missing/rejected clipboard shows a labeled readonly fallback URL
+	 * instead of claiming success. Never touches transport, queue, or storage.
+	 */
+	async function copyShareLink(): Promise<void> {
+		// Every activation supersedes prior results, even one that refuses
+		// below: clear stale success/fallback state up front so an invalid
+		// activation cannot leave a misleading success message or a live
+		// pending write behind.
+		const generation = (shareCopyGeneration += 1);
+		shareCopyStatus = '';
+		shareCopyFallbackUrl = null;
+		const trackId = current?.id ?? null;
+		if (trackId === null || !DEMO_TRACKS.some((track) => track.id === trackId)) return;
+		const position = audioEl?.currentTime;
+		if (typeof position !== 'number' || !Number.isFinite(position) || position < 0) return;
+		let query: string;
+		try {
+			query = buildShareQuery(trackId, position);
+		} catch {
+			return;
+		}
+		const url = `${window.location.origin}/demo/player?${query}`;
+		const revision = sourceRevision;
+		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
+		let clipboard: ClipboardWriter | undefined;
+		try {
+			const candidate = (navigator as Navigator & { clipboard?: ClipboardWriter }).clipboard;
+			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
+		} catch {
+			clipboard = undefined;
+		}
+		if (!clipboard) {
+			shareCopyStatus = '';
+			shareCopyFallbackUrl = url;
+			return;
+		}
+		try {
+			await clipboard.writeText(url);
+		} catch {
+			// Denied or failed write: same fallback, no success claim.
+			if (!shareCopyAlive || generation !== shareCopyGeneration) return;
+			if (current?.id !== trackId || sourceRevision !== revision) return;
+			shareCopyStatus = '';
+			shareCopyFallbackUrl = url;
+			return;
+		}
+		if (!shareCopyAlive || generation !== shareCopyGeneration) return;
+		if (current?.id !== trackId || sourceRevision !== revision) return;
+		shareCopyFallbackUrl = null;
+		shareCopyStatus = SHARE_COPY_DONE;
 	}
 
 	// Player comforts: sleep timer, playback speed, per-track resume.
@@ -604,6 +675,16 @@
 		applyLeveling();
 	});
 
+	// A new track or source invalidates any pending copy and clears its
+	// outcome, so stale confirmations never linger past a switch.
+	$effect(() => {
+		const sourceIdentity = `${current?.id ?? ''}:${current?.streamUrl ?? ''}:${sourceRevision}`;
+		void sourceIdentity;
+		shareCopyGeneration += 1;
+		shareCopyStatus = '';
+		shareCopyFallbackUrl = null;
+	});
+
 	/**
 	 * Run by the smoke test: fire 10 rapid Range seeks through one
 	 * controller (each aborts its predecessor), then one proving seek.
@@ -715,6 +796,9 @@
 		window.addEventListener('pagehide', persistOnPageHide);
 		// OS media controls are global: release them when the page goes away.
 		return () => {
+			// A copy settling after teardown must not resurrect state.
+			shareCopyAlive = false;
+			shareCopyGeneration += 1;
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
@@ -811,6 +895,36 @@
 		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
 			Keyboard shortcuts
 		</button>
+	</div>
+
+	<div>
+		<button
+			type="button"
+			data-testid="share-copy"
+			disabled={!shareCopyEnabled}
+			onclick={(event) => {
+				event.currentTarget.focus();
+				void copyShareLink();
+			}}
+		>
+			Copy link at current time
+		</button>
+		<p data-testid="share-copy-status" aria-live="polite">{shareCopyStatus}</p>
+		{#if shareCopyFallbackUrl !== null}
+			<div>
+				<label for="share-copy-fallback-field">Share link</label>
+				<input
+					id="share-copy-fallback-field"
+					type="text"
+					readonly
+					data-testid="share-copy-fallback"
+					value={shareCopyFallbackUrl}
+				/>
+				<p data-testid="share-copy-instructions">
+					Copy the link manually: focus the field and press Ctrl+C (or Cmd+C on Mac).
+				</p>
+			</div>
+		{/if}
 	</div>
 
 	{#if shortcutsOpen}
