@@ -51,9 +51,9 @@
 </button>
 
 <ol aria-label="Playback queue">
-	<!-- Keyed by queue position. Uniqueness comes from the store: addTrack
-		dedupes and restoreQueue rejects duplicates. -->
-	{#each state.tracks as track, i (i)}
+	<!-- Stable track identity preserves keyboard focus through reorders. The
+		store guarantees uniqueness: addTrack dedupes and restoreQueue rejects duplicates. -->
+	{#each state.tracks as track, i (track.id)}
 		<li
 			data-testid="queue-item"
 			data-track-id={track.id}
