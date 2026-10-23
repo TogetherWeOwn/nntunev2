@@ -73,8 +73,9 @@ test('404 error page keeps its current navigation and offers no Reload action', 
 	await page.goto(UNKNOWN_PATHS[0]!);
 
 	await expect(page.getByTestId('error-page')).toBeVisible();
-	await expect(page.locator('a[href="/library"]')).toBeVisible();
-	await expect(page.locator('a[href="/login"]')).toBeVisible();
+	const errorPage = page.getByTestId('error-page');
+	await expect(errorPage.locator('a[href="/library"]')).toBeVisible();
+	await expect(errorPage.locator('a[href="/login"]')).toBeVisible();
 	await expect(page.getByRole('button', { name: /reload|try again|retry/i })).toHaveCount(0);
 });
 
