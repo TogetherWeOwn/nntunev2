@@ -18,6 +18,13 @@
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import {
+		actionForKey,
+		isModalOpen,
+		isTypingTarget,
+		SEEK_SECONDS,
+		SHORTCUT_ROWS
+	} from '#lib/player/shortcuts.js';
+	import {
 		addTrack,
 		clearQueue,
 		createQueue,
@@ -57,6 +64,10 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
+	let muted = $state(false);
+	let shortcutsOpen = $state(false);
+	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
+	let shortcutsOpener: HTMLElement | null = null;
 
 	const current = $derived(currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
@@ -249,6 +260,88 @@
 		void playback.unload();
 	}
 
+	async function openShortcuts(): Promise<void> {
+		if (shortcutsOpen) return;
+		shortcutsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		shortcutsOpen = true;
+		await tick();
+		// Native modality moves focus to Close and makes the background inert.
+		if (shortcutsOpen) shortcutsDialogEl?.showModal();
+	}
+
+	function closeShortcuts(): void {
+		shortcutsDialogEl?.close();
+		shortcutsOpen = false;
+		shortcutsOpener?.focus();
+	}
+
+	function togglePlayShortcut(): void {
+		if (status === 'playing' || status === 'loading') pauseCurrent();
+		else playCurrent();
+	}
+
+	function seekShortcut(deltaSeconds: number): void {
+		const el = audioEl;
+		if (!el) return;
+		const max = Number.isFinite(el.duration) ? el.duration : Number.POSITIVE_INFINITY;
+		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
+	}
+
+	// Mute lives in player state, not on the element: the keyed <audio>
+	// is recreated on every track change, and native controls can mute
+	// behind the shortcut's back. The effect re-applies state to each
+	// new element; volumechange absorbs native-side changes.
+	$effect(() => {
+		if (audioEl) audioEl.muted = muted;
+	});
+
+	function handleVolumeChange(event: Event): void {
+		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	}
+
+	function toggleMuteShortcut(): void {
+		muted = !muted;
+		if (audioEl) audioEl.muted = muted;
+	}
+
+	// Global transport keymap. Escape closes our dialog first so a modal
+	// guard can never wedge it; every other binding yields to typing
+	// surfaces, open modals and modified chords. No preventDefault: the
+	// map holds only keys with no page-level default to suppress.
+	function handleGlobalKeydown(event: KeyboardEvent): void {
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const action = actionForKey(event.key);
+		if (!action) return;
+		if (action === 'close-shortcuts') {
+			if (shortcutsOpen) closeShortcuts();
+			return;
+		}
+		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		switch (action) {
+			case 'toggle-play':
+				togglePlayShortcut();
+				break;
+			case 'next-track':
+				goNext();
+				break;
+			case 'previous-track':
+				goPrevious();
+				break;
+			case 'seek-back':
+				seekShortcut(-SEEK_SECONDS);
+				break;
+			case 'seek-forward':
+				seekShortcut(SEEK_SECONDS);
+				break;
+			case 'toggle-mute':
+				toggleMuteShortcut();
+				break;
+			case 'open-shortcuts':
+				openShortcuts();
+				break;
+		}
+	}
+
 	// `ended` is only honoured for the source the queue still points at; a
 	// late event from a superseded track must not skip the new one.
 	function handleEnded(event: Event): void {
@@ -346,6 +439,8 @@
 	});
 </script>
 
+<svelte:window onkeydown={handleGlobalKeydown} />
+
 <main class="nt-wrap">
 	<h1>Player resilience demo</h1>
 	<p data-testid="player-status" aria-live="polite">Status: {status === 'selected' && seekReady ? 'ready' : status}</p>
@@ -402,6 +497,7 @@
 			onpause={handlePause}
 			onerror={handleError}
 			onended={handleEnded}
+			onvolumechange={handleVolumeChange}
 		></audio>
 	{/key}
 
@@ -413,7 +509,32 @@
 			Next
 		</button>
 		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
+		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
+			Keyboard shortcuts
+		</button>
 	</div>
+
+	{#if shortcutsOpen}
+		<dialog
+			bind:this={shortcutsDialogEl}
+			data-testid="shortcuts-dialog"
+			aria-label="Keyboard shortcuts"
+			oncancel={(event) => {
+				event.preventDefault();
+				closeShortcuts();
+			}}
+		>
+			<h2>Keyboard shortcuts</h2>
+			<ul>
+				{#each SHORTCUT_ROWS as row (row.key)}
+					<li><kbd>{row.key}</kbd> {row.label}</li>
+				{/each}
+			</ul>
+			<button type="button" data-testid="shortcuts-close" onclick={closeShortcuts}>
+				Close
+			</button>
+		</dialog>
+	{/if}
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
