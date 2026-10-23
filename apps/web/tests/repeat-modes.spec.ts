@@ -239,6 +239,34 @@ for (const value of ['one', 'queue'] as const) {
 		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
 	});
 
+	test(`REP-B13 ${value} never restarts after error then current-resource ended`, async ({ page }) => {
+		await page.getByTestId('queue-move-up-third-light').click();
+		await page.getByTestId('queue-move-up-third-light').click();
+		expect(await order(page)).toEqual(arranged);
+		await mode(page, value);
+		await expect(page.getByTestId('player-repeat')).toHaveValue(value);
+		await start(page, 'demo-track');
+		const audio = page.getByTestId('demo-audio');
+		const src = await audio.getAttribute('src');
+		expect(await calls(page)).toBeGreaterThan(0);
+		await audio.evaluate((el) => el.dispatchEvent(new Event('error')));
+		await expect(page.getByTestId('player-status')).toHaveText('Status: error');
+		const count = await calls(page);
+		await audio.evaluate((el) => {
+			Object.defineProperty(el, 'paused', { value: true, configurable: true });
+			Object.defineProperty(el, 'ended', { value: true, configurable: true });
+			el.dispatchEvent(new Event('ended'));
+		});
+		// Let the real ended handler, promises and Svelte effects settle.
+		await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+		expect.soft(await calls(page), 'A failed track must not trigger another play request').toBe(count);
+		await expect.soft(page.getByTestId('player-status')).toHaveText('Status: error');
+		await expect.soft(page.getByTestId('now-playing')).toContainText(titles.a);
+		await expect.soft(audio).toHaveAttribute('src', src!);
+		expect.soft(await order(page)).toEqual(arranged);
+		await expect.soft(page.getByTestId('radio-badge')).toHaveCount(0);
+	});
+
 	for (const timer of ['end-of-track', 'stop-after'] as const) {
 		test(`REP-B08 ${value}: ${timer} sleep completion wins over repeat`, async ({ page }) => {
 			await mode(page, value);
