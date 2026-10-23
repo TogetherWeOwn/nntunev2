@@ -109,6 +109,12 @@
 </ol>
 
 <style>
+	.queue-row {
+		/* Clear the 2px outline + 2px offset when nearest-scroll rounds
+		 * fractional line heights at the viewport edge. */
+		scroll-margin-block: 4px;
+	}
+
 	/* Programmatic focus target for explicit reveal: the ring must hold
 	 * even where the app stylesheet is absent (mounted test parent). */
 	.queue-row:focus-visible {
