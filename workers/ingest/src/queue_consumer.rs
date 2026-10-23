@@ -1722,7 +1722,12 @@ async fn run_transcode_step_with<R: TranscodeRuntime>(
     // that ever disagrees fails closed as a pipeline bug, never as
     // another job's bytes).
     let input_key = input.key.rsplit('/').next().unwrap_or("");
-    let staging_id = match crate::transcode::derive_transcode_staging(&input.sha256, input_key) {
+    let staging_id = match crate::transcode::derive_transcode_staging(
+        &input.sha256,
+        input_key,
+        &msg.job_id,
+        &input.scratch_prefix,
+    ) {
         Ok(staging_id) => staging_id,
         Err(reason) => return Err(JobError::permanent(ERR_TRANSCODE_FAILED, reason)),
     };

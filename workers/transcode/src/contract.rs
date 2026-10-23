@@ -159,9 +159,13 @@ pub enum Plan {
 /// Idempotency decision from the stored `result.json`, if any. Only a
 /// result stamped with the *current* request's `staging_id`
 /// short-circuits the paid run; an unstamped (legacy) or mismatched
-/// result is another input's verdict and reruns. A corrupt stored
-/// result is a server fault: silently re-running would spend a second
-/// paid encode on a staging that may have completed.
+/// result is another input's verdict and reruns. Ingest derives this
+/// token from the profile, job, verify-round scratch prefix, input key
+/// and source hash, not the whole manifest: each encode consumes only
+/// that verified file, so unrelated manifest entries cannot change its
+/// artifact. A corrupt stored result is a server fault: silently
+/// re-running would spend a second paid encode on a staging that may
+/// have completed.
 pub fn plan(
     _req: &TranscodeRequest,
     existing_result: Option<&[u8]>,

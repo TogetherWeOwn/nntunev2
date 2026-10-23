@@ -20,9 +20,11 @@ The no-route Worker that fronts the `opus-64` transcode Container
 - **Idempotent stagings.** If `out/result.json` already exists for the
   job and carries the current request's `staging_id`, the stored
   verdict is replied without a second paid Container run. The
-  staging id is content-derived (ingest derives it from the input's
-  content hash), so the previous input's verdict — same job, other
-  staging — never replays for this input. On mismatch the
+  staging id binds the profile, job, verify-round scratch prefix,
+  input key and verified content hash. It identifies a single-file
+  encode generation, not the whole manifest: unrelated files do not
+  affect that encode. Another job, round, key or source cannot reuse
+  its verdict. On mismatch the
   Container's staging state is cleaned, the stale `out/result.json`
   is deleted, and only then does the input stage and rerun, so a
   retry inside the new generation replays the Container's own
@@ -33,8 +35,8 @@ The no-route Worker that fronts the `opus-64` transcode Container
   only then is `out/result.json` written. Ingest receives a small
   status reply (`{status, artifact_sha256, byte_size}`); the bytes
   stay in scratch for ingest to fetch.
-  (Sources: `src/contract.rs:165-197` (`plan`),
-  `:283-290` (`ingest_reply_body`);
+  (Sources: `src/contract.rs:169-201` (`plan`),
+  `:287-294` (`ingest_reply_body`);
   `src/runtime.rs:243-250` (marker read + plan), `:251-276`
   (stale-generation cleanup), `:278-308` (stage, `/transcode`
   call, validate, verified fetch, marker-last write).)
@@ -43,8 +45,8 @@ The no-route Worker that fronts the `opus-64` transcode Container
   must match the claimed size and SHA-256 before the R2 put — a
   corrupt or substituted artifact fails here, never as a published
   cache row. `Untranscodable` skips the fetch entirely.
-  (Sources: `src/contract.rs:205-220`
-  (`validate_transcoded_result`), `:231-245` (`verify_artifact`);
+  (Sources: `src/contract.rs:209-224`
+  (`validate_transcoded_result`), `:235-249` (`verify_artifact`);
   `src/runtime.rs:288-295`.)
 - **Container isolation.** The Container is started with internet
   access disabled and holds no vault, NNTP or R2 credentials; it sees
@@ -52,7 +54,7 @@ The no-route Worker that fronts the `opus-64` transcode Container
   or credentials cross). Errors are stable machine-readable codes
   and logs carry job ids, statuses and byte counts, never file names.
   (Sources: `src/runtime.rs:334-356`, `:561-573`;
-  `src/contract.rs:319-326`;
+  `src/contract.rs:323-330`;
   `containers/transcode/src/lib.rs:3-9`.)
 
 Scratch layout and validation rules are the shared contract in

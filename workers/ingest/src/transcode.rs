@@ -136,10 +136,10 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 768;
 /// object name (`{index:04}-{sha256(file_name)}`) under
 /// `{scratch_prefix}in/`; `source_sha256` is the verified bytes'
 /// hash (the content identity the front memoises on);
-/// `staging_id` is the manifest digest binding this exact input set,
-/// so a redrive that re-stages different bytes under the same names
-/// cannot replay the previous generation's artifact (the repair
-/// `staging_id` lesson).
+/// `staging_id` binds the profile, job, verify-round scratch prefix,
+/// input key and verified content hash (see [`derive_transcode_staging`]).
+/// It identifies one file's encode generation, not the full manifest;
+/// another job, round, key or source cannot replay its artifact.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranscodeRequest {
     pub job_id: String,
@@ -633,20 +633,31 @@ pub fn record_transcode_inputs(
     Ok(())
 }
 
-/// Content-derived staging id for one encode request: sha256 over the
-/// profile tag plus the verified content hash and staged input key.
-/// Identical bytes keep the id (redeliveries replay the memoised
-/// artifact instead of re-paying the encode); any byte change — or a
-/// re-staging under a new key — mints a different one, so a previous
-/// generation's artifact can never replay for new bytes.
+/// Generation-bound staging id for one encode request: sha256 over
+/// the profile tag, job, verify-round scratch prefix, verified content
+/// hash and staged input key. Redeliveries of the same recorded input
+/// replay the memoised artifact; another job or round never does, even
+/// for identical bytes. All fields are validated before hashing, and
+/// their alphabets exclude the `:` separator.
 pub fn derive_transcode_staging(
     source_sha256_hex: &str,
     input_key: &str,
+    job_id: &str,
+    scratch_prefix: &str,
 ) -> Result<String, &'static str> {
+    if !validate_job_id(job_id) {
+        return Err("job id outside the pipeline alphabet");
+    }
+    if !validate_transcode_prefix(scratch_prefix, job_id) {
+        return Err("scratch prefix outside the job round dir");
+    }
+    if !validate_transcode_input_key(input_key) {
+        return Err("input key is not a staged object key");
+    }
     let sha = canonical_sha256_hex(source_sha256_hex)
         .map_err(|_| "source sha256 must be 64 hex chars")?;
     Ok(sha256_hex(
-        format!("opus-64:v1:{sha}:{input_key}").as_bytes(),
+        format!("opus-64:v2:{job_id}:{scratch_prefix}:{sha}:{input_key}").as_bytes(),
     ))
 }
 

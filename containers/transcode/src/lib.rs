@@ -545,6 +545,9 @@ impl<'a> BodyReader<'a> {
 
 impl Read for BodyReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         match self.mode {
             BodyMode::Fixed => {
                 if self.remaining == 0 {
@@ -552,6 +555,9 @@ impl Read for BodyReader<'_> {
                 }
                 let take = (out.len() as u64).min(self.remaining) as usize;
                 let n = self.stream.read(&mut out[..take])?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "fixed body"));
+                }
                 self.remaining -= n as u64;
                 Ok(n)
             }
@@ -591,6 +597,9 @@ impl Read for BodyReader<'_> {
                 }
                 let take = (out.len() as u64).min(self.chunk_left) as usize;
                 let n = self.stream.read(&mut out[..take])?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk data"));
+                }
                 self.chunk_left -= n as u64;
                 if self.chunk_left == 0 {
                     let mut crlf = [0u8; 2];

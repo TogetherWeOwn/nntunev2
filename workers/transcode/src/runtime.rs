@@ -668,7 +668,7 @@ async fn read_object_capped(
         return Ok(None);
     };
     if object.size() > cap as u64 {
-        return Err(ApiFault::new(413, "payload_too_large"));
+        return Err(ApiFault::new(500, "transcode_unavailable"));
     }
     let body = object
         .body()
