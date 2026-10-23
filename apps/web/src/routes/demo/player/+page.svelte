@@ -4,7 +4,12 @@
 </svelte:head>
 
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
+	import {
+		applySoundPreference,
+		loadSoundPreference,
+		saveSoundPreference
+	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
@@ -71,6 +76,9 @@
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let muted = $state(false);
+	let volume = $state(1);
+	let volumeRestricted = $state(false);
+	let soundElement: HTMLAudioElement | undefined;
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -494,21 +502,51 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
-	// Mute lives in player state, not on the element: the keyed <audio>
-	// is recreated on every track change, and native controls can mute
-	// behind the shortcut's back. The effect re-applies state to each
-	// new element; volumechange absorbs native-side changes.
+	// Initialize only after storage restoration, and once per keyed element.
+	// Native changes flow in one direction: event -> state/storage, never back
+	// through this effect. Setup's queued events see the final actual state.
 	$effect(() => {
-		if (audioEl) audioEl.muted = muted;
+		const element = audioEl;
+		if (!restored || !element) return;
+		untrack(() => {
+			const actual = applySoundPreference(element, { volume, muted });
+			volume = actual.volume;
+			muted = actual.muted;
+			volumeRestricted = actual.volumeRestricted;
+			soundElement = element;
+		});
 	});
 
+	function absorbSound(element: HTMLAudioElement): void {
+		const changed = volume !== element.volume || muted !== element.muted;
+		volume = element.volume;
+		muted = element.muted;
+		if (changed) saveSoundPreference(safeStorage(), { volume, muted });
+	}
+
 	function handleVolumeChange(event: Event): void {
-		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+		const element = event.currentTarget;
+		if (!(element instanceof HTMLAudioElement) || element !== soundElement || !eventForCurrent(event)) return;
+		absorbSound(element);
+	}
+
+	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
+		if (!audioEl || audioEl !== soundElement) return;
+		const actual = applySoundPreference(audioEl, {
+			volume: Number(event.currentTarget.value) / 100,
+			muted: audioEl.muted
+		});
+		volumeRestricted = actual.volumeRestricted;
+		absorbSound(audioEl);
+		// A rejected setter may leave state unchanged, so also undo the native
+		// slider's own input edit rather than waiting for a reactive rerender.
+		event.currentTarget.value = String(volume * 100);
 	}
 
 	function toggleMuteShortcut(): void {
-		muted = !muted;
-		if (audioEl) audioEl.muted = muted;
+		if (!audioEl || audioEl !== soundElement) return;
+		applySoundPreference(audioEl, { volume: audioEl.volume, muted: !audioEl.muted });
+		absorbSound(audioEl);
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -628,6 +666,9 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
+		const sound = loadSoundPreference(safeStorage());
+		volume = sound.volume;
+		muted = sound.muted;
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		(
@@ -791,6 +832,29 @@
 			onvolumechange={handleVolumeChange}
 		></audio>
 	{/key}
+
+	<div class="sound-controls">
+		<label for="device-volume">Volume</label>
+		<input
+			id="device-volume"
+			type="range"
+			min="0"
+			max="100"
+			step="1"
+			value={volume * 100}
+			aria-valuetext={`${Math.round(volume * 100)}%`}
+			aria-describedby={volumeRestricted ? 'system-volume-note' : undefined}
+			disabled={!restored || volumeRestricted}
+			oninput={handleVolumeInput}
+		/>
+		<span class="volume-percent">{Math.round(volume * 100)}%</span>
+		<button type="button" aria-pressed={muted} disabled={!restored} onclick={toggleMuteShortcut}>
+			{muted ? 'Unmute' : 'Mute'}
+		</button>
+	</div>
+	{#if volumeRestricted}
+		<p id="system-volume-note" role="status">Volume is controlled by your device. Use system volume controls.</p>
+	{/if}
 
 	<div>
 		<button type="button" data-testid="player-prev" onclick={userPrevious} disabled={!current}>
@@ -958,3 +1022,23 @@
 	</button>
 	<p data-testid="seek-stats">completed {completedSeeks}, aborted {abortedSeeks}, last {lastBytes} bytes</p>
 </main>
+
+<style>
+	.sound-controls {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+		margin-block: var(--nt-space-3);
+	}
+
+	.sound-controls input {
+		width: 8rem;
+		accent-color: var(--nt-accent);
+	}
+
+	.volume-percent {
+		min-width: 4ch;
+		font-variant-numeric: tabular-nums;
+	}
+</style>
