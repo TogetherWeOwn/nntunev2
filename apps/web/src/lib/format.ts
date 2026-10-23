@@ -9,6 +9,33 @@ export function formatDuration(totalSeconds: number): string {
 	return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+/** Display strings for the current track's elapsed/remaining/total media time. */
+export interface TrackTime {
+	elapsed: string;
+	remaining: string | null;
+	duration: string | null;
+}
+
+/**
+ * Derive elapsed/remaining/total display strings from media seconds. An
+ * unknown duration (non-finite or negative) yields null coordinates, never
+ * zero; a finite zero duration is known. Unknown elapsed normalizes to zero,
+ * finite elapsed clamps to `[0, duration]` when known, and fractions floor
+ * after clamping/subtraction.
+ */
+export function deriveTrackTime(currentTime: number, duration: number): TrackTime {
+	const elapsedRaw = Number.isFinite(currentTime) ? currentTime : 0;
+	if (!Number.isFinite(duration) || duration < 0) {
+		return { elapsed: formatDuration(elapsedRaw), remaining: null, duration: null };
+	}
+	const clamped = Math.min(Math.max(0, elapsedRaw), duration);
+	return {
+		elapsed: formatDuration(clamped),
+		remaining: formatDuration(duration - clamped),
+		duration: formatDuration(duration)
+	};
+}
+
 /** Format a byte count with one decimal, e.g. `1.5 KB`. */
 export function formatBytes(bytes: number): string {
 	if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';

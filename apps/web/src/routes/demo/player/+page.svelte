@@ -6,6 +6,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { page } from '$app/state';
+	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
 	import {
@@ -317,6 +318,60 @@
 		return event.currentTarget === audioEl &&
 			endedForCurrent(event.currentTarget as HTMLAudioElement, current?.streamUrl);
 	}
+
+	// Current-track time display: a page-session elapsed/remaining choice plus
+	// coordinates read only from the current matching audio element. No
+	// persistence, no transport calls, no live region for per-second updates.
+	let timeMode = $state<'elapsed' | 'remaining'>('elapsed');
+	let trackTime = $state(0);
+	let trackDuration = $state(NaN);
+
+	// Time events are honoured only from the mounted element whose current
+	// resource is still the queue's track. A connected element reporting a
+	// different currentSrc (or a detached one) cannot supply coordinates.
+	function timeEventForCurrent(element: HTMLAudioElement): boolean {
+		if (element !== audioEl || !element.isConnected) return false;
+		const expected = current?.streamUrl;
+		if (expected === undefined) return false;
+		try {
+			return element.currentSrc === new URL(expected, document.baseURI).href;
+		} catch {
+			return false;
+		}
+	}
+
+	function handleTrackTime(event: Event): void {
+		const target = event.currentTarget;
+		if (!(target instanceof HTMLAudioElement) || !timeEventForCurrent(target)) return;
+		trackTime = target.currentTime;
+		trackDuration = target.duration;
+	}
+
+	function handleTimeModeChange(value: string): void {
+		timeMode = value === 'remaining' ? 'remaining' : 'elapsed';
+	}
+
+	// Any source replacement (track change, retry revision, queue clear or
+	// re-add) resets the coordinates; the mode choice survives within the page.
+	$effect(() => {
+		current?.streamUrl;
+		sourceRevision;
+		trackTime = 0;
+		trackDuration = NaN;
+	});
+
+	const trackTimeSummary = $derived.by(() => {
+		if (!current) return 'No track selected';
+		const derived = deriveTrackTime(trackTime, trackDuration);
+		if (timeMode === 'remaining') {
+			if (derived.remaining === null || derived.duration === null) {
+				return 'Remaining unavailable — Duration unavailable';
+			}
+			return `Remaining ${derived.remaining} of ${derived.duration}`;
+		}
+		if (derived.duration === null) return `Elapsed ${derived.elapsed} — Duration unavailable`;
+		return `Elapsed ${derived.elapsed} of ${derived.duration}`;
+	});
 
 	function handlePlay(event: Event): void {
 		// A queued play event can arrive after a newer pause. The element's
@@ -789,8 +844,25 @@
 			onerror={handleError}
 			onended={handleEnded}
 			onvolumechange={handleVolumeChange}
+			ontimeupdate={handleTrackTime}
+			onloadedmetadata={handleTrackTime}
+			ondurationchange={handleTrackTime}
 		></audio>
 	{/key}
+
+	<div>
+		<label for="track-time-mode">Time display</label>
+		<select
+			id="track-time-mode"
+			data-testid="track-time-mode"
+			value={timeMode}
+			onchange={(event) => handleTimeModeChange(event.currentTarget.value)}
+		>
+			<option value="elapsed">Elapsed</option>
+			<option value="remaining">Remaining</option>
+		</select>
+	</div>
+	<p data-testid="track-time-summary">{trackTimeSummary}</p>
 
 	<div>
 		<button type="button" data-testid="player-prev" onclick={userPrevious} disabled={!current}>
@@ -958,3 +1030,12 @@
 	</button>
 	<p data-testid="seek-stats">completed {completedSeeks}, aborted {abortedSeeks}, last {lastBytes} bytes</p>
 </main>
+
+<style>
+	/* The mode choice keeps a visible focus ring under programmatic focus
+	   too, where the global :focus-visible rule does not apply. */
+	#track-time-mode:focus {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+</style>
