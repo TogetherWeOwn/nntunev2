@@ -391,7 +391,15 @@
 		// Native controls bypass playCurrent: retry the resume on the gesture.
 		resumeLevelingContext();
 		if (status === 'error') playCurrent(true);
-		else if (status !== 'playing') status = 'loading';
+		else if (status !== 'playing') {
+			// A play event outside a playCurrent flight is a native-control
+			// press: record it like any explicit play-press. playCurrent sets
+			// status 'loading' synchronously before the async play, so its own
+			// plays (and retries) always arrive as 'loading' and record at
+			// their own call sites — or not at all.
+			if (status !== 'loading') recordRecent(current?.id);
+			status = 'loading';
+		}
 	}
 
 	function handlePlaying(event: Event): void {
@@ -611,10 +619,12 @@
 				togglePlayShortcut();
 				break;
 			case 'next-track':
-				goNext();
+				// Same gesture as the Next button: persist, navigate, resume
+				// and record through the shared explicit-play path.
+				userNext();
 				break;
 			case 'previous-track':
-				goPrevious();
+				userPrevious();
 				break;
 			case 'seek-back':
 				seekShortcut(-SEEK_SECONDS);
