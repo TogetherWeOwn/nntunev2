@@ -5,7 +5,14 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import {
+		applySoundPreference,
+		loadSoundPreference,
+		saveSoundPreference,
+		type SoundPreference
+	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
+	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
@@ -17,7 +24,12 @@
 		type LevelingTags
 	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
-	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
+	import {
+		applyMediaSession,
+		clearMediaSession,
+		setMediaSessionPosition,
+		type MediaSessionSeekDetails
+	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
@@ -75,7 +87,7 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
-	let muted = $state(false);
+	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -380,6 +392,7 @@
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
+		if (restored) updateSound(sound, node, false);
 		const stopObserving = playback.observe(node);
 		return {
 			destroy() {
@@ -398,6 +411,56 @@
 		return event.currentTarget === audioEl &&
 			endedForCurrent(event.currentTarget as HTMLAudioElement, current?.streamUrl);
 	}
+
+	// Current-track time display: a page-session elapsed/remaining choice plus
+	// coordinates read only from the current matching audio element. No
+	// persistence, no transport calls, no live region for per-second updates.
+	let timeMode = $state<'elapsed' | 'remaining'>('elapsed');
+	let trackTime = $state(0);
+	let trackDuration = $state(NaN);
+
+	// Time events are honoured only from the mounted element whose current
+	// resource is still the queue's track. A connected element reporting a
+	// different currentSrc (or a detached one) cannot supply coordinates.
+	function timeEventForCurrent(element: HTMLAudioElement): boolean {
+		if (element !== audioEl || !element.isConnected) return false;
+		const expected = current?.streamUrl;
+		if (!expected) return false;
+		try {
+			return element.currentSrc === new URL(expected, document.baseURI).href;
+		} catch {
+			return false;
+		}
+	}
+
+	function handleTrackTime(event: Event): void {
+		// Bound directly to the audio element, currentTarget is always that
+		// element during dispatch; the identity check below fences the rest.
+		const target = event.currentTarget as HTMLAudioElement;
+		if (!timeEventForCurrent(target)) return;
+		trackTime = target.currentTime;
+		trackDuration = target.duration;
+	}
+
+	// Any source replacement (track change, retry revision, queue clear or
+	// re-add) resets the coordinates; the mode choice survives within the page.
+	$effect(() => {
+		current?.streamUrl;
+		sourceRevision;
+		trackTime = 0;
+		trackDuration = NaN;
+	});
+
+	const trackTimeSummary = $derived.by(() => {
+		if (!current) return 'No track selected';
+		const derived = deriveTrackTime(trackTime, trackDuration);
+		// Both modes share one total fragment: a known duration reads
+		// "of <total>", an unknown one names the missing coordinate.
+		const total = derived.duration === null ? '— Duration unavailable' : `of ${derived.duration}`;
+		if (timeMode !== 'remaining') return `Elapsed ${derived.elapsed} ${total}`;
+		if (derived.remaining === null) return `Remaining unavailable ${total}`;
+		return `Remaining ${derived.remaining} ${total}`;
+	});
 
 	function handlePlay(event: Event): void {
 		// A queued play event can arrive after a newer pause. The element's
@@ -575,6 +638,20 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
+	// Mount and keyed replacements apply before playback's tick resolves.
+	// Native events use the same equality-guarded path: no setter feedback.
+	function updateSound(preference: SoundPreference, element = audioEl, persist = true): void {
+		if (!element) return;
+		const actual = applySoundPreference(element, preference);
+		actual.restricted ||= sound.restricted ?? false;
+		if (persist) {
+			if (sound.volume !== actual.volume || sound.muted !== actual.muted) {
+				saveSoundPreference(safeStorage(), actual);
+			}
+		}
+		sound = actual;
+	}
+
 	// Visible jump controls share the keyboard relative-seek path above:
 	// the current element is read at activation and SEEK_SECONDS stays the
 	// single step source. Unusable media (no current track, non-finite or
@@ -600,21 +677,21 @@
 		}
 	}
 
-	// Mute lives in player state, not on the element: the keyed <audio>
-	// is recreated on every track change, and native controls can mute
-	// behind the shortcut's back. The effect re-applies state to each
-	// new element; volumechange absorbs native-side changes.
-	$effect(() => {
-		if (audioEl) audioEl.muted = muted;
-	});
 
-	function handleVolumeChange(event: Event): void {
-		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
+		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
+	}
+
+	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
+		if (!audioEl || !restored) return;
+		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
+		// A rejected setter leaves state unchanged: undo the range's own edit.
+		event.currentTarget.value = String(sound.volume * 100);
 	}
 
 	function toggleMuteShortcut(): void {
-		muted = !muted;
-		if (audioEl) audioEl.muted = muted;
+		if (!audioEl || !restored) return;
+		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -678,15 +755,82 @@
 		seekCurrentResume();
 	}
 
-	// MediaSession follows the current track; queue order + current track
-	// persist for the tab session (sessionStorage, restored on mount).
+	// Scope OS callbacks and timeline events to this exact source/element.
+	// Cleanup fences retained callbacks as well as removing event listeners.
 	$effect(() => {
-		applyMediaSession(current, {
-			onNext: userNext,
-			onPrevious: userPrevious,
-			onPlay: () => playCurrent(),
-			onPause: pauseCurrent
+		const track = current;
+		const el = audioEl;
+		const revision = sourceRevision;
+		let active = true;
+		const isCurrent = () =>
+			active && current === track && audioEl === el && sourceRevision === revision &&
+			!!el && endedForCurrent(el, track?.streamUrl);
+		const publishPosition = () => {
+			if (!isCurrent() || !el) return;
+			setMediaSessionPosition({
+				duration: el.duration,
+				position: el.currentTime,
+				playbackRate: el.playbackRate
+			});
+		};
+		const seek = (details: MediaSessionSeekDetails, direction: -1 | 0 | 1) => {
+			if (!isCurrent() || !el) return;
+			const duration = el.duration;
+			if (!Number.isFinite(duration) || duration <= 0) return;
+			let target: number;
+			if (direction === 0) {
+				const time = details?.seekTime;
+				if (typeof time !== 'number' || !Number.isFinite(time) || time < 0) return;
+				target = time;
+			} else {
+				const offset = details?.seekOffset === undefined ? 10 : details.seekOffset;
+				if (
+					typeof offset !== 'number' || !Number.isFinite(offset) || offset <= 0 ||
+					!Number.isFinite(el.currentTime)
+				) return;
+				target = el.currentTime + direction * offset;
+			}
+			try {
+				el.currentTime = Math.min(duration, Math.max(0, target));
+				// Seeking to the end must not synthesize natural completion and
+				// advance the queue/start radio, including while play() is pending.
+				if (target >= duration) pauseCurrent();
+			} catch {
+				// Some resources reject a seek despite having loaded metadata.
+				return;
+			}
+			publishPosition();
+		};
+		applyMediaSession(track, {
+			onNext: () => {
+				if (isCurrent()) userNext();
+			},
+			onPrevious: () => {
+				if (isCurrent()) userPrevious();
+			},
+			onPlay: () => {
+				if (isCurrent()) playCurrent();
+			},
+			onPause: () => {
+				if (isCurrent()) pauseCurrent();
+			},
+			onSeekTo: (details) => seek(details, 0),
+			onSeekForward: (details) => seek(details, 1),
+			onSeekBackward: (details) => seek(details, -1)
 		});
+		const events = ['loadedmetadata', 'durationchange', 'timeupdate', 'seeked', 'ratechange'];
+		for (const event of events) el?.addEventListener(event, publishPosition);
+		// Clear first on a track change; metadata may already be available if
+		// the source came from cache, otherwise its events repopulate state.
+		publishPosition();
+		return () => {
+			active = false;
+			for (const event of events) el?.removeEventListener(event, publishPosition);
+		};
+	});
+
+	// Queue order + current track persist for the tab session.
+	$effect(() => {
 		if (restored) {
 			try {
 				sessionStorage.setItem(QUEUE_STORAGE_KEY, serializeQueue(queue));
@@ -744,6 +888,8 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
+		sound = loadSoundPreference(safeStorage());
+		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		(
@@ -908,8 +1054,38 @@
 			onerror={handleError}
 			onended={handleEnded}
 			onvolumechange={handleVolumeChange}
+			ontimeupdate={handleTrackTime}
+			onloadedmetadata={handleTrackTime}
+			ondurationchange={handleTrackTime}
 		></audio>
 	{/key}
+
+	<div class="nt-sound">
+		<label>
+			Volume {Math.round(sound.volume * 100)}%
+			<input
+				type="range"
+				min="0"
+				max="100"
+				value={sound.volume * 100}
+				disabled={!restored || sound.restricted}
+				oninput={handleVolumeInput}
+			/>
+		</label>
+		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
+			Mute
+		</button>
+	</div>
+	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
+
+	<div>
+		<label for="track-time-mode">Time display</label>
+		<select id="track-time-mode" data-testid="track-time-mode" bind:value={timeMode}>
+			<option value="elapsed">Elapsed</option>
+			<option value="remaining">Remaining</option>
+		</select>
+	</div>
+	<p data-testid="track-time-summary">{trackTimeSummary}</p>
 
 	<div>
 		<button type="button" data-testid="player-prev" onclick={userPrevious} disabled={!current}>
@@ -1134,3 +1310,12 @@
 	</button>
 	<p data-testid="seek-stats">completed {completedSeeks}, aborted {abortedSeeks}, last {lastBytes} bytes</p>
 </main>
+
+<style>
+	/* The mode choice keeps a visible focus ring under programmatic focus
+	   too, where the global :focus-visible rule does not apply. */
+	#track-time-mode:focus {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+</style>

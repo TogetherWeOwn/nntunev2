@@ -5,6 +5,7 @@ import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary } from '#lib/library/favorites.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw',
@@ -78,6 +79,9 @@ function pageScript() {
 		saveFavorites,
 		clearFavoritesAtAuthBoundary,
 		createLibraryRefresher,
+		displayArtist,
+		displayTitle,
+		orderLibraryItems,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		subscribeLocalAuthTransition,
 		browserStorage: () => null,
