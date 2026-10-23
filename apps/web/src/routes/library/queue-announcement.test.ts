@@ -29,7 +29,7 @@ const ITEMS = [
  * must leave stale text here, even though the ordinary browser case passes.
  */
 function pageScript() {
-	const script = sources['./+page.svelte'].match(/<script[^>]*>([\s\S]*?)<\/script>/)?.[1];
+	const script = sources['./+page.svelte'].match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
 	if (!script) throw new Error('Library page script missing');
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const body = parsed.statements
