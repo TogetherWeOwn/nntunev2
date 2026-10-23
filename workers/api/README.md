@@ -211,7 +211,8 @@ behavior changes here.
   fails to decrypt. Rotation via `rewrap_dek` without touching ciphertext.
   (Sources: `workers/api/src/vault.rs` — `encrypt_vault`, `decrypt_vault`,
   `dek_aad`/`payload_aad`, `rewrap_dek`; KEK from `VAULT_KEK_BASE64` +
-  `VAULT_KEK_VERSION` in `workers/api/src/worker_entry.rs`; marker/index in
+  `VAULT_KEK_VERSION` (legacy) or `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`
+  (versioned) in `workers/api/src/worker_entry.rs`; marker/index in
   `migrations/0015_kek_rotation.sql`, design `docs/security/kek-rotation.md` §1–§2.)
 - **Never logged, never returned:** reads return booleans only
   (`redacted_summary`); `test connection` returns a boolean, never provider

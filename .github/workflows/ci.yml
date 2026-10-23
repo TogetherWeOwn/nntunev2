@@ -1022,10 +1022,22 @@ jobs:
           node --check workers/observability/tests/project-tail-event.test.mjs
           node --check workers/observability/evaluate-error-window.mjs
           node --check workers/observability/tests/evaluate-error-window.test.mjs
+          node --check workers/observability/render-verdict-alert.mjs
+          node --check workers/observability/tests/render-verdict-alert.test.mjs
+          node --check workers/observability/evaluate-health-window.mjs
+          node --check workers/observability/tests/evaluate-health-window.test.mjs
+          node --check workers/observability/render-health-alert.mjs
+          node --check workers/observability/tests/render-health-alert.test.mjs
       - name: Run Tail projection acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
       - name: Run error-window acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/evaluate-error-window.test.mjs
+      - name: Run verdict-alert acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/render-verdict-alert.test.mjs
+      - name: Run health-window acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/evaluate-health-window.test.mjs
+      - name: Run health-alert acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
 
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.

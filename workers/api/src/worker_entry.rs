@@ -14,6 +14,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use tokio_postgres::GenericClient;
 use worker::{
     Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
     Result as WorkerResult,
@@ -40,11 +41,134 @@ const DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 // --- Config ---------------------------------------------------------------------------
 
 fn env_string(env: &Env, name: &str) -> Option<String> {
+    env_string_raw(env, name).filter(|s| !s.is_empty())
+}
+
+/// Presence-preserving env lookup: `Some("")` for a present-but-empty
+/// var, `None` only when neither secret nor var exists. Used solely by
+/// the vault-KEK provisioning decision, where a blanked var (what a
+/// dashboard "clear this var" action leaves behind) must fail closed
+/// rather than read as absent.
+fn env_string_raw(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
         .ok()
         .map(|s| s.to_string())
         .or_else(|| env.var(name).ok().map(|s| s.to_string()))
+}
+
+/// Half-width of the versioned-KEK discovery window around
+/// `VAULT_KEK_CURRENT` (see [`kek_set_from_lookup`]). The Worker's `Env`
+/// offers no key listing, so provisioned `VAULT_KEK_V<N>` secrets are
+/// discovered by probing version names; the rotation ceremony's live set
+/// (`{N-1, N}` steady state, `{N, N+1}` pre-staged — `kek-rotation.md`
+/// §5) fits with wide margin, and anything outside the window simply
+/// stays unprovisioned (reads for it fail closed per-row, like any
+/// unknown version).
+const KEK_VERSION_WINDOW: u32 = 8;
+
+/// Parsed vault KEK set: the current write key plus the retained priors
+/// for mixed-version reads. Built by [`kek_set_from_lookup`], consumed
+/// once by `config_from_env`.
+struct KekSet {
+    kek: [u8; 32],
+    version: u32,
+    priors: Vec<(u32, [u8; 32])>,
+}
+
+/// Strict KEK decode: unpadded base64url (`crate::b64`, F-HARD-01)
+/// plus the exact 32-byte length. One helper so legacy and versioned
+/// paths cannot drift apart.
+fn decode_kek(raw: &str) -> Option<[u8; 32]> {
+    crate::b64::decode(raw).ok()?.try_into().ok()
+}
+
+/// Pure vault-KEK provisioning decision over the env lookup, so native
+/// tests drive the exact function `config_from_env` calls. Two
+/// exclusive modes (`docs/security/kek-rotation.md` §3):
+///
+/// - `VAULT_KEK_CURRENT` present and non-blank: versioned mode. The
+///   current write key is `VAULT_KEK_V{current}` (required — missing,
+///   blank or invalid fails startup, even when legacy vars are also
+///   present, so a half-cutover never serves the wrong write
+///   version), and every other present `VAULT_KEK_V<N>` inside
+///   `current ± KEK_VERSION_WINDOW` becomes a retained prior
+///   (present-but-blank or present-but-invalid fails startup; absent
+///   is simply unprovisioned). Legacy `VAULT_KEK_BASE64`/
+///   `VAULT_KEK_VERSION` are ignored: the cutover reuses the legacy
+///   key as `VAULT_KEK_V<L>` + `VAULT_KEK_CURRENT=<L>`, where L is
+///   live `VAULT_KEK_VERSION`; delete legacy only after V<L> reads green.
+/// - `VAULT_KEK_CURRENT` absent: legacy single-key mode —
+///   `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`, both required, no
+///   priors. Per-version secrets are ignored here, so provisioning
+///   `V<L>` ahead of the cutover deploy never changes serving behavior.
+///
+/// A present-but-blank (empty or whitespace-only) or
+/// present-but-unparsable `VAULT_KEK_CURRENT` fails startup rather
+/// than silently falling back to legacy: the operator asked for a
+/// versioned cutover, and serving legacy writes would split-brain
+/// the version the ceremony believes is current.
+/// Callers must pass a presence-preserving lookup (`env_string_raw`,
+/// not `env_string`): empty-filtering the lookup would erase the
+/// absent/blank distinction this decision depends on.
+fn kek_set_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<KekSet> {
+    // Present-but-blank CURRENT (empty from a dashboard "clear this
+    // var", or whitespace-only from a stray paste) fails closed: it
+    // must never downgrade to legacy mode while retained
+    // `VAULT_KEK_BASE64` is still set. The trim is load-bearing, not
+    // cosmetic: without it a whitespace-only value would refuse only
+    // incidentally via the u32 parse below, and a future trim of the
+    // lookup could silently re-open the legacy downgrade.
+    match get("VAULT_KEK_CURRENT") {
+        None => {}
+        Some(current_raw) => {
+            if current_raw.trim().is_empty() {
+                return None;
+            }
+            let current: u32 = current_raw.parse().ok()?;
+            let kek = get(&format!("VAULT_KEK_V{current}"))
+                .filter(|s| !s.is_empty())
+                .and_then(|raw| decode_kek(&raw))?;
+            let mut priors = Vec::new();
+            let low = current.saturating_sub(KEK_VERSION_WINDOW);
+            let high = current.saturating_add(KEK_VERSION_WINDOW);
+            // Nested (not let-chained): this crate is edition 2021, where
+            // `if a && let ...` does not compile.
+            let mut version = low;
+            loop {
+                if version != current {
+                    if let Some(raw) = get(&format!("VAULT_KEK_V{version}")) {
+                        // A blanked prior is fail-closed, never silently
+                        // treated as unprovisioned.
+                        if raw.is_empty() {
+                            return None;
+                        }
+                        priors.push((version, decode_kek(&raw)?));
+                    }
+                }
+                if version == high {
+                    break;
+                }
+                version = version.saturating_add(1);
+            }
+            return Some(KekSet {
+                kek,
+                version: current,
+                priors,
+            });
+        }
+    }
+    let kek = get("VAULT_KEK_BASE64")
         .filter(|s| !s.is_empty())
+        .and_then(|raw| decode_kek(&raw))?;
+    let version: u32 = get("VAULT_KEK_VERSION")
+        .filter(|s| !s.is_empty())?
+        .parse()
+        .ok()?;
+    Some(KekSet {
+        kek,
+        version,
+        priors: Vec::new(),
+    })
 }
 
 fn config_from_env(env: &Env) -> Option<Config> {
@@ -64,9 +188,13 @@ fn config_from_env(env: &Env) -> Option<Config> {
     // Strict unpadded base64url for both secrets (`crate::b64`, F-HARD-01):
     // padded std-base64 input is rejected, matching the template contract.
     let session_secret = crate::b64::decode(&env_string(env, "SESSION_SECRET_BASE64")?).ok()?;
-    let kek_bytes = crate::b64::decode(&env_string(env, "VAULT_KEK_BASE64")?).ok()?;
-    let kek: [u8; 32] = kek_bytes.try_into().ok()?;
-    let kek_version: u32 = env_string(env, "VAULT_KEK_VERSION")?.parse().ok()?;
+    // Vault KEK set: legacy `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION`
+    // single-key mode, or the versioned `VAULT_KEK_V<N>` +
+    // `VAULT_KEK_CURRENT` map — the pure `kek_set_from_lookup` decides,
+    // and any half-provisioned versioned config refuses to start here.
+    // The lookup is presence-preserving on purpose: a blanked var must
+    // fail closed, not read as absent (see `env_string_raw`).
+    let kek_set = kek_set_from_lookup(|name| env_string_raw(env, name))?;
     let session_ttl_secs: u64 = env_string(env, "SESSION_TTL_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(crate::session::MAX_SESSION_SECS);
@@ -93,14 +221,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         &rp_id,
         &origin,
         session_secret,
-        kek,
-        kek_version,
+        kek_set.kek,
+        kek_set.version,
         session_ttl_secs,
         truthy("INVITES_REQUIRED"),
         truthy("ALLOW_LOOPBACK_DEV"),
         session_previous_secret,
     )
-    .ok()?;
+    .ok()?
+    .with_prior_keks(kek_set.priors);
     // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
     // armed ONLY by the explicit staging flag, and usable only with the
     // staged QA bearer. Both default off/absent, so production serves the
@@ -299,7 +428,7 @@ fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
 }
 
 async fn delete_expired_rate_limit_slots(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     now: i64,
 ) -> Result<(), StoreError> {
     client
@@ -317,7 +446,7 @@ async fn delete_expired_rate_limit_slots(
 /// release), `Ok(None)` is an exhausted budget. Caller has already
 /// deleted expired rows for `now_i`.
 async fn claim_rate_limit_slot(
-    client: &tokio_postgres::Client,
+    client: &impl GenericClient,
     budget: &RateLimitBudget<'_>,
     now: u64,
     now_i: i64,
@@ -368,27 +497,6 @@ async fn claim_rate_limit_slot(
     Ok(None)
 }
 
-/// Release the exact slot `claim_rate_limit_slot` took for `budget`
-/// at `now` (same scope, action, slot and expiry), so the pair
-/// path's compensation can never free another request's slot.
-async fn release_rate_limit_slot(
-    client: &tokio_postgres::Client,
-    budget: &RateLimitBudget<'_>,
-    slot: i32,
-    now: u64,
-) -> Result<(), StoreError> {
-    let expires_at = i64_of(now.saturating_add(budget.window_secs))?;
-    client
-        .execute(
-            "DELETE FROM auth_rate_limit_slots \
-             WHERE scope_key = $1 AND action = $2 AND slot = $3 AND expires_at = $4",
-            &[&budget.scope_key, &budget.action, &slot, &expires_at],
-        )
-        .await
-        .map_err(|_| StoreError)?;
-    Ok(())
-}
-
 /// Race `future` against a `timeout_ms` budget, returning the caller's
 /// opaque `error` on expiry. [`PgStore::connect`] uses this with the vault
 /// dial/total budgets; the timer is platform-appropriate (Worker `Delay`
@@ -426,6 +534,21 @@ struct PgStore {
 }
 
 impl PgStore {
+    /// Race a store operation against the caller's budget, expiring to the
+    /// opaque `StoreError`. Every `Store` method runs its connect plus
+    /// statements inside this seam with the vault total: Hyperdrive pools
+    /// in transaction mode and RESETs the backend on return, so the
+    /// connect-time `SET statement_timeout` cannot bound later statements
+    /// and each method re-bounds where its statements run. The budget stays
+    /// a caller parameter (never a new literal) so native tests can race a
+    /// short deadline without a database.
+    async fn bounded<T>(
+        operation: impl Future<Output = Result<T, StoreError>>,
+        timeout_ms: u64,
+    ) -> Result<T, StoreError> {
+        with_deadline(operation, timeout_ms, StoreError).await
+    }
+
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         // One overall budget encloses dial, handshake, driver spawn, and
         // statement setup: the handshake and SET consume the time left
@@ -465,7 +588,8 @@ impl PgStore {
                     let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
                 });
                 // Connect-time SET of the total budget; Hyperdrive RESETs
-                // pooled backends, so per-query bounds are separate work.
+                // pooled backends, so each Store method additionally races
+                // its statements through Self::bounded.
                 client
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
@@ -561,27 +685,39 @@ fn native_credential_from_row(
 
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT id, email, created_at FROM users WHERE email = $1",
-                &[&email],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| user_from_row(&r)).transpose()
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT id, email, created_at FROM users WHERE email = $1",
+                        &[&email],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| user_from_row(&r)).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn insert_user(&self, user: &UserRecord) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
-                &[&user.id, &user.email, &i64_of(user.created_at)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
+                        &[&user.id, &user.email, &i64_of(user.created_at)?],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn insert_challenge(
@@ -590,6 +726,7 @@ impl Store for PgStore {
         user_id: Option<&str>,
         purpose: &str,
     ) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -607,40 +744,48 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn challenge_by_id(&self, id: &str) -> Result<Option<ChallengeRow>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose \
                  FROM auth_challenges WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| {
-            let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
-            let expires_at = u64_of(expires_at)?;
-            Ok(ChallengeRow {
-                challenge: PasskeyChallenge {
-                    id: r.try_get("id").map_err(|_| StoreError)?,
-                    rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
-                    origin: r.try_get("origin").map_err(|_| StoreError)?,
-                    // The schema stores expiry only; nothing downstream
-                    // authorizes on issue time.
-                    issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
-                    expires_at,
-                    consumed: r.try_get("consumed").map_err(|_| StoreError)?,
-                },
-                user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                purpose: r.try_get("purpose").map_err(|_| StoreError)?,
-            })
-        })
-        .transpose()
+                        &[&id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| {
+                    let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
+                    let expires_at = u64_of(expires_at)?;
+                    Ok(ChallengeRow {
+                        challenge: PasskeyChallenge {
+                            id: r.try_get("id").map_err(|_| StoreError)?,
+                            rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
+                            origin: r.try_get("origin").map_err(|_| StoreError)?,
+                            // The schema stores expiry only; nothing downstream
+                            // authorizes on issue time.
+                            issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
+                            expires_at,
+                            consumed: r.try_get("consumed").map_err(|_| StoreError)?,
+                        },
+                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                        purpose: r.try_get("purpose").map_err(|_| StoreError)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn insert_credential(&self, credential: &PasskeyCredential) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -657,34 +802,49 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn credential_by_id(
         &self,
         cred_id_b64url: &str,
     ) -> Result<Option<PasskeyCredential>, StoreError> {
-        let client = self.connect().await?;
-        let sql =
-            format!("SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE cred_id = $1");
-        let row = client
-            .query_opt(&sql, &[&cred_id_b64url])
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| credential_from_row(&r)).transpose()
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let sql = format!(
+                    "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE cred_id = $1"
+                );
+                let row = client
+                    .query_opt(&sql, &[&cred_id_b64url])
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| credential_from_row(&r)).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn credentials_for_user(
         &self,
         user_id: &str,
     ) -> Result<Vec<PasskeyCredential>, StoreError> {
-        let client = self.connect().await?;
-        let sql =
-            format!("SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE user_id = $1");
-        let rows = client
-            .query(&sql, &[&user_id])
-            .await
-            .map_err(|_| StoreError)?;
-        rows.iter().map(credential_from_row).collect()
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let sql = format!(
+                    "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE user_id = $1"
+                );
+                let rows = client
+                    .query(&sql, &[&user_id])
+                    .await
+                    .map_err(|_| StoreError)?;
+                rows.iter().map(credential_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn advance_sign_count(
@@ -693,20 +853,27 @@ impl Store for PgStore {
         expected: u32,
         new: u32,
     ) -> Result<bool, StoreError> {
-        let client = self.connect().await?;
-        let rows = client
-            .query(
-                "UPDATE webauthn_credentials SET sign_count = $3 \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query(
+                        "UPDATE webauthn_credentials SET sign_count = $3 \
                  WHERE cred_id = $1 AND sign_count = $2 RETURNING cred_id",
-                &[&cred_id_b64url, &i64::from(expected), &i64::from(new)],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(rows.len() == 1)
+                        &[&cred_id_b64url, &i64::from(expected), &i64::from(new)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -724,29 +891,36 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn magic_by_hash(&self, token_hash: &str) -> Result<Option<MagicLinkRecord>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT token_hash, user_id, email, issued_at, expires_at, used \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT token_hash, user_id, email, issued_at, expires_at, used \
                  FROM magic_link_tokens WHERE token_hash = $1",
-                &[&token_hash],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| {
-            Ok(MagicLinkRecord {
-                token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
-                user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                email: r.try_get("email").map_err(|_| StoreError)?,
-                issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
-                expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                used: r.try_get("used").map_err(|_| StoreError)?,
-            })
-        })
-        .transpose()
+                        &[&token_hash],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| {
+                    Ok(MagicLinkRecord {
+                        token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
+                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                        email: r.try_get("email").map_err(|_| StoreError)?,
+                        issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
+                        used: r.try_get("used").map_err(|_| StoreError)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     // Staging-only code-seam outbox (migration 0018): one latest-token
@@ -758,6 +932,7 @@ impl Store for PgStore {
         token: &str,
         now: u64,
     ) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -768,46 +943,60 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
-                &[&email],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| {
-            Ok(QaIssuedCode {
-                token: r.try_get("token").map_err(|_| StoreError)?,
-                issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
-            })
-        })
-        .transpose()
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
+                        &[&email],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| {
+                    Ok(QaIssuedCode {
+                        token: r.try_get("token").map_err(|_| StoreError)?,
+                        issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
-                &[&code_hash],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| {
-            Ok(InviteRecord {
-                code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
-                used: r.try_get("used").map_err(|_| StoreError)?,
-                created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
-            })
-        })
-        .transpose()
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
+                        &[&code_hash],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| {
+                    Ok(InviteRecord {
+                        code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
+                        used: r.try_get("used").map_err(|_| StoreError)?,
+                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -824,30 +1013,37 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                "SELECT id, user_id, created_at, expires_at, rotation_counter, revoked \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        "SELECT id, user_id, created_at, expires_at, rotation_counter, revoked \
                  FROM sessions WHERE id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|r| {
-            let counter: i32 = r.try_get("rotation_counter").map_err(|_| StoreError)?;
-            Ok(SessionRecord {
-                id: r.try_get("id").map_err(|_| StoreError)?,
-                user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
-                expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                rotation_counter: u32::try_from(counter).map_err(|_| StoreError)?,
-                revoked: r.try_get("revoked").map_err(|_| StoreError)?,
-            })
-        })
-        .transpose()
+                        &[&id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|r| {
+                    let counter: i32 = r.try_get("rotation_counter").map_err(|_| StoreError)?;
+                    Ok(SessionRecord {
+                        id: r.try_get("id").map_err(|_| StoreError)?,
+                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
+                        rotation_counter: u32::try_from(counter).map_err(|_| StoreError)?,
+                        revoked: r.try_get("revoked").map_err(|_| StoreError)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn rotate_session_row(
@@ -857,27 +1053,34 @@ impl Store for PgStore {
         new_counter: u32,
         new_expires_at: u64,
     ) -> Result<bool, StoreError> {
-        let client = self.connect().await?;
-        let rows = client
-            .query(
-                "UPDATE sessions SET rotation_counter = $3, expires_at = $4 \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query(
+                        "UPDATE sessions SET rotation_counter = $3, expires_at = $4 \
                  WHERE id = $1 AND rotation_counter = $2 AND revoked = FALSE RETURNING id",
-                &[
-                    &id,
-                    &i32::try_from(expected_counter).map_err(|_| StoreError)?,
-                    &i32::try_from(new_counter).map_err(|_| StoreError)?,
-                    &i64_of(new_expires_at)?,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(rows.len() == 1)
+                        &[
+                            &id,
+                            &i32::try_from(expected_counter).map_err(|_| StoreError)?,
+                            &i32::try_from(new_counter).map_err(|_| StoreError)?,
+                            &i64_of(new_expires_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn replace_session_after_reauthentication(
         &self,
         replacement: &crate::session::ReauthenticatedSession,
     ) -> Result<bool, StoreError> {
+        Self::bounded(async {
         let claim = replacement.revocation_claim();
         let params = claim.params();
         let rotation_counter =
@@ -919,40 +1122,59 @@ impl Store for PgStore {
         }
         transaction.commit().await.map_err(|_| StoreError)?;
         Ok(true)
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn revoke_session(&self, id: &str) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute("UPDATE sessions SET revoked = TRUE WHERE id = $1", &[&id])
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute("UPDATE sessions SET revoked = TRUE WHERE id = $1", &[&id])
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn revoke_single_session(&self, id: &str, user_id: &str) -> Result<bool, StoreError> {
-        let client = self.connect().await?;
-        let claim = crate::session::SessionRevokeClaim::Single {
-            session_id: id,
-            user_id,
-        };
-        let rows = client
-            .query(claim.statement(), &[&id, &user_id])
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(rows.len() == 1)
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let claim = crate::session::SessionRevokeClaim::Single {
+                    session_id: id,
+                    user_id,
+                };
+                let rows = client
+                    .query(claim.statement(), &[&id, &user_id])
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
-                &[&user_id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
+                        &[&user_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     // --- Native REST credentials (ADR 0010, migration 0019) -------------------------------
@@ -962,6 +1184,7 @@ impl Store for PgStore {
     // composite UNIQUE (pepper_version, key_hmac) is the lookup identity.
 
     async fn insert_native_credential(&self, row: &NativeCredentialRow) -> Result<(), StoreError> {
+        Self::bounded(async {
         let scopes: Vec<String> = row
             .record
             .scopes
@@ -1001,22 +1224,29 @@ impl Store for PgStore {
             return Err(StoreError);
         }
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn native_credentials_for_user(
         &self,
         user_id: &str,
     ) -> Result<Vec<NativeCredentialRow>, StoreError> {
-        let client = self.connect().await?;
-        let sql = format!(
-            "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let sql = format!(
+                    "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
              WHERE user_id = $1 ORDER BY created_at, id"
-        );
-        let rows = client
-            .query(&sql, &[&user_id])
-            .await
-            .map_err(|_| StoreError)?;
-        rows.iter().map(native_credential_from_row).collect()
+                );
+                let rows = client
+                    .query(&sql, &[&user_id])
+                    .await
+                    .map_err(|_| StoreError)?;
+                rows.iter().map(native_credential_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn native_credential_by_hmac(
@@ -1024,22 +1254,28 @@ impl Store for PgStore {
         pepper_version: u32,
         key_hmac: &str,
     ) -> Result<Option<NativeCredentialRow>, StoreError> {
-        let client = self.connect().await?;
-        let sql = format!(
-            "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let sql = format!(
+                    "SELECT {NATIVE_REST_COLUMNS} FROM native_rest_credentials \
              WHERE pepper_version = $1 AND key_hmac = $2"
-        );
-        let row = client
-            .query_opt(
-                &sql,
-                &[
-                    &i32::try_from(pepper_version).map_err(|_| StoreError)?,
-                    &key_hmac,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        row.map(|row| native_credential_from_row(&row)).transpose()
+                );
+                let row = client
+                    .query_opt(
+                        &sql,
+                        &[
+                            &i32::try_from(pepper_version).map_err(|_| StoreError)?,
+                            &key_hmac,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                row.map(|row| native_credential_from_row(&row)).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn revoke_native_credential(
@@ -1048,30 +1284,36 @@ impl Store for PgStore {
         user_id: &str,
         now: u64,
     ) -> Result<bool, StoreError> {
-        let client = self.connect().await?;
-        // Owner-scoped and sticky: only a live row of this user
-        // transitions; an already-revoked row keeps its timestamp.
-        let transitioned = client
-            .execute(
-                "UPDATE native_rest_credentials SET revoked_at = $3 \
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Owner-scoped and sticky: only a live row of this user
+                // transitions; an already-revoked row keeps its timestamp.
+                let transitioned = client
+                    .execute(
+                        "UPDATE native_rest_credentials SET revoked_at = $3 \
                  WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
-                &[&id, &user_id, &i64_of(now)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        if transitioned == 1 {
-            return Ok(true);
-        }
-        // No transition: report whether the row exists at all (unknown
-        // and foreign ids both report false — no existence oracle).
-        let exists = client
-            .query_opt(
-                "SELECT id FROM native_rest_credentials WHERE id = $1 AND user_id = $2",
-                &[&id, &user_id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(exists.is_some())
+                        &[&id, &user_id, &i64_of(now)?],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transitioned == 1 {
+                    return Ok(true);
+                }
+                // No transition: report whether the row exists at all (unknown
+                // and foreign ids both report false — no existence oracle).
+                let exists = client
+                    .query_opt(
+                        "SELECT id FROM native_rest_credentials WHERE id = $1 AND user_id = $2",
+                        &[&id, &user_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(exists.is_some())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn revoke_all_native_credentials(
@@ -1079,38 +1321,52 @@ impl Store for PgStore {
         user_id: &str,
         now: u64,
     ) -> Result<u64, StoreError> {
-        // An empty user id (upstream bug) must never become a mass
-        // revocation: revoke nothing without a database round trip.
-        if user_id.is_empty() {
-            return Ok(0);
-        }
-        let client = self.connect().await?;
-        let revoked = client
-            .execute(
-                "UPDATE native_rest_credentials SET revoked_at = $2 \
+        Self::bounded(
+            async {
+                // An empty user id (upstream bug) must never become a mass
+                // revocation: revoke nothing without a database round trip.
+                if user_id.is_empty() {
+                    return Ok(0);
+                }
+                let client = self.connect().await?;
+                let revoked = client
+                    .execute(
+                        "UPDATE native_rest_credentials SET revoked_at = $2 \
                  WHERE user_id = $1 AND revoked_at IS NULL",
-                &[&user_id, &i64_of(now)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(revoked)
+                        &[&user_id, &i64_of(now)?],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(revoked)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn record_native_credential_use(&self, id: &str, now: u64) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "UPDATE native_rest_credentials SET last_used_at = $2 WHERE id = $1",
-                &[&id, &i64_of(now)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "UPDATE native_rest_credentials SET last_used_at = $2 WHERE id = $1",
+                        &[&id, &i64_of(now)?],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
-        let client = self.connect().await?;
-        let row = client
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
             .query_opt(
                 "SELECT kek_version, dek_wrapped_nonce, dek_wrapped, payload_nonce, payload, \
                  indexer_configured, updated_at FROM provider_vaults WHERE user_id = $1",
@@ -1118,26 +1374,35 @@ impl Store for PgStore {
             )
             .await
             .map_err(|_| StoreError)?;
-        row.map(|r| {
-            let kek_version: i32 = r.try_get("kek_version").map_err(|_| StoreError)?;
-            Ok(VaultRow {
-                blob: VaultBlob {
-                    kek_version: u32::try_from(kek_version).map_err(|_| StoreError)?,
-                    dek_wrapped_nonce_b64url: r
-                        .try_get("dek_wrapped_nonce")
-                        .map_err(|_| StoreError)?,
-                    dek_wrapped_b64url: r.try_get("dek_wrapped").map_err(|_| StoreError)?,
-                    payload_nonce_b64url: r.try_get("payload_nonce").map_err(|_| StoreError)?,
-                    payload_b64url: r.try_get("payload").map_err(|_| StoreError)?,
-                },
-                indexer_configured: r.try_get("indexer_configured").map_err(|_| StoreError)?,
-                updated_at: u64_of(r.try_get("updated_at").map_err(|_| StoreError)?)?,
-            })
-        })
-        .transpose()
+                row.map(|r| {
+                    let kek_version: i32 = r.try_get("kek_version").map_err(|_| StoreError)?;
+                    Ok(VaultRow {
+                        blob: VaultBlob {
+                            kek_version: u32::try_from(kek_version).map_err(|_| StoreError)?,
+                            dek_wrapped_nonce_b64url: r
+                                .try_get("dek_wrapped_nonce")
+                                .map_err(|_| StoreError)?,
+                            dek_wrapped_b64url: r.try_get("dek_wrapped").map_err(|_| StoreError)?,
+                            payload_nonce_b64url: r
+                                .try_get("payload_nonce")
+                                .map_err(|_| StoreError)?,
+                            payload_b64url: r.try_get("payload").map_err(|_| StoreError)?,
+                        },
+                        indexer_configured: r
+                            .try_get("indexer_configured")
+                            .map_err(|_| StoreError)?,
+                        updated_at: u64_of(r.try_get("updated_at").map_err(|_| StoreError)?)?,
+                    })
+                })
+                .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
         // while the owner's deleting_at is NULL, holding the user row
@@ -1175,38 +1440,52 @@ impl Store for PgStore {
             return Err(StoreError);
         }
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "DELETE FROM provider_vaults WHERE user_id = $1",
-                &[&user_id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "DELETE FROM provider_vaults WHERE user_id = $1",
+                        &[&user_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
-        let client = self.connect().await?;
-        let row = client
-            .query_opt(
-                crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
-                &[&user_id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        match row {
-            Some(row) => row.try_get("deleting").map_err(|_| StoreError),
-            // The user row is gone (erased or reaped): not a fenced
-            // write, so the handler keeps its generic failure.
-            None => Ok(false),
-        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = client
+                    .query_opt(
+                        crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
+                        &[&user_id],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                match row {
+                    Some(row) => row.try_get("deleting").map_err(|_| StoreError),
+                    // The user row is gone (erased or reaped): not a fenced
+                    // write, so the handler keeps its generic failure.
+                    None => Ok(false),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -1222,6 +1501,7 @@ impl Store for PgStore {
             .await
             .map_err(|_| StoreError)?;
         Ok(())
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn reserve_rate_limit(
@@ -1232,21 +1512,27 @@ impl Store for PgStore {
         now: u64,
         window_secs: u64,
     ) -> Result<bool, StoreError> {
-        let budget = RateLimitBudget {
-            scope_key,
-            action,
-            limit,
-            window_secs,
-        };
-        if !rate_limit_budget_admissible(&budget) {
-            return Ok(false);
-        }
-        let client = self.connect().await?;
-        let now_i = i64_of(now)?;
-        delete_expired_rate_limit_slots(&client, now_i).await?;
-        Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
-            .await?
-            .is_some())
+        Self::bounded(
+            async {
+                let budget = RateLimitBudget {
+                    scope_key,
+                    action,
+                    limit,
+                    window_secs,
+                };
+                if !rate_limit_budget_admissible(&budget) {
+                    return Ok(false);
+                }
+                let client = self.connect().await?;
+                let now_i = i64_of(now)?;
+                delete_expired_rate_limit_slots(&client, now_i).await?;
+                Ok(claim_rate_limit_slot(&client, &budget, now, now_i)
+                    .await?
+                    .is_some())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn reserve_rate_limit_pair(
@@ -1255,48 +1541,64 @@ impl Store for PgStore {
         second: RateLimitBudget<'_>,
         now: u64,
     ) -> Result<PairAdmission, StoreError> {
-        if !rate_limit_budget_admissible(&first) {
-            return Ok(PairAdmission::DeniedFirst);
-        }
-        if !rate_limit_budget_admissible(&second) {
-            return Ok(PairAdmission::DeniedSecond);
-        }
-        // All-or-none on one connection: claim the first slot, then the
-        // second; if the second does not admit, release the first by
-        // its exact identity (scope, action, slot, expiry). A live
-        // slot cannot be overwritten by another claim (reuse requires
-        // an expired row), so the compensating DELETE can only remove
-        // the slot this call just took — a denied attempt ends up
-        // consuming neither budget.
-        let client = self.connect().await?;
-        let now_i = i64_of(now)?;
-        delete_expired_rate_limit_slots(&client, now_i).await?;
-        let Some(first_slot) = claim_rate_limit_slot(&client, &first, now, now_i).await? else {
-            return Ok(PairAdmission::DeniedFirst);
-        };
-        match claim_rate_limit_slot(&client, &second, now, now_i).await {
-            Ok(Some(_)) => Ok(PairAdmission::Allowed),
-            Ok(None) => {
-                release_rate_limit_slot(&client, &first, first_slot, now).await?;
-                Ok(PairAdmission::DeniedSecond)
-            }
-            Err(err) => {
-                let _ = release_rate_limit_slot(&client, &first, first_slot, now).await;
-                Err(err)
-            }
-        }
+        Self::bounded(
+            async {
+                if !rate_limit_budget_admissible(&first) {
+                    return Ok(PairAdmission::DeniedFirst);
+                }
+                if !rate_limit_budget_admissible(&second) {
+                    return Ok(PairAdmission::DeniedSecond);
+                }
+                // All-or-none in one transaction: the delete plus both
+                // claims commit together, so deadline expiry — which drops
+                // this future — rolls back instead of stranding the first
+                // slot past an unreachable Err-arm release. A dropped
+                // tokio-postgres transaction rolls back (and the driver
+                // terminate aborts it server-side); `?` errors take the
+                // same implicit rollback with no extra round-trip.
+                let mut client = self.connect().await?;
+                let now_i = i64_of(now)?;
+                let transaction = client.transaction().await.map_err(|_| StoreError)?;
+                delete_expired_rate_limit_slots(&transaction, now_i).await?;
+                if claim_rate_limit_slot(&transaction, &first, now, now_i)
+                    .await?
+                    .is_none()
+                {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Ok(PairAdmission::DeniedFirst);
+                }
+                if claim_rate_limit_slot(&transaction, &second, now, now_i)
+                    .await?
+                    .is_some()
+                {
+                    transaction.commit().await.map_err(|_| StoreError)?;
+                    Ok(PairAdmission::Allowed)
+                } else {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    Ok(PairAdmission::DeniedSecond)
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn prune_expired_challenges(&self, now: u64) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "DELETE FROM auth_challenges WHERE expires_at <= $1",
-                &[&i64_of(now)?],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "DELETE FROM auth_challenges WHERE expires_at <= $1",
+                        &[&i64_of(now)?],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn reap_unverified_users(
@@ -1305,21 +1607,27 @@ impl Store for PgStore {
         ttl_secs: u64,
         protected_user_id: Option<&str>,
     ) -> Result<(), StoreError> {
-        // Single source of truth lives in `handlers` (statement-shape test
-        // pins the purpose literal and the vault/session/magic exemptions):
-        // magic-only accounts and vault owners are never reaped, so a vault
-        // saved under a magic session cannot cascade-delete 24h later.
-        let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
-        let now = i64_of(now)?;
-        let client = self.connect().await?;
-        client
-            .execute(
-                &handlers::reap_unverified_users_sql(),
-                &[&cutoff, &protected_user_id, &now],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                // Single source of truth lives in `handlers` (statement-shape test
+                // pins the purpose literal and the vault/session/magic exemptions):
+                // magic-only accounts and vault owners are never reaped, so a vault
+                // saved under a magic session cannot cascade-delete 24h later.
+                let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+                let now = i64_of(now)?;
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        &handlers::reap_unverified_users_sql(),
+                        &[&cutoff, &protected_user_id, &now],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn acquire_test_connection_lease(
@@ -1329,6 +1637,7 @@ impl Store for PgStore {
         lease_secs: u64,
         max_concurrency: u32,
     ) -> Result<bool, StoreError> {
+        Self::bounded(async {
         if max_concurrency == 0 || max_concurrency > 16 || lease_secs == 0 {
             return Ok(false);
         }
@@ -1365,6 +1674,7 @@ impl Store for PgStore {
             }
         }
         Ok(false)
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn release_test_connection_lease(
@@ -1372,15 +1682,21 @@ impl Store for PgStore {
         user_id: &str,
         token: &str,
     ) -> Result<(), StoreError> {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "DELETE FROM vault_test_leases WHERE user_id = $1 AND token = $2",
-                &[&user_id, &token],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client
+                    .execute(
+                        "DELETE FROM vault_test_leases WHERE user_id = $1 AND token = $2",
+                        &[&user_id, &token],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 }
 
@@ -1389,36 +1705,43 @@ impl Store for PgStore {
 /// it returned — autocommitted before the handler responds.
 impl SingleUseStore for PgStore {
     async fn claim(&self, candidate: SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
-        let statement = candidate.statement();
-        let client = self.connect().await.map_err(|_| auth::AuthError::Invalid)?;
-        type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
-        let rows = match &candidate {
-            SingleUseClaim::MagicLink { record, now } => {
-                let expires = i64_of(record.expires_at).map_err(|_| auth::AuthError::Invalid)?;
-                let now = i64_of(*now).map_err(|_| auth::AuthError::Invalid)?;
-                let params: [Param<'_>; 5] = [
-                    &record.token_hash,
-                    &record.user_id,
-                    &record.email,
-                    &expires,
-                    &now,
-                ];
-                client.query(statement, &params[..]).await
-            }
-            SingleUseClaim::Challenge { record, now } => {
-                let expires = i64_of(record.expires_at).map_err(|_| auth::AuthError::Invalid)?;
-                let now = i64_of(*now).map_err(|_| auth::AuthError::Invalid)?;
-                let params: [Param<'_>; 5] =
-                    [&record.id, &record.rp_id, &record.origin, &expires, &now];
-                client.query(statement, &params[..]).await
-            }
-            SingleUseClaim::Invite { record } => {
-                let params: [Param<'_>; 1] = [&record.code_hash];
-                client.query(statement, &params[..]).await
-            }
-        }
-        .map_err(|_| auth::AuthError::Invalid)?;
-        Ok(rows.len() as u64)
+        Self::bounded(
+            async {
+                let statement = candidate.statement();
+                let client = self.connect().await?;
+                type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
+                let rows = match &candidate {
+                    SingleUseClaim::MagicLink { record, now } => {
+                        let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
+                        let now = i64_of(*now).map_err(|_| StoreError)?;
+                        let params: [Param<'_>; 5] = [
+                            &record.token_hash,
+                            &record.user_id,
+                            &record.email,
+                            &expires,
+                            &now,
+                        ];
+                        client.query(statement, &params[..]).await
+                    }
+                    SingleUseClaim::Challenge { record, now } => {
+                        let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
+                        let now = i64_of(*now).map_err(|_| StoreError)?;
+                        let params: [Param<'_>; 5] =
+                            [&record.id, &record.rp_id, &record.origin, &expires, &now];
+                        client.query(statement, &params[..]).await
+                    }
+                    SingleUseClaim::Invite { record } => {
+                        let params: [Param<'_>; 1] = [&record.code_hash];
+                        client.query(statement, &params[..]).await
+                    }
+                }
+                .map_err(|_| StoreError)?;
+                Ok(rows.len() as u64)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+        .map_err(|_| auth::AuthError::Invalid)
     }
 }
 
@@ -2629,6 +2952,304 @@ mod tests {
         assert_eq!(staged_previous_secret(Some(String::new()), true), Err(()));
     }
 
+    fn kek_vars(pairs: &[(&str, String)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect()
+    }
+
+    fn kek_lookup(vars: &HashMap<String, String>) -> impl Fn(&str) -> Option<String> + '_ {
+        |name: &str| vars.get(name).cloned()
+    }
+
+    fn kek_b64(byte: u8) -> String {
+        crate::b64::encode(&[byte; 32])
+    }
+
+    #[test]
+    fn kek_set_legacy_single_key_mode_is_preserved() {
+        // No VAULT_KEK_CURRENT: exactly the pre-versioned behavior —
+        // VAULT_KEK_BASE64 + VAULT_KEK_VERSION, both required, no priors.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("legacy config parses");
+        assert_eq!(set.kek, [9u8; 32]);
+        assert_eq!(set.version, 41);
+        assert!(set.priors.is_empty());
+        for missing in ["VAULT_KEK_BASE64", "VAULT_KEK_VERSION"] {
+            let mut vars = vars.clone();
+            vars.remove(missing);
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "legacy mode without {missing} must refuse to start"
+            );
+            // Present-but-empty legacy vars refuse like missing ones:
+            // the raw lookup preserves presence, the legacy path
+            // filters empties itself.
+            let mut vars = vars.clone();
+            vars.insert(missing.to_string(), String::new());
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "legacy mode with blanked {missing} must refuse to start"
+            );
+        }
+    }
+
+    #[test]
+    fn kek_set_legacy_mode_ignores_versioned_vars() {
+        // Provisioning V1 ahead of the cutover deploy must not change
+        // serving behavior while VAULT_KEK_CURRENT is still unset.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+            ("VAULT_KEK_V1", kek_b64(1)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("legacy config parses");
+        assert_eq!(set.kek, [9u8; 32]);
+        assert_eq!(set.version, 41);
+        assert!(set.priors.is_empty());
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_selects_current_and_priors() {
+        // VAULT_KEK_CURRENT=2: writes select V2, V1 is a retained prior,
+        // and legacy vars are ignored (cutover deploy still has them set).
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V1", kek_b64(1)),
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("versioned config parses");
+        assert_eq!(set.kek, [2u8; 32]);
+        assert_eq!(set.version, 2);
+        assert_eq!(set.priors, vec![(1, [1u8; 32])]);
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_reads_prestaged_future_version() {
+        // Ceremony phase 1: V3 is pre-staged while writes stay at 2 — the
+        // Worker reads N+1 but still writes N.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V3", kek_b64(3)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("pre-staged config parses");
+        assert_eq!(set.kek, [2u8; 32]);
+        assert_eq!(set.version, 2);
+        assert_eq!(set.priors, vec![(3, [3u8; 32])]);
+    }
+
+    #[test]
+    fn kek_set_versioned_mode_fails_closed() {
+        let legacy = vec![
+            ("VAULT_KEK_BASE64", kek_b64(9)),
+            ("VAULT_KEK_VERSION", "41".to_string()),
+        ];
+        // Missing current key: a half-cutover never serves legacy writes.
+        let mut vars = kek_vars(&legacy);
+        vars.insert("VAULT_KEK_CURRENT".to_string(), "2".to_string());
+        vars.insert("VAULT_KEK_V1".to_string(), kek_b64(1));
+        assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Present-but-unparsable CURRENT: the operator asked for a
+        // cutover, so silently serving legacy would split-brain the
+        // ceremony's current version.
+        let mut vars = kek_vars(&legacy);
+        vars.insert("VAULT_KEK_CURRENT".to_string(), "two".to_string());
+        assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Present-but-empty CURRENT (a dashboard "clear this var"):
+        // fails closed, never downgrades to legacy mode while the
+        // retained legacy vars are still set.
+        let mut vars = kek_vars(&legacy);
+        vars.insert("VAULT_KEK_CURRENT".to_string(), String::new());
+        vars.insert("VAULT_KEK_V2".to_string(), kek_b64(2));
+        assert!(
+            kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+            "blanked CURRENT must refuse to start, not serve legacy writes"
+        );
+        // Blanked CURRENT with no legacy fallback also refuses.
+        let vars = kek_vars(&[("VAULT_KEK_CURRENT", String::new())]);
+        assert!(kek_set_from_lookup(kek_lookup(&vars)).is_none());
+        // Whitespace-only CURRENT (a dashboard value of a single space,
+        // or "2 " from a stray paste): refused by the blank guard, never
+        // silently read as absent — and never parsed as a version.
+        for blank in [" ", "  ", "2 ", "\t"] {
+            let mut vars = kek_vars(&legacy);
+            vars.insert("VAULT_KEK_CURRENT".to_string(), blank.to_string());
+            vars.insert("VAULT_KEK_V2".to_string(), kek_b64(2));
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "whitespace-only CURRENT {blank:?} must refuse to start"
+            );
+        }
+        // Present-but-invalid priors fail startup, never serve half-keyed.
+        for bad in [
+            "!!!not-base64!!!".to_string(),
+            // Padded std-base64 is rejected like every other secret codec.
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            // Short keys can neither wrap nor unwrap.
+            crate::b64::encode(&[1u8; 16]),
+        ] {
+            let vars = kek_vars(&[
+                ("VAULT_KEK_CURRENT", "2".to_string()),
+                ("VAULT_KEK_V2", kek_b64(2)),
+                ("VAULT_KEK_V1", bad),
+            ]);
+            assert!(
+                kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+                "invalid retained prior must refuse to start"
+            );
+        }
+        // Blanked staged prior: fails closed, never silently treated
+        // as unprovisioned.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V1", String::new()),
+        ]);
+        assert!(
+            kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+            "blanked retained prior must refuse to start"
+        );
+        // Blanked current key: fails closed like a missing one.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", String::new()),
+            ("VAULT_KEK_V1", kek_b64(1)),
+        ]);
+        assert!(
+            kek_set_from_lookup(kek_lookup(&vars)).is_none(),
+            "blanked current key must refuse to start"
+        );
+    }
+
+    #[test]
+    fn kek_set_discovery_window_bounds() {
+        // CURRENT=20: the window is 12..=28 — boundary versions provision,
+        // anything outside stays unprovisioned (reads for it fail closed
+        // per-row, like any unknown version).
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "20".to_string()),
+            ("VAULT_KEK_V20", kek_b64(20)),
+            ("VAULT_KEK_V12", kek_b64(12)),
+            ("VAULT_KEK_V11", kek_b64(11)),
+            ("VAULT_KEK_V28", kek_b64(28)),
+            ("VAULT_KEK_V29", kek_b64(29)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("window config parses");
+        assert_eq!(set.version, 20);
+        let versions: Vec<u32> = set.priors.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions, vec![12, 28]);
+        assert_eq!(
+            KEK_VERSION_WINDOW,
+            20 - 12,
+            "pin the window the boundary test assumes"
+        );
+    }
+
+    #[test]
+    fn kek_set_discovery_window_saturates_at_zero() {
+        // CURRENT=2: the low edge saturates instead of wrapping — V0
+        // provisions when present.
+        let vars = kek_vars(&[
+            ("VAULT_KEK_CURRENT", "2".to_string()),
+            ("VAULT_KEK_V2", kek_b64(2)),
+            ("VAULT_KEK_V0", kek_b64(0)),
+        ]);
+        let set = kek_set_from_lookup(kek_lookup(&vars)).expect("saturating config parses");
+        assert_eq!(set.priors, vec![(0, [0u8; 32])]);
+    }
+
+    #[test]
+    fn config_from_env_provisions_the_kek_set() {
+        // `config_from_env` needs a wasm Env, so pin its KEK wiring the
+        // same way the keyring matrix pins its call site: slice ONLY the
+        // fn body out of the pre-test source, so this test's own
+        // literals cannot satisfy the assertions.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("kek_set_from_lookup(|name| env_string_raw(env, name))"),
+            "config_from_env must build the KEK set from the presence-preserving env lookup"
+        );
+        assert!(
+            body.contains(".with_prior_keks(kek_set.priors)"),
+            "config_from_env must provision the retained priors on the Config"
+        );
+        assert!(
+            body.contains("kek_set.kek") && body.contains("kek_set.version"),
+            "Config::new must take the selected current key and version"
+        );
+    }
+
+    #[test]
+    fn env_string_raw_preserves_presence_without_filtering() {
+        // `env_string_raw` needs a wasm Env, so pin its
+        // presence-preserving body the same way the KEK wiring pins its
+        // call site: slice ONLY the fn out of the pre-test source, so
+        // this test's own literals cannot satisfy the assertions.
+        // Reverting the body to empty-filtering (the pre-PR production
+        // behavior) would silently downgrade a blanked
+        // VAULT_KEK_CURRENT to legacy mode with the suite green — the
+        // KEK unit tests drive `kek_set_from_lookup` through a HashMap
+        // closure, never through this fn. Each slice is bounded at the
+        // fn's own closing brace: these are negative assertions, so the
+        // looser next-fn bound would sweep in the neighboring
+        // const/struct and go brittle.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let raw_body = production
+            .split_once("fn env_string_raw(")
+            .expect("env_string_raw must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("env_string_raw must close")
+            .0;
+        assert!(
+            !raw_body.contains("is_empty"),
+            "env_string_raw must not filter empty values: presence preservation is the fail-closed decision's input"
+        );
+        assert!(
+            !raw_body.contains(".filter("),
+            "env_string_raw must not filter: the only empty filter lives in env_string"
+        );
+        assert!(
+            raw_body.contains("env.secret(name)") && raw_body.contains("env.var(name)"),
+            "env_string_raw must stay the secret-then-var fallthrough, not delegate to the filtering lookup"
+        );
+        // `env_string` stays the single place that maps present-but-empty
+        // to absent.
+        let body = production
+            .split_once("fn env_string(")
+            .expect("env_string must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("env_string must close")
+            .0;
+        assert!(
+            body.contains("env_string_raw(env, name).filter(|s| !s.is_empty())"),
+            "env_string must stay exactly the raw lookup plus the single empty filter"
+        );
+    }
+
     #[test]
     fn native_rest_pepper_matrix_is_both_or_neither() {
         // `config_from_env` needs a wasm Env, so pin its keyring matrix
@@ -3115,5 +3736,84 @@ mod tests {
             "https://app.example.com/auth/magic?token=fixture-token"
         );
         assert_eq!(payload["token"], "fixture-token");
+    }
+
+    // Native contract for the per-statement bound: PgStore::bounded races
+    // a store operation against the supplied budget and expires to the
+    // opaque StoreError. No Worker sockets or database; the watchdog only
+    // fails a stuck test. Mirrors hyperdrive_deadline.rs, which contracts
+    // the shared with_deadline helper this seam delegates to.
+    fn poll_bounded_to_ready<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
+        use std::task::{Context, Poll};
+        use std::time::{Duration, Instant};
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+            assert!(
+                Instant::now() < end,
+                "bounded seam still pending at the independent 2s watchdog"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn bounded_statement_expires_a_stalled_operation_to_the_opaque_error() {
+        use std::time::{Duration, Instant};
+        let mut bounded = Box::pin(PgStore::bounded(
+            std::future::pending::<Result<u8, StoreError>>(),
+            25,
+        ));
+        let start = Instant::now();
+        let outcome = poll_bounded_to_ready(bounded.as_mut());
+        assert!(
+            outcome.is_err(),
+            "a stalled statement must fail closed, not hang"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "expiry must not be an immediate unconditional error"
+        );
+    }
+
+    #[test]
+    fn bounded_statement_passes_a_ready_operation_through() {
+        let mut bounded = Box::pin(PgStore::bounded(async { Ok::<_, StoreError>(7u8) }, 5_000));
+        assert_eq!(poll_bounded_to_ready(bounded.as_mut()).unwrap(), 7);
+    }
+
+    #[test]
+    fn bounded_expiry_drops_between_phases_before_in_future_compensation_runs() {
+        use std::cell::Cell;
+        // The rate-limit pair claims its first slot, then its second,
+        // inside one bounded future. When the second phase stalls past
+        // the budget, the seam drops the whole future — an Err-arm
+        // release written inside the future can never run. The pair
+        // therefore commits both claims in one database transaction (a
+        // dropped tokio-postgres transaction rolls back) instead of
+        // compensating in Rust; this test pins the drop that makes that
+        // necessary, using the real seam with no database.
+        let compensated = Cell::new(false);
+        let mut raced = Box::pin(PgStore::bounded(
+            async {
+                match std::future::pending::<Result<(), StoreError>>().await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        compensated.set(true);
+                        Err(err)
+                    }
+                }
+            },
+            25,
+        ));
+        let outcome = poll_bounded_to_ready(raced.as_mut());
+        assert!(outcome.is_err(), "a stalled second phase must fail closed");
+        assert!(
+            !compensated.get(),
+            "expiry drops the future: in-future compensation never runs"
+        );
     }
 }

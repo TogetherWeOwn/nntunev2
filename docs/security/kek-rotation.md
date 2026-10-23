@@ -83,27 +83,57 @@ Rules:
 
 ## 3. KEK provisioning and versioning
 
-Slice-1 reality (`wrangler.toml.example`): one KEK per environment —
-`VAULT_KEK_BASE64` (32 random bytes, unpadded base64url, 43 chars,
-decodes via `nntune_api::b64::decode`) plus `VAULT_KEK_VERSION`
-(the integer version stamped on every row). The rotation target below
-kicks in at the FIRST rotation; until then the single key IS version 1.
+Provisioning has two modes (`wrangler.toml.example`, parsed by
+`kek_set_from_lookup` in `workers/api/src/worker_entry.rs`):
 
-- At first rotation, the current key is re-provisioned as a **separate
-  per-version Worker secret**: `VAULT_KEK_V1` (same bytes as the slice-1
-  key), then `VAULT_KEK_V2`, … — each 32 random bytes, unpadded-base64url
+- Legacy single-key mode (slice 1, still supported): one KEK per
+  environment — `VAULT_KEK_BASE64` (32 random bytes, unpadded base64url,
+  43 chars, decodes via `nntune_api::b64::decode`) plus
+  `VAULT_KEK_VERSION` (the integer version stamped on every row; call it
+  `L`). Active if and only if
+  `VAULT_KEK_CURRENT` is unset; per-version secrets are ignored in this
+  mode, so staging `V<L>` ahead of cutover never changes serving. A
+  blanked `VAULT_KEK_CURRENT` (present-but-blank — empty, as a
+  dashboard "clear this var" leaves behind, or whitespace-only from a
+  stray paste) is not "unset": it refuses to start rather than falling
+  back to legacy.
+- Versioned mode: `VAULT_KEK_CURRENT` (a **non-secret** config var,
+  e.g. `VAULT_KEK_CURRENT=2` in wrangler `vars`, not `secrets`,
+  replacing `VAULT_KEK_VERSION` at cutover) names the write version,
+  and the current write key is the `VAULT_KEK_V{current}` secret. Every
+  other provisioned per-version secret is a retained prior for
+  mixed-version reads. Legacy vars are ignored in this mode.
+
+- At first cutover, the live legacy key is re-provisioned as a **separate
+  per-version Worker secret**: `VAULT_KEK_V<L>` (same bytes as the legacy
+  `VAULT_KEK_BASE64`, where `L` is the env's live legacy
+  `VAULT_KEK_VERSION`), then `VAULT_KEK_V<L+1>`, … for later rotations —
+  each 32 random bytes, unpadded-base64url
   at rest (`openssl rand 32 | basenc --base64url | tr -d '='`, 43 chars,
   decodes via `nntune_api::b64::decode`; generated inside the private
   operator secrets store, provisioned via `wrangler secret put` or the
-  dashboard).
-  The legacy `VAULT_KEK_BASE64` is deleted once V1 reads green.
-- The write version is a **non-secret** config var, e.g.
-  `VAULT_KEK_CURRENT=2` (wrangler `vars`, not `secrets`), replacing
-  `VAULT_KEK_VERSION` at cutover.
-- The Worker build knows how to **read** every provisioned version
-  (current + retained priors, ≤3 retained — a `kek_by_version` selector
-  over the provisioned set, so rows at mixed versions decrypt during
-  phases 1–2) but **writes only** `VAULT_KEK_CURRENT`.
+  dashboard). Cutover is one deploy setting `V<L>` + `VAULT_KEK_CURRENT=<L>`
+  alongside the legacy pair; the legacy `VAULT_KEK_BASE64` /
+  `VAULT_KEK_VERSION` are deleted once V<L> reads green. Never assume
+  `L=1`: an env whose legacy version is not 1 must cut over at its own
+  live version, or every pre-existing row goes unreadable post-cutover.
+- Discovery window: the `Env` API offers no key listing, so the Worker
+  probes `VAULT_KEK_V<N>` for N in `CURRENT ± 8`
+  (`KEK_VERSION_WINDOW`); anything outside stays unprovisioned, and
+  reads for it fail closed per-row like any unknown version. The
+  ceremony's live set (`{N-1, N}` steady state, `{N, N+1}` pre-staged)
+  always fits inside.
+- The Worker build **reads** every provisioned version within the
+  `CURRENT ± 8` discovery window (current + up to 16 retained priors;
+  fewer near the `u32` bounds) through `Config::kek_by_version` in
+  `workers/api/src/handlers.rs`, so rows at mixed versions decrypt
+  during phases 1–2, but **writes only** `VAULT_KEK_CURRENT`. There is
+  no separate three-prior runtime cap. Retirement still requires the
+  row-count and backup/PITR-horizon proof in §5 invariant 3; moving a
+  version outside the window is not a substitute for that proof.
+  A half-provisioned versioned config (missing, blank, or invalid
+  current key; blank or unparsable `CURRENT`; blank or invalid retained
+  prior) refuses to start rather than serving the wrong write version.
 - Staging and production have **independent key sets generated
   independently** — never copy a KEK value between environments, never
   reuse a version number scheme as a shared secret. A rotation ceremony
@@ -264,23 +294,29 @@ Job properties:
 
 ## 7. Runbook (operator copy-paste)
 
-> **NOT EXECUTABLE — design only. Do not run the steps below in an
-> incident.** The re-wrap job (§6 runner: no Cloudflare Workflow/Queue
-> consumer is implemented, §8) and the versioned KEK map (a
-> `kek_by_version` selector over `VAULT_KEK_V<N>` per-version secrets +
-> `VAULT_KEK_CURRENT` write-version var, plus the `rotation_runs`
-> progress table — none of which exist in Worker code or migrations)
-> have not landed: the Worker reads only `VAULT_KEK_BASE64` +
-> `VAULT_KEK_VERSION` (`workers/api/src/worker_entry.rs`). Until those
-> land, routine KEK rotation cannot be executed. On suspected or
+> **NOT EXECUTABLE end to end — do not run the steps below in an
+> incident.** The versioned KEK map HAS landed — `Config::kek_by_version`
+> + `Config::with_prior_keks` (`workers/api/src/handlers.rs`) over
+> `VAULT_KEK_V<N>` per-version secrets + the `VAULT_KEK_CURRENT`
+> write-version var (`kek_set_from_lookup`,
+> `workers/api/src/worker_entry.rs`), with legacy single-key
+> compatibility — so pre-staging a version and flipping the write
+> version (steps 3–4 mechanics) are implemented. The re-wrap job (§6
+> runner: no Cloudflare Workflow/Queue consumer is implemented, §8)
+> and the `rotation_runs` progress table have NOT landed, so no
+> rotation can be carried through re-wrap/retire/close (steps 5–7):
+> routine KEK rotation still cannot be executed. On suspected or
 > confirmed KEK exposure, report it through GitHub's private
 > vulnerability reporting (see `SECURITY.md`); §10 is design-only and
-> has no runner. Today's executable containment is: replace
-> `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single KEK so
-> rows pinned to the exposed version fail closed, treat all vaulted
-> credentials as exposed, and force credential re-entry — never the
-> steps below (the §10 per-row re-key needs the versioned KEK map +
-> runner that have not landed).
+> has no runner. Today's executable containment is: legacy mode —
+> replace `VAULT_KEK_BASE64`/`VAULT_KEK_VERSION` with a fresh single
+> KEK so rows pinned to the exposed version fail closed; versioned
+> mode — remove the exposed `VAULT_KEK_V<N>` from the Worker (material
+> stays in the operator store) with `VAULT_KEK_CURRENT` on a live
+> version, so those rows fail closed the same way. In both modes treat
+> all vaulted credentials as exposed and force credential re-entry —
+> never the steps below (the §10 per-row re-key still needs the runner
+> that has not landed).
 
 ### Rotation executability today (Worker code as merged)
 
@@ -288,8 +324,8 @@ Job properties:
 |---|---|---|
 | Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
 | Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
-| KEK (routine re-wrap, §§5–6 below) | ❌ No — re-wrap job and versioned KEK map not implemented | `VAULT_KEK_BASE64` + `VAULT_KEK_VERSION` read in `worker_entry.rs`; `VAULT_KEK_V<N>`, `VAULT_KEK_CURRENT`, and `rotation_runs` appear nowhere in code or migrations (**not implemented**) |
-| KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | same as above |
+| KEK (routine re-wrap, §§5–6 below) | ❌ No — re-wrap job and `rotation_runs` not implemented (versioned KEK map + `CURRENT` flip landed; steps 5–7 still need the runner) | `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` read in `worker_entry.rs` (`kek_set_from_lookup`), `kek_by_version` in `handlers.rs`, legacy pair still supported; `rotation_runs` appears nowhere in code or migrations (**not implemented**) |
+| KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | versioned map as above; per-row re-key still needs the runner (**not implemented**) |
 | Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
 
 Preconditions: staging bake ≥24h on the new version; backup verified
@@ -353,9 +389,13 @@ CISO gate verifies each at its exact head):
       — `migrations/0015_kek_rotation.sql`; the §6 re-wrap UPDATE sets
       `rewrapped_at`, and per-version progress counts are documented
       in §6.
-- [ ] `kek_by_version` selector over provisioned versions so mixed-version
+- [x] `kek_by_version` selector over provisioned versions so mixed-version
       rows decrypt during phases 1–2; first rotation cuts over to
-      `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` (§3).
+      `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` (§3) —
+      `Config::kek_by_version` + `Config::with_prior_keks`
+      (`workers/api/src/handlers.rs`), versioned/legacy env parsing
+      (`kek_set_from_lookup`, `workers/api/src/worker_entry.rs`),
+      legacy single-key mode preserved.
 - [ ] Re-wrap job present, idempotent, resumable, with poison-row
       handling and count-only telemetry; re-wrap UPDATE binds the new
       AAD (§6 step 2).
@@ -376,13 +416,15 @@ CISO gate verifies each at its exact head):
 
 ## 10. Compromise rotation (incident response) — DESIGN ONLY, no runner
 
-> **DESIGN ONLY — no runner.** Steps 1–2 below need the versioned KEK
-> map (`VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`) and the re-wrap runner,
-> neither of which exists in Worker code or migrations. On suspected or
-> confirmed exposure, report through GitHub's private vulnerability
-> reporting (see `SECURITY.md`) and apply today's executable
-> containment from §7 (fresh single KEK so exposed-version rows fail
-> closed, treat vaulted credentials as exposed, force re-entry).
+> **DESIGN ONLY — no runner.** Steps 1–2 below need the re-wrap
+> runner, which does not exist in Worker code or migrations (the
+> versioned KEK map — `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` — HAS
+> landed, §7). On suspected or confirmed exposure, report through
+> GitHub's private vulnerability reporting (see `SECURITY.md`) and
+> apply today's executable containment from §7 (fresh single KEK in
+> legacy mode, or remove the exposed `VAULT_KEK_V<N>` with
+> `VAULT_KEK_CURRENT` on a live version, so exposed-version rows fail
+> closed; treat vaulted credentials as exposed, force re-entry).
 
 Routine re-wrap (§§5–6) rotates the WRAPPING, not the data key: anyone
 holding an exposed KEK[N] plus any pre-rotation snapshot still unwraps

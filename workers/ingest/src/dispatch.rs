@@ -122,6 +122,10 @@ fn dispatch(
         limit: None,
         page: None,
         payload_ref: None,
+        // No pool attribution at admission: the stream pool's provider
+        // wiring does not exist yet, so every job starts unattributed
+        // and the first fetch records the id on the checkpoint.
+        provider_id: None,
     })
 }
 
@@ -230,6 +234,9 @@ mod tests {
         assert_eq!(a.indexer_ref.as_deref(), Some(INDEXER));
         assert_eq!((a.limit, a.page), (Some(25), Some(0)));
         assert!(a.payload_ref.is_none());
+        // No pool attribution at admission: the stream pool's provider
+        // wiring does not exist yet, so every job starts unattributed.
+        assert!(a.provider_id.is_none());
     }
 
     #[test]

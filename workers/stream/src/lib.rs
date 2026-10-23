@@ -42,6 +42,7 @@ pub mod api_error;
 pub mod body;
 pub mod cache;
 pub mod grant;
+pub mod loader;
 pub mod meter;
 pub mod nntp;
 pub mod observability;
