@@ -40,6 +40,24 @@ describe('buffering native element lifecycle', () => {
 		expect(onBufferingChange.mock.calls).toEqual([[true], [false]]);
 	});
 
+	it('waiting before the first playing event is initial loading, not buffering', async () => {
+		const media = new NativeMedia();
+		const onBufferingChange = vi.fn();
+		const playback = createPlayback({ audio: () => media, flush: () => Promise.resolve(), onBufferingChange });
+		await playback.play();
+		// Play promise settled and the element unpaused, but no playing event
+		// yet: a slow initial load must not be diagnosed as mid-track buffering.
+		// The unpaused precondition is what makes this a killing test for the
+		// hasPlayed entry guard (paused fixtures mask its removal).
+		expect(media.paused).toBe(false);
+		media.dispatchEvent(new Event('waiting'));
+		expect(onBufferingChange).not.toHaveBeenCalled();
+		// Positive control: the same waiting after a real playing event buffers.
+		media.dispatchEvent(new Event('playing'));
+		media.dispatchEvent(new Event('waiting'));
+		expect(onBufferingChange.mock.calls).toEqual([[true]]);
+	});
+
 	it('a repeated old cleanup cannot reset a newer subscription on the same element', async () => {
 		const media = new NativeMedia();
 		const onBufferingChange = vi.fn();

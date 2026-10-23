@@ -48,8 +48,10 @@ providers.
   **13/13 pass**.
 - Added native lifecycle cases reproduced two assertion failures (end-handler
   ordering cancels the next attempt; an old cleanup resets a new subscription).
-  Both now pass, as does native-only playback: **3/3 pass**.
-- Complete web units: **1671/1671 pass**, zero skips. Web check: **0 errors,
+  Both now pass, as do native-only playback and the pre-playing waiting pin
+  (fails when the hasPlayed entry guard is removed; passes on this head):
+  **4/4 pass**.
+- Complete web units: **1672/1672 pass**, zero skips. Web check: **0 errors,
   0 warnings**.
 - Mocked-browser buffering and unchanged failure/queue/shortcut/comfort/radio
   regressions: **82/82 pass**, zero skips. Additional leveling: **4/4 pass**.
