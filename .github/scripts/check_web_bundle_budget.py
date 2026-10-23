@@ -7,10 +7,12 @@ fails when the total exceeds the pinned budget below. Without this gate,
 bundle bloat (a heavy dependency, an accidental full-library import) lands
 silently — ``pnpm build`` itself asserts nothing about size.
 
-Budget: ``BUDGET_CLIENT_JS_BYTES = 230_400`` (225 KiB, raw bytes, not gzip).
-Measured 176,417 B (~172 KiB) on 2026-10-17, so the budget leaves ~30%
-headroom for framework upgrades while catching any serious addition (a
-charting or date library typically adds 50+ KiB).
+Budget: ``BUDGET_CLIENT_JS_BYTES = 307_200`` (300 KiB, raw bytes, not gzip).
+Measured 229,997 B (~225 KiB, 36 files) on 2026-10-23, so the budget leaves
+~33% headroom for framework upgrades while catching any serious addition (a
+charting or date library typically adds 50+ KiB). Growth since the 176,417 B
+baseline of 2026-10-17 is expected: first-party features only, no new runtime
+dependencies.
 
 How to update the budget (deliberately, in its own PR):
 1. Run ``pnpm --dir apps/web build`` and note the new total this script prints.
@@ -33,7 +35,7 @@ import sys
 from pathlib import Path
 
 # Pinned budget, raw bytes. See module docstring for how to update.
-BUDGET_CLIENT_JS_BYTES = 230_400  # 225 KiB; measured 176,417 B on 2026-10-17
+BUDGET_CLIENT_JS_BYTES = 307_200  # 300 KiB; measured 229,997 B on 2026-10-23
 
 CLIENT_DIR_PARTS = ("apps", "web", ".svelte-kit", "output", "client")
 
