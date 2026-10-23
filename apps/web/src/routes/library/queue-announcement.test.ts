@@ -28,8 +28,31 @@ const ITEMS = [
  * no tracks to drop. Reverting just that handler to `queue = clearQueue(queue)`
  * must leave stale text here, even though the ordinary browser case passes.
  */
+/**
+ * Body of the first `<script>` block. Plain string search (no regexp) so
+ * HTML tag-filter checks do not apply; the end tag may carry whitespace
+ * (`</script >`).
+ */
+function extractFirstScript(source: string): string | undefined {
+	const lower = source.toLowerCase();
+	const openStart = lower.indexOf('<script');
+	if (openStart === -1) return undefined;
+	const openEnd = source.indexOf('>', openStart + '<script'.length);
+	if (openEnd === -1) return undefined;
+	let closeStart = lower.indexOf('</script', openEnd + 1);
+	while (closeStart !== -1) {
+		const closeEnd = source.indexOf('>', closeStart + '</script'.length);
+		if (closeEnd === -1) return undefined;
+		if (source.slice(closeStart + '</script'.length, closeEnd).trim() === '') {
+			return source.slice(openEnd + 1, closeStart);
+		}
+		closeStart = lower.indexOf('</script', closeStart + 1);
+	}
+	return undefined;
+}
+
 function pageScript() {
-	const script = sources['./+page.svelte'].match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
+	const script = extractFirstScript(sources['./+page.svelte']);
 	if (!script) throw new Error('Library page script missing');
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const body = parsed.statements
