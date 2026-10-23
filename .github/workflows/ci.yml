@@ -861,6 +861,10 @@ jobs:
   e2e-lint:
     name: e2e-lint
     runs-on: ubuntu-latest
+    # Preinstalled browsers + OS libraries avoid per-job apt mirror stalls.
+    # linux/amd64 v1.64.1-noble manifest verified 2026-10-23. Re-pin with
+    # e2e/package-lock.json; the offline image test rejects version drift.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -874,6 +878,15 @@ jobs:
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 
+      # The Node browser image does not promise Python; provision it for the
+      # existing traceability gate and the offline browser-image regression test.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - name: Browser image and preflight self-tests (offline doubles only)
+        run: python3 .github/scripts/test_ci_playwright_image.py
+
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
 
@@ -881,9 +894,16 @@ jobs:
         working-directory: e2e
         run: npm ci
 
-      - name: Install Playwright chromium (browser-level self-tests)
+      - name: Verify preinstalled Playwright chromium (browser-level self-tests)
         working-directory: e2e
-        run: npx playwright install --with-deps chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
 
       - name: Typecheck
         working-directory: e2e
