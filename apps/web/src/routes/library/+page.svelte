@@ -9,6 +9,11 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+	import {
+		clearFavoritesAtAuthBoundary,
+		loadFavorites,
+		saveFavorites
+	} from '#lib/library/favorites.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
@@ -30,6 +35,7 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	let favorites: string[] = $state([]);
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -56,6 +62,14 @@
 					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
 				}
 			}
+			// Favorites are storage truth re-read once the refresher settles:
+			// a completed refresh may have minted the auth context, while an
+			// auth boundary or 401 revokes it (empty until the next account
+			// stars something). Skipped mid-flight so Refresh never flickers
+			// the stars.
+			if (!state.loading) {
+				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+			}
 		}
 	});
 
@@ -69,6 +83,14 @@
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const favoriteIds = $derived(new Set(favorites));
+	// Favorites render in star order; ids absent from the current library
+	// stay stored but unlisted (there is no title to show for them).
+	const favoriteTracks = $derived(
+		favorites
+			.map((id) => items.find((track) => track.id === id) ?? null)
+			.filter((track): track is LibraryItem => track !== null)
+	);
 
 	function displayTitle(track: LibraryItem): string {
 		const title = track.title;
@@ -95,6 +117,24 @@
 		});
 	}
 
+	function toggleFavorite(id: string): void {
+		// Storage is the source of truth: re-read, flip one id, write back.
+		// Idempotent, instant, and never touches the queue or the network.
+		const session = browserStorage('session');
+		const local = browserStorage('local');
+		const current = loadFavorites(session, local);
+		const next = current.includes(id)
+			? current.filter((favorite) => favorite !== id)
+			: [...current, id];
+		saveFavorites(session, local, next);
+		favorites = next;
+	}
+
+	function starLabel(track: LibraryItem): string {
+		const title = displayTitle(track);
+		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
+	}
+
 	function refresh(): Promise<void> {
 		return refresher.refresh();
 	}
@@ -106,6 +146,10 @@
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			queue = clearQueue(queue);
 			clearSignedInEmail();
+			// Clear favorites storage BEFORE the refresher revokes the
+			// session auth context the scoped key derives from.
+			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			favorites = [];
 		}
 		refresher.handleAuthTransition(event);
 	}
@@ -113,6 +157,8 @@
 	function handleLocalAuthTransition(): void {
 		queue = clearQueue(queue);
 		clearSignedInEmail();
+		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		favorites = [];
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -121,6 +167,7 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
+		favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 		void refresh();
 		return () => {
 			refresher.dispose();
@@ -151,6 +198,26 @@
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
 		{/if}
 
+		<section data-testid="favorites-section" aria-label="Favorites">
+			<h2>Favorites</h2>
+			{#if favoriteTracks.length === 0}
+				<p data-testid="favorites-empty">No favorites yet. Star a track to pin it here.</p>
+			{:else}
+				<ul>
+					{#each favoriteTracks as track (track.id)}
+						<li data-testid="favorite-item" data-id={track.id}>
+							<button type="button" onclick={() => selectTrack(track.id)}>
+								{displayTitle(track)}
+								{#if displayArtist(track)}
+									<span> — {displayArtist(track)}</span>
+								{/if}
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
+
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
 			<p><a href="/library/import">Import an NZB</a></p>
@@ -172,6 +239,15 @@
 							{#if displayArtist(track)}
 								<span> — {displayArtist(track)}</span>
 							{/if}
+						</button>
+						<button
+							type="button"
+							class="nt-library-star"
+							aria-pressed={favoriteIds.has(track.id)}
+							aria-label={starLabel(track)}
+							onclick={() => toggleFavorite(track.id)}
+						>
+							<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
 						</button>
 					</li>
 				{/each}
@@ -210,12 +286,24 @@
 
 <style>
 	.nt-library-item {
+		display: flex;
+		align-items: center;
 		padding: 0;
 	}
 	.nt-library-row {
 		display: block;
+		flex: 1 1 auto;
 		width: 100%;
 		text-align: left;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.nt-library-star {
+		flex: 0 0 auto;
 		background: none;
 		border: 0;
 		padding: 0.5rem 0.75rem;
