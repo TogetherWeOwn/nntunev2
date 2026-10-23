@@ -87,7 +87,7 @@ describe('fail-soft device storage', () => {
 describe('element-only sound application', () => {
 	it('preserves zero/mute and leaves transport, rate, time and gain alone', () => {
 		const element = { volume: 1, muted: false, paused: true, currentTime: 5, playbackRate: 1.5, gain: 0.7, play: vi.fn() };
-		expect(applySoundPreference(element, { volume: 0, muted: true })).toEqual({ volume: 0, muted: true, volumeRestricted: false });
+		expect(applySoundPreference(element, { volume: 0, muted: true })).toEqual({ volume: 0, muted: true, restricted: false });
 		expect(element).toMatchObject({ volume: 0, muted: true, paused: true, currentTime: 5, playbackRate: 1.5, gain: 0.7 });
 		expect(element.play).not.toHaveBeenCalled();
 	});
@@ -103,11 +103,11 @@ describe('element-only sound application', () => {
 
 	it.each(['throw', 'ignore'])('reports actual volume for a setter that will %s, still applies mute', (mode) => {
 		const element = { get volume() { return 1; }, set volume(_v: number) { if (mode === 'throw') throw new Error('unsupported'); }, muted: false };
-		expect(applySoundPreference(element, { volume: 0.35, muted: true })).toEqual({ volume: 1, muted: true, volumeRestricted: true });
+		expect(applySoundPreference(element, { volume: 0.35, muted: true })).toEqual({ volume: 1, muted: true, restricted: true });
 	});
 
 	it('tolerates a restricted mute setter independently of volume', () => {
 		const element = { volume: 1, get muted() { return false; }, set muted(_v: boolean) { throw new Error('unsupported'); } };
-		expect(applySoundPreference(element, { volume: 0.35, muted: true })).toEqual({ volume: 0.35, muted: false, volumeRestricted: false });
+		expect(applySoundPreference(element, { volume: 0.35, muted: true })).toEqual({ volume: 0.35, muted: false, restricted: false });
 	});
 });

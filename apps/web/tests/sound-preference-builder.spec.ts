@@ -18,7 +18,7 @@ for (const mode of ['throw', 'ignore']) {
 		await expectSound(page, 1, false);
 		await expect(volumeControl(page)).toHaveValue('100');
 		await expect(volumeControl(page)).toBeDisabled();
-		await expect(page.getByRole('status').filter({ hasText: 'Volume is controlled by your device.' })).toBeVisible();
+		await expect(page.getByRole('status').filter({ hasText: "Use system volume controls." })).toBeVisible();
 		expect(await playCount(page)).toBe(0);
 		await muteControl(page).click();
 		await expectSound(page, 1, true);

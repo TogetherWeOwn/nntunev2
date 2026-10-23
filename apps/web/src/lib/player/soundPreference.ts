@@ -12,10 +12,11 @@ function defaults(): SoundPreference {
 }
 
 function validSound(value: unknown): value is SoundPreference {
-	if (typeof value !== 'object' || value === null) return false;
+	if (typeof value !== 'object' || !value) return false;
 	const sound = value as Partial<SoundPreference>;
-	return typeof sound.volume === 'number' && Number.isFinite(sound.volume) &&
-		sound.volume >= 0 && sound.volume <= 1 && typeof sound.muted === 'boolean';
+	// The closed interval also rejects NaN and both infinities.
+	return typeof sound.volume === 'number' && sound.volume >= 0 &&
+		sound.volume <= 1 && typeof sound.muted === 'boolean';
 }
 
 export function parseSoundPreference(raw: string | null): SoundPreference {
@@ -55,7 +56,7 @@ export function saveSoundPreference(storage: SoundStorage, value: SoundPreferenc
 export function applySoundPreference(
 	element: Pick<HTMLMediaElement, 'volume' | 'muted'>,
 	preference: SoundPreference
-): SoundPreference & { volumeRestricted: boolean } {
+): SoundPreference & { restricted: boolean } {
 	try {
 		if (element.volume !== preference.volume) element.volume = preference.volume;
 	} catch {
@@ -69,6 +70,6 @@ export function applySoundPreference(
 	return {
 		volume: element.volume,
 		muted: element.muted,
-		volumeRestricted: element.volume !== preference.volume
+		restricted: element.volume !== preference.volume
 	};
 }
