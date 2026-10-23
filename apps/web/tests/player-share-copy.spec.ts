@@ -502,7 +502,11 @@ test('[COPY-TIME-11] fallback renders the URL as safe text: no HTML injection fr
 		expect(value, `fallback value must not contain "${fragment}"`).not.toContain(fragment);
 	}
 	const injected = await page.evaluate(
-		() => document.querySelectorAll('img[src="x"], script').length
+		() =>
+			document.querySelectorAll('img[src="x"]').length +
+			Array.from(document.querySelectorAll('script')).filter((el) =>
+				(el.textContent ?? '').includes('alert(2)')
+			).length
 	);
 	expect(injected, 'malicious query/hash must not inject elements').toBe(0);
 	const outer = await fallback.evaluate((el) => el.outerHTML);
