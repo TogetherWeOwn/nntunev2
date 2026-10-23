@@ -9,6 +9,62 @@
 
 	let { children }: LayoutProps = $props();
 
+	type Appearance = 'system' | 'light' | 'dark';
+
+	// Device-local appearance choice. Only the raw validated enum is ever
+	// stored — no identity, no backend contact. Missing, malformed or
+	// unreadable storage means System, which follows the OS.
+	const APPEARANCE_KEY = 'nntune:appearance:v1';
+	const APPEARANCE_ATTRIBUTE = 'data-appearance';
+
+	let appearance = $state<Appearance>('system');
+
+	function readStoredAppearance(): Appearance {
+		try {
+			const raw = window.localStorage.getItem(APPEARANCE_KEY);
+			return raw === 'light' || raw === 'dark' || raw === 'system' ? raw : 'system';
+		} catch {
+			return 'system';
+		}
+	}
+
+	function applyAppearance(value: Appearance): void {
+		if (value === 'system') {
+			document.documentElement.removeAttribute(APPEARANCE_ATTRIBUTE);
+		} else {
+			document.documentElement.setAttribute(APPEARANCE_ATTRIBUTE, value);
+		}
+	}
+
+	function onAppearanceChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value as Appearance;
+		appearance = value;
+		applyAppearance(value);
+		try {
+			window.localStorage.setItem(APPEARANCE_KEY, value);
+		} catch {
+			// Storage refused: the in-memory choice still applies for this
+			// session; the next load falls back to System.
+		}
+	}
+
+	$effect(() => {
+		// Client-only ($effect never runs during SSR): restore the saved
+		// choice over the server-rendered System default, then track OS
+		// changes while System is selected. Exactly one media listener for
+		// the layout's lifetime — choices and client navigations never add
+		// more, and unmount removes it.
+		const initial = readStoredAppearance();
+		appearance = initial;
+		applyAppearance(initial);
+		const media = window.matchMedia('(prefers-color-scheme: dark)');
+		const onChange = () => {
+			if (untrack(() => appearance) === 'system') applyAppearance('system');
+		};
+		media.addEventListener('change', onChange);
+		return () => media.removeEventListener('change', onChange);
+	});
+
 	// Any 402/429 limit response from an API client lands here as a paywall
 	// modal (upgrade CTA, not a dead-end toast). See planLimit.ts.
 	let paywall = $state<PaywallModel | null>(null);
@@ -77,6 +133,15 @@
 	<link rel="manifest" href="/manifest.webmanifest" />
 	<meta name="theme-color" content="#0b0d12" />
 </svelte:head>
+
+<div class="nt-appearance nt-wrap">
+	<label for="nt-appearance-select">Appearance</label>
+	<select id="nt-appearance-select" value={appearance} onchange={onAppearanceChange}>
+		<option value="system">System</option>
+		<option value="light">Light</option>
+		<option value="dark">Dark</option>
+	</select>
+</div>
 
 {@render children()}
 
