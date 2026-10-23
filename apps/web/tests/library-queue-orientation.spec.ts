@@ -373,7 +373,7 @@ test.describe('mocked library integration', () => {
 			await expect(page.getByTestId('library-item')).toHaveCount(31);
 			// DOM events supply parent state without test-runner scrolling/focusing
 			// every row. Reveal itself below is a genuine keyboard gesture.
-			for (const item of items) await libraryRow(page, item.id).getByRole('button').dispatchEvent('click');
+			for (const item of items) await libraryRow(page, item.id).locator('button.nt-library-row').dispatchEvent('click');
 			await expect(page.getByTestId('queue-item')).toHaveCount(31);
 			for (let index = 0; index < 15; index += 1) await page.getByTestId('player-next').dispatchEvent('click');
 			await expect(currentRow(page)).toHaveAttribute('data-track-id', 'long-15');
@@ -423,7 +423,7 @@ test.describe('mocked library integration', () => {
 		await page.keyboard.press('Enter');
 		await expect(currentRow(page)).toHaveAttribute('data-track-id', MANGO.id);
 		await expect(next).toBeFocused();
-		await libraryRow(page, APPLE.id).getByRole('button').dispatchEvent('click');
+		await libraryRow(page, APPLE.id).locator('button.nt-library-row').dispatchEvent('click');
 		await expect(page.getByTestId('queue-item')).toHaveCount(3);
 		await expect(next).toBeFocused();
 		await settle(page);
