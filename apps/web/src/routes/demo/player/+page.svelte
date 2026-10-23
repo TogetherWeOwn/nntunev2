@@ -16,7 +16,12 @@
 		type LevelingTags
 	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
-	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
+	import {
+		applyMediaSession,
+		clearMediaSession,
+		setMediaSessionPosition,
+		type MediaSessionSeekDetails
+	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
@@ -572,15 +577,82 @@
 		seekCurrentResume();
 	}
 
-	// MediaSession follows the current track; queue order + current track
-	// persist for the tab session (sessionStorage, restored on mount).
+	// Scope OS callbacks and timeline events to this exact source/element.
+	// Cleanup fences retained callbacks as well as removing event listeners.
 	$effect(() => {
-		applyMediaSession(current, {
-			onNext: userNext,
-			onPrevious: userPrevious,
-			onPlay: () => playCurrent(),
-			onPause: pauseCurrent
+		const track = current;
+		const el = audioEl;
+		const revision = sourceRevision;
+		let active = true;
+		const isCurrent = () =>
+			active && current === track && audioEl === el && sourceRevision === revision &&
+			!!el && endedForCurrent(el, track?.streamUrl);
+		const publishPosition = () => {
+			if (!isCurrent() || !el) return;
+			setMediaSessionPosition({
+				duration: el.duration,
+				position: el.currentTime,
+				playbackRate: el.playbackRate
+			});
+		};
+		const seek = (details: MediaSessionSeekDetails, direction: -1 | 0 | 1) => {
+			if (!isCurrent() || !el) return;
+			const duration = el.duration;
+			if (!Number.isFinite(duration) || duration <= 0) return;
+			let target: number;
+			if (direction === 0) {
+				const time = details?.seekTime;
+				if (typeof time !== 'number' || !Number.isFinite(time) || time < 0) return;
+				target = time;
+			} else {
+				const offset = details?.seekOffset === undefined ? 10 : details.seekOffset;
+				if (
+					typeof offset !== 'number' || !Number.isFinite(offset) || offset <= 0 ||
+					!Number.isFinite(el.currentTime)
+				) return;
+				target = el.currentTime + direction * offset;
+			}
+			try {
+				el.currentTime = Math.min(duration, Math.max(0, target));
+				// Seeking to the end must not synthesize natural completion and
+				// advance the queue/start radio, including while play() is pending.
+				if (target >= duration) pauseCurrent();
+			} catch {
+				// Some resources reject a seek despite having loaded metadata.
+				return;
+			}
+			publishPosition();
+		};
+		applyMediaSession(track, {
+			onNext: () => {
+				if (isCurrent()) userNext();
+			},
+			onPrevious: () => {
+				if (isCurrent()) userPrevious();
+			},
+			onPlay: () => {
+				if (isCurrent()) playCurrent();
+			},
+			onPause: () => {
+				if (isCurrent()) pauseCurrent();
+			},
+			onSeekTo: (details) => seek(details, 0),
+			onSeekForward: (details) => seek(details, 1),
+			onSeekBackward: (details) => seek(details, -1)
 		});
+		const events = ['loadedmetadata', 'durationchange', 'timeupdate', 'seeked', 'ratechange'];
+		for (const event of events) el?.addEventListener(event, publishPosition);
+		// Clear first on a track change; metadata may already be available if
+		// the source came from cache, otherwise its events repopulate state.
+		publishPosition();
+		return () => {
+			active = false;
+			for (const event of events) el?.removeEventListener(event, publishPosition);
+		};
+	});
+
+	// Queue order + current track persist for the tab session.
+	$effect(() => {
 		if (restored) {
 			try {
 				sessionStorage.setItem(QUEUE_STORAGE_KEY, serializeQueue(queue));
