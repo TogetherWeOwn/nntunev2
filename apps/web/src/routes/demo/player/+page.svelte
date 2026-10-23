@@ -649,10 +649,11 @@
 	function togglePlayShortcut(): void {
 		if (status === 'playing' || status === 'loading') pauseCurrent();
 		else {
-			// A play-press records the current track; pause records nothing
-			// and a resumed press dedupes to the single entry.
-			playCurrent();
-			recordRecent(current?.id);
+			// Snapshot before playCurrent changes status to loading: an
+			// error-state press retries without recording another play.
+			const retry = status === 'error';
+			playCurrent(retry);
+			if (!retry) recordRecent(current?.id);
 		}
 	}
 
@@ -778,8 +779,9 @@
 			onNext: userNext,
 			onPrevious: userPrevious,
 			onPlay: () => {
-				playCurrent();
-				recordRecent(current?.id);
+				const retry = status === 'error';
+				playCurrent(retry);
+				if (!retry) recordRecent(current?.id);
 			},
 			onPause: pauseCurrent
 		});
