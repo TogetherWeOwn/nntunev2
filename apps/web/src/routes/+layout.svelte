@@ -22,7 +22,8 @@
 	function readStoredAppearance(): Appearance {
 		try {
 			const raw = window.localStorage.getItem(APPEARANCE_KEY);
-			return raw === 'light' || raw === 'dark' || raw === 'system' ? raw : 'system';
+			// 'system' (or anything else unknown) falls through to the default.
+			return raw === 'light' || raw === 'dark' ? raw : 'system';
 		} catch {
 			return 'system';
 		}
