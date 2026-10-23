@@ -86,8 +86,8 @@ def test_non_positive_budget_rejected() -> None:
 
 
 def test_pinned_budget_covers_current_build() -> None:
-    """The pinned budget must leave headroom over a 229,997 B bundle."""
-    assert BUDGET_CLIENT_JS_BYTES > 229_997, BUDGET_CLIENT_JS_BYTES
+    """The pinned budget must leave headroom over a 232,233 B bundle."""
+    assert BUDGET_CLIENT_JS_BYTES > 232_233, BUDGET_CLIENT_JS_BYTES
 
 
 def test_pinned_budget_value_unchanged() -> None:

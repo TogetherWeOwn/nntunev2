@@ -33,8 +33,8 @@ measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
 (`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
-procedure — that script is the single source of truth. Baseline was 229,997 B
-(~225 KiB, 36 files) on 2026-10-23, leaving ~33% headroom for framework
+procedure — that script is the single source of truth. Baseline was 232,233 B
+(~227 KiB, 36 files) on 2026-10-23, leaving ~32% headroom for framework
 upgrades while catching heavy additions (a charting or date library typically
 adds 50+ KiB).
 
