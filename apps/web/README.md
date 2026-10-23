@@ -38,6 +38,14 @@ procedure — that script is the single source of truth. Baseline was 176,417 B
 upgrades while catching heavy additions (a charting or date library typically
 adds 50+ KiB).
 
+Production builds run a build-only Terser compression pass in Vite's
+`renderChunk` hook, alongside the default Oxc minification. This happens before
+chunk content hashes are finalized and supplies a source map for composition.
+It uses safe ES2020 compression, without property mangling or unsafe transforms;
+application features and the raw-byte gate remain unchanged. Verify the result
+with `pnpm --dir apps/web build` followed by
+`python3 .github/scripts/check_web_bundle_budget.py` from the repository root.
+
 To update the budget deliberately, in its own PR: rebuild, confirm the growth
 is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
 with a comment citing the reason, and update the number in this paragraph.
