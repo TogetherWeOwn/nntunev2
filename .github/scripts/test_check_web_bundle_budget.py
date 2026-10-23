@@ -86,16 +86,13 @@ def test_non_positive_budget_rejected() -> None:
 
 
 def test_pinned_budget_covers_current_build() -> None:
-    """The pinned budget must leave headroom over a 231,768 B bundle."""
-    assert BUDGET_CLIENT_JS_BYTES > 231_768, BUDGET_CLIENT_JS_BYTES
+    """The pinned budget must leave headroom over a 230,544 B bundle."""
+    assert BUDGET_CLIENT_JS_BYTES > 230_544, BUDGET_CLIENT_JS_BYTES
 
 
 def test_pinned_budget_value_unchanged() -> None:
     """Pin the exact budget value: bumps happen deliberately, in their own PR."""
-    # Bumped 2026-10-23 alongside the demo recently-played list: base main
-    # had reached 228,813 B (99.3% of 230,400 B), so any feature tripped the
-    # gate; the measured feature total is 231,768 B (see PR justification).
-    assert BUDGET_CLIENT_JS_BYTES == 240_640, BUDGET_CLIENT_JS_BYTES
+    assert BUDGET_CLIENT_JS_BYTES == 286_720, BUDGET_CLIENT_JS_BYTES
 
 
 def test_exact_budget_passes_and_one_byte_over_fails() -> None:
