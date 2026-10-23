@@ -1327,20 +1327,26 @@ mod tests {
     #[test]
     fn staging_id_is_deterministic_and_content_sensitive() {
         const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
-        let first = derive_transcode_staging(SHA, INPUT).unwrap();
-        assert_eq!(first.len(), 64);
-        assert_eq!(derive_transcode_staging(SHA, INPUT).unwrap(), first);
-        // Uppercase spelling of the same hash derives the same id.
+        let first = derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap();
+        // Independent SHA-256 fixture for the specified v2 domain and scope.
         assert_eq!(
-            derive_transcode_staging(&SHA.to_ascii_uppercase(), INPUT).unwrap(),
+            first,
+            "64e7ca9681a8c87e6d2acc5629774dcdfd27387c9b64b71d81273e075f923a9e"
+        );
+        assert_eq!(
+            derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap(),
             first
         );
-        // Any byte change — or a re-staging under a new key — mints a
-        // different id, so replays bind to exact bytes.
+        assert_eq!(
+            derive_transcode_staging(&SHA.to_ascii_uppercase(), INPUT, JOB, PREFIX).unwrap(),
+            first
+        );
         assert_ne!(
             derive_transcode_staging(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                INPUT
+                INPUT,
+                JOB,
+                PREFIX,
             )
             .unwrap(),
             first
@@ -1348,12 +1354,98 @@ mod tests {
         assert_ne!(
             derive_transcode_staging(
                 SHA,
-                "0008-9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734"
+                "0008-9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+                JOB,
+                PREFIX,
             )
             .unwrap(),
             first
         );
-        assert!(derive_transcode_staging("short", INPUT).is_err());
+    }
+
+    #[test]
+    fn staging_id_separates_jobs_with_valid_matching_prefixes_and_rounds() {
+        const SHA: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        let first = derive_transcode_staging(SHA, INPUT, JOB, PREFIX).unwrap();
+        let other_job =
+            derive_transcode_staging(SHA, INPUT, "job_OTHER", "ingest-scratch/job_OTHER/r1/")
+                .unwrap();
+        assert_eq!(
+            other_job,
+            "1dde7b664004ae89588f5a23862a6c0bb5dbd4d9d6b1a25ecec95487bee1bee2"
+        );
+        let other_round =
+            derive_transcode_staging(SHA, INPUT, JOB, "ingest-scratch/job_01J9ZQ8K2M/r2/").unwrap();
+        assert_eq!(
+            other_round,
+            "e1e734e2df252e228387255e6008ff79cf1b6c84d2d66b1c29d92827bd991cde"
+        );
+        assert_ne!(first, other_job);
+        assert_ne!(first, other_round);
+        assert_ne!(other_job, other_round);
+    }
+
+    #[test]
+    fn staging_id_rejects_invalid_source_key_job_and_prefix() {
+        for sha in ["", "short", &"z".repeat(64)] {
+            assert!(derive_transcode_staging(sha, INPUT, JOB, PREFIX).is_err());
+        }
+        for key in ["", "../input", "0007-short", "0007/invalid", STAGING] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, key, JOB, PREFIX).is_err(),
+                "key {key}"
+            );
+        }
+        for job in ["", "bad job!", "../job", "job/other"] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, INPUT, job, PREFIX).is_err(),
+                "job {job}"
+            );
+        }
+        for prefix in [
+            "",
+            "ingest-scratch/",
+            "ingest-scratch/job_OTHER/r1/",
+            "ingest-scratch/job_01J9ZQ8K2M/r1",
+            "ingest-scratch/job_01J9ZQ8K2M/r1:/",
+            "ingest-scratch/job_01J9ZQ8K2M/r1 /",
+        ] {
+            assert!(
+                derive_transcode_staging(SOURCE_SHA, INPUT, JOB, prefix).is_err(),
+                "prefix {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_derives_staging_from_the_recorded_job_and_verify_round() {
+        let source = include_str!("queue_consumer.rs");
+        let start = source.find("async fn run_transcode_step_with<").unwrap();
+        let function = &source[start..];
+        let end = function[10..]
+            .find("async fn ")
+            .map(|offset| offset + 10)
+            .unwrap_or(function.len());
+        let function = function[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            function.contains("crate::transcode::derive_transcode_staging( &input.sha256, input_key, &msg.job_id, &input.scratch_prefix, )"),
+            "queue caller must derive from the recorded job and scratch prefix, not a reconstructed default round"
+        );
+    }
+
+    #[test]
+    fn stored_marker_fault_retries_but_request_size_fault_is_permanent() {
+        assert_eq!(
+            classify_transcode_reply(500, br#"{"error":"transcode_unavailable"}"#),
+            TranscodeCall::Retry,
+        );
+        assert_eq!(
+            classify_transcode_reply(413, br#"{"error":"payload_too_large"}"#),
+            TranscodeCall::Untranscodable,
+        );
     }
 
     #[test]
