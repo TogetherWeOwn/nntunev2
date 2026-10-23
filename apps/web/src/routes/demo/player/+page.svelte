@@ -11,6 +11,17 @@
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
+	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
+	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
+	import { parseTimestampParam } from '#lib/player/shareTimestamp.js';
+	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
+	import {
+		actionForKey,
+		isModalOpen,
+		isTypingTarget,
+		SEEK_SECONDS,
+		SHORTCUT_ROWS
+	} from '#lib/player/shortcuts.js';
 	import {
 		addTrack,
 		clearQueue,
@@ -40,6 +51,10 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
+	let muted = $state(false);
+	let shortcutsOpen = $state(false);
+	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
+	let shortcutsOpener: HTMLElement | null = null;
 
 	/**
 	 * Auto-continue radio: a seeded pass over the loaded catalogue that
@@ -82,11 +97,123 @@
 		if (current && status !== 'error' && status !== 'ended') status = 'paused';
 	}
 
+	// Player comforts: sleep timer, playback speed, per-track resume.
+	let sleepMode = $state<SleepTimerMode | null>(null);
+	let sleepAnnouncement = $state('Sleep timer off');
+	let minutesEl: HTMLInputElement | undefined = $state();
+	let tracksEl: HTMLInputElement | undefined = $state();
+	let speedValue = $state('1');
+	let speed: PlaybackSpeed | null = null;
+	let resumeStore: ResumeStore | null = null;
+
+	// The test hook advances the same clock the live interval ticks, so
+	// duration paths stay deterministic without a second timer.
+	let clockOffset = 0;
+	const sleepTimer = createSleepTimer({
+		now: () => Date.now() + clockOffset,
+		onFire: () => {
+			sleepMode = null;
+			sleepAnnouncement = 'Sleep timer fired — playback paused';
+			pauseCurrent();
+		}
+	});
+
+	function armDuration(): void {
+		const raw = minutesEl?.value.trim() ?? '';
+		const minutes = Number(raw);
+		if (!Number.isFinite(minutes) || minutes <= 0) return;
+		sleepTimer.start({ kind: 'duration', ms: minutes * 60_000 });
+		sleepMode = sleepTimer.mode;
+		sleepAnnouncement = `Sleep in ${raw} minutes`;
+	}
+
+	function armEndOfTrack(): void {
+		sleepTimer.start({ kind: 'end-of-track' });
+		sleepMode = sleepTimer.mode;
+		sleepAnnouncement = 'Sleep at end of track';
+	}
+
+	function armStopAfter(): void {
+		const count = Number(tracksEl?.value.trim() ?? '');
+		if (!Number.isInteger(count) || count < 1) return;
+		sleepTimer.start({ kind: 'stop-after-tracks', count });
+		sleepMode = sleepTimer.mode;
+		sleepAnnouncement = `Sleep after ${count} tracks`;
+	}
+
+	function cancelSleep(): void {
+		sleepTimer.cancel();
+		sleepMode = null;
+		sleepAnnouncement = 'Sleep timer off';
+	}
+
+	/** Drive the real armed duration timer forward; the smoke-test hook. */
+	function advanceSleep(ms: number): void {
+		clockOffset += ms;
+		sleepTimer.tick();
+	}
+
+	function handleSpeedChange(value: string): void {
+		speedValue = value;
+		speed?.set(Number(value));
+	}
+
+	/** In-memory Storage stand-in when the browser blocks site storage. */
+	function memoryStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+		const entries = new Map<string, string>();
+		return {
+			getItem: (key) => entries.get(key) ?? null,
+			setItem: (key, value) => {
+				entries.set(key, String(value));
+			},
+			removeItem: (key) => {
+				entries.delete(key);
+			}
+		};
+	}
+
+	/** Persist the outgoing track's latest position (zero means never started). */
+	function persistPosition(
+		trackId: string | undefined,
+		element: HTMLAudioElement | undefined = audioEl
+	): void {
+		if (!trackId || !resumeStore) return;
+		// An ended node carries the finished position: persisting it would
+		// resurrect the entry handleEnded just cleared.
+		if (element?.ended) return;
+		const position = element?.currentTime;
+		if (typeof position !== 'number' || !Number.isFinite(position) || position <= 0) return;
+		resumeStore.save(trackId, position);
+	}
+
+	/** Seek to a track's saved resume position after the element swap lands. */
+	function seekToResume(trackId: string): void {
+		void tick().then(() => {
+			if (current?.id !== trackId) return;
+			const element = audioEl;
+			if (!element || !resumeStore) return;
+			const saved = resumeStore.positionFor(trackId);
+			if (saved === null) return;
+			try {
+				element.currentTime = saved;
+			} catch {
+				// The element is not seekable yet; keep playing from the start.
+			}
+		});
+	}
+
+	function seekCurrentResume(): void {
+		if (current) seekToResume(current.id);
+	}
+
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
-	function releaseAudio(node: HTMLAudioElement) {
+	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
 		return {
 			destroy() {
+				// The action tears down on every swap and on unmount, before
+				// the source unloads: persist from this node while it holds time.
+				persistPosition(trackId, node);
 				node.pause();
 				node.removeAttribute('src');
 				node.load();
@@ -193,11 +320,35 @@
 		playCurrent();
 	}
 
+	// Explicit navigation persists the outgoing track's position and seeks
+	// the incoming track to its saved one. Natural `ended` advances go
+	// through goNext directly: the ended track is cleared, not persisted.
+	function userNext(): void {
+		const outgoingId = current?.id;
+		persistPosition(outgoingId);
+		goNext();
+		if (current?.id !== outgoingId) seekCurrentResume();
+	}
+
+	function userPrevious(): void {
+		const outgoingId = current?.id;
+		persistPosition(outgoingId);
+		goPrevious();
+		if (current?.id !== outgoingId) seekCurrentResume();
+	}
+
 	function selectAt(index: number): void {
+		const next = selectTrack(queue, index);
+		const nextId = next.tracks[next.currentIndex]?.id;
+		// Keep live progress on reselection; a never-started element can
+		// still load a seeded resume entry under the selection contract.
+		const shouldResume = nextId !== current?.id || !audioEl?.currentTime;
+		if (nextId !== undefined && nextId !== current?.id) persistPosition(current?.id);
 		// An explicit pick leaves radio: the queue resumes from the picked track.
 		radio = null;
-		queue = selectTrack(queue, index);
+		queue = next;
 		playCurrent();
+		if (nextId !== undefined && shouldResume) seekToResume(nextId);
 	}
 
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
@@ -205,7 +356,10 @@
 		queue = addTrack(queue, track);
 		// The first add to an empty queue makes it current: start it like any
 		// other track change instead of showing a track that never plays.
-		if (wasEmpty) playCurrent();
+		if (wasEmpty) {
+			playCurrent();
+			seekCurrentResume();
+		}
 	}
 
 	function clearAll(): void {
@@ -215,30 +369,117 @@
 		void playback.unload();
 	}
 
+	async function openShortcuts(): Promise<void> {
+		if (shortcutsOpen) return;
+		shortcutsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		shortcutsOpen = true;
+		await tick();
+		// Native modality moves focus to Close and makes the background inert.
+		if (shortcutsOpen) shortcutsDialogEl?.showModal();
+	}
+
+	function closeShortcuts(): void {
+		shortcutsDialogEl?.close();
+		shortcutsOpen = false;
+		shortcutsOpener?.focus();
+	}
+
+	function togglePlayShortcut(): void {
+		if (status === 'playing' || status === 'loading') pauseCurrent();
+		else playCurrent();
+	}
+
+	function seekShortcut(deltaSeconds: number): void {
+		const el = audioEl;
+		if (!el) return;
+		const max = Number.isFinite(el.duration) ? el.duration : Number.POSITIVE_INFINITY;
+		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
+	}
+
+	// Mute lives in player state, not on the element: the keyed <audio>
+	// is recreated on every track change, and native controls can mute
+	// behind the shortcut's back. The effect re-applies state to each
+	// new element; volumechange absorbs native-side changes.
+	$effect(() => {
+		if (audioEl) audioEl.muted = muted;
+	});
+
+	function handleVolumeChange(event: Event): void {
+		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	}
+
+	function toggleMuteShortcut(): void {
+		muted = !muted;
+		if (audioEl) audioEl.muted = muted;
+	}
+
+	// Global transport keymap. Escape closes our dialog first so a modal
+	// guard can never wedge it; every other binding yields to typing
+	// surfaces, open modals and modified chords. No preventDefault: the
+	// map holds only keys with no page-level default to suppress.
+	function handleGlobalKeydown(event: KeyboardEvent): void {
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const action = actionForKey(event.key);
+		if (!action) return;
+		if (action === 'close-shortcuts') {
+			if (shortcutsOpen) closeShortcuts();
+			return;
+		}
+		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		switch (action) {
+			case 'toggle-play':
+				togglePlayShortcut();
+				break;
+			case 'next-track':
+				goNext();
+				break;
+			case 'previous-track':
+				goPrevious();
+				break;
+			case 'seek-back':
+				seekShortcut(-SEEK_SECONDS);
+				break;
+			case 'seek-forward':
+				seekShortcut(SEEK_SECONDS);
+				break;
+			case 'toggle-mute':
+				toggleMuteShortcut();
+				break;
+			case 'open-shortcuts':
+				openShortcuts();
+				break;
+		}
+	}
+
 	// `ended` is only honoured for the source the queue still points at; a
 	// late event from a superseded track must not skip the new one.
 	function handleEnded(event: Event): void {
 		if (!eventForCurrent(event) || status === 'paused' || status === 'ended') return;
+		const endedId = current?.id ?? null;
+		const fired = sleepTimer.trackEnded();
+		// A finished track never resumes mid-way, whether the timer fired or
+		// the queue advances.
+		if (endedId !== null) resumeStore?.clear(endedId);
+		// A fired timer already paused via onFire; the queue stays untouched.
+		if (fired) return;
 		// Only a natural end starts radio: explicit Next past the end stops
 		// in goNext, and pause (or a stale ended while paused) never gets here.
 		if (radio) {
 			advanceRadio();
-			return;
+		} else {
+			if (!current) return;
+			if (nextTrack(queue) === queue) startRadio();
+			else goNext();
 		}
-		if (!current) return;
-		if (nextTrack(queue) === queue) {
-			startRadio();
-			return;
-		}
-		goNext();
+		seekCurrentResume();
 	}
 
 	// MediaSession follows the current track; queue order + current track
 	// persist for the tab session (sessionStorage, restored on mount).
 	$effect(() => {
 		applyMediaSession(current, {
-			onNext: goNext,
-			onPrevious: goPrevious,
+			onNext: userNext,
+			onPrevious: userPrevious,
 			onPlay: () => playCurrent(),
 			onPause: pauseCurrent
 		});
@@ -275,22 +516,85 @@
 		};
 	}
 
+	// A swapped-in element starts at 1x: re-apply the persisted speed.
+	$effect(() => {
+		audioEl;
+		speed?.apply();
+	});
+
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
+		(window as unknown as { __comforts?: { advanceSleep: typeof advanceSleep } }).__comforts = {
+			advanceSleep
+		};
+		// Reading `localStorage` itself can throw when site storage is
+		// blocked (cookie block, sandboxed iframe). Fall back to memory so
+		// the rest of setup — queue restore, share links, the tick clock —
+		// still runs; speed/resume then work for this page view only.
+		let store: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+		try {
+			store = localStorage;
+		} catch {
+			store = memoryStorage();
+		}
+		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
+		speedValue = String(speed.current());
+		speed.apply();
+		resumeStore = createResumeStore({ storage: store });
 		try {
 			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
 		} catch {
 			// Keep the fixture queue when storage is unavailable.
 		}
+		// Share links select the track and seek to `t` (plain seconds or
+		// clock forms); an unparsable `t` starts at 0, an unknown track
+		// keeps the default queue.
+		const params = new URLSearchParams(window.location.search);
+		const sharedId = params.get('track');
+		const shared = DEMO_TRACKS.find((track) => track.id === sharedId);
+		if (shared !== undefined) {
+			let index = queue.tracks.findIndex((track) => track.id === shared.id);
+			if (index < 0) {
+				// A restored-but-empty queue (or one missing the track) must
+				// not swallow a valid link: re-add the track, then select it.
+				queue = addTrack(queue, shared);
+				index = queue.tracks.length - 1;
+			}
+			queue = selectTrack(queue, index);
+			const startAt = parseTimestampParam(params.get('t')) ?? 0;
+			void tick().then(() => {
+				if (current?.id !== shared.id || !audioEl) return;
+				try {
+					audioEl.currentTime = startAt;
+				} catch {
+					// The element is not seekable yet; it starts at 0.
+				}
+			});
+		}
 		status = current ? 'selected' : 'empty';
 		restored = true;
+		// An ordinary reload restores the queue but mounts a fresh element
+		// at zero: resume the selected track's saved position. Share links
+		// already sought above and stay authoritative.
+		if (shared === undefined && current) seekToResume(current.id);
+		const tickId = setInterval(() => {
+			sleepTimer.tick();
+		}, 500);
+		// A reload never runs the destroy path: persist the live position
+		// on hide so resume survives it.
+		const persistOnPageHide = () => persistPosition(current?.id);
+		window.addEventListener('pagehide', persistOnPageHide);
 		// OS media controls are global: release them when the page goes away.
 		return () => {
+			window.removeEventListener('pagehide', persistOnPageHide);
+			clearInterval(tickId);
 			clearMediaSession();
 		};
 	});
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <main class="nt-wrap">
 	<h1>Player resilience demo</h1>
@@ -345,7 +649,7 @@
 	{#key `${current?.streamUrl}:${sourceRevision}`}
 		<audio
 			bind:this={audioEl}
-			use:releaseAudio
+			use:releaseAudio={current?.id}
 			data-testid="demo-audio"
 			src={current?.streamUrl}
 			preload="metadata"
@@ -355,17 +659,43 @@
 			onpause={handlePause}
 			onerror={handleError}
 			onended={handleEnded}
+			onvolumechange={handleVolumeChange}
 		></audio>
 	{/key}
 
 	<div>
-		<button type="button" data-testid="player-prev" onclick={goPrevious} disabled={!current}>
+		<button type="button" data-testid="player-prev" onclick={userPrevious} disabled={!current}>
 			Previous
 		</button>
-		<button type="button" data-testid="player-next" onclick={goNext} disabled={!current}>
+		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
+			Keyboard shortcuts
+		</button>
 	</div>
+
+	{#if shortcutsOpen}
+		<dialog
+			bind:this={shortcutsDialogEl}
+			data-testid="shortcuts-dialog"
+			aria-label="Keyboard shortcuts"
+			oncancel={(event) => {
+				event.preventDefault();
+				closeShortcuts();
+			}}
+		>
+			<h2>Keyboard shortcuts</h2>
+			<ul>
+				{#each SHORTCUT_ROWS as row (row.key)}
+					<li><kbd>{row.key}</kbd> {row.label}</li>
+				{/each}
+			</ul>
+			<button type="button" data-testid="shortcuts-close" onclick={closeShortcuts}>
+				Close
+			</button>
+		</dialog>
+	{/if}
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
@@ -425,6 +755,72 @@
 				</li>
 			{/each}
 		</ul>
+	</section>
+
+	<section data-testid="comforts-panel" aria-label="Player comforts">
+		<h2>Comforts</h2>
+		<div>
+			<label for="sleep-minutes">Sleep timer (minutes)</label>
+			<input
+				id="sleep-minutes"
+				type="number"
+				min="1"
+				value="15"
+				data-testid="sleep-timer-minutes"
+				bind:this={minutesEl}
+			/>
+			<button type="button" data-testid="sleep-timer-set-duration" onclick={armDuration}>
+				Sleep after duration
+			</button>
+		</div>
+		<div>
+			<button type="button" data-testid="sleep-timer-set-end-of-track" onclick={armEndOfTrack}>
+				Sleep at end of track
+			</button>
+		</div>
+		<div>
+			<label for="sleep-tracks">Stop after tracks</label>
+			<input
+				id="sleep-tracks"
+				type="number"
+				min="1"
+				step="1"
+				value="2"
+				data-testid="sleep-timer-tracks"
+				bind:this={tracksEl}
+			/>
+			<button type="button" data-testid="sleep-timer-set-stop-after" onclick={armStopAfter}>
+				Sleep after N tracks
+			</button>
+		</div>
+		<div>
+			<button
+				type="button"
+				data-testid="sleep-timer-cancel"
+				disabled={sleepMode === null}
+				onclick={cancelSleep}
+			>
+				Cancel sleep timer
+			</button>
+		</div>
+		<p data-testid="sleep-timer-status" aria-live="polite">{sleepAnnouncement}</p>
+		<div>
+			<label for="playback-speed">Playback speed</label>
+			<select
+				id="playback-speed"
+				data-testid="playback-speed"
+				value={speedValue}
+				onchange={(event) => handleSpeedChange(event.currentTarget.value)}
+			>
+				<option value="0.5">0.5x</option>
+				<option value="0.75">0.75x</option>
+				<option value="1">1x</option>
+				<option value="1.25">1.25x</option>
+				<option value="1.5">1.5x</option>
+				<option value="1.75">1.75x</option>
+				<option value="2">2x</option>
+			</select>
+		</div>
 	</section>
 
 	<button type="button" data-testid="seek-storm" onclick={() => void seekStorm()}>
