@@ -63,7 +63,9 @@ import { expect, test, type Page } from '@playwright/test';
  * keeps history, RP-B-11 replay, RP-B-12 replay keyboard, RP-B-13 Clear,
  * RP-B-14 corrupt storage, RP-B-15 reload persistence, RP-B-16 cap,
  * RP-B-17 demo-only, RP-B-18 zero backend calls, RP-B-19 pause,
- * RP-B-20 comforts, RP-B-21 radio completion.
+ * RP-B-20 comforts, RP-B-21 radio completion, RP-B-22 keyboard retry,
+ * RP-B-23 MediaSession retry, RP-B-24 explicit MediaSession play,
+ * RP-B-25 native play, RP-B-26 keyboard Next/Previous and resume.
  */
 
 const STORAGE_KEY = 'nntune:demo-recently-played:v1';
@@ -492,4 +494,243 @@ test('RP-B-21 completing a radio track records it; radio behavior is untouched',
 
 	await expect(page.getByTestId('radio-badge')).toContainText('Radio');
 	expect(await recentIds(page)).toContain(radioId as string);
+});
+
+type ReviewMedia = {
+	mode: 'resolve' | 'reject';
+	handlers: Map<MediaSessionAction, MediaSessionActionHandler | null>;
+};
+
+async function openReviewPlayer(page: Page): Promise<void> {
+	await page.clock.setFixedTime(new Date('2026-01-01T12:00:00Z'));
+	await page.addInitScript(() => {
+		const control: ReviewMedia = { mode: 'resolve', handlers: new Map() };
+		Object.assign(window, { __recentReviewMedia: control });
+		HTMLMediaElement.prototype.play = function () {
+			return control.mode === 'reject'
+				? Promise.reject(new Error('fixture autoplay failed'))
+				: Promise.resolve();
+		};
+		HTMLMediaElement.prototype.pause = function () {};
+		navigator.mediaSession.setActionHandler = (action, handler) => {
+			control.handlers.set(action, handler);
+		};
+	});
+	await page.route('**/api/demo/audio**', () => {});
+	await page.goto('/demo/player');
+	await expect(page.getByTestId('queue-item')).toHaveCount(3);
+}
+
+async function reviewMediaAction(page: Page, action: 'play' | 'pause'): Promise<void> {
+	await page.evaluate((name) => {
+		const control = (window as unknown as { __recentReviewMedia: ReviewMedia }).__recentReviewMedia;
+		const handler = control.handlers.get(name);
+		if (!handler) throw new Error(`missing MediaSession ${name} handler`);
+		handler({ action: name });
+	}, action);
+}
+
+async function nativePlay(page: Page): Promise<void> {
+	await page.getByTestId('demo-audio').evaluate((el) => {
+		Object.defineProperty(el, 'paused', { value: false, configurable: true });
+		Object.defineProperty(el, 'ended', { value: false, configurable: true });
+		el.dispatchEvent(new Event('play'));
+		el.dispatchEvent(new Event('playing'));
+	});
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+}
+
+async function failAutoAdvance(page: Page): Promise<void> {
+	await page.getByTestId('queue-select-demo-track').click();
+	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+	await page.evaluate(() => {
+		(window as unknown as { __recentReviewMedia: ReviewMedia }).__recentReviewMedia.mode = 'reject';
+	});
+	await naturalEnd(page);
+	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+	await expect(page.getByTestId('player-status')).toHaveText('Status: error');
+	await expect(page.getByTestId('player-error')).toBeVisible();
+	expect(await recentIds(page)).toEqual(['demo-track']);
+	expect((await storedEntries(page)).map((entry) => entry.trackId)).toEqual(['demo-track']);
+}
+
+test.describe('review regressions', () => {
+	// No retry, native control or shortcut may send history to a backend.
+	const backendCalls = new WeakMap<Page, string[]>();
+	test.beforeEach(async ({ page }) => {
+		const calls: string[] = [];
+		backendCalls.set(page, calls);
+		await page.route('**/*', async (route) => {
+			const request = route.request();
+			if (['fetch', 'xhr'].includes(request.resourceType()) || request.method() !== 'GET') {
+				calls.push(`${request.method()} ${request.url()}`);
+				await route.abort();
+			} else {
+				await route.fallback();
+			}
+		});
+	});
+	test.afterEach(async ({ page }) => {
+		expect(backendCalls.get(page), 'synthetic player flows must make zero backend calls').toEqual([]);
+	});
+
+	for (const retry of [
+		{ id: 'RP-B-22', name: 'keyboard k', action: (page: Page) => page.keyboard.press('k') },
+		{ id: 'RP-B-23', name: 'MediaSession play', action: (page: Page) => reviewMediaAction(page, 'play') }
+	]) {
+		test(`${retry.id} ${retry.name} retry of failed auto-advance preserves entries and timestamps`, async ({
+			page
+		}) => {
+			await openReviewPlayer(page);
+			await failAutoAdvance(page);
+			const before = await storedEntries(page);
+			expect(before[0]?.playedAt).toBe(new Date('2026-01-01T12:00:00Z').getTime());
+
+			// A distinct clock value catches timestamp-only rewrites as well as appends.
+			await page.clock.setFixedTime(new Date('2026-01-01T12:01:00Z'));
+			await page.evaluate(() => {
+				(window as unknown as { __recentReviewMedia: ReviewMedia }).__recentReviewMedia.mode = 'resolve';
+			});
+			await retry.action(page);
+			await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+			await nativePlay(page);
+			await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+			await expect(page.getByTestId('player-error')).toHaveCount(0);
+			expect.soft(await recentIds(page)).toEqual(['demo-track']);
+			expect(await storedEntries(page)).toEqual(before);
+		});
+	}
+
+	test('RP-B-24 non-error MediaSession play records the paused auto-advanced track', async ({ page }) => {
+		await openReviewPlayer(page);
+		await page.getByTestId('queue-select-demo-track').click();
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		await naturalEnd(page);
+		await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		expect(await recentIds(page)).toEqual(['demo-track']);
+		const before = await storedEntries(page);
+		await reviewMediaAction(page, 'pause');
+		await expect(page.getByTestId('player-status')).toHaveText('Status: paused');
+		await page.clock.setFixedTime(new Date('2026-01-01T12:01:00Z'));
+
+		await reviewMediaAction(page, 'play');
+
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		expect(await recentIds(page)).toEqual(['second-signal', 'demo-track']);
+		expect(await storedEntries(page)).toEqual([
+			{ trackId: 'second-signal', playedAt: new Date('2026-01-01T12:01:00Z').getTime() },
+			...before
+		]);
+	});
+
+	test('RP-B-25 native play from selected moves the current track ahead of a newer entry', async ({ page }) => {
+		const seeded = [
+			{ trackId: 'second-signal', playedAt: 2000 },
+			{ trackId: 'demo-track', playedAt: 1000 }
+		];
+		await page.addInitScript(({ key, entries }) => {
+			sessionStorage.setItem(key, JSON.stringify(entries));
+		}, { key: STORAGE_KEY, entries: seeded });
+		await openReviewPlayer(page);
+		await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+		await expect(page.getByTestId('player-status')).toHaveText('Status: selected');
+		expect(await recentIds(page)).toEqual(['second-signal', 'demo-track']);
+
+		await nativePlay(page);
+
+		expect(await recentIds(page)).toEqual(['demo-track', 'second-signal']);
+		expect(await storedEntries(page)).toEqual([
+			{ trackId: 'demo-track', playedAt: new Date('2026-01-01T12:00:00Z').getTime() },
+			seeded[0]
+		]);
+	});
+
+	test('RP-B-25 native play from paused records an auto-advanced track not yet in history', async ({ page }) => {
+		await openReviewPlayer(page);
+		await page.getByTestId('queue-select-demo-track').click();
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		await naturalEnd(page);
+		await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		await page.getByTestId('demo-audio').evaluate((el) => {
+			Object.defineProperty(el, 'paused', { value: true, configurable: true });
+			el.dispatchEvent(new Event('pause'));
+		});
+		await expect(page.getByTestId('player-status')).toHaveText('Status: paused');
+		expect(await recentIds(page)).toEqual(['demo-track']);
+		const before = await storedEntries(page);
+		await page.clock.setFixedTime(new Date('2026-01-01T12:01:00Z'));
+
+		await nativePlay(page);
+
+		expect(await recentIds(page)).toEqual(['second-signal', 'demo-track']);
+		expect(await storedEntries(page)).toEqual([
+			{ trackId: 'second-signal', playedAt: new Date('2026-01-01T12:01:00Z').getTime() },
+			...before
+		]);
+	});
+
+	test('RP-B-25 native play from ended records the current track after history was cleared', async ({ page }) => {
+		await openReviewPlayer(page);
+		await page.getByTestId('queue-select-third-light').click();
+		await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+		await page.getByTestId('player-next').click();
+		await expect(page.getByTestId('player-status')).toHaveText('Status: ended');
+		await page.getByTestId('recently-played-clear').click();
+		expect(await recentIds(page)).toEqual([]);
+		expect(await storedEntries(page)).toEqual([]);
+
+		await nativePlay(page);
+
+		await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+		expect(await recentIds(page)).toEqual(['third-light']);
+		expect(await storedEntries(page)).toEqual([
+			{ trackId: 'third-light', playedAt: new Date('2026-01-01T12:00:00Z').getTime() }
+		]);
+	});
+
+	for (const navigation of [
+		{ key: 'n', from: 'demo-track', fromTitle: 'Demo track' },
+		{ key: 'p', from: 'third-light', fromTitle: 'Third Light' }
+	]) {
+		test(`RP-B-26 keyboard ${navigation.key} records the new track and preserves resume across reload`, async ({ page }) => {
+			await openReviewPlayer(page);
+			await page.getByTestId(`queue-select-${navigation.from}`).click();
+			await expect(page.getByTestId('now-playing')).toContainText(navigation.fromTitle);
+			await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+			expect(await recentIds(page)).toEqual([navigation.from]);
+			await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
+				el.currentTime = 31.25;
+				el.dispatchEvent(new Event('timeupdate'));
+			});
+			await page.clock.setFixedTime(new Date('2026-01-01T12:01:00Z'));
+
+			await page.keyboard.press(navigation.key);
+
+			await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+			await expect(page.getByTestId('player-status')).toHaveText('Status: playing');
+			expect(await recentIds(page)).toEqual(['second-signal', navigation.from]);
+			const entries = await storedEntries(page);
+			expect(entries).toEqual([
+				{ trackId: 'second-signal', playedAt: new Date('2026-01-01T12:01:00Z').getTime() },
+				{ trackId: navigation.from, playedAt: new Date('2026-01-01T12:00:00Z').getTime() }
+			]);
+			expect(await page.evaluate((from) => {
+				const saved = JSON.parse(localStorage.getItem('nntune:resume:v1') ?? '{}');
+				return saved[from];
+			}, navigation.from)).toBe(31.25);
+
+			await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
+				el.currentTime = 42.5;
+				el.dispatchEvent(new Event('timeupdate'));
+			});
+			await page.reload();
+			await expect(page.getByTestId('queue-item')).toHaveCount(3);
+			await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
+			await expect.poll(() => page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => el.currentTime)).toBe(42.5);
+			expect(await recentIds(page)).toEqual(['second-signal', navigation.from]);
+			expect(await storedEntries(page)).toEqual(entries);
+		});
+	}
 });
