@@ -1,10 +1,14 @@
 <script lang="ts">
 	import { currentTrack, type QueueState } from './queue.js';
+	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 
 	interface Props {
 		state: QueueState;
 		/** Transport stays with the host page: called when Next is activated. */
 		onnext?: () => void;
+		/** Queue-only edit: the host must not restart playback. */
+		onshuffle?: () => void;
+		radioActive?: boolean;
 		/** Queue management stays with the host page too: the panel reports intent, never mutates. */
 		onmove?: (from: number, to: number) => void;
 		onplaynext?: (index: number) => void;
@@ -19,8 +23,17 @@
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
-	let { state: queue, onnext, onmove, onplaynext, onremove, onclear, announcement = '' }: Props =
-		$props();
+	let {
+		state: queue,
+		onnext,
+		onshuffle,
+		radioActive = false,
+		onmove,
+		onplaynext,
+		onremove,
+		onclear,
+		announcement = ''
+	}: Props = $props();
 
 	let current = $derived(currentTrack(queue));
 
@@ -105,6 +118,8 @@
 >
 	Show current track
 </button>
+
+<ShuffleUpcoming state={queue} {onshuffle} {radioActive} />
 
 <ol aria-label="Playback queue" bind:this={list}>
 	<!-- Stable track identity preserves keyboard focus through reorders. The

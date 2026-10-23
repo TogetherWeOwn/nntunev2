@@ -23,6 +23,7 @@
 		playNext,
 		removeTrack,
 		selectTrack as selectQueueIndex,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
@@ -218,6 +219,7 @@
 				state={queue}
 				announcement={queueAnnouncement}
 				onnext={() => replaceQueue(nextTrack(queue))}
+				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
 				onremove={(index) => replaceQueue(removeTrack(queue, index))}

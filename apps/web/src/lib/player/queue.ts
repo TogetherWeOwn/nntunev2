@@ -115,6 +115,18 @@ export function moveTrack(state: QueueState, from: number, to: number): QueueSta
 	};
 }
 
+/** One-shot Fisher–Yates over the upcoming suffix; prefix/current stay fixed. */
+export function shuffleUpcoming(state: QueueState, random: () => number = Math.random): QueueState {
+	const start = state.currentIndex + 1;
+	if (state.currentIndex < 0 || state.tracks.length - start < 2) return state;
+	const tracks = [...state.tracks];
+	for (let i = tracks.length - 1; i > start; i -= 1) {
+		const j = start + Math.floor(random() * (i - start + 1));
+		[tracks[i], tracks[j]] = [tracks[j]!, tracks[i]!];
+	}
+	return { ...state, tracks };
+}
+
 /**
  * Remove the track at `index`. The current *track* (not the slot) stays
  * current: removing ahead of it shifts the index down, removing it advances
