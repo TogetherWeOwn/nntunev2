@@ -18,7 +18,10 @@
 		clearQueue,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		moveTrack,
 		nextTrack,
+		playNext,
+		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
 		type QueueState
@@ -31,6 +34,7 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	let queueAnnouncement = $state('');
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -54,7 +58,7 @@
 					const rebuilt = createQueue(kept);
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
 			}
 		}
@@ -92,12 +96,36 @@
 		// No stream URL until the streaming slice: playback wiring is out of
 		// scope, so the queue carries library display fields only. addTrack
 		// dedupes, so re-selecting a queued row is a no-op.
-		queue = addTrack(queue, {
-			id: item.id,
-			title: displayTitle(item),
-			artist: displayArtist(item) ?? '',
-			streamUrl: ''
-		});
+		replaceQueue(
+			addTrack(queue, {
+				id: item.id,
+				title: displayTitle(item),
+				artist: displayArtist(item) ?? '',
+				streamUrl: ''
+			})
+		);
+	}
+
+	/**
+	 * Swap the queue for any change that is not a move. The move
+	 * announcement names a track and its position, so every other edit
+	 * invalidates it; clearing it here also keeps a previous account's
+	 * track title from lingering across the auth-boundary clears below.
+	 */
+	function replaceQueue(next: QueueState): void {
+		queue = next;
+		queueAnnouncement = '';
+	}
+
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (moved === undefined) return;
+		const reordered = moveTrack(queue, from, to);
+		// Announce real moves only: a no-op reorder must not chatter the
+		// live region.
+		if (reordered === queue) return;
+		queue = reordered;
+		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
 	function refresh(): Promise<void> {
@@ -109,14 +137,14 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
-			queue = clearQueue(queue);
+			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 		}
 		refresher.handleAuthTransition(event);
 	}
 
 	function handleLocalAuthTransition(): void {
-		queue = clearQueue(queue);
+		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		refresher.handleLocalAuthTransition();
 	}
@@ -189,8 +217,13 @@
 			</ul>
 			<PlayerQueue
 				state={queue}
-				onnext={() => (queue = nextTrack(queue))}
-				onshuffle={() => (queue = shuffleUpcoming(queue))}
+				announcement={queueAnnouncement}
+				onnext={() => replaceQueue(nextTrack(queue))}
+				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
+				onmove={moveQueuedTrack}
+				onplaynext={(index) => replaceQueue(playNext(queue, index))}
+				onremove={(index) => replaceQueue(removeTrack(queue, index))}
+				onclear={() => replaceQueue(clearQueue(queue))}
 			/>
 		{/if}
 
