@@ -176,8 +176,8 @@ test('RC-04 choice persists only a boolean and reload restores both values witho
 	await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), PREFERENCE_KEY)).toBe('false');
 	const after = await storageSnapshot(page);
 	expect(after.session).toEqual(before.session);
-	const { [PREFERENCE_KEY]: value, ...unrelated } = after.local;
-	const { [PREFERENCE_KEY]: _previous, ...previousUnrelated } = before.local;
+	const { [PREFERENCE_KEY]: value, ...unrelated } = after['local'];
+	const { [PREFERENCE_KEY]: _previous, ...previousUnrelated } = before['local'];
 	expect(value).toBe('false');
 	expect(unrelated).toEqual(previousUnrelated);
 	await page.reload();
