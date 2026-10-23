@@ -50,13 +50,15 @@
 		currentTrack,
 		DEMO_TRACKS,
 		moveTrack,
+		naturalEndPolicy,
 		nextTrack,
 		previousTrack,
 		restoreQueue,
 		selectTrack,
 		serializeQueue,
 		shuffleUpcoming,
-		type QueueState
+		type QueueState,
+		type RepeatMode
 	} from '#lib/player/queue.js';
 
 	const AUDIO_URL = '/api/demo/audio';
@@ -104,6 +106,8 @@
 		seed: number;
 	}
 	let radio = $state<RadioState | null>(null);
+	// Repeat is page-local, unlike the persisted queue: reload always starts Off.
+	let repeat = $state<RepeatMode>('off');
 
 	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
@@ -563,8 +567,8 @@
 	}
 
 	// Explicit navigation persists the outgoing track's position and seeks
-	// the incoming track to its saved one. Natural `ended` advances go
-	// through goNext directly: the ended track is cleared, not persisted.
+	// the incoming track to its saved one. Natural completion is separate:
+	// the ended track is cleared, not persisted.
 	function userNext(): void {
 		const outgoingId = current?.id;
 		persistPosition(outgoingId);
@@ -735,24 +739,46 @@
 	// `ended` is only honoured for the source the queue still points at; a
 	// late event from a superseded track must not skip the new one.
 	function handleEnded(event: Event): void {
-		if (!eventForCurrent(event) || status === 'paused' || status === 'ended') return;
-		const endedId = current?.id ?? null;
+		// Off preserves the existing completion path after a resource error;
+		// repeat requires an active transport, never an errored resource.
+		const playing = status === 'playing' || status === 'loading' ||
+			(repeat === 'off' && status === 'error');
+		if (!eventForCurrent(event) || !playing || !current) return;
+		const endedId = current.id;
 		const fired = sleepTimer.trackEnded();
 		// A finished track never resumes mid-way, whether the timer fired or
 		// the queue advances.
-		if (endedId !== null) resumeStore?.clear(endedId);
-		// A fired timer already paused via onFire; the queue stays untouched.
-		if (fired) return;
-		// Only a natural end starts radio: explicit Next past the end stops
-		// in goNext, and pause (or a stale ended while paused) never gets here.
-		if (radio) {
-			advanceRadio();
-		} else {
-			if (!current) return;
-			if (nextTrack(queue) === queue) startRadio();
-			else goNext();
+		resumeStore?.clear(endedId);
+		const result = naturalEndPolicy(queue, {
+			repeat,
+			radioActive: radio !== null,
+			// Preserve this host's existing automatic continuation when Off.
+			continueRadio: true,
+			playing,
+			validEnd: true,
+			sleepComplete: fired
+		});
+		if (result.action === 'stop') {
+			// A fired timer already paused via onFire; keep that paused state.
+			if (!fired) {
+				playback.pause();
+				status = 'ended';
+			}
+			return;
 		}
-		seekCurrentResume();
+		if (result.action === 'ignore') return;
+		if (result.action === 'radio') {
+			if (radio) advanceRadio();
+			else startRadio();
+			seekCurrentResume();
+			return;
+		}
+		queue = result.queue;
+		// A fresh keyed element starts even a singleton replay at zero and
+		// fences late events from the completed resource. Never use audio.loop:
+		// each completion must still reach sleep timers and resume clearing.
+		playCurrent(repeat !== 'off');
+		if (repeat === 'off') seekCurrentResume();
 	}
 
 	// Scope OS callbacks and timeline events to this exact source/element.
@@ -1094,6 +1120,22 @@
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<label for="player-repeat">Repeat</label>
+		<select
+			id="player-repeat"
+			data-testid="player-repeat"
+			bind:value={repeat}
+			disabled={radio !== null}
+			aria-describedby={radio ? 'repeat-radio-explanation' : undefined}
+		>
+			<option value="off">Off</option>
+			<option value="one">One</option>
+			<option value="queue">Queue</option>
+		</select>
+		<p data-testid="repeat-status" role="status">Repeat: {repeat === 'one' ? 'One' : repeat === 'queue' ? 'Queue' : 'Off'}</p>
+		{#if radio}
+			<p id="repeat-radio-explanation">Repeat is unavailable while radio is active. Stop radio to change repeat.</p>
+		{/if}
 		<!-- Own row so the pair stays side by side at 360px instead of
 		     wrapping around Previous/Next into overlapping lines. -->
 		<div>
