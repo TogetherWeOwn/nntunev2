@@ -33,13 +33,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `--locked` for api, ingest, mb and repair: each committed
-          # workers/<crate>/Cargo.lock is the audited dependency set,
-          # enforced the same way as in the required CI lanes.
+          # `--locked` for api, ingest, mb, repair and transcode: each
+          # committed workers/<crate>/Cargo.lock is the audited
+          # dependency set, enforced the same way as in the required
+          # CI lanes.
           cargo llvm-cov --locked --manifest-path workers/api/Cargo.toml \
             --lcov --output-path coverage-api.lcov
           cargo llvm-cov --locked --manifest-path workers/repair/Cargo.toml \
             --lcov --output-path coverage-repair.lcov
+          cargo llvm-cov --locked --manifest-path workers/transcode/Cargo.toml \
+            --lcov --output-path coverage-transcode.lcov
           for crate in ingest mb; do
             cargo llvm-cov --locked --manifest-path "workers/${crate}/Cargo.toml" \
               --lcov --output-path "coverage-${crate}.lcov"
@@ -51,7 +54,7 @@ jobs:
           set -euo pipefail
           printf '| Crate | Lines found | Lines hit | Line coverage |\n' >> "$GITHUB_STEP_SUMMARY"
           printf '| --- | ---: | ---: | ---: |\n' >> "$GITHUB_STEP_SUMMARY"
-          for crate in root api ingest mb repair; do
+          for crate in root api ingest mb repair transcode; do
             report="coverage-${crate}.lcov"
             if [[ ! -s "$report" ]]; then
               echo "Coverage report for ${crate} is missing or empty: ${report}" >&2

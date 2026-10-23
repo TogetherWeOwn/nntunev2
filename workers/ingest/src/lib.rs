@@ -159,6 +159,14 @@ pub(crate) fn build_sha_from_env(env: &Env) -> String {
     nntune_logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
 }
 
+/// Audio bucket name behind the `AUDIO_PUBLISH` binding (worker var
+/// or secret, `nntunev2-audio-{staging,prod}`), bound into the
+/// published `cache_objects` row. `None` when unconfigured: the
+/// `Transcoding` step fails transiently so a redeploy heals it.
+pub(crate) fn audio_bucket_from_env(env: &Env) -> Option<String> {
+    env_string(env, crate::transcode::AUDIO_BUCKET_NAME_VAR)
+}
+
 /// Emit one structured log line for this request (`docs/logging-standard.md`).
 /// Field validation runs at construction: a banned key or secret-like value
 /// drops the line instead of leaking it. All call-site fields are constants
