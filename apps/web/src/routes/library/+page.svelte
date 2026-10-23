@@ -57,7 +57,7 @@
 					const rebuilt = createQueue(kept);
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
 			}
 		}
@@ -91,12 +91,25 @@
 		// No stream URL until the streaming slice: playback wiring is out of
 		// scope, so the queue carries library display fields only. addTrack
 		// dedupes, so re-selecting a queued row is a no-op.
-		queue = addTrack(queue, {
-			id: item.id,
-			title: displayTitle(item),
-			artist: displayArtist(item) ?? '',
-			streamUrl: ''
-		});
+		replaceQueue(
+			addTrack(queue, {
+				id: item.id,
+				title: displayTitle(item),
+				artist: displayArtist(item) ?? '',
+				streamUrl: ''
+			})
+		);
+	}
+
+	/**
+	 * Swap the queue for any change that is not a move. The move
+	 * announcement names a track and its position, so every other edit
+	 * invalidates it; clearing it here also keeps a previous account's
+	 * track title from lingering across the auth-boundary clears below.
+	 */
+	function replaceQueue(next: QueueState): void {
+		queue = next;
+		queueAnnouncement = '';
 	}
 
 	function moveQueuedTrack(from: number, to: number): void {
@@ -119,14 +132,14 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
-			queue = clearQueue(queue);
+			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 		}
 		refresher.handleAuthTransition(event);
 	}
 
 	function handleLocalAuthTransition(): void {
-		queue = clearQueue(queue);
+		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		refresher.handleLocalAuthTransition();
 	}
@@ -194,11 +207,11 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
-				onnext={() => (queue = nextTrack(queue))}
+				onnext={() => replaceQueue(nextTrack(queue))}
 				onmove={moveQueuedTrack}
-				onplaynext={(index) => (queue = playNext(queue, index))}
-				onremove={(index) => (queue = removeTrack(queue, index))}
-				onclear={() => (queue = clearQueue(queue))}
+				onplaynext={(index) => replaceQueue(playNext(queue, index))}
+				onremove={(index) => replaceQueue(removeTrack(queue, index))}
+				onclear={() => replaceQueue(clearQueue(queue))}
 			/>
 		{/if}
 
