@@ -6,6 +6,14 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import Artwork from '#lib/player/Artwork.svelte';
+	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import {
+		applyGainToNode,
+		loadLevelingEnabled,
+		resolveTrackLinearGain,
+		saveLevelingEnabled,
+		type LevelingTags
+	} from '#lib/player/replayGain.js';
 	import { SeekController } from '#lib/player/seekController.js';
 	import { applyMediaSession, clearMediaSession } from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
@@ -38,6 +46,17 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
 
+	/**
+	 * Fixture ReplayGain tags for the demo tracks: synthetic metadata for
+	 * synthetic audio (no backend). Peaks keep the clipping guard inert by
+	 * construction, so the gain node pins leveling, not limiting.
+	 */
+	const DEMO_LEVELING_TAGS: Readonly<Record<string, LevelingTags>> = {
+		'demo-track': { trackGainDb: '-3.00 dB', trackPeak: 0.42 },
+		'second-signal': { trackGainDb: '+4.00 dB', trackPeak: 0.3 },
+		'third-light': { trackGainDb: '-1.50 dB', trackPeak: 0.48 }
+	};
+
 	type TransportState = 'selected' | 'loading' | 'playing' | 'paused' | 'error' | 'ended' | 'empty';
 	let status = $state<TransportState>('selected');
 	let seekReady = $state(false);
@@ -68,8 +87,81 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		}
 	});
 
+	// Loudness leveling: the toggle persists across reloads (default ON) and
+	// each track's fixture tags resolve to a gain-node multiplier.
+	let levelingEnabled = $state(true);
+	let levelingLinear = $state(1);
+	let levelingCtx: AudioContext | null = null;
+	let levelingSource: MediaElementAudioSourceNode | null = null;
+	let levelingGain: GainNode | null = null;
+	let wiredEl: HTMLAudioElement | null = null;
+
+	function safeStorage(): Storage | null {
+		try {
+			return localStorage;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * One AudioContext per page; each keyed `<audio>` element gets its own
+	 * MediaElementSource (an element can only be captured once). Leveling
+	 * failure never breaks playback: unwired elements play at natural volume.
+	 */
+	function ensureLevelingGraph(): GainNode | null {
+		try {
+			if (typeof AudioContext === 'undefined' || !audioEl) return null;
+			if (wiredEl !== audioEl) {
+				levelingSource?.disconnect();
+				levelingGain?.disconnect();
+				levelingCtx ??= new AudioContext();
+				levelingSource = levelingCtx.createMediaElementSource(audioEl);
+				levelingGain = levelingCtx.createGain();
+				levelingSource.connect(levelingGain);
+				levelingGain.connect(levelingCtx.destination);
+				wiredEl = audioEl;
+			}
+			return levelingGain;
+		} catch {
+			return null;
+		}
+	}
+
+	function applyLeveling(): void {
+		const tags = (current && DEMO_LEVELING_TAGS[current.id]) ?? {};
+		const linear = resolveTrackLinearGain(tags, { enabled: levelingEnabled });
+		levelingLinear = linear;
+		const node = ensureLevelingGraph();
+		if (node) {
+			applyGainToNode(node, linear);
+			resumeLevelingContext();
+		}
+	}
+
+	/**
+	 * Best-effort resume of the page-local leveling context. The mount-time
+	 * resume can reject under autoplay policy (no user activation yet), and
+	 * a suspended context renders routed playback silent — so every play
+	 * path retries it inside the user's gesture.
+	 */
+	function resumeLevelingContext(): void {
+		if (!levelingCtx || levelingCtx.state === 'running') return;
+		void levelingCtx.resume().catch(() => {
+			// Still suspended; the next user-initiated play retries.
+		});
+	}
+
+	function setLevelingEnabled(enabled: boolean): void {
+		levelingEnabled = enabled;
+		saveLevelingEnabled(safeStorage(), enabled);
+	}
+
 	function playCurrent(reload = false): void {
 		if (!current) return;
+		// A play press is a user gesture: retry the mount-time resume so a
+		// suspended leveling context cannot mute this playback.
+		resumeLevelingContext();
 		// A failed media resource needs a fresh load even when its URL is
 		// unchanged. A keyed element also fences queued events from that load.
 		if (reload || status === 'error') sourceRevision += 1;
@@ -215,12 +307,18 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		// A queued play event can arrive after a newer pause. The element's
 		// current paused flag distinguishes that from an explicit native resume.
 		if (!eventForCurrent(event) || (event.currentTarget as HTMLAudioElement).paused) return;
+		// Native controls bypass playCurrent: retry the resume on the gesture.
+		resumeLevelingContext();
 		if (status === 'error') playCurrent(true);
 		else if (status !== 'playing') status = 'loading';
 	}
 
 	function handlePlaying(event: Event): void {
-		if (eventForCurrent(event) && (status === 'loading' || status === 'playing')) status = 'playing';
+		if (!eventForCurrent(event)) return;
+		// Media Session and programmatic plays also land here; retry the
+		// resume so routed playback is never stuck silent.
+		resumeLevelingContext();
+		if (status === 'loading' || status === 'playing') status = 'playing';
 	}
 
 	function handlePause(event: Event): void {
@@ -420,6 +518,12 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		}
 	});
 
+	// Leveling follows the current track, the toggle, and the wired element
+	// (the keyed `<audio>` is recreated per source, so a track change rewires).
+	$effect(() => {
+		applyLeveling();
+	});
+
 	/**
 	 * Run by the smoke test: fire 10 rapid Range seeks through one
 	 * controller (each aborts its predecessor), then one proving seek.
@@ -453,6 +557,22 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
+		levelingEnabled = loadLevelingEnabled(safeStorage());
+		(
+			window as unknown as {
+				__levelingProbe?: () => {
+					enabled: boolean;
+					trackId: string | null;
+					linear: number;
+					contextState: AudioContextState | 'unavailable';
+				};
+			}
+		).__levelingProbe = () => ({
+			enabled: levelingEnabled,
+			trackId: current?.id ?? null,
+			linear: levelingLinear,
+			contextState: levelingCtx?.state ?? 'unavailable'
+		});
 		(window as unknown as { __comforts?: { advanceSleep: typeof advanceSleep } }).__comforts = {
 			advanceSleep
 		};
@@ -518,6 +638,15 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
+			// The leveling graph is page-local: close the context so repeat
+			// visits cannot exhaust the browser's context limit, and drop
+			// the probe so later visits never read stale state.
+			void levelingCtx?.close().catch(() => {});
+			levelingCtx = null;
+			levelingSource = null;
+			levelingGain = null;
+			wiredEl = null;
+			delete (window as unknown as { __levelingProbe?: unknown }).__levelingProbe;
 		};
 	});
 </script>
@@ -591,6 +720,7 @@ import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
 		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
 			Keyboard shortcuts
 		</button>
