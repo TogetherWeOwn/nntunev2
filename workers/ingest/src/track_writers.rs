@@ -90,13 +90,14 @@ pub const ENVELOPE_WRAPPED_DEK_BYTES: usize = 48;
 /// `tracks` has no file identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackRow<'a> {
-    /// Matched release MBID as UUID text (canonical 8-4-4-4-12 hex binds
-    /// a Postgres `uuid`).
+    /// Matched release MBID as UUID text (canonical 8-4-4-4-12 hex); SQL
+    /// casts the text binding to Postgres `uuid`.
     pub release_id: &'a str,
     /// Recording title from the match (trimmed), never a filename.
     pub title: &'a str,
-    pub medium_no: i16,
-    pub track_no: i16,
+    /// Positions bind as Postgres `INTEGER`, not the match parser's `i16`.
+    pub medium_no: i32,
+    pub track_no: i32,
     /// Recording MBID as UUID text. NULL-able in the schema, always bound
     /// here: a row derives only from a validated recording.
     pub mbid: &'a str,
@@ -216,8 +217,8 @@ fn track_row_for<'a>(
     let row = TrackRow {
         release_id: release_mbid,
         title: recording.title.trim(),
-        medium_no,
-        track_no,
+        medium_no: i32::from(medium_no),
+        track_no: i32::from(track_no),
         mbid: recording.mbid.as_str(),
         file_ordinal,
     };
@@ -263,8 +264,10 @@ pub const TRACK_INSERT_PARAM_ORDER: [&str; 6] = [
 /// replay converges. A zero-row write is a benign replay or a fenced
 /// account; the consumer separates them with
 /// [`select_track_id_by_position_sql`] plus [`classify_track_zero_rows`].
+/// UUID parameters cast through text so `tokio_postgres` accepts Rust
+/// strings; positions bind as `i32` to match the `INTEGER` columns.
 pub fn upsert_track_sql() -> &'static str {
-    "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) SELECT $1, $2, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
+    "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
 }
 
 /// Fetch the track id after an [`upsert_track_sql`] write, by the natural
@@ -272,7 +275,7 @@ pub fn upsert_track_sql() -> &'static str {
 /// ($2), `track_no` ($3). Serves both zero-row classification and the
 /// downstream FKs (`track_sources`, `track_media`).
 pub fn select_track_id_by_position_sql() -> &'static str {
-    "SELECT id FROM tracks WHERE release_id = $1 AND medium_no = $2 AND track_no = $3"
+    "SELECT id FROM tracks WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3"
 }
 
 /// One `track_sources` row's bound values, in
@@ -383,15 +386,17 @@ pub const TRACK_SOURCE_PARAM_ORDER: [&str; 10] = [
 /// provenance wins, every replay converges. A zero-row write is a benign
 /// replay or a fenced account; the consumer separates them with
 /// [`select_track_source_by_pk_sql`] plus [`classify_track_zero_rows`].
+/// UUID parameters cast through text for string bindings; the cast keeps
+/// a nullable `indexer_id` as NULL.
 pub fn upsert_track_source_sql() -> &'static str {
-    "INSERT INTO track_sources (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) SELECT $1, $2, $3, $4, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id) DO NOTHING"
+    "INSERT INTO track_sources (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id) DO NOTHING"
 }
 
 /// Fetch the source row after a zero-row [`upsert_track_source_sql`]
 /// write so the consumer can separate a benign replay from a fenced
 /// account. Parameters: `user_id` ($1), `track_id` ($2).
 pub fn select_track_source_by_pk_sql() -> &'static str {
-    "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2"
+    "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2::text::uuid"
 }
 
 /// Outcome of one fenced idempotent track write.
@@ -452,7 +457,7 @@ mod tests {
         assert_eq!(
             upsert_track_sql(),
             "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) \
-             SELECT $1, $2, $3, $4, $5 \
+             SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 \
              FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
              ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
         );
@@ -474,7 +479,7 @@ mod tests {
         // fails here (ADR 0002 rule 3).
         assert!(
             sql.contains(
-                "SELECT $1, $2, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+                "SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
             ),
             "{sql}"
         );
@@ -503,7 +508,7 @@ mod tests {
         assert_eq!(
             upsert_track_source_sql(),
             "INSERT INTO track_sources (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) \
-             SELECT $1, $2, $3, $4, $5, 2, $6, $7, $8, $9, $10 \
+             SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 \
              FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
              ON CONFLICT (user_id, track_id) DO NOTHING"
         );
@@ -525,7 +530,7 @@ mod tests {
         let sql = upsert_track_source_sql();
         assert!(
             sql.contains(
-                "SELECT $1, $2, $3, $4, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+                "SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
             ),
             "{sql}"
         );
@@ -548,11 +553,11 @@ mod tests {
     fn pk_selects_are_pinned() {
         assert_eq!(
             select_track_id_by_position_sql(),
-            "SELECT id FROM tracks WHERE release_id = $1 AND medium_no = $2 AND track_no = $3"
+            "SELECT id FROM tracks WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3"
         );
         assert_eq!(
             select_track_source_by_pk_sql(),
-            "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2"
+            "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2::text::uuid"
         );
     }
 
@@ -599,6 +604,26 @@ mod tests {
         // Derivation output always validates: the wire-up can bind it.
         for row in &derived.rows {
             assert!(validate_track_row(row).is_ok());
+        }
+    }
+
+    #[test]
+    fn derived_positions_bind_as_postgres_integers() {
+        use tokio_postgres::types::{ToSql, Type};
+
+        let files = [file(0, "content")];
+        let recordings = [recording(REC1, "First", Some(1), Some(i16::MAX))];
+        let derived = derive_track_rows(Some(RELEASE), &files, &recordings).unwrap();
+        let row = &derived.rows[0];
+        // INTEGER columns infer INT4 parameters; binding an i16 must not
+        // defer a WrongType failure to the future execution wiring.
+        for (position, expected) in [
+            (&row.medium_no as &(dyn ToSql + Sync), 1_i32),
+            (&row.track_no as &(dyn ToSql + Sync), 32767_i32),
+        ] {
+            let mut encoded = Default::default();
+            position.to_sql_checked(&Type::INT4, &mut encoded).unwrap();
+            assert_eq!(&encoded[..], expected.to_be_bytes().as_slice());
         }
     }
 
