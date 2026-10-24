@@ -952,6 +952,11 @@ test('[LIBSHARE-22] successive copies read live state at activation (no stale sn
 	await expect.poll(() => clipboardCalls(page)).toHaveLength(2);
 
 	await selectRow(page, 'share-pine', 'Pine Morning');
+	// Library selection appends without stealing current, so advance
+	// explicitly before sampling pine's position.
+	await page.getByTestId('player-next').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
+	expect(await currentQueueId(page)).toBe('share-pine');
 	await setAudioTime(page, 5.9);
 	const pineCopy = await expectRowCopyButton(page, 'LIBSHARE-22', 'share-pine', 'Pine Morning');
 	await pineCopy.click();
