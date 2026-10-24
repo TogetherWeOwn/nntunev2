@@ -33,10 +33,13 @@ import { expect, test, type Page } from '@playwright/test';
  * Baseline RED is a failing transport assertion AFTER the queue fixture
  * preconditions (order/value/row), never a navigation/build/import failure.
  * Guard no-ops open behind a capability gate (`s` shuffles, `r` cycles) so the
- * suite is RED pre-implementation for the asserted reason. Deliberately
- * unpinned: shuffle completion announcements (button-component-local), `r`
- * with the select focused (native type-ahead interplay), IME composition
- * events (sibling guard-semantics lane), and the `0` RESTART lane. Stable IDs
+ * suite is RED pre-implementation for the asserted reason. SHUFREP-B09 pins
+ * the s/r yield to a focused native select (playback speed) and to IME
+ * composition (`isComposing`, legacy `keyCode` 229); the yield is scoped to
+ * s/r only, so the pinned `0`-on-speed-select restart keeps working (owned
+ * by the restart builder suite). Deliberately unpinned: shuffle completion
+ * announcements (button-component-local), `r` with the repeat select focused
+ * (native type-ahead interplay), and the `0` RESTART lane itself. Stable IDs
  * SHUFREP-Bxx map to the handoff report. No standalone red-CI PR.
  */
 
@@ -201,6 +204,18 @@ test('SHUFREP-B03 s is inert while radio is active and recovers after stop', asy
 
 	await page.getByTestId('radio-stop').click();
 	await expect(page.getByTestId('radio-badge')).toHaveCount(0);
+	// Stop preserves the end-of-queue selection: Third Light stays current
+	// with zero upcoming, so `s` must no-op under the fewer-than-two guard.
+	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
+	await expect(page.getByTestId('queue-select-third-light')).toHaveAttribute('aria-current', 'true');
+	await focusBody(page);
+	await page.keyboard.press('s');
+	await settle(page);
+	expect(await queueOrder(page)).toEqual(INITIAL);
+
+	// Restore an upcoming suffix, then `s` shuffles the pair again.
+	await page.getByTestId('queue-select-demo-track').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
 	await focusBody(page);
 	await page.keyboard.press('s');
 	await expect.poll(() => queueOrder(page)).toEqual(SWAPPED);
@@ -438,4 +453,65 @@ test('SHUFREP-B08 s and r change only their own state: no transport side effects
 	await page.keyboard.press('s');
 	await expect.poll(() => queueOrder(page)).toEqual(INITIAL);
 	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
+});
+
+test('SHUFREP-B09 s and r yield to a focused native select and IME composition', async ({
+	page
+}) => {
+	await openPlayer(page);
+	await focusBody(page);
+	// Capability gates (RED pre-implementation), then restore the baseline.
+	await page.keyboard.press('s');
+	await expect.poll(() => queueOrder(page)).toEqual(SWAPPED);
+	await page.keyboard.press('s');
+	await expect.poll(() => queueOrder(page)).toEqual(INITIAL);
+	await page.keyboard.press('r');
+	await expect(page.getByTestId('player-repeat')).toHaveValue('one');
+	await page.keyboard.press('r');
+	await page.keyboard.press('r');
+	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
+
+	// A focused native select keeps the keystrokes for type-ahead: neither
+	// binding fires and the select value is untouched. The `0` restart lane
+	// deliberately still fires from here (pinned in the restart builder
+	// suite); this yield is scoped to s/r only.
+	const speed = page.getByTestId('playback-speed');
+	await speed.focus();
+	await expect(speed).toBeFocused();
+	const speedValue = await speed.inputValue();
+	const plays = await playCalls(page);
+	for (const key of ['s', 'r', 'S', 'R']) await page.keyboard.press(key);
+	await settle(page);
+	expect(await queueOrder(page)).toEqual(INITIAL);
+	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
+	await expect(page.getByTestId('repeat-status')).toHaveText('Repeat: Off');
+	await expect(speed).toHaveValue(speedValue);
+	expect(await playCalls(page)).toBe(plays);
+	await expect(page.getByTestId('shortcuts-dialog')).toHaveCount(0);
+
+	// IME composition swallows the bindings through both the modern flag
+	// and the legacy 229 keyCode (dispatched: no real IME runs headless).
+	await focusBody(page);
+	await page.evaluate(() => {
+		for (const init of [
+			{ key: 's', isComposing: true },
+			{ key: 'r', isComposing: true },
+			{ key: 's', keyCode: 229 },
+			{ key: 'r', keyCode: 229 }
+		] as KeyboardEventInit[]) {
+			window.dispatchEvent(new KeyboardEvent('keydown', { ...init, bubbles: true }));
+		}
+	});
+	await settle(page);
+	expect(await queueOrder(page)).toEqual(INITIAL);
+	await expect(page.getByTestId('player-repeat')).toHaveValue('off');
+	expect(await playCalls(page)).toBe(plays);
+
+	// Real keystrokes still work afterwards.
+	await page.keyboard.press('s');
+	await expect.poll(() => queueOrder(page)).toEqual(SWAPPED);
+	await page.keyboard.press('s');
+	await expect.poll(() => queueOrder(page)).toEqual(INITIAL);
+	await page.keyboard.press('r');
+	await expect(page.getByTestId('player-repeat')).toHaveValue('one');
 });
