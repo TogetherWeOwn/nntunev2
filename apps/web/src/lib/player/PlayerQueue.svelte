@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { currentTrack, type QueueState } from './queue.js';
+	import { tick } from 'svelte';
+	import { currentTrack, type QueueState, type Track } from './queue.js';
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 
 	interface Props {
@@ -20,6 +21,13 @@
 		 * renders the region.
 		 */
 		announcement?: string;
+		/**
+		 * Transient queue-only filter text. Bindable so a host that
+		 * unmounts/remounts the panel (library refresh swaps branches)
+		 * can keep the query across mounts; unbound parents get the same
+		 * component-local default. Never persisted or fetched.
+		 */
+		filterQuery?: string;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
@@ -32,7 +40,8 @@
 		onplaynext,
 		onremove,
 		onclear,
-		announcement = ''
+		announcement = '',
+		filterQuery = $bindable('')
 	}: Props = $props();
 
 	let current = $derived(currentTrack(queue));
@@ -56,14 +65,41 @@
 
 	let list: HTMLOListElement | null = $state(null);
 
+	let normalizedQuery = $derived(filterQuery.trim().toLowerCase());
+
+	/** Blank titles render (and match) as their stable track id, never empty. */
+	function displayTitle(track: Track): string {
+		return track.title?.trim() ? track.title : track.id;
+	}
+
+	function matchesQuery(track: Track, normalized: string): boolean {
+		if (!normalized) return true;
+		const haystack = `${displayTitle(track)} ${track.artist ?? ''}`.toLowerCase();
+		return haystack.includes(normalized);
+	}
+
+	/**
+	 * Visible rows with their ORIGINAL queue indices: every row action,
+	 * disabled boundary and the current marker use the full-queue slot, never
+	 * the filtered position. Pure reads only — frozen props stay untouched.
+	 */
+	let visibleEntries = $derived(
+		queue.tracks
+			.map((track, index) => ({ track, index }))
+			.filter(({ track }) => matchesQuery(track, normalizedQuery))
+	);
+
 	/**
 	 * Explicit reveal only: bound to the Show-current-track button's click.
+	 * Clears a hiding filter first, then focuses/reveals the real row.
 	 * Never runs from an effect, never mutates state, never calls transport.
 	 * Focus uses preventScroll and the scroll is instant (`block: nearest`,
 	 * never smooth), so no reduced-motion special case is needed.
 	 */
-	function revealCurrent(): void {
+	async function revealCurrent(): Promise<void> {
 		if (selectedIndex < 0) return;
+		filterQuery = '';
+		await tick();
 		const row = list?.querySelector<HTMLElement>(
 			'[data-testid="queue-item"][aria-current="true"]'
 		);
@@ -121,46 +157,65 @@
 
 <ShuffleUpcoming state={queue} {onshuffle} {radioActive} />
 
+<!--
+	Queue-only filter: transient presentation state. It hides rows but
+	never reorders, reselects, persists or fetches anything; the
+	orientation summary above always describes the full queue.
+-->
+<div class="queue-filter">
+	<label for="queue-filter-input">Filter queue</label>
+	<input id="queue-filter-input" type="search" bind:value={filterQuery} />
+	<button type="button" onclick={() => (filterQuery = '')}>Clear queue filter</button>
+</div>
+
+<p data-testid="queue-filter-count" role="status">
+	{visibleEntries.length} of {trackCount} tracks
+</p>
+
+{#if trackCount > 0 && visibleEntries.length === 0}
+	<p data-testid="queue-filter-empty">No matches in this queue</p>
+{/if}
+
 <ol aria-label="Playback queue" bind:this={list}>
 	<!-- Stable track identity preserves keyboard focus through reorders. The
 		store guarantees uniqueness: addTrack dedupes and restoreQueue rejects duplicates. -->
-	{#each queue.tracks as track, i (track.id)}
+	{#each visibleEntries as { track, index } (track.id)}
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex: tabindex is provably -1-or-absent (QO-U14); the current row is a programmatic focus target, never a tab stop. -->
 		<li
 			class="queue-row"
 			data-testid="queue-item"
 			data-track-id={track.id}
-			aria-current={i === selectedIndex ? 'true' : undefined}
-			tabindex={i === selectedIndex ? -1 : undefined}
+			aria-current={index === selectedIndex ? 'true' : undefined}
+			tabindex={index === selectedIndex ? -1 : undefined}
 		>
-			{track.title}{#if track.artist} — {track.artist}{/if}
+			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
 			<button
 				type="button"
 				aria-label="Move {track.title} up"
-				disabled={i === 0}
-				onclick={() => onmove?.(i, i - 1)}
+				disabled={index === 0}
+				onclick={() => onmove?.(index, index - 1)}
 			>
 				Up
 			</button>
 			<button
 				type="button"
 				aria-label="Move {track.title} down"
-				disabled={i === queue.tracks.length - 1}
-				onclick={() => onmove?.(i, i + 1)}
+				disabled={index === trackCount - 1}
+				onclick={() => onmove?.(index, index + 1)}
 			>
 				Down
 			</button>
 			<button
 				type="button"
 				aria-label="Play {track.title} next"
-				onclick={() => onplaynext?.(i)}
+				onclick={() => onplaynext?.(index)}
 			>
 				Next
 			</button>
 			<button
 				type="button"
 				aria-label="Remove {track.title} from queue"
-				onclick={() => onremove?.(i)}
+				onclick={() => onremove?.(index)}
 			>
 				Remove
 			</button>
@@ -177,6 +232,40 @@
 </button>
 
 <style>
+	.queue-filter {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.queue-filter input {
+		flex: 1 1 12rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	/* Visible keyboard focus ring even where the app stylesheet is absent
+	 * (mounted test parent); the app's own :focus-visible agrees with this. */
+	.queue-filter input:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
+
+	/* Touch-sized clear action matching the input row. */
+	.queue-filter button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
 	.queue-row {
 		/* Clear the 2px outline + 2px offset when nearest-scroll rounds
 		 * fractional line heights at the viewport edge. */
