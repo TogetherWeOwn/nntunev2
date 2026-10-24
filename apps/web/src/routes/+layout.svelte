@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
+	import { page } from '$app/state';
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
@@ -127,6 +128,35 @@
 		restoreAfterNavigation = false;
 		restoreFocus();
 	});
+
+	// App-shell navigation (roadmap NAV): Library, local NZB selection and
+	// Account, reachable from every page without typing URLs. Static native
+	// links only: the shell never fetches, uploads or processes anything.
+	type ShellDestination = 'library' | 'import' | 'account';
+
+	function matchesBoundary(pathname: string, base: string): boolean {
+		return pathname === base || pathname.startsWith(`${base}/`);
+	}
+
+	// Longest base first so nested destinations win: exactly the
+	// most-specific boundary match carries aria-current.
+	const currentDestination = $derived.by((): ShellDestination | null => {
+		const pathname = page.url.pathname;
+		if (matchesBoundary(pathname, '/library/import')) return 'import';
+		if (matchesBoundary(pathname, '/library')) return 'library';
+		if (matchesBoundary(pathname, '/account')) return 'account';
+		return null;
+	});
+
+	// Skip link: move keyboard focus to the page's own <main> (each route
+	// renders exactly one) without adding nested landmarks.
+	function skipToContent(event: MouseEvent): void {
+		const main = document.querySelector('main');
+		if (!main) return;
+		event.preventDefault();
+		if (!main.hasAttribute('tabindex')) main.setAttribute('tabindex', '-1');
+		main.focus();
+	}
 </script>
 
 <svelte:head>
@@ -134,6 +164,19 @@
 	<link rel="manifest" href="/manifest.webmanifest" />
 	<meta name="theme-color" content="#0b0d12" />
 </svelte:head>
+
+<a class="skip-link" href="#main-content" onclick={skipToContent}>Skip to content</a>
+<nav aria-label="Primary" class="nt-wrap shell-nav">
+	<a href="/library" aria-current={currentDestination === 'library' ? 'page' : undefined}>
+		Library
+	</a>
+	<a href="/library/import" aria-current={currentDestination === 'import' ? 'page' : undefined}>
+		Select NZB locally
+	</a>
+	<a href="/account/billing" aria-current={currentDestination === 'account' ? 'page' : undefined}>
+		Account
+	</a>
+</nav>
 
 <div class="nt-appearance nt-wrap">
 	<label for="nt-appearance-select">Appearance</label>
@@ -149,3 +192,43 @@
 {#if paywall}
 	<PaywallModal model={paywall} onclose={dismissPaywall} />
 {/if}
+
+<style>
+	.skip-link {
+		position: absolute;
+		inset-inline-start: var(--nt-space-3);
+		top: var(--nt-space-2);
+		z-index: 10;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+		transform: translateY(-300%);
+	}
+
+	.skip-link:focus-visible {
+		transform: none;
+	}
+
+	.shell-nav {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-4);
+		padding-block: var(--nt-space-2);
+		border-bottom: 1px solid var(--nt-border);
+	}
+
+	.shell-nav a {
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border-radius: var(--nt-radius);
+		color: var(--nt-fg-muted);
+		text-decoration: none;
+	}
+
+	.shell-nav a[aria-current='page'] {
+		color: var(--nt-fg);
+		font-weight: 600;
+		text-decoration: underline;
+	}
+</style>

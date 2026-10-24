@@ -3,6 +3,20 @@ import { render } from 'svelte/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$app/navigation', () => ({ afterNavigate: () => {} }));
+// Direct SSR rendering has no Kit request context. Supply page state at that
+// boundary while keeping the actual root layout and its children under test.
+vi.mock('$app/state', () => ({
+	page: {
+		data: {},
+		error: null,
+		form: null,
+		params: {},
+		route: { id: '/library' },
+		state: {},
+		status: 200,
+		url: new URL('https://nntune.test/library')
+	}
+}));
 
 import Layout from './+layout.svelte';
 
