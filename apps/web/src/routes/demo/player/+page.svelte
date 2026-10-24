@@ -730,6 +730,10 @@
 	}
 
 	async function playNextAt(index: number, control: HTMLButtonElement): Promise<void> {
+		// Radio owns what plays next (radio.order), so reordering the resting
+		// queue would announce a move the button cannot fulfil. ShuffleUpcoming
+		// disables itself the same way; the button mirrors it below.
+		if (radio) return;
 		const track = queue.tracks[index];
 		const reordered = playNext(queue, index);
 		// Current/already-next requests leave even the previous announcement alone.
@@ -1492,6 +1496,7 @@
 						class="queue-play-next"
 						data-testid="queue-play-next-{track.id}"
 						aria-label="Play {track.title} next"
+						disabled={radio !== null}
 						onclick={(event) => void playNextAt(index, event.currentTarget)}
 					>
 						Play next
