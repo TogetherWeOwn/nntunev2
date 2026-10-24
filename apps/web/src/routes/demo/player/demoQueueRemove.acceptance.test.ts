@@ -207,11 +207,12 @@ describe('demo per-row remove — helper-reuse contract', () => {
 		]) {
 			expect(source, `expected the existing ${hook} hook to survive`).toContain(hook);
 		}
-		// Stable identity: rows stay keyed by track id, carrying data-track-id.
-		expect(source).toContain('{#each queue.tracks as track, i (track.id)}');
+		// Stable identity: filtered rows stay keyed by track id, carrying data-track-id.
+		expect(source).toContain('{#each visibleQueueEntries as { track, index } (track.id)}');
 		expect(source).toContain('data-track-id={track.id}');
-		// The current marker stays on the per-row select control.
-		expect(source).toContain("aria-current={i === queue.currentIndex ? 'true' : undefined}");
+		// The current marker stays on the per-row select control, using the
+		// full-queue index carried by each filtered entry.
+		expect(source).toContain("aria-current={index === queue.currentIndex ? 'true' : undefined}");
 		// Clear stays a native button, disabled exactly when the queue empties.
 		expect(source).toContain('disabled={queue.tracks.length === 0}');
 		// Negative: the row hook stays one <li> family in markup (script may
