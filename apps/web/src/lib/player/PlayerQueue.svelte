@@ -98,8 +98,10 @@
 	 */
 	async function revealCurrent(): Promise<void> {
 		if (selectedIndex < 0) return;
-		filterQuery = '';
-		await tick();
+		if (!visibleEntries.some((entry) => entry.index === selectedIndex)) {
+			filterQuery = '';
+			await tick();
+		}
 		const row = list?.querySelector<HTMLElement>(
 			'[data-testid="queue-item"][aria-current="true"]'
 		);
