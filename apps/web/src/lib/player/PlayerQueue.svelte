@@ -120,7 +120,7 @@
 -->
 <p data-testid="now-playing" role="status">
 	{#if current}
-		Now playing: {current.title}{#if current.artist} — {current.artist}{/if}
+		Now playing: {displayTitle(current)}{#if current.artist} — {current.artist}{/if}
 	{:else}
 		Queue is empty
 	{/if}
@@ -193,7 +193,7 @@
 			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
 			<button
 				type="button"
-				aria-label="Move {track.title} up"
+				aria-label="Move {displayTitle(track)} up"
 				disabled={index === 0}
 				onclick={() => onmove?.(index, index - 1)}
 			>
@@ -201,7 +201,7 @@
 			</button>
 			<button
 				type="button"
-				aria-label="Move {track.title} down"
+				aria-label="Move {displayTitle(track)} down"
 				disabled={index === trackCount - 1}
 				onclick={() => onmove?.(index, index + 1)}
 			>
@@ -209,14 +209,14 @@
 			</button>
 			<button
 				type="button"
-				aria-label="Play {track.title} next"
+				aria-label="Play {displayTitle(track)} next"
 				onclick={() => onplaynext?.(index)}
 			>
 				Next
 			</button>
 			<button
 				type="button"
-				aria-label="Remove {track.title} from queue"
+				aria-label="Remove {displayTitle(track)} from queue"
 				onclick={() => onremove?.(index)}
 			>
 				Remove
