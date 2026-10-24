@@ -16,7 +16,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   NAV-02d direct load matches nested paths by pathname boundary
  *   NAV-03  client-side navigation updates the marker without a reload
  *   NAV-04  skip link moves keyboard focus to the page main (wide + narrow)
- *   NAV-05  keyboard order is skip, then nav links, then content (wide + narrow)
+ *   NAV-05  keyboard order is skip, nav links, Appearance, content (wide + narrow)
  *   NAV-06  visible focus ring on shell links (wide + narrow)
  *   NAV-07 390px/360px narrow widths wrap, no overflow, no hamburger
  *   NAV-08a links stay discoverable with a populated library
@@ -338,7 +338,7 @@ for (const width of [1280, 390]) {
 		}
 	});
 
-	test(`[NAV-05 ${width}px] keyboard order is skip, nav links, then content`, async ({
+	test(`[NAV-05 ${width}px] keyboard order is skip, nav links, Appearance, then content`, async ({
 		page
 	}) => {
 		await page.setViewportSize({ width, height: 800 });
@@ -360,6 +360,24 @@ for (const width of [1280, 390]) {
 					`"${label}" was not next. Builder: keep nav links in DOM order after the skip link.`
 			).toBeFocused();
 		}
+		// The existing Appearance control remains in the shell's native tab order.
+		const appearance = page.getByRole('combobox', { name: 'Appearance', exact: true });
+		await page.keyboard.press('Tab');
+		await expect(
+			appearance,
+			`expected Appearance immediately after Account at ${width}px; ` +
+				'Builder: preserve the existing selector in the shell keyboard order.'
+		).toBeFocused();
+		expect(await appearance.evaluate((element) => element.tagName)).toBe('SELECT');
+		await page.keyboard.press('Home');
+		await page.keyboard.press('ArrowDown');
+		await page.keyboard.press('Enter');
+		await expect(appearance).toHaveValue('light');
+		// Dismiss any native option popup before testing forward traversal.
+		await page.keyboard.press('Escape');
+		await expect(appearance).toBeFocused();
+
+		// One more Tab must enter the actual page main, not any arbitrary target.
 		await page.keyboard.press('Tab');
 		const inMain = await page.evaluate(() => {
 			const main = document.querySelector('main');
@@ -367,7 +385,7 @@ for (const width of [1280, 390]) {
 		});
 		expect(
 			inMain,
-			`expected keyboard focus to move into the page main after the shell links at ${width}px. ` +
+			`expected keyboard focus to move into the page main immediately after Appearance at ${width}px. ` +
 				'Builder: keep the shell before <main> in DOM order.'
 		).toBe(true);
 	});
