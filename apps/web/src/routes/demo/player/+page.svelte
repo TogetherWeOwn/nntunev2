@@ -58,6 +58,7 @@
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
+		playNext,
 		previousTrack,
 		restoreQueue,
 		selectTrack,
@@ -128,6 +129,7 @@
 	 * filtering hides rows only and never touches order, selection or
 	 * playback. Matching is the shared PlayerQueue contract.
 	 */
+	let queueAnnouncement = $state('');
 	let demoFilterQuery = $state('');
 	let demoFilterInput: HTMLInputElement | undefined = $state();
 	let visibleQueueEntries = $derived(
@@ -725,6 +727,18 @@
 		// retry afterwards must not append.
 		recordRecent(nextId);
 		if (nextId !== undefined && shouldResume) seekToResume(nextId);
+	}
+
+	async function playNextAt(index: number, control: HTMLButtonElement): Promise<void> {
+		const track = queue.tracks[index];
+		const reordered = playNext(queue, index);
+		// Current/already-next requests leave even the previous announcement alone.
+		if (reordered === queue || !track) return;
+		queue = reordered;
+		queueAnnouncement = `${track.title} moved to position ${reordered.currentIndex + 2} of ${reordered.tracks.length}`;
+		// A keyed row can move in the DOM without keeping browser focus.
+		await tick();
+		control.focus({ preventScroll: true });
 	}
 
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
@@ -1418,6 +1432,7 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<p data-testid="queue-announcement" role="status">{queueAnnouncement}</p>
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
@@ -1471,6 +1486,15 @@
 						onclick={() => (queue = moveTrack(queue, index, index + 1))}
 					>
 						Down
+					</button>
+					<button
+						type="button"
+						class="queue-play-next"
+						data-testid="queue-play-next-{track.id}"
+						aria-label="Play {track.title} next"
+						onclick={(event) => void playNextAt(index, event.currentTarget)}
+					>
+						Play next
 					</button>
 				</li>
 			{/each}
@@ -1611,6 +1635,14 @@
 	#track-time-mode:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
+	}
+
+	.queue-play-next {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
 	}
 
 	/* Queue-only filter row: wraps on narrow screens, touch-sized
