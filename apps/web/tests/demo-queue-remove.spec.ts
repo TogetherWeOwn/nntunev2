@@ -584,3 +584,41 @@ test('DM-B-11 regression: selection, moves, transport, clear and re-add keep wor
 	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
 	expectDemoTraffic(traffic);
 });
+
+test('DM-B-12 removing the same track again after a re-add announces a fresh outcome', async ({
+	page,
+	baseURL
+}) => {
+	const traffic: Traffic = { apiCalls: [], foreign: [] };
+	await openDemo(page, baseURL!, traffic);
+
+	const remove = removeButton(page, 'second-signal');
+	await expect(remove).toBeVisible();
+	await remove.click();
+	expect(await queueIds(page)).toEqual(['demo-track', 'third-light']);
+	await expect(announcement(page)).toHaveText('Second Signal removed from the queue');
+
+	const add = page.getByTestId('queue-add-second-signal');
+	await expect(add).toBeVisible();
+	await add.click();
+	expect(await queueIds(page)).toEqual(['demo-track', 'third-light', 'second-signal']);
+
+	// Observe only the second removal: the identical outcome string must
+	// still be a new live-region commit, or assistive tech hears nothing.
+	await watchAnnouncements(page);
+	const again = removeButton(page, 'second-signal');
+	await expect(again).toBeVisible();
+	await again.click();
+
+	expect(await queueIds(page)).toEqual(['demo-track', 'third-light']);
+	await expect(announcement(page)).toHaveText('Second Signal removed from the queue');
+	await expect
+		.poll(() => announcementCommits(page), {
+			message:
+				'repeat removal after re-add must commit a fresh announcement (next action: clear the stale removal message when a track is re-added)'
+		})
+		.toEqual(['Second Signal removed from the queue']);
+	await page.waitForTimeout(150);
+	expect(await announcementCommits(page)).toEqual(['Second Signal removed from the queue']);
+	expectDemoTraffic(traffic);
+});
