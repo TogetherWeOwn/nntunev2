@@ -37,7 +37,8 @@
 		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
-		type QueueState
+		type QueueState,
+		type Track
 	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
@@ -138,6 +139,16 @@
 	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
+	// One-action bulk queue: the same displayed ordered collection the rows
+	// render, so sorting changes what an activation appends. The count names
+	// only missing IDs, never the view's total.
+	const bulkMissing = $derived(orderedItems.filter((track) => !queuedIds.has(track.id)));
+	const bulkDisabled = $derived(
+		libraryUnavailable || orderedItems.length === 0 || bulkMissing.length === 0
+	);
+	const bulkAllQueued = $derived(
+		!libraryUnavailable && orderedItems.length > 0 && bulkMissing.length === 0
+	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
 	// Favorites render in star order; ids absent from the current library
@@ -152,20 +163,38 @@
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
 	}
 
+	function queuedTrackFor(item: LibraryItem): Track {
+		// No stream URL until the streaming slice: playback wiring is out of
+		// scope, so the queue carries library display fields only.
+		return {
+			id: item.id,
+			title: displayTitle(item),
+			artist: displayArtist(item) ?? '',
+			streamUrl: ''
+		};
+	}
+
 	function selectTrack(id: string): void {
 		const item = items.find((track) => track.id === id);
 		if (!item) return;
-		// No stream URL until the streaming slice: playback wiring is out of
-		// scope, so the queue carries library display fields only. addTrack
-		// dedupes, so re-selecting a queued row is a no-op.
-		replaceQueue(
-			addTrack(queue, {
-				id: item.id,
-				title: displayTitle(item),
-				artist: displayArtist(item) ?? '',
-				streamUrl: ''
-			})
-		);
+		// addTrack dedupes, so re-selecting a queued row is a no-op.
+		replaceQueue(addTrack(queue, queuedTrackFor(item)));
+	}
+
+	/**
+	 * Append every displayed-but-missing track in displayed order. addTrack
+	 * dedupes by ID and preserves the current index, so the existing
+	 * arrangement, current selection and stored metadata survive; repeating
+	 * the activation adds nothing. The count names only the missing IDs this
+	 * activation appended — metadata-only, never audible playback.
+	 */
+	function addDisplayedTracksToQueue(): void {
+		const missing = orderedItems.filter((track) => !queuedIds.has(track.id));
+		if (missing.length === 0) return;
+		let next = queue;
+		for (const item of missing) next = addTrack(next, queuedTrackFor(item));
+		replaceQueue(next);
+		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
 	}
 
 	/**
@@ -339,6 +368,21 @@
 			{/if}
 		</section>
 
+		<div class="nt-bulk-queue">
+			<button
+				class="nt-button nt-bulk-queue-action"
+				type="button"
+				disabled={bulkDisabled}
+				aria-describedby={bulkAllQueued ? 'bulk-queue-hint' : undefined}
+				onclick={addDisplayedTracksToQueue}
+			>
+				Add displayed tracks to queue
+			</button>
+			{#if bulkAllQueued}
+				<p id="bulk-queue-hint">All displayed tracks are already in the queue.</p>
+			{/if}
+		</div>
+
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
 			<p><a href="/library/import">Import an NZB</a></p>
@@ -455,6 +499,22 @@
 		border-radius: var(--nt-radius);
 	}
 	.nt-library-order span {
+		color: var(--nt-fg-muted);
+	}
+	.nt-bulk-queue {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-bulk-queue-action {
+		display: inline-flex;
+		align-items: center;
+		min-height: 2.75rem;
+	}
+	.nt-bulk-queue p {
+		margin: 0;
 		color: var(--nt-fg-muted);
 	}
 	.nt-library-item {

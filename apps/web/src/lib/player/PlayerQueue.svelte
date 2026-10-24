@@ -153,7 +153,9 @@
 -->
 <p data-testid="now-playing" role="status">
 	{#if current}
-		Now playing: {displayTitle(current)}{#if current.artist} — {current.artist}{/if}
+		<!-- String expression: Svelte trims the leading space of ` — ` after
+			{#if}, rendering an asymmetric `Title— Artist`. -->
+		Now playing: {displayTitle(current)}{#if current.artist}{' — '}{current.artist}{/if}
 	{:else}
 		Queue is empty
 	{/if}
