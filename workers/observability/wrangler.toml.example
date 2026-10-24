@@ -1,0 +1,32 @@
+# Inactive, local-only validation example. Not a deployment or Tail attachment.
+name = "nntune-alerts-local"
+main = "runtime.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+send_metrics = false
+
+# Automatic subrequest spans must never capture the secret delivery endpoint.
+[observability]
+enabled = false
+
+[observability.logs]
+enabled = false
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[vars]
+PRODUCER_SCRIPT_NAME = "nntune-api-staging"
+LOGS_URL = "https://logs.example.invalid/unconfigured"
+# OPS_ALERT_WEBHOOK_URL is a secret binding NAME only; no value belongs here.
+# This example neither provisions that secret nor enables external delivery.
+
+[[durable_objects.bindings]]
+name = "ALERT_WINDOWS"
+class_name = "ErrorRateAlerts"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ErrorRateAlerts"]

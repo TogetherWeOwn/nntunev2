@@ -1112,9 +1112,9 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
-  # Privacy-safe Tail observation projection: pure, dependency-free ESM
-  # projector with VM-isolated acceptance tests. No Cloudflare API,
-  # network, or deploy. Keep this job id in ci-ok's needs.
+  # Privacy-safe Tail helpers and integrated durable alert runtime. The Node
+  # VM acceptance harness fakes Cloudflare, storage, time and all delivery:
+  # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
   tail-projection:
     name: tail-projection
     runs-on: ubuntu-latest
@@ -1138,6 +1138,11 @@ jobs:
           node --check workers/observability/tests/evaluate-health-window.test.mjs
           node --check workers/observability/render-health-alert.mjs
           node --check workers/observability/tests/render-health-alert.test.mjs
+          node --check workers/observability/runtime.mjs
+          node --check workers/observability/tests/runtime-harness.mjs
+          node --check workers/observability/tests/runtime.test.mjs
+      - name: Run durable Tail alert runtime acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/runtime.test.mjs
       - name: Run Tail projection acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
       - name: Run error-window acceptance tests
