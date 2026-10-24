@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -50,6 +50,19 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let queueAnnouncement = $state('');
+	/**
+	 * Transient queue-only filter text, owned here (not in the panel) so
+	 * it survives the panel unmounting/remounting across library refresh
+	 * branch swaps. Cleared only at the account/auth boundary below;
+	 * same-account refreshes preserve it. Never persisted or fetched.
+	 */
+	let queueFilterQuery = $state('');
+	/**
+	 * True only when a refresh starts while the filter input holds focus.
+	 * The loading branch unmounts the panel, so completion restores focus
+	 * to the remounted input in that case — and never otherwise.
+	 */
+	let restoreFilterFocus = false;
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -65,6 +78,11 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
+			// An access refusal that empties the library unmounts the queue
+			// panel (alert branch); the route-owned filter text must go with
+			// it so the next account never inherits the previous query.
+			// Successful same-account refreshes keep items and keep the query.
+			if (state.loadError && state.items.length === 0) queueFilterQuery = '';
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -87,6 +105,23 @@
 			if (!state.loading && !state.loadError && !state.libraryUnavailable && !favoritesInitialized) {
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
+			}
+			// Same-account refresh completion: the panel remounted, so hand
+			// focus back to the filter input the user was typing in. Any
+			// other focus placement (or an empty query) is left alone. The
+			// page-script unit harness runs this handler with neither DOM
+			// nor svelte bindings, so the restore is skipped there.
+			if (!state.loading && restoreFilterFocus) {
+				restoreFilterFocus = false;
+				if (
+					queueFilterQuery !== '' &&
+					typeof document !== 'undefined' &&
+					typeof tick === 'function'
+				) {
+					void tick().then(() =>
+						document.getElementById('queue-filter-input')?.focus({ preventScroll: true })
+					);
+				}
 			}
 		}
 	});
@@ -168,6 +203,9 @@
 	}
 
 	function refresh(): Promise<void> {
+		restoreFilterFocus =
+			typeof document !== 'undefined' &&
+			document.activeElement?.id === 'queue-filter-input';
 		return refresher.refresh();
 	}
 
@@ -183,6 +221,7 @@
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
+			queueFilterQuery = '';
 		}
 		refresher.handleAuthTransition(event);
 	}
@@ -193,6 +232,7 @@
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;
+		queueFilterQuery = '';
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -303,6 +343,7 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
+				bind:filterQuery={queueFilterQuery}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
