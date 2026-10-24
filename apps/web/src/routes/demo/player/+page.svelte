@@ -841,6 +841,73 @@
 		}
 	}
 
+	// Explicit "Go to time" seek: the form reuses the shared timestamp
+	// parser (seconds, m:ss, h:mm:ss — the same grammar as inbound share
+	// links), then independently guards finite range, live duration and
+	// the current matching element before writing currentTime. Every
+	// refusal explains itself inline; nothing clamps, autoplays or moves
+	// focus into a modal.
+	const GOTO_HINT_ID = 'player-goto-hint';
+	const GOTO_ERROR_ID = 'player-goto-error-text';
+	let gotoValue = $state('');
+	let gotoError = $state('');
+	let gotoStatus = $state('');
+
+	function submitGotoTime(): void {
+		// Each submission replaces prior feedback: a refusal clears an
+		// older success and a success clears an older refusal.
+		gotoError = '';
+		gotoStatus = '';
+		const seconds = parseTimestampParam(gotoValue);
+		if (
+			seconds === null ||
+			!Number.isFinite(seconds) ||
+			seconds < 0 ||
+			seconds > Number.MAX_SAFE_INTEGER
+		) {
+			gotoError = 'Enter a valid time in seconds, m:ss, or h:mm:ss.';
+			return;
+		}
+		const el = audioEl;
+		if (!el || !current) {
+			gotoError = 'No track is selected, so there is no media to seek. Add or select a track first.';
+			return;
+		}
+		// The bound element must still be the live one for this track: a
+		// detached node or a source swap since render is unavailable media,
+		// never a stale reference to write through.
+		if (!el.isConnected || !endedForCurrent(el, current.streamUrl)) {
+			gotoError = 'Track media is not available right now. Wait for it to load and try again.';
+			return;
+		}
+		// Duration is read from the live element at submission, never from
+		// a cached coordinate: it can shrink or go unknown after editing.
+		let duration = Number.NaN;
+		try {
+			duration = el.duration;
+		} catch {
+			duration = Number.NaN;
+		}
+		if (!Number.isFinite(duration) || duration < 0) {
+			gotoError = 'Duration is unavailable — the track has not loaded enough to seek yet.';
+			return;
+		}
+		// An explicit out-of-range request is corrected, never clamped.
+		if (seconds > duration) {
+			gotoError = 'That time is past the end of this track. Enter a time within the duration.';
+			return;
+		}
+		try {
+			el.currentTime = seconds;
+		} catch {
+			// The setter refused (a non-seekable resource): report honestly
+			// and never echo decoder internals into the page.
+			gotoError = 'Could not seek this track. Try again once it is playing.';
+			return;
+		}
+		gotoStatus = `Seeked to ${seconds} seconds.`;
+	}
+
 
 	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
 		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
@@ -1054,6 +1121,16 @@
 		shareCopyGeneration += 1;
 		shareCopyStatus = '';
 		shareCopyFallbackUrl = null;
+	});
+
+	// The same switch clears explicit-seek feedback, so a stale success or
+	// correction never lingers past a track change. The entered value stays:
+	// only the outcome belongs to the previous source.
+	$effect(() => {
+		const gotoIdentity = `${current?.id ?? ''}:${current?.streamUrl ?? ''}:${sourceRevision}`;
+		void gotoIdentity;
+		gotoError = '';
+		gotoStatus = '';
 	});
 
 	/**
@@ -1364,6 +1441,37 @@
 		</button>
 	</div>
 
+	<!-- Explicit seek for the synthetic demo track: a native form so Enter
+	     submits it and typing never reaches the global transport keymap. -->
+	<div>
+		<form
+			class="goto-form"
+			onsubmit={(event) => {
+				event.preventDefault();
+				submitGotoTime();
+			}}
+		>
+			<label for="player-goto-input">Go to time</label>
+			<input
+				id="player-goto-input"
+				type="text"
+				name="goto-time"
+				autocomplete="off"
+				spellcheck="false"
+				data-testid="player-goto-time"
+				bind:value={gotoValue}
+				aria-describedby={gotoError ? `${GOTO_HINT_ID} ${GOTO_ERROR_ID}` : GOTO_HINT_ID}
+				aria-invalid={gotoError ? 'true' : undefined}
+			/>
+			<p id={GOTO_HINT_ID}>Enter seconds, m:ss, or h:mm:ss.</p>
+			<button type="submit" data-testid="player-goto-seek">Seek</button>
+			{#if gotoError}
+				<p data-testid="player-goto-error" id={GOTO_ERROR_ID} role="alert">{gotoError}</p>
+			{/if}
+			<p data-testid="player-goto-status" role="status">{gotoStatus}</p>
+		</form>
+	</div>
+
 	<div>
 		<button
 			type="button"
@@ -1641,6 +1749,39 @@
 	}
 
 	.queue-filter button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	/* Explicit-seek form: same wrap/shrink contract as the queue filter
+	   row so the entry and Seek stay inside the 360px viewport. */
+	.goto-form {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.goto-form input {
+		flex: 1 1 12rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.goto-form input:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
+
+	.goto-form button {
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
