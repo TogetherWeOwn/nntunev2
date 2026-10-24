@@ -9,7 +9,18 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+	import {
+		clearFavoritesAtAuthBoundary,
+		loadFavorites,
+		saveFavorites
+	} from '#lib/library/favorites.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import {
+		displayArtist,
+		displayTitle,
+		orderLibraryItems,
+		type LibraryOrder
+	} from '#lib/library/order.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
@@ -18,22 +29,35 @@
 		clearQueue,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		moveTrack,
 		nextTrack,
+		playNext,
+		removeTrack,
 		selectTrack as selectQueueIndex,
+		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
+	let order: LibraryOrder = $state('original');
+	const orderedItems = $derived(orderLibraryItems(items, order));
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	let favorites: string[] = $state([]);
+	let favoritesInitialized = false;
+	let queueAnnouncement = $state('');
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
-		invalidateLibraryCache,
+		invalidateLibraryCache: () => {
+			favorites = [];
+			favoritesInitialized = false;
+			invalidateLibraryCache();
+		},
 		onStateChange: (state) => {
 			items = state.items;
 			staleAt = state.staleAt;
@@ -53,8 +77,16 @@
 					const rebuilt = createQueue(kept);
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
-					queue = index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt;
+					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
+			}
+			// Bootstrap once after an authenticated load has minted the context.
+			// Memory stays authoritative for this visit, even if persistence
+			// fails; Refresh must not overwrite pending edits with stale storage.
+			// Auth transitions and access refusals reset both memory and bootstrap.
+			if (!state.loading && !state.loadError && !state.libraryUnavailable && !favoritesInitialized) {
+				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+				favoritesInitialized = true;
 			}
 		}
 	});
@@ -69,16 +101,17 @@
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const favoriteIds = $derived(new Set(favorites));
+	// Favorites render in star order; ids absent from the current library
+	// stay stored but unlisted (there is no title to show for them).
+	const favoriteTracks = $derived(
+		favorites
+			.map((id) => items.find((track) => track.id === id) ?? null)
+			.filter((track): track is LibraryItem => track !== null)
+	);
 
-	function displayTitle(track: LibraryItem): string {
-		const title = track.title;
-		if (typeof title === 'string' && title.trim().length > 0) return title;
-		return track.id;
-	}
-
-	function displayArtist(track: LibraryItem): string | null {
-		const artist = track.artist;
-		return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
+	function trackCountLabel(count: number): string {
+		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
 	}
 
 	function selectTrack(id: string): void {
@@ -87,12 +120,51 @@
 		// No stream URL until the streaming slice: playback wiring is out of
 		// scope, so the queue carries library display fields only. addTrack
 		// dedupes, so re-selecting a queued row is a no-op.
-		queue = addTrack(queue, {
-			id: item.id,
-			title: displayTitle(item),
-			artist: displayArtist(item) ?? '',
-			streamUrl: ''
-		});
+		replaceQueue(
+			addTrack(queue, {
+				id: item.id,
+				title: displayTitle(item),
+				artist: displayArtist(item) ?? '',
+				streamUrl: ''
+			})
+		);
+	}
+
+	/**
+	 * Swap the queue for any change that is not a move. The move
+	 * announcement names a track and its position, so every other edit
+	 * invalidates it; clearing it here also keeps a previous account's
+	 * track title from lingering across the auth-boundary clears below.
+	 */
+	function replaceQueue(next: QueueState): void {
+		queue = next;
+		queueAnnouncement = '';
+	}
+
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (moved === undefined) return;
+		const reordered = moveTrack(queue, from, to);
+		// Announce real moves only: a no-op reorder must not chatter the
+		// live region.
+		if (reordered === queue) return;
+		queue = reordered;
+		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
+	}
+
+	function toggleFavorite(id: string): void {
+		// Toggle visible state, not the last successful write. The next write
+		// persists the full set, including edits made while storage failed.
+		const next = favorites.includes(id)
+			? favorites.filter((favorite) => favorite !== id)
+			: [...favorites, id];
+		favorites = next;
+		saveFavorites(browserStorage('session'), browserStorage('local'), next);
+	}
+
+	function starLabel(track: LibraryItem): string {
+		const title = displayTitle(track);
+		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
 	function refresh(): Promise<void> {
@@ -104,15 +176,23 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
-			queue = clearQueue(queue);
+			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
+			// Clear favorites storage BEFORE the refresher revokes the
+			// session auth context the scoped key derives from.
+			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			favorites = [];
+			favoritesInitialized = false;
 		}
 		refresher.handleAuthTransition(event);
 	}
 
 	function handleLocalAuthTransition(): void {
-		queue = clearQueue(queue);
+		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
+		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		favorites = [];
+		favoritesInitialized = false;
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -151,32 +231,85 @@
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
 		{/if}
 
+		<section data-testid="favorites-section" aria-label="Favorites">
+			<h2>Favorites</h2>
+			{#if favoriteTracks.length === 0}
+				<p data-testid="favorites-empty">No favorites yet. Star a track to pin it here.</p>
+			{:else}
+				<ul>
+					{#each favoriteTracks as track (track.id)}
+						<li data-testid="favorite-item" data-id={track.id}>
+							<button type="button" onclick={() => selectTrack(track.id)}>
+								{displayTitle(track)}
+								{#if displayArtist(track)}
+									<span> — {displayArtist(track)}</span>
+								{/if}
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
+
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
 			<p><a href="/library/import">Import an NZB</a></p>
 		{:else if items.length === 0}
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
+			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
+			<div class="nt-library-order">
+				<label for="library-order">Order tracks</label>
+				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
+					<option value="original">Original order</option>
+					<option value="title">Title A–Z</option>
+					<option value="artist">Artist A–Z</option>
+				</select>
+				<span id="library-order-hint">Changes this list only, not your queue.</span>
+			</div>
 			<ul data-testid="library-list">
-				{#each items as track (track.id)}
+				{#each orderedItems as track (track.id)}
+					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
 							type="button"
 							class="nt-library-row"
-							aria-label={queuedIds.has(track.id)
+							aria-label={queued
 								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
 								: undefined}
+							aria-pressed={queued ? true : undefined}
 							onclick={() => selectTrack(track.id)}
 						>
 							{displayTitle(track)}
 							{#if displayArtist(track)}
 								<span> — {displayArtist(track)}</span>
 							{/if}
+							{#if queued}
+								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
+							{/if}
+						</button>
+						<button
+							type="button"
+							class="nt-library-star"
+							aria-pressed={favoriteIds.has(track.id)}
+							aria-label={starLabel(track)}
+							onclick={() => toggleFavorite(track.id)}
+						>
+							<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
 						</button>
 					</li>
 				{/each}
 			</ul>
-			<PlayerQueue state={queue} onnext={() => (queue = nextTrack(queue))} />
+			<PlayerQueue
+				state={queue}
+				announcement={queueAnnouncement}
+				onnext={() => replaceQueue(nextTrack(queue))}
+				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
+				onmove={moveQueuedTrack}
+				onplaynext={(index) => replaceQueue(playNext(queue, index))}
+				onremove={(index) => replaceQueue(removeTrack(queue, index))}
+				onclear={() => replaceQueue(clearQueue(queue))}
+			/>
 		{/if}
 
 		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
@@ -209,11 +342,33 @@
 </main>
 
 <style>
+	.nt-library-order {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-order select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-order span {
+		color: var(--nt-fg-muted);
+	}
 	.nt-library-item {
+		display: flex;
+		align-items: center;
 		padding: 0;
 	}
 	.nt-library-row {
 		display: block;
+		flex: 1 1 auto;
 		width: 100%;
 		text-align: left;
 		background: none;
@@ -222,5 +377,25 @@
 		cursor: pointer;
 		font: inherit;
 		color: inherit;
+	}
+	.nt-library-star {
+		flex: 0 0 auto;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.nt-queued-badge {
+		display: inline-block;
+		margin-left: var(--nt-space-2);
+		padding: 0 var(--nt-space-2);
+		border-radius: var(--nt-radius);
+		background: var(--nt-accent);
+		color: var(--nt-accent-fg);
+		font-size: 0.75rem;
+		line-height: 1.6;
+		white-space: nowrap;
 	}
 </style>
