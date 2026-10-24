@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { tick } from 'svelte';
 	import { currentTrack, type QueueState, type Track } from './queue.js';
+	import { matchesQueueQuery } from './queueFilter.js';
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 
 	interface Props {
@@ -87,10 +88,13 @@
 		return track.title?.trim() ? track.title : track.id;
 	}
 
+	/**
+	 * Shared presentation matcher: `normalized` is already trimmed and
+	 * lowercased, and the shared export re-normalizes idempotently, so
+	 * this delegation renders byte-identical output to the inline version.
+	 */
 	function matchesQuery(track: Track, normalized: string): boolean {
-		if (!normalized) return true;
-		const haystack = `${displayTitle(track)} ${track.artist ?? ''}`.toLowerCase();
-		return haystack.includes(normalized);
+		return matchesQueueQuery(track, normalized);
 	}
 
 	/**
