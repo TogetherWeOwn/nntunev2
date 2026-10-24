@@ -13,6 +13,7 @@ export type ShortcutAction =
 	| 'previous-track'
 	| 'seek-back'
 	| 'seek-forward'
+	| 'restart-track'
 	| 'toggle-mute'
 	| 'open-shortcuts'
 	| 'close-shortcuts';
@@ -24,6 +25,7 @@ const KEY_BINDINGS: Readonly<Record<string, ShortcutAction>> = {
 	p: 'previous-track',
 	j: 'seek-back',
 	l: 'seek-forward',
+	'0': 'restart-track',
 	m: 'toggle-mute',
 	'?': 'open-shortcuts'
 };
@@ -85,6 +87,7 @@ export const SHORTCUT_ROWS: readonly ShortcutRow[] = [
 	{ key: 'p', label: 'Previous track' },
 	{ key: 'j', label: 'Seek back 10 seconds' },
 	{ key: 'l', label: 'Seek forward 10 seconds' },
+	{ key: '0', label: 'Restart track' },
 	{ key: 'm', label: 'Mute / unmute' },
 	{ key: '?', label: 'Open this shortcuts dialog' },
 	{ key: 'Escape', label: 'Close this dialog' }
