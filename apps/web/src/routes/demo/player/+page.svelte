@@ -770,14 +770,14 @@
 		sound = actual;
 	}
 
-	// Visible jump controls share the keyboard relative-seek path above:
-	// the current element is read at activation and SEEK_SECONDS stays the
-	// single step source. Unusable media (no current track, non-finite or
-	// negative time, non-finite duration) refuses quietly instead of
-	// throwing through the UI or reporting a seek that never happened.
-	function seekButton(deltaSeconds: number): void {
+	// Usable-media gate shared by the jump and restart controls: the
+	// current element is read at activation and unusable media (no current
+	// track, non-finite or negative time, non-finite duration) refuses
+	// quietly instead of throwing through the UI or reporting a seek that
+	// never happened.
+	function seekCoordinates(): { element: HTMLAudioElement } | null {
 		const el = audioEl;
-		if (!el || !current) return;
+		if (!el || !current) return null;
 		let position = Number.NaN;
 		let bound = Number.NaN;
 		try {
@@ -786,9 +786,33 @@
 		} catch {
 			// An unreadable element is unusable media: refuse below.
 		}
-		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return;
+		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return null;
+		return { element: el };
+	}
+
+	// Visible jump controls share the keyboard relative-seek path above:
+	// SEEK_SECONDS stays the single step source and the gate above fences
+	// unusable media before the write.
+	function seekButton(deltaSeconds: number): void {
+		if (!seekCoordinates()) return;
 		try {
 			seekShortcut(deltaSeconds);
+		} catch {
+			// A non-seekable element refuses the assignment; keep the
+			// previous position instead of throwing through the UI.
+		}
+	}
+
+	// Restart seeks the current element to zero through the same validated
+	// gate: it reads the live element at activation (never a cached one, so
+	// a source swap between renders cannot mistarget), preserves
+	// paused/playing intent and rate by touching nothing but currentTime,
+	// and never advances tracks, calls play, or records accounting.
+	function restartCurrent(): void {
+		const coords = seekCoordinates();
+		if (!coords) return;
+		try {
+			coords.element.currentTime = 0;
 		} catch {
 			// A non-seekable element refuses the assignment; keep the
 			// previous position instead of throwing through the UI.
@@ -842,6 +866,9 @@
 				break;
 			case 'seek-forward':
 				seekShortcut(SEEK_SECONDS);
+				break;
+			case 'restart-track':
+				restartCurrent();
 				break;
 			case 'toggle-mute':
 				toggleMuteShortcut();
@@ -1297,6 +1324,13 @@
 				disabled={!current}
 			>
 				Forward 10 seconds
+			</button>
+		</div>
+		<!-- Own row like the jump pair above: three transport buttons in one
+		     row would overflow the 360px viewport. -->
+		<div>
+			<button type="button" data-testid="player-restart" onclick={restartCurrent} disabled={!current}>
+				Restart track
 			</button>
 		</div>
 		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
