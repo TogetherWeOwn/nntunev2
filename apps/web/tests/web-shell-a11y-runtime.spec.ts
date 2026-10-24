@@ -51,7 +51,8 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 			await expect(nowPlaying).toContainText('Queue is empty');
 			await expect(page.getByRole('list', { name: 'Playback queue' })).toBeAttached();
 			await page.screenshot({ path: testInfo.outputPath('queue-empty.png'), fullPage: true });
-			const mangoButton = page.getByTestId('library-item').filter({ hasText: 'Mango Season' }).getByRole('button');
+			// Queue control only: the row also carries a star toggle button.
+			const mangoButton = page.getByTestId('library-item').filter({ hasText: 'Mango Season' }).locator('button.nt-library-row');
 			await expect(mangoButton).toHaveAccessibleName('Mango Season — Acceptance Band');
 			await expect(mangoButton).not.toHaveAttribute('aria-pressed');
 			await mangoButton.click();

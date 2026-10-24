@@ -98,7 +98,7 @@ function row(page: Page, id: string): Locator {
 }
 
 function rowButton(page: Page, id: string): Locator {
-	return row(page, id).getByRole('button');
+	return row(page, id).locator('button.nt-library-row');
 }
 
 function badgeFor(page: Page, id: string): Locator {
