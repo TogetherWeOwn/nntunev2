@@ -75,6 +75,7 @@
 
 	let list: HTMLOListElement | null = $state(null);
 	let emptyTarget: HTMLElement | null = $state(null);
+	let filterEmptyTarget: HTMLElement | null = $state(null);
 
 	function currentRowElement(): HTMLElement | null {
 		return (
@@ -125,6 +126,18 @@
 	}
 
 	/**
+	 * Zero-visible fallback: tracks survive behind the filter but no row
+	 * renders, so the no-matches status — not the "Queue is empty" target,
+	 * which would misannounce — receives recovery focus.
+	 */
+	function focusFilterEmptyTarget(): boolean {
+		if (!filterEmptyTarget) return false;
+		filterEmptyTarget.focus({ preventScroll: true });
+		filterEmptyTarget.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+		return true;
+	}
+
+	/**
 	 * Focus is only recovered when this explicit action stranded it: the
 	 * activated control held focus at dispatch and, after render, focus sits
 	 * on nothing (body/null) — or is still on that same control while the
@@ -148,8 +161,9 @@
 	/**
 	 * Report one remove intent, then land focus deterministically: the next
 	 * surviving displayed row's Remove, otherwise the previous, otherwise
-	 * the stable empty target. Consecutive keyboard removals stay operable
-	 * because each recovery lands on a live Remove control.
+	 * the no-matches status when hidden tracks survive behind the filter,
+	 * otherwise the stable empty target. Consecutive keyboard removals stay
+	 * operable because each recovery lands on a live Remove control.
 	 */
 	async function reportRemove(event: Event, index: number): Promise<void> {
 		// currentTarget and the pre-action order are only valid during dispatch.
@@ -166,7 +180,12 @@
 			if (id !== null) current.add(id);
 		}
 		const target = survivorId(beforeIds, removedId, current);
-		if (target === null || !focusRemoveFor(target)) focusEmptyTarget();
+		if (target !== null && focusRemoveFor(target)) return;
+		// No surviving displayed row. When tracks survive but the filter
+		// hides every one of them, the honest no-matches status takes
+		// recovery focus; only a truly empty queue uses the empty target.
+		if (queue.tracks.length > 0 && focusFilterEmptyTarget()) return;
+		focusEmptyTarget();
 	}
 
 	/**
@@ -309,7 +328,13 @@
 </p>
 
 {#if trackCount > 0 && visibleEntries.length === 0}
-	<p data-testid="queue-filter-empty">No matches in this queue</p>
+	<!--
+		Zero-visible recovery target: programmatically focusable so a removal
+		that leaves only hidden tracks behind lands here instead of the body.
+		Focused only by explicit remove recovery, never on render; never a
+		tab stop.
+	-->
+	<p data-testid="queue-filter-empty" tabindex="-1" bind:this={filterEmptyTarget}>No matches in this queue</p>
 {/if}
 
 <ol aria-label="Playback queue" bind:this={list}>
@@ -443,13 +468,16 @@
 		outline-offset: 2px;
 	}
 
-	/* Same ring for the empty-queue recovery target: keyboard recovery
-	 * must stay visible without relying on the host page's stylesheet. */
-	[data-testid='queue-empty-focus'] {
+	/* Same ring for the empty-queue and zero-visible recovery targets:
+	 * keyboard recovery must stay visible without relying on the host
+	 * page's stylesheet. */
+	[data-testid='queue-empty-focus'],
+	[data-testid='queue-filter-empty'] {
 		scroll-margin-block: 4px;
 	}
 
-	[data-testid='queue-empty-focus']:focus {
+	[data-testid='queue-empty-focus']:focus,
+	[data-testid='queue-filter-empty']:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}
