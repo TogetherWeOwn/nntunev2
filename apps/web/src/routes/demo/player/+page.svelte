@@ -34,6 +34,12 @@
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
 	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
+	import {
+		createRecentlyPlayedStore,
+		formatRecentPlayedAt,
+		type RecentEntry,
+		type RecentlyPlayedStore
+	} from '#lib/player/recentlyPlayed.js';
 	import { buildShareQuery, parseTimestampParam } from '#lib/player/shareTimestamp.js';
 	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
 	import {
@@ -293,6 +299,11 @@
 	let speed: PlaybackSpeed | null = null;
 	let resumeStore: ResumeStore | null = null;
 
+	// Session-local recently-played list (demo synthetic tracks only; the
+	// store itself is fail-soft, so a corrupt key renders the empty state).
+	let recentStore: RecentlyPlayedStore | null = null;
+	let recentEntries = $state<RecentEntry[]>([]);
+
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
 	let clockOffset = 0;
@@ -393,6 +404,61 @@
 		if (current) seekToResume(current.id);
 	}
 
+	interface RecentRow extends RecentEntry {
+		title: string;
+		artist: string;
+	}
+
+	/**
+	 * Rendered rows: entries resolved against the demo catalogue. Unknown ids
+	 * stay stored (the cap counts them) but render nothing, so a seeded or
+	 * stale key can never show a non-demo title.
+	 */
+	function toRecentRows(entries: RecentEntry[]): RecentRow[] {
+		return entries.flatMap((entry) => {
+			const track = DEMO_TRACKS.find((candidate) => candidate.id === entry.trackId);
+			return track === undefined
+				? []
+				: [{ ...entry, title: track.title, artist: track.artist }];
+		});
+	}
+
+	const recentTracks = $derived(toRecentRows(recentEntries));
+
+	function refreshRecent(): void {
+		recentEntries = recentStore?.entries() ?? [];
+	}
+
+	/** Record an explicit or completed demo play (no-op before mount). */
+	function recordRecent(trackId: string | undefined): void {
+		if (!trackId || !recentStore) return;
+		recentStore.record(trackId);
+		refreshRecent();
+	}
+
+	function recentLabel(playedAt: number): string {
+		return formatRecentPlayedAt(playedAt, Date.now());
+	}
+
+	function clearRecent(): void {
+		recentStore?.clear();
+		refreshRecent();
+	}
+
+	function replayRecent(trackId: string): void {
+		// A cleared queue may no longer hold the track: re-add the demo
+		// catalogue entry, then select it like any explicit pick (which also
+		// moves it to the front of the recent list without duplicating).
+		const deck = DEMO_TRACKS.find((track) => track.id === trackId);
+		if (!deck) return;
+		let index = queue.tracks.findIndex((track) => track.id === trackId);
+		if (index < 0) {
+			queue = addTrack(queue, deck);
+			index = queue.tracks.length - 1;
+		}
+		selectAt(index);
+	}
+
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
@@ -473,7 +539,15 @@
 		// Native controls bypass playCurrent: retry the resume on the gesture.
 		resumeLevelingContext();
 		if (status === 'error') playCurrent(true);
-		else if (status !== 'playing') status = 'loading';
+		else if (status !== 'playing') {
+			// A play event outside a playCurrent flight is a native-control
+			// press: record it like any explicit play-press. playCurrent sets
+			// status 'loading' synchronously before the async play, so its own
+			// plays (and retries) always arrive as 'loading' and record at
+			// their own call sites — or not at all.
+			if (status !== 'loading') recordRecent(current?.id);
+			status = 'loading';
+		}
 	}
 
 	function handlePlaying(event: Event): void {
@@ -573,14 +647,22 @@
 		const outgoingId = current?.id;
 		persistPosition(outgoingId);
 		goNext();
-		if (current?.id !== outgoingId) seekCurrentResume();
+		if (current?.id !== outgoingId) {
+			seekCurrentResume();
+			// Explicit Next records the newly playing track. Auto-advances go
+			// through goNext directly and record nothing extra.
+			recordRecent(current?.id);
+		}
 	}
 
 	function userPrevious(): void {
 		const outgoingId = current?.id;
 		persistPosition(outgoingId);
 		goPrevious();
-		if (current?.id !== outgoingId) seekCurrentResume();
+		if (current?.id !== outgoingId) {
+			seekCurrentResume();
+			recordRecent(current?.id);
+		}
 	}
 
 	function selectAt(index: number): void {
@@ -594,6 +676,9 @@
 		radio = null;
 		queue = next;
 		playCurrent();
+		// An explicit pick records even when its playback fails; only the
+		// retry afterwards must not append.
+		recordRecent(nextId);
 		if (nextId !== undefined && shouldResume) seekToResume(nextId);
 	}
 
@@ -632,7 +717,13 @@
 
 	function togglePlayShortcut(): void {
 		if (status === 'playing' || status === 'loading') pauseCurrent();
-		else playCurrent();
+		else {
+			// Snapshot before playCurrent changes status to loading: an
+			// error-state press retries without recording another play.
+			const retry = status === 'error';
+			playCurrent(retry);
+			if (!retry) recordRecent(current?.id);
+		}
 	}
 
 	function seekShortcut(deltaSeconds: number): void {
@@ -716,10 +807,12 @@
 				togglePlayShortcut();
 				break;
 			case 'next-track':
-				goNext();
+				// Same gesture as the Next button: persist, navigate, resume
+				// and record through the shared explicit-play path.
+				userNext();
 				break;
 			case 'previous-track':
-				goPrevious();
+				userPrevious();
 				break;
 			case 'seek-back':
 				seekShortcut(-SEEK_SECONDS);
@@ -745,6 +838,9 @@
 			(repeat === 'off' && status === 'error');
 		if (!eventForCurrent(event) || !playing || !current) return;
 		const endedId = current.id;
+		// The completed track's entry covers the listen (queue and radio
+		// alike); the auto-advanced track earns its own on completion.
+		recordRecent(endedId);
 		const fired = sleepTimer.trackEnded();
 		// A finished track never resumes mid-way, whether the timer fired or
 		// the queue advances.
@@ -835,7 +931,10 @@
 				if (isCurrent()) userPrevious();
 			},
 			onPlay: () => {
-				if (isCurrent()) playCurrent();
+				if (!isCurrent()) return;
+				const retry = status === 'error';
+				playCurrent(retry);
+				if (!retry) recordRecent(current?.id);
 			},
 			onPause: () => {
 				if (isCurrent()) pauseCurrent();
@@ -950,6 +1049,12 @@
 		speedValue = String(speed.current());
 		speed.apply();
 		resumeStore = createResumeStore({ storage: store });
+		try {
+			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
+		} catch {
+			recentStore = createRecentlyPlayedStore({ storage: memoryStorage() });
+		}
+		refreshRecent();
 		try {
 			queue = restoreQueue(sessionStorage.getItem(QUEUE_STORAGE_KEY), DEMO_TRACKS);
 		} catch {
@@ -1279,6 +1384,38 @@
 				</li>
 			{/each}
 		</ul>
+	</section>
+
+	<section data-testid="recently-played" aria-label="Recently played">
+		<h2>Recently played</h2>
+		<p>
+			Demo session history — synthetic demo tracks only. Clearing the queue never wipes this
+			list; only Clear below does.
+		</p>
+		{#if recentTracks.length === 0}
+			<p data-testid="recently-played-empty">
+				Nothing played yet this demo session — press play to start your recent list.
+			</p>
+		{:else}
+			<ol>
+				{#each recentTracks as row (row.trackId)}
+					<li data-testid="recent-item" data-track-id={row.trackId}>
+						{row.title} — {row.artist}
+						<span data-testid="recent-played-at-{row.trackId}">{recentLabel(row.playedAt)}</span>
+						<button
+							type="button"
+							data-testid="recent-replay-{row.trackId}"
+							onclick={() => replayRecent(row.trackId)}
+						>
+							Replay {row.title}
+						</button>
+					</li>
+				{/each}
+			</ol>
+		{/if}
+		<button type="button" data-testid="recently-played-clear" onclick={clearRecent}>
+			Clear recently played
+		</button>
 	</section>
 
 	<section data-testid="comforts-panel" aria-label="Player comforts">
