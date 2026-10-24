@@ -190,6 +190,28 @@
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
+	function removeQueuedTrack(index: number): void {
+		const removed = queue.tracks[index];
+		if (removed === undefined) return;
+		const next = removeTrack(queue, index);
+		// Announce real removals only: a no-op removal must not chatter the
+		// live region. The single assignment replaces any previous move
+		// message instead of replaying it.
+		if (next === queue) return;
+		const title = removed.title?.trim() ? removed.title : removed.id;
+		queue = next;
+		queueAnnouncement = `${title} removed from the queue.`;
+	}
+
+	function clearQueuedTracks(): void {
+		const next = clearQueue(queue);
+		// Announce real clears only: a no-op clear must not chatter the live
+		// region.
+		if (next === queue) return;
+		queue = next;
+		queueAnnouncement = 'Queue cleared.';
+	}
+
 	function trimPreviousTracks(): void {
 		const trimmed = keepCurrentAndUpcoming(queue);
 		// Announce real trims only: a no-op trim must not chatter the live
@@ -396,8 +418,8 @@
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
-				onremove={(index) => replaceQueue(removeTrack(queue, index))}
-				onclear={() => replaceQueue(clearQueue(queue))}
+				onremove={removeQueuedTrack}
+				onclear={clearQueuedTracks}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
