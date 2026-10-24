@@ -26,9 +26,29 @@ function currentIds(body: string) {
 		.map(([tag]) => tag.match(/data-track-id="([^"]+)"/)?.[1]);
 }
 
+/**
+ * SSR button text extraction (test-only; the result feeds assertions, never rendering).
+ * A `<...>`-span scanner instead of a tag-stripping `replace` call, which CodeQL
+ * flags as `js/incomplete-multi-character-sanitization`. Semantics match the old
+ * tag-stripping pattern exactly: a `<` is dropped only together with everything up
+ * to the next `>`; a `<` with no later `>` is kept.
+ */
+function textContent(html: string) {
+	let text = '';
+	let rest = html;
+	for (;;) {
+		const open = rest.indexOf('<');
+		if (open === -1) return text + rest;
+		const close = rest.indexOf('>', open + 1);
+		if (close === -1) return text + rest;
+		text += rest.slice(0, open);
+		rest = rest.slice(close + 1);
+	}
+}
+
 function selectButtons(body: string) {
 	return [...body.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)]
-		.filter(([, attrs, content]) => /aria-label="Select [^"]+"/.test(attrs!) || /^Select\s/.test(content!.replace(/<[^>]*>/g, '').trim()));
+		.filter(([, attrs, content]) => /aria-label="Select [^"]+"/.test(attrs!) || /^Select\s/.test(textContent(content!).trim()));
 }
 
 function frozenQueue() {
@@ -87,7 +107,7 @@ describe('PICK state transitions and shared component contract', () => {
 		const buttons = selectButtons(render(PlayerQueue, { props }).body);
 		expect(buttons, 'missing host-owned direct-selection controls').toHaveLength(3);
 		for (const title of ['Zulu Song', 'Alpha Song', 'Mike Song']) {
-			const button = buttons.find(([, attrs, content]) => attrs?.includes(`aria-label="Select ${title}"`) || content?.replace(/<[^>]*>/g, '').trim() === `Select ${title}`);
+			const button = buttons.find(([, attrs, content]) => attrs?.includes(`aria-label="Select ${title}"`) || (content === undefined ? undefined : textContent(content).trim()) === `Select ${title}`);
 			expect(button, `missing Select ${title}`).toBeDefined();
 			expect(button?.[1]).toMatch(/type="button"/);
 			expect(button?.[0]).not.toMatch(/play now|stream available|is playing/i);
