@@ -69,6 +69,7 @@
 
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
+	const RADIO_CONTINUE_STORAGE_KEY = 'nntune:radio-continue:v1';
 
 	/**
 	 * Fixture ReplayGain tags for the demo tracks: synthetic metadata for
@@ -112,6 +113,7 @@
 		seed: number;
 	}
 	let radio = $state<RadioState | null>(null);
+	let radioContinueEnabled = $state(true);
 	// Repeat is page-local, unlike the persisted queue: reload always starts Off.
 	let repeat = $state<RepeatMode>('off');
 
@@ -161,6 +163,27 @@
 			return localStorage;
 		} catch {
 			return null;
+		}
+	}
+
+	function loadRadioContinueEnabled(): boolean {
+		try {
+			const raw = safeStorage()?.getItem(RADIO_CONTINUE_STORAGE_KEY);
+			if (raw === null || raw === undefined) return true;
+			const parsed: unknown = JSON.parse(raw);
+			return typeof parsed === 'boolean' ? parsed : true;
+		} catch {
+			return true;
+		}
+	}
+
+	function setRadioContinueEnabled(enabled: boolean): void {
+		// This changes only future queue exhaustion, never an active radio pass.
+		radioContinueEnabled = enabled;
+		try {
+			safeStorage()?.setItem(RADIO_CONTINUE_STORAGE_KEY, JSON.stringify(enabled));
+		} catch {
+			// Storage failures leave the in-session preference usable.
 		}
 	}
 
@@ -848,8 +871,8 @@
 		const result = naturalEndPolicy(queue, {
 			repeat,
 			radioActive: radio !== null,
-			// Preserve this host's existing automatic continuation when Off.
-			continueRadio: true,
+			// The preference applies only after the queue ends with repeat Off.
+			continueRadio: radioContinueEnabled,
 			playing,
 			validEnd: true,
 			sleepComplete: fired
@@ -1017,6 +1040,7 @@
 		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
+		radioContinueEnabled = loadRadioContinueEnabled();
 		(
 			window as unknown as {
 				__levelingProbe?: () => {
@@ -1153,6 +1177,20 @@
 		{:else}
 			Queue is empty
 		{/if}
+	</p>
+
+	<label>
+		<input
+			type="checkbox"
+			checked={radioContinueEnabled}
+			aria-describedby="radio-continue-scope"
+			onchange={(event) => setRadioContinueEnabled(event.currentTarget.checked)}
+		/>
+		Continue with radio when queue ends
+	</label>
+	<p id="radio-continue-scope">
+		Demo tracks only, not live library playback. This choice applies when the queue ends with Repeat Off;
+		it does not stop a track or radio already playing.
 	</p>
 
 	{#if radio}
