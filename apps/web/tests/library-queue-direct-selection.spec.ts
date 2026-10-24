@@ -219,8 +219,15 @@ for (const example of [
 			await expect(current(page)).toBeInViewport();
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 			await testInfo.attach('selection-runtime', { body: await page.screenshot(), contentType: 'image/png' });
-			if (example.index === 2) await expect(page.getByTestId('player-next')).toBeDisabled();
-			else {
+			if (example.index === 2) {
+				// Preserved boundary (QO-B04 + playerQueueContracts): Next stays
+				// enabled at tail; activating it is a clamped no-op that keeps
+				// selection, order and marker.
+				const next = page.getByTestId('player-next');
+				await expect(next).toBeEnabled();
+				await next.click();
+				await selected(page, example.track, example.title, example.index + 1);
+			} else {
 				await page.getByTestId('player-next').click();
 				await selected(page, IDS[example.index + 1]!, example.index === 0 ? 'Zulu Song' : 'Alpha Song', example.index + 2);
 			}
