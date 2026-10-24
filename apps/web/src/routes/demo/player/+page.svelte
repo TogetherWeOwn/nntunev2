@@ -838,8 +838,10 @@
 
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
-	// surfaces, open modals and modified chords. No preventDefault: the
-	// map holds only keys with no page-level default to suppress.
+	// surfaces, open modals and modified chords. Handled bindings suppress
+	// their keydown default: the digit binding would otherwise also drive
+	// native select type-ahead (the 0.5x/0.75x speed options start with
+	// 0), so one keystroke would restart the track AND halve the speed.
 	function handleGlobalKeydown(event: KeyboardEvent): void {
 		if (event.metaKey || event.ctrlKey || event.altKey) return;
 		const action = actionForKey(event.key);
@@ -849,6 +851,7 @@
 			return;
 		}
 		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		event.preventDefault();
 		switch (action) {
 			case 'toggle-play':
 				togglePlayShortcut();
