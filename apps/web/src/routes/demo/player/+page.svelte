@@ -55,6 +55,8 @@
 		createQueue,
 		currentTrack,
 		DEMO_TRACKS,
+		formatQueueText,
+		formatQueueM3U,
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
@@ -150,6 +152,80 @@
 	const shareCopyEnabled = $derived(
 		current !== null && DEMO_TRACKS.some((track) => track.id === (current?.id ?? ''))
 	);
+
+	let queueExportStatus = $state('');
+	let queueExportFallback = $state<string | null>(null);
+	let queueExportGeneration = 0;
+	let queueExportAlive = true;
+	let queueDownloadUrl: string | null = null;
+
+	function releaseQueueDownload(): void {
+		if (queueDownloadUrl !== null) URL.revokeObjectURL(queueDownloadUrl);
+		queueDownloadUrl = null;
+	}
+
+	// Every queue replacement (including selection) invalidates feedback.
+	// Handlers also compare snapshot identity to fence same-tick changes
+	// before this effect flushes. Export never writes the queue itself.
+	$effect(() => {
+		queue;
+		queueExportGeneration += 1;
+		queueExportStatus = '';
+		queueExportFallback = null;
+	});
+
+	function beginQueueExport(): number {
+		queueExportGeneration += 1;
+		queueExportStatus = '';
+		queueExportFallback = null;
+		return queueExportGeneration;
+	}
+
+	async function copyQueueText(): Promise<void> {
+		const generation = beginQueueExport();
+		const snapshot = queue;
+		if (!queueExportAlive || snapshot.tracks.length === 0) return;
+		const text = formatQueueText(snapshot);
+		try {
+			// Both the API getter and the write can fail. Neither is proof
+			// of a successful copy: expose selectable text instead.
+			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
+			await navigator.clipboard.writeText(text);
+		} catch {
+			if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
+			queueExportStatus = 'Clipboard unavailable. Copy the queue manually below.';
+			queueExportFallback = text;
+			return;
+		}
+		if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
+		queueExportStatus = 'Copied queue as text.';
+	}
+
+	function downloadQueueM3U(): void {
+		beginQueueExport();
+		if (!queueExportAlive || queue.tracks.length === 0) return;
+		const link = document.createElement('a');
+		try {
+			// Retain at most one Blob URL until the next download or teardown,
+			// not an arbitrary timer while the browser may still be saving it.
+			releaseQueueDownload();
+			const blob = new Blob([formatQueueM3U(queue)], { type: 'audio/x-mpegurl;charset=utf-8' });
+			queueDownloadUrl = URL.createObjectURL(blob);
+			link.href = queueDownloadUrl;
+			link.download = 'queue.m3u';
+			link.hidden = true;
+			document.body.append(link);
+			link.click();
+			// The browser owns the save dialog: initiating it cannot prove
+			// that a file was saved to disk.
+			queueExportStatus = 'Download started. Check your browser’s saved downloads for queue.m3u.';
+		} catch {
+			releaseQueueDownload();
+			queueExportStatus = 'Could not start the download. Try again or copy the queue as text.';
+		} finally {
+			link.remove();
+		}
+	}
 
 	const playback = createPlayback({
 		audio: () => audioEl,
@@ -1179,6 +1255,9 @@
 			// A copy settling after teardown must not resurrect state.
 			shareCopyAlive = false;
 			shareCopyGeneration += 1;
+			queueExportAlive = false;
+			queueExportGeneration += 1;
+			releaseQueueDownload();
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
@@ -1418,6 +1497,50 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<div class="queue-export">
+			<div class="queue-export-actions">
+				<button
+					type="button"
+					data-testid="queue-export-copy"
+					disabled={queue.tracks.length === 0}
+					aria-describedby="queue-export-scope queue-export-status"
+					onclick={(event) => {
+						event.currentTarget.focus();
+						void copyQueueText();
+					}}
+				>
+					Copy queue as text
+				</button>
+				<button
+					type="button"
+					data-testid="queue-export-download"
+					disabled={queue.tracks.length === 0}
+					aria-describedby="queue-export-scope queue-export-status"
+					onclick={downloadQueueM3U}
+				>
+					Download queue.m3u
+				</button>
+			</div>
+			<p id="queue-export-scope">Whole queue, in arranged order. Track IDs only in M3U — no audio or stream links.</p>
+			<p id="queue-export-status" data-testid="queue-export-status" aria-live="polite">
+				{queue.tracks.length === 0 ? 'Queue is empty. Add a track to copy or download it.' : queueExportStatus}
+			</p>
+			{#if queueExportFallback !== null}
+				<label for="queue-export-fallback-field">Queue as text</label>
+				<textarea
+					id="queue-export-fallback-field"
+					data-testid="queue-export-fallback"
+					readonly
+					rows="4"
+					value={queueExportFallback}
+					aria-describedby="queue-export-instructions"
+				></textarea>
+				<p id="queue-export-instructions" data-testid="queue-export-instructions">
+					Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or Cmd+C).
+					On touch screens, long-press the text, select all and choose Copy.
+				</p>
+			{/if}
+		</div>
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
@@ -1606,6 +1729,44 @@
 </main>
 
 <style>
+	.queue-export {
+		margin-block: var(--nt-space-3);
+	}
+
+	.queue-export-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2);
+	}
+
+	.queue-export button {
+		min-height: 2.75rem;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	.queue-export p {
+		margin-block: var(--nt-space-2);
+	}
+
+	#queue-export-scope {
+		color: var(--nt-fg-muted);
+	}
+
+	.queue-export textarea {
+		display: block;
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
 	/* The mode choice keeps a visible focus ring under programmatic focus
 	   too, where the global :focus-visible rule does not apply. */
 	#track-time-mode:focus {
