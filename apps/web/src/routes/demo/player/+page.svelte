@@ -342,6 +342,10 @@
 	// store itself is fail-soft, so a corrupt key renders the empty state).
 	let recentStore: RecentlyPlayedStore | null = null;
 	let recentEntries = $state<RecentEntry[]>([]);
+	// Polite action-only feedback for history Add/Forget: empty until the
+	// first activation, never set on load, play, seek or timeupdate.
+	let recentFeedback = $state('');
+	let recentSection: HTMLElement | undefined = $state();
 
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
@@ -446,19 +450,22 @@
 	interface RecentRow extends RecentEntry {
 		title: string;
 		artist: string;
+		/** False for stale ids outside the demo catalogue: shown as unavailable, never resolved to another track. */
+		available: boolean;
 	}
 
 	/**
 	 * Rendered rows: entries resolved against the demo catalogue. Unknown ids
-	 * stay stored (the cap counts them) but render nothing, so a seeded or
-	 * stale key can never show a non-demo title.
+	 * stay stored (the cap counts them) and render an honest unavailable row
+	 * with no playback or queue actions, so a seeded or stale key can never
+	 * show a non-demo title.
 	 */
 	function toRecentRows(entries: RecentEntry[]): RecentRow[] {
-		return entries.flatMap((entry) => {
+		return entries.map((entry) => {
 			const track = DEMO_TRACKS.find((candidate) => candidate.id === entry.trackId);
 			return track === undefined
-				? []
-				: [{ ...entry, title: track.title, artist: track.artist }];
+				? { ...entry, title: 'Unavailable track', artist: '', available: false }
+				: { ...entry, title: track.title, artist: track.artist, available: true };
 		});
 	}
 
@@ -496,6 +503,55 @@
 			index = queue.tracks.length - 1;
 		}
 		selectAt(index);
+	}
+
+	/**
+	 * Append a history entry to the queue without touching playback: no
+	 * play, seek, source change or restart, and no history rewrite. Uses
+	 * the shared addTrack semantics (append only if missing), so a repeat
+	 * activation is an explained no-op. Unknown ids never resolve to
+	 * another track.
+	 */
+	function enqueueRecent(trackId: string): void {
+		const deck = DEMO_TRACKS.find((track) => track.id === trackId);
+		if (!deck) {
+			recentFeedback = 'That history entry is unavailable.';
+			return;
+		}
+		if (queue.tracks.some((track) => track.id === trackId)) {
+			recentFeedback = `${deck.title} is already in the queue.`;
+			return;
+		}
+		queue = addTrack(queue, deck);
+		recentFeedback = `Added ${deck.title} to the queue.`;
+	}
+
+	/** Forget one history entry: queue, current media and resume are untouched. */
+	function forgetRecent(row: RecentRow, removedIndex: number): void {
+		if (!recentStore) return;
+		recentStore.forget(row.trackId);
+		refreshRecent();
+		recentFeedback = row.available
+			? `Forgot ${row.title} from recent history.`
+			: 'Forgot the unavailable entry from recent history.';
+		void focusAfterForget(removedIndex);
+	}
+
+	/**
+	 * Keep keyboard focus on an enabled surviving history control after a
+	 * row is removed: the row taking the removed slot, else the last row's
+	 * first action, else Clear when the list is empty.
+	 */
+	async function focusAfterForget(removedIndex: number): Promise<void> {
+		await tick();
+		const section = recentSection;
+		if (!section) return;
+		const rows = section.querySelectorAll('li[data-testid="recent-item"]');
+		const targetRow = rows[Math.min(removedIndex, rows.length - 1)];
+		const target =
+			targetRow?.querySelector('button:not([disabled])') ??
+			section.querySelector('[data-testid="recently-played-clear"]');
+		(target as HTMLElement | null)?.focus?.();
 	}
 
 	// A source gets its own element: an event queued by the browser before
@@ -1501,28 +1557,37 @@
 		</ul>
 	</section>
 
-	<section data-testid="recently-played" aria-label="Recently played">
+	<section data-testid="recently-played" aria-label="Recently played" bind:this={recentSection}>
 		<h2>Recently played</h2>
 		<p>
 			Demo session history — synthetic demo tracks only. Clearing the queue never wipes this
 			list; only Clear below does.
 		</p>
+		<p role="status">{recentFeedback}</p>
 		{#if recentTracks.length === 0}
 			<p data-testid="recently-played-empty">
 				Nothing played yet this demo session — press play to start your recent list.
 			</p>
 		{:else}
 			<ol>
-				{#each recentTracks as row (row.trackId)}
-					<li data-testid="recent-item" data-track-id={row.trackId}>
-						{row.title} — {row.artist}
+				{#each recentTracks as row, index (row.trackId)}
+					<li class="recent-row" data-testid="recent-item" data-track-id={row.trackId}>
+						{row.title}{#if row.artist} — {row.artist}{/if}
 						<span data-testid="recent-played-at-{row.trackId}">{recentLabel(row.playedAt)}</span>
-						<button
-							type="button"
-							data-testid="recent-replay-{row.trackId}"
-							onclick={() => replayRecent(row.trackId)}
-						>
-							Replay {row.title}
+						{#if row.available}
+							<button
+								type="button"
+								data-testid="recent-replay-{row.trackId}"
+								onclick={() => replayRecent(row.trackId)}
+							>
+								Replay {row.title}
+							</button>
+							<button type="button" onclick={() => enqueueRecent(row.trackId)}>
+								Add to queue
+							</button>
+						{/if}
+						<button type="button" onclick={() => forgetRecent(row, index)}>
+							Forget this entry
 						</button>
 					</li>
 				{/each}
@@ -1644,5 +1709,13 @@
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
+	}
+
+	/* Recently-played row actions: a reachable touch floor on narrow
+	   screens (the row text still wraps, so nothing widens past the
+	   viewport). */
+	.recent-row button {
+		min-height: 1.75rem;
+		min-width: 1.75rem;
 	}
 </style>
