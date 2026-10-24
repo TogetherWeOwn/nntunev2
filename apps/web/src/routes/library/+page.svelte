@@ -190,6 +190,25 @@
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
+	/**
+	 * Metadata-only direct selection: apply the validated selectTrack
+	 * transition on the ORIGINAL queue coordinate, preserving every track id
+	 * and arrangement. Never transport, audio, storage, provider or stream
+	 * language. Reselecting the current row is an observable no-op that keeps
+	 * the existing feedback; stale or invalid coordinates select nothing.
+	 */
+	function selectQueuedTrack(index: number): void {
+		if (!Number.isInteger(index) || index < 0 || index >= queue.tracks.length) return;
+		if (index === queue.currentIndex) return;
+		const target = queue.tracks[index];
+		if (target === undefined) return;
+		const selected = selectQueueIndex(queue, index);
+		if (selected === queue) return;
+		queue = selected;
+		const title = target.title?.trim() ? target.title : target.id;
+		queueAnnouncement = `Selected ${title}`;
+	}
+
 	function trimPreviousTracks(): void {
 		const trimmed = keepCurrentAndUpcoming(queue);
 		// Announce real trims only: a no-op trim must not chatter the live
@@ -398,6 +417,7 @@
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
 				onremove={(index) => replaceQueue(removeTrack(queue, index))}
 				onclear={() => replaceQueue(clearQueue(queue))}
+				onselect={selectQueuedTrack}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
