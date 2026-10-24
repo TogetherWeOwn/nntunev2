@@ -67,6 +67,7 @@
 		type RepeatMode
 	} from '#lib/player/queue.js';
 	import { matchesQueueQuery } from '#lib/player/queueFilter.js';
+	import { createDemoTabTitle } from '#lib/player/tabTitle.js';
 
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
@@ -1027,6 +1028,16 @@
 			active = false;
 			for (const event of events) el?.removeEventListener(event, publishPosition);
 		};
+	});
+
+	// Capture the static head title once per client mount, not per track.
+	// Only the inner effect tracks playback; outer cleanup runs on unmount.
+	$effect(() => {
+		const tabTitle = createDemoTabTitle(document);
+		$effect(() => {
+			tabTitle.update(current, visibleStatus === 'playing');
+		});
+		return () => tabTitle.restore();
 	});
 
 	// Queue order + current track persist for the tab session.
