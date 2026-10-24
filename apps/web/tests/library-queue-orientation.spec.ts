@@ -106,7 +106,11 @@ async function instrument(page: Page) {
 			const original = Storage.prototype[method];
 			Object.defineProperty(Storage.prototype, method, {
 				configurable: true,
-				value(...args: unknown[]) { probe.storage.push(method); return Reflect.apply(original, this, args); }
+				value(...args: unknown[]) {
+					const key = args.length > 0 ? String(args[0]) : '';
+					probe.storage.push(key ? `${method}:${key}` : method);
+					return Reflect.apply(original, this, args);
+				}
 			});
 		}
 		const original = Element.prototype.scrollIntoView;
@@ -176,6 +180,23 @@ async function expectNoSideEffects(page: Page) {
 	const probe = await page.evaluate(() => window.orientationProbe);
 	expect(probe.media).toEqual([]);
 	expect(probe.storage).toEqual([]);
+	return probe;
+}
+
+/**
+ * Session queue persist/restore writes `setItem` to this key on every queue
+ * change. QO-B04's contract forbids storage side effects beyond that key:
+ * every recorded storage call must be a queue-key write, while media,
+ * scroll, focus and reveal assertions stay as strict as before.
+ */
+const QUEUE_STORAGE_KEY = 'nntune.library.queue.v1';
+
+async function expectOnlyQueuePersistence(page: Page) {
+	const probe = await page.evaluate(() => window.orientationProbe);
+	expect(probe.media).toEqual([]);
+	for (const entry of probe.storage) {
+		expect(entry).toBe(`setItem:${QUEUE_STORAGE_KEY}`);
+	}
 	return probe;
 }
 
@@ -428,7 +449,7 @@ test.describe('mocked library integration', () => {
 		await expect(next).toBeFocused();
 		await settle(page);
 		expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
-		expect((await expectNoSideEffects(page)).scroll).toEqual([]);
+		expect((await expectOnlyQueuePersistence(page)).scroll).toEqual([]);
 		await expectPosition(page, 'Track 2 of 3', '1 upcoming');
 	});
 });
