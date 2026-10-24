@@ -74,11 +74,112 @@
 	let upcoming = $derived(selectedIndex < 0 ? 0 : trackCount - selectedIndex - 1);
 
 	let list: HTMLOListElement | null = $state(null);
+	let emptyTarget: HTMLElement | null = $state(null);
 
 	function currentRowElement(): HTMLElement | null {
 		return (
 			list?.querySelector<HTMLElement>('[data-testid="queue-item"][aria-current="true"]') ?? null
 		);
+	}
+
+	/**
+	 * Stable-id survivor for remove recovery: the first id after the removed
+	 * one in the pre-action displayed order that still exists, otherwise the
+	 * nearest preceding one. Re-resolved against the live DOM after render,
+	 * never from stale array indices.
+	 */
+	function survivorId(
+		beforeIds: string[],
+		removedId: string | undefined,
+		current: Set<string>
+	): string | null {
+		const at = removedId === undefined ? -1 : beforeIds.indexOf(removedId);
+		for (let i = at + 1; i < beforeIds.length; i++) {
+			const id = beforeIds[i]!;
+			if (current.has(id)) return id;
+		}
+		for (let i = Math.min(at - 1, beforeIds.length - 1); i >= 0; i--) {
+			const id = beforeIds[i]!;
+			if (current.has(id)) return id;
+		}
+		return null;
+	}
+
+	function focusRemoveFor(trackId: string): boolean {
+		const rows = list?.querySelectorAll('[data-testid="queue-item"]') ?? [];
+		for (const row of rows) {
+			if (row.getAttribute('data-track-id') !== trackId) continue;
+			const remove = row.querySelector<HTMLButtonElement>('button[aria-label^="Remove "]');
+			if (!remove) return false;
+			remove.focus({ preventScroll: true });
+			remove.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+			return true;
+		}
+		return false;
+	}
+
+	function focusEmptyTarget(): void {
+		if (!emptyTarget) return;
+		emptyTarget.focus({ preventScroll: true });
+		emptyTarget.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+	}
+
+	/**
+	 * Focus is only recovered when this explicit action stranded it: the
+	 * activated control held focus at dispatch and, after render, focus sits
+	 * on nothing (body/null) — or is still on that same control while the
+	 * action just disabled it. DOM removal strands synchronously, but a
+	 * control that becomes disabled keeps focus through the flush microtask
+	 * and the browser drops it to the body on the next rendering steps, so
+	 * waiting for body/null alone would miss Clear every time. Any focus
+	 * that has moved on to a different live element — Tab movement, pointer
+	 * flow, host-driven restore — is left alone, and prop-only updates
+	 * (refresh, auth purge) never reach here.
+	 */
+	function focusStranded(heldFocus: boolean, button: EventTarget | null): boolean {
+		if (!heldFocus) return false;
+		const active = document.activeElement;
+		if (active === null || active === document.body) return true;
+		return (
+			button instanceof HTMLButtonElement && button.disabled && active === button
+		);
+	}
+
+	/**
+	 * Report one remove intent, then land focus deterministically: the next
+	 * surviving displayed row's Remove, otherwise the previous, otherwise
+	 * the stable empty target. Consecutive keyboard removals stay operable
+	 * because each recovery lands on a live Remove control.
+	 */
+	async function reportRemove(event: Event, index: number): Promise<void> {
+		// currentTarget and the pre-action order are only valid during dispatch.
+		const button = event.currentTarget;
+		const heldFocus = button instanceof HTMLElement && document.activeElement === button;
+		const removedId = queue.tracks[index]?.id;
+		const beforeIds = visibleEntries.map((entry) => entry.track.id);
+		onremove?.(index);
+		await tick();
+		if (!focusStranded(heldFocus, button)) return;
+		const current = new Set<string>();
+		for (const row of list?.querySelectorAll('[data-testid="queue-item"]') ?? []) {
+			const id = row.getAttribute('data-track-id');
+			if (id !== null) current.add(id);
+		}
+		const target = survivorId(beforeIds, removedId, current);
+		if (target === null || !focusRemoveFor(target)) focusEmptyTarget();
+	}
+
+	/**
+	 * Report the clear intent, then land focus on the stable empty target
+	 * instead of the now-disabled Clear button or the body.
+	 */
+	async function reportClear(event: Event): Promise<void> {
+		const button = event.currentTarget;
+		const heldFocus = button instanceof HTMLElement && document.activeElement === button;
+		onclear?.();
+		await tick();
+		if (!focusStranded(heldFocus, button)) return;
+		focusEmptyTarget();
 	}
 
 	let normalizedQuery = $derived(filterQuery.trim().toLowerCase());
@@ -250,7 +351,7 @@
 			<button
 				type="button"
 				aria-label="Remove {displayTitle(track)} from queue"
-				onclick={() => onremove?.(index)}
+				onclick={(event) => void reportRemove(event, index)}
 			>
 				Remove
 			</button>
@@ -277,10 +378,19 @@
 	</button>
 {/if}
 
+{#if trackCount === 0}
+	<!--
+		Stable recovery target when no rows survive: a programmatically
+		focusable status line, never a control, tab stop or modal. Focused
+		only by explicit remove/clear recovery, never on render.
+	-->
+	<p data-testid="queue-empty-focus" tabindex="-1" bind:this={emptyTarget}>Queue is empty</p>
+{/if}
+
 <button
 	type="button"
 	disabled={queue.tracks.length === 0}
-	onclick={() => onclear?.()}
+	onclick={(event) => void reportClear(event)}
 >
 	Clear queue
 </button>
@@ -329,6 +439,17 @@
 	/* Programmatic focus target for explicit reveal: the ring must hold
 	 * even where the app stylesheet is absent (mounted test parent). */
 	.queue-row:focus {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+
+	/* Same ring for the empty-queue recovery target: keyboard recovery
+	 * must stay visible without relying on the host page's stylesheet. */
+	[data-testid='queue-empty-focus'] {
+		scroll-margin-block: 4px;
+	}
+
+	[data-testid='queue-empty-focus']:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}
