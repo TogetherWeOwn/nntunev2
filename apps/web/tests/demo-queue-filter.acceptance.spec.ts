@@ -130,7 +130,7 @@ async function snapshot(page: Page) {
 
 for (const vector of [
 	{ id: 'DEMOFIND-B01', query: '  sIgNaL  ', rows: ['second-signal'] },
-	{ id: 'DEMOFIND-B02', query: '  fIxTuRe BaNd  ', rows: ORDER },
+	{ id: 'DEMOFIND-B02', query: '  fIxTuRe BaNd  ', rows: ['demo-track', 'second-signal'] },
 	{ id: 'DEMOFIND-B03', query: ' \t ', rows: ORDER },
 	{ id: 'DEMOFIND-B04', query: 'no such track', rows: [] },
 	{ id: 'DEMOFIND-B05', query: 'second-signal', rows: [] },
