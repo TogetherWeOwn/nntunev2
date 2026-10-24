@@ -168,6 +168,16 @@
 		);
 	}
 
+	function queueFavorites(): void {
+		if (favoriteTracks.length === 0) return;
+		const before = queue.tracks.length;
+		// Use the shelf's resolved star order and the same deduping path as
+		// individual taps. No persistence, playback, or account lookup here.
+		for (const track of favoriteTracks) selectTrack(track.id);
+		const added = queue.tracks.length - before;
+		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
+	}
+
 	/**
 	 * Swap the queue for any change that is not a move. The move
 	 * announcement names a track and its position, so every other edit
@@ -324,6 +334,7 @@
 			{#if favoriteTracks.length === 0}
 				<p data-testid="favorites-empty">No favorites yet. Star a track to pin it here.</p>
 			{:else}
+				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
 				<ul>
 					{#each favoriteTracks as track (track.id)}
 						<li data-testid="favorite-item" data-id={track.id}>
