@@ -15,7 +15,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   NAV-02c direct load marks nothing outside the three destinations
  *   NAV-02d direct load matches nested paths by pathname boundary
  *   NAV-03  client-side navigation updates the marker without a reload
- *   NAV-04  skip link moves keyboard focus to the page main (wide + narrow)
+ *   NAV-04  skip link reveals on focus and moves keyboard focus to the page main (wide + narrow)
  *   NAV-05  keyboard order is skip, nav links, Appearance, content (wide + narrow)
  *   NAV-06  visible focus ring on shell links (wide + narrow)
  *   NAV-07 390px/360px narrow widths wrap, no overflow, no hamburger
@@ -27,7 +27,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   NAV-10  demo player links carry explicit demo labeling, no playback claims
  *   NAV-11  shell navigation preserves the local-only import disclosure
  *   NAV-12  account subnav keeps working alongside the shell nav
- *   NAV-13  paywall close keeps focus restoration and modal isolation with nav
+ *   NAV-13  paywall close keeps focus restoration and modal isolation (Tab + Shift+Tab) with nav
  *   NAV-14  paywall upgrade navigation keeps the shell and a sane focus target
  *   NAV-15  existing player shortcuts keep working with the shell present
  *   NAV-16  PWA head, landing honesty and login stay intact across navigation
@@ -151,6 +151,55 @@ async function expectCurrent(
 		).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
 	}
 	void nav;
+}
+
+/**
+ * The focused skip link must be visibly revealed, not just focused:
+ * `toBeVisible` passes for an off-viewport transform, so assert the rendered
+ * box intersects the viewport. Pins the `:focus-visible` reveal in the root
+ * layout (deleting it leaves the link translated above the viewport).
+ */
+async function expectSkipLinkRevealed(page: Page, where: string): Promise<void> {
+	const box = await skipLink(page).boundingBox();
+	expect(
+		box,
+		`expected the focused skip link on ${where} to have a rendered box. ` +
+			'Builder: keep the skip link rendered (off-viewport when idle), not display:none.'
+	).not.toBeNull();
+	if (!box) return;
+	const viewportHeight = page.viewportSize()?.height ?? 800;
+	expect(
+		box.y + box.height,
+		`expected the focused skip link on ${where} to be revealed inside the viewport, ` +
+			`got box y=${box.y} height=${box.height} (bottom ${box.y + box.height}). ` +
+			'Builder: keep the .skip-link:focus-visible reveal that cancels the idle translate.'
+	).toBeGreaterThan(0);
+	expect(
+		box.y,
+		`expected the focused skip link on ${where} to sit below the viewport top, got y=${box.y}. ` +
+			'Builder: keep the .skip-link:focus-visible reveal at the top of the viewport.'
+	).toBeLessThan(viewportHeight);
+}
+
+/** Live focus state over the paywall dialog's focusable controls (links + enabled buttons). */
+async function paywallFocusState(page: Page): Promise<{
+	count: number;
+	inside: boolean;
+	onFirst: boolean;
+	onLast: boolean;
+}> {
+	return page.evaluate(() => {
+		const open = document.querySelector('[role="dialog"]');
+		const controls = [
+			...(open?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)') ?? [])
+		].filter((control) => control.getClientRects().length > 0);
+		return {
+			count: controls.length,
+			inside: !!open?.contains(document.activeElement),
+			onFirst: controls.length > 0 && document.activeElement === controls[0],
+			onLast: controls.length > 0 && document.activeElement === controls[controls.length - 1]
+		};
+	});
 }
 
 test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally and Account', async ({
@@ -316,6 +365,7 @@ for (const width of [1280, 390]) {
 				`expected the first Tab stop on ${path} at ${width}px to be the skip link. ` +
 					'Builder: put the skip link first in DOM order.'
 			).toBeFocused();
+			await expectSkipLinkRevealed(page, `${path} at ${width}px`);
 
 			await page.keyboard.press('Enter');
 			const main = page.getByRole('main');
@@ -402,6 +452,7 @@ for (const width of [1280, 390]) {
 
 		await page.keyboard.press('Tab');
 		await expect(skipLink(page)).toBeFocused();
+		await expectSkipLinkRevealed(page, `/library at ${width}px`);
 		for (const [label, link] of [
 			['Library', libraryLink(page)],
 			['Select NZB locally', importLink(page)],
@@ -738,6 +789,37 @@ test('[NAV-13] paywall close keeps focus restoration and modal isolation with na
 			'expected keyboard focus to stay inside the open paywall dialog (modal isolation). ' +
 				'Builder: keep the native <dialog> trap; shell links stay inert while it is open.'
 		).toBe(true);
+	}
+
+	// Reverse modal isolation: Shift+Tab wraps the first control to the last.
+	const reverseCount = (await paywallFocusState(page)).count;
+	expect(
+		reverseCount,
+		'expected at least two focusable controls in the paywall dialog for the Shift+Tab check. ' +
+			'Builder: keep the upgrade link and dismiss actions rendered together.'
+	).toBeGreaterThan(1);
+	await page.evaluate(() => {
+		const open = document.querySelector('[role="dialog"]');
+		const controls = [
+			...(open?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)') ?? [])
+		].filter((control) => control.getClientRects().length > 0);
+		controls[0]?.focus();
+	});
+	for (let tab = 0; tab < reverseCount; tab += 1) {
+		await page.keyboard.press('Shift+Tab');
+		const state = await paywallFocusState(page);
+		expect(
+			state.inside,
+			'expected Shift+Tab to keep keyboard focus inside the open paywall dialog. ' +
+				'Builder: keep the Shift+Tab wrap guard in the paywall focus trap.'
+		).toBe(true);
+		if (tab === 0) {
+			expect(
+				state.onLast,
+				'expected Shift+Tab on the first paywall control to wrap focus to the last control. ' +
+					'Builder: keep the Shift+Tab first-to-last wrap in the paywall focus trap.'
+			).toBe(true);
+		}
 	}
 
 	await dialog.getByRole('button', { name: 'Not now', exact: true }).click();
