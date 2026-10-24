@@ -36,6 +36,12 @@ export interface PlaybackSpeed {
 	set(rate: number): number;
 	/** Re-apply the current rate (for element swaps); returns the effective rate. */
 	apply(): number;
+	/**
+	 * Adopt a verified native rate without touching media (for `ratechange`
+	 * reconciliation); persists best-effort and returns the effective rate.
+	 * Non-finite input keeps the previous rate and leaves storage untouched.
+	 */
+	adoptNativeRate(rate: number): number;
 }
 
 export function createPlaybackSpeed({
@@ -58,20 +64,65 @@ export function createPlaybackSpeed({
 		}
 	}
 
+	/**
+	 * Write a rate to the element and read back what actually applied. A
+	 * finite readback (clamped into range) becomes current and is persisted,
+	 * even when media rejected or clamped the request: storage holds the
+	 * verified actual rate, never an unapplied request. A throwing setter,
+	 * throwing getter or non-finite reading retains the previous rate,
+	 * leaves storage untouched and never throws.
+	 */
+	function writeAndVerify(request: number): number {
+		let element: { playbackRate: number } | null | undefined;
+		try {
+			element = audio();
+		} catch {
+			return current;
+		}
+		if (!element) {
+			current = clampPlaybackSpeed(request);
+			persist(current);
+			return current;
+		}
+		const clampedRequest = clampPlaybackSpeed(request);
+		try {
+			element.playbackRate = clampedRequest;
+		} catch {
+			return current;
+		}
+		let applied: number;
+		try {
+			applied = element.playbackRate;
+		} catch {
+			return current;
+		}
+		if (!Number.isFinite(applied)) return current;
+		current = clampPlaybackSpeed(applied);
+		persist(current);
+		return current;
+	}
+
 	return {
 		current() {
 			return current;
 		},
 		set(rate: number) {
-			current = clampPlaybackSpeed(rate);
-			const element = audio();
-			if (element) element.playbackRate = current;
-			persist(current);
-			return current;
+			return writeAndVerify(rate);
 		},
 		apply() {
-			const element = audio();
-			if (element) element.playbackRate = current;
+			let element: { playbackRate: number } | null | undefined;
+			try {
+				element = audio();
+			} catch {
+				return current;
+			}
+			if (!element) return current;
+			return writeAndVerify(current);
+		},
+		adoptNativeRate(rate: number) {
+			if (!Number.isFinite(rate)) return current;
+			current = clampPlaybackSpeed(rate);
+			persist(current);
 			return current;
 		}
 	};

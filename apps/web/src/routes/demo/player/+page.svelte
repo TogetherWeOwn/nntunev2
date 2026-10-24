@@ -32,7 +32,11 @@
 	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
-	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
+	import {
+		clampPlaybackSpeed,
+		createPlaybackSpeed,
+		type PlaybackSpeed
+	} from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
 	import {
 		createRecentlyPlayedStore,
@@ -336,6 +340,11 @@
 	let tracksEl: HTMLInputElement | undefined = $state();
 	let speedValue = $state('1');
 	let speed: PlaybackSpeed | null = null;
+	/** Concise failure note when a requested rate does not apply; empty on success. */
+	let speedFeedback = $state('');
+	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
+	/** A restored or native non-preset rate renders as its own explicit option. */
+	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
 
 	// Session-local recently-played list (demo synthetic tracks only; the
@@ -390,9 +399,48 @@
 		sleepTimer.tick();
 	}
 
-	function handleSpeedChange(value: string): void {
-		speedValue = value;
-		speed?.set(Number(value));
+	function handleSpeedChange(control: HTMLSelectElement): void {
+		const value = control.value;
+		if (!speed) {
+			speedValue = value;
+			return;
+		}
+		// The store verifies against the element and returns the actual
+		// applied rate: the selection names that rate, never the request.
+		const effective = speed.set(Number(value));
+		speedValue = String(effective);
+		// A rejected request leaves state unchanged, so one-way
+		// `value={speedValue}` would keep showing the refused choice: revert
+		// the control itself to the verified rate.
+		control.value = String(effective);
+		if (effective !== clampPlaybackSpeed(Number(value))) {
+			speedFeedback = `Speed ${value}x not applied — still ${effective}x`;
+		} else {
+			speedFeedback = '';
+		}
+	}
+
+	/**
+	 * Reconcile a native-control rate change to state, display and
+	 * best-effort persistence. Reads only: never writes back into the
+	 * element (no feedback loop) and never implies play or seek. Detached,
+	 * stale, throwing or non-finite readings are ignored so they cannot
+	 * poison the last verified preference.
+	 */
+	function handleNativeRateChange(event: Event): void {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		if (!element || element !== audioEl || !element.isConnected) return;
+		if (!speed) return;
+		let nativeRate: number;
+		try {
+			nativeRate = element.playbackRate;
+		} catch {
+			return;
+		}
+		if (!Number.isFinite(nativeRate)) return;
+		const effective = speed.adoptNativeRate(nativeRate);
+		speedValue = String(effective);
+		speedFeedback = '';
 	}
 
 	/** In-memory Storage stand-in when the browser blocks site storage. */
@@ -1081,9 +1129,12 @@
 	}
 
 	// A swapped-in element starts at 1x: re-apply the persisted speed.
+	// `apply` verifies against the element, so reconcile the display to
+	// the actual rate it reports (a rejecting/clamping element must not
+	// leave a false selection on screen).
 	$effect(() => {
 		audioEl;
-		speed?.apply();
+		if (speed) speedValue = String(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
@@ -1122,8 +1173,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.current());
-		speed.apply();
+		speedValue = String(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
@@ -1278,6 +1328,7 @@
 			ontimeupdate={handleTrackTime}
 			onloadedmetadata={handleTrackTime}
 			ondurationchange={handleTrackTime}
+			onratechange={handleNativeRateChange}
 		></audio>
 	{/key}
 
@@ -1586,8 +1637,11 @@
 				id="playback-speed"
 				data-testid="playback-speed"
 				value={speedValue}
-				onchange={(event) => handleSpeedChange(event.currentTarget.value)}
+				onchange={(event) => handleSpeedChange(event.currentTarget)}
 			>
+				{#if showCustomSpeed}
+					<option value={speedValue}>{speedValue}x</option>
+				{/if}
 				<option value="0.5">0.5x</option>
 				<option value="0.75">0.75x</option>
 				<option value="1">1x</option>
@@ -1596,6 +1650,9 @@
 				<option value="1.75">1.75x</option>
 				<option value="2">2x</option>
 			</select>
+			{#if speedFeedback}
+				<p data-testid="speed-status" role="status">{speedFeedback}</p>
+			{/if}
 		</div>
 	</section>
 
