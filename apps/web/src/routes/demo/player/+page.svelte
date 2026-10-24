@@ -66,6 +66,7 @@
 		type QueueState,
 		type RepeatMode
 	} from '#lib/player/queue.js';
+	import { matchesQueueQuery } from '#lib/player/queueFilter.js';
 
 	const AUDIO_URL = '/api/demo/audio';
 	const QUEUE_STORAGE_KEY = 'nntune:demo-queue:v1';
@@ -119,6 +120,21 @@
 
 	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
+
+	/**
+	 * Queue-only filter: transient presentation state, never persisted.
+	 * Visible rows keep their ORIGINAL queue indices, so every row action,
+	 * disabled boundary and the current marker use the full-queue slot —
+	 * filtering hides rows only and never touches order, selection or
+	 * playback. Matching is the shared PlayerQueue contract.
+	 */
+	let demoFilterQuery = $state('');
+	let demoFilterInput: HTMLInputElement | undefined = $state();
+	let visibleQueueEntries = $derived(
+		queue.tracks
+			.map((track, index) => ({ track, index }))
+			.filter(({ track }) => matchesQueueQuery(track, demoFilterQuery))
+	);
 
 	// Copy link at current time (synthetic demo ids only): explicit button
 	// activation copies a fresh same-origin `/demo/player?track=&t=` URL
@@ -686,6 +702,12 @@
 			seekCurrentResume();
 			recordRecent(current?.id);
 		}
+	}
+
+	/** Clearing restores every row and keeps focus inside the panel. */
+	function clearDemoFilter(): void {
+		demoFilterQuery = '';
+		demoFilterInput?.focus();
 	}
 
 	function selectAt(index: number): void {
@@ -1403,23 +1425,41 @@
 				if (!radio) queue = shuffleUpcoming(queue);
 			}}
 		/>
+		<!--
+			Queue-only filter: transient presentation state. It hides rows but
+			never reorders, reselects, persists or fetches anything.
+		-->
+		<div class="queue-filter">
+			<label for="demo-queue-filter-input">Filter queue</label>
+			<input
+				id="demo-queue-filter-input"
+				type="search"
+				bind:value={demoFilterQuery}
+				bind:this={demoFilterInput}
+			/>
+			<button type="button" onclick={clearDemoFilter}>Clear queue filter</button>
+		</div>
+		<p role="status">{visibleQueueEntries.length} of {queue.tracks.length} tracks</p>
+		{#if queue.tracks.length > 0 && visibleQueueEntries.length === 0}
+			<p role="status">No matches in this queue</p>
+		{/if}
 		<ol>
-			{#each queue.tracks as track, i (track.id)}
+			{#each visibleQueueEntries as { track, index } (track.id)}
 				<li data-testid="queue-item" data-track-id={track.id}>
 					<button
 						type="button"
 						data-testid="queue-select-{track.id}"
-						aria-current={i === queue.currentIndex ? 'true' : undefined}
-						onclick={() => selectAt(i)}
+						aria-current={index === queue.currentIndex ? 'true' : undefined}
+						onclick={() => selectAt(index)}
 					>
-						{track.title} — {track.artist}{i === queue.currentIndex ? (visibleStatus === 'playing' ? ' (playing)' : ' (selected)') : ''}
+						{track.title} — {track.artist}{index === queue.currentIndex ? (visibleStatus === 'playing' ? ' (playing)' : ' (selected)') : ''}
 					</button>
 					<button
 						type="button"
 						data-testid="queue-move-up-{track.id}"
 						aria-label="Move {track.title} up"
-						disabled={i === 0}
-						onclick={() => (queue = moveTrack(queue, i, i - 1))}
+						disabled={index === 0}
+						onclick={() => (queue = moveTrack(queue, index, index - 1))}
 					>
 						Up
 					</button>
@@ -1427,8 +1467,8 @@
 						type="button"
 						data-testid="queue-move-down-{track.id}"
 						aria-label="Move {track.title} down"
-						disabled={i === queue.tracks.length - 1}
-						onclick={() => (queue = moveTrack(queue, i, i + 1))}
+						disabled={index === queue.tracks.length - 1}
+						onclick={() => (queue = moveTrack(queue, index, index + 1))}
 					>
 						Down
 					</button>
@@ -1571,5 +1611,38 @@
 	#track-time-mode:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
+	}
+
+	/* Queue-only filter row: wraps on narrow screens, touch-sized
+	   controls, same contract as the library PlayerQueue panel. */
+	.queue-filter {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.queue-filter input {
+		flex: 1 1 12rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.queue-filter input:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
+
+	.queue-filter button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
 	}
 </style>
