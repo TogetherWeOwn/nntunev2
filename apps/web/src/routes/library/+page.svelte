@@ -263,9 +263,12 @@
 			if (!button.disabled && button.isConnected) {
 				button.focus({ preventScroll: true });
 			} else {
-				const item = document.querySelector(
-					`[data-testid="favorite-item"][data-id="${id.replace(/"/g, '\\"')}"]`
-				);
+				// Closest-ancestor lookup, never id interpolation: track ids
+				// are opaque server strings, and any quoting scheme risks an
+				// invalid selector (a trailing backslash throws inside this
+				// voided handler). The activated button is always inside its
+				// own favorite item.
+				const item = button.closest('[data-testid="favorite-item"]');
 				const fallback =
 					item?.querySelector<HTMLButtonElement>(
 						'button[aria-label^="Move favorite"]:not([disabled])'
