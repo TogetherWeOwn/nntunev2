@@ -55,6 +55,8 @@
 		createQueue,
 		currentTrack,
 		DEMO_TRACKS,
+		moveToBottom,
+		moveToTop,
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
@@ -95,6 +97,11 @@
 	let lastBytes = $state(0);
 
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
+	// A move describes one queue snapshot; other edits invalidate its position.
+	let queueMoveAnnouncement = $state.raw<{ queue: QueueState; text: string } | null>(null);
+	let queueAnnouncement = $derived(
+		queueMoveAnnouncement?.queue === queue ? queueMoveAnnouncement.text : ''
+	);
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
@@ -708,6 +715,23 @@
 	function clearDemoFilter(): void {
 		demoFilterQuery = '';
 		demoFilterInput?.focus();
+	}
+
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (!moved) return;
+		const reordered =
+			to === 0
+				? moveToTop(queue, from)
+				: to === queue.tracks.length - 1
+					? moveToBottom(queue, from)
+					: moveTrack(queue, from, to);
+		if (reordered === queue) return;
+		queue = reordered;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${moved.title} moved to ${to + 1} of ${queue.tracks.length}`
+		};
 	}
 
 	function selectAt(index: number): void {
@@ -1418,6 +1442,7 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<p data-testid="queue-announcement" role="status">{queueAnnouncement}</p>
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
@@ -1459,7 +1484,7 @@
 						data-testid="queue-move-up-{track.id}"
 						aria-label="Move {track.title} up"
 						disabled={index === 0}
-						onclick={() => (queue = moveTrack(queue, index, index - 1))}
+						onclick={() => moveQueuedTrack(index, index - 1)}
 					>
 						Up
 					</button>
@@ -1468,9 +1493,25 @@
 						data-testid="queue-move-down-{track.id}"
 						aria-label="Move {track.title} down"
 						disabled={index === queue.tracks.length - 1}
-						onclick={() => (queue = moveTrack(queue, index, index + 1))}
+						onclick={() => moveQueuedTrack(index, index + 1)}
 					>
 						Down
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to top"
+						disabled={index === 0}
+						onclick={() => moveQueuedTrack(index, 0)}
+					>
+						Move to top
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to bottom"
+						disabled={index === queue.tracks.length - 1}
+						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
+					>
+						Move to bottom
 					</button>
 				</li>
 			{/each}
