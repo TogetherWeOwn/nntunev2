@@ -336,10 +336,10 @@ test('TT-B-12 title flows make zero network calls and add zero storage keys (GRE
 	);
 
 	const keys = await page.evaluate(() => ({
-		local: Object.keys(localStorage),
+		localKeys: Object.keys(localStorage),
 		session: Object.keys(sessionStorage)
 	}));
-	for (const key of keys.local) {
+	for (const key of keys.localKeys) {
 		expect(KNOWN_LOCAL_KEYS, `unexpected localStorage key from title flows: ${key}`).toContain(
 			key
 		);
