@@ -858,6 +858,15 @@
 		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
+	function shuffleQueueUpcoming(): void {
+		if (!radio) queue = shuffleUpcoming(queue);
+	}
+
+	function cycleRepeat(): void {
+		if (radio) return;
+		repeat = repeat === 'off' ? 'one' : repeat === 'one' ? 'queue' : 'off';
+	}
+
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
 	// surfaces, open modals and modified chords. Handled bindings suppress
@@ -873,6 +882,13 @@
 			return;
 		}
 		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		// The new queue bindings yield to IME and native select editing without
+		// changing existing transport defaults (notably 0 on the speed select).
+		if (
+			(action === 'shuffle-upcoming' || action === 'cycle-repeat') &&
+			(event.isComposing || event.keyCode === 229 ||
+				(event.target instanceof Element && event.target.closest('select')))
+		) return;
 		event.preventDefault();
 		switch (action) {
 			case 'toggle-play':
@@ -897,6 +913,12 @@
 				break;
 			case 'toggle-mute':
 				toggleMuteShortcut();
+				break;
+			case 'shuffle-upcoming':
+				shuffleQueueUpcoming();
+				break;
+			case 'cycle-repeat':
+				cycleRepeat();
 				break;
 			case 'open-shortcuts':
 				openShortcuts();
@@ -1421,9 +1443,7 @@
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
-			onshuffle={() => {
-				if (!radio) queue = shuffleUpcoming(queue);
-			}}
+			onshuffle={shuffleQueueUpcoming}
 		/>
 		<!--
 			Queue-only filter: transient presentation state. It hides rows but
