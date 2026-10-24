@@ -466,11 +466,15 @@ test('LF-08 keyboard: tab-reachable native controls, no per-keystroke assertive 
 		await page.keyboard.press('Tab');
 	}
 	await expect(field, 'find field must be reachable by Tab').toBeFocused();
-	await expect(page.locator('[aria-live="assertive"]')).toHaveCount(0);
+	// SvelteKit injects a framework-owned route announcer
+	// (#svelte-announcer, aria-live assertive) outside <main> on every page;
+	// it is required for screen-reader route announcements and must not count
+	// as build-added assertive chatter.
+	await expect(page.locator('[aria-live="assertive"]:not(#svelte-announcer)')).toHaveCount(0);
 	await page.keyboard.type('beta', { delay: 20 });
 	await expectView(page, ['filter-beta']);
 	await expect(
-		page.locator('[aria-live="assertive"]'),
+		page.locator('[aria-live="assertive"]:not(#svelte-announcer)'),
 		'filtering must not add assertive live regions'
 	).toHaveCount(0);
 	await expect(page.getByRole('alert'), 'filtering must not raise alerts').toHaveCount(0);
