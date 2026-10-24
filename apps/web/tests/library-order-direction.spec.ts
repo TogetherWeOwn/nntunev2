@@ -266,6 +266,12 @@ test('DORD-05 recomputation: refresh retains descending; failure keeps rows, mod
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expectView(page, ['fresh-zulu', 'fresh-tie', 'fresh-alpha', 'fresh-unknown']);
 	await expect(ordering(page).locator('option:checked')).toHaveText('Artist Z–A');
+	// A successful refresh drops queued ids missing from the new snapshot
+	// (pinned refresh-reconcile contract), so re-queue from the fresh rows
+	// before exercising failed-refresh retention.
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await row(page, 'fresh-zulu').click();
+	await expectQueue(page, ['fresh-zulu'], 'fresh-zulu', 'Zulu');
 	await choose(page, 'Title Z–A');
 	await expectView(page, ['fresh-zulu', 'fresh-unknown', 'fresh-tie', 'fresh-alpha']);
 	reply.status = 503;
@@ -273,7 +279,7 @@ test('DORD-05 recomputation: refresh retains descending; failure keeps rows, mod
 	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
 	await expectView(page, ['fresh-zulu', 'fresh-unknown', 'fresh-tie', 'fresh-alpha']);
 	await expect(ordering(page).locator('option:checked')).toHaveText('Title Z–A');
-	await expectQueue(page, ['dir-zulu'], 'dir-zulu', 'Zulu Song');
+	await expectQueue(page, ['fresh-zulu'], 'fresh-zulu', 'Zulu');
 	await choose(page, 'Original order');
 	await expectView(page, ['fresh-unknown', 'fresh-alpha', 'fresh-zulu', 'fresh-tie']);
 	expect(api.requests).toEqual(['GET /api/library', 'GET /api/library', 'GET /api/library']);
