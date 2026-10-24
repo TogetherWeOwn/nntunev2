@@ -200,6 +200,9 @@
 	 * unmounts this button, dropping focus to the body. Restore it only when
 	 * focus was lost that way — never when the user moved on, and never on
 	 * mount/auth/transition refreshes, which do not run through this handler.
+	 * Both the list-branch Refresh and the error-branch Retry bind the same
+	 * ref; the branches are mutually exclusive, so the ref always points at
+	 * the mounted successor (including a Refresh-to-401 landing on Retry).
 	 */
 	async function refreshFromButton(): Promise<void> {
 		await refresh();
@@ -263,7 +266,14 @@
 		{#if requiresSignIn}
 			<a class="nt-button" href="/login">Sign in</a>
 		{/if}
-		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
+		<button
+			class="nt-button"
+			type="button"
+			bind:this={refreshButton}
+			onclick={() => void refreshFromButton()}
+		>
+			Retry
+		</button>
 	{:else}
 		{#if staleAt}
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
