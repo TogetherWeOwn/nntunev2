@@ -27,8 +27,10 @@
 	import {
 		addTrack,
 		clearQueue,
+		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		keepCurrentAndUpcoming,
 		moveTrack,
 		nextTrack,
 		playNext,
@@ -50,6 +52,7 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let queueAnnouncement = $state('');
+	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
 	 * it survives the panel unmounting/remounting across library refresh
@@ -187,6 +190,27 @@
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
+	function trimPreviousTracks(): void {
+		const trimmed = keepCurrentAndUpcoming(queue);
+		// Announce real trims only: a no-op trim must not chatter the live
+		// region. Rows before the selection are only unselected, never proof
+		// of listening, so the copy never calls them played.
+		if (trimmed === queue) return;
+		const removed = queue.tracks.length - trimmed.tracks.length;
+		queue = trimmed;
+		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
+	}
+
+	function trimUpcomingTracks(): void {
+		const trimmed = clearUpcoming(queue);
+		// Announce real trims only: a no-op trim must not chatter the live
+		// region.
+		if (trimmed === queue) return;
+		const removed = queue.tracks.length - trimmed.tracks.length;
+		queue = trimmed;
+		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
+	}
+
 	function toggleFavorite(id: string): void {
 		// Toggle visible state, not the last successful write. The next write
 		// persists the full set, including edits made while storage failed.
@@ -207,6 +231,23 @@
 			typeof document !== 'undefined' &&
 			document.activeElement?.id === 'queue-filter-input';
 		return refresher.refresh();
+	}
+
+	/**
+	 * Button-activated refresh with deterministic focus: the loading branch
+	 * unmounts this button, dropping focus to the body. Restore it only when
+	 * focus was lost that way — never when the user moved on, and never on
+	 * mount/auth/transition refreshes, which do not run through this handler.
+	 * Both the list-branch Refresh and the error-branch Retry bind the same
+	 * ref; the branches are mutually exclusive, so the ref always points at
+	 * the mounted successor (including a Refresh-to-401 landing on Retry).
+	 */
+	async function refreshFromButton(): Promise<void> {
+		await refresh();
+		await tick();
+		if (document.activeElement === null || document.activeElement === document.body) {
+			refreshButton?.focus({ preventScroll: true });
+		}
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
@@ -265,7 +306,14 @@
 		{#if requiresSignIn}
 			<a class="nt-button" href="/login">Sign in</a>
 		{/if}
-		<button class="nt-button" type="button" onclick={() => void refresh()}>Retry</button>
+		<button
+			class="nt-button"
+			type="button"
+			bind:this={refreshButton}
+			onclick={() => void refreshFromButton()}
+		>
+			Retry
+		</button>
 	{:else}
 		{#if staleAt}
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
@@ -350,10 +398,17 @@
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
 				onremove={(index) => replaceQueue(removeTrack(queue, index))}
 				onclear={() => replaceQueue(clearQueue(queue))}
+				onkeepcurrentandupcoming={trimPreviousTracks}
+				onclearupcoming={trimUpcomingTracks}
 			/>
 		{/if}
 
-		<button class="nt-button nt-button--ghost" type="button" onclick={() => void refresh()}>
+		<button
+			class="nt-button nt-button--ghost"
+			type="button"
+			bind:this={refreshButton}
+			onclick={() => void refreshFromButton()}
+		>
 			{staleAt ? 'Retry' : 'Refresh'}
 		</button>
 	{/if}
