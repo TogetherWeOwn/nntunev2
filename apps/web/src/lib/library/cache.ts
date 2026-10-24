@@ -31,6 +31,8 @@ export interface LibrarySnapshot {
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
+/** Tab-local arranged queue; contains stable IDs only, never media or identity. */
+export const LIBRARY_QUEUE_KEY = 'nntune.library.queue.v1';
 /**
  * Base key for device-local favorites. Values live in `localStorage` under
  * `${LIBRARY_FAVORITES_KEY}.${auth-context}` — the same session auth-context
@@ -266,6 +268,11 @@ export function invalidateLibraryCache(): void {
 		context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY) ?? null;
 	} catch {
 		context = null;
+	}
+	try {
+		session?.removeItem(LIBRARY_QUEUE_KEY);
+	} catch {
+		// Best effort when storage is blocked; the live page also fences restore.
 	}
 	clearSnapshot(session);
 	const local = browserStorage('local');

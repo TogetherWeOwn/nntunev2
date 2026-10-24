@@ -5,6 +5,7 @@
 		clearSnapshot,
 		invalidateLibraryCache,
 		LIBRARY_AUTH_TRANSITION_KEY,
+		LIBRARY_QUEUE_KEY,
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
@@ -35,7 +36,9 @@
 		nextTrack,
 		playNext,
 		removeTrack,
+		restoreQueue,
 		selectTrack as selectQueueIndex,
+		serializeQueue,
 		shuffleUpcoming,
 		type QueueState
 	} from '#lib/player/queue.js';
@@ -49,6 +52,9 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	// Bootstrap once from a fresh authenticated catalogue. Later refreshes
+	// reconcile memory, never re-read a stale or failed storage write.
+	let queueInitialized = false;
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let queueAnnouncement = $state('');
@@ -70,6 +76,8 @@
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
+			replaceQueue(clearQueue(queue), false);
+			purgeStoredQueue();
 			favorites = [];
 			favoritesInitialized = false;
 			invalidateLibraryCache();
@@ -100,6 +108,39 @@
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
 					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
 				}
+			}
+			if (
+				!queueInitialized && !state.loading && !state.loadError &&
+				!state.libraryUnavailable && !state.requiresSignIn && state.staleAt === null
+			) {
+				// Validate before restoreQueue: its demo fallback is the full
+				// catalogue, but an unrecognizable library queue must stay empty.
+				try {
+					const raw = browserStorage('session')?.getItem(LIBRARY_QUEUE_KEY) ?? null;
+					// Bound JSON decoding before allocating an attacker-sized graph.
+					if (raw !== null && raw.length <= 65_536) {
+						const parsed = JSON.parse(raw) as { orderIds?: unknown; currentId?: unknown } | null;
+						const ids = parsed?.orderIds;
+						const known = new Set(state.items.map((track) => track.id));
+						if (
+							Array.isArray(ids) && ids.length <= state.items.length &&
+							ids.every((id) => typeof id === 'string' && known.has(id)) &&
+							new Set(ids).size === ids.length &&
+							(parsed?.currentId == null || typeof parsed.currentId === 'string')
+						) {
+							const catalogue = state.items.map((item) => ({
+								id: item.id,
+								title: displayTitle(item),
+								artist: displayArtist(item) ?? '',
+								streamUrl: ''
+							}));
+							replaceQueue(restoreQueue(raw, catalogue), false);
+						}
+					}
+				} catch {
+					// Corrupt/blocked storage leaves the initially empty queue alone.
+				}
+				queueInitialized = true;
 			}
 			// Bootstrap once after an authenticated load has minted the context.
 			// Memory stays authoritative for this visit, even if persistence
@@ -174,9 +215,33 @@
 	 * invalidates it; clearing it here also keeps a previous account's
 	 * track title from lingering across the auth-boundary clears below.
 	 */
-	function replaceQueue(next: QueueState): void {
+	function replaceQueue(next: QueueState, persist = true): void {
 		queue = next;
 		queueAnnouncement = '';
+		if (persist) persistQueue();
+	}
+
+	function persistQueue(): void {
+		if (!queueInitialized) return;
+		try {
+			const storage = browserStorage('session');
+			if (!storage) return;
+			const raw = serializeQueue(queue);
+			if (raw.length <= 65_536) storage.setItem(LIBRARY_QUEUE_KEY, raw);
+			else storage.removeItem(LIBRARY_QUEUE_KEY);
+		} catch {
+			// Memory remains authoritative for this visit if storage fails.
+		}
+	}
+
+	function purgeStoredQueue(): void {
+		// Do not bootstrap again in this visit, even if removal is blocked.
+		queueInitialized = true;
+		try {
+			browserStorage('session')?.removeItem(LIBRARY_QUEUE_KEY);
+		} catch {
+			// Best effort in privacy-restricted browser contexts.
+		}
 	}
 
 	function moveQueuedTrack(from: number, to: number): void {
@@ -187,6 +252,7 @@
 		// live region.
 		if (reordered === queue) return;
 		queue = reordered;
+		persistQueue();
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
@@ -198,6 +264,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		queue = trimmed;
+		persistQueue();
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -208,6 +275,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		queue = trimmed;
+		persistQueue();
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
@@ -255,7 +323,8 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
-			replaceQueue(clearQueue(queue));
+			replaceQueue(clearQueue(queue), false);
+			purgeStoredQueue();
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
@@ -268,7 +337,8 @@
 	}
 
 	function handleLocalAuthTransition(): void {
-		replaceQueue(clearQueue(queue));
+		replaceQueue(clearQueue(queue), false);
+		purgeStoredQueue();
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
