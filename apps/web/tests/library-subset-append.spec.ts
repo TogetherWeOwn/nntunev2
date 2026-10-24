@@ -261,18 +261,19 @@ test('[SUB-B-04] checkboxes are keyboard operable with stable focus', async ({ p
 	await expect(box).toBeFocused();
 	await expect(selectionCount(page)).toContainText('0 selected');
 
-	// Tab reaches another checkbox: nothing is tabindex-removed.
+	// Tab reaches another control: nothing is tabindex-removed. Native tab
+	// order interleaves checkbox, row button and star per row, so the next
+	// stop after a checkbox is the row BUTTON; this pins reachability, not
+	// sequence (same shape as library-queue-manage.spec.ts).
 	await page.keyboard.press('Tab');
 	const focused = await page.evaluate(() => {
 		const el = document.activeElement as HTMLElement | null;
 		return {
 			tag: el?.tagName ?? '',
-			type: el?.getAttribute('type') ?? '',
 			name: el?.getAttribute('aria-label') ?? el?.textContent ?? ''
 		};
 	});
-	expect(focused.tag).toBe('INPUT');
-	expect(focused.type).toBe('checkbox');
+	expect(focused.tag).toBe('BUTTON');
 	expect(focused.name.trim().length).toBeGreaterThan(0);
 });
 
@@ -433,10 +434,15 @@ test('[SUB-B-10] a filter discloses its hidden-selected count; without one nothi
 	await checkbox(page, 'row-zulu').check();
 
 	// The current page ships sort only; this branch activates if (and only
-	// if) a filter control lands independently.
-	const filter =
-		page.getByRole('searchbox').first().or(page.getByLabel(/filter|search/i).first());
-	if ((await filter.count()) > 0) {
+	// if) a library filter control lands independently. The queue filter
+	// (#queue-filter-input, "Filter queue") is a searchbox too, so it is
+	// excluded: filling it cannot hide library rows.
+	const candidates = page
+		.getByRole('searchbox')
+		.or(page.getByLabel(/filter|search/i))
+		.and(page.locator(':not(#queue-filter-input)'));
+	if ((await candidates.count()) > 0) {
+		const filter = candidates.first();
 		await filter.fill('mike');
 		await expect(row(page, 'row-mike')).toBeVisible();
 		await expect(row(page, 'row-zulu')).toHaveCount(0);
@@ -555,7 +561,14 @@ for (const status of [401, 403, 404] as const) {
 		await page.unroute('**/api/library');
 		payload.current = NEXT_ACCOUNT;
 		await routeLibrary(page, payload);
-		await page.getByRole('button', { name: 'Retry' }).click();
+		// The 404 landing is the neutral libraryUnavailable branch whose
+		// recovery control is labeled Refresh (staleAt null); 401/403 land on
+		// the error branch with Retry.
+		if (status === 404) {
+			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		} else {
+			await page.getByRole('button', { name: 'Retry' }).click();
+		}
 		await expect(page.getByTestId('library-item')).toHaveCount(NEXT_ACCOUNT.length);
 		await expect(selectionCount(page)).toContainText('0 selected');
 		await expect(appendButton(page)).toBeDisabled();
