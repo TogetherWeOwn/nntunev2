@@ -3,7 +3,14 @@
  * JSON array of `{ trackId, playedAt }` (most-recent-first) under one
  * sessionStorage key; all storage access is fail-soft. Demo synthetic
  * tracks only — never library or private history.
+ *
+ * Decoding is bounded (see `./localStateBounds.js`): raw payloads over
+ * `MAX_SERIALIZED_CHARS` are refused without calling `JSON.parse`, and ids
+ * over `MAX_OPAQUE_ID_CHARS` code units are treated as absent. Loads still cap
+ * at `MAX_RECENTLY_PLAYED` keeping the front.
  */
+
+import { MAX_OPAQUE_ID_CHARS, MAX_SERIALIZED_CHARS } from './localStateBounds.js';
 
 export const RECENTLY_PLAYED_STORAGE_KEY = 'nntune:demo-recently-played:v1';
 export const MAX_RECENTLY_PLAYED = 10;
@@ -40,7 +47,11 @@ export interface RecentlyPlayedStore {
 }
 
 function isValidId(trackId: unknown): trackId is string {
-	return typeof trackId === 'string' && trackId.trim() !== '';
+	return (
+		typeof trackId === 'string' &&
+		trackId.trim() !== '' &&
+		trackId.length <= MAX_OPAQUE_ID_CHARS
+	);
 }
 
 function isValidPlayedAt(playedAt: unknown): playedAt is number {
@@ -66,6 +77,7 @@ export function createRecentlyPlayedStore({
 			return [];
 		}
 		if (raw === null) return [];
+		if (raw.length > MAX_SERIALIZED_CHARS) return [];
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);
