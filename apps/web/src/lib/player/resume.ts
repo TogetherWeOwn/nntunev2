@@ -73,8 +73,19 @@ export function createResumeStore({
 	}
 
 	function writeAll(positions: Record<string, number>): void {
+		let serialized: string;
 		try {
-			storage.setItem(storageKey, JSON.stringify(positions));
+			serialized = JSON.stringify(positions);
+		} catch {
+			// Fail-soft: playback continues from the start.
+			return;
+		}
+		// State-preserving refusal: reserialization can expand values (e.g.
+		// `1e20` -> `100000000000000000000`), so a near-cap payload could
+		// rewrite over the bound and become unreadable. Keep prior bytes.
+		if (serialized.length > MAX_SERIALIZED_CHARS) return;
+		try {
+			storage.setItem(storageKey, serialized);
 		} catch {
 			// Fail-soft: playback continues from the start.
 		}
