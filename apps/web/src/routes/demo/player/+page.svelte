@@ -5,6 +5,12 @@
 
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import {
+		applySoundPreference,
+		loadSoundPreference,
+		saveSoundPreference,
+		type SoundPreference
+	} from '#lib/player/soundPreference.js';
 	import { page } from '$app/state';
 	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
@@ -50,13 +56,15 @@
 		currentTrack,
 		DEMO_TRACKS,
 		moveTrack,
+		naturalEndPolicy,
 		nextTrack,
 		previousTrack,
 		restoreQueue,
 		selectTrack,
 		serializeQueue,
 		shuffleUpcoming,
-		type QueueState
+		type QueueState,
+		type RepeatMode
 	} from '#lib/player/queue.js';
 
 	const AUDIO_URL = '/api/demo/audio';
@@ -87,7 +95,7 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
-	let muted = $state(false);
+	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
 	let shortcutsOpen = $state(false);
 	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
 	let shortcutsOpener: HTMLElement | null = null;
@@ -104,6 +112,8 @@
 		seed: number;
 	}
 	let radio = $state<RadioState | null>(null);
+	// Repeat is page-local, unlike the persisted queue: reload always starts Off.
+	let repeat = $state<RepeatMode>('off');
 
 	const current = $derived(radio ? (radio.order[radio.index] ?? null) : currentTrack(queue));
 	const inQueue = $derived(new Set(queue.tracks.map((t) => t.id)));
@@ -452,6 +462,7 @@
 	// A source gets its own element: an event queued by the browser before
 	// a src swap otherwise has no source/intent identifier we could inspect.
 	function releaseAudio(node: HTMLAudioElement, trackId: string | undefined) {
+		if (restored) updateSound(sound, node, false);
 		const stopObserving = playback.observe(node);
 		return {
 			destroy() {
@@ -630,8 +641,8 @@
 	}
 
 	// Explicit navigation persists the outgoing track's position and seeks
-	// the incoming track to its saved one. Natural `ended` advances go
-	// through goNext directly: the ended track is cleared, not persisted.
+	// the incoming track to its saved one. Natural completion is separate:
+	// the ended track is cleared, not persisted.
 	function userNext(): void {
 		const outgoingId = current?.id;
 		persistPosition(outgoingId);
@@ -722,6 +733,20 @@
 		el.currentTime = Math.min(Math.max(0, el.currentTime + deltaSeconds), max);
 	}
 
+	// Mount and keyed replacements apply before playback's tick resolves.
+	// Native events use the same equality-guarded path: no setter feedback.
+	function updateSound(preference: SoundPreference, element = audioEl, persist = true): void {
+		if (!element) return;
+		const actual = applySoundPreference(element, preference);
+		actual.restricted ||= sound.restricted ?? false;
+		if (persist) {
+			if (sound.volume !== actual.volume || sound.muted !== actual.muted) {
+				saveSoundPreference(safeStorage(), actual);
+			}
+		}
+		sound = actual;
+	}
+
 	// Visible jump controls share the keyboard relative-seek path above:
 	// the current element is read at activation and SEEK_SECONDS stays the
 	// single step source. Unusable media (no current track, non-finite or
@@ -747,21 +772,21 @@
 		}
 	}
 
-	// Mute lives in player state, not on the element: the keyed <audio>
-	// is recreated on every track change, and native controls can mute
-	// behind the shortcut's back. The effect re-applies state to each
-	// new element; volumechange absorbs native-side changes.
-	$effect(() => {
-		if (audioEl) audioEl.muted = muted;
-	});
 
-	function handleVolumeChange(event: Event): void {
-		if (event.currentTarget instanceof HTMLAudioElement) muted = event.currentTarget.muted;
+	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
+		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
+	}
+
+	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
+		if (!audioEl || !restored) return;
+		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
+		// A rejected setter leaves state unchanged: undo the range's own edit.
+		event.currentTarget.value = String(sound.volume * 100);
 	}
 
 	function toggleMuteShortcut(): void {
-		muted = !muted;
-		if (audioEl) audioEl.muted = muted;
+		if (!audioEl || !restored) return;
+		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
 	// Global transport keymap. Escape closes our dialog first so a modal
@@ -807,27 +832,49 @@
 	// `ended` is only honoured for the source the queue still points at; a
 	// late event from a superseded track must not skip the new one.
 	function handleEnded(event: Event): void {
-		if (!eventForCurrent(event) || status === 'paused' || status === 'ended') return;
-		const endedId = current?.id ?? null;
+		// Off preserves the existing completion path after a resource error;
+		// repeat requires an active transport, never an errored resource.
+		const playing = status === 'playing' || status === 'loading' ||
+			(repeat === 'off' && status === 'error');
+		if (!eventForCurrent(event) || !playing || !current) return;
+		const endedId = current.id;
 		// The completed track's entry covers the listen (queue and radio
 		// alike); the auto-advanced track earns its own on completion.
-		if (endedId !== null) recordRecent(endedId);
+		recordRecent(endedId);
 		const fired = sleepTimer.trackEnded();
 		// A finished track never resumes mid-way, whether the timer fired or
 		// the queue advances.
-		if (endedId !== null) resumeStore?.clear(endedId);
-		// A fired timer already paused via onFire; the queue stays untouched.
-		if (fired) return;
-		// Only a natural end starts radio: explicit Next past the end stops
-		// in goNext, and pause (or a stale ended while paused) never gets here.
-		if (radio) {
-			advanceRadio();
-		} else {
-			if (!current) return;
-			if (nextTrack(queue) === queue) startRadio();
-			else goNext();
+		resumeStore?.clear(endedId);
+		const result = naturalEndPolicy(queue, {
+			repeat,
+			radioActive: radio !== null,
+			// Preserve this host's existing automatic continuation when Off.
+			continueRadio: true,
+			playing,
+			validEnd: true,
+			sleepComplete: fired
+		});
+		if (result.action === 'stop') {
+			// A fired timer already paused via onFire; keep that paused state.
+			if (!fired) {
+				playback.pause();
+				status = 'ended';
+			}
+			return;
 		}
-		seekCurrentResume();
+		if (result.action === 'ignore') return;
+		if (result.action === 'radio') {
+			if (radio) advanceRadio();
+			else startRadio();
+			seekCurrentResume();
+			return;
+		}
+		queue = result.queue;
+		// A fresh keyed element starts even a singleton replay at zero and
+		// fences late events from the completed resource. Never use audio.loop:
+		// each completion must still reach sleep timers and resume clearing.
+		playCurrent(repeat !== 'off');
+		if (repeat === 'off') seekCurrentResume();
 	}
 
 	// Scope OS callbacks and timeline events to this exact source/element.
@@ -966,6 +1013,8 @@
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
 	onMount(() => {
+		sound = loadSoundPreference(safeStorage());
+		updateSound(sound, audioEl, false);
 		(window as unknown as { __seekStorm?: typeof seekStorm }).__seekStorm = seekStorm;
 		levelingEnabled = loadLevelingEnabled(safeStorage());
 		(
@@ -1142,6 +1191,24 @@
 		></audio>
 	{/key}
 
+	<div class="nt-sound">
+		<label>
+			Volume {Math.round(sound.volume * 100)}%
+			<input
+				type="range"
+				min="0"
+				max="100"
+				value={sound.volume * 100}
+				disabled={!restored || sound.restricted}
+				oninput={handleVolumeInput}
+			/>
+		</label>
+		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
+			Mute
+		</button>
+	</div>
+	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
+
 	<div>
 		<label for="track-time-mode">Time display</label>
 		<select id="track-time-mode" data-testid="track-time-mode" bind:value={timeMode}>
@@ -1158,6 +1225,22 @@
 		<button type="button" data-testid="player-next" onclick={userNext} disabled={!current}>
 			Next
 		</button>
+		<label for="player-repeat">Repeat</label>
+		<select
+			id="player-repeat"
+			data-testid="player-repeat"
+			bind:value={repeat}
+			disabled={radio !== null}
+			aria-describedby={radio ? 'repeat-radio-explanation' : undefined}
+		>
+			<option value="off">Off</option>
+			<option value="one">One</option>
+			<option value="queue">Queue</option>
+		</select>
+		<p data-testid="repeat-status" role="status">Repeat: {repeat === 'one' ? 'One' : repeat === 'queue' ? 'Queue' : 'Off'}</p>
+		{#if radio}
+			<p id="repeat-radio-explanation">Repeat is unavailable while radio is active. Stop radio to change repeat.</p>
+		{/if}
 		<!-- Own row so the pair stays side by side at 360px instead of
 		     wrapping around Previous/Next into overlapping lines. -->
 		<div>
