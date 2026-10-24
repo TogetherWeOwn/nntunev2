@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { currentTrack, type QueueState } from './queue.js';
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 
@@ -14,6 +15,13 @@
 		onplaynext?: (index: number) => void;
 		onremove?: (index: number) => void;
 		onclear?: () => void;
+		/**
+		 * Trim intents, same contract: the host applies the transition and
+		 * owns the announcement; the panel reports once and never mutates.
+		 * Each control renders only when its callback is provided.
+		 */
+		onkeepcurrentandupcoming?: () => void;
+		onclearupcoming?: () => void;
 		/**
 		 * Polite move announcements, owned by the host: the host sets the
 		 * moved track and its new position after each move; the panel only
@@ -32,6 +40,8 @@
 		onplaynext,
 		onremove,
 		onclear,
+		onkeepcurrentandupcoming,
+		onclearupcoming,
 		announcement = ''
 	}: Props = $props();
 
@@ -56,6 +66,12 @@
 
 	let list: HTMLOListElement | null = $state(null);
 
+	function currentRowElement(): HTMLElement | null {
+		return (
+			list?.querySelector<HTMLElement>('[data-testid="queue-item"][aria-current="true"]') ?? null
+		);
+	}
+
 	/**
 	 * Explicit reveal only: bound to the Show-current-track button's click.
 	 * Never runs from an effect, never mutates state, never calls transport.
@@ -64,12 +80,27 @@
 	 */
 	function revealCurrent(): void {
 		if (selectedIndex < 0) return;
-		const row = list?.querySelector<HTMLElement>(
-			'[data-testid="queue-item"][aria-current="true"]'
-		);
+		const row = currentRowElement();
 		if (!row) return;
 		row.focus({ preventScroll: true });
 		row.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+	}
+
+	/**
+	 * Report one trim intent, then land focus deterministically: a trim that
+	 * removed the rows keeping its control enabled leaves a disabled button
+	 * behind, so focus moves to the surviving current row instead of the
+	 * body. Runs only on explicit activation — prop-only updates never reach
+	 * here, so background refreshes cannot steal focus.
+	 */
+	async function reportTrim(event: Event, notify: (() => void) | undefined): Promise<void> {
+		// currentTarget is only valid during dispatch; capture it before the tick.
+		const button = event.currentTarget;
+		notify?.();
+		await tick();
+		if (button instanceof HTMLButtonElement && button.disabled) {
+			currentRowElement()?.focus({ preventScroll: true });
+		}
 	}
 </script>
 
@@ -167,6 +198,25 @@
 		</li>
 	{/each}
 </ol>
+
+{#if onkeepcurrentandupcoming}
+	<button
+		type="button"
+		disabled={selectedIndex <= 0}
+		onclick={(event) => void reportTrim(event, onkeepcurrentandupcoming)}
+	>
+		Keep current and upcoming
+	</button>
+{/if}
+{#if onclearupcoming}
+	<button
+		type="button"
+		disabled={selectedIndex < 0 || selectedIndex >= trackCount - 1}
+		onclick={(event) => void reportTrim(event, onclearupcoming)}
+	>
+		Clear upcoming
+	</button>
+{/if}
 
 <button
 	type="button"

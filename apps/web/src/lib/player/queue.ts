@@ -192,6 +192,45 @@ export function playNext(state: QueueState, index: number): QueueState {
 	return moveTrack(state, index, to);
 }
 
+/**
+ * Drop every track before the current one, keeping the current track and
+ * everything after it in arranged order. The current *track* (not the
+ * slot) stays current, so the index rewinds to 0. Queue-only edit: never
+ * touches transport, position or providers. A no-op (same state) without
+ * a valid in-range integer selection or when nothing precedes current.
+ */
+export function keepCurrentAndUpcoming(state: QueueState): QueueState {
+	if (
+		!Number.isInteger(state.currentIndex) ||
+		state.currentIndex <= 0 ||
+		state.currentIndex >= state.tracks.length
+	) {
+		return state;
+	}
+	return { tracks: state.tracks.slice(state.currentIndex), currentIndex: 0 };
+}
+
+/**
+ * Drop every track after the current one, keeping the prefix and the
+ * current track in arranged order. The current track keeps its slot, so
+ * the index is unchanged. Queue-only edit: never touches transport,
+ * position or providers. A no-op (same state) without a valid in-range
+ * integer selection or when nothing follows current.
+ */
+export function clearUpcoming(state: QueueState): QueueState {
+	if (
+		!Number.isInteger(state.currentIndex) ||
+		state.currentIndex < 0 ||
+		state.currentIndex >= state.tracks.length - 1
+	) {
+		return state;
+	}
+	return {
+		tracks: state.tracks.slice(0, state.currentIndex + 1),
+		currentIndex: state.currentIndex
+	};
+}
+
 /** In-session persistence (sessionStorage): order + current track id only. */
 export function serializeQueue(state: QueueState): string {
 	return JSON.stringify({
