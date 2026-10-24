@@ -123,11 +123,13 @@
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
 			}
-			// Same-account refresh completion: the panel remounted, so hand
-			// focus back to the filter input the user was typing in. Any
-			// other focus placement (or an empty query) is left alone. The
-			// page-script unit harness runs this handler with neither DOM
-			// nor svelte bindings, so the restore is skipped there.
+			// Same-account refresh completion: the panel may have remounted
+			// (branch swap), so hand focus back to the filter input the user
+			// was typing in. Background refreshes keep the panel mounted, so
+			// the restore is a no-op there. Any other focus placement (or an
+			// empty query) is left alone. The page-script unit harness runs
+			// this handler with neither DOM nor svelte bindings, so the
+			// restore is skipped there.
 			if (!state.loading && restoreFilterFocus) {
 				restoreFilterFocus = false;
 				if (
@@ -519,10 +521,19 @@
 					</li>
 				{/each}
 			</ul>
+			<!--
+				The queue panel stays mounted across background refreshes (its
+				rows remain readable while the new list loads), but its four
+				live statuses suspend while loading so the inline loading
+				indicator keeps the single-status transient the ordering specs
+				pin with an unfiltered role query. Content, controls and
+				focus are untouched; the roles return with the fresh list.
+			-->
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
 				bind:filterQuery={queueFilterQuery}
+				liveRegions={!loading}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}

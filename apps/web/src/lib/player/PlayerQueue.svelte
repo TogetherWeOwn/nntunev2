@@ -36,6 +36,14 @@
 		 * component-local default. Never persisted or fetched.
 		 */
 		filterQuery?: string;
+		/**
+		 * Whether the panel's polite regions are exposed as live statuses.
+		 * The library host suspends them while a library refresh is in
+		 * flight so the loading transient keeps a single page-level
+		 * status; content, controls and focus are untouched. Defaults to
+		 * exposed; component harnesses leave it on.
+		 */
+		liveRegions?: boolean;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
@@ -51,7 +59,8 @@
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
-		filterQuery = $bindable('')
+		filterQuery = $bindable(''),
+		liveRegions = true
 	}: Props = $props();
 
 	let current = $derived(currentTrack(queue));
@@ -151,7 +160,7 @@
 	(via `onmove`/`onplaynext`/`onremove`/`onclear`); the panel itself never
 	mutates state.
 -->
-<p data-testid="now-playing" role="status">
+<p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
 	{#if current}
 		Now playing: {displayTitle(current)}{#if current.artist} — {current.artist}{/if}
 	{:else}
@@ -170,7 +179,7 @@
 	{/if}
 </p>
 
-<p data-testid="queue-announcement" role="status">{announcement}</p>
+<p data-testid="queue-announcement" role={liveRegions ? 'status' : undefined}>{announcement}</p>
 
 <button
 	type="button"
@@ -190,7 +199,7 @@
 	Show current track
 </button>
 
-<ShuffleUpcoming state={queue} {onshuffle} {radioActive} />
+<ShuffleUpcoming state={queue} {onshuffle} {radioActive} {liveRegions} />
 
 <!--
 	Queue-only filter: transient presentation state. It hides rows but
@@ -203,7 +212,7 @@
 	<button type="button" onclick={() => (filterQuery = '')}>Clear queue filter</button>
 </div>
 
-<p data-testid="queue-filter-count" role="status">
+<p data-testid="queue-filter-count" role={liveRegions ? 'status' : undefined}>
 	{visibleEntries.length} of {trackCount} tracks
 </p>
 
