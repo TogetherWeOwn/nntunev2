@@ -644,7 +644,7 @@ describe('LSB-U-15 writer output stays readable under the caps', () => {
 	it('resume saves refuse before the serialized output could exceed the cap', () => {
 		const storage = fakeStorage();
 		const store = createResumeStore({ storage });
-		const ids = Array.from({ length: MAX_RESUME_ENTRIES }, (_, i) => `w${i}${'y'.repeat(245)}`);
+		const ids = Array.from({ length: MAX_RESUME_ENTRIES }, (_, i) => `w${i}${'y'.repeat(248)}`);
 		for (const id of ids) expect(id.length).toBeLessThanOrEqual(MAX_OPAQUE_ID_CHARS);
 
 		for (const id of ids) store.save(id, 1);
