@@ -347,7 +347,7 @@ test('[QUEUEEXPORT-04] successive exports read live state: reorder and clear/re-
 	const calls = await clipboardCalls(page);
 	expect(calls[0], 'first copy must export the default order').toBe(DEFAULT_TEXT);
 	expect(calls[1], 'second copy must export the rearranged order').toBe(MOVED_DOWN_TEXT);
-	expect(calls[2], 'third copy must export the re-added order').toBe(READDED_TEXT);
+	expect(calls[2], 'third copy must export the re-added order').toBe(REadded_TEXT);
 });
 
 test('[QUEUEEXPORT-05] selection never filters the export: the whole queue is copied', async ({
@@ -520,7 +520,7 @@ test('[QUEUEEXPORT-10] rejected clipboard write falls back without claiming succ
 	await expect(page.getByTestId('queue-export-status')).not.toContainText(/copied|success/i);
 	expect(await execCommandCallCount(page), 'rejection must not use execCommand').toBe(0);
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
-	expect(copy, 'copy stays enabled after a rejected write').toBeEnabled();
+	await expect(copy, 'copy stays enabled after a rejected write').toBeEnabled();
 });
 
 test('[QUEUEEXPORT-11] download saves queue.m3u with arranged #EXTINF id-only entries, fully offline', async ({
