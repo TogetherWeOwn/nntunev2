@@ -30,7 +30,7 @@ type Probe = {
 	playCalls: number;
 	pendingPlays: (() => void)[];
 	settledPlays: number;
-	timeupdates: { time: number; trusted: boolean; positions: (Position | null)[] }[];
+	timeupdates: { timeBefore: number; timeAfter: number; trusted: boolean; positions: (Position | null)[] }[];
 	retired: Callback[];
 	oldAudio: HTMLAudioElement | null;
 };
@@ -526,14 +526,15 @@ test('MS-B15 native timeupdate publishes an advancing timeline without any seek'
 		}
 		p.positions = [];
 		let before = 0;
-		let time = 0;
+		let timeBefore = 0;
 		el.addEventListener('timeupdate', () => {
 			before = p.positions.length;
-			time = el.currentTime;
+			timeBefore = el.currentTime;
 		}, { capture: true });
 		// Registered after the host's listener: bracket that synchronous publish.
+		// Native playback can advance between listeners, even in the same event.
 		el.addEventListener('timeupdate', (event) => p.timeupdates.push({
-			time, trusted: event.isTrusted, positions: p.positions.slice(before)
+			timeBefore, timeAfter: el.currentTime, trusted: event.isTrusted, positions: p.positions.slice(before)
 		}));
 		return el.currentTime;
 	});
@@ -553,7 +554,10 @@ test('MS-B15 native timeupdate publishes an advancing timeline without any seek'
 		expect(Number.isFinite(state!.position)).toBe(true);
 		expect(state!.position).toBeGreaterThanOrEqual(0);
 		expect(state!.position).toBeLessThanOrEqual(duration);
-		expect(state!.position).toBeCloseTo(sample.time, 2);
+		expect(Number.isFinite(sample.timeBefore) && Number.isFinite(sample.timeAfter)).toBe(true);
+		expect(sample.timeAfter).toBeGreaterThanOrEqual(sample.timeBefore);
+		expect(state!.position).toBeGreaterThanOrEqual(sample.timeBefore);
+		expect(state!.position).toBeLessThanOrEqual(sample.timeAfter);
 	}
 	expect(samples.at(-1)!.positions[0]!.position - samples[0]!.positions[0]!.position).toBeGreaterThan(0.4);
 	await expect(page.getByTestId('player-status')).toHaveText('Status: playing');

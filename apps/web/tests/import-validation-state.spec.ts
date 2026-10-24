@@ -14,7 +14,7 @@ test('import feedback resets on reselection and clearing without making requests
 	});
 	await expect(feedback).toHaveAttribute('role', 'alert');
 	await expect(feedback).toContainText('empty');
-	await expect(input).toHaveAttribute('aria-describedby', 'import-feedback');
+	await expect(input).toHaveAttribute('aria-describedby', 'import-requirements import-feedback');
 
 	// The inclusive cap and case-insensitive extension are reachable in the UI.
 	await input.setInputFiles({
@@ -35,6 +35,6 @@ test('import feedback resets on reselection and clearing without making requests
 
 	await input.setInputFiles([]);
 	await expect(feedback).toHaveCount(0);
-	await expect(input).not.toHaveAttribute('aria-describedby');
+	await expect(input).toHaveAttribute('aria-describedby', 'import-requirements');
 	expect(requests).toEqual([]);
 });
