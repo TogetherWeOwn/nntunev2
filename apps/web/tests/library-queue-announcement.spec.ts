@@ -3,10 +3,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 /**
  * Queue announcement hygiene on /library (QUEUE-MANAGE follow-up).
  *
- * The `queue-announcement` live region is host-owned page state that only a
- * move sets. Any other queue edit must clear it, otherwise the previous
- * "moved to N of M" text goes stale (positions may no longer exist) and a
- * track title can linger across queue clears.
+ * The `queue-announcement` live region is host-owned page state. A move
+ * sets the position text; remove and clear replace it with their own
+ * concise outcome; every other queue edit clears it. Otherwise the
+ * previous "moved to N of M" text goes stale (positions may no longer
+ * exist) and a track title can linger across queue clears.
  *
  * Harness note (same as the neighbouring library specs): `/library` is
  * client-fetched (`ssr = false`), so the click-driven contract is pinned
@@ -202,7 +203,7 @@ test('same-tab auth transition clears a move announcement before the next sessio
 	await expect(page.getByTestId('queue-announcement')).toHaveText('');
 });
 
-test('remove clears a stale move announcement', async ({ page }) => {
+test('remove replaces a stale move announcement with the remove outcome', async ({ page }) => {
 	await seedQueue(page);
 	const announcement = await moveAlphaUp(page);
 
@@ -211,7 +212,8 @@ test('remove clears a stale move announcement', async ({ page }) => {
 	await remove.click();
 
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-alpha']);
-	await expect(announcement).toHaveText('');
+	await expect(announcement).toHaveText('Zulu Song removed from the queue.');
+	await expect(announcement).not.toContainText('moved to');
 });
 
 test('play-next clears a stale move announcement', async ({ page }) => {
@@ -226,7 +228,7 @@ test('play-next clears a stale move announcement', async ({ page }) => {
 	await expect(announcement).toHaveText('');
 });
 
-test('clear empties the announcement with the queue', async ({ page }) => {
+test('clear replaces the announcement with the cleared outcome', async ({ page }) => {
 	await seedQueue(page);
 	const announcement = await moveAlphaUp(page);
 
@@ -235,5 +237,6 @@ test('clear empties the announcement with the queue', async ({ page }) => {
 	await clear.click();
 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
-	await expect(announcement).toHaveText('');
+	await expect(announcement).toHaveText('Queue cleared.');
+	await expect(announcement).not.toContainText('moved to');
 });

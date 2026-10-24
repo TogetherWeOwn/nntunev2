@@ -196,13 +196,19 @@ async function expectEmptyRecovery(page: Page): Promise<void> {
 async function watchAnnouncements(page: Page): Promise<void> {
 	await page.evaluate(() => {
 		const region = document.querySelector('[data-testid="queue-announcement"]');
-		(window as unknown as { __qfCommits: string[] }).__qfCommits = [];
+		const watched = window as unknown as {
+			__qfCommits: string[];
+			__qfObserver?: MutationObserver;
+		};
+		// A second call must replace, not stack onto, the first observer:
+		// two live observers on the same node would push one commit twice.
+		watched.__qfObserver?.disconnect();
+		watched.__qfCommits = [];
 		if (!region) return;
-		new MutationObserver(() => {
-			(window as unknown as { __qfCommits: string[] }).__qfCommits.push(
-				region.textContent ?? ''
-			);
-		}).observe(region, { childList: true, characterData: true, subtree: true });
+		watched.__qfObserver = new MutationObserver(() => {
+			watched.__qfCommits.push(region.textContent ?? '');
+		});
+		watched.__qfObserver.observe(region, { childList: true, characterData: true, subtree: true });
 	});
 }
 
