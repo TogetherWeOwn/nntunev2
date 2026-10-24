@@ -6,6 +6,15 @@ import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary } from '#lib
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
+import {
+	appendResultLabel,
+	appendSelection,
+	clearSelection,
+	createSelection,
+	pruneSelection,
+	selectionCountLabel,
+	toggleSelected
+} from '#lib/library/selection.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw',
@@ -82,6 +91,13 @@ function pageScript() {
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		appendResultLabel,
+		appendSelection,
+		clearSelection,
+		createSelection,
+		pruneSelection,
+		selectionCountLabel,
+		toggleSelected,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		subscribeLocalAuthTransition,
 		browserStorage: () => null,
