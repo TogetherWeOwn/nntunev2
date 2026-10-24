@@ -21,6 +21,7 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
+	import { filterLibraryItems } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
@@ -43,6 +44,14 @@
 	let items: LibraryItem[] = $state([]);
 	let order: LibraryOrder = $state('original');
 	const orderedItems = $derived(orderLibraryItems(items, order));
+	/**
+	 * Transient find-in-loaded-tracks query. Presentation-only: it filters
+	 * the already-ordered rows below without fetching, queueing, starring
+	 * or persisting anything. Cleared only at the account/auth boundary;
+	 * same-account refreshes (including failed ones) preserve it.
+	 */
+	let findQuery = $state('');
+	const visibleItems = $derived(filterLibraryItems(orderedItems, findQuery));
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -85,7 +94,10 @@
 			// panel (alert branch); the route-owned filter text must go with
 			// it so the next account never inherits the previous query.
 			// Successful same-account refreshes keep items and keep the query.
-			if (state.loadError && state.items.length === 0) queueFilterQuery = '';
+			if (state.loadError && state.items.length === 0) {
+				queueFilterQuery = '';
+				findQuery = '';
+			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -263,6 +275,7 @@
 			favorites = [];
 			favoritesInitialized = false;
 			queueFilterQuery = '';
+			findQuery = '';
 		}
 		refresher.handleAuthTransition(event);
 	}
@@ -274,6 +287,7 @@
 		favorites = [];
 		favoritesInitialized = false;
 		queueFilterQuery = '';
+		findQuery = '';
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -346,6 +360,26 @@
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
+			<div class="nt-library-find">
+				<label for="library-find">Find in loaded tracks</label>
+				<input
+					id="library-find"
+					type="search"
+					bind:value={findQuery}
+					aria-describedby="library-find-hint"
+				/>
+				<p id="library-find-hint">
+					Searches only the tracks already loaded here, not the remote catalog.
+				</p>
+				<p data-testid="library-find-count">
+					Showing {visibleItems.length} of {orderedItems.length}
+				</p>
+				{#if findQuery !== ''}
+					<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
+						Clear search
+					</button>
+				{/if}
+			</div>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
 				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
@@ -355,8 +389,14 @@
 				</select>
 				<span id="library-order-hint">Changes this list only, not your queue.</span>
 			</div>
-			<ul data-testid="library-list">
-				{#each orderedItems as track (track.id)}
+			{#if visibleItems.length === 0}
+				<p>No matches in your loaded tracks.</p>
+				<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
+					Clear search
+				</button>
+			{:else}
+				<ul data-testid="library-list">
+					{#each visibleItems as track (track.id)}
 					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<button
@@ -387,7 +427,8 @@
 						</button>
 					</li>
 				{/each}
-			</ul>
+				</ul>
+			{/if}
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
@@ -438,6 +479,28 @@
 </main>
 
 <style>
+	.nt-library-find {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-find input {
+		box-sizing: border-box;
+		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find p {
+		flex-basis: 100%;
+		margin: 0;
+		color: var(--nt-fg-muted);
+	}
 	.nt-library-order {
 		display: flex;
 		align-items: center;
