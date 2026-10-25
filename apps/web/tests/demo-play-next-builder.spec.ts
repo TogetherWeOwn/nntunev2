@@ -11,6 +11,8 @@ import { expect, test, type Page } from '@playwright/test';
  * vectors prove both layers: every row button is disabled during radio,
  * and a forced click changes neither the queue order nor the polite
  * announcement. Stopping radio re-enables the controls.
+ * A filtered-row case also pins the original queue index: Third Light is
+ * full index 2 but visible position 0, which would silently target current.
  *
  * Offline setup: pnpm --dir apps/web install --offline --frozen-lockfile --prod=false
  * Run: CI=1 PUBLIC_API_BASE_URL='' pnpm --dir apps/web exec playwright test \
@@ -65,6 +67,32 @@ const announcement = (page: Page) =>
 	page.getByTestId('queue-panel').getByTestId('queue-announcement').textContent();
 
 test.setTimeout(20_000);
+
+test('filtered play next uses the original queue index rather than the visible position', async ({ page }) => {
+	await openPlayer(page);
+	// Metadata is published by a client effect, so this proves hydration.
+	await expect.poll(() => page.evaluate(() => navigator.mediaSession.metadata?.title)).toBe('Demo track');
+	const filter = page.getByRole('searchbox', { name: 'Filter queue', exact: true });
+	await filter.fill('third');
+	await expect.poll(() => order(page)).toEqual(['third-light']);
+
+	// Third Light is full index 2, but visible position 0 would target the
+	// current Demo track and silently no-op instead of moving Third Light.
+	const control = page.getByTestId('queue-play-next-third-light');
+	await control.click();
+	const region = page.getByTestId('queue-panel').getByTestId('queue-announcement');
+	await expect(region).toHaveAttribute('role', 'status');
+	await expect(region).toContainText('Third Light');
+	await expect(region).toContainText('position 2 of 3');
+	await expect(control).toBeFocused();
+	await expect(filter).toHaveValue('third');
+	await expect.poll(() => order(page)).toEqual(['third-light']);
+
+	await page.getByRole('button', { name: 'Clear queue filter', exact: true }).click();
+	await expect.poll(() => order(page)).toEqual(['demo-track', 'third-light', 'second-signal']);
+	await expect(page.getByTestId('queue-select-demo-track')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+});
 
 test('play next disables during radio and forced clicks change nothing', async ({ page }) => {
 	await openPlayer(page);
