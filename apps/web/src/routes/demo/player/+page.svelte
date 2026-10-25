@@ -899,6 +899,9 @@
 		}
 		try {
 			el.currentTime = seconds;
+			// An exact-end seek during active or pending playback must become an
+			// intentional pause before native completion can advance the queue.
+			if (seconds >= duration && (status === 'playing' || status === 'loading')) pauseCurrent();
 		} catch {
 			// The setter refused (a non-seekable resource): report honestly
 			// and never echo decoder internals into the page.
