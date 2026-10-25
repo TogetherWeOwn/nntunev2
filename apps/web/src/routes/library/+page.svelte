@@ -103,6 +103,7 @@
 	);
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
+	let queueAnnouncementVersion = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -275,6 +276,29 @@
 		if (reordered === queue) return;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
+	}
+
+	function removeQueuedTrack(index: number): void {
+		const removed = queue.tracks[index];
+		if (removed === undefined) return;
+		const next = removeTrack(queue, index);
+		// Announce real removals only, including distinct tracks with equal
+		// titles: the version refreshes the content inside the stable region.
+		if (next === queue) return;
+		const title = removed.title?.trim() ? removed.title : removed.id;
+		queue = next;
+		queueAnnouncement = `${title} removed from the queue.`;
+		queueAnnouncementVersion += 1;
+	}
+
+	function clearQueuedTracks(): void {
+		const next = clearQueue(queue);
+		// Announce real clears only: a no-op clear must not chatter the live
+		// region.
+		if (next === queue) return;
+		queue = next;
+		queueAnnouncement = 'Queue cleared.';
+		queueAnnouncementVersion += 1;
 	}
 
 	function trimPreviousTracks(): void {
@@ -707,6 +731,7 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
+				announcementVersion={queueAnnouncementVersion}
 				{favoriteIds}
 				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
@@ -715,8 +740,8 @@
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
-				onremove={(index) => replaceQueue(removeTrack(queue, index))}
-				onclear={() => replaceQueue(clearQueue(queue))}
+				onremove={removeQueuedTrack}
+				onclear={clearQueuedTracks}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
