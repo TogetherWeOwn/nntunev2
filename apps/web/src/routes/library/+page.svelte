@@ -23,6 +23,16 @@
 	} from '#lib/library/order.js';
 	import { filterLibraryItems } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
+	import {
+		appendResultLabel,
+		appendSelection,
+		clearSelection,
+		createSelection,
+		hiddenSelectedCount,
+		pruneSelection,
+		selectionCountLabel,
+		toggleSelected
+	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import {
@@ -60,6 +70,21 @@
 	let queue: QueueState = $state(createQueue([]));
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
+	/**
+	 * Explicit subset selection: page-local ordered stable IDs in checkbox
+	 * activation order. Never persisted, never fetched, never shared across
+	 * tabs; purged only at auth/account boundaries, pruned only against a
+	 * successful snapshot. The last append outcome stays until the next
+	 * append or a boundary purge.
+	 */
+	let selectedIds: string[] = $state(createSelection());
+	const hiddenSelectionCount = $derived(
+		hiddenSelectedCount(
+			selectedIds,
+			visibleItems.map((track) => track.id)
+		)
+	);
+	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -111,6 +136,23 @@
 					const index =
 						currentId === null ? -1 : kept.findIndex((track) => track.id === currentId);
 					replaceQueue(index > 0 ? selectQueueIndex(rebuilt, index) : rebuilt);
+				}
+			}
+			// The pending subset is per-account: an access refusal or auth
+			// transition that empties the library purges it, so the next
+			// account never inherits the previous choices. A successful
+			// same-account refresh prunes IDs the new snapshot no longer
+			// carries, preserving activation order. Transient failures keep
+			// their items through the stale fallback, so prune is a no-op
+			// there; failures without a snapshot have no rows selected.
+			if (!state.loading) {
+				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
+					if (selectedIds.length > 0 || appendFeedback !== null) purgeSelection();
+				} else if (!state.loadError) {
+					selectedIds = pruneSelection(
+						selectedIds,
+						state.items.map((track) => track.id)
+					);
 				}
 			}
 			// Bootstrap once after an authenticated load has minted the context.
@@ -238,6 +280,25 @@
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
+	function toggleSelectedId(id: string): void {
+		selectedIds = toggleSelected(selectedIds, id);
+	}
+
+	function clearSelectedIds(): void {
+		selectedIds = clearSelection(selectedIds);
+	}
+
+	function appendSelectedIds(): void {
+		const result = appendSelection(queue, selectedIds, items);
+		replaceQueue(result.queue);
+		appendFeedback = appendResultLabel(result.added, result.skipped);
+	}
+
+	function purgeSelection(): void {
+		selectedIds = createSelection();
+		appendFeedback = null;
+	}
+
 	function refresh(): Promise<void> {
 		restoreFilterFocus =
 			typeof document !== 'undefined' &&
@@ -276,6 +337,7 @@
 			favoritesInitialized = false;
 			queueFilterQuery = '';
 			findQuery = '';
+			purgeSelection();
 		}
 		refresher.handleAuthTransition(event);
 	}
@@ -288,6 +350,7 @@
 		favoritesInitialized = false;
 		queueFilterQuery = '';
 		findQuery = '';
+		purgeSelection();
 		refresher.handleLocalAuthTransition();
 	}
 
@@ -389,46 +452,76 @@
 				</select>
 				<span id="library-order-hint">Changes this list only, not your queue.</span>
 			</div>
-			{#if visibleItems.length === 0}
-				<p>No matches in your loaded tracks.</p>
-				<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
-					Clear search
-				</button>
-			{:else}
-				<ul data-testid="library-list">
-					{#each visibleItems as track (track.id)}
-					{@const queued = queuedIds.has(track.id)}
-					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
-						<button
-							type="button"
-							class="nt-library-row"
-							aria-label={queued
-								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
-								: undefined}
-							aria-pressed={queued ? true : undefined}
-							onclick={() => selectTrack(track.id)}
-						>
-							{displayTitle(track)}
-							{#if displayArtist(track)}
-								<span> — {displayArtist(track)}</span>
-							{/if}
-							{#if queued}
-								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
-							{/if}
-						</button>
-						<button
-							type="button"
-							class="nt-library-star"
-							aria-pressed={favoriteIds.has(track.id)}
-							aria-label={starLabel(track)}
-							onclick={() => toggleFavorite(track.id)}
-						>
-							<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
-						</button>
-					</li>
-				{/each}
-				</ul>
-			{/if}
+				<div class="nt-selection-bar">
+					<p data-testid="selection-count">{selectionCountLabel(selectedIds.length)}</p>
+					<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
+						Clear selection
+					</button>
+					<button
+						class="nt-button"
+						type="button"
+						disabled={selectedIds.length === 0}
+						onclick={() => appendSelectedIds()}
+					>
+						Append selected
+					</button>
+					{#if appendFeedback}
+						<p data-testid="append-result" role="status">{appendFeedback}</p>
+					{/if}
+					{#if hiddenSelectionCount > 0}
+						<p data-testid="selection-hidden-count">
+							{hiddenSelectionCount} selected {hiddenSelectionCount === 1 ? 'track is' : 'tracks are'} hidden by this find.
+						</p>
+					{/if}
+				</div>
+				{#if visibleItems.length === 0}
+					<p>No matches in your loaded tracks.</p>
+					<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
+						Clear search
+					</button>
+				{:else}
+					<ul data-testid="library-list">
+						{#each visibleItems as track (track.id)}
+						{@const queued = queuedIds.has(track.id)}
+						<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+							<input
+								class="nt-library-select"
+								type="checkbox"
+								aria-label={`Select ${displayTitle(track)}`}
+								checked={selectedIds.includes(track.id)}
+								onclick={(event) => event.stopPropagation()}
+								onchange={() => toggleSelectedId(track.id)}
+							/>
+							<button
+								type="button"
+								class="nt-library-row"
+								aria-label={queued
+									? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+									: undefined}
+								aria-pressed={queued ? true : undefined}
+								onclick={() => selectTrack(track.id)}
+							>
+								{displayTitle(track)}
+								{#if displayArtist(track)}
+									<span> — {displayArtist(track)}</span>
+								{/if}
+								{#if queued}
+									<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
+								{/if}
+							</button>
+							<button
+								type="button"
+								class="nt-library-star"
+								aria-pressed={favoriteIds.has(track.id)}
+								aria-label={starLabel(track)}
+								onclick={() => toggleFavorite(track.id)}
+							>
+								<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
+							</button>
+						</li>
+					{/each}
+					</ul>
+				{/if}
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
@@ -519,6 +612,25 @@
 	}
 	.nt-library-order span {
 		color: var(--nt-fg-muted);
+	}
+	.nt-selection-bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-selection-bar p {
+		margin: 0;
+	}
+	.nt-selection-bar [data-testid='append-result'] {
+		flex-basis: 100%;
+	}
+	.nt-library-select {
+		flex: 0 0 auto;
+		width: 1.5rem;
+		height: 1.5rem;
+		margin: 0.5rem 0 0.5rem 0.75rem;
+		accent-color: var(--nt-accent);
 	}
 	.nt-library-item {
 		display: flex;
