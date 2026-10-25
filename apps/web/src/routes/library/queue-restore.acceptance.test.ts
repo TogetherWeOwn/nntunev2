@@ -19,6 +19,7 @@ import {
 } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
+import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 
 /**
@@ -212,6 +213,8 @@ function pageHarness(): PageHarness {
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		createSelection,
+		pruneSelection,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		LIBRARY_QUEUE_KEY: QUEUE_KEY,
 		subscribeLocalAuthTransition,
