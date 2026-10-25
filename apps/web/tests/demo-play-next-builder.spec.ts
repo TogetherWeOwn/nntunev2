@@ -77,8 +77,9 @@ test('play next disables during radio and forced clicks change nothing', async (
 	const beforeAnnouncement = await announcement(page);
 
 	// dispatchEvent bypasses the disabled actionability check, pinning the
-	// handler's own radio guard rather than the attribute alone.
-	await page.getByTestId('queue-play-next-third-light').dispatchEvent('click');
+	// handler's own radio guard rather than the attribute alone. demo-track
+	// is not current during radio, so playNext would move it without the guard.
+	await page.getByTestId('queue-play-next-demo-track').dispatchEvent('click');
 	await expect(page.getByTestId('radio-badge')).toContainText('Radio');
 	expect(await order(page)).toEqual(beforeOrder);
 	expect(await announcement(page)).toBe(beforeAnnouncement);
