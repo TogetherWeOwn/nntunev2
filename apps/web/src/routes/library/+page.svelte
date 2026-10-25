@@ -266,6 +266,14 @@
 		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 	}
 
+	function toggleQueuedFavorite(id: string): void {
+		const track = queue.tracks.find((track) => track.id === id);
+		if (!track) return;
+		const wasFavorite = favorites.includes(id);
+		toggleFavorite(id);
+		queueAnnouncement = `${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`;
+	}
+
 	function starLabel(track: LibraryItem): string {
 		const title = displayTitle(track);
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
@@ -483,6 +491,8 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
+				{favoriteIds}
+				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}

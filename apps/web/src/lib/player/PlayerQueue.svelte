@@ -16,6 +16,9 @@
 		onplaynext?: (index: number) => void;
 		onremove?: (index: number) => void;
 		onclear?: () => void;
+		/** Favorites stay with the library host; other queues omit the intent. */
+		favoriteIds?: ReadonlySet<string>;
+		ontogglefavorite?: (id: string) => void;
 		/**
 		 * Trim intents, same contract: the host applies the transition and
 		 * owns the announcement; the panel reports once and never mutates.
@@ -48,6 +51,8 @@
 		onplaynext,
 		onremove,
 		onclear,
+		favoriteIds = new Set<string>(),
+		ontogglefavorite,
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
@@ -224,6 +229,17 @@
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
 			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
+			{#if ontogglefavorite}
+				<button
+					type="button"
+					class="queue-star"
+					aria-label="{favoriteIds.has(track.id) ? 'Unstar' : 'Star'} {displayTitle(track)}"
+					aria-pressed={favoriteIds.has(track.id)}
+					onclick={() => ontogglefavorite?.(track.id)}
+				>
+					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
+				</button>
+			{/if}
 			<button
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
@@ -320,7 +336,22 @@
 		font: inherit;
 	}
 
+	.queue-star {
+		min-width: 2.75rem;
+		min-height: 2.75rem;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		vertical-align: middle;
+	}
+
+	.queue-star:focus-visible {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+
 	.queue-row {
+		overflow-wrap: anywhere;
 		/* Clear the 2px outline + 2px offset when nearest-scroll rounds
 		 * fractional line heights at the viewport edge. */
 		scroll-margin-block: 4px;
