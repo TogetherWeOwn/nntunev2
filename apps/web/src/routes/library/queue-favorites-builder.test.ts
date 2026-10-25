@@ -1,7 +1,8 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
+import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -23,12 +24,19 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
-	const handlers = new Set(['queuedTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites']);
+	const handlers = new Set([
+		'queuedTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback'
+	]);
+	// Row selection now clears transient link feedback. Execute that real
+	// dependency with its real initial state, not a no-op handler substitute.
+	const state = new Set([
+		'favoriteTracks', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek'
+	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
 			? handlers.has(statement.name?.text ?? '')
 			: ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
-				(declaration) => declaration.name.getText(parsed) === 'favoriteTracks'
+				(declaration) => state.has(declaration.name.getText(parsed))
 			)
 	).map((statement) => statement.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(body, {
@@ -36,7 +44,8 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	}).outputText;
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
-		addTrack, displayArtist, displayTitle, $derived: <T>(value: T) => value
+		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {

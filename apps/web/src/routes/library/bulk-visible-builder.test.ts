@@ -3,7 +3,8 @@ import ts from 'typescript';
 import { displayArtist, displayTitle, orderLibraryItems, type LibraryOrder } from '#lib/library/order.js';
 import { selectFavoriteItems } from '#lib/library/favorites.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
-import { createQueue, type QueueState } from '#lib/player/queue.js';
+import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
+import { resolveStreamUrl } from '#lib/library/stream-url.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
 // must bound both the bulk action and its disabled/already-queued states.
@@ -20,8 +21,17 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
-	const handlers = new Set(['missingDisplayedTracks', 'queuedTrackFor', 'replaceQueue', 'addDisplayedTracksToQueue']);
+	const handlers = new Set([
+		'missingDisplayedTracks', 'queuedTrackFor', 'replaceQueue',
+		'addDisplayedTracksToQueue', 'clearShareFeedback'
+	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
+	// Queue replacement clears real share state when the current source changes.
+	// Include those dependencies without substituting or weakening the handler.
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek']);
+	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+		(declaration) => stateNames.has(declaration.name.getText(parsed))
+	));
 	const derived = ['orderedItems', 'displayedItems', 'visibleItems', 'bulkMissing', 'bulkDisabled', 'bulkAllQueued'].map((name) => {
 		const node = parsed.statements.find((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 			(declaration) => declaration.name.getText(parsed) === name
@@ -29,7 +39,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		if (!node) throw new Error(`Missing library derived value: ${name}`);
 		return node;
 	});
-	const body = [...functions, ...derived].map((node) => node.getText(parsed)).join('\n');
+	const body = [...functions, ...state, ...derived].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -38,6 +48,8 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
+		queueCurrentTrack, resolveStreamUrl,
+		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}

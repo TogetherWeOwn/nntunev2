@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { afterNavigate } from '$app/navigation';
+	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -122,10 +124,26 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
+	let audioEl: HTMLAudioElement | undefined = $state();
+	let shareStatus = $state('');
+	let shareFallbackUrl: string | null = $state(null);
+	let shareInvalid = $state(false);
+	let shareGeneration = 0;
+	let shareAlive = true;
+	// A link is consumed once per navigation, never replayed by Refresh or
+	// across an account boundary. Deferred seeks belong to one loaded source.
+	let handledShareSearch: string | null = null;
+	let pendingShareSeek: {
+		trackId: string;
+		streamUrl: string;
+		seconds: number;
+		appliedSeconds: number | null;
+	} | null = null;
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
+			resetShareAtAuthBoundary();
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
@@ -148,6 +166,10 @@
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
+			}
+			if (state.loading || state.items.length === 0) {
+				clearShareFeedback();
+				pendingShareSeek = null;
 			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
@@ -189,6 +211,7 @@
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
 			}
+			if (!state.loading) applyShareLink();
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
 			// was typing in. Background refreshes keep the panel mounted, so
@@ -270,8 +293,18 @@
 	function selectTrack(id: string): void {
 		const item = items.find((track) => track.id === id);
 		if (!item) return;
-		// addTrack dedupes, so re-selecting a queued row is a no-op.
-		replaceQueue(addTrack(queue, queuedTrackFor(item)));
+		clearShareFeedback();
+		pendingShareSeek = null;
+		// Preserve append-only row selection; only an inbound link explicitly
+		// selects its target. Stream-less items still carry display fields only.
+		replaceQueue(
+			addTrack(queue, {
+				id: item.id,
+				title: displayTitle(item),
+				artist: displayArtist(item) ?? '',
+				streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl })
+			})
+		);
 	}
 
 	/**
@@ -309,8 +342,134 @@
 	 * track title from lingering across the auth-boundary clears below.
 	 */
 	function replaceQueue(next: QueueState): void {
+		const before = queueCurrentTrack(queue);
+		const after = queueCurrentTrack(next);
+		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			clearShareFeedback();
+			pendingShareSeek = null;
+		}
 		queue = next;
 		queueAnnouncement = '';
+	}
+
+	function clearShareFeedback(): void {
+		shareGeneration += 1;
+		shareStatus = '';
+		shareFallbackUrl = null;
+	}
+
+	function resetShareAtAuthBoundary(): void {
+		clearShareFeedback();
+		pendingShareSeek = null;
+		shareInvalid = false;
+		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
+	}
+
+	async function copyTrackLink(id: string): Promise<void> {
+		clearShareFeedback();
+		const generation = shareGeneration;
+		const item = items.find((track) => track.id === id);
+		if (!item || loading) return;
+		const current = queueCurrentTrack(queue);
+		const seconds =
+			current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
+		let url: string;
+		try {
+			url = `${window.location.origin}/library?${buildShareQuery(id, seconds)}`;
+		} catch {
+			return;
+		}
+		// Match demo copy: feature-detect inside a try (even the getter may
+		// throw), and offer manual copy for missing/denied clipboard access.
+		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
+		let clipboard: ClipboardWriter | undefined;
+		try {
+			const candidate = navigator.clipboard;
+			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
+		} catch {
+			clipboard = undefined;
+		}
+		if (!clipboard) {
+			shareFallbackUrl = url;
+			return;
+		}
+		try {
+			await clipboard.writeText(url);
+		} catch {
+			if (shareAlive && generation === shareGeneration) shareFallbackUrl = url;
+			return;
+		}
+		if (!shareAlive || generation !== shareGeneration) return;
+		const title = displayTitle(item);
+		shareStatus = `Copied link for ${title.length > 70 ? `${title.slice(0, 69)}…` : title}.`;
+	}
+
+	function applyShareLink(): void {
+		// A failed/unavailable load cannot resolve a link against the library.
+		// Leave it unconsumed for Retry; auth resets still fence account changes.
+		if (typeof window === 'undefined' || loading || loadError || libraryUnavailable) return;
+		const search = window.location.search;
+		if (search === handledShareSearch) return;
+		handledShareSearch = search;
+		pendingShareSeek = null;
+		shareInvalid = false;
+		const params = new URLSearchParams(search);
+		if (!params.has('track') && !params.has('t')) return;
+		const target = resolveShareTarget(
+			{ track: params.get('track'), t: params.get('t') },
+			items.map((track) => track.id)
+		);
+		if (
+			!target ||
+			!Number.isFinite(target.seconds) ||
+			params.getAll('track').length !== 1 ||
+			params.getAll('t').length !== 1
+		) {
+			shareInvalid = true;
+			return;
+		}
+		selectTrack(target.trackId);
+		replaceQueue(
+			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))
+		);
+		const source = resolveStreamUrl(queueCurrentTrack(queue));
+		if (!source) return;
+		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		// Try after the keyed audio mounts; metadata/duration events retry if
+		// the browser cannot seek yet and clamp a previously unknown duration.
+		void tick().then(() => applyPendingShareSeek());
+	}
+
+	function applyPendingShareSeek(element = audioEl): void {
+		const pending = pendingShareSeek;
+		const current = queueCurrentTrack(queue);
+		if (!pending || !element || element !== audioEl || !shareAlive) return;
+		if (current?.id !== pending.trackId || resolveStreamUrl(current) !== pending.streamUrl) return;
+		const knownDuration = Number.isFinite(element.duration) && element.duration >= 0;
+		const seconds = knownDuration ? Math.min(pending.seconds, element.duration) : pending.seconds;
+		try {
+			pending.appliedSeconds = seconds;
+			element.currentTime = seconds;
+			if (knownDuration) pendingShareSeek = null;
+		} catch {
+			// Some browsers require metadata first. Keep this source-fenced seek
+			// pending until its own metadata event, never play to force loading.
+		}
+	}
+
+	function handleSeeking(): void {
+		// A listener's own seek wins over a pending late-duration adjustment.
+		if (
+			pendingShareSeek?.appliedSeconds != null &&
+			audioEl?.currentTime !== pendingShareSeek.appliedSeconds
+		) {
+			pendingShareSeek = null;
+		}
+	}
+
+	if (typeof window !== 'undefined') {
+		afterNavigate(() => applyShareLink());
 	}
 
 	function moveQueuedTrack(from: number, to: number): void {
@@ -578,6 +737,7 @@
 		// even before the refresher's state lands; the onStateChange
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
+			resetShareAtAuthBoundary();
 			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
@@ -597,6 +757,7 @@
 	}
 
 	function handleLocalAuthTransition(): void {
+		resetShareAtAuthBoundary();
 		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
@@ -619,6 +780,9 @@
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
+			shareAlive = false;
+			clearShareFeedback();
+			pendingShareSeek = null;
 			refresher.dispose();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
@@ -633,6 +797,28 @@
 
 <main class="nt-wrap">
 	<h1>Library</h1>
+
+	{#if shareInvalid}
+		<p data-testid="library-share-invalid" role="alert">
+			Invalid link — choose a track from your library.
+		</p>
+	{/if}
+	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{shareStatus}</div>
+	{#if shareFallbackUrl}
+		<div class="nt-library-share-fallback">
+			<label for="library-share-url">Track link</label>
+			<input
+				id="library-share-url"
+				data-testid="library-share-fallback"
+				aria-describedby="library-share-instructions"
+				readonly
+				value={shareFallbackUrl}
+			/>
+			<p id="library-share-instructions" data-testid="library-share-instructions">
+				Select the link and press Ctrl+C or Cmd+C to copy it.
+			</p>
+		</div>
+	{/if}
 
 	{#if loading && items.length === 0}
 		<p role="status">Loading your library…</p>
@@ -866,6 +1052,15 @@
 						</button>
 						<button
 							type="button"
+							class="nt-library-copy"
+							data-testid="library-copy-link"
+							aria-label={`Copy link ${displayTitle(track)}`}
+							onclick={() => void copyTrackLink(track.id)}
+						>
+							Copy link
+						</button>
+						<button
+							type="button"
 							class="nt-library-star"
 							aria-pressed={favoriteIds.has(track.id)}
 							aria-label={starLabel(track)}
@@ -939,7 +1134,17 @@
 					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
 				</p>
 			{/if}
-			<audio data-testid="audio-player" controls src={streamUrl}></audio>
+			{#key `${currentTrack?.id}:${streamUrl}`}
+				<audio
+					bind:this={audioEl}
+					data-testid="audio-player"
+					controls
+					src={streamUrl}
+					onloadedmetadata={(event) => applyPendingShareSeek(event.currentTarget)}
+					ondurationchange={(event) => applyPendingShareSeek(event.currentTarget)}
+					onseeking={handleSeeking}
+				></audio>
+			{/key}
 		</section>
 	{/if}
 </main>
@@ -1104,6 +1309,9 @@
 	.nt-library-row {
 		display: block;
 		flex: 1 1 auto;
+		min-width: 0;
+		min-height: 2.75rem;
+		overflow-wrap: anywhere;
 		width: 100%;
 		text-align: left;
 		background: none;
@@ -1113,14 +1321,35 @@
 		font: inherit;
 		color: inherit;
 	}
+	.nt-library-copy,
 	.nt-library-star {
 		flex: 0 0 auto;
+		min-width: 2.75rem;
+		min-height: 2.75rem;
 		background: none;
 		border: 0;
 		padding: 0.5rem 0.75rem;
 		cursor: pointer;
 		font: inherit;
 		color: inherit;
+	}
+	.nt-library-copy {
+		color: var(--nt-accent);
+		white-space: nowrap;
+	}
+	.nt-library-share-fallback {
+		margin-block: var(--nt-space-3);
+	}
+	.nt-library-share-fallback input {
+		display: block;
+		width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
 	}
 	.nt-queued-badge {
 		display: inline-block;
