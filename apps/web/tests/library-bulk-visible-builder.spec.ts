@@ -1,12 +1,12 @@
 import { expect, test } from '@playwright/test';
 
-// Builder-owned integration coverage for bulk addition after Favorites-only
+// Builder-owned integration coverage for bulk addition after favorites/query
 // filtering. The original bulk and favorites acceptance banks stay unchanged.
 const LABEL = 'Add displayed tracks to queue';
 const ITEMS = [
-	{ id: 'visible-z', title: 'Zulu Song' },
-	{ id: 'visible-m', title: 'Middle Song' },
-	{ id: 'visible-a', title: 'Alpha Song' }
+	{ id: 'visible-z', title: 'Zulu Song', artist: 'North Harbor' },
+	{ id: 'visible-m', title: 'Middle Song', artist: 'South Bay' },
+	{ id: 'visible-a', title: 'Alpha Song', artist: 'North Harbor' }
 ];
 
 test.beforeEach(async ({ page, context }) => {
@@ -53,4 +53,31 @@ test('an empty Favorites-only view disables bulk instead of adding hidden librar
 	await expect(page.getByText('All displayed tracks are already in the queue.', { exact: true })).toHaveCount(0);
 	await page.getByRole('combobox', { name: 'Show', exact: true }).selectOption('all');
 	await expect(page.getByRole('button', { name: LABEL, exact: true })).toBeEnabled();
+});
+
+test('bulk composes the query with descending favorites and recomputes availability without auto-adding', async ({ page }) => {
+	for (const title of ['Zulu Song', 'Middle Song', 'Alpha Song']) {
+		await page.getByRole('button', { name: `Star ${title}`, exact: true }).click();
+	}
+	await page.getByRole('combobox', { name: 'Show', exact: true }).selectOption('favorites');
+	await page.getByRole('combobox', { name: 'Order tracks', exact: true }).selectOption('title-desc');
+	const find = page.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
+	await find.fill('north');
+	await expect(page.getByTestId('library-item')).toHaveCount(2);
+	await expect(page.getByTestId('library-item').nth(0)).toHaveAttribute('data-id', 'visible-z');
+	await page.getByRole('button', { name: LABEL, exact: true }).click();
+	await expect.poll(() => page.getByTestId('queue-item').evaluateAll(
+		(rows) => rows.map((row) => row.getAttribute('data-track-id'))
+	)).toEqual(['visible-z', 'visible-a']);
+	await expect(page.getByTestId('queue-announcement')).toHaveText('Added 2 tracks to the queue.');
+	await expect(page.getByRole('button', { name: LABEL, exact: true })).toBeDisabled();
+	await page.getByRole('button', { name: 'Clear search', exact: true }).click();
+	await expect(page.getByTestId('library-item')).toHaveCount(3);
+	await expect(page.getByRole('button', { name: LABEL, exact: true })).toBeEnabled();
+	await expect(page.getByTestId('queue-item')).toHaveCount(2);
+	await find.fill('no matching title or artist');
+	await expect(page.getByTestId('library-item')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: LABEL, exact: true })).toBeDisabled();
+	await expect(page.getByText('All displayed tracks are already in the queue.', { exact: true })).toHaveCount(0);
+	await expect(page.getByTestId('queue-item')).toHaveCount(2);
 });

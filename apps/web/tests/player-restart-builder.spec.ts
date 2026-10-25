@@ -1,10 +1,11 @@
 import { expect, test, type Page } from '@playwright/test';
 
 /**
- * Builder-owned pins around the protected `player-restart.spec.ts` suite:
- * the `0` shortcut restarts from a focused SELECT without also driving
- * the select's native type-ahead (the 0.5x/0.75x speed options start with
- * 0). Same pending-media harness as the acceptance suite.
+ * Builder-owned pins around the protected `player-restart.spec.ts` suite.
+ * KEYSAFETY contract: native select elements own their keys, so `0` from a
+ * focused SELECT must not restart, and the player must not suppress the
+ * select's native type-ahead (the 0.5x/0.75x speed options start with 0).
+ * Same pending-media harness as the acceptance suite.
  */
 
 type MediaControl = {
@@ -69,7 +70,7 @@ async function mediaRate(page: Page): Promise<number> {
 	return page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => el.playbackRate);
 }
 
-test('0 from the focused speed select restarts without changing the speed', async ({
+test('0 from the focused speed select stays native: no restart, type-ahead owns the key', async ({
 	page
 }) => {
 	await openPlayer(page);
@@ -82,9 +83,11 @@ test('0 from the focused speed select restarts without changing the speed', asyn
 
 	await page.keyboard.press('0');
 
-	// The restart lands through the global binding while the select keeps
-	// its value: no type-ahead jump to 0.5x, no persisted rate change.
-	await expect.poll(() => mediaTime(page), { timeout: 5_000 }).toBe(0);
-	await expect(speed).toHaveValue('1');
-	await expect.poll(() => mediaRate(page)).toBe(1);
+	// The restart handler is synchronous, so a missing guard would already
+	// have zeroed the clock: still 45 proves the shortcut stayed inert.
+	// Native type-ahead wins instead: first `0*` option (0.5x) selects and
+	// applies, proving the player suppressed nothing.
+	expect(await mediaTime(page)).toBe(45);
+	await expect(speed).toHaveValue('0.5');
+	await expect.poll(() => mediaRate(page)).toBe(0.5);
 });
