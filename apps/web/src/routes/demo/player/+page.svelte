@@ -523,6 +523,7 @@
 			return;
 		}
 		queue = addTrack(queue, deck);
+		if (status === 'empty') status = 'selected';
 		recentFeedback = `Added ${deck.title} to the queue.`;
 	}
 
@@ -1582,11 +1583,21 @@
 							>
 								Replay {row.title}
 							</button>
-							<button type="button" onclick={() => enqueueRecent(row.trackId)}>
+							<button
+								type="button"
+								aria-label={`Add ${row.title} to queue`}
+								onclick={() => enqueueRecent(row.trackId)}
+							>
 								Add to queue
 							</button>
 						{/if}
-						<button type="button" onclick={() => forgetRecent(row, index)}>
+						<button
+							type="button"
+							aria-label={row.available
+								? `Forget ${row.title} from recent history`
+								: `Forget unavailable entry ${row.trackId} from recent history`}
+							onclick={() => forgetRecent(row, index)}
+						>
 							Forget this entry
 						</button>
 					</li>
@@ -1715,7 +1726,7 @@
 	   screens (the row text still wraps, so nothing widens past the
 	   viewport). */
 	.recent-row button {
-		min-height: 1.75rem;
-		min-width: 1.75rem;
+		min-height: 2.75rem;
+		min-width: 2.75rem;
 	}
 </style>
