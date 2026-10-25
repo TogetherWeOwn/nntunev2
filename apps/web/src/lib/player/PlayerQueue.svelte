@@ -193,7 +193,9 @@
 -->
 <p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
 	{#if current}
-		Now playing: {displayTitle(current)}{#if current.artist} — {current.artist}{/if}
+		<!-- String expression: Svelte trims the leading space of ` — ` after
+			{#if}, rendering an asymmetric `Title— Artist`. -->
+		Now playing: {displayTitle(current)}{#if current.artist}{' — '}{current.artist}{/if}
 	{:else}
 		Queue is empty
 	{/if}
@@ -263,7 +265,7 @@
 			aria-current={index === selectedIndex ? 'true' : undefined}
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
-			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
+			{displayTitle(track)}{#if track.artist}{' — '}{track.artist}{/if}
 			{#if ontogglefavorite}
 				<button
 					type="button"

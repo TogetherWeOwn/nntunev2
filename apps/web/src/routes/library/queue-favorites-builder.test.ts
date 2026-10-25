@@ -23,7 +23,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
-	const handlers = new Set(['selectTrack', 'replaceQueue', 'queueFavorites']);
+	const handlers = new Set(['queuedTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites']);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
 			? handlers.has(statement.name?.text ?? '')
