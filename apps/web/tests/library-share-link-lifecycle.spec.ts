@@ -45,6 +45,58 @@ async function openLink(page: Page, { waitForMetadata = false } = {}) {
 		.not.toBeNull();
 }
 
+for (const navigateAfterFailure of [false, true]) {
+	test(`valid link survives an empty failed load and Retry (${navigateAfterFailure ? 'same-route navigation' : 'initial link'})`, async ({ page }) => {
+		let available = false;
+		await page.route('**/api/library', (route) => available
+			? route.fulfill({ json: ITEMS })
+			: route.fulfill({ status: 500, body: 'Synthetic temporary failure' }));
+		await page.route('**/test-audio/**', () => {});
+		await page.addInitScript(() => {
+			Object.defineProperty(HTMLMediaElement.prototype, 'duration', {
+				configurable: true, get: () => 60
+			});
+			HTMLMediaElement.prototype.play = function () {
+				this.dataset.playCalls = String(Number(this.dataset.playCalls ?? 0) + 1);
+				return Promise.resolve();
+			};
+		});
+		await page.goto(navigateAfterFailure ? '/library' : '/library?track=coral&t=90');
+		await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+		if (navigateAfterFailure) {
+			await page.evaluate(() => {
+				const link = document.createElement('a');
+				link.id = 'recovery-navigation';
+				link.href = '/library?track=coral&t=90';
+				link.textContent = 'Open track link';
+				document.body.append(link);
+			});
+			await page.locator('#recovery-navigation').click();
+			await expect(page).toHaveURL(/\/library\?track=coral&t=90$/);
+		}
+		await expect(page.getByTestId('library-share-invalid')).toHaveCount(0);
+		await expect(page.getByTestId('audio-player')).toHaveCount(0);
+		available = true;
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
+		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+		await expect(page.locator('[data-testid="queue-item"][aria-current="true"]')).toHaveAttribute(
+			'data-track-id', 'coral'
+		);
+		await expect.poll(() => audioTime(page)).toBe(60);
+		await expect(page.getByTestId('library-share-invalid')).toHaveCount(0);
+		await expectNoAutoplay(page);
+		// A successful retry consumes the link once, not on every later refresh.
+		await page.getByTestId('audio-player').evaluate((element: HTMLAudioElement) => {
+			element.currentTime = 12;
+			element.dispatchEvent(new Event('seeking'));
+		});
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled();
+		expect(await audioTime(page)).toBe(12);
+		await expectNoAutoplay(page);
+	});
+}
+
 function audioTime(page: Page) {
 	return page.getByTestId('audio-player').evaluate((element: HTMLAudioElement) => element.currentTime);
 }

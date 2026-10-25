@@ -335,7 +335,9 @@
 	}
 
 	function applyShareLink(): void {
-		if (typeof window === 'undefined' || loading) return;
+		// A failed/unavailable load cannot resolve a link against the library.
+		// Leave it unconsumed for Retry; auth resets still fence account changes.
+		if (typeof window === 'undefined' || loading || loadError || libraryUnavailable) return;
 		const search = window.location.search;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
