@@ -41,15 +41,22 @@ export function actionForKey(key: string): ShortcutAction | null {
 }
 
 /**
- * True while the key event targets a typing surface (input, textarea or
- * contenteditable region). `isContentEditable` is inherited, so targets
- * nested inside an editable region are covered too.
+ * True while the key event targets a typing surface (input, textarea,
+ * select/option or contenteditable region). `isContentEditable` is inherited,
+ * so targets nested inside an editable region are covered too. Native
+ * selectors keep type-ahead/Space/arrow ownership; ordinary buttons, audio
+ * and body still permit shortcuts.
  */
 export function isTypingTarget(target: unknown): boolean {
 	if (typeof target !== 'object' || target === null) return false;
 	const candidate = target as { isContentEditable?: unknown; tagName?: unknown };
 	if (candidate.isContentEditable === true) return true;
-	return candidate.tagName === 'INPUT' || candidate.tagName === 'TEXTAREA';
+	return (
+		candidate.tagName === 'INPUT' ||
+		candidate.tagName === 'TEXTAREA' ||
+		candidate.tagName === 'SELECT' ||
+		candidate.tagName === 'OPTION'
+	);
 }
 
 /**
