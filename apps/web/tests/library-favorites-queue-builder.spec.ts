@@ -27,6 +27,34 @@ test('ghost-only stored favorites show the empty shelf without a bulk queue acti
 	await expect(page.getByTestId('favorites-section').getByRole('button', { name: 'Queue favorites' })).toHaveCount(0);
 });
 
+test('bulk queue activations never write to browser storage', async ({ page }) => {
+	await seedLibrary(page);
+	await page.getByTestId('library-item').getByRole('button', { name: 'Star Builder Song' }).click();
+
+	// Start after fixture writes; keep the real storage methods so even
+	// transient or idempotent persistence during queueing is observable.
+	await page.evaluate(() => {
+		const calls: string[] = [];
+		(window as unknown as { storageCalls: string[] }).storageCalls = calls;
+		for (const method of ['setItem', 'removeItem', 'clear'] as const) {
+			const original = Storage.prototype[method];
+			Storage.prototype[method] = function (this: Storage, ...args: string[]) {
+				calls.push(`${this === window.localStorage ? 'local' : 'session'}:${method}`);
+				return Reflect.apply(original, this, args);
+			};
+		}
+	});
+
+	const action = page.getByRole('button', { name: 'Queue favorites', exact: true });
+	await action.click();
+	await expect(page.getByTestId('queue-announcement')).toContainText(/queued 1.*0 already queued/i);
+	await action.click();
+	await expect(page.getByTestId('queue-announcement')).toContainText(/queued 0.*1 already queued/i);
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	const calls = await page.evaluate(() => (window as unknown as { storageCalls: string[] }).storageCalls);
+	expect(calls).toEqual([]);
+});
+
 test('the bulk queue outcome cannot survive an account-boundary retry', async ({ page }) => {
 	await seedLibrary(page);
 	await page.getByTestId('library-item').getByRole('button', { name: 'Star Builder Song' }).click();
