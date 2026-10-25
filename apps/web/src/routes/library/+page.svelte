@@ -280,6 +280,13 @@
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
+	function clearFind(): void {
+		findQuery = '';
+		if (typeof document !== 'undefined') {
+			document.getElementById('library-find')?.focus({ preventScroll: true });
+		}
+	}
+
 	function toggleSelectedId(id: string): void {
 		selectedIds = toggleSelected(selectedIds, id);
 	}
@@ -438,7 +445,7 @@
 					Showing {visibleItems.length} of {orderedItems.length}
 				</p>
 				{#if findQuery !== ''}
-					<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
+					<button class="nt-button" type="button" onclick={clearFind}>
 						Clear search
 					</button>
 				{/if}
@@ -476,7 +483,7 @@
 				</div>
 				{#if visibleItems.length === 0}
 					<p>No matches in your loaded tracks.</p>
-					<button class="nt-button" type="button" onclick={() => (findQuery = '')}>
+					<button class="nt-button" type="button" onclick={clearFind}>
 						Clear search
 					</button>
 				{:else}
