@@ -149,6 +149,15 @@ export function moveTrack(state: QueueState, from: number, to: number): QueueSta
 	};
 }
 
+/** Jump to either end without changing the current track or allocating on a no-op. */
+export function moveToTop(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, 0);
+}
+
+export function moveToBottom(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, state.tracks.length - 1);
+}
+
 /** One-shot Fisher–Yates over the upcoming suffix; prefix/current stay fixed. */
 export function shuffleUpcoming(state: QueueState, random: () => number = Math.random): QueueState {
 	const start = state.currentIndex + 1;

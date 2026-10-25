@@ -61,6 +61,8 @@
 		DEMO_TRACKS,
 		formatQueueText,
 		formatQueueM3U,
+		moveToBottom,
+		moveToTop,
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
@@ -102,6 +104,11 @@
 	let lastBytes = $state(0);
 
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
+	// A move describes one queue snapshot; other edits invalidate its position.
+	let queueMoveAnnouncement = $state.raw<{ queue: QueueState; text: string } | null>(null);
+	let queueAnnouncement = $derived(
+		queueMoveAnnouncement?.queue === queue ? queueMoveAnnouncement.text : ''
+	);
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
@@ -135,7 +142,6 @@
 	 * filtering hides rows only and never touches order, selection or
 	 * playback. Matching is the shared PlayerQueue contract.
 	 */
-	let queueAnnouncement = $state('');
 	let demoFilterQuery = $state('');
 	let demoFilterInput: HTMLInputElement | undefined = $state();
 	let visibleQueueEntries = $derived(
@@ -900,6 +906,23 @@
 		demoFilterInput?.focus();
 	}
 
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (!moved) return;
+		const reordered =
+			to === 0
+				? moveToTop(queue, from)
+				: to === queue.tracks.length - 1
+					? moveToBottom(queue, from)
+					: moveTrack(queue, from, to);
+		if (reordered === queue) return;
+		queue = reordered;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${moved.title} moved to ${to + 1} of ${queue.tracks.length}`
+		};
+	}
+
 	function selectAt(index: number): void {
 		const next = selectTrack(queue, index);
 		const nextId = next.tracks[next.currentIndex]?.id;
@@ -927,7 +950,10 @@
 		// Current/already-next requests leave even the previous announcement alone.
 		if (reordered === queue || !track) return;
 		queue = reordered;
-		queueAnnouncement = `${track.title} moved to position ${reordered.currentIndex + 2} of ${reordered.tracks.length}`;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${track.title} moved to position ${reordered.currentIndex + 2} of ${reordered.tracks.length}`
+		};
 		// A keyed row can move in the DOM without keeping browser focus.
 		await tick();
 		control.focus({ preventScroll: true });
@@ -1182,6 +1208,15 @@
 		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
+	function shuffleQueueUpcoming(): void {
+		if (!radio) queue = shuffleUpcoming(queue);
+	}
+
+	function cycleRepeat(): void {
+		if (radio) return;
+		repeat = repeat === 'off' ? 'one' : repeat === 'one' ? 'queue' : 'off';
+	}
+
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
 	// surfaces, open modals and modified chords. Cancelled or composing keys
@@ -1202,6 +1237,13 @@
 			return;
 		}
 		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		// The new queue bindings yield to IME and native select editing without
+		// changing existing transport defaults (notably 0 on the speed select).
+		if (
+			(action === 'shuffle-upcoming' || action === 'cycle-repeat') &&
+			(event.isComposing || event.keyCode === 229 ||
+				(event.target instanceof Element && event.target.closest('select')))
+		) return;
 		event.preventDefault();
 		switch (action) {
 			case 'toggle-play':
@@ -1227,6 +1269,12 @@
 				break;
 			case 'toggle-mute':
 				toggleMuteShortcut();
+				break;
+			case 'shuffle-upcoming':
+				shuffleQueueUpcoming();
+				break;
+			case 'cycle-repeat':
+				cycleRepeat();
 				break;
 			case 'open-shortcuts':
 				openShortcuts();
@@ -1844,9 +1892,7 @@
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
-			onshuffle={() => {
-				if (!radio) queue = shuffleUpcoming(queue);
-			}}
+			onshuffle={shuffleQueueUpcoming}
 		/>
 		<!--
 			Queue-only filter: transient presentation state. It hides rows but
@@ -1882,7 +1928,7 @@
 						data-testid="queue-move-up-{track.id}"
 						aria-label="Move {track.title} up"
 						disabled={index === 0}
-						onclick={() => (queue = moveTrack(queue, index, index - 1))}
+						onclick={() => moveQueuedTrack(index, index - 1)}
 					>
 						Up
 					</button>
@@ -1891,9 +1937,25 @@
 						data-testid="queue-move-down-{track.id}"
 						aria-label="Move {track.title} down"
 						disabled={index === queue.tracks.length - 1}
-						onclick={() => (queue = moveTrack(queue, index, index + 1))}
+						onclick={() => moveQueuedTrack(index, index + 1)}
 					>
 						Down
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to top"
+						disabled={index === 0}
+						onclick={() => moveQueuedTrack(index, 0)}
+					>
+						Move to top
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to bottom"
+						disabled={index === queue.tracks.length - 1}
+						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
+					>
+						Move to bottom
 					</button>
 					<button
 						type="button"
