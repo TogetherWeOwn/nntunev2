@@ -23,12 +23,10 @@
 		 */
 		onkeepcurrentandupcoming?: () => void;
 		onclearupcoming?: () => void;
-		/**
-		 * Polite move announcements, owned by the host: the host sets the
-		 * moved track and its new position after each move; the panel only
-		 * renders the region.
-		 */
+		/** Polite queue-action announcements, owned by the host; the panel only renders the region. */
 		announcement?: string;
+		/** Real action identity: equal outcome text must still update the live region. */
+		announcementVersion?: number;
 		/**
 		 * Transient queue-only filter text. Bindable so a host that
 		 * unmounts/remounts the panel (library refresh swaps branches)
@@ -51,6 +49,7 @@
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
+		announcementVersion = 0,
 		filterQuery = $bindable('')
 	}: Props = $props();
 
@@ -290,7 +289,8 @@
 	{/if}
 </p>
 
-<p data-testid="queue-announcement" role="status">{announcement}</p>
+<!-- Keep the live region mounted; refresh only its content for equal-title actions. -->
+<p data-testid="queue-announcement" role="status">{#key announcementVersion}{announcement}{/key}</p>
 
 <button
 	type="button"

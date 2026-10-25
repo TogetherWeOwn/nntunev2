@@ -52,6 +52,7 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let queueAnnouncement = $state('');
+	let queueAnnouncementVersion = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -194,13 +195,13 @@
 		const removed = queue.tracks[index];
 		if (removed === undefined) return;
 		const next = removeTrack(queue, index);
-		// Announce real removals only: a no-op removal must not chatter the
-		// live region. The single assignment replaces any previous move
-		// message instead of replaying it.
+		// Announce real removals only, including distinct tracks with equal
+		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
 		queue = next;
 		queueAnnouncement = `${title} removed from the queue.`;
+		queueAnnouncementVersion += 1;
 	}
 
 	function clearQueuedTracks(): void {
@@ -210,6 +211,7 @@
 		if (next === queue) return;
 		queue = next;
 		queueAnnouncement = 'Queue cleared.';
+		queueAnnouncementVersion += 1;
 	}
 
 	function trimPreviousTracks(): void {
@@ -413,6 +415,7 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
+				announcementVersion={queueAnnouncementVersion}
 				bind:filterQuery={queueFilterQuery}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
