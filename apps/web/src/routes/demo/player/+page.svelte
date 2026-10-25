@@ -948,6 +948,41 @@
 		shortcutsOpener?.focus();
 	}
 
+	// Explicit Tab wrap for the shortcuts dialog. Native showModal keeps the
+	// background inert, but Chromium does not cycle Tab past the dialog's
+	// last/first control: focus falls back to body instead of wrapping,
+	// which KEYSAFE-B11 pins as a failure (same workaround as PaywallModal
+	// wrapTab, which documents the stutter). Cycling the rendered controls
+	// here restores the documented trap in every browser. Scoped to this
+	// dialog only: page tab order and modified chords pass through, and an
+	// already-handled Tab keeps its prior ownership.
+	function trapShortcutsTab(event: KeyboardEvent): void {
+		if (event.key !== 'Tab') return;
+		if (event.defaultPrevented) return;
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const root = shortcutsDialogEl;
+		if (!root) return;
+		const controls = [...root.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])'
+		)].filter((control) => control.getClientRects().length > 0);
+		if (controls.length === 0) {
+			event.preventDefault();
+			return;
+		}
+		const first = controls[0];
+		const last = controls[controls.length - 1];
+		const active = document.activeElement;
+		if (event.shiftKey) {
+			if (active === first || !root.contains(active)) {
+				event.preventDefault();
+				last.focus();
+			}
+		} else if (active === last || !root.contains(active)) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
+
 	function togglePlayShortcut(): void {
 		if (status === 'playing' || status === 'loading') pauseCurrent();
 		else {
@@ -980,14 +1015,21 @@
 		sound = actual;
 	}
 
-	// Usable-media gate shared by the jump and restart controls: the
-	// current element is read at activation and unusable media (no current
-	// track, non-finite or negative time, non-finite duration) refuses
-	// quietly instead of throwing through the UI or reporting a seek that
-	// never happened.
+	// Usable-media gate shared by the jump, restart and keyboard seeks:
+	// the current element is read at activation and unusable media (no
+	// current track, stale source, non-finite or negative time, non-finite
+	// or non-positive duration) refuses quietly instead of throwing through
+	// the UI or reporting a seek that never happened.
 	function seekCoordinates(): { element: HTMLAudioElement } | null {
 		const el = audioEl;
 		if (!el || !current) return null;
+		try {
+			// Same-task navigation changes the queue before the keyed element
+			// swaps: a src mismatch is the previous track, never seek it.
+			if (el.getAttribute('src') !== current.streamUrl) return null;
+		} catch {
+			return null;
+		}
 		let position = Number.NaN;
 		let bound = Number.NaN;
 		try {
@@ -996,7 +1038,13 @@
 		} catch {
 			// An unreadable element is unusable media: refuse below.
 		}
-		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return null;
+		if (
+			!Number.isFinite(position) ||
+			position < 0 ||
+			!Number.isFinite(bound) ||
+			bound <= 0
+		)
+			return null;
 		return { element: el };
 	}
 
@@ -1048,12 +1096,17 @@
 
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
-	// surfaces, open modals and modified chords. Handled bindings suppress
-	// their keydown default: the digit binding would otherwise also drive
-	// native select type-ahead (the 0.5x/0.75x speed options start with
-	// 0), so one keystroke would restart the track AND halve the speed.
+	// surfaces, open modals and modified chords. Cancelled or composing keys
+	// keep native ownership: no preventDefault and no player mutation.
+	// Handled bindings suppress their keydown default: the digit binding
+	// would otherwise also drive native select type-ahead (the 0.5x/0.75x
+	// speed options start with 0), so one keystroke would restart the track
+	// AND halve the speed.
 	function handleGlobalKeydown(event: KeyboardEvent): void {
 		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		// Prior ownership wins: a cancelled event was already handled, and an
+		// isComposing or legacy 229 key belongs to the IME, not the player.
+		if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
 		const action = actionForKey(event.key);
 		if (!action) return;
 		if (action === 'close-shortcuts') {
@@ -1075,10 +1128,11 @@
 				userPrevious();
 				break;
 			case 'seek-back':
-				seekShortcut(-SEEK_SECONDS);
+				// Same validated/clamped gate as the visible jump controls.
+				seekButton(-SEEK_SECONDS);
 				break;
 			case 'seek-forward':
-				seekShortcut(SEEK_SECONDS);
+				seekButton(SEEK_SECONDS);
 				break;
 			case 'restart-track':
 				restartCurrent();
@@ -1593,6 +1647,7 @@
 			bind:this={shortcutsDialogEl}
 			data-testid="shortcuts-dialog"
 			aria-label="Keyboard shortcuts"
+			onkeydown={trapShortcutsTab}
 			oncancel={(event) => {
 				event.preventDefault();
 				closeShortcuts();

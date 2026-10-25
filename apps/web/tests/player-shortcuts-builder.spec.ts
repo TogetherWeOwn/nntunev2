@@ -143,6 +143,47 @@ for (const opener of ['?', 'button'] as const) {
 	});
 }
 
+for (const shiftKey of [false, true]) {
+	for (const [ownership, seed] of [
+		['cancelled', { cancelled: true }],
+		['ctrl', { ctrlKey: true }],
+		['alt', { altKey: true }],
+		['meta', { metaKey: true }]
+	] as const) {
+		test(`KEYSAFE-TAB-B01 ${shiftKey ? 'reverse' : 'forward'} ${ownership} Tab stays native in help`, async ({ page }) => {
+			await page.route('**/*', (route) => {
+				const url = new URL(route.request().url());
+				return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+					? route.continue() : route.abort();
+			});
+			await openPlayer(page);
+			const opener = page.getByTestId('shortcuts-button');
+			await opener.click();
+			const close = page.getByTestId('shortcuts-close');
+			await expect(close).toBeFocused();
+			// Synthetic chords avoid browser accelerators. Count only suppression
+			// after prior cancellation, just like the protected dispatch helper.
+			const result = await close.evaluate((node, input) => {
+				const event = new KeyboardEvent('keydown', {
+					key: 'Tab', bubbles: true, cancelable: true, ...input
+				});
+				if ('cancelled' in input && input.cancelled) event.preventDefault();
+				let preventCalls = 0;
+				const original = event.preventDefault.bind(event);
+				event.preventDefault = () => { preventCalls += 1; original(); };
+				node.dispatchEvent(event);
+				return { prevented: event.defaultPrevented, preventCalls };
+			}, { shiftKey, ...seed });
+			expect(result).toEqual({ prevented: ownership === 'cancelled', preventCalls: 0 });
+			await expect(close).toBeFocused();
+			await expect(page.getByTestId('shortcuts-dialog')).toBeVisible();
+			await page.keyboard.press('Escape');
+			await expect(page.getByTestId('shortcuts-dialog')).toHaveCount(0);
+			await expect(opener).toBeFocused();
+		});
+	}
+}
+
 test('seek clamps at the media bounds instead of overshooting', async ({ page }) => {
 	await page.addInitScript(() => {
 		sessionStorage.removeItem('nntune:demo-queue:v1');
