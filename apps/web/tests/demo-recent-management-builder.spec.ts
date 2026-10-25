@@ -72,7 +72,9 @@ async function open(page: Page, baseURL: string, options: OpenOptions = {}): Pro
 			return route.abort();
 		}
 		if (target.pathname === '/api/demo/audio') return;
-		if (target.pathname.startsWith('/api/')) {
+		// Page-embedded image GETs (demo artwork placeholders) are static assets, not
+		// backend calls; only mutating or xhr/fetch requests count, as in the sibling spec.
+		if (request.method() !== 'GET' || ['xhr', 'fetch'].includes(request.resourceType())) {
 			calls.push(`${request.method()} ${target.pathname}`);
 			return route.abort();
 		}
