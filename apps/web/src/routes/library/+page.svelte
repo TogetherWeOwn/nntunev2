@@ -68,6 +68,7 @@
 	 * selectFavoriteItems projection; the queue never sees it.
 	 */
 	let view: 'all' | 'favorites' = $state('all');
+	let viewSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
 	let shelfSection: HTMLElement | null = $state(null);
@@ -117,7 +118,12 @@
 			// panel (alert branch); the route-owned filter text must go with
 			// it so the next account never inherits the previous query.
 			// Successful same-account refreshes keep items and keep the query.
-			if (state.loadError && state.items.length === 0) queueFilterQuery = '';
+			if (state.loadError && state.items.length === 0) {
+				queueFilterQuery = '';
+				view = 'all';
+				confirmClear = false;
+				managementFeedback = '';
+			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -275,6 +281,18 @@
 			: [...favorites, id];
 		favorites = next;
 		saveFavorites(browserStorage('session'), browserStorage('local'), next);
+		// Favorites-only unmounts an unstarred row, including its focused button.
+		// All-tracks keeps that button mounted and must leave focus alone.
+		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
+	}
+
+	function focusLibraryView(): void {
+		void tick().then(() => viewSelect?.focus({ preventScroll: true }));
+	}
+
+	function showAllTracks(): void {
+		view = 'all';
+		focusLibraryView();
 	}
 
 	function starLabel(track: LibraryItem): string {
@@ -289,13 +307,15 @@
 	 * surviving shelf unstar control, or the shelf heading when none remains.
 	 */
 	function unstarFromShelf(id: string): void {
+		const removedIndex = favoriteTracks.findIndex((item) => item.id === id);
 		const track = items.find((item) => item.id === id);
 		const title = track ? displayTitle(track) : 'track';
 		favorites = favorites.filter((favorite) => favorite !== id);
 		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		managementFeedback = `Removed ${title} from favorites.`;
 		void tick().then(() => {
-			const next = shelfSection?.querySelector<HTMLButtonElement>('[data-shelf-unstar]');
+			const controls = shelfSection?.querySelectorAll<HTMLButtonElement>('[data-shelf-unstar]');
+			const next = controls?.[Math.max(0, Math.min(removedIndex, controls.length - 1))];
 			if (next) next.focus({ preventScroll: true });
 			else shelfHeading?.focus({ preventScroll: true });
 		});
@@ -529,7 +549,7 @@
 			</div>
 			<div class="nt-library-view">
 				<label for="library-view">Show</label>
-				<select id="library-view" bind:value={view}>
+				<select id="library-view" bind:this={viewSelect} bind:value={view}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
 				</select>
@@ -541,7 +561,7 @@
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
 					No favorites in this list.
-					<button type="button" onclick={() => (view = 'all')}>Show all tracks</button>
+					<button type="button" onclick={showAllTracks}>Show all tracks</button>
 				</p>
 			{/if}
 			<div class="nt-selection-bar">
