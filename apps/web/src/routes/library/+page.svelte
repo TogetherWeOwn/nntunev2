@@ -15,6 +15,7 @@
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
+	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import {
 		displayArtist,
@@ -71,6 +72,7 @@
 	let queue: QueueState = $state(createQueue([]));
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
+	let favoritesAnnouncement = $state('');
 	/**
 	 * Transient Favorites-only view over the loaded list. Plain component
 	 * state: never persisted, never fetched, reset on reload (fresh state)
@@ -126,6 +128,7 @@
 		invalidateLibraryCache: () => {
 			favorites = [];
 			favoritesInitialized = false;
+			favoritesAnnouncement = '';
 			invalidateLibraryCache();
 		},
 		onStateChange: (state) => {
@@ -391,6 +394,7 @@
 			? favorites.filter((favorite) => favorite !== id)
 			: [...favorites, id];
 		favorites = next;
+		favoritesAnnouncement = '';
 		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
@@ -419,6 +423,59 @@
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
+	/**
+	 * Move a visible favorite one slot up or down within the complete
+	 * stored order. No-ops (boundary activation, stale id) return the same
+	 * array and change nothing: no save, no announcement, no focus shift.
+	 * Real moves persist the full list through the existing seam, announce
+	 * the new visible position politely, and keep keyboard focus on the
+	 * moved track's controls. Never touches the queue, the library view,
+	 * stars, refresh or the network.
+	 */
+	async function moveFavorite(
+		id: string,
+		direction: FavoriteMoveDirection,
+		event: Event
+	): Promise<void> {
+		const button = event.currentTarget;
+		const visibleIds = favoriteTracks.map((track) => track.id);
+		const next = moveFavoriteId(favorites, visibleIds, id, direction);
+		if (next === favorites) return;
+		favorites = [...next];
+		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
+		const visible = new Set(visibleIds);
+		const position = next.filter((storedId) => visible.has(storedId)).indexOf(id) + 1;
+		const track = items.find((candidate) => candidate.id === id);
+		favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position} of ${visibleIds.length}`;
+		await tick();
+		// The keyed list preserves nodes, so an enabled button keeps focus
+		// on its own; a move onto a boundary disables the activated button
+		// and drops focus to the body, so land on the surviving move
+		// control of the same track instead. Runs only on explicit
+		// activation, so background refreshes cannot steal focus.
+		if (button instanceof HTMLButtonElement && typeof document !== 'undefined') {
+			if (!button.disabled && button.isConnected) {
+				button.focus({ preventScroll: true });
+			} else {
+				// Closest-ancestor lookup, never id interpolation: track ids
+				// are opaque server strings, and any quoting scheme risks an
+				// invalid selector (a trailing backslash throws inside this
+				// voided handler). The activated button is always inside its
+				// own favorite item.
+				const item = button.closest('[data-testid="favorite-item"]');
+				const fallback =
+					item?.querySelector<HTMLButtonElement>(
+						'button[aria-label^="Move favorite"]:not([disabled])'
+					) ?? item?.querySelector<HTMLButtonElement>('button:not([disabled])');
+				fallback?.focus({ preventScroll: true });
+			}
+		}
+	}
+
+	function moveFavoriteLabel(track: LibraryItem, direction: FavoriteMoveDirection): string {
+		return `Move favorite ${displayTitle(track)} ${direction}`;
+	}
+
 	function clearFind(): void {
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -437,6 +494,7 @@
 		const track = items.find((item) => item.id === id);
 		const title = track ? displayTitle(track) : 'track';
 		favorites = favorites.filter((favorite) => favorite !== id);
+		favoritesAnnouncement = '';
 		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		managementFeedback = `Removed ${title} from favorites.`;
 		void tick().then(() => {
@@ -465,6 +523,7 @@
 	 */
 	function confirmClearFavorites(): void {
 		favorites = [];
+		favoritesAnnouncement = '';
 		saveFavorites(browserStorage('session'), browserStorage('local'), []);
 		confirmClear = false;
 		managementFeedback = 'Cleared local favorites.';
@@ -526,6 +585,7 @@
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
+			favoritesAnnouncement = '';
 			queueFilterQuery = '';
 			findQuery = '';
 			view = 'all';
@@ -542,6 +602,7 @@
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;
+		favoritesAnnouncement = '';
 		queueFilterQuery = '';
 		findQuery = '';
 		view = 'all';
@@ -598,6 +659,7 @@
 
 		<section data-testid="favorites-section" aria-label="Favorites" bind:this={shelfSection}>
 			<h2 tabindex="-1" bind:this={shelfHeading}>Favorites</h2>
+			<p data-testid="favorites-announcement" aria-live="polite">{favoritesAnnouncement}</p>
 			{#if managementFeedback}
 				<p role="status">{managementFeedback}</p>
 			{/if}
@@ -608,17 +670,35 @@
 			{:else}
 				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
 				<ul>
-					{#each favoriteTracks as track (track.id)}
-						<li
-							class="nt-shelf-item"
-							data-testid="favorite-item"
-							data-id={track.id}
-						>
-							<button type="button" onclick={() => selectTrack(track.id)}>
+					{#each favoriteTracks as track, index (track.id)}
+						<li class="nt-favorite-item" data-testid="favorite-item" data-id={track.id}>
+							<button
+								type="button"
+								class="nt-favorite-row"
+								onclick={() => selectTrack(track.id)}
+							>
 								{displayTitle(track)}
 								{#if displayArtist(track)}
 									<span> — {displayArtist(track)}</span>
 								{/if}
+							</button>
+							<button
+								type="button"
+								class="nt-favorite-move"
+								aria-label={moveFavoriteLabel(track, 'up')}
+								disabled={index === 0}
+								onclick={(event) => void moveFavorite(track.id, 'up', event)}
+							>
+								Up
+							</button>
+							<button
+								type="button"
+								class="nt-favorite-move"
+								aria-label={moveFavoriteLabel(track, 'down')}
+								disabled={index === favoriteTracks.length - 1}
+								onclick={(event) => void moveFavorite(track.id, 'down', event)}
+							>
+								Down
 							</button>
 							<button
 								type="button"
@@ -944,11 +1024,36 @@
 		border: 1px solid var(--nt-border);
 		border-radius: var(--nt-radius);
 	}
-	.nt-shelf-item {
+	.nt-favorite-item {
 		display: flex;
 		align-items: center;
 		flex-wrap: wrap;
-		gap: var(--nt-space-2) var(--nt-space-3);
+		padding: 0;
+	}
+	.nt-favorite-row {
+		display: block;
+		flex: 1 1 auto;
+		min-width: 0;
+		text-align: left;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.nt-favorite-move {
+		flex: 0 0 auto;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.5rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.nt-favorite-move:disabled {
+		cursor: default;
+		opacity: 0.4;
 	}
 	.nt-shelf-unstar {
 		flex: 0 0 auto;
