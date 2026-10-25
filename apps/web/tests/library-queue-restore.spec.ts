@@ -352,7 +352,8 @@ test('[LIBQR-B12] restore fetches once, renders no audio, and preserves favorite
 	expect(fetchCount).toBe(1);
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
 
-	await page.getByRole('button', { name: 'Star Mike Song' }).click();
+	const libraryList = page.getByTestId('library-list');
+	await libraryList.getByRole('button', { name: 'Star Mike Song' }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 
 	await page.reload();
@@ -360,6 +361,6 @@ test('[LIBQR-B12] restore fetches once, renders no audio, and preserves favorite
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expect.poll(async () => queueOrder(page)).toEqual(['row-zulu', 'row-mike']);
 	expect(fetchCount).toBe(2);
-	await expect(page.getByRole('button', { name: 'Unstar Mike Song' })).toBeVisible();
+	await expect(libraryList.getByRole('button', { name: 'Unstar Mike Song' })).toBeVisible();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 });

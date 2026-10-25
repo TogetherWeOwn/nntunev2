@@ -1,11 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ts from 'typescript';
+import { tick } from 'svelte';
+import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { filterLibraryItems } from '#lib/library/filter.js';
+import { moveFavoriteId } from '#lib/library/favorites-order.js';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import {
 	loadFavorites,
 	saveFavorites,
-	clearFavoritesAtAuthBoundary
+	clearFavoritesAtAuthBoundary,
+	selectFavoriteItems
 } from '#lib/library/favorites.js';
 import {
 	LIBRARY_AUTH_CONTEXT_KEY,
@@ -14,12 +19,22 @@ import {
 	browserStorage,
 	clearSnapshot,
 	invalidateLibraryCache,
+	staleLabel,
 	type LibraryItem,
 	type SnapshotStorage
 } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { createSelection, pruneSelection } from '#lib/library/selection.js';
+import {
+	appendResultLabel,
+	appendSelection,
+	clearSelection,
+	createSelection,
+	hiddenSelectedCount,
+	pruneSelection,
+	selectionCountLabel,
+	toggleSelected
+} from '#lib/library/selection.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 
 /**
@@ -56,21 +71,22 @@ import { clearSignedInEmail } from '#lib/signed-in-email.js';
  * the REAL queue functions, the REAL refresher (fetch mocked, never
  * network), and REAL storage/cache/favorites helpers against memory
  * storage. Only presentation bindings (`$state`/`$derived` as identity),
- * `onMount`, and `resolveStreamUrl` are substituted. RED here means the
+ * browser lifecycle registration (`onMount`/`afterNavigate`), and
+ * `resolveStreamUrl` are substituted. Location has an empty library query;
+ * presentation, selection and share helpers remain real. RED here means the
  * persist/restore behavior is missing — never a missing import.
  *
- * Implementation-surface contract (the harness strips page imports, so the
- * page script may only reference the bound names below plus the
- * `LIBRARY_QUEUE_KEY` literal): persist via `serializeQueue` +
- * `browserStorage('session')`, restore inline in `onStateChange` after a
- * successful load with `createQueue` + JSON validation, purge via
- * `browserStorage('session')` removal. Persist INLINE in the two queue
- * writers (`replaceQueue`, `moveQueuedTrack`) — no `$effect`-based persist
- * (the harness has no reactivity) — and keep the page-script function
- * names (`refresh`, `selectTrack`, `moveQueuedTrack`,
- * `handleAuthTransition`, `handleLocalAuthTransition`) stable. A build
- * that needs a new page-script import must send this file back to the
- * acceptance lane for a harness update instead of editing it.
+ * Implementation surface: the harness strips imports and supplies the real
+ * dependencies below. Queue bootstrap/persist helpers declared in the page
+ * stay real, as do the rendered remove/clear handlers. Persist synchronously
+ * via `serializeQueue` + `browserStorage('session')`, restore after a
+ * successful load with `createQueue` + JSON validation, and purge via
+ * `browserStorage('session')` removal. No `$effect`-based persist (the harness
+ * has no reactivity). Keep the page-script entry points (`refresh`,
+ * `selectTrack`, `moveQueuedTrack`, `removeQueuedTrack`, `clearQueuedTracks`,
+ * `handleAuthTransition`, `handleLocalAuthTransition`) stable. A build that
+ * needs a new page-script import must send this file back to the acceptance
+ * lane for a harness update instead of editing it.
  *
  * RED-vs-guard split (verified on the pre-implementation base): the
  * persist (U01-U05), positive-restore (U06-U08), gated-restore (U15, U16),
@@ -192,11 +208,17 @@ function pageHarness(): PageHarness {
 	}).outputText;
 	const session = memoryStorage();
 	const local = memoryStorage();
-	vi.stubGlobal('window', { sessionStorage: session, localStorage: local });
+	vi.stubGlobal('window', {
+		sessionStorage: session,
+		localStorage: local,
+		location: new URL('https://nntune.test/library')
+	});
 	const bindings = {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
+		clearUpcoming: queueFunctions.clearUpcoming,
 		createQueue: queueFunctions.createQueue,
+		keepCurrentAndUpcoming: queueFunctions.keepCurrentAndUpcoming,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
 		playNext: queueFunctions.playNext,
@@ -209,21 +231,35 @@ function pageHarness(): PageHarness {
 		loadFavorites,
 		saveFavorites,
 		clearFavoritesAtAuthBoundary,
+		selectFavoriteItems,
+		moveFavoriteId,
 		createLibraryRefresher,
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		filterLibraryItems,
+		appendResultLabel,
+		appendSelection,
+		clearSelection,
 		createSelection,
+		hiddenSelectedCount,
 		pruneSelection,
+		selectionCountLabel,
+		toggleSelected,
+		buildShareQuery,
+		resolveShareTarget,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		LIBRARY_QUEUE_KEY: QUEUE_KEY,
 		subscribeLocalAuthTransition,
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
+		staleLabel,
 		clearSignedInEmail,
 		resolveStreamUrl: () => null,
 		onMount: () => {},
+		afterNavigate: () => {},
+		tick,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
@@ -232,8 +268,8 @@ function pageHarness(): PageHarness {
 			refresh, selectTrack, moveQueuedTrack,
 			nextUi: () => replaceQueue(nextTrack(queue)),
 			playNextUi: (index) => replaceQueue(playNext(queue, index)),
-			removeUi: (index) => replaceQueue(removeTrack(queue, index)),
-			clearUi: () => replaceQueue(clearQueue(queue)),
+			removeUi: removeQueuedTrack,
+			clearUi: clearQueuedTracks,
 			handleAuthTransition, handleLocalAuthTransition,
 			read: () => ({
 				queue, items, loading, loadError, libraryUnavailable,

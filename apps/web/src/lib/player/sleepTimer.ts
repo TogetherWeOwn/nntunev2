@@ -16,11 +16,26 @@ export interface SleepTimerDeps {
 	onFire: () => void;
 }
 
+/** Read-only remaining-state snapshot; see `SleepTimer.progress`. */
+export type SleepTimerProgress =
+	| { kind: 'duration'; remainingMs: number }
+	| { kind: 'end-of-track' }
+	| { kind: 'stop-after-tracks'; remainingTracks: number };
+
 export interface SleepTimer {
 	/** The armed mode, or null when disarmed. */
 	readonly mode: SleepTimerMode | null;
 	/** Track ends observed since arming (duration timers never count). */
 	readonly tracksElapsed: number;
+	/**
+	 * Detached read-only snapshot of the remaining sleep state, derived
+	 * from the existing arming clock (`armedAt` plus `mode.ms`) and the
+	 * injected `now()`. Reading never ticks, fires, re-arms or schedules:
+	 * duration clamps at zero past the deadline, end-of-track carries no
+	 * fictitious time/count, and stop-after-N reports natural completions
+	 * left. Null when disarmed.
+	 */
+	readonly progress: SleepTimerProgress | null;
 	/** Arm (replaces any armed timer, resetting progress). Validates first. */
 	start(mode: SleepTimerMode): void;
 	/** Disarm; later ticks/ends are inert. */
@@ -59,6 +74,17 @@ export function createSleepTimer({ now, onFire }: SleepTimerDeps): SleepTimer {
 		},
 		get tracksElapsed() {
 			return tracksElapsed;
+		},
+		get progress(): SleepTimerProgress | null {
+			if (mode === null) return null;
+			if (mode.kind === 'duration') {
+				return { kind: 'duration', remainingMs: Math.max(0, armedAt + mode.ms - now()) };
+			}
+			if (mode.kind === 'end-of-track') return { kind: 'end-of-track' };
+			return {
+				kind: 'stop-after-tracks',
+				remainingTracks: Math.max(0, mode.count - tracksElapsed)
+			};
 		},
 		start(next: SleepTimerMode) {
 			// Validate before touching state: a rejected start leaves the

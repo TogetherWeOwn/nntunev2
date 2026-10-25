@@ -71,6 +71,20 @@ export function saveFavorites(
 }
 
 /**
+ * Project the loaded rows to the starred subset for the transient
+ * Favorites-only view. Pure: matches by stable id against the already
+ * ordered rows, keeps input order and row identity, and returns an
+ * independent array. Never mutates, sorts, stores or fetches.
+ */
+export function selectFavoriteItems<T extends { id: string }>(
+	orderedItems: readonly T[],
+	favoriteIds: readonly string[]
+): T[] {
+	const starred = new Set(favoriteIds);
+	return orderedItems.filter((item) => starred.has(item.id));
+}
+
+/**
  * Clear favorites at the auth boundary: the scoped key for the outgoing
  * context plus the legacy unscoped base key. Call BEFORE the refresher's
  * transition handler revokes the session auth context — afterwards the
