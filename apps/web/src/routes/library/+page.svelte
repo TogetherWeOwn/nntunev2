@@ -12,7 +12,8 @@
 	import {
 		clearFavoritesAtAuthBoundary,
 		loadFavorites,
-		saveFavorites
+		saveFavorites,
+		selectFavoriteItems
 	} from '#lib/library/favorites.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import {
@@ -61,6 +62,19 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	/**
+	 * Transient Favorites-only view over the loaded list. Plain component
+	 * state: never persisted, never fetched, reset on reload (fresh state)
+	 * and at the auth boundary. Filters after ordering via the pure
+	 * selectFavoriteItems projection; the queue never sees it.
+	 */
+	let view: 'all' | 'favorites' = $state('all');
+	let viewSelect: HTMLSelectElement | null = $state(null);
+	let confirmClear = $state(false);
+	let managementFeedback = $state('');
+	let shelfSection: HTMLElement | null = $state(null);
+	let shelfHeading: HTMLHeadingElement | null = $state(null);
+	let clearButton: HTMLButtonElement | null = $state(null);
+	/**
 	 * Explicit subset selection: page-local ordered stable IDs in checkbox
 	 * activation order. Never persisted, never fetched, never shared across
 	 * tabs; purged only at auth/account boundaries, pruned only against a
@@ -80,8 +94,9 @@
 	let queueFilterQuery = $state('');
 	/**
 	 * True only when a refresh starts while the filter input holds focus.
-	 * The loading branch unmounts the panel, so completion restores focus
-	 * to the remounted input in that case — and never otherwise.
+	 * A branch swap (error/empty) unmounts the panel, so completion restores
+	 * focus to the remounted input in that case — and never otherwise.
+	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
 
@@ -103,7 +118,12 @@
 			// panel (alert branch); the route-owned filter text must go with
 			// it so the next account never inherits the previous query.
 			// Successful same-account refreshes keep items and keep the query.
-			if (state.loadError && state.items.length === 0) queueFilterQuery = '';
+			if (state.loadError && state.items.length === 0) {
+				queueFilterQuery = '';
+				view = 'all';
+				confirmClear = false;
+				managementFeedback = '';
+			}
 			// The queue is per-account: drop tracks the new library no longer
 			// contains, so a 401/403/404 or auth transition cannot leak the
 			// previous account's queue into the next session's Retry. The
@@ -144,11 +164,13 @@
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
 			}
-			// Same-account refresh completion: the panel remounted, so hand
-			// focus back to the filter input the user was typing in. Any
-			// other focus placement (or an empty query) is left alone. The
-			// page-script unit harness runs this handler with neither DOM
-			// nor svelte bindings, so the restore is skipped there.
+			// Same-account refresh completion: the panel may have remounted
+			// (branch swap), so hand focus back to the filter input the user
+			// was typing in. Background refreshes keep the panel mounted, so
+			// the restore is a no-op there. Any other focus placement (or an
+			// empty query) is left alone. The page-script unit harness runs
+			// this handler with neither DOM nor svelte bindings, so the
+			// restore is skipped there.
 			if (!state.loading && restoreFilterFocus) {
 				restoreFilterFocus = false;
 				if (
@@ -175,6 +197,11 @@
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
+	// Transient Favorites-only projection: an immutable subset of the already
+	// ordered rows by stable id. Filters after ordering; the queue never sees it.
+	const displayedItems = $derived(
+		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+	);
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
 	const favoriteTracks = $derived(
@@ -264,6 +291,18 @@
 			: [...favorites, id];
 		favorites = next;
 		saveFavorites(browserStorage('session'), browserStorage('local'), next);
+		// Favorites-only unmounts an unstarred row, including its focused button.
+		// All-tracks keeps that button mounted and must leave focus alone.
+		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
+	}
+
+	function focusLibraryView(): void {
+		void tick().then(() => viewSelect?.focus({ preventScroll: true }));
+	}
+
+	function showAllTracks(): void {
+		view = 'all';
+		focusLibraryView();
 	}
 
 	function toggleQueuedFavorite(id: string): void {
@@ -277,6 +316,51 @@
 	function starLabel(track: LibraryItem): string {
 		const title = displayTitle(track);
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
+	}
+
+	/**
+	 * Shelf unstar: remove one id from the full visit state (hidden ids ride
+	 * along untouched) and persist the whole set through the existing saver.
+	 * Queue, ordering and refresh are untouched. Focus moves to the next
+	 * surviving shelf unstar control, or the shelf heading when none remains.
+	 */
+	function unstarFromShelf(id: string): void {
+		const removedIndex = favoriteTracks.findIndex((item) => item.id === id);
+		const track = items.find((item) => item.id === id);
+		const title = track ? displayTitle(track) : 'track';
+		favorites = favorites.filter((favorite) => favorite !== id);
+		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
+		managementFeedback = `Removed ${title} from favorites.`;
+		void tick().then(() => {
+			const controls = shelfSection?.querySelectorAll<HTMLButtonElement>('[data-shelf-unstar]');
+			const next = controls?.[Math.max(0, Math.min(removedIndex, controls.length - 1))];
+			if (next) next.focus({ preventScroll: true });
+			else shelfHeading?.focus({ preventScroll: true });
+		});
+	}
+
+	function requestClearFavorites(): void {
+		confirmClear = true;
+	}
+
+	/** Cancel is a pure UI reset: no save, queue and favorites untouched. */
+	function cancelClearFavorites(): void {
+		confirmClear = false;
+		managementFeedback = `Clear cancelled. ${trackCountLabel(favorites.length)} kept.`;
+		void tick().then(() => clearButton?.focus({ preventScroll: true }));
+	}
+
+	/**
+	 * Confirmed clear: persist the entire empty scoped set (including ids
+	 * absent from this library) through the existing saver. Never touches
+	 * the auth context, other accounts, the queue or the network.
+	 */
+	function confirmClearFavorites(): void {
+		favorites = [];
+		saveFavorites(browserStorage('session'), browserStorage('local'), []);
+		confirmClear = false;
+		managementFeedback = 'Cleared local favorites.';
+		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
 	function toggleSelectedId(id: string): void {
@@ -335,6 +419,9 @@
 			favorites = [];
 			favoritesInitialized = false;
 			queueFilterQuery = '';
+			view = 'all';
+			confirmClear = false;
+			managementFeedback = '';
 			purgeSelection();
 		}
 		refresher.handleAuthTransition(event);
@@ -347,6 +434,9 @@
 		favorites = [];
 		favoritesInitialized = false;
 		queueFilterQuery = '';
+		view = 'all';
+		confirmClear = false;
+		managementFeedback = '';
 		purgeSelection();
 		refresher.handleLocalAuthTransition();
 	}
@@ -373,7 +463,7 @@
 <main class="nt-wrap">
 	<h1>Library</h1>
 
-	{#if loading}
+	{#if loading && items.length === 0}
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
 		<p role="alert">{loadError}</p>
@@ -389,29 +479,75 @@
 			Retry
 		</button>
 	{:else}
+		{#if loading}
+			<p role="status">Loading your library…</p>
+		{/if}
 		{#if staleAt}
 			<p data-testid="library-stale-badge" role="status">{staleLabel(staleAt)}</p>
 		{/if}
 
-		<section data-testid="favorites-section" aria-label="Favorites">
-			<h2>Favorites</h2>
+		<section data-testid="favorites-section" aria-label="Favorites" bind:this={shelfSection}>
+			<h2 tabindex="-1" bind:this={shelfHeading}>Favorites</h2>
+			{#if managementFeedback}
+				<p role="status">{managementFeedback}</p>
+			{/if}
 			{#if favoriteTracks.length === 0}
-				<p data-testid="favorites-empty">No favorites yet. Star a track to pin it here.</p>
+				<p data-testid="favorites-empty" tabindex="-1">
+					No favorites yet. Star a track to pin it here.
+				</p>
 			{:else}
 				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
 				<ul>
 					{#each favoriteTracks as track (track.id)}
-						<li data-testid="favorite-item" data-id={track.id}>
+						<li
+							class="nt-shelf-item"
+							data-testid="favorite-item"
+							data-id={track.id}
+						>
 							<button type="button" onclick={() => selectTrack(track.id)}>
 								{displayTitle(track)}
 								{#if displayArtist(track)}
 									<span> — {displayArtist(track)}</span>
 								{/if}
 							</button>
+							<button
+								type="button"
+								class="nt-shelf-unstar"
+								data-shelf-unstar
+								onclick={() => unstarFromShelf(track.id)}
+							>
+								<span aria-hidden="true">★</span>
+								Unstar {displayTitle(track)}
+							</button>
 						</li>
 					{/each}
 				</ul>
 			{/if}
+			<div class="nt-shelf-clear">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					bind:this={clearButton}
+					onclick={requestClearFavorites}
+				>
+					Clear local favorites
+				</button>
+				{#if confirmClear}
+					<p>Clear all local favorites? This cannot be undone.</p>
+					<div class="nt-shelf-confirm">
+						<button
+							class="nt-button nt-button--ghost"
+							type="button"
+							onclick={cancelClearFavorites}
+						>
+							Cancel
+						</button>
+						<button class="nt-button" type="button" onclick={confirmClearFavorites}>
+							Yes, clear local favorites
+						</button>
+					</div>
+				{/if}
+			</div>
 		</section>
 
 		{#if libraryUnavailable}
@@ -430,6 +566,23 @@
 				</select>
 				<span id="library-order-hint">Changes this list only, not your queue.</span>
 			</div>
+			<div class="nt-library-view">
+				<label for="library-view">Show</label>
+				<select id="library-view" bind:this={viewSelect} bind:value={view}>
+					<option value="all">All tracks</option>
+					<option value="favorites">Favorites only</option>
+				</select>
+			</div>
+			<p>
+				{displayedItems.length} of {items.length}
+				{displayedItems.length === 1 ? 'track' : 'tracks'}
+			</p>
+			{#if view === 'favorites' && displayedItems.length === 0}
+				<p>
+					No favorites in this list.
+					<button type="button" onclick={showAllTracks}>Show all tracks</button>
+				</p>
+			{/if}
 			<div class="nt-selection-bar">
 				<p data-testid="selection-count">{selectionCountLabel(selectedIds.length)}</p>
 				<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
@@ -448,7 +601,7 @@
 				{/if}
 			</div>
 			<ul data-testid="library-list">
-				{#each orderedItems as track (track.id)}
+				{#each displayedItems as track (track.id)}
 					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<input
@@ -488,12 +641,21 @@
 					</li>
 				{/each}
 			</ul>
+			<!--
+				The queue panel stays mounted across background refreshes (its
+				rows remain readable while the new list loads), but its four
+				live statuses suspend while loading so the inline loading
+				indicator keeps the single-status transient the ordering specs
+				pin with an unfiltered role query. Content, controls and
+				focus are untouched; the roles return with the fresh list.
+			-->
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
 				{favoriteIds}
 				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
+				liveRegions={!loading}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
@@ -569,6 +731,50 @@
 	}
 	.nt-library-order span {
 		color: var(--nt-fg-muted);
+	}
+	.nt-library-view {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-view select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-shelf-item {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-shelf-unstar {
+		flex: 0 0 auto;
+		max-width: 100%;
+		background: none;
+		border: 0;
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+		text-align: left;
+	}
+	.nt-shelf-clear {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: var(--nt-space-2);
+	}
+	.nt-shelf-confirm {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
 	}
 	.nt-selection-bar {
 		display: flex;
