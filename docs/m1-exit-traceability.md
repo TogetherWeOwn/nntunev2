@@ -73,6 +73,15 @@ configured, the harness fails closed instead of skipping.
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
 
+- Local Favorites bulk queue (`apps/web/tests/library-favorites-queue-all.spec.ts:114`,
+  '[FAVQ-01] the queue-all action renders exactly once only when a favorite resolves',
+  plus FAVQ-02–09 in the same file) uses a mocked library API to cover star-order
+  append, dedupe/current preservation, one outcome announcement, missing-id skip,
+  auth purge, keyboard/touch operation and no storage/network/playback mutations.
+  `apps/web/tests/library-favorites-queue-builder.spec.ts` adds ghost-only shelf
+  visibility and bulk-announcement clearing across an auth-boundary retry.
+  This is offline browser coverage, not live playback or staging acceptance.
+
 - Usage meter increase + plan metadata (`ingest-play-meter.spec.ts:266`)
   and over-limit refusal — stream (`ingest-play-meter.spec.ts:890`) and
   ingest (`ingest-play-meter.spec.ts:960`), each on a separately minted

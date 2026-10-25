@@ -240,6 +240,36 @@ export function clearUpcoming(state: QueueState): QueueState {
 	};
 }
 
+/** Keep display metadata on one line, including title/id fallbacks. */
+function exportField(value: string | null | undefined): string {
+	return (value ?? '').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+}
+
+function exportLabel(track: Track): string {
+	const title = exportField(track.title) || exportField(track.id);
+	const artist = exportField(track.artist);
+	return artist ? `${title} — ${artist}` : title;
+}
+
+/** Read-only export of the whole arranged queue, independent of selection. */
+export function formatQueueText(state: QueueState): string {
+	return state.tracks.map((track, index) => `${index + 1}. ${exportLabel(track)}`).join('\n');
+}
+
+/** Preserve identifier-shaped catalogue ids exactly; never turn an id into a URL or directive. */
+function exportTrackId(id: string): string {
+	if (!/^[\p{L}\p{N}_-]+$/u.test(id)) throw new Error('Cannot export an unsafe track id.');
+	return id;
+}
+
+/** Offline list of stable ids, deliberately not a playlist of stream URLs. */
+export function formatQueueM3U(state: QueueState): string {
+	return [
+		'#EXTM3U',
+		...state.tracks.flatMap((track) => [`#EXTINF:-1,${exportLabel(track)}`, exportTrackId(track.id)])
+	].join('\n');
+}
+
 /** In-session persistence (sessionStorage): order + current track id only. */
 export function serializeQueue(state: QueueState): string {
 	return JSON.stringify({
