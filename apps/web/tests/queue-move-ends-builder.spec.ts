@@ -91,6 +91,14 @@ for (const surface of ['library', 'demo'] as const) {
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 
 		await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
-		await expect(page.getByTestId('queue-announcement')).toHaveText('');
+		await expect(page.getByTestId('queue-announcement')).toHaveText(
+			surface === 'library' ? 'Queue cleared.' : ''
+		);
+		expect(await page.evaluate(() => (window as unknown as {
+			queueMoveProbe: { messages: string[] };
+		}).queueMoveProbe.messages)).toEqual([
+			'Third Light moved to 1 of 3', 'Demo track moved to 3 of 3',
+			...(surface === 'library' ? ['Queue cleared.'] : [])
+		]);
 	});
 }
