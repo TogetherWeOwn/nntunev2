@@ -420,6 +420,11 @@
 	// Player comforts: sleep timer, playback speed, per-track resume.
 	let sleepMode = $state<SleepTimerMode | null>(null);
 	let sleepAnnouncement = $state('Sleep timer off');
+	// Truthful remaining text derived from the single timer authority
+	// (`sleepTimer.progress`); never a second clock or tick counter.
+	let sleepRemainingText = $state('');
+	let minutesError = $state('');
+	let tracksError = $state('');
 	let minutesEl: HTMLInputElement | undefined = $state();
 	let tracksEl: HTMLInputElement | undefined = $state();
 	let speedValue = $state('1');
@@ -445,11 +450,39 @@
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
 	let clockOffset = 0;
+
+	/** Bounded m:ss/h:mm:ss, ceiling fractional seconds, never negative. */
+	function formatSleepRemainingMs(remainingMs: number): string {
+		const totalSeconds = Math.max(0, Math.ceil(Math.max(0, remainingMs) / 1000));
+		const hours = Math.floor(totalSeconds / 3600);
+		const minutes = Math.floor((totalSeconds % 3600) / 60);
+		const seconds = totalSeconds % 60;
+		if (hours > 0) {
+			return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+		}
+		return `${minutes}:${String(seconds).padStart(2, '0')}`;
+	}
+
+	/** Read-only text from the existing arming; never ticks, fires or re-arms. */
+	function sleepProgressText(): string {
+		const progress = sleepTimer.progress;
+		if (progress === null) return '';
+		if (progress.kind === 'duration') return formatSleepRemainingMs(progress.remainingMs);
+		if (progress.kind === 'end-of-track') return 'End of track';
+		const n = progress.remainingTracks;
+		return `${n} track${n === 1 ? '' : 's'} remaining`;
+	}
+
+	function refreshSleepRemaining(): void {
+		sleepRemainingText = sleepProgressText();
+	}
+
 	const sleepTimer = createSleepTimer({
 		now: () => Date.now() + clockOffset,
 		onFire: () => {
 			sleepMode = null;
 			sleepAnnouncement = 'Sleep timer fired — playback paused';
+			sleepRemainingText = '';
 			pauseCurrent();
 		}
 	});
@@ -457,36 +490,67 @@
 	function armDuration(): void {
 		const raw = minutesEl?.value.trim() ?? '';
 		const minutes = Number(raw);
-		if (!Number.isFinite(minutes) || minutes <= 0) return;
-		sleepTimer.start({ kind: 'duration', ms: minutes * 60_000 });
+		const ms = minutes * 60_000;
+		if (raw === '' || !Number.isFinite(minutes) || minutes <= 0 || !Number.isFinite(ms) || ms <= 0) {
+			minutesError = 'Enter a positive finite number of minutes.';
+			return;
+		}
+		try {
+			sleepTimer.start({ kind: 'duration', ms });
+		} catch {
+			minutesError = 'Enter a positive finite number of minutes.';
+			return;
+		}
+		minutesError = '';
+		tracksError = '';
 		sleepMode = sleepTimer.mode;
 		sleepAnnouncement = `Sleep in ${raw} minutes`;
+		refreshSleepRemaining();
 	}
 
 	function armEndOfTrack(): void {
 		sleepTimer.start({ kind: 'end-of-track' });
+		minutesError = '';
+		tracksError = '';
 		sleepMode = sleepTimer.mode;
 		sleepAnnouncement = 'Sleep at end of track';
+		refreshSleepRemaining();
 	}
 
 	function armStopAfter(): void {
-		const count = Number(tracksEl?.value.trim() ?? '');
-		if (!Number.isInteger(count) || count < 1) return;
-		sleepTimer.start({ kind: 'stop-after-tracks', count });
+		const raw = tracksEl?.value.trim() ?? '';
+		const count = Number(raw);
+		if (raw === '' || !Number.isInteger(count) || count < 1) {
+			tracksError = 'Enter a whole positive integer count of tracks.';
+			return;
+		}
+		try {
+			sleepTimer.start({ kind: 'stop-after-tracks', count });
+		} catch {
+			tracksError = 'Enter a whole positive integer count of tracks.';
+			return;
+		}
+		minutesError = '';
+		tracksError = '';
 		sleepMode = sleepTimer.mode;
-		sleepAnnouncement = `Sleep after ${count} tracks`;
+		sleepAnnouncement = `Sleep after ${count} track${count === 1 ? '' : 's'}`;
+		refreshSleepRemaining();
 	}
 
 	function cancelSleep(): void {
 		sleepTimer.cancel();
 		sleepMode = null;
 		sleepAnnouncement = 'Sleep timer off';
+		minutesError = '';
+		tracksError = '';
+		sleepRemainingText = '';
 	}
 
 	/** Drive the real armed duration timer forward; the smoke-test hook. */
 	function advanceSleep(ms: number): void {
 		clockOffset += ms;
 		sleepTimer.tick();
+		refreshSleepRemaining();
 	}
 
 	function handleSpeedChange(control: HTMLSelectElement): void {
@@ -1295,6 +1359,20 @@
 		// alike); the auto-advanced track earns its own on completion.
 		recordRecent(endedId);
 		const fired = sleepTimer.trackEnded();
+		if (fired) {
+			// onFire already paused, cleared the mode and announced expiry.
+			sleepRemainingText = '';
+		} else {
+			// Natural completions are the only after-N signal: seeks, retries,
+			// queue edits and clock ticks never reach this path. Announce the
+			// real remaining-track change politely; duration timers stay silent.
+			const progress = sleepTimer.progress;
+			if (progress?.kind === 'stop-after-tracks') {
+				const n = progress.remainingTracks;
+				sleepAnnouncement = `Sleep after ${n} track${n === 1 ? '' : 's'}`;
+			}
+			refreshSleepRemaining();
+		}
 		// A finished track never resumes mid-way, whether the timer fired or
 		// the queue advances.
 		resumeStore?.clear(endedId);
@@ -1557,9 +1635,24 @@
 		// at zero: resume the selected track's saved position. Share links
 		// already sought above and stay authoritative.
 		if (shared === undefined && current) seekToResume(current.id);
+		// The single owned refresh: the existing 500ms authority tick also
+		// re-reads the read-only progress snapshot, so display resyncs from
+		// the actual deadline after background delays without a second timer.
+		// Stale callbacks replay the same wall-clock check, never a captured
+		// deadline, and cannot pause, re-arm or resurrect the loop.
+		let alive = true;
 		const tickId = setInterval(() => {
+			if (!alive) return;
 			sleepTimer.tick();
+			refreshSleepRemaining();
 		}, 500);
+		const resyncOnVisible = () => {
+			if (!alive) return;
+			if (document.visibilityState !== 'visible') return;
+			sleepTimer.tick();
+			refreshSleepRemaining();
+		};
+		document.addEventListener('visibilitychange', resyncOnVisible);
 		// A reload never runs the destroy path: persist the live position
 		// on hide so resume survives it.
 		const persistOnPageHide = () => persistPosition(current?.id);
@@ -1567,12 +1660,17 @@
 		// OS media controls are global: release them when the page goes away.
 		return () => {
 			// A copy settling after teardown must not resurrect state.
+			alive = false;
+			// Disarm the page-local timer so callbacks captured before
+			// teardown cannot fire after unmount.
+			sleepTimer.cancel();
 			shareCopyAlive = false;
 			shareCopyGeneration += 1;
 			queueExportAlive = false;
 			queueExportGeneration += 1;
 			releaseQueueDownload();
 			window.removeEventListener('pagehide', persistOnPageHide);
+			document.removeEventListener('visibilitychange', resyncOnVisible);
 			clearInterval(tickId);
 			clearMediaSession();
 			// The leveling graph is page-local: close the context so repeat
@@ -2049,7 +2147,7 @@
 
 	<section data-testid="comforts-panel" aria-label="Player comforts">
 		<h2>Comforts</h2>
-		<div>
+		<div class="sleep-row">
 			<label for="sleep-minutes">Sleep timer (minutes)</label>
 			<input
 				id="sleep-minutes"
@@ -2058,17 +2156,23 @@
 				value="15"
 				data-testid="sleep-timer-minutes"
 				bind:this={minutesEl}
+				aria-invalid={minutesError ? 'true' : undefined}
+				aria-describedby={minutesError ? 'sleep-minutes-error' : undefined}
+				aria-errormessage={minutesError ? 'sleep-minutes-error' : undefined}
 			/>
 			<button type="button" data-testid="sleep-timer-set-duration" onclick={armDuration}>
 				Sleep after duration
 			</button>
+			{#if minutesError}
+				<p id="sleep-minutes-error" class="sleep-error" role="alert">{minutesError}</p>
+			{/if}
 		</div>
 		<div>
 			<button type="button" data-testid="sleep-timer-set-end-of-track" onclick={armEndOfTrack}>
 				Sleep at end of track
 			</button>
 		</div>
-		<div>
+		<div class="sleep-row">
 			<label for="sleep-tracks">Stop after tracks</label>
 			<input
 				id="sleep-tracks"
@@ -2078,10 +2182,16 @@
 				value="2"
 				data-testid="sleep-timer-tracks"
 				bind:this={tracksEl}
+				aria-invalid={tracksError ? 'true' : undefined}
+				aria-describedby={tracksError ? 'sleep-tracks-error' : undefined}
+				aria-errormessage={tracksError ? 'sleep-tracks-error' : undefined}
 			/>
 			<button type="button" data-testid="sleep-timer-set-stop-after" onclick={armStopAfter}>
 				Sleep after N tracks
 			</button>
+			{#if tracksError}
+				<p id="sleep-tracks-error" class="sleep-error" role="alert">{tracksError}</p>
+			{/if}
 		</div>
 		<div>
 			<button
@@ -2093,7 +2203,11 @@
 				Cancel sleep timer
 			</button>
 		</div>
+		{#if sleepMode !== null && sleepRemainingText}
+			<p data-testid="sleep-timer-remaining">{sleepRemainingText}</p>
+		{/if}
 		<p data-testid="sleep-timer-status" aria-live="polite">{sleepAnnouncement}</p>
+		<p>Duration timers use wall-clock time and continue while paused.</p>
 		<div>
 			<label for="playback-speed">Playback speed</label>
 			<select
@@ -2210,6 +2324,41 @@
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
+	}
+
+	/* Sleep timer rows: wrap on 360px screens, touch-sized controls,
+	   inline errors take a full row and wrap instead of overflowing. */
+	.sleep-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.sleep-row input {
+		flex: 0 1 8rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.sleep-row button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	.sleep-error {
+		flex-basis: 100%;
+		margin: 0;
+		color: var(--nt-bad);
+		overflow-wrap: anywhere;
 	}
 
 	/* Explicit-seek form: same wrap/shrink contract as the queue filter
