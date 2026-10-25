@@ -16,6 +16,16 @@
 		onplaynext?: (index: number) => void;
 		onremove?: (index: number) => void;
 		onclear?: () => void;
+		/** Favorites stay with the library host; other queues omit the intent. */
+		favoriteIds?: ReadonlySet<string>;
+		ontogglefavorite?: (id: string) => void;
+		/**
+		 * Metadata-only direct selection: the host applies the validated
+		 * selectTrack transition and owns the announcement; the panel reports
+		 * the ORIGINAL queue index once and never mutates, transports or
+		 * fetches. Each Select control renders only when provided.
+		 */
+		onselect?: (index: number) => void;
 		/**
 		 * Trim intents, same contract: the host applies the transition and
 		 * owns the announcement; the panel reports once and never mutates.
@@ -36,6 +46,14 @@
 		 * component-local default. Never persisted or fetched.
 		 */
 		filterQuery?: string;
+		/**
+		 * Whether the panel's polite regions are exposed as live statuses.
+		 * The library host suspends them while a library refresh is in
+		 * flight so the loading transient keeps a single page-level
+		 * status; content, controls and focus are untouched. Defaults to
+		 * exposed; component harnesses leave it on.
+		 */
+		liveRegions?: boolean;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
@@ -48,10 +66,14 @@
 		onplaynext,
 		onremove,
 		onclear,
+		onselect,
+		favoriteIds = new Set<string>(),
+		ontogglefavorite,
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
-		filterQuery = $bindable('')
+		filterQuery = $bindable(''),
+		liveRegions = true
 	}: Props = $props();
 
 	let current = $derived(currentTrack(queue));
@@ -142,16 +164,34 @@
 			currentRowElement()?.focus({ preventScroll: true });
 		}
 	}
+
+	/**
+	 * Report one direct-selection intent with the ORIGINAL queue coordinate.
+	 * Runs only on explicit activation — prop-only updates never reach here,
+	 * so background refreshes cannot steal focus. A detached button (removed
+	 * row) or an identity mismatch (stale closure over a reused slot) reports
+	 * nothing, so a removed identity can never select its replacement. The
+	 * host validates again and applies the selectTrack transition.
+	 */
+	function reportSelect(event: Event, index: number, trackId: string): void {
+		const button = event.currentTarget;
+		if (!(button instanceof HTMLButtonElement)) return;
+		if (!button.isConnected) return;
+		if (!onselect) return;
+		if (queue.tracks[index]?.id !== trackId) return;
+		if (!Number.isInteger(index) || index < 0 || index >= queue.tracks.length) return;
+		onselect(index);
+	}
 </script>
 
 <!--
 	Reusable queue panel: renders a `QueueState` from the queue store with
 	the same hooks the demo player and the queue-order specs rely on.
-	The host page owns selection, transport (via `onnext`) and management
-	(via `onmove`/`onplaynext`/`onremove`/`onclear`); the panel itself never
-	mutates state.
+	The host page owns selection (via `onselect`), transport (via `onnext`)
+	and management (via `onmove`/`onplaynext`/`onremove`/`onclear`); the
+	panel itself never mutates state.
 -->
-<p data-testid="now-playing" role="status">
+<p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
 	{#if current}
 		Now playing: {displayTitle(current)}{#if current.artist} — {current.artist}{/if}
 	{:else}
@@ -170,7 +210,7 @@
 	{/if}
 </p>
 
-<p data-testid="queue-announcement" role="status">{announcement}</p>
+<p data-testid="queue-announcement" role={liveRegions ? 'status' : undefined}>{announcement}</p>
 
 <button
 	type="button"
@@ -190,7 +230,7 @@
 	Show current track
 </button>
 
-<ShuffleUpcoming state={queue} {onshuffle} {radioActive} />
+<ShuffleUpcoming state={queue} {onshuffle} {radioActive} {liveRegions} />
 
 <!--
 	Queue-only filter: transient presentation state. It hides rows but
@@ -203,7 +243,7 @@
 	<button type="button" onclick={() => (filterQuery = '')}>Clear queue filter</button>
 </div>
 
-<p data-testid="queue-filter-count" role="status">
+<p data-testid="queue-filter-count" role={liveRegions ? 'status' : undefined}>
 	{visibleEntries.length} of {trackCount} tracks
 </p>
 
@@ -224,6 +264,17 @@
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
 			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
+			{#if ontogglefavorite}
+				<button
+					type="button"
+					class="queue-star"
+					aria-label="{favoriteIds.has(track.id) ? 'Unstar' : 'Star'} {displayTitle(track)}"
+					aria-pressed={favoriteIds.has(track.id)}
+					onclick={() => ontogglefavorite?.(track.id)}
+				>
+					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
+				</button>
+			{/if}
 			<button
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
@@ -240,6 +291,24 @@
 			>
 				Down
 			</button>
+			{#if trackCount > 1}
+				<button
+					type="button"
+					aria-label="Move {displayTitle(track)} to top"
+					disabled={index === 0}
+					onclick={() => onmove?.(index, 0)}
+				>
+					Move to top
+				</button>
+				<button
+					type="button"
+					aria-label="Move {displayTitle(track)} to bottom"
+					disabled={index === trackCount - 1}
+					onclick={() => onmove?.(index, trackCount - 1)}
+				>
+					Move to bottom
+				</button>
+			{/if}
 			<button
 				type="button"
 				aria-label="Play {displayTitle(track)} next"
@@ -254,6 +323,15 @@
 			>
 				Remove
 			</button>
+			{#if onselect}
+				<button
+					type="button"
+					aria-label="Select {displayTitle(track)}"
+					onclick={(event) => reportSelect(event, index, track.id)}
+				>
+					Select
+				</button>
+			{/if}
 		</li>
 	{/each}
 </ol>
@@ -320,7 +398,22 @@
 		font: inherit;
 	}
 
+	.queue-star {
+		min-width: 2.75rem;
+		min-height: 2.75rem;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		vertical-align: middle;
+	}
+
+	.queue-star:focus-visible {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+
 	.queue-row {
+		overflow-wrap: anywhere;
 		/* Clear the 2px outline + 2px offset when nearest-scroll rounds
 		 * fractional line heights at the viewport edge. */
 		scroll-margin-block: 4px;

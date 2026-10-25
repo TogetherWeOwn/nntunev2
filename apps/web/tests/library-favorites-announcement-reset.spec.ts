@@ -58,3 +58,21 @@ test('clears a prior favorite-move announcement when a track is starred', async 
 
 	await expect(announcement(page)).toHaveText('');
 });
+
+for (const edit of ['unstar', 'clear'] as const) {
+	test(`clears a prior favorite-move announcement after shelf ${edit}`, async ({ page }) => {
+		await open(page, ['announce-z', 'announce-a', 'announce-m']);
+		await move(page, 'Mike Song', 'up').click();
+		await expect(announcement(page)).toHaveText('Mike Song moved to 2 of 3');
+
+		if (edit === 'unstar') {
+			await favorites(page).getByRole('button', { name: 'Unstar Zulu Song', exact: true }).click();
+		} else {
+			await favorites(page).getByRole('button', { name: 'Clear local favorites', exact: true }).click();
+			await favorites(page).getByRole('button', { name: 'Yes, clear local favorites', exact: true }).click();
+		}
+
+		await expect(announcement(page)).toHaveText('');
+		await expect(favorites(page).getByTestId('favorite-item')).toHaveCount(edit === 'unstar' ? 2 : 0);
+	});
+}

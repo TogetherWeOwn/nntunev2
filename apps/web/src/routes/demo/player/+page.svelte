@@ -32,7 +32,11 @@
 	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
-	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
+	import {
+		clampPlaybackSpeed,
+		createPlaybackSpeed,
+		type PlaybackSpeed
+	} from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
 	import {
 		createRecentlyPlayedStore,
@@ -55,9 +59,14 @@
 		createQueue,
 		currentTrack,
 		DEMO_TRACKS,
+		formatQueueText,
+		formatQueueM3U,
+		moveToBottom,
+		moveToTop,
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
+		playNext,
 		previousTrack,
 		restoreQueue,
 		selectTrack,
@@ -95,6 +104,11 @@
 	let lastBytes = $state(0);
 
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
+	// A move describes one queue snapshot; other edits invalidate its position.
+	let queueMoveAnnouncement = $state.raw<{ queue: QueueState; text: string } | null>(null);
+	let queueAnnouncement = $derived(
+		queueMoveAnnouncement?.queue === queue ? queueMoveAnnouncement.text : ''
+	);
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
@@ -150,6 +164,80 @@
 	const shareCopyEnabled = $derived(
 		current !== null && DEMO_TRACKS.some((track) => track.id === (current?.id ?? ''))
 	);
+
+	let queueExportStatus = $state('');
+	let queueExportFallback = $state<string | null>(null);
+	let queueExportGeneration = 0;
+	let queueExportAlive = true;
+	let queueDownloadUrl: string | null = null;
+
+	function releaseQueueDownload(): void {
+		if (queueDownloadUrl !== null) URL.revokeObjectURL(queueDownloadUrl);
+		queueDownloadUrl = null;
+	}
+
+	// Every queue replacement (including selection) invalidates feedback.
+	// Handlers also compare snapshot identity to fence same-tick changes
+	// before this effect flushes. Export never writes the queue itself.
+	$effect(() => {
+		queue;
+		queueExportGeneration += 1;
+		queueExportStatus = '';
+		queueExportFallback = null;
+	});
+
+	function beginQueueExport(): number {
+		queueExportGeneration += 1;
+		queueExportStatus = '';
+		queueExportFallback = null;
+		return queueExportGeneration;
+	}
+
+	async function copyQueueText(): Promise<void> {
+		const generation = beginQueueExport();
+		const snapshot = queue;
+		if (!queueExportAlive || snapshot.tracks.length === 0) return;
+		const text = formatQueueText(snapshot);
+		try {
+			// Both the API getter and the write can fail. Neither is proof
+			// of a successful copy: expose selectable text instead.
+			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
+			await navigator.clipboard.writeText(text);
+		} catch {
+			if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
+			queueExportStatus = 'Clipboard unavailable. Copy the queue manually below.';
+			queueExportFallback = text;
+			return;
+		}
+		if (!queueExportAlive || queue !== snapshot || generation !== queueExportGeneration) return;
+		queueExportStatus = 'Copied queue as text.';
+	}
+
+	function downloadQueueM3U(): void {
+		beginQueueExport();
+		if (!queueExportAlive || queue.tracks.length === 0) return;
+		const link = document.createElement('a');
+		try {
+			// Retain at most one Blob URL until the next download or teardown,
+			// not an arbitrary timer while the browser may still be saving it.
+			releaseQueueDownload();
+			const blob = new Blob([formatQueueM3U(queue)], { type: 'audio/x-mpegurl;charset=utf-8' });
+			queueDownloadUrl = URL.createObjectURL(blob);
+			link.href = queueDownloadUrl;
+			link.download = 'queue.m3u';
+			link.hidden = true;
+			document.body.append(link);
+			link.click();
+			// The browser owns the save dialog: initiating it cannot prove
+			// that a file was saved to disk.
+			queueExportStatus = 'Download started. Check your browser’s saved downloads for queue.m3u.';
+		} catch {
+			releaseQueueDownload();
+			queueExportStatus = 'Could not start the download. Try again or copy the queue as text.';
+		} finally {
+			link.remove();
+		}
+	}
 
 	const playback = createPlayback({
 		audio: () => audioEl,
@@ -336,12 +424,23 @@
 	let tracksEl: HTMLInputElement | undefined = $state();
 	let speedValue = $state('1');
 	let speed: PlaybackSpeed | null = null;
+	/** Concise failure note when a requested rate does not apply; empty on success. */
+	let speedFeedback = $state('');
+	// Retain a mismatch through the ratechange emitted by the same media write.
+	let speedFeedbackRate: number | null = null;
+	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
+	/** A restored or native non-preset rate renders as its own explicit option. */
+	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
 
 	// Session-local recently-played list (demo synthetic tracks only; the
 	// store itself is fail-soft, so a corrupt key renders the empty state).
 	let recentStore: RecentlyPlayedStore | null = null;
 	let recentEntries = $state<RecentEntry[]>([]);
+	// Polite action-only feedback for history Add/Forget: empty until the
+	// first activation, never set on load, play, seek or timeupdate.
+	let recentFeedback = $state('');
+	let recentSection: HTMLElement | undefined = $state();
 
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
@@ -390,9 +489,53 @@
 		sleepTimer.tick();
 	}
 
-	function handleSpeedChange(value: string): void {
-		speedValue = value;
-		speed?.set(Number(value));
+	function handleSpeedChange(control: HTMLSelectElement): void {
+		const value = control.value;
+		if (!speed) {
+			speedValue = value;
+			return;
+		}
+		// The store verifies against the element and returns the actual
+		// applied rate: the selection names that rate, never the request.
+		const effective = speed.set(Number(value));
+		speedValue = String(effective);
+		// A rejected request leaves state unchanged, so one-way
+		// `value={speedValue}` would keep showing the refused choice: revert
+		// the control itself to the verified rate.
+		control.value = String(effective);
+		if (effective !== clampPlaybackSpeed(Number(value))) {
+			speedFeedback = `Speed ${value}x not applied — still ${effective}x`;
+			speedFeedbackRate = effective;
+		} else {
+			speedFeedback = '';
+			speedFeedbackRate = null;
+		}
+	}
+
+	/**
+	 * Reconcile a native-control rate change to state, display and
+	 * best-effort persistence. Reads only: never writes back into the
+	 * element (no feedback loop) and never implies play or seek. Detached,
+	 * stale, throwing or non-finite readings are ignored so they cannot
+	 * poison the last verified preference.
+	 */
+	function handleNativeRateChange(event: Event): void {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		if (!element || element !== audioEl || !element.isConnected) return;
+		if (!speed) return;
+		let nativeRate: number;
+		try {
+			nativeRate = element.playbackRate;
+		} catch {
+			return;
+		}
+		if (!Number.isFinite(nativeRate)) return;
+		const effective = speed.adoptNativeRate(nativeRate);
+		speedValue = String(effective);
+		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+			speedFeedback = '';
+			speedFeedbackRate = null;
+		}
 	}
 
 	/** In-memory Storage stand-in when the browser blocks site storage. */
@@ -446,19 +589,22 @@
 	interface RecentRow extends RecentEntry {
 		title: string;
 		artist: string;
+		/** False for stale ids outside the demo catalogue: shown as unavailable, never resolved to another track. */
+		available: boolean;
 	}
 
 	/**
 	 * Rendered rows: entries resolved against the demo catalogue. Unknown ids
-	 * stay stored (the cap counts them) but render nothing, so a seeded or
-	 * stale key can never show a non-demo title.
+	 * stay stored (the cap counts them) and render an honest unavailable row
+	 * with no playback or queue actions, so a seeded or stale key can never
+	 * show a non-demo title.
 	 */
 	function toRecentRows(entries: RecentEntry[]): RecentRow[] {
-		return entries.flatMap((entry) => {
+		return entries.map((entry) => {
 			const track = DEMO_TRACKS.find((candidate) => candidate.id === entry.trackId);
 			return track === undefined
-				? []
-				: [{ ...entry, title: track.title, artist: track.artist }];
+				? { ...entry, title: 'Unavailable track', artist: '', available: false }
+				: { ...entry, title: track.title, artist: track.artist, available: true };
 		});
 	}
 
@@ -496,6 +642,56 @@
 			index = queue.tracks.length - 1;
 		}
 		selectAt(index);
+	}
+
+	/**
+	 * Append a history entry to the queue without touching playback: no
+	 * play, seek, source change or restart, and no history rewrite. Uses
+	 * the shared addTrack semantics (append only if missing), so a repeat
+	 * activation is an explained no-op. Unknown ids never resolve to
+	 * another track.
+	 */
+	function enqueueRecent(trackId: string): void {
+		const deck = DEMO_TRACKS.find((track) => track.id === trackId);
+		if (!deck) {
+			recentFeedback = 'That history entry is unavailable.';
+			return;
+		}
+		if (queue.tracks.some((track) => track.id === trackId)) {
+			recentFeedback = `${deck.title} is already in the queue.`;
+			return;
+		}
+		queue = addTrack(queue, deck);
+		if (status === 'empty') status = 'selected';
+		recentFeedback = `Added ${deck.title} to the queue.`;
+	}
+
+	/** Forget one history entry: queue, current media and resume are untouched. */
+	function forgetRecent(row: RecentRow, removedIndex: number): void {
+		if (!recentStore) return;
+		recentStore.forget(row.trackId);
+		refreshRecent();
+		recentFeedback = row.available
+			? `Forgot ${row.title} from recent history.`
+			: 'Forgot the unavailable entry from recent history.';
+		void focusAfterForget(removedIndex);
+	}
+
+	/**
+	 * Keep keyboard focus on an enabled surviving history control after a
+	 * row is removed: the row taking the removed slot, else the last row's
+	 * first action, else Clear when the list is empty.
+	 */
+	async function focusAfterForget(removedIndex: number): Promise<void> {
+		await tick();
+		const section = recentSection;
+		if (!section) return;
+		const rows = section.querySelectorAll('li[data-testid="recent-item"]');
+		const targetRow = rows[Math.min(removedIndex, rows.length - 1)];
+		const target =
+			targetRow?.querySelector('button:not([disabled])') ??
+			section.querySelector('[data-testid="recently-played-clear"]');
+		(target as HTMLElement | null)?.focus?.();
 	}
 
 	// A source gets its own element: an event queued by the browser before
@@ -710,6 +906,23 @@
 		demoFilterInput?.focus();
 	}
 
+	function moveQueuedTrack(from: number, to: number): void {
+		const moved = queue.tracks[from];
+		if (!moved) return;
+		const reordered =
+			to === 0
+				? moveToTop(queue, from)
+				: to === queue.tracks.length - 1
+					? moveToBottom(queue, from)
+					: moveTrack(queue, from, to);
+		if (reordered === queue) return;
+		queue = reordered;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${moved.title} moved to ${to + 1} of ${queue.tracks.length}`
+		};
+	}
+
 	function selectAt(index: number): void {
 		const next = selectTrack(queue, index);
 		const nextId = next.tracks[next.currentIndex]?.id;
@@ -725,6 +938,25 @@
 		// retry afterwards must not append.
 		recordRecent(nextId);
 		if (nextId !== undefined && shouldResume) seekToResume(nextId);
+	}
+
+	async function playNextAt(index: number, control: HTMLButtonElement): Promise<void> {
+		// Radio owns what plays next (radio.order), so reordering the resting
+		// queue would announce a move the button cannot fulfil. ShuffleUpcoming
+		// disables itself the same way; the button mirrors it below.
+		if (radio) return;
+		const track = queue.tracks[index];
+		const reordered = playNext(queue, index);
+		// Current/already-next requests leave even the previous announcement alone.
+		if (reordered === queue || !track) return;
+		queue = reordered;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${track.title} moved to position ${reordered.currentIndex + 2} of ${reordered.tracks.length}`
+		};
+		// A keyed row can move in the DOM without keeping browser focus.
+		await tick();
+		control.focus({ preventScroll: true });
 	}
 
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
@@ -760,6 +992,41 @@
 		shortcutsOpener?.focus();
 	}
 
+	// Explicit Tab wrap for the shortcuts dialog. Native showModal keeps the
+	// background inert, but Chromium does not cycle Tab past the dialog's
+	// last/first control: focus falls back to body instead of wrapping,
+	// which KEYSAFE-B11 pins as a failure (same workaround as PaywallModal
+	// wrapTab, which documents the stutter). Cycling the rendered controls
+	// here restores the documented trap in every browser. Scoped to this
+	// dialog only: page tab order and modified chords pass through, and an
+	// already-handled Tab keeps its prior ownership.
+	function trapShortcutsTab(event: KeyboardEvent): void {
+		if (event.key !== 'Tab') return;
+		if (event.defaultPrevented) return;
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const root = shortcutsDialogEl;
+		if (!root) return;
+		const controls = [...root.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])'
+		)].filter((control) => control.getClientRects().length > 0);
+		if (controls.length === 0) {
+			event.preventDefault();
+			return;
+		}
+		const first = controls[0];
+		const last = controls[controls.length - 1];
+		const active = document.activeElement;
+		if (event.shiftKey) {
+			if (active === first || !root.contains(active)) {
+				event.preventDefault();
+				last.focus();
+			}
+		} else if (active === last || !root.contains(active)) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
+
 	function togglePlayShortcut(): void {
 		if (status === 'playing' || status === 'loading') pauseCurrent();
 		else {
@@ -792,14 +1059,21 @@
 		sound = actual;
 	}
 
-	// Usable-media gate shared by the jump and restart controls: the
-	// current element is read at activation and unusable media (no current
-	// track, non-finite or negative time, non-finite duration) refuses
-	// quietly instead of throwing through the UI or reporting a seek that
-	// never happened.
+	// Usable-media gate shared by the jump, restart and keyboard seeks:
+	// the current element is read at activation and unusable media (no
+	// current track, stale source, non-finite or negative time, non-finite
+	// or non-positive duration) refuses quietly instead of throwing through
+	// the UI or reporting a seek that never happened.
 	function seekCoordinates(): { element: HTMLAudioElement } | null {
 		const el = audioEl;
 		if (!el || !current) return null;
+		try {
+			// Same-task navigation changes the queue before the keyed element
+			// swaps: a src mismatch is the previous track, never seek it.
+			if (el.getAttribute('src') !== current.streamUrl) return null;
+		} catch {
+			return null;
+		}
 		let position = Number.NaN;
 		let bound = Number.NaN;
 		try {
@@ -808,7 +1082,13 @@
 		} catch {
 			// An unreadable element is unusable media: refuse below.
 		}
-		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return null;
+		if (
+			!Number.isFinite(position) ||
+			position < 0 ||
+			!Number.isFinite(bound) ||
+			bound <= 0
+		)
+			return null;
 		return { element: el };
 	}
 
@@ -841,6 +1121,76 @@
 		}
 	}
 
+	// Explicit "Go to time" seek: the form reuses the shared timestamp
+	// parser (seconds, m:ss, h:mm:ss — the same grammar as inbound share
+	// links), then independently guards finite range, live duration and
+	// the current matching element before writing currentTime. Every
+	// refusal explains itself inline; nothing clamps, autoplays or moves
+	// focus into a modal.
+	const GOTO_HINT_ID = 'player-goto-hint';
+	const GOTO_ERROR_ID = 'player-goto-error-text';
+	let gotoValue = $state('');
+	let gotoError = $state('');
+	let gotoStatus = $state('');
+
+	function submitGotoTime(): void {
+		// Each submission replaces prior feedback: a refusal clears an
+		// older success and a success clears an older refusal.
+		gotoError = '';
+		gotoStatus = '';
+		const seconds = parseTimestampParam(gotoValue);
+		if (
+			seconds === null ||
+			!Number.isFinite(seconds) ||
+			seconds < 0 ||
+			seconds > Number.MAX_SAFE_INTEGER
+		) {
+			gotoError = 'Enter a valid time in seconds, m:ss, or h:mm:ss.';
+			return;
+		}
+		const el = audioEl;
+		if (!el || !current) {
+			gotoError = 'No track is selected, so there is no media to seek. Add or select a track first.';
+			return;
+		}
+		// The bound element must still be the live one for this track: a
+		// detached node or a source swap since render is unavailable media,
+		// never a stale reference to write through.
+		if (!el.isConnected || !endedForCurrent(el, current.streamUrl)) {
+			gotoError = 'Track media is not available right now. Wait for it to load and try again.';
+			return;
+		}
+		// Duration is read from the live element at submission, never from
+		// a cached coordinate: it can shrink or go unknown after editing.
+		let duration = Number.NaN;
+		try {
+			duration = el.duration;
+		} catch {
+			duration = Number.NaN;
+		}
+		if (!Number.isFinite(duration) || duration < 0) {
+			gotoError = 'Duration is unavailable — the track has not loaded enough to seek yet.';
+			return;
+		}
+		// An explicit out-of-range request is corrected, never clamped.
+		if (seconds > duration) {
+			gotoError = 'That time is past the end of this track. Enter a time within the duration.';
+			return;
+		}
+		try {
+			el.currentTime = seconds;
+			// An exact-end seek during active or pending playback must become an
+			// intentional pause before native completion can advance the queue.
+			if (seconds >= duration && (status === 'playing' || status === 'loading')) pauseCurrent();
+		} catch {
+			// The setter refused (a non-seekable resource): report honestly
+			// and never echo decoder internals into the page.
+			gotoError = 'Could not seek this track. Try again once it is playing.';
+			return;
+		}
+		gotoStatus = `Seeked to ${seconds} seconds.`;
+	}
+
 
 	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
 		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
@@ -858,14 +1208,28 @@
 		updateSound({ volume: audioEl.volume, muted: !audioEl.muted });
 	}
 
+	function shuffleQueueUpcoming(): void {
+		if (!radio) queue = shuffleUpcoming(queue);
+	}
+
+	function cycleRepeat(): void {
+		if (radio) return;
+		repeat = repeat === 'off' ? 'one' : repeat === 'one' ? 'queue' : 'off';
+	}
+
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
-	// surfaces, open modals and modified chords. Handled bindings suppress
-	// their keydown default: the digit binding would otherwise also drive
-	// native select type-ahead (the 0.5x/0.75x speed options start with
-	// 0), so one keystroke would restart the track AND halve the speed.
+	// surfaces, open modals and modified chords. Cancelled or composing keys
+	// keep native ownership: no preventDefault and no player mutation.
+	// Handled bindings suppress their keydown default: the digit binding
+	// would otherwise also drive native select type-ahead (the 0.5x/0.75x
+	// speed options start with 0), so one keystroke would restart the track
+	// AND halve the speed.
 	function handleGlobalKeydown(event: KeyboardEvent): void {
 		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		// Prior ownership wins: a cancelled event was already handled, and an
+		// isComposing or legacy 229 key belongs to the IME, not the player.
+		if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
 		const action = actionForKey(event.key);
 		if (!action) return;
 		if (action === 'close-shortcuts') {
@@ -873,6 +1237,13 @@
 			return;
 		}
 		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
+		// The new queue bindings yield to IME and native select editing without
+		// changing existing transport defaults (notably 0 on the speed select).
+		if (
+			(action === 'shuffle-upcoming' || action === 'cycle-repeat') &&
+			(event.isComposing || event.keyCode === 229 ||
+				(event.target instanceof Element && event.target.closest('select')))
+		) return;
 		event.preventDefault();
 		switch (action) {
 			case 'toggle-play':
@@ -887,16 +1258,23 @@
 				userPrevious();
 				break;
 			case 'seek-back':
-				seekShortcut(-SEEK_SECONDS);
+				// Same validated/clamped gate as the visible jump controls.
+				seekButton(-SEEK_SECONDS);
 				break;
 			case 'seek-forward':
-				seekShortcut(SEEK_SECONDS);
+				seekButton(SEEK_SECONDS);
 				break;
 			case 'restart-track':
 				restartCurrent();
 				break;
 			case 'toggle-mute':
 				toggleMuteShortcut();
+				break;
+			case 'shuffle-upcoming':
+				shuffleQueueUpcoming();
+				break;
+			case 'cycle-repeat':
+				cycleRepeat();
 				break;
 			case 'open-shortcuts':
 				openShortcuts();
@@ -1056,6 +1434,16 @@
 		shareCopyFallbackUrl = null;
 	});
 
+	// The same switch clears explicit-seek feedback, so a stale success or
+	// correction never lingers past a track change. The entered value stays:
+	// only the outcome belongs to the previous source.
+	$effect(() => {
+		const gotoIdentity = `${current?.id ?? ''}:${current?.streamUrl ?? ''}:${sourceRevision}`;
+		void gotoIdentity;
+		gotoError = '';
+		gotoStatus = '';
+	});
+
 	/**
 	 * Run by the smoke test: fire 10 rapid Range seeks through one
 	 * controller (each aborts its predecessor), then one proving seek.
@@ -1081,9 +1469,12 @@
 	}
 
 	// A swapped-in element starts at 1x: re-apply the persisted speed.
+	// `apply` verifies against the element, so reconcile the display to
+	// the actual rate it reports (a rejecting/clamping element must not
+	// leave a false selection on screen).
 	$effect(() => {
 		audioEl;
-		speed?.apply();
+		if (speed) speedValue = String(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
@@ -1122,8 +1513,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.current());
-		speed.apply();
+		speedValue = String(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
@@ -1179,6 +1569,9 @@
 			// A copy settling after teardown must not resurrect state.
 			shareCopyAlive = false;
 			shareCopyGeneration += 1;
+			queueExportAlive = false;
+			queueExportGeneration += 1;
+			releaseQueueDownload();
 			window.removeEventListener('pagehide', persistOnPageHide);
 			clearInterval(tickId);
 			clearMediaSession();
@@ -1278,6 +1671,7 @@
 			ontimeupdate={handleTrackTime}
 			onloadedmetadata={handleTrackTime}
 			ondurationchange={handleTrackTime}
+			onratechange={handleNativeRateChange}
 		></audio>
 	{/key}
 
@@ -1364,6 +1758,37 @@
 		</button>
 	</div>
 
+	<!-- Explicit seek for the synthetic demo track: a native form so Enter
+	     submits it and typing never reaches the global transport keymap. -->
+	<div>
+		<form
+			class="goto-form"
+			onsubmit={(event) => {
+				event.preventDefault();
+				submitGotoTime();
+			}}
+		>
+			<label for="player-goto-input">Go to time</label>
+			<input
+				id="player-goto-input"
+				type="text"
+				name="goto-time"
+				autocomplete="off"
+				spellcheck="false"
+				data-testid="player-goto-time"
+				bind:value={gotoValue}
+				aria-describedby={gotoError ? `${GOTO_HINT_ID} ${GOTO_ERROR_ID}` : GOTO_HINT_ID}
+				aria-invalid={gotoError ? 'true' : undefined}
+			/>
+			<p id={GOTO_HINT_ID}>Enter seconds, m:ss, or h:mm:ss.</p>
+			<button type="submit" data-testid="player-goto-seek">Seek</button>
+			{#if gotoError}
+				<p data-testid="player-goto-error" id={GOTO_ERROR_ID} role="alert">{gotoError}</p>
+			{/if}
+			<p data-testid="player-goto-status" role="status">{gotoStatus}</p>
+		</form>
+	</div>
+
 	<div>
 		<button
 			type="button"
@@ -1399,6 +1824,7 @@
 			bind:this={shortcutsDialogEl}
 			data-testid="shortcuts-dialog"
 			aria-label="Keyboard shortcuts"
+			onkeydown={trapShortcutsTab}
 			oncancel={(event) => {
 				event.preventDefault();
 				closeShortcuts();
@@ -1418,12 +1844,55 @@
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>
+		<p data-testid="queue-announcement" role="status">{queueAnnouncement}</p>
+		<div class="queue-export">
+			<div class="queue-export-actions">
+				<button
+					type="button"
+					data-testid="queue-export-copy"
+					disabled={queue.tracks.length === 0}
+					aria-describedby="queue-export-scope queue-export-status"
+					onclick={(event) => {
+						event.currentTarget.focus();
+						void copyQueueText();
+					}}
+				>
+					Copy queue as text
+				</button>
+				<button
+					type="button"
+					data-testid="queue-export-download"
+					disabled={queue.tracks.length === 0}
+					aria-describedby="queue-export-scope queue-export-status"
+					onclick={downloadQueueM3U}
+				>
+					Download queue.m3u
+				</button>
+			</div>
+			<p id="queue-export-scope">Whole queue, in arranged order. Track IDs only in M3U — no audio or stream links.</p>
+			<p id="queue-export-status" data-testid="queue-export-status" aria-live="polite">
+				{queue.tracks.length === 0 ? 'Nothing to export: the track list is empty. Add a track first.' : queueExportStatus}
+			</p>
+			{#if queueExportFallback !== null}
+				<label for="queue-export-fallback-field">Queue as text</label>
+				<textarea
+					id="queue-export-fallback-field"
+					data-testid="queue-export-fallback"
+					readonly
+					rows="4"
+					value={queueExportFallback}
+					aria-describedby="queue-export-instructions"
+				></textarea>
+				<p id="queue-export-instructions" data-testid="queue-export-instructions">
+					Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or Cmd+C).
+					On touch screens, long-press the text, select all and choose Copy.
+				</p>
+			{/if}
+		</div>
 		<ShuffleUpcoming
 			state={queue}
 			radioActive={radio !== null}
-			onshuffle={() => {
-				if (!radio) queue = shuffleUpcoming(queue);
-			}}
+			onshuffle={shuffleQueueUpcoming}
 		/>
 		<!--
 			Queue-only filter: transient presentation state. It hides rows but
@@ -1459,7 +1928,7 @@
 						data-testid="queue-move-up-{track.id}"
 						aria-label="Move {track.title} up"
 						disabled={index === 0}
-						onclick={() => (queue = moveTrack(queue, index, index - 1))}
+						onclick={() => moveQueuedTrack(index, index - 1)}
 					>
 						Up
 					</button>
@@ -1468,9 +1937,35 @@
 						data-testid="queue-move-down-{track.id}"
 						aria-label="Move {track.title} down"
 						disabled={index === queue.tracks.length - 1}
-						onclick={() => (queue = moveTrack(queue, index, index + 1))}
+						onclick={() => moveQueuedTrack(index, index + 1)}
 					>
 						Down
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to top"
+						disabled={index === 0}
+						onclick={() => moveQueuedTrack(index, 0)}
+					>
+						Move to top
+					</button>
+					<button
+						type="button"
+						aria-label="Move {track.title} to bottom"
+						disabled={index === queue.tracks.length - 1}
+						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
+					>
+						Move to bottom
+					</button>
+					<button
+						type="button"
+						class="queue-play-next"
+						data-testid="queue-play-next-{track.id}"
+						aria-label="Play {track.title} next"
+						disabled={radio !== null}
+						onclick={(event) => void playNextAt(index, event.currentTarget)}
+					>
+						Play next
 					</button>
 				</li>
 			{/each}
@@ -1501,28 +1996,47 @@
 		</ul>
 	</section>
 
-	<section data-testid="recently-played" aria-label="Recently played">
+	<section data-testid="recently-played" aria-label="Recently played" bind:this={recentSection}>
 		<h2>Recently played</h2>
 		<p>
 			Demo session history — synthetic demo tracks only. Clearing the queue never wipes this
 			list; only Clear below does.
 		</p>
+		<p role="status">{recentFeedback}</p>
 		{#if recentTracks.length === 0}
 			<p data-testid="recently-played-empty">
 				Nothing played yet this demo session — press play to start your recent list.
 			</p>
 		{:else}
 			<ol>
-				{#each recentTracks as row (row.trackId)}
-					<li data-testid="recent-item" data-track-id={row.trackId}>
-						{row.title} — {row.artist}
+				{#each recentTracks as row, index (row.trackId)}
+					<li class="recent-row" data-testid="recent-item" data-track-id={row.trackId}>
+						{row.title}{#if row.artist} — {row.artist}{/if}
 						<span data-testid="recent-played-at-{row.trackId}">{recentLabel(row.playedAt)}</span>
+						{#if row.available}
+							<button
+								type="button"
+								data-testid="recent-replay-{row.trackId}"
+								onclick={() => replayRecent(row.trackId)}
+							>
+								Replay {row.title}
+							</button>
+							<button
+								type="button"
+								aria-label={`Add ${row.title} to queue`}
+								onclick={() => enqueueRecent(row.trackId)}
+							>
+								Add to queue
+							</button>
+						{/if}
 						<button
 							type="button"
-							data-testid="recent-replay-{row.trackId}"
-							onclick={() => replayRecent(row.trackId)}
+							aria-label={row.available
+								? `Forget ${row.title} from recent history`
+								: `Forget unavailable entry ${row.trackId} from recent history`}
+							onclick={() => forgetRecent(row, index)}
 						>
-							Replay {row.title}
+							Forget this entry
 						</button>
 					</li>
 				{/each}
@@ -1586,8 +2100,11 @@
 				id="playback-speed"
 				data-testid="playback-speed"
 				value={speedValue}
-				onchange={(event) => handleSpeedChange(event.currentTarget.value)}
+				onchange={(event) => handleSpeedChange(event.currentTarget)}
 			>
+				{#if showCustomSpeed}
+					<option value={speedValue}>{speedValue}x</option>
+				{/if}
 				<option value="0.5">0.5x</option>
 				<option value="0.75">0.75x</option>
 				<option value="1">1x</option>
@@ -1596,6 +2113,9 @@
 				<option value="1.75">1.75x</option>
 				<option value="2">2x</option>
 			</select>
+			{#if speedFeedback}
+				<p data-testid="speed-status" role="status">{speedFeedback}</p>
+			{/if}
 		</div>
 	</section>
 
@@ -1606,11 +2126,57 @@
 </main>
 
 <style>
+	.queue-export {
+		margin-block: var(--nt-space-3);
+	}
+
+	.queue-export-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2);
+	}
+
+	.queue-export button {
+		min-height: 2.75rem;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	.queue-export p {
+		margin-block: var(--nt-space-2);
+	}
+
+	#queue-export-scope {
+		color: var(--nt-fg-muted);
+	}
+
+	.queue-export textarea {
+		display: block;
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
 	/* The mode choice keeps a visible focus ring under programmatic focus
 	   too, where the global :focus-visible rule does not apply. */
 	#track-time-mode:focus {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
+	}
+
+	.queue-play-next {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
 	}
 
 	/* Queue-only filter row: wraps on narrow screens, touch-sized
@@ -1644,5 +2210,46 @@
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
+	}
+
+	/* Explicit-seek form: same wrap/shrink contract as the queue filter
+	   row so the entry and Seek stay inside the 360px viewport. */
+	.goto-form {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.goto-form input {
+		flex: 1 1 12rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.goto-form input:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
+
+	.goto-form button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	/* Recently-played row actions: a reachable touch floor on narrow
+	   screens (the row text still wraps, so nothing widens past the
+	   viewport). */
+	.recent-row button {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
 	}
 </style>

@@ -15,6 +15,8 @@ export type ShortcutAction =
 	| 'seek-forward'
 	| 'restart-track'
 	| 'toggle-mute'
+	| 'shuffle-upcoming'
+	| 'cycle-repeat'
 	| 'open-shortcuts'
 	| 'close-shortcuts';
 
@@ -27,6 +29,8 @@ const KEY_BINDINGS: Readonly<Record<string, ShortcutAction>> = {
 	l: 'seek-forward',
 	'0': 'restart-track',
 	m: 'toggle-mute',
+	s: 'shuffle-upcoming',
+	r: 'cycle-repeat',
 	'?': 'open-shortcuts'
 };
 
@@ -41,15 +45,22 @@ export function actionForKey(key: string): ShortcutAction | null {
 }
 
 /**
- * True while the key event targets a typing surface (input, textarea or
- * contenteditable region). `isContentEditable` is inherited, so targets
- * nested inside an editable region are covered too.
+ * True while the key event targets a typing surface (input, textarea,
+ * select/option or contenteditable region). `isContentEditable` is inherited,
+ * so targets nested inside an editable region are covered too. Native
+ * selectors keep type-ahead/Space/arrow ownership; ordinary buttons, audio
+ * and body still permit shortcuts.
  */
 export function isTypingTarget(target: unknown): boolean {
 	if (typeof target !== 'object' || target === null) return false;
 	const candidate = target as { isContentEditable?: unknown; tagName?: unknown };
 	if (candidate.isContentEditable === true) return true;
-	return candidate.tagName === 'INPUT' || candidate.tagName === 'TEXTAREA';
+	return (
+		candidate.tagName === 'INPUT' ||
+		candidate.tagName === 'TEXTAREA' ||
+		candidate.tagName === 'SELECT' ||
+		candidate.tagName === 'OPTION'
+	);
 }
 
 /**
@@ -89,6 +100,8 @@ export const SHORTCUT_ROWS: readonly ShortcutRow[] = [
 	{ key: 'l', label: 'Seek forward 10 seconds' },
 	{ key: '0', label: 'Restart track' },
 	{ key: 'm', label: 'Mute / unmute' },
+	{ key: 's', label: 'Shuffle upcoming tracks' },
+	{ key: 'r', label: 'Cycle repeat: Off / One / Queue' },
 	{ key: '?', label: 'Open this shortcuts dialog' },
 	{ key: 'Escape', label: 'Close this dialog' }
 ];
