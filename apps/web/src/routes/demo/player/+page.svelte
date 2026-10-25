@@ -342,6 +342,8 @@
 	let speed: PlaybackSpeed | null = null;
 	/** Concise failure note when a requested rate does not apply; empty on success. */
 	let speedFeedback = $state('');
+	// Retain a mismatch through the ratechange emitted by the same media write.
+	let speedFeedbackRate: number | null = null;
 	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
 	/** A restored or native non-preset rate renders as its own explicit option. */
 	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
@@ -415,8 +417,10 @@
 		control.value = String(effective);
 		if (effective !== clampPlaybackSpeed(Number(value))) {
 			speedFeedback = `Speed ${value}x not applied — still ${effective}x`;
+			speedFeedbackRate = effective;
 		} else {
 			speedFeedback = '';
+			speedFeedbackRate = null;
 		}
 	}
 
@@ -440,7 +444,10 @@
 		if (!Number.isFinite(nativeRate)) return;
 		const effective = speed.adoptNativeRate(nativeRate);
 		speedValue = String(effective);
-		speedFeedback = '';
+		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+			speedFeedback = '';
+			speedFeedbackRate = null;
+		}
 	}
 
 	/** In-memory Storage stand-in when the browser blocks site storage. */
