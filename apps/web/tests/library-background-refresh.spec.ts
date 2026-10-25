@@ -17,7 +17,7 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  *   is, and never swaps in the full-page loading state. Progress is
  *   signalled on the controls that stay mounted: the Refresh trigger is
  *   disabled while a refresh is in flight, and the library list carries
- *   `aria-busy="true"` until the refresh settles.
+ *   `aria-busy="true"` and a visible refreshing status until the refresh settles.
  * - Queue selection and Next stay usable while a refresh is pending.
  * - A fresh payload with the same ids updates queued display entries
  *   (corrected title/artist) without reordering the queue or moving the
@@ -236,9 +236,12 @@ test('background refresh keeps the loaded list and queue mounted while the refre
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('player-next')).toBeEnabled();
 	await expect(page.getByText('Loading your library…')).toHaveCount(0);
+	const refreshing = page.getByRole('status').filter({ hasText: 'Refreshing your library…' });
+	await expect(refreshing).toBeVisible();
 
 	await hold.releaseJson(ITEMS);
 	await expect(list).not.toHaveAttribute('aria-busy', 'true');
+	await expect(refreshing).toHaveCount(0);
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 });
 
@@ -270,6 +273,7 @@ test('background refresh preserves DOM node identity and row focus for surviving
 	expect(await keptMarks(queued)).toEqual(['kept', 'kept']);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).not.toHaveAttribute('aria-busy', 'true');
 	await expect(focusTarget).toBeFocused();
 	expect(await keptMarks(rows)).toEqual(['kept', 'kept', 'kept']);
 	expect(await keptMarks(queued)).toEqual(['kept', 'kept']);
@@ -314,6 +318,7 @@ test('queue Next stays usable while a background refresh is pending', async ({ p
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).not.toHaveAttribute('aria-busy', 'true');
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 });
@@ -331,6 +336,7 @@ test('selecting a row while a background refresh is pending queues it', async ({
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).not.toHaveAttribute('aria-busy', 'true');
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 });
@@ -378,12 +384,18 @@ test('refresh to a subset drops absent ids and moves current to the first surviv
 	await row(page, 'row-alpha').click();
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
 	await markNodes(page.getByTestId('library-item'));
+	// Only Zulu is marked: index-key reuse would move its node to Alpha.
+	await markNodes(queueItem(page, 'row-zulu'));
+	expect(await keptMarks(page.getByTestId('queue-item'))).toEqual([null, 'kept', null]);
 
 	payload.current = WITHOUT_MIKE;
 	await page.getByRole('button', { name: 'Refresh' }).click();
+	await expect(page.getByTestId('library-list')).not.toHaveAttribute('aria-busy', 'true');
 
 	await expect(page.getByTestId('library-item')).toHaveCount(2);
 	expect(await queueOrder(page)).toEqual(['row-zulu', 'row-alpha']);
+	expect(await keptMarks(queueItem(page, 'row-zulu'))).toEqual(['kept']);
+	expect(await keptMarks(queueItem(page, 'row-alpha'))).toEqual([null]);
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	expect(await ariaCurrent(queueItem(page, 'row-zulu'))).toBe('true');
 	expect(await ariaCurrent(queueItem(page, 'row-alpha'))).toBeNull();
