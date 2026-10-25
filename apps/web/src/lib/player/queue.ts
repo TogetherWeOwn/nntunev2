@@ -149,6 +149,15 @@ export function moveTrack(state: QueueState, from: number, to: number): QueueSta
 	};
 }
 
+/** Jump to either end without changing the current track or allocating on a no-op. */
+export function moveToTop(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, 0);
+}
+
+export function moveToBottom(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, state.tracks.length - 1);
+}
+
 /** One-shot Fisher–Yates over the upcoming suffix; prefix/current stay fixed. */
 export function shuffleUpcoming(state: QueueState, random: () => number = Math.random): QueueState {
 	const start = state.currentIndex + 1;
@@ -229,6 +238,36 @@ export function clearUpcoming(state: QueueState): QueueState {
 		tracks: state.tracks.slice(0, state.currentIndex + 1),
 		currentIndex: state.currentIndex
 	};
+}
+
+/** Keep display metadata on one line, including title/id fallbacks. */
+function exportField(value: string | null | undefined): string {
+	return (value ?? '').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+}
+
+function exportLabel(track: Track): string {
+	const title = exportField(track.title) || exportField(track.id);
+	const artist = exportField(track.artist);
+	return artist ? `${title} — ${artist}` : title;
+}
+
+/** Read-only export of the whole arranged queue, independent of selection. */
+export function formatQueueText(state: QueueState): string {
+	return state.tracks.map((track, index) => `${index + 1}. ${exportLabel(track)}`).join('\n');
+}
+
+/** Preserve identifier-shaped catalogue ids exactly; never turn an id into a URL or directive. */
+function exportTrackId(id: string): string {
+	if (!/^[\p{L}\p{N}_-]+$/u.test(id)) throw new Error('Cannot export an unsafe track id.');
+	return id;
+}
+
+/** Offline list of stable ids, deliberately not a playlist of stream URLs. */
+export function formatQueueM3U(state: QueueState): string {
+	return [
+		'#EXTM3U',
+		...state.tracks.flatMap((track) => [`#EXTINF:-1,${exportLabel(track)}`, exportTrackId(track.id)])
+	].join('\n');
 }
 
 /** In-session persistence (sessionStorage): order + current track id only. */
