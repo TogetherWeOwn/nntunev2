@@ -142,7 +142,7 @@
 	// One-action bulk queue: the same displayed ordered collection the rows
 	// render, so sorting changes what an activation appends. The count names
 	// only missing IDs, never the view's total.
-	const bulkMissing = $derived(orderedItems.filter((track) => !queuedIds.has(track.id)));
+	const bulkMissing = $derived(missingDisplayedTracks(orderedItems, queuedIds));
 	const bulkDisabled = $derived(
 		libraryUnavailable || orderedItems.length === 0 || bulkMissing.length === 0
 	);
@@ -161,6 +161,18 @@
 
 	function trackCountLabel(count: number): string {
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
+	}
+
+	function missingDisplayedTracks(
+		displayed: readonly LibraryItem[],
+		existingIds: ReadonlySet<string>
+	): LibraryItem[] {
+		const knownIds = new Set(existingIds);
+		return displayed.filter((track) => {
+			if (knownIds.has(track.id)) return false;
+			knownIds.add(track.id);
+			return true;
+		});
 	}
 
 	function queuedTrackFor(item: LibraryItem): Track {
@@ -182,18 +194,20 @@
 	}
 
 	/**
-	 * Append every displayed-but-missing track in displayed order. addTrack
-	 * dedupes by ID and preserves the current index, so the existing
-	 * arrangement, current selection and stored metadata survive; repeating
-	 * the activation adds nothing. The count names only the missing IDs this
-	 * activation appended — metadata-only, never audible playback.
+	 * Append every displayed-but-missing track in displayed order. The
+	 * deduplicated snapshot preserves addTrack's append/current-index semantics
+	 * in one immutable queue update, so the existing arrangement, current
+	 * selection and stored metadata survive; repeating the activation adds
+	 * nothing. The count names only the missing IDs this activation appended —
+	 * metadata-only, never audible playback.
 	 */
 	function addDisplayedTracksToQueue(): void {
-		const missing = orderedItems.filter((track) => !queuedIds.has(track.id));
+		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		let next = queue;
-		for (const item of missing) next = addTrack(next, queuedTrackFor(item));
-		replaceQueue(next);
+		replaceQueue({
+			tracks: [...queue.tracks, ...missing.map(queuedTrackFor)],
+			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
+		});
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
 	}
 
