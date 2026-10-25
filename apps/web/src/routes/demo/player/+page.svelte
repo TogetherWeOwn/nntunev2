@@ -1650,7 +1650,7 @@
 				Sleep after duration
 			</button>
 			{#if minutesError}
-				<p id="sleep-minutes-error" class="sleep-error">{minutesError}</p>
+				<p id="sleep-minutes-error" class="sleep-error" role="alert">{minutesError}</p>
 			{/if}
 		</div>
 		<div>
@@ -1676,7 +1676,7 @@
 				Sleep after N tracks
 			</button>
 			{#if tracksError}
-				<p id="sleep-tracks-error" class="sleep-error">{tracksError}</p>
+				<p id="sleep-tracks-error" class="sleep-error" role="alert">{tracksError}</p>
 			{/if}
 		</div>
 		<div>
