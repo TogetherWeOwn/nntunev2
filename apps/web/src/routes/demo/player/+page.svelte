@@ -1523,7 +1523,7 @@
 			</div>
 			<p id="queue-export-scope">Whole queue, in arranged order. Track IDs only in M3U — no audio or stream links.</p>
 			<p id="queue-export-status" data-testid="queue-export-status" aria-live="polite">
-				{queue.tracks.length === 0 ? 'Queue is empty. Add a track to copy or download it.' : queueExportStatus}
+				{queue.tracks.length === 0 ? 'Nothing to export: the track list is empty. Add a track first.' : queueExportStatus}
 			</p>
 			{#if queueExportFallback !== null}
 				<label for="queue-export-fallback-field">Queue as text</label>
