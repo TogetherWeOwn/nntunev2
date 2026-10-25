@@ -22,12 +22,14 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
+	import { filterLibraryItems } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
 		appendSelection,
 		clearSelection,
 		createSelection,
+		hiddenSelectedCount,
 		pruneSelection,
 		selectionCountLabel,
 		toggleSelected
@@ -53,6 +55,13 @@
 	let items: LibraryItem[] = $state([]);
 	let order: LibraryOrder = $state('original');
 	const orderedItems = $derived(orderLibraryItems(items, order));
+	/**
+	 * Transient find-in-loaded-tracks query. Presentation-only: it filters
+	 * the already-ordered rows below without fetching, queueing, starring
+	 * or persisting anything. Cleared only at the account/auth boundary;
+	 * same-account refreshes (including failed ones) preserve it.
+	 */
+	let findQuery = $state('');
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -68,6 +77,10 @@
 	 * selectFavoriteItems projection; the queue never sees it.
 	 */
 	let view: 'all' | 'favorites' = $state('all');
+	const displayedItems = $derived(
+		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+	);
+	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery));
 	let viewSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
@@ -82,6 +95,12 @@
 	 * append or a boundary purge.
 	 */
 	let selectedIds: string[] = $state(createSelection());
+	const hiddenSelectionCount = $derived(
+		hiddenSelectedCount(
+			selectedIds,
+			visibleItems.map((track) => track.id)
+		)
+	);
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let refreshButton: HTMLButtonElement | null = $state(null);
@@ -120,6 +139,7 @@
 			// Successful same-account refreshes keep items and keep the query.
 			if (state.loadError && state.items.length === 0) {
 				queueFilterQuery = '';
+				findQuery = '';
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
@@ -197,11 +217,6 @@
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
-	// Transient Favorites-only projection: an immutable subset of the already
-	// ordered rows by stable id. Filters after ordering; the queue never sees it.
-	const displayedItems = $derived(
-		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
-	);
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
 	const favoriteTracks = $derived(
@@ -318,6 +333,13 @@
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
+	function clearFind(): void {
+		findQuery = '';
+		if (typeof document !== 'undefined') {
+			document.getElementById('library-find')?.focus({ preventScroll: true });
+		}
+	}
+
 	/**
 	 * Shelf unstar: remove one id from the full visit state (hidden ids ride
 	 * along untouched) and persist the whole set through the existing saver.
@@ -419,6 +441,7 @@
 			favorites = [];
 			favoritesInitialized = false;
 			queueFilterQuery = '';
+			findQuery = '';
 			view = 'all';
 			confirmClear = false;
 			managementFeedback = '';
@@ -434,6 +457,7 @@
 		favorites = [];
 		favoritesInitialized = false;
 		queueFilterQuery = '';
+		findQuery = '';
 		view = 'all';
 		confirmClear = false;
 		managementFeedback = '';
@@ -557,6 +581,23 @@
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
+			<div class="nt-library-find">
+				<label for="library-find">Find in loaded tracks</label>
+				<input
+					id="library-find"
+					type="search"
+					bind:value={findQuery}
+					aria-describedby="library-find-hint"
+				/>
+				<p id="library-find-hint">
+					Searches only the tracks already loaded here, not the remote catalog.
+				</p>
+				{#if findQuery !== ''}
+					<button class="nt-button" type="button" onclick={clearFind}>
+						Clear search
+					</button>
+				{/if}
+			</div>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
 				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
@@ -575,9 +616,9 @@
 					<option value="favorites">Favorites only</option>
 				</select>
 			</div>
-			<p>
-				{displayedItems.length} of {items.length}
-				{displayedItems.length === 1 ? 'track' : 'tracks'}
+			<p data-testid="library-find-count">
+				Showing {visibleItems.length} of {items.length}
+				{visibleItems.length === 1 ? 'track' : 'tracks'}
 			</p>
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
@@ -601,9 +642,20 @@
 				{#if appendFeedback}
 					<p data-testid="append-result" role="status">{appendFeedback}</p>
 				{/if}
+				{#if hiddenSelectionCount > 0}
+					<p data-testid="selection-hidden-count">
+						{hiddenSelectionCount} selected {hiddenSelectionCount === 1 ? 'track is' : 'tracks are'} hidden by this {view === 'all' ? 'find' : 'view'}.
+					</p>
+				{/if}
 			</div>
+			{#if displayedItems.length > 0 && visibleItems.length === 0}
+				<p>No matches in your loaded tracks.</p>
+				<button class="nt-button" type="button" onclick={clearFind}>
+					Clear search
+				</button>
+			{:else}
 			<ul data-testid="library-list">
-				{#each displayedItems as track (track.id)}
+				{#each visibleItems as track (track.id)}
 					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<input
@@ -643,6 +695,7 @@
 					</li>
 				{/each}
 			</ul>
+			{/if}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -709,6 +762,28 @@
 </main>
 
 <style>
+	.nt-library-find {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-find input {
+		box-sizing: border-box;
+		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find p {
+		flex-basis: 100%;
+		margin: 0;
+		color: var(--nt-fg-muted);
+	}
 	.nt-player-identity {
 		overflow-wrap: anywhere;
 	}
