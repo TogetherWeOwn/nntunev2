@@ -23,8 +23,19 @@ function pageScript(search: string) {
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
-	const body = parsed.statements.filter((statement) => !ts.isImportDeclaration(statement))
-		.map((statement) => statement.getText(parsed)).join('\n');
+	// Presentation projections are lazy in Svelte and unused by these handlers.
+	// Do not eagerly evaluate them as plain JavaScript: unrelated view imports
+	// added by a base merge must not become dependencies of this state machine.
+	const body = parsed.statements.filter((statement) => {
+		if (ts.isImportDeclaration(statement)) return false;
+		if (!ts.isVariableStatement(statement)) return true;
+		return !statement.declarationList.declarations.some((declaration) => {
+			const value = declaration.initializer;
+			return value && ts.isCallExpression(value) &&
+				(value.expression.getText(parsed) === '$derived' ||
+				 value.expression.getText(parsed) === '$derived.by');
+		});
+	}).map((statement) => statement.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
