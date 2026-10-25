@@ -221,6 +221,7 @@
 			? favorites.filter((favorite) => favorite !== id)
 			: [...favorites, id];
 		favorites = next;
+		favoritesAnnouncement = '';
 		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 	}
 

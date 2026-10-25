@@ -95,25 +95,35 @@ function pageScript() {
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
-			refresh, selectTrack, moveQueuedTrack,
+			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
 			handleAuthTransition, handleLocalAuthTransition,
 			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
-			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); }
+			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); },
+			setFavoriteAnnouncementForFixture: (announcement) => {
+				favoritesAnnouncement = announcement;
+			}
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
 		selectTrack: (id: string) => void;
 		moveQueuedTrack: (from: number, to: number) => void;
+		toggleFavorite: (id: string) => void;
 		handleAuthTransition: (event: Pick<StorageEvent, 'key'>) => void;
 		handleLocalAuthTransition: () => void;
 		emptyQueueWithoutEdit: () => void;
+		setFavoriteAnnouncementForFixture: (announcement: string) => void;
 		read: () => {
 			queue: queueFunctions.QueueState;
 			announcement: string;
 			items: { id: string; title?: string }[];
 			loadError: string | null;
+		};
+		readFavorites: () => {
+			favorites: string[];
+			announcement: string;
 		};
 	};
 }
@@ -154,3 +164,17 @@ for (const boundary of ['storage', 'local'] as const) {
 		expect(page.read().announcement).toBe('');
 	});
 }
+
+test('favorite membership edits clear a prior arrangement announcement', () => {
+	const page = pageScript();
+	page.setFavoriteAnnouncementForFixture('Mike Song moved to 2 of 3');
+
+	page.toggleFavorite('row-mike');
+
+	expect(page.readFavorites()).toEqual({ favorites: ['row-mike'], announcement: '' });
+
+	page.setFavoriteAnnouncementForFixture('Mike Song moved to 1 of 1');
+	page.toggleFavorite('row-mike');
+
+	expect(page.readFavorites()).toEqual({ favorites: [], announcement: '' });
+});
