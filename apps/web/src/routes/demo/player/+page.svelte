@@ -32,7 +32,11 @@
 	} from '#lib/player/mediaSession.js';
 	import { createPlayback, endedForCurrent } from '#lib/player/playback.js';
 	import { createRadioOrder, parseRadioSeed } from '#lib/player/radio.js';
-	import { createPlaybackSpeed, type PlaybackSpeed } from '#lib/player/playbackSpeed.js';
+	import {
+		clampPlaybackSpeed,
+		createPlaybackSpeed,
+		type PlaybackSpeed
+	} from '#lib/player/playbackSpeed.js';
 	import { createResumeStore, type ResumeStore } from '#lib/player/resume.js';
 	import {
 		createRecentlyPlayedStore,
@@ -341,12 +345,23 @@
 	let tracksEl: HTMLInputElement | undefined = $state();
 	let speedValue = $state('1');
 	let speed: PlaybackSpeed | null = null;
+	/** Concise failure note when a requested rate does not apply; empty on success. */
+	let speedFeedback = $state('');
+	// Retain a mismatch through the ratechange emitted by the same media write.
+	let speedFeedbackRate: number | null = null;
+	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
+	/** A restored or native non-preset rate renders as its own explicit option. */
+	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
 
 	// Session-local recently-played list (demo synthetic tracks only; the
 	// store itself is fail-soft, so a corrupt key renders the empty state).
 	let recentStore: RecentlyPlayedStore | null = null;
 	let recentEntries = $state<RecentEntry[]>([]);
+	// Polite action-only feedback for history Add/Forget: empty until the
+	// first activation, never set on load, play, seek or timeupdate.
+	let recentFeedback = $state('');
+	let recentSection: HTMLElement | undefined = $state();
 
 	// The test hook advances the same clock the live interval ticks, so
 	// duration paths stay deterministic without a second timer.
@@ -454,9 +469,53 @@
 		refreshSleepRemaining();
 	}
 
-	function handleSpeedChange(value: string): void {
-		speedValue = value;
-		speed?.set(Number(value));
+	function handleSpeedChange(control: HTMLSelectElement): void {
+		const value = control.value;
+		if (!speed) {
+			speedValue = value;
+			return;
+		}
+		// The store verifies against the element and returns the actual
+		// applied rate: the selection names that rate, never the request.
+		const effective = speed.set(Number(value));
+		speedValue = String(effective);
+		// A rejected request leaves state unchanged, so one-way
+		// `value={speedValue}` would keep showing the refused choice: revert
+		// the control itself to the verified rate.
+		control.value = String(effective);
+		if (effective !== clampPlaybackSpeed(Number(value))) {
+			speedFeedback = `Speed ${value}x not applied — still ${effective}x`;
+			speedFeedbackRate = effective;
+		} else {
+			speedFeedback = '';
+			speedFeedbackRate = null;
+		}
+	}
+
+	/**
+	 * Reconcile a native-control rate change to state, display and
+	 * best-effort persistence. Reads only: never writes back into the
+	 * element (no feedback loop) and never implies play or seek. Detached,
+	 * stale, throwing or non-finite readings are ignored so they cannot
+	 * poison the last verified preference.
+	 */
+	function handleNativeRateChange(event: Event): void {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		if (!element || element !== audioEl || !element.isConnected) return;
+		if (!speed) return;
+		let nativeRate: number;
+		try {
+			nativeRate = element.playbackRate;
+		} catch {
+			return;
+		}
+		if (!Number.isFinite(nativeRate)) return;
+		const effective = speed.adoptNativeRate(nativeRate);
+		speedValue = String(effective);
+		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+			speedFeedback = '';
+			speedFeedbackRate = null;
+		}
 	}
 
 	/** In-memory Storage stand-in when the browser blocks site storage. */
@@ -510,19 +569,22 @@
 	interface RecentRow extends RecentEntry {
 		title: string;
 		artist: string;
+		/** False for stale ids outside the demo catalogue: shown as unavailable, never resolved to another track. */
+		available: boolean;
 	}
 
 	/**
 	 * Rendered rows: entries resolved against the demo catalogue. Unknown ids
-	 * stay stored (the cap counts them) but render nothing, so a seeded or
-	 * stale key can never show a non-demo title.
+	 * stay stored (the cap counts them) and render an honest unavailable row
+	 * with no playback or queue actions, so a seeded or stale key can never
+	 * show a non-demo title.
 	 */
 	function toRecentRows(entries: RecentEntry[]): RecentRow[] {
-		return entries.flatMap((entry) => {
+		return entries.map((entry) => {
 			const track = DEMO_TRACKS.find((candidate) => candidate.id === entry.trackId);
 			return track === undefined
-				? []
-				: [{ ...entry, title: track.title, artist: track.artist }];
+				? { ...entry, title: 'Unavailable track', artist: '', available: false }
+				: { ...entry, title: track.title, artist: track.artist, available: true };
 		});
 	}
 
@@ -560,6 +622,56 @@
 			index = queue.tracks.length - 1;
 		}
 		selectAt(index);
+	}
+
+	/**
+	 * Append a history entry to the queue without touching playback: no
+	 * play, seek, source change or restart, and no history rewrite. Uses
+	 * the shared addTrack semantics (append only if missing), so a repeat
+	 * activation is an explained no-op. Unknown ids never resolve to
+	 * another track.
+	 */
+	function enqueueRecent(trackId: string): void {
+		const deck = DEMO_TRACKS.find((track) => track.id === trackId);
+		if (!deck) {
+			recentFeedback = 'That history entry is unavailable.';
+			return;
+		}
+		if (queue.tracks.some((track) => track.id === trackId)) {
+			recentFeedback = `${deck.title} is already in the queue.`;
+			return;
+		}
+		queue = addTrack(queue, deck);
+		if (status === 'empty') status = 'selected';
+		recentFeedback = `Added ${deck.title} to the queue.`;
+	}
+
+	/** Forget one history entry: queue, current media and resume are untouched. */
+	function forgetRecent(row: RecentRow, removedIndex: number): void {
+		if (!recentStore) return;
+		recentStore.forget(row.trackId);
+		refreshRecent();
+		recentFeedback = row.available
+			? `Forgot ${row.title} from recent history.`
+			: 'Forgot the unavailable entry from recent history.';
+		void focusAfterForget(removedIndex);
+	}
+
+	/**
+	 * Keep keyboard focus on an enabled surviving history control after a
+	 * row is removed: the row taking the removed slot, else the last row's
+	 * first action, else Clear when the list is empty.
+	 */
+	async function focusAfterForget(removedIndex: number): Promise<void> {
+		await tick();
+		const section = recentSection;
+		if (!section) return;
+		const rows = section.querySelectorAll('li[data-testid="recent-item"]');
+		const targetRow = rows[Math.min(removedIndex, rows.length - 1)];
+		const target =
+			targetRow?.querySelector('button:not([disabled])') ??
+			section.querySelector('[data-testid="recently-played-clear"]');
+		(target as HTMLElement | null)?.focus?.();
 	}
 
 	// A source gets its own element: an event queued by the browser before
@@ -1159,9 +1271,12 @@
 	}
 
 	// A swapped-in element starts at 1x: re-apply the persisted speed.
+	// `apply` verifies against the element, so reconcile the display to
+	// the actual rate it reports (a rejecting/clamping element must not
+	// leave a false selection on screen).
 	$effect(() => {
 		audioEl;
-		speed?.apply();
+		if (speed) speedValue = String(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
@@ -1200,8 +1315,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.current());
-		speed.apply();
+		speedValue = String(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
@@ -1376,6 +1490,7 @@
 			ontimeupdate={handleTrackTime}
 			onloadedmetadata={handleTrackTime}
 			ondurationchange={handleTrackTime}
+			onratechange={handleNativeRateChange}
 		></audio>
 	{/key}
 
@@ -1599,28 +1714,47 @@
 		</ul>
 	</section>
 
-	<section data-testid="recently-played" aria-label="Recently played">
+	<section data-testid="recently-played" aria-label="Recently played" bind:this={recentSection}>
 		<h2>Recently played</h2>
 		<p>
 			Demo session history — synthetic demo tracks only. Clearing the queue never wipes this
 			list; only Clear below does.
 		</p>
+		<p role="status">{recentFeedback}</p>
 		{#if recentTracks.length === 0}
 			<p data-testid="recently-played-empty">
 				Nothing played yet this demo session — press play to start your recent list.
 			</p>
 		{:else}
 			<ol>
-				{#each recentTracks as row (row.trackId)}
-					<li data-testid="recent-item" data-track-id={row.trackId}>
-						{row.title} — {row.artist}
+				{#each recentTracks as row, index (row.trackId)}
+					<li class="recent-row" data-testid="recent-item" data-track-id={row.trackId}>
+						{row.title}{#if row.artist} — {row.artist}{/if}
 						<span data-testid="recent-played-at-{row.trackId}">{recentLabel(row.playedAt)}</span>
+						{#if row.available}
+							<button
+								type="button"
+								data-testid="recent-replay-{row.trackId}"
+								onclick={() => replayRecent(row.trackId)}
+							>
+								Replay {row.title}
+							</button>
+							<button
+								type="button"
+								aria-label={`Add ${row.title} to queue`}
+								onclick={() => enqueueRecent(row.trackId)}
+							>
+								Add to queue
+							</button>
+						{/if}
 						<button
 							type="button"
-							data-testid="recent-replay-{row.trackId}"
-							onclick={() => replayRecent(row.trackId)}
+							aria-label={row.available
+								? `Forget ${row.title} from recent history`
+								: `Forget unavailable entry ${row.trackId} from recent history`}
+							onclick={() => forgetRecent(row, index)}
 						>
-							Replay {row.title}
+							Forget this entry
 						</button>
 					</li>
 				{/each}
@@ -1700,8 +1834,11 @@
 				id="playback-speed"
 				data-testid="playback-speed"
 				value={speedValue}
-				onchange={(event) => handleSpeedChange(event.currentTarget.value)}
+				onchange={(event) => handleSpeedChange(event.currentTarget)}
 			>
+				{#if showCustomSpeed}
+					<option value={speedValue}>{speedValue}x</option>
+				{/if}
 				<option value="0.5">0.5x</option>
 				<option value="0.75">0.75x</option>
 				<option value="1">1x</option>
@@ -1710,6 +1847,9 @@
 				<option value="1.75">1.75x</option>
 				<option value="2">2x</option>
 			</select>
+			{#if speedFeedback}
+				<p data-testid="speed-status" role="status">{speedFeedback}</p>
+			{/if}
 		</div>
 	</section>
 
@@ -1793,5 +1933,13 @@
 		margin: 0;
 		color: var(--nt-bad);
 		overflow-wrap: anywhere;
+	}
+
+	/* Recently-played row actions: a reachable touch floor on narrow
+	   screens (the row text still wraps, so nothing widens past the
+	   viewport). */
+	.recent-row button {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
 	}
 </style>
