@@ -225,7 +225,7 @@
 			aria-current={index === selectedIndex ? 'true' : undefined}
 			tabindex={index === selectedIndex ? -1 : undefined}
 		>
-			{displayTitle(track)}{#if track.artist} — {track.artist}{/if}
+			{displayTitle(track)}{#if track.artist}{' — '}{track.artist}{/if}
 			<button
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
