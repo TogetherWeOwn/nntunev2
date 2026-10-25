@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 const AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 const AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
+const QUEUE_KEY = 'nntune.library.queue.v1';
 const ITEMS = [{ id: 'builder-track', title: 'Builder Song' }];
 
 async function seedLibrary(page: Page): Promise<void> {
@@ -27,19 +28,21 @@ test('ghost-only stored favorites show the empty shelf without a bulk queue acti
 	await expect(page.getByTestId('favorites-section').getByRole('button', { name: 'Queue favorites' })).toHaveCount(0);
 });
 
-test('bulk queue activations never write to browser storage', async ({ page }) => {
+type StorageCall = { storage: string; method: string; args: string[] };
+
+test('bulk queue activations only persist the arranged queue in session storage', async ({ page }) => {
 	await seedLibrary(page);
 	await page.getByTestId('library-item').getByRole('button', { name: 'Star Builder Song' }).click();
 
-	// Start after fixture writes; keep the real storage methods so even
-	// transient or idempotent persistence during queueing is observable.
+	// Observe every storage method, including idempotent calls. Queue persistence
+	// is expected; favorites/local storage and unrelated session keys stay untouched.
 	await page.evaluate(() => {
-		const calls: string[] = [];
-		(window as unknown as { storageCalls: string[] }).storageCalls = calls;
+		const calls: StorageCall[] = [];
+		(window as unknown as { storageCalls: StorageCall[] }).storageCalls = calls;
 		for (const method of ['setItem', 'removeItem', 'clear'] as const) {
 			const original = Storage.prototype[method];
 			Storage.prototype[method] = function (this: Storage, ...args: string[]) {
-				calls.push(`${this === window.localStorage ? 'local' : 'session'}:${method}`);
+				calls.push({ storage: this === window.localStorage ? 'local' : 'session', method, args });
 				return Reflect.apply(original, this, args);
 			};
 		}
@@ -51,8 +54,13 @@ test('bulk queue activations never write to browser storage', async ({ page }) =
 	await action.click();
 	await expect(page.getByTestId('queue-announcement')).toContainText(/queued 0.*1 already queued/i);
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
-	const calls = await page.evaluate(() => (window as unknown as { storageCalls: string[] }).storageCalls);
-	expect(calls).toEqual([]);
+	const calls = await page.evaluate(() => (window as unknown as { storageCalls: StorageCall[] }).storageCalls);
+	const snapshot = JSON.stringify({ orderIds: ['builder-track'], currentId: 'builder-track' });
+	expect(calls.length).toBeGreaterThan(0);
+	for (const call of calls) {
+		expect(call).toEqual({ storage: 'session', method: 'setItem', args: [QUEUE_KEY, snapshot] });
+	}
+	expect(await page.evaluate((key) => window.sessionStorage.getItem(key), QUEUE_KEY)).toBe(snapshot);
 });
 
 test('the bulk queue outcome cannot survive an account-boundary retry', async ({ page }) => {

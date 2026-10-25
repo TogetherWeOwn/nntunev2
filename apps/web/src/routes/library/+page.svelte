@@ -248,7 +248,7 @@
 		if (favoriteTracks.length === 0) return;
 		const before = queue.tracks.length;
 		// Use the shelf's resolved star order and the same deduping path as
-		// individual taps. No persistence, playback, or account lookup here.
+		// individual taps, including queue persistence. No playback or account lookup here.
 		for (const track of favoriteTracks) selectTrack(track.id);
 		const added = queue.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
