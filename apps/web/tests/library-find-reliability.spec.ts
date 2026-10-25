@@ -107,3 +107,59 @@ test('[LF-R-HIDDEN] find discloses the exact hidden selection and clears only th
 	await expect(betaChoice).toBeChecked();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 });
+
+test('[LF-R-FAVORITES] find intersects Favorites only and each reset preserves the other filter', async ({
+	page
+}) => {
+	let requests = 0;
+	await page.route('**/api/library', (route) => {
+		requests += 1;
+		return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(ITEMS) });
+	});
+	await page.goto('/library');
+	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await page.locator('[data-testid="library-item"][data-id="find-beta"]')
+		.getByRole('button', { name: 'Star Beta Song', exact: true }).click();
+	await page.getByRole('checkbox', { name: 'Select Private Previous Account Text', exact: true }).check();
+	await page.getByRole('checkbox', { name: 'Select Beta Song', exact: true }).check();
+	const stored = await page.evaluate(() => Object.entries(window.localStorage));
+
+	const view = page.getByRole('combobox', { name: 'Show', exact: true });
+	const field = page.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
+	const count = page.getByTestId('library-find-count');
+	const hidden = page.getByTestId('selection-hidden-count');
+	await expect(view).toBeVisible();
+	await expect(field).toBeVisible();
+	await view.selectOption('favorites');
+	await expect(page.getByTestId('library-item')).toHaveAttribute('data-id', 'find-beta');
+	await expect(count).toHaveText('Showing 1 of 2 track');
+	await expect(hidden).toHaveText('1 selected track is hidden by this view.');
+
+	await field.fill('private');
+	await expect(page.getByTestId('library-item')).toHaveCount(0);
+	await expect(count).toHaveText('Showing 0 of 2 tracks');
+	await expect(hidden).toHaveText('2 selected tracks are hidden by this view.');
+	await expect(page.getByText('No matches in your loaded tracks.', { exact: true })).toBeVisible();
+	await expect(page.getByText('No favorites in this list.', { exact: false })).toHaveCount(0);
+
+	await view.selectOption('all');
+	await expect(field).toHaveValue('private');
+	await expect(page.getByTestId('library-item')).toHaveAttribute('data-id', 'find-private');
+	await view.selectOption('favorites');
+	await page.getByRole('button', { name: 'Clear search', exact: true }).first().click();
+	await expect(field).toHaveValue('');
+	await expect(field).toBeFocused();
+	await expect(view).toHaveValue('favorites');
+	await expect(page.getByTestId('library-item')).toHaveAttribute('data-id', 'find-beta');
+	await expect(count).toHaveText('Showing 1 of 2 track');
+	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
+
+	await view.selectOption('all');
+	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+	await expect(hidden).toHaveCount(0);
+	await expect(page.getByRole('checkbox', { name: 'Select Private Previous Account Text', exact: true })).toBeChecked();
+	await expect(page.getByRole('checkbox', { name: 'Select Beta Song', exact: true })).toBeChecked();
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	expect(await page.evaluate(() => Object.entries(window.localStorage))).toEqual(stored);
+	expect(requests).toBe(1);
+});
