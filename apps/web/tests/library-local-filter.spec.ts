@@ -31,8 +31,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * never the queue's "Clear queue"); the no-match reset is actionable; the
  * loaded-tracks disclaimer is programmatically associated with the field
  * (label, aria-label, labelledby or describedby — a nearby order hint must not
- * satisfy it). There is deliberately NO Play All / Add displayed / batch
- * action: LF-00 and LF-01 assert its absence before and after the bundle.
+ * satisfy it). LF-00 and LF-01 prohibit Play All and unsupported batch actions
+ * before and after the bundle. Only the independently approved metadata-only
+ * "Add displayed tracks to queue" action is exempt; finding never queues tracks.
  *
  * Case IDs (stable): LF-00 control, LF-01 bundle, LF-02 title, LF-03 artist +
  * id fallback, LF-04 literals + folding + reset, LF-05 presentation-only,
@@ -247,9 +248,11 @@ test('LF-00 control: API order and gesture-order queue work before find lands', 
 	await row(page, 'filter-zulu').click();
 	await expectQueue(page, ['filter-alpha', 'filter-zulu'], 'filter-alpha', 'Alpha Song');
 	expect(api.requests()).toBe(1);
-	// Finding must never grow a batch action.
+	// Finding must not add a batch action beyond the approved displayed-track action.
 	await expect(
-		page.getByRole('button', { name: /play all|add all|enqueue all|add displayed|queue all/i })
+		page.getByRole('button', {
+			name: /^(?!Add displayed tracks to queue$).*(?:play all|add all|enqueue all|add displayed|queue all)/i
+		})
 	).toHaveCount(0);
 });
 
@@ -268,7 +271,9 @@ test('LF-01 bundle: labeled find field, clear control, counts and loaded-tracks 
 	await expectMatchCounts(page, 1, 8);
 	await expectCatalogDisclaimer(page);
 	await expect(
-		page.getByRole('button', { name: /play all|add all|enqueue all|add displayed|queue all/i })
+		page.getByRole('button', {
+			name: /^(?!Add displayed tracks to queue$).*(?:play all|add all|enqueue all|add displayed|queue all)/i
+		})
 	).toHaveCount(0);
 });
 
