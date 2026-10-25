@@ -85,7 +85,7 @@ test('removing the last visible row focuses the no-matches status, not the body'
 	await expect(status).toBeFocused();
 	await expect(status).toBeVisible();
 	await expect(status).toHaveAttribute('tabindex', '-1');
-	await expect(status).toContainText(/no matches/i);
+	await expect(status).toHaveText('No matches in this queue');
 	const tag = await status.evaluate((el) => el.tagName);
 	expect(tag).not.toMatch(/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/);
 	const ring = await status.evaluate((el) => {
@@ -96,7 +96,7 @@ test('removing the last visible row focuses the no-matches status, not the body'
 		);
 	});
 	expect(ring).toBe(true);
-	expect(page.getByTestId('queue-empty-focus')).toHaveCount(0);
+	await expect(page.getByTestId('queue-empty-focus')).toHaveCount(0);
 	await expect(page.getByTestId('queue-announcement')).toHaveText(
 		'Zulu Song removed from the queue.'
 	);
