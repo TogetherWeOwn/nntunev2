@@ -20,6 +20,13 @@
 		favoriteIds?: ReadonlySet<string>;
 		ontogglefavorite?: (id: string) => void;
 		/**
+		 * Metadata-only direct selection: the host applies the validated
+		 * selectTrack transition and owns the announcement; the panel reports
+		 * the ORIGINAL queue index once and never mutates, transports or
+		 * fetches. Each Select control renders only when provided.
+		 */
+		onselect?: (index: number) => void;
+		/**
 		 * Trim intents, same contract: the host applies the transition and
 		 * owns the announcement; the panel reports once and never mutates.
 		 * Each control renders only when its callback is provided.
@@ -59,6 +66,7 @@
 		onplaynext,
 		onremove,
 		onclear,
+		onselect,
 		favoriteIds = new Set<string>(),
 		ontogglefavorite,
 		onkeepcurrentandupcoming,
@@ -156,14 +164,32 @@
 			currentRowElement()?.focus({ preventScroll: true });
 		}
 	}
+
+	/**
+	 * Report one direct-selection intent with the ORIGINAL queue coordinate.
+	 * Runs only on explicit activation — prop-only updates never reach here,
+	 * so background refreshes cannot steal focus. A detached button (removed
+	 * row) or an identity mismatch (stale closure over a reused slot) reports
+	 * nothing, so a removed identity can never select its replacement. The
+	 * host validates again and applies the selectTrack transition.
+	 */
+	function reportSelect(event: Event, index: number, trackId: string): void {
+		const button = event.currentTarget;
+		if (!(button instanceof HTMLButtonElement)) return;
+		if (!button.isConnected) return;
+		if (!onselect) return;
+		if (queue.tracks[index]?.id !== trackId) return;
+		if (!Number.isInteger(index) || index < 0 || index >= queue.tracks.length) return;
+		onselect(index);
+	}
 </script>
 
 <!--
 	Reusable queue panel: renders a `QueueState` from the queue store with
 	the same hooks the demo player and the queue-order specs rely on.
-	The host page owns selection, transport (via `onnext`) and management
-	(via `onmove`/`onplaynext`/`onremove`/`onclear`); the panel itself never
-	mutates state.
+	The host page owns selection (via `onselect`), transport (via `onnext`)
+	and management (via `onmove`/`onplaynext`/`onremove`/`onclear`); the
+	panel itself never mutates state.
 -->
 <p data-testid="now-playing" role={liveRegions ? 'status' : undefined}>
 	{#if current}
@@ -279,6 +305,15 @@
 			>
 				Remove
 			</button>
+			{#if onselect}
+				<button
+					type="button"
+					aria-label="Select {displayTitle(track)}"
+					onclick={(event) => reportSelect(event, index, track.id)}
+				>
+					Select
+				</button>
+			{/if}
 		</li>
 	{/each}
 </ol>
