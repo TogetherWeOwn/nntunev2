@@ -453,17 +453,20 @@ test('QF-B12 a newer Tab movement wins over an older removal focus', async ({ pa
 	const doomed = rowButton(page, 'row-mike', 'Remove Mike Song from queue');
 	await expect(doomed).toBeVisible();
 	await doomed.focus();
-	// Tab past zulu Star and Up to Down. Up becomes disabled when Mike is
-	// removed; Down stays enabled, so this pins recency rather than
-	// disabled-control fallout while keeping native favorites tab stops.
-	await page.keyboard.press('Tab');
-	await page.keyboard.press('Tab');
-	await page.keyboard.press('Tab');
+	// Traverse native tab stops (including optional row controls) to Zulu Down.
+	// Up becomes disabled when Mike is removed; Down stays enabled, so this
+	// pins recency rather than disabled-control fallout. Fail if unreachable.
+	const newer = rowButton(page, 'row-zulu', 'Move Zulu Song down');
+	const maxTabs = 20;
+	for (let tabs = 0; tabs < maxTabs; tabs += 1) {
+		await page.keyboard.press('Tab');
+		if (await newer.evaluate((button) => button === document.activeElement)) break;
+	}
+	await expect(newer, `Zulu Down must receive keyboard focus within ${maxTabs} Tabs`).toBeFocused();
 	const identity = await activeIdentity(page);
 	expect(identity.tag).toBe('BUTTON');
 	expect(identity.label).toBe('Move Zulu Song down');
-	const newer = page.getByRole('button', { name: identity.label, exact: true });
-	await expect(newer).toBeFocused();
+	expect(identity.track).toBe('row-zulu');
 	await expect(newer).toBeEnabled();
 
 	await doomed.dispatchEvent('click');
