@@ -66,6 +66,7 @@
 		moveTrack,
 		naturalEndPolicy,
 		nextTrack,
+		playNext,
 		previousTrack,
 		restoreQueue,
 		selectTrack,
@@ -939,6 +940,25 @@
 		if (nextId !== undefined && shouldResume) seekToResume(nextId);
 	}
 
+	async function playNextAt(index: number, control: HTMLButtonElement): Promise<void> {
+		// Radio owns what plays next (radio.order), so reordering the resting
+		// queue would announce a move the button cannot fulfil. ShuffleUpcoming
+		// disables itself the same way; the button mirrors it below.
+		if (radio) return;
+		const track = queue.tracks[index];
+		const reordered = playNext(queue, index);
+		// Current/already-next requests leave even the previous announcement alone.
+		if (reordered === queue || !track) return;
+		queue = reordered;
+		queueMoveAnnouncement = {
+			queue,
+			text: `${track.title} moved to position ${reordered.currentIndex + 2} of ${reordered.tracks.length}`
+		};
+		// A keyed row can move in the DOM without keeping browser focus.
+		await tick();
+		control.focus({ preventScroll: true });
+	}
+
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
 		const wasEmpty = queue.tracks.length === 0;
 		queue = addTrack(queue, track);
@@ -970,6 +990,41 @@
 		shortcutsDialogEl?.close();
 		shortcutsOpen = false;
 		shortcutsOpener?.focus();
+	}
+
+	// Explicit Tab wrap for the shortcuts dialog. Native showModal keeps the
+	// background inert, but Chromium does not cycle Tab past the dialog's
+	// last/first control: focus falls back to body instead of wrapping,
+	// which KEYSAFE-B11 pins as a failure (same workaround as PaywallModal
+	// wrapTab, which documents the stutter). Cycling the rendered controls
+	// here restores the documented trap in every browser. Scoped to this
+	// dialog only: page tab order and modified chords pass through, and an
+	// already-handled Tab keeps its prior ownership.
+	function trapShortcutsTab(event: KeyboardEvent): void {
+		if (event.key !== 'Tab') return;
+		if (event.defaultPrevented) return;
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const root = shortcutsDialogEl;
+		if (!root) return;
+		const controls = [...root.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])'
+		)].filter((control) => control.getClientRects().length > 0);
+		if (controls.length === 0) {
+			event.preventDefault();
+			return;
+		}
+		const first = controls[0];
+		const last = controls[controls.length - 1];
+		const active = document.activeElement;
+		if (event.shiftKey) {
+			if (active === first || !root.contains(active)) {
+				event.preventDefault();
+				last.focus();
+			}
+		} else if (active === last || !root.contains(active)) {
+			event.preventDefault();
+			first.focus();
+		}
 	}
 
 	function togglePlayShortcut(): void {
@@ -1004,14 +1059,21 @@
 		sound = actual;
 	}
 
-	// Usable-media gate shared by the jump and restart controls: the
-	// current element is read at activation and unusable media (no current
-	// track, non-finite or negative time, non-finite duration) refuses
-	// quietly instead of throwing through the UI or reporting a seek that
-	// never happened.
+	// Usable-media gate shared by the jump, restart and keyboard seeks:
+	// the current element is read at activation and unusable media (no
+	// current track, stale source, non-finite or negative time, non-finite
+	// or non-positive duration) refuses quietly instead of throwing through
+	// the UI or reporting a seek that never happened.
 	function seekCoordinates(): { element: HTMLAudioElement } | null {
 		const el = audioEl;
 		if (!el || !current) return null;
+		try {
+			// Same-task navigation changes the queue before the keyed element
+			// swaps: a src mismatch is the previous track, never seek it.
+			if (el.getAttribute('src') !== current.streamUrl) return null;
+		} catch {
+			return null;
+		}
 		let position = Number.NaN;
 		let bound = Number.NaN;
 		try {
@@ -1020,7 +1082,13 @@
 		} catch {
 			// An unreadable element is unusable media: refuse below.
 		}
-		if (!Number.isFinite(position) || position < 0 || !Number.isFinite(bound)) return null;
+		if (
+			!Number.isFinite(position) ||
+			position < 0 ||
+			!Number.isFinite(bound) ||
+			bound <= 0
+		)
+			return null;
 		return { element: el };
 	}
 
@@ -1053,6 +1121,76 @@
 		}
 	}
 
+	// Explicit "Go to time" seek: the form reuses the shared timestamp
+	// parser (seconds, m:ss, h:mm:ss — the same grammar as inbound share
+	// links), then independently guards finite range, live duration and
+	// the current matching element before writing currentTime. Every
+	// refusal explains itself inline; nothing clamps, autoplays or moves
+	// focus into a modal.
+	const GOTO_HINT_ID = 'player-goto-hint';
+	const GOTO_ERROR_ID = 'player-goto-error-text';
+	let gotoValue = $state('');
+	let gotoError = $state('');
+	let gotoStatus = $state('');
+
+	function submitGotoTime(): void {
+		// Each submission replaces prior feedback: a refusal clears an
+		// older success and a success clears an older refusal.
+		gotoError = '';
+		gotoStatus = '';
+		const seconds = parseTimestampParam(gotoValue);
+		if (
+			seconds === null ||
+			!Number.isFinite(seconds) ||
+			seconds < 0 ||
+			seconds > Number.MAX_SAFE_INTEGER
+		) {
+			gotoError = 'Enter a valid time in seconds, m:ss, or h:mm:ss.';
+			return;
+		}
+		const el = audioEl;
+		if (!el || !current) {
+			gotoError = 'No track is selected, so there is no media to seek. Add or select a track first.';
+			return;
+		}
+		// The bound element must still be the live one for this track: a
+		// detached node or a source swap since render is unavailable media,
+		// never a stale reference to write through.
+		if (!el.isConnected || !endedForCurrent(el, current.streamUrl)) {
+			gotoError = 'Track media is not available right now. Wait for it to load and try again.';
+			return;
+		}
+		// Duration is read from the live element at submission, never from
+		// a cached coordinate: it can shrink or go unknown after editing.
+		let duration = Number.NaN;
+		try {
+			duration = el.duration;
+		} catch {
+			duration = Number.NaN;
+		}
+		if (!Number.isFinite(duration) || duration < 0) {
+			gotoError = 'Duration is unavailable — the track has not loaded enough to seek yet.';
+			return;
+		}
+		// An explicit out-of-range request is corrected, never clamped.
+		if (seconds > duration) {
+			gotoError = 'That time is past the end of this track. Enter a time within the duration.';
+			return;
+		}
+		try {
+			el.currentTime = seconds;
+			// An exact-end seek during active or pending playback must become an
+			// intentional pause before native completion can advance the queue.
+			if (seconds >= duration && (status === 'playing' || status === 'loading')) pauseCurrent();
+		} catch {
+			// The setter refused (a non-seekable resource): report honestly
+			// and never echo decoder internals into the page.
+			gotoError = 'Could not seek this track. Try again once it is playing.';
+			return;
+		}
+		gotoStatus = `Seeked to ${seconds} seconds.`;
+	}
+
 
 	function handleVolumeChange(event: Event & { currentTarget: HTMLAudioElement }): void {
 		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
@@ -1072,12 +1210,17 @@
 
 	// Global transport keymap. Escape closes our dialog first so a modal
 	// guard can never wedge it; every other binding yields to typing
-	// surfaces, open modals and modified chords. Handled bindings suppress
-	// their keydown default: the digit binding would otherwise also drive
-	// native select type-ahead (the 0.5x/0.75x speed options start with
-	// 0), so one keystroke would restart the track AND halve the speed.
+	// surfaces, open modals and modified chords. Cancelled or composing keys
+	// keep native ownership: no preventDefault and no player mutation.
+	// Handled bindings suppress their keydown default: the digit binding
+	// would otherwise also drive native select type-ahead (the 0.5x/0.75x
+	// speed options start with 0), so one keystroke would restart the track
+	// AND halve the speed.
 	function handleGlobalKeydown(event: KeyboardEvent): void {
 		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		// Prior ownership wins: a cancelled event was already handled, and an
+		// isComposing or legacy 229 key belongs to the IME, not the player.
+		if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
 		const action = actionForKey(event.key);
 		if (!action) return;
 		if (action === 'close-shortcuts') {
@@ -1099,10 +1242,11 @@
 				userPrevious();
 				break;
 			case 'seek-back':
-				seekShortcut(-SEEK_SECONDS);
+				// Same validated/clamped gate as the visible jump controls.
+				seekButton(-SEEK_SECONDS);
 				break;
 			case 'seek-forward':
-				seekShortcut(SEEK_SECONDS);
+				seekButton(SEEK_SECONDS);
 				break;
 			case 'restart-track':
 				restartCurrent();
@@ -1266,6 +1410,16 @@
 		shareCopyGeneration += 1;
 		shareCopyStatus = '';
 		shareCopyFallbackUrl = null;
+	});
+
+	// The same switch clears explicit-seek feedback, so a stale success or
+	// correction never lingers past a track change. The entered value stays:
+	// only the outcome belongs to the previous source.
+	$effect(() => {
+		const gotoIdentity = `${current?.id ?? ''}:${current?.streamUrl ?? ''}:${sourceRevision}`;
+		void gotoIdentity;
+		gotoError = '';
+		gotoStatus = '';
 	});
 
 	/**
@@ -1582,6 +1736,37 @@
 		</button>
 	</div>
 
+	<!-- Explicit seek for the synthetic demo track: a native form so Enter
+	     submits it and typing never reaches the global transport keymap. -->
+	<div>
+		<form
+			class="goto-form"
+			onsubmit={(event) => {
+				event.preventDefault();
+				submitGotoTime();
+			}}
+		>
+			<label for="player-goto-input">Go to time</label>
+			<input
+				id="player-goto-input"
+				type="text"
+				name="goto-time"
+				autocomplete="off"
+				spellcheck="false"
+				data-testid="player-goto-time"
+				bind:value={gotoValue}
+				aria-describedby={gotoError ? `${GOTO_HINT_ID} ${GOTO_ERROR_ID}` : GOTO_HINT_ID}
+				aria-invalid={gotoError ? 'true' : undefined}
+			/>
+			<p id={GOTO_HINT_ID}>Enter seconds, m:ss, or h:mm:ss.</p>
+			<button type="submit" data-testid="player-goto-seek">Seek</button>
+			{#if gotoError}
+				<p data-testid="player-goto-error" id={GOTO_ERROR_ID} role="alert">{gotoError}</p>
+			{/if}
+			<p data-testid="player-goto-status" role="status">{gotoStatus}</p>
+		</form>
+	</div>
+
 	<div>
 		<button
 			type="button"
@@ -1617,6 +1802,7 @@
 			bind:this={shortcutsDialogEl}
 			data-testid="shortcuts-dialog"
 			aria-label="Keyboard shortcuts"
+			onkeydown={trapShortcutsTab}
 			oncancel={(event) => {
 				event.preventDefault();
 				closeShortcuts();
@@ -1750,6 +1936,16 @@
 						onclick={() => moveQueuedTrack(index, queue.tracks.length - 1)}
 					>
 						Move to bottom
+					</button>
+					<button
+						type="button"
+						class="queue-play-next"
+						data-testid="queue-play-next-{track.id}"
+						aria-label="Play {track.title} next"
+						disabled={radio !== null}
+						onclick={(event) => void playNextAt(index, event.currentTarget)}
+					>
+						Play next
 					</button>
 				</li>
 			{/each}
@@ -1955,6 +2151,14 @@
 		outline-offset: 2px;
 	}
 
+	.queue-play-next {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
 	/* Queue-only filter row: wraps on narrow screens, touch-sized
 	   controls, same contract as the library PlayerQueue panel. */
 	.queue-filter {
@@ -1983,6 +2187,39 @@
 	}
 
 	.queue-filter button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	/* Explicit-seek form: same wrap/shrink contract as the queue filter
+	   row so the entry and Seek stay inside the 360px viewport. */
+	.goto-form {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2);
+	}
+
+	.goto-form input {
+		flex: 1 1 12rem;
+		min-width: 0;
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.goto-form input:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
+
+	.goto-form button {
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
