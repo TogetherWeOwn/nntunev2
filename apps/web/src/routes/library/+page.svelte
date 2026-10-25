@@ -24,12 +24,14 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
+	import { filterLibraryItems } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
 		appendSelection,
 		clearSelection,
 		createSelection,
+		hiddenSelectedCount,
 		pruneSelection,
 		selectionCountLabel,
 		toggleSelected
@@ -49,12 +51,20 @@
 		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
-		type QueueState
+		type QueueState,
+		type Track
 	} from '#lib/player/queue.js';
 
 	let items: LibraryItem[] = $state([]);
 	let order: LibraryOrder = $state('original');
 	const orderedItems = $derived(orderLibraryItems(items, order));
+	/**
+	 * Transient find-in-loaded-tracks query. Presentation-only: it filters
+	 * the already-ordered rows below without fetching, queueing, starring
+	 * or persisting anything. Cleared only at the account/auth boundary;
+	 * same-account refreshes (including failed ones) preserve it.
+	 */
+	let findQuery = $state('');
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -70,6 +80,10 @@
 	 * selectFavoriteItems projection; the queue never sees it.
 	 */
 	let view: 'all' | 'favorites' = $state('all');
+	const displayedItems = $derived(
+		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+	);
+	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery));
 	let viewSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
@@ -84,8 +98,15 @@
 	 * append or a boundary purge.
 	 */
 	let selectedIds: string[] = $state(createSelection());
+	const hiddenSelectionCount = $derived(
+		hiddenSelectedCount(
+			selectedIds,
+			visibleItems.map((track) => track.id)
+		)
+	);
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
+	let queueAnnouncementVersion = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -138,6 +159,7 @@
 			// Successful same-account refreshes keep items and keep the query.
 			if (state.loadError && state.items.length === 0) {
 				queueFilterQuery = '';
+				findQuery = '';
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
@@ -218,13 +240,18 @@
 	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
+	// One-action bulk queue: the same displayed ordered collection the rows
+	// render, so sorting or filtering changes what an activation appends. The
+	// count names only missing IDs, never the view's total.
+	const bulkMissing = $derived(missingDisplayedTracks(visibleItems, queuedIds));
+	const bulkDisabled = $derived(
+		libraryUnavailable || visibleItems.length === 0 || bulkMissing.length === 0
+	);
+	const bulkAllQueued = $derived(
+		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
+	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
-	// Transient Favorites-only projection: an immutable subset of the already
-	// ordered rows by stable id. Filters after ordering; the queue never sees it.
-	const displayedItems = $derived(
-		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
-	);
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
 	const favoriteTracks = $derived(
@@ -235,6 +262,29 @@
 
 	function trackCountLabel(count: number): string {
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
+	}
+
+	function missingDisplayedTracks(
+		displayed: readonly LibraryItem[],
+		existingIds: ReadonlySet<string>
+	): LibraryItem[] {
+		const knownIds = new Set(existingIds);
+		return displayed.filter((track) => {
+			if (knownIds.has(track.id)) return false;
+			knownIds.add(track.id);
+			return true;
+		});
+	}
+
+	function queuedTrackFor(item: LibraryItem): Track {
+		// No stream URL until the streaming slice: playback wiring is out of
+		// scope, so the queue carries library display fields only.
+		return {
+			id: item.id,
+			title: displayTitle(item),
+			artist: displayArtist(item) ?? '',
+			streamUrl: ''
+		};
 	}
 
 	function selectTrack(id: string): void {
@@ -252,6 +302,24 @@
 				streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl })
 			})
 		);
+	}
+
+	/**
+	 * Append every displayed-but-missing track in displayed order. The
+	 * deduplicated snapshot preserves addTrack's append/current-index semantics
+	 * in one immutable queue update, so the existing arrangement, current
+	 * selection and stored metadata survive; repeating the activation adds
+	 * nothing. The count names only the missing IDs this activation appended —
+	 * metadata-only, never audible playback.
+	 */
+	function addDisplayedTracksToQueue(): void {
+		const missing = bulkMissing;
+		if (missing.length === 0) return;
+		replaceQueue({
+			tracks: [...queue.tracks, ...missing.map(queuedTrackFor)],
+			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
+		});
+		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
 	}
 
 	function queueFavorites(): void {
@@ -412,6 +480,48 @@
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
+	function removeQueuedTrack(index: number): void {
+		const removed = queue.tracks[index];
+		if (removed === undefined) return;
+		const next = removeTrack(queue, index);
+		// Announce real removals only, including distinct tracks with equal
+		// titles: the version refreshes the content inside the stable region.
+		if (next === queue) return;
+		const title = removed.title?.trim() ? removed.title : removed.id;
+		queue = next;
+		queueAnnouncement = `${title} removed from the queue.`;
+		queueAnnouncementVersion += 1;
+	}
+
+	function clearQueuedTracks(): void {
+		const next = clearQueue(queue);
+		// Announce real clears only: a no-op clear must not chatter the live
+		// region.
+		if (next === queue) return;
+		queue = next;
+		queueAnnouncement = 'Queue cleared.';
+		queueAnnouncementVersion += 1;
+	}
+
+	/**
+	 * Metadata-only direct selection: apply the validated selectTrack
+	 * transition on the ORIGINAL queue coordinate, preserving every track id
+	 * and arrangement. Never transport, audio, storage, provider or stream
+	 * language. Reselecting the current row is an observable no-op that keeps
+	 * the existing feedback; stale or invalid coordinates select nothing.
+	 */
+	function selectQueuedTrack(index: number): void {
+		if (!Number.isInteger(index) || index < 0 || index >= queue.tracks.length) return;
+		if (index === queue.currentIndex) return;
+		const target = queue.tracks[index];
+		if (target === undefined) return;
+		const selected = selectQueueIndex(queue, index);
+		if (selected === queue) return;
+		queue = selected;
+		const title = target.title?.trim() ? target.title : target.id;
+		queueAnnouncement = `Selected ${title}`;
+	}
+
 	function trimPreviousTracks(): void {
 		const trimmed = keepCurrentAndUpcoming(queue);
 		// Announce real trims only: a no-op trim must not chatter the live
@@ -466,6 +576,13 @@
 	function starLabel(track: LibraryItem): string {
 		const title = displayTitle(track);
 		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
+	}
+
+	function clearFind(): void {
+		findQuery = '';
+		if (typeof document !== 'undefined') {
+			document.getElementById('library-find')?.focus({ preventScroll: true });
+		}
 	}
 
 	/**
@@ -570,6 +687,7 @@
 			favorites = [];
 			favoritesInitialized = false;
 			queueFilterQuery = '';
+			findQuery = '';
 			view = 'all';
 			confirmClear = false;
 			managementFeedback = '';
@@ -586,6 +704,7 @@
 		favorites = [];
 		favoritesInitialized = false;
 		queueFilterQuery = '';
+		findQuery = '';
 		view = 'all';
 		confirmClear = false;
 		managementFeedback = '';
@@ -727,6 +846,21 @@
 			</div>
 		</section>
 
+		<div class="nt-bulk-queue">
+			<button
+				class="nt-button nt-bulk-queue-action"
+				type="button"
+				disabled={bulkDisabled}
+				aria-describedby={bulkAllQueued ? 'bulk-queue-hint' : undefined}
+				onclick={addDisplayedTracksToQueue}
+			>
+				Add displayed tracks to queue
+			</button>
+			{#if bulkAllQueued}
+				<p id="bulk-queue-hint">All displayed tracks are already in the queue.</p>
+			{/if}
+		</div>
+
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
 			<p><a href="/library/import">Import an NZB</a></p>
@@ -734,12 +868,31 @@
 			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
+			<div class="nt-library-find">
+				<label for="library-find">Find in loaded tracks</label>
+				<input
+					id="library-find"
+					type="search"
+					bind:value={findQuery}
+					aria-describedby="library-find-hint"
+				/>
+				<p id="library-find-hint">
+					Searches only the tracks already loaded here, not the remote catalog.
+				</p>
+				{#if findQuery !== ''}
+					<button class="nt-button" type="button" onclick={clearFind}>
+						Clear search
+					</button>
+				{/if}
+			</div>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
 				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
 					<option value="original">Original order</option>
 					<option value="title">Title A–Z</option>
 					<option value="artist">Artist A–Z</option>
+					<option value="title-desc">Title Z–A</option>
+					<option value="artist-desc">Artist Z–A</option>
 				</select>
 				<span id="library-order-hint">Changes this list only, not your queue.</span>
 			</div>
@@ -750,9 +903,9 @@
 					<option value="favorites">Favorites only</option>
 				</select>
 			</div>
-			<p>
-				{displayedItems.length} of {items.length}
-				{displayedItems.length === 1 ? 'track' : 'tracks'}
+			<p data-testid="library-find-count">
+				Showing {visibleItems.length} of {items.length}
+				{visibleItems.length === 1 ? 'track' : 'tracks'}
 			</p>
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
@@ -776,9 +929,20 @@
 				{#if appendFeedback}
 					<p data-testid="append-result" role="status">{appendFeedback}</p>
 				{/if}
+				{#if hiddenSelectionCount > 0}
+					<p data-testid="selection-hidden-count">
+						{hiddenSelectionCount} selected {hiddenSelectionCount === 1 ? 'track is' : 'tracks are'} hidden by this {view === 'all' ? 'find' : 'view'}.
+					</p>
+				{/if}
 			</div>
+			{#if displayedItems.length > 0 && visibleItems.length === 0}
+				<p>No matches in your loaded tracks.</p>
+				<button class="nt-button" type="button" onclick={clearFind}>
+					Clear search
+				</button>
+			{:else}
 			<ul data-testid="library-list">
-				{#each displayedItems as track (track.id)}
+				{#each visibleItems as track (track.id)}
 					{@const queued = queuedIds.has(track.id)}
 					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
 						<input
@@ -827,6 +991,7 @@
 					</li>
 				{/each}
 			</ul>
+			{/if}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -838,6 +1003,7 @@
 			<PlayerQueue
 				state={queue}
 				announcement={queueAnnouncement}
+				announcementVersion={queueAnnouncementVersion}
 				{favoriteIds}
 				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
@@ -846,8 +1012,9 @@
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
-				onremove={(index) => replaceQueue(removeTrack(queue, index))}
-				onclear={() => replaceQueue(clearQueue(queue))}
+				onremove={removeQueuedTrack}
+				onclear={clearQueuedTracks}
+				onselect={selectQueuedTrack}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
@@ -903,6 +1070,28 @@
 </main>
 
 <style>
+	.nt-library-find {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-find input {
+		box-sizing: border-box;
+		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find p {
+		flex-basis: 100%;
+		margin: 0;
+		color: var(--nt-fg-muted);
+	}
 	.nt-player-identity {
 		overflow-wrap: anywhere;
 	}
@@ -926,6 +1115,22 @@
 		border-radius: var(--nt-radius);
 	}
 	.nt-library-order span {
+		color: var(--nt-fg-muted);
+	}
+	.nt-bulk-queue {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-bulk-queue-action {
+		display: inline-flex;
+		align-items: center;
+		min-height: 2.75rem;
+	}
+	.nt-bulk-queue p {
+		margin: 0;
 		color: var(--nt-fg-muted);
 	}
 	.nt-library-view {

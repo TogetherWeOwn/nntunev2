@@ -24,7 +24,9 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
-	const handlers = new Set(['selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback']);
+	const handlers = new Set([
+		'queuedTrackFor', 'selectTrack', 'replaceQueue', 'queueFavorites', 'clearShareFeedback'
+	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
