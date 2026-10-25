@@ -291,6 +291,24 @@
 			>
 				Down
 			</button>
+			{#if trackCount > 1}
+				<button
+					type="button"
+					aria-label="Move {displayTitle(track)} to top"
+					disabled={index === 0}
+					onclick={() => onmove?.(index, 0)}
+				>
+					Move to top
+				</button>
+				<button
+					type="button"
+					aria-label="Move {displayTitle(track)} to bottom"
+					disabled={index === trackCount - 1}
+					onclick={() => onmove?.(index, trackCount - 1)}
+				>
+					Move to bottom
+				</button>
+			{/if}
 			<button
 				type="button"
 				aria-label="Play {displayTitle(track)} next"
