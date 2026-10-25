@@ -513,12 +513,23 @@
 	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
+			{#if currentTrack}
+				<p class="nt-player-identity" data-testid="library-now-playing">
+					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
+				</p>
+			{/if}
 			<audio data-testid="audio-player" controls src={streamUrl}></audio>
 		</section>
 	{/if}
 </main>
 
 <style>
+	.nt-player-identity {
+		overflow-wrap: anywhere;
+	}
+	audio {
+		max-width: 100%;
+	}
 	.nt-library-order {
 		display: flex;
 		align-items: center;
