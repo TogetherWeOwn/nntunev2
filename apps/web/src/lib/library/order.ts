@@ -2,13 +2,13 @@ import type { LibraryItem } from './cache.js';
 
 export type LibraryOrder = 'original' | 'title' | 'artist';
 
-export function displayTitle(track: LibraryItem): string {
+export function displayTitle(track: Pick<LibraryItem, 'id' | 'title'>): string {
 	const title = track.title;
 	if (typeof title === 'string' && title.trim().length > 0) return title;
 	return track.id;
 }
 
-export function displayArtist(track: LibraryItem): string | null {
+export function displayArtist(track: Pick<LibraryItem, 'id' | 'artist'>): string | null {
 	const artist = track.artist;
 	return typeof artist === 'string' && artist.trim().length > 0 ? artist : null;
 }
