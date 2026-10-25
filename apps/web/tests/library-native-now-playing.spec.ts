@@ -54,7 +54,10 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 			configFile: false,
 			root: decodeURIComponent(new URL('./fixtures/library-now-playing/', import.meta.url).pathname),
 			publicDir: false,
-			resolve: { alias: { '#lib': `${webRoot}src/lib` } },
+			resolve: { alias: {
+				'#lib': `${webRoot}src/lib`,
+				'$app/navigation': decodeURIComponent(new URL('./fixtures/library-now-playing/navigation.ts', import.meta.url).pathname)
+			} },
 			plugins: [{
 				name: 'acceptance-library-queue-input', enforce: 'pre',
 				transform(code, id) {
