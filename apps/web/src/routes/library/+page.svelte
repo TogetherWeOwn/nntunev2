@@ -563,6 +563,8 @@
 					<option value="original">Original order</option>
 					<option value="title">Title A–Z</option>
 					<option value="artist">Artist A–Z</option>
+					<option value="title-desc">Title Z–A</option>
+					<option value="artist-desc">Artist Z–A</option>
 				</select>
 				<span id="library-order-hint">Changes this list only, not your queue.</span>
 			</div>
