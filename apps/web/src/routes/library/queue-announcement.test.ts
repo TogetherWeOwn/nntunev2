@@ -2,10 +2,21 @@ import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary } from '#lib/library/favorites.js';
+import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
+import { filterLibraryItems } from '#lib/library/filter.js';
+import {
+	appendResultLabel,
+	appendSelection,
+	clearSelection,
+	createSelection,
+	hiddenSelectedCount,
+	pruneSelection,
+	selectionCountLabel,
+	toggleSelected
+} from '#lib/library/selection.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw',
@@ -78,10 +89,20 @@ function pageScript() {
 		loadFavorites,
 		saveFavorites,
 		clearFavoritesAtAuthBoundary,
+		selectFavoriteItems,
 		createLibraryRefresher,
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		filterLibraryItems,
+		appendResultLabel,
+		appendSelection,
+		clearSelection,
+		createSelection,
+		hiddenSelectedCount,
+		pruneSelection,
+		selectionCountLabel,
+		toggleSelected,
 		LIBRARY_AUTH_TRANSITION_KEY,
 		subscribeLocalAuthTransition,
 		browserStorage: () => null,
@@ -90,30 +111,43 @@ function pageScript() {
 		clearSignedInEmail: () => {},
 		resolveStreamUrl: () => null,
 		onMount: () => {},
+		tick: () => Promise.resolve(),
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
-			refresh, selectTrack, moveQueuedTrack,
-			handleAuthTransition, handleLocalAuthTransition,
+			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
+			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
 			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
-			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); }
+			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); },
+			setFavoriteAnnouncementForFixture: (announcement) => {
+				favoritesAnnouncement = announcement;
+			}
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
 		selectTrack: (id: string) => void;
 		moveQueuedTrack: (from: number, to: number) => void;
+		toggleFavorite: (id: string) => void;
+		unstarFromShelf: (id: string) => void;
+		confirmClearFavorites: () => void;
 		handleAuthTransition: (event: Pick<StorageEvent, 'key'>) => void;
 		handleLocalAuthTransition: () => void;
 		emptyQueueWithoutEdit: () => void;
+		setFavoriteAnnouncementForFixture: (announcement: string) => void;
 		read: () => {
 			queue: queueFunctions.QueueState;
 			announcement: string;
 			items: { id: string; title?: string }[];
 			loadError: string | null;
+		};
+		readFavorites: () => {
+			favorites: string[];
+			announcement: string;
 		};
 	};
 }
@@ -152,5 +186,63 @@ for (const boundary of ['storage', 'local'] as const) {
 		expect(page.read().items).toEqual([{ id: 'row-bravo', title: 'Bravo Song' }]);
 		expect(page.read().queue.tracks).toEqual([]);
 		expect(page.read().announcement).toBe('');
+	});
+}
+
+test('favorite membership edits clear a prior arrangement announcement', () => {
+	const page = pageScript();
+	page.setFavoriteAnnouncementForFixture('Mike Song moved to 2 of 3');
+
+	page.toggleFavorite('row-mike');
+
+	expect(page.readFavorites()).toEqual({ favorites: ['row-mike'], announcement: '' });
+
+	page.setFavoriteAnnouncementForFixture('Mike Song moved to 1 of 1');
+	page.toggleFavorite('row-mike');
+
+	expect(page.readFavorites()).toEqual({ favorites: [], announcement: '' });
+});
+
+for (const boundary of ['storage', 'local', '401', '403'] as const) {
+	test(`${boundary} boundary clears a previous account's favorite arrangement announcement`, async () => {
+		let status = 200;
+		vi.stubGlobal('fetch', async () => new Response(JSON.stringify(ITEMS), {
+			status,
+			headers: { 'content-type': 'application/json' }
+		}));
+		const page = pageScript();
+		await page.refresh();
+		page.toggleFavorite('row-mike');
+		page.setFavoriteAnnouncementForFixture('Mike Song moved to 2 of 3');
+
+		if (boundary === 'storage') {
+			page.handleAuthTransition({ key: LIBRARY_AUTH_TRANSITION_KEY });
+		} else if (boundary === 'local') {
+			page.handleLocalAuthTransition();
+		} else {
+			status = Number(boundary);
+			await page.refresh();
+		}
+
+		expect(page.readFavorites()).toEqual({ favorites: [], announcement: '' });
+		expect(page.read().items).toEqual([]);
+		expect(page.read().loadError).not.toBeNull();
+	});
+}
+
+for (const edit of ['unstar', 'clear'] as const) {
+	test(`shelf ${edit} clears a prior arrangement announcement`, () => {
+		const page = pageScript();
+		page.toggleFavorite('row-mike');
+		page.toggleFavorite('row-zulu');
+		page.setFavoriteAnnouncementForFixture('Mike Song moved to 2 of 2');
+
+		if (edit === 'unstar') page.unstarFromShelf('row-mike');
+		else page.confirmClearFavorites();
+
+		expect(page.readFavorites()).toEqual({
+			favorites: edit === 'unstar' ? ['row-zulu'] : [],
+			announcement: ''
+		});
 	});
 }
