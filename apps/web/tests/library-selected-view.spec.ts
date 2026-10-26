@@ -617,7 +617,7 @@ test('[SV-B-09] a transient refresh keeps the Selected-only view; a successful o
 
 	h.state.abort = false;
 	payload.current = ITEMS.filter((item) => item.id !== 'sv-zulu');
-	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expectDisplayed(page, ['sv-alpha', 'sv-mike']);
 	await expect(selectionCount(page)).toContainText('2 selected');
 	await expect(page.getByTestId('selection-hidden-count')).toHaveCount(0);
