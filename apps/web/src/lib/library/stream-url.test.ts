@@ -51,7 +51,8 @@ describe('library player wiring', () => {
 	const source = routeSources['../../routes/library/+page.svelte'];
 
 	it('derives the stream URL through resolveStreamUrl', () => {
-		expect(source).toMatch(/resolveStreamUrl\(currentTrack\)/);
+		expect(source).toMatch(/resolveStreamUrl\(audioTrack\)/);
+		expect(source).toMatch(/const audioTrack = \$derived\(currentAudioTrack\(\)\)/);
 	});
 
 	it('renders audio only when a stream URL exists', () => {

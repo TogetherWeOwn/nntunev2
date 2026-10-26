@@ -188,6 +188,51 @@ export function removeTrack(state: QueueState, index: number): QueueState {
 	return { tracks, currentIndex };
 }
 
+/** Visit-local removal receipt; never included in QueueState or serialization. */
+export interface RemovalUndo {
+	readonly track: Track;
+	readonly index: number;
+	readonly before: QueueState;
+	readonly after: QueueState;
+}
+
+/** Reuse the shipped removal transition, retaining only one reversible edit. */
+export function removeTrackWithUndo(
+	state: QueueState,
+	index: number
+): { state: QueueState; undo: RemovalUndo | null } {
+	const after = removeTrack(state, index);
+	if (after === state) return { state, undo: null };
+	return {
+		state: after,
+		undo: { track: state.tracks[index]!, index, before: state, after }
+	};
+}
+
+/**
+ * Restore only an untouched removal result. Compare selection and exact track
+ * objects rather than IDs so refreshed/replaced metadata cannot be resurrected.
+ * The host retires the receipt on edits, even when a later edit returns to the
+ * same arrangement. No queue rebuilding, persistence or transport here.
+ */
+export function undoRemoval(state: QueueState, undo: RemovalUndo | null | undefined): QueueState {
+	if (!undo) return state;
+	const { track, index, before, after } = undo;
+	if (
+		!Number.isInteger(index) ||
+		index < 0 ||
+		index >= before.tracks.length ||
+		before.tracks[index] !== track ||
+		state.currentIndex !== after.currentIndex ||
+		state.tracks.length !== after.tracks.length ||
+		state.tracks.some((survivor, i) => survivor !== after.tracks[i]) ||
+		state.tracks.some((survivor) => survivor.id === track.id)
+	) {
+		return state;
+	}
+	return { tracks: [...before.tracks], currentIndex: before.currentIndex };
+}
+
 /**
  * Move the track at `index` to play immediately after the current track,
  * reusing `moveTrack` so the current track identity is preserved and the

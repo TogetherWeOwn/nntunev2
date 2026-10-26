@@ -1,0 +1,102 @@
+import { expect, test, type Page } from '@playwright/test';
+
+// Builder-owned regressions supplement the protected undo bank. Breaks caught:
+// remounting live media on metadata undo, resurrecting a catalogue-deleted track,
+// and leaving keyboard focus behind a hiding queue filter.
+const ITEMS = [
+	{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' },
+	{ id: 'pine', title: 'Pine Morning', streamUrl: '/test-audio/pine' },
+	{ id: 'ember', title: 'Ember Line', streamUrl: '/test-audio/ember' }
+];
+
+async function seed(page: Page, payload = { current: ITEMS }): Promise<void> {
+	await page.route('**/api/library', (route) => route.fulfill({ json: payload.current }));
+	await page.route('**/test-audio/**', (route) => route.abort());
+	await page.goto('/library');
+	for (const item of ITEMS) {
+		await page.locator(`[data-testid="library-item"][data-id="${item.id}"]`).click();
+	}
+	await expect(page.getByTestId('queue-item')).toHaveCount(3);
+}
+
+const undo = (page: Page) => page.getByRole('button', { name: 'Undo removal of Coral Night', exact: true });
+const remove = (page: Page) => page.getByRole('button', { name: 'Remove Coral Night from queue', exact: true });
+
+test('metadata undo preserves the mounted media source, intent and position', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', {
+			configurable: true,
+			value: { writeText: async (text: string) => { document.documentElement.dataset.copiedLink = text; } }
+		});
+	});
+	await seed(page, { current: [...ITEMS, { id: 'spruce', title: 'Spruce Day', streamUrl: '/test-audio/spruce' }] });
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await audio.evaluate((element: HTMLAudioElement) => {
+		element.setAttribute('data-original-source', 'yes');
+		// A sentinel position catches writes without depending on network media.
+		Object.defineProperty(element, 'currentTime', { configurable: true, value: 12, writable: true });
+		for (const name of ['play', 'pause', 'load'] as const) {
+			Object.defineProperty(element, name, {
+				configurable: true,
+				value: () => { element.setAttribute('data-transport-call', name); }
+			});
+		}
+	});
+	await undo(page).click();
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	await expect(audio).toHaveAttribute('data-original-source', 'yes');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await expect(audio).toHaveJSProperty('currentTime', 12);
+	await expect(audio).toHaveJSProperty('paused', true);
+	await expect(audio).not.toHaveAttribute('data-transport-call');
+	await expect(page.getByTestId('library-now-playing')).toContainText('Pine Morning');
+	await page.getByRole('button', { name: 'Copy link Coral Night', exact: true }).click();
+	await expect.poll(() => page.evaluate(() => {
+		const url = new URL(document.documentElement.dataset.copiedLink!);
+		return { track: url.searchParams.get('track'), t: url.searchParams.get('t') };
+	})).toEqual({ track: 'coral', t: '0' });
+	await page.locator('[data-testid="library-item"][data-id="spruce"]').click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(4);
+	await expect(audio).toHaveAttribute('data-original-source', 'yes');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+});
+
+test('undoing the sole streamed track restores metadata without reloading its source', async ({ page }) => {
+	await seed(page);
+	for (const title of ['Pine Morning', 'Ember Line']) {
+		await page.getByRole('button', { name: `Remove ${title} from queue`, exact: true }).click();
+	}
+	await remove(page).click();
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await undo(page).click();
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+});
+
+test('refresh dropping only the removed track retires undo without touching survivors', async ({ page }) => {
+	const payload = { current: ITEMS };
+	await seed(page, payload);
+	await remove(page).click();
+	await expect(undo(page)).toBeVisible();
+	payload.current = ITEMS.slice(1);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByTestId('library-item')).toHaveCount(2);
+	await expect(undo(page)).toHaveCount(0);
+	await expect(page.getByTestId('queue-item')).toHaveCount(2);
+	await expect(page.getByTestId('queue-announcement')).not.toContainText(/restored/i);
+});
+
+test('keyboard undo reveals a filtered restored row and focuses its Remove control', async ({ page }) => {
+	await page.emulateMedia({ reducedMotion: 'reduce' });
+	await seed(page);
+	await remove(page).click();
+	await page.getByLabel('Filter queue', { exact: true }).fill('pine');
+	await undo(page).focus();
+	await page.keyboard.press('Enter');
+	await expect(page.getByLabel('Filter queue', { exact: true })).toHaveValue('');
+	await expect(remove(page)).toBeFocused();
+	await expect(page.getByTestId('queue-item')).toHaveCount(3);
+});

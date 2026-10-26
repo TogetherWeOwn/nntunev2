@@ -49,7 +49,9 @@
 		moveTrack,
 		nextTrack,
 		playNext,
-		removeTrack,
+		removeTrackWithUndo,
+		undoRemoval,
+		type RemovalUndo,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
 		type QueueState,
@@ -78,6 +80,10 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	let removalUndo: RemovalUndo | null = $state(null);
+	// Undo restores queue metadata, not transport: retain the mounted source
+	// even when the restored selection differs from the audible track.
+	let preservedAudio: { track: Track | null } | null = $state(null);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
@@ -150,6 +156,8 @@
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
+			removalUndo = null;
+			preservedAudio = null;
 			resetShareAtAuthBoundary();
 			favorites = [];
 			favoritesInitialized = false;
@@ -158,6 +166,9 @@
 		},
 		onStateChange: (state) => {
 			items = state.items;
+			if (removalUndo && !state.items.some((track) => track.id === removalUndo?.track.id)) {
+				removalUndo = null;
+			}
 			staleAt = state.staleAt;
 			loading = state.loading;
 			loadError = state.loadError;
@@ -261,7 +272,11 @@
 	const bulkAllQueued = $derived(
 		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
 	);
-	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	function currentAudioTrack(): Track | null {
+		return preservedAudio ? preservedAudio.track : currentTrack;
+	}
+	const audioTrack = $derived(currentAudioTrack());
+	const streamUrl = $derived(resolveStreamUrl(audioTrack));
 	const favoriteIds = $derived(new Set(favorites));
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
@@ -350,9 +365,11 @@
 	 * track title from lingering across the auth-boundary clears below.
 	 */
 	function replaceQueue(next: QueueState): void {
+		if (next !== queue) removalUndo = null;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			preservedAudio = null;
 			clearShareFeedback();
 			pendingShareSeek = null;
 		}
@@ -367,6 +384,8 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		removalUndo = null;
+		preservedAudio = null;
 		clearShareFeedback();
 		pendingShareSeek = null;
 		shareInvalid = false;
@@ -378,7 +397,7 @@
 		const generation = shareGeneration;
 		const item = items.find((track) => track.id === id);
 		if (!item || loading) return;
-		const current = queueCurrentTrack(queue);
+		const current = currentAudioTrack();
 		const seconds =
 			current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
@@ -487,21 +506,34 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
-		queue = reordered;
+		replaceQueue(reordered);
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
 	function removeQueuedTrack(index: number): void {
-		const removed = queue.tracks[index];
-		if (removed === undefined) return;
-		const next = removeTrack(queue, index);
-		// Announce real removals only, including distinct tracks with equal
-		// titles: the version refreshes the content inside the stable region.
-		if (next === queue) return;
+		const result = removeTrackWithUndo(queue, index);
+		if (!result.undo) return;
+		replaceQueue(result.state);
+		removalUndo = result.undo;
+		const removed = result.undo.track;
 		const title = removed.title?.trim() ? removed.title : removed.id;
-		queue = next;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
+	}
+
+	function undoQueuedRemoval(): boolean {
+		const undo = removalUndo;
+		const restored = undoRemoval(queue, undo);
+		removalUndo = null;
+		if (!undo || restored === queue) return false;
+		const audioBefore = currentAudioTrack();
+		replaceQueue(restored);
+		// Null is intentional too: undo never recreates an unloaded source.
+		preservedAudio = { track: audioBefore };
+		const title = undo.track.title?.trim() ? undo.track.title : undo.track.id;
+		queueAnnouncement = `${title.length > 100 ? `${title.slice(0, 99)}…` : title} restored to the queue.`;
+		queueAnnouncementVersion += 1;
+		return true;
 	}
 
 	function clearQueuedTracks(): void {
@@ -509,7 +541,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
-		queue = next;
+		replaceQueue(next);
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
 	}
@@ -528,7 +560,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
-		queue = selected;
+		replaceQueue(selected);
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
 	}
@@ -540,7 +572,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		queue = trimmed;
+		replaceQueue(trimmed);
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -550,7 +582,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
-		queue = trimmed;
+		replaceQueue(trimmed);
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
@@ -1132,6 +1164,8 @@
 				onmove={moveQueuedTrack}
 				onplaynext={(index) => replaceQueue(playNext(queue, index))}
 				onremove={removeQueuedTrack}
+				undoTrack={removalUndo?.track ?? null}
+				onundoremove={undoQueuedRemoval}
 				onclear={clearQueuedTracks}
 				onselect={selectQueuedTrack}
 				onkeepcurrentandupcoming={trimPreviousTracks}
@@ -1168,12 +1202,12 @@
 	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
-			{#if currentTrack}
+			{#if audioTrack}
 				<p class="nt-player-identity" data-testid="library-now-playing">
-					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
+					{displayTitle(audioTrack)}{#if displayArtist(audioTrack)}{' — '}{displayArtist(audioTrack)}{/if}
 				</p>
 			{/if}
-			{#key `${currentTrack?.id}:${streamUrl}`}
+			{#key `${audioTrack?.id}:${streamUrl}`}
 				<audio
 					bind:this={audioEl}
 					data-testid="audio-player"

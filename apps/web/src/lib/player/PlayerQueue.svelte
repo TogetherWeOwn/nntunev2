@@ -15,6 +15,9 @@
 		onmove?: (from: number, to: number) => void;
 		onplaynext?: (index: number) => void;
 		onremove?: (index: number) => void;
+		/** Host-owned visit-local offer. False means no restore and no focus move. */
+		undoTrack?: Track | null;
+		onundoremove?: () => boolean;
 		onclear?: () => void;
 		/** Favorites stay with the library host; other queues omit the intent. */
 		favoriteIds?: ReadonlySet<string>;
@@ -63,6 +66,8 @@
 		onmove,
 		onplaynext,
 		onremove,
+		undoTrack = null,
+		onundoremove,
 		onclear,
 		onselect,
 		favoriteIds = new Set<string>(),
@@ -209,6 +214,23 @@
 		focusEmptyTarget();
 	}
 
+	/** Only explicit, successful undo recovers focus; offering it steals none. */
+	async function reportUndoRemoval(event: Event): Promise<void> {
+		const button = event.currentTarget;
+		const heldFocus = button instanceof HTMLElement && document.activeElement === button;
+		const trackId = undoTrack?.id;
+		const queryBefore = filterQuery;
+		if (!trackId || !onundoremove?.()) return;
+		await tick();
+		if (!focusStranded(heldFocus, button) || filterQuery !== queryBefore) return;
+		if (!queue.tracks.some((track) => track.id === trackId)) return;
+		if (!visibleEntries.some((entry) => entry.track.id === trackId)) {
+			filterQuery = '';
+			await tick();
+		}
+		if (focusStranded(heldFocus, button)) focusRemoveFor(trackId);
+	}
+
 	/**
 	 * Report the clear intent, then land focus on the stable empty target
 	 * instead of the now-disabled Clear button or the body.
@@ -333,6 +355,20 @@
 
 <!-- Keep the live region mounted; refresh only its content for equal-title actions. -->
 <p data-testid="queue-announcement" role={liveRegions ? 'status' : undefined}>{#key announcementVersion}{announcement}{/key}</p>
+
+<!-- Announce the offered action without changing the existing removal outcome. -->
+<div aria-live={liveRegions ? 'polite' : undefined}>
+	{#if undoTrack && onundoremove}
+		<button
+			type="button"
+			class="queue-undo"
+			aria-label={`Undo removal of ${displayTitle(undoTrack)}`}
+			onclick={reportUndoRemoval}
+		>
+			Undo removal
+		</button>
+	{/if}
+</div>
 
 <button
 	type="button"
@@ -501,6 +537,12 @@
 </button>
 
 <style>
+	.queue-undo {
+		min-height: 2.75rem;
+		max-width: 100%;
+		overflow-wrap: anywhere;
+	}
+
 	.queue-filter {
 		display: flex;
 		flex-wrap: wrap;
