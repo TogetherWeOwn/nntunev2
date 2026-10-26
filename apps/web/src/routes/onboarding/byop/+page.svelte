@@ -58,6 +58,12 @@
 	// Step 2: optional indexer.
 	let indexerUrl = $state('');
 	let indexerApiKey = $state('');
+	// Redacted-summary fact only: an indexer counts as configured when both
+	// of its fields are present (the same both-or-neither shape the indexer
+	// validation enforces). The values themselves are never rendered.
+	const indexerConfigured = $derived(
+		indexerUrl.trim().length > 0 && indexerApiKey.trim().length > 0
+	);
 
 	type FieldErrors = ProviderFieldErrors & IndexerFieldErrors;
 	let errors = $state<FieldErrors>({});
@@ -220,6 +226,20 @@
 		} else {
 			void focusFirstError();
 		}
+	}
+
+	// Deliberate skip: dropping the optional indexer must leave nothing
+	// behind to send. Clear both fields (a partial or invalid pair is
+	// abandoned, never validated or submitted), void any tested/save proof
+	// through the same invalidation path as an edit, keep the provider
+	// fields untouched, and move to review without any request.
+	function continueWithoutIndexer() {
+		if (disposed || resetRequired || busy || saveState === 'saved') return;
+		indexerUrl = '';
+		indexerApiKey = '';
+		invalidateTest();
+		errors = {};
+		void goTo(3);
 	}
 
 	async function runTest() {
@@ -543,6 +563,14 @@
 			</label>
 			<button class="nt-button" type="button" onclick={() => backTo(1)}>Back</button>
 			<button class="nt-button" type="submit">Continue</button>
+			<button
+				class="nt-button nt-button--ghost"
+				type="button"
+				onclick={continueWithoutIndexer}
+				disabled={busy || saveState === 'saved' || resetRequired}
+			>
+				Continue without indexer
+			</button>
 		</form>
 	{:else}
 		<section aria-labelledby="byop-step-heading" aria-busy={testState === 'testing' || saveState === 'saving' || reauthState === 'working'}>
@@ -550,6 +578,36 @@
 				We check connectivity to <strong>{host || 'your provider'}</strong> and validate the configuration and addresses{indexerUrl.trim().length > 0 ? ' (including your indexer URL)' : ''}, without storing anything yet.
 				This does not verify provider credentials{indexerUrl.trim().length > 0 ? ' or contact or authenticate to your indexer' : ''}.
 			</p>
+			<div data-testid="byop-review-summary">
+				<h3>Review your settings</h3>
+				<ul class="byop-summary">
+					<li>Provider hostname: {host.trim() || 'your provider'}</li>
+					<li>Port: {port}</li>
+					<li>TLS: {tls ? 'on' : 'off'}</li>
+					<li>Connection limit: {maxConnections}</li>
+					<li>Indexer: {indexerConfigured ? 'configured' : 'not configured'}</li>
+				</ul>
+				<p>
+					Usernames, passwords and API keys are never shown here. This summary only
+					shows what will be checked; it does not mean anything is stored yet.
+				</p>
+			</div>
+			<button
+				class="nt-button nt-button--ghost"
+				type="button"
+				onclick={() => backTo(1)}
+				disabled={busy || saveState === 'saved' || resetRequired}
+			>
+				Edit provider
+			</button>
+			<button
+				class="nt-button nt-button--ghost"
+				type="button"
+				onclick={() => backTo(2)}
+				disabled={busy || saveState === 'saved' || resetRequired}
+			>
+				Edit indexer
+			</button>
 			<button
 				class="nt-button nt-button--ghost"
 				type="button"
@@ -658,5 +716,10 @@
 		border: 1px solid var(--nt-border);
 		border-radius: var(--nt-radius);
 		font: inherit;
+	}
+	.byop-summary {
+		margin: 0;
+		padding-inline-start: 1.25rem;
+		overflow-wrap: anywhere;
 	}
 </style>
