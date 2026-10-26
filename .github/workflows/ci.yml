@@ -225,6 +225,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Fail stalled transfers so checkout's bounded fetch retry can run
+        # instead of consuming the entire job before the offline tests.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: '1'
+          GIT_HTTP_LOW_SPEED_TIME: '60'
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -1071,8 +1076,8 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Ubuntu dependency downloads can consume 17 minutes; the full browser
-    # suite now takes about 21 minutes. Bound both phases with headroom.
+    # Slow Ubuntu dependency downloads can consume 17 minutes; the full
+    # browser suite now takes about 21 minutes. Include cleanup headroom.
     timeout-minutes: 45
     defaults:
       run:
