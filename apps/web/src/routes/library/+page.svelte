@@ -352,15 +352,30 @@
 	 * invalidates it; clearing it here also keeps a previous account's
 	 * track title from lingering across the auth-boundary clears below.
 	 */
+	/**
+	 * A current-source change invalidates the restart outcome and its
+	 * availability snapshot, whichever queue edit caused it — including
+	 * the direct-assign handlers that bypass replaceQueue, so a stale
+	 * "Restarted …" can never describe the new current track.
+	 */
+	function resetRestartOnSourceChange(
+		before: Track | null | undefined,
+		after: Track | null | undefined
+	): void {
+		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			restartCanSeek = false;
+			restartStatus = '';
+		}
+	}
+
 	function replaceQueue(next: QueueState): void {
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			clearShareFeedback();
 			pendingShareSeek = null;
-			restartCanSeek = false;
-			restartStatus = '';
 		}
+		resetRestartOnSourceChange(before, after);
 		queue = next;
 		queueAnnouncement = '';
 	}
@@ -554,7 +569,7 @@
 			const suffix = ` ${title}.`;
 			return words.length + suffix.length <= 99
 				? `${words}${suffix}`
-				: `${words} ${title.slice(0, 98 - words.length)}…`;
+				: `${words} ${title.slice(0, 97 - words.length)}…`;
 		};
 		// The explicit gesture supersedes a pending share seek for this
 		// source even if the native write is refused: later metadata for
@@ -625,6 +640,9 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		// Removing the current row advances the current source; the restart
+		// outcome for the removed track must not carry onto its successor.
+		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
 		queue = next;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
@@ -654,6 +672,9 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		// Direct selection always changes the current source (reselecting
+		// the current row returned above), so restart state resets here.
+		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
 		queue = selected;
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
