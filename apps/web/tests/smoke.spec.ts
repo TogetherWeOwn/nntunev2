@@ -125,8 +125,8 @@ test('contract routes resolve and render their e2e hooks', async ({ page, reques
 	await page.locator('input[name="host"]').fill('news.example.com');
 	await page.locator('input[name="username"]').fill('alice');
 	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await expect(page.getByTestId('byop-test-connection')).toBeVisible();
 
 	await page.goto('/library');
@@ -178,8 +178,8 @@ test('contract byop result hooks render after a mocked connection test', async (
 		await page.getByLabel('Hostname').fill('news.example.test');
 		await page.getByLabel('Username').fill('reader');
 		await page.getByLabel('Password').fill('fixture-password');
-		await page.getByRole('button', { name: 'Continue' }).click();
-		await page.getByRole('button', { name: 'Continue' }).click();
+		await page.getByRole('button', { name: 'Continue', exact: true }).click();
+		await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	}
 
 	await reachTestStep();
@@ -304,10 +304,10 @@ test('provider wizard walks provider, indexer and test steps', async ({ page, re
 	await page.locator('input[name="host"]').fill('news.example.com');
 	await page.locator('input[name="username"]').fill('alice');
 	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 
 	await expect(page.getByText(/indexer improves search/i)).toBeVisible();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 
 	await expect(page.getByRole('heading', { level: 2 })).toContainText('Test the connection');
 	await expect(
@@ -339,10 +339,10 @@ test('wizard hides save until a connection test passes', async ({ page }) => {
 	await page.locator('input[name="host"]').fill('news.example.com');
 	await page.locator('input[name="username"]').fill('alice');
 	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 
 	await expect(page.getByText(/indexer improves search/i)).toBeVisible();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 
 	await expect(page.getByRole('heading', { level: 2 })).toContainText('Test the connection');
 	// Save stays hidden until the live test passes, so the wizard can never

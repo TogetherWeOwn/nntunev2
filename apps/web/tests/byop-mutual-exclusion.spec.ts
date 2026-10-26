@@ -125,8 +125,8 @@ async function reachTestedConfig(page: Page, options: RouteOptions = {}): Promis
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByTestId('byop-test-connection').click();
 	await expect(page.getByTestId('byop-save')).toBeVisible();
 
@@ -345,7 +345,7 @@ test('leaving the test step after a passing test still voids the save binding un
 	const wizard = await reachTestedConfig(page);
 
 	await page.getByRole('button', { name: 'Back' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 
 	// Back at the test step, nothing can be saved until the exact
 	// current configuration has been tested again.

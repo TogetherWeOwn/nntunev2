@@ -31,8 +31,8 @@ test('stale session on provider save directs the user to sign in again', async (
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByTestId('byop-test-connection').click();
 	await expect(page.getByTestId('byop-save')).toBeVisible();
 	await page.getByTestId('byop-save').click();
@@ -126,8 +126,8 @@ test('successful passkey reauthentication saves once with controls disabled whil
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByTestId('byop-test-connection').click();
 	await expect(page.getByTestId('byop-save')).toBeVisible();
 	await page.getByTestId('byop-save').click();
@@ -369,8 +369,8 @@ async function reachReauthPrompt(page: Page): Promise<ReauthTraffic> {
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password', { exact: true }).fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByTestId('byop-test-connection').click();
 	await expect(page.getByTestId('byop-save')).toBeVisible();
 	await page.getByTestId('byop-save').click();

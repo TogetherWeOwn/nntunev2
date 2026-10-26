@@ -251,10 +251,10 @@ async function fillByopDraft(page: Page, tag: string) {
 	await page.getByLabel('Hostname').fill(`news.${tag}.example.test`);
 	await page.getByLabel('Username').fill(`${tag}-reader`);
 	await page.getByLabel('Password', { exact: true }).fill(`${tag}-probe-password`);
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByLabel('Indexer URL').fill(`https://indexer.${tag}.example.test`);
 	await page.getByLabel('Indexer API key').fill(`${tag}-probe-indexer-key`);
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await expect(page.getByRole('region', { name: 'Test the connection' })).toBeVisible();
 }
 

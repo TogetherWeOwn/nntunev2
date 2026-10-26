@@ -114,8 +114,8 @@ async function reachTestedConfig(page: Page, options: RouteOptions = {}): Promis
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByTestId('byop-test-connection').click();
 	await expect(page.getByTestId('byop-save')).toBeVisible();
 
