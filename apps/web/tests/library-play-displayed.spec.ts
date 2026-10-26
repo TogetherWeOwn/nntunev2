@@ -327,7 +327,7 @@ test('PLAYALL-02 non-empty queue appends missing through the append core and sel
 	await expect(page.getByTestId('append-result')).toHaveCount(0);
 	await expect(page.getByRole('combobox', { name: /order|sort/i })).toHaveValue('title');
 	await expect(page.getByLabel('Find in loaded tracks')).toHaveValue('');
-	await expect(page.getByLabel('Show')).toHaveValue('all');
+	await expect(page.getByLabel('Show', { exact: true })).toHaveValue('all');
 	await expect(page.getByTestId('library-share-status')).toBeEmpty();
 	expect(new URL(page.url()).search).toBe('');
 	await expect(page.locator('audio')).toHaveCount(0);
@@ -424,7 +424,7 @@ test('PLAYALL-06 favorites-only view plays the displayed projection and leaves f
 	await row(page, 'shown-middle').getByRole('button', { name: 'Star Middle Song', exact: true }).click();
 	await row(page, 'shown-alpha').getByRole('button', { name: 'Star Alpha Song', exact: true }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
-	await page.getByLabel('Show').selectOption('favorites');
+	await page.getByLabel('Show', { exact: true }).selectOption('favorites');
 	await expectView(page, ['shown-alpha', 'shown-middle']);
 	const control = action(page);
 	await expect(control, `${ACTION_MARKER} the one-action play-from-top control is missing`).toBeVisible();
@@ -440,7 +440,7 @@ test('PLAYALL-06 favorites-only view plays the displayed projection and leaves f
 	await expect(
 		row(page, 'shown-middle').getByRole('button', { name: 'Unstar Middle Song', exact: true })
 	).toHaveAttribute('aria-pressed', 'true');
-	await expect(page.getByLabel('Show')).toHaveValue('favorites');
+	await expect(page.getByLabel('Show', { exact: true })).toHaveValue('favorites');
 	await expect(page.locator('audio')).toHaveCount(0);
 	expect(await playCalls(page)).toBe(0);
 });
