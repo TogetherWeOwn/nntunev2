@@ -9,6 +9,12 @@ gate, or drifting the pin between attempts must turn CI red.
 Stdlib only: no committed check under .github/scripts depends on PyYAML,
 so jobs and steps are located by indentation-aware scanning of the
 workflow source instead of a YAML parse.
+
+This module is also the shared workflow reader for the sibling
+structural suites. It therefore cross-pins the web-e2e timeout guard's
+registration in public-text: that suite cannot catch deletion of its
+own run step, but this independently executed suite can (and the
+timeout suite reciprocally pins this suite's step).
 """
 
 import os
@@ -22,6 +28,7 @@ RETRY_JOBS = ("svelte-check", "vitest", "web-build", "web-e2e")
 RETRY_STEP_NAME = "Retry pnpm bootstrap once"
 RETRY_GATE = "steps.pnpm-setup.outcome == 'failure'"
 PINNED_USES = re.compile(r"^pnpm/action-setup@[0-9a-f]{40}$")
+WEB_E2E_TIMEOUT_COMMAND = "python3 .github/scripts/test_ci_web_e2e_timeout.py"
 
 _JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$")
 _STEPS_HEADER = re.compile(r"^    steps:\s*(?:#.*)?$")
@@ -81,6 +88,80 @@ def step_field(step_chunk, field):
         if match:
             return re.sub(r"\s+#.*$", "", match.group(1))
     return None
+
+
+def job_needs(job_chunk):
+    """Exact job ids from a job's `needs` (flow list, scalar, or block list).
+
+    Substring membership on the raw scalar is not a gate check: a job id
+    such as ``web-e2e-shadow`` contains ``web-e2e`` but does not make the
+    dependent job wait for the browser suite.
+    """
+    lines = job_chunk.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)needs:\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        indent, value = match.groups()
+        value = re.sub(r"\s+#.*$", "", value).strip()
+        if value.startswith("["):
+            flow = value
+            while "]" not in flow and index + 1 < len(lines):
+                index += 1
+                flow += " " + re.sub(r"\s+#.*$", "", lines[index]).strip()
+            inner = flow[1:flow.index("]")] if "]" in flow else flow[1:]
+            return [item.strip().strip("'\"") for item in inner.split(",") if item.strip()]
+        if value:
+            return [value.strip("'\"")]
+        needs = []
+        for following in lines[index + 1:]:
+            item = re.match(r"^(\s*)-\s*(.*?)\s*$", following)
+            if item and len(item.group(1)) > len(indent):
+                needs.append(re.sub(r"\s+#.*$", "", item.group(2)).strip().strip("'\""))
+                continue
+            if following.strip():
+                break
+        return needs
+    return []
+
+
+def check_required_step(job_id, job_chunk, command):
+    """Error strings unless `command` runs as a required step of the job.
+
+    Required means: a step whose `run` is exactly `command` (a trailing
+    ``|| true`` or a shell wrapper would mask its failure), with no `if`
+    gate and no `continue-on-error`, in a job that is itself neither
+    gated nor continue-on-error. Anything weaker lets the guarded suite
+    be silently dropped or neutralized without CI turning red.
+    """
+    errors = []
+    header = job_chunk.split("    steps:", 1)[0]
+    if step_field(header, "if") is not None:
+        errors.append(f"{job_id}: job must be unconditional (no job-level if)")
+    if step_field(header, "continue-on-error") is not None:
+        errors.append(f"{job_id}: job must fail on a failed step, not continue-on-error")
+    script = command.rsplit("/", 1)[-1]
+    candidates = [
+        step
+        for step in split_steps(job_chunk)
+        if script in (step_field(step, "run") or "")
+    ]
+    if not candidates:
+        errors.append(f"{job_id}: no step runs {command}")
+        return errors
+    for step in candidates:
+        if step_field(step, "run") != command:
+            errors.append(f"{job_id}: step running {script} must be exactly `{command}`")
+        elif step_field(step, "if") is not None:
+            errors.append(f"{job_id}: step running {script} must be unconditional (no if)")
+        elif step_field(step, "continue-on-error") is not None:
+            errors.append(
+                f"{job_id}: step running {script} must fail the job, "
+                "not continue-on-error"
+            )
+        else:
+            return errors
+    return errors
 
 
 def check_job_retry(job_id, job_chunk):
@@ -193,6 +274,81 @@ class TestPnpmRetryShape(unittest.TestCase):
         text = workflow_with().replace("        continue-on-error: true\n", "", 1)
         errors = errors_for(text)
         self.assertTrue(any("must set continue-on-error" in e for e in errors), errors)
+
+
+def public_text_with(step_block, job_extra=""):
+    """A minimal public-text job chunk carrying `step_block`."""
+    return (
+        "  public-text:\n"
+        "    runs-on: ubuntu-latest\n"
+        f"{job_extra}"
+        "    steps:\n"
+        f"{step_block}"
+    )
+
+
+def timeout_step(extra=""):
+    """The web-e2e timeout guard's public-text step, plus `extra` lines."""
+    return (
+        "      - name: Structural-test the web-e2e timeout budget\n"
+        f"        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+        f"{extra}"
+    )
+
+
+def wiring_errors(text):
+    """Wiring errors for the timeout guard in a public-text job chunk."""
+    return check_required_step("public-text", text, WEB_E2E_TIMEOUT_COMMAND)
+
+
+class TestWebE2eTimeoutWiring(unittest.TestCase):
+    """Cross-pin the timeout guard's only CI registration.
+
+    The timeout suite cannot catch deletion of its own run step, so this
+    independently executed suite (same public-text job, separate step)
+    requires that registration, and public-text's place in the ci-ok
+    gate, to stay exactly as pinned.
+    """
+
+    def test_real_workflow_runs_timeout_guard_in_ci_ok_gate(self):
+        """The real public-text job runs the guard and gates ci-ok."""
+        with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+            jobs = split_jobs(handle.read())
+        self.assertIn("public-text", jobs, "ci.yml no longer defines public-text")
+        self.assertEqual(wiring_errors(jobs["public-text"]), [])
+        self.assertIn("public-text", job_needs(jobs["ci-ok"]))
+
+    def test_missing_timeout_step_fails(self):
+        """Deleting the guard's run step turns this suite red."""
+        errors = wiring_errors(public_text_with(""))
+        self.assertTrue(any("no step runs" in e for e in errors), errors)
+
+    def test_conditional_timeout_step_fails(self):
+        """An `if` gate on the guard's step turns this suite red."""
+        errors = wiring_errors(public_text_with(timeout_step("        if: always()\n")))
+        self.assertTrue(any("must be unconditional" in e for e in errors), errors)
+
+    def test_continue_on_error_timeout_step_fails(self):
+        """A continue-on-error guard step turns this suite red."""
+        errors = wiring_errors(
+            public_text_with(timeout_step("        continue-on-error: true\n"))
+        )
+        self.assertTrue(any("not continue-on-error" in e for e in errors), errors)
+
+    def test_masked_timeout_command_fails(self):
+        """Masking the guard's exit code turns this suite red."""
+        text = public_text_with(timeout_step()).replace(
+            WEB_E2E_TIMEOUT_COMMAND, f"{WEB_E2E_TIMEOUT_COMMAND} || true"
+        )
+        errors = wiring_errors(text)
+        self.assertTrue(any("must be exactly" in e for e in errors), errors)
+
+    def test_job_level_continue_on_error_fails(self):
+        """A continue-on-error public-text job turns this suite red."""
+        errors = wiring_errors(
+            public_text_with(timeout_step(), job_extra="    continue-on-error: true\n")
+        )
+        self.assertTrue(any("not continue-on-error" in e for e in errors), errors)
 
 
 if __name__ == "__main__":
