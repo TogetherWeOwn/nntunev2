@@ -44,7 +44,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
         suite = next(s for s in steps if step_field(s, "name") == "Run apps/web Playwright suite")
         verify = next((s for s in steps if step_field(s, "name") == VERIFY_NAME), None)
         self.assertIsNotNone(verify, "require an actual Chromium launch/close before the suite")
-        self.assertEqual(step_field(self.job, "timeout-minutes"), "30")
+        self.assertEqual(step_field(self.job, "timeout-minutes"), "45")
         self.assertEqual(step_field(self.job, "runs-on"), "ubuntu-latest")
         self.assertEqual(step_field(self.job, "working-directory"), "apps/web")
         self.assertIsNone(step_field(verify, "working-directory"))

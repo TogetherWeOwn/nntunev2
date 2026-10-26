@@ -44,7 +44,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		view, favorites, queue, findQuery, order, items: ITEMS,
+		view, favorites, queue, findQuery, findScope: 'both', order, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
