@@ -518,9 +518,12 @@
 	function removeQueuedTrack(index: number): void {
 		const result = removeTrackWithUndo(queue, index);
 		if (!result.undo) return;
+		const removed = result.undo.track;
+		// Undo can preserve a source other than the selected queue track.
+		// Explicit removal must not leave that removed source mounted.
+		if (preservedAudio?.track?.id === removed.id) preservedAudio = null;
 		replaceQueue(result.state);
 		removalUndo = result.undo;
-		const removed = result.undo.track;
 		const title = removed.title?.trim() ? removed.title : removed.id;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;

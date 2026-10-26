@@ -64,6 +64,27 @@ test('metadata undo preserves the mounted media source, intent and position', as
 	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
 });
 
+test('removing the preserved source after undo switches away from the removed media', async ({ page }) => {
+	await seed(page);
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await audio.evaluate((element: HTMLAudioElement) => {
+		element.setAttribute('data-original-source', 'yes');
+	});
+	await undo(page).click();
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	// An unrelated removal must keep the preserved source mounted.
+	await page.getByRole('button', { name: 'Remove Ember Line from queue', exact: true }).click();
+	await expect(audio).toHaveAttribute('data-original-source', 'yes');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await page.getByRole('button', { name: 'Remove Pine Morning from queue', exact: true }).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(audio).toHaveAttribute('src', '/test-audio/coral');
+	await expect(audio).not.toHaveAttribute('data-original-source');
+	await expect(page.getByTestId('library-now-playing')).toContainText('Coral Night');
+});
+
 test('undoing the sole streamed track restores metadata without reloading its source', async ({ page }) => {
 	await seed(page);
 	for (const title of ['Pine Morning', 'Ember Line']) {
