@@ -90,16 +90,54 @@ def step_field(step_chunk, field):
     return None
 
 
+def job_level_field(job_chunk, field):
+    """First `field: value` scalar at job-key indent (four spaces).
+
+    ``step_field`` matches a field at any depth, so a key nested under
+    a job mapping such as ``strategy.matrix`` or ``defaults`` can pose
+    as the job's own field. Job keys sit at exactly four spaces (job
+    ids at two); anything deeper belongs to a nested mapping.
+    """
+    pattern = re.compile(rf"^    {re.escape(field)}:\s*(.*?)\s*$")
+    for line in job_chunk.splitlines():
+        match = pattern.match(line)
+        if match:
+            return re.sub(r"\s+#.*$", "", match.group(1))
+    return None
+
+
+def step_level_field(step_chunk, field):
+    """First `field: value` scalar at step-key indent, comment-stripped.
+
+    Step keys sit on the step's dash line (six spaces plus ``- ``) or
+    at exactly eight spaces. Keys nested under a step mapping such as
+    ``env:`` or ``with:`` sit deeper, so an ``env.run`` value cannot
+    pose as the step's executed ``run`` command.
+    """
+    pattern = re.compile(
+        rf"^(?:      -\s+|        ){re.escape(field)}:\s*(.*?)\s*$"
+    )
+    for line in step_chunk.splitlines():
+        match = pattern.match(line)
+        if match:
+            return re.sub(r"\s+#.*$", "", match.group(1))
+    return None
+
+
 def job_needs(job_chunk):
     """Exact job ids from a job's `needs` (flow list, scalar, or block list).
 
     Substring membership on the raw scalar is not a gate check: a job id
     such as ``web-e2e-shadow`` contains ``web-e2e`` but does not make the
     dependent job wait for the browser suite.
+
+    Only the job-level field counts (four-space indent): a ``needs``
+    nested deeper, for instance a ``strategy.matrix.needs`` axis that
+    happens to precede the real field, is matrix data, not a dependency.
     """
     lines = job_chunk.splitlines()
     for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)needs:\s*(.*?)\s*$", line)
+        match = re.match(r"^(    )needs:\s*(.*?)\s*$", line)
         if not match:
             continue
         indent, value = match.groups()
@@ -136,25 +174,25 @@ def check_required_step(job_id, job_chunk, command):
     """
     errors = []
     header = job_chunk.split("    steps:", 1)[0]
-    if step_field(header, "if") is not None:
+    if job_level_field(header, "if") is not None:
         errors.append(f"{job_id}: job must be unconditional (no job-level if)")
-    if step_field(header, "continue-on-error") is not None:
+    if job_level_field(header, "continue-on-error") is not None:
         errors.append(f"{job_id}: job must fail on a failed step, not continue-on-error")
     script = command.rsplit("/", 1)[-1]
     candidates = [
         step
         for step in split_steps(job_chunk)
-        if script in (step_field(step, "run") or "")
+        if script in (step_level_field(step, "run") or "")
     ]
     if not candidates:
         errors.append(f"{job_id}: no step runs {command}")
         return errors
     for step in candidates:
-        if step_field(step, "run") != command:
+        if step_level_field(step, "run") != command:
             errors.append(f"{job_id}: step running {script} must be exactly `{command}`")
-        elif step_field(step, "if") is not None:
+        elif step_level_field(step, "if") is not None:
             errors.append(f"{job_id}: step running {script} must be unconditional (no if)")
-        elif step_field(step, "continue-on-error") is not None:
+        elif step_level_field(step, "continue-on-error") is not None:
             errors.append(
                 f"{job_id}: step running {script} must fail the job, "
                 "not continue-on-error"
@@ -342,6 +380,43 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
         )
         errors = wiring_errors(text)
         self.assertTrue(any("must be exactly" in e for e in errors), errors)
+
+    def test_nested_env_run_does_not_satisfy_required_step(self):
+        """An exact nested `env.run` is not the executed command.
+
+        The same scoped reader guards the reciprocal pnpm-command pin
+        the timeout suite makes, so both commands are checked here.
+        """
+        for command in (
+            WEB_E2E_TIMEOUT_COMMAND,
+            "python3 .github/scripts/test_ci_pnpm_retry.py",
+        ):
+            with self.subTest(command=command):
+                step = (
+                    "      - name: Structural-test the web-e2e timeout budget\n"
+                    "        env:\n"
+                    f"          run: {command}\n"
+                    "        run: echo skipped\n"
+                )
+                errors = check_required_step(
+                    "public-text", public_text_with(step), command
+                )
+                self.assertTrue(any("no step runs" in e for e in errors), errors)
+
+    def test_nested_env_run_does_not_mask_real_timeout_step(self):
+        """A nested `env.run` before the real command is ignored."""
+        step = (
+            "      - name: Structural-test the web-e2e timeout budget\n"
+            "        env:\n"
+            "          run: echo not-the-command\n"
+            f"        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+        )
+        self.assertEqual(wiring_errors(public_text_with(step)), [])
+
+    def test_dash_line_run_satisfies_required_step(self):
+        """A command on the step's dash line is a step-level `run`."""
+        step = f"      - run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+        self.assertEqual(wiring_errors(public_text_with(step)), [])
 
     def test_job_level_continue_on_error_fails(self):
         """A continue-on-error public-text job turns this suite red."""

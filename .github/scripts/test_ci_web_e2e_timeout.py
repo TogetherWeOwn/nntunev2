@@ -19,7 +19,7 @@ web-e2e job in ci.yml and this file together.
 import os
 import unittest
 
-from test_ci_pnpm_retry import check_required_step, job_needs, split_jobs, step_field
+from test_ci_pnpm_retry import check_required_step, job_level_field, job_needs, split_jobs
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
@@ -38,7 +38,20 @@ class TestWebE2eTimeout(unittest.TestCase):
 
     def test_web_e2e_timeout_matches_measured_budget(self):
         """web-e2e's timeout stays at the measured 45-minute budget."""
-        self.assertEqual(step_field(self.jobs["web-e2e"], "timeout-minutes"), "45")
+        self.assertEqual(job_level_field(self.jobs["web-e2e"], "timeout-minutes"), "45")
+
+    def test_nested_timeout_does_not_satisfy_job_budget(self):
+        """A step-level timeout cannot pose as the job's timeout."""
+        self.assertIsNone(
+            job_level_field("        timeout-minutes: 45\n", "timeout-minutes")
+        )
+        self.assertEqual(
+            job_level_field(
+                "    timeout-minutes: 45\n        timeout-minutes: 1\n",
+                "timeout-minutes",
+            ),
+            "45",
+        )
 
     def test_web_e2e_stays_in_ci_ok_gate(self):
         """ci-ok needs the exact web-e2e and public-text job ids.
@@ -55,6 +68,25 @@ class TestWebE2eTimeout(unittest.TestCase):
         needs = job_needs("    needs: [web-e2e-shadow, pre-web-e2e, public-text]\n")
         self.assertEqual(needs, ["web-e2e-shadow", "pre-web-e2e", "public-text"])
         self.assertNotIn("web-e2e", needs)
+
+    def test_nested_needs_do_not_satisfy_ci_ok_gate(self):
+        """A nested matrix `needs` axis is not the job dependency list."""
+        needs = job_needs(
+            "    strategy:\n"
+            "      matrix:\n"
+            "        needs: [web-e2e, public-text, e2e-lint]\n"
+            "    needs: [public-text, e2e-lint]\n"
+        )
+        self.assertEqual(needs, ["public-text", "e2e-lint"])
+        self.assertNotIn("web-e2e", needs)
+        self.assertEqual(
+            job_needs(
+                "    strategy:\n"
+                "      matrix:\n"
+                "        needs: [web-e2e, public-text]\n"
+            ),
+            [],
+        )
 
     def test_block_and_scalar_needs_parse_exactly(self):
         """Block-list and scalar `needs` forms parse to exact job ids."""
