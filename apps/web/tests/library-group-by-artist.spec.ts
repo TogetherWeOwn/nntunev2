@@ -673,8 +673,13 @@ test('[GA-B06] row actions: exact accessible names act on the exact track despit
 		page.getByRole('button', { name: 'Star Harbor', exact: true }),
 		'the substring sibling must stay unstarred'
 	).toHaveAttribute('aria-pressed', 'false');
+	// The pressed-state assertion addresses the browse row directly: once
+	// the track is starred, the favorites shelf legitimately carries its
+	// own "Unstar Harbor Song" control, so that exact name is no longer
+	// page-unique. The Star lookups above stay page-wide — no shelf
+	// control carries those names — which keeps the substring trap live.
 	await expect(
-		page.getByRole('button', { name: 'Unstar Harbor Song', exact: true })
+		row(page, 'grp-echo-b').getByRole('button', { name: 'Unstar Harbor Song', exact: true })
 	).toHaveAttribute('aria-pressed', 'true');
 
 	// Select: "Harbor" only.
@@ -684,11 +689,16 @@ test('[GA-B06] row actions: exact accessible names act on the exact track despit
 		page.getByRole('checkbox', { name: 'Select Harbor Song', exact: true })
 	).not.toBeChecked();
 
-	// Play/queue via the main row buttons, addressed page-wide by their
-	// exact flat names (title — artist as shipped).
+	// Play/queue via the main row buttons, addressed by their exact flat
+	// names (title — artist as shipped). "Harbor" is not on the shelf, so
+	// its lookup stays page-wide; the shelf's favorite row duplicates
+	// "Harbor Song — echo" exactly, so that click addresses the browse
+	// row, like the Unstar assertion above.
 	await page.getByRole('button', { name: 'Harbor — Echo', exact: true }).click();
 	await expectQueue(page, ['grp-echo-a'], 'grp-echo-a', 'Harbor');
-	await page.getByRole('button', { name: 'Harbor Song — echo', exact: true }).click();
+	await row(page, 'grp-echo-b')
+		.getByRole('button', { name: 'Harbor Song — echo', exact: true })
+		.click();
 	await expectQueue(page, ['grp-echo-a', 'grp-echo-b'], 'grp-echo-a', 'Harbor');
 	expect(await favoriteShelfIds(page), 'queueing must not change favorites').toEqual([
 		'grp-echo-b'
