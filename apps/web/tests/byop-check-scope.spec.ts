@@ -9,12 +9,12 @@ for (const withIndexer of [false, true]) {
 			await page.getByLabel('Hostname').fill('news.example.test');
 			await page.getByLabel('Username').fill('reader');
 			await page.getByLabel('Password', { exact: true }).fill('fixture-password');
-			await page.getByRole('button', { name: 'Continue' }).click();
+			await page.getByRole('button', { name: 'Continue', exact: true }).click();
 			if (withIndexer) {
 				await page.getByLabel('Indexer URL').fill('https://indexer.example.test');
 				await page.getByLabel('Indexer API key').fill('fixture-indexer-key');
 			}
-			await page.getByRole('button', { name: 'Continue' }).click();
+			await page.getByRole('button', { name: 'Continue', exact: true }).click();
 		});
 
 		test(`check scope and save gating ${flow}`, async ({ page }) => {
@@ -163,10 +163,10 @@ async function reachDraft(page: Page, tag: string): Promise<void> {
 	await page.getByLabel('Hostname').fill(`news.${tag}.example.test`);
 	await page.getByLabel('Username').fill(`${tag}-reader`);
 	await page.getByLabel('Password', { exact: true }).fill(`${tag}-probe-password`);
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await page.getByLabel('Indexer URL').fill(`https://indexer.${tag}.example.test`);
 	await page.getByLabel('Indexer API key').fill(`${tag}-probe-indexer-key`);
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await expect(page.getByRole('region', { name: 'Test the connection' })).toBeVisible();
 }
 
@@ -256,7 +256,7 @@ test.describe('delivered auth transition', () => {
 		await page.getByLabel('Hostname').fill('news.after.example.test');
 		await page.getByLabel('Username').fill('after-reader');
 		await page.getByLabel('Password', { exact: true }).fill('after-password-entry');
-		await page.getByRole('button', { name: 'Continue' }).click();
+		await page.getByRole('button', { name: 'Continue', exact: true }).click();
 		await expect(page.getByLabel('Indexer URL')).toHaveValue('');
 		await expect(page.getByLabel('Indexer API key')).toHaveValue('');
 		expect.soft(pageErrors).toEqual([]);
