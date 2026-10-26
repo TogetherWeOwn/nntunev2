@@ -34,6 +34,7 @@
 		createSelection,
 		hiddenSelectedCount,
 		pruneSelection,
+		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected
 	} from '#lib/library/selection.js';
@@ -82,14 +83,28 @@
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
 	/**
-	 * Transient Favorites-only view over the loaded list. Plain component
-	 * state: never persisted, never fetched, reset on reload (fresh state)
-	 * and at the auth boundary. Filters after ordering via the pure
-	 * selectFavoriteItems projection; the queue never sees it.
+	 * Explicit subset selection: page-local ordered stable IDs in checkbox
+	 * activation order. Never persisted, never fetched, never shared across
+	 * tabs; purged only at auth/account boundaries, pruned only against a
+	 * successful snapshot. Declared here because the Selected-only
+	 * projection below consumes it.
 	 */
-	let view: 'all' | 'favorites' = $state('all');
+	let selectedIds: string[] = $state(createSelection());
+	/**
+	 * Transient view over the loaded list. Plain component state: never
+	 * persisted, never fetched, reset on reload (fresh state) and at the
+	 * auth boundary. Filters after ordering via the pure
+	 * selectFavoriteItems/selectSelectedItems projections (loaded order as
+	 * reshaped by ordering, never activation order); the queue never sees
+	 * it, and switching views never mutates the selection.
+	 */
+	let view: 'all' | 'favorites' | 'selected' = $state('all');
 	const displayedItems = $derived(
-		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+		view === 'all'
+			? orderedItems
+			: view === 'favorites'
+				? selectFavoriteItems(orderedItems, favorites)
+				: selectSelectedItems(orderedItems, selectedIds)
 	);
 	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
 	let viewSelect: HTMLSelectElement | null = $state(null);
@@ -99,20 +114,13 @@
 	let shelfSection: HTMLElement | null = $state(null);
 	let shelfHeading: HTMLHeadingElement | null = $state(null);
 	let clearButton: HTMLButtonElement | null = $state(null);
-	/**
-	 * Explicit subset selection: page-local ordered stable IDs in checkbox
-	 * activation order. Never persisted, never fetched, never shared across
-	 * tabs; purged only at auth/account boundaries, pruned only against a
-	 * successful snapshot. The last append outcome stays until the next
-	 * append or a boundary purge.
-	 */
-	let selectedIds: string[] = $state(createSelection());
 	const hiddenSelectionCount = $derived(
 		hiddenSelectedCount(
 			selectedIds,
 			visibleItems.map((track) => track.id)
 		)
 	);
+	// The last append outcome stays until the next append or a boundary purge.
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
@@ -705,12 +713,75 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
+	/** ID of the library row holding focus, or null when focus is elsewhere. */
+	function focusedLibraryRowId(): string | null {
+		if (typeof document === 'undefined') return null;
+		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
+		return holder?.getAttribute('data-id') ?? null;
+	}
+
+	/**
+	 * After a selected row unmounts, land focus on the checkbox of the next
+	 * surviving displayed row, else the previous one, else the Show
+	 * control. Runs after rendering and only when the removed control took
+	 * focus with it (active element fell back to the body), so controls
+	 * that remain mounted — including the Clear selection button itself —
+	 * and any focus the user has already moved keep it.
+	 */
+	function focusAfterSelectedRowRemoval(nextId: string | null, previousId: string | null): void {
+		void tick().then(() => {
+			if (typeof document === 'undefined') return;
+			const active = document.activeElement;
+			if (active && active !== document.body) return;
+			for (const id of [nextId, previousId]) {
+				if (id === null) continue;
+				// Find the row by attribute comparison, never selector
+				// interpolation: track ids are opaque server strings.
+				const rowEl = [...document.querySelectorAll('[data-testid="library-item"]')].find(
+					(element) => element.getAttribute('data-id') === id
+				);
+				const target = rowEl?.querySelector<HTMLElement>(
+					'input[type="checkbox"]:not([disabled]), button:not([disabled])'
+				);
+				if (target) {
+					target.focus({ preventScroll: true });
+					return;
+				}
+			}
+			viewSelect?.focus({ preventScroll: true });
+		});
+	}
+
 	function toggleSelectedId(id: string): void {
+		// Deselecting inside Selected only unmounts the row; when that row
+		// held focus, recover it to a surviving row or the Show control.
+		if (view !== 'selected' || !selectedIds.includes(id) || focusedLibraryRowId() !== id) {
+			selectedIds = toggleSelected(selectedIds, id);
+			return;
+		}
+		const displayedIds = visibleItems.map((track) => track.id);
+		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
+		const survivors = new Set(selectedIds);
+		const nextId =
+			removedIndex < 0
+				? null
+				: (displayedIds.slice(removedIndex + 1).find((candidate) => survivors.has(candidate)) ?? null);
+		const previousId =
+			removedIndex <= 0
+				? null
+				: ([...displayedIds.slice(0, removedIndex)]
+						.reverse()
+						.find((candidate) => survivors.has(candidate)) ?? null);
+		focusAfterSelectedRowRemoval(nextId, previousId);
 	}
 
 	function clearSelectedIds(): void {
+		// Clearing inside Selected only unmounts every row; only focus that
+		// sat inside one of them needs the Show-control fallback.
+		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		selectedIds = clearSelection(selectedIds);
+		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
 	function appendSelectedIds(): void {
@@ -1005,11 +1076,11 @@
 				<select id="library-view" bind:this={viewSelect} bind:value={view}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
+					<option value="selected">Selected only</option>
 				</select>
 			</div>
 			<p data-testid="library-find-count">
-				Showing {visibleItems.length} of {items.length}
-				{visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
+				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
 					? ' (title only)'
 					: findScope === 'artist'
 						? ' (artist only)'
@@ -1018,6 +1089,12 @@
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
 					No favorites in this list.
+					<button type="button" onclick={showAllTracks}>Show all tracks</button>
+				</p>
+			{/if}
+			{#if view === 'selected' && selectedIds.length === 0}
+				<p>
+					No tracks selected. Select tracks to review them here.
 					<button type="button" onclick={showAllTracks}>Show all tracks</button>
 				</p>
 			{/if}
