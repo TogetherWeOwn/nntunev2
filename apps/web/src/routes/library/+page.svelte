@@ -96,6 +96,11 @@
 	// Visit-local presentation only; SSR and each account start with the flat list.
 	let groupByArtist = $state(false);
 	const artistGroups = $derived(groupByArtist ? groupLibraryItems(visibleItems) : []);
+	// The final DOM row sequence in either presentation. Display-level
+	// actions use this sequence so grouped rows and the queue agree.
+	const renderedItems = $derived(
+		groupByArtist ? artistGroups.flatMap((group) => group.items) : visibleItems
+	);
 	let groupingAnnouncement = $state('');
 
 	function toggleArtistGrouping(): void {
@@ -263,15 +268,15 @@
 	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
-	// One-action bulk queue: the same displayed ordered collection the rows
-	// render, so sorting or filtering changes what an activation appends. The
-	// count names only missing IDs, never the view's total.
-	const bulkMissing = $derived(missingDisplayedTracks(visibleItems, queuedIds));
+	// One-action bulk queue: the same final rendered ordered collection the
+	// rows render, so sorting, filtering or grouping changes what an
+	// activation appends. The count names only missing IDs, never the total.
+	const bulkMissing = $derived(missingDisplayedTracks(renderedItems, queuedIds));
 	const bulkDisabled = $derived(
-		libraryUnavailable || visibleItems.length === 0 || bulkMissing.length === 0
+		libraryUnavailable || renderedItems.length === 0 || bulkMissing.length === 0
 	);
 	const bulkAllQueued = $derived(
-		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
+		!libraryUnavailable && renderedItems.length > 0 && bulkMissing.length === 0
 	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
