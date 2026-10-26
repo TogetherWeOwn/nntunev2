@@ -456,6 +456,11 @@
 			shareInvalid = true;
 			return;
 		}
+		// An explicit link selects its target as the audible track. A metadata
+		// undo can leave the mounted element on the preserved source while the
+		// queue already shows the target; without this the pending seek below
+		// passes its queue-metadata fence and lands on the wrong media.
+		preservedAudio = null;
 		selectTrack(target.trackId);
 		replaceQueue(
 			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))

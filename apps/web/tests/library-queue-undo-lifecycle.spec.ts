@@ -2,7 +2,8 @@ import { expect, test, type Page } from '@playwright/test';
 
 // Builder-owned regressions supplement the protected undo bank. Breaks caught:
 // remounting live media on metadata undo, resurrecting a catalogue-deleted track,
-// and leaving keyboard focus behind a hiding queue filter.
+// leaving keyboard focus behind a hiding queue filter, and seeking preserved
+// media from a same-route share link after undo.
 const ITEMS = [
 	{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' },
 	{ id: 'pine', title: 'Pine Morning', streamUrl: '/test-audio/pine' },
@@ -99,4 +100,48 @@ test('keyboard undo reveals a filtered restored row and focuses its Remove contr
 	await expect(page.getByLabel('Filter queue', { exact: true })).toHaveValue('');
 	await expect(remove(page)).toBeFocused();
 	await expect(page.getByTestId('queue-item')).toHaveCount(3);
+});
+
+test('same-route share link after undo seeks the link target, not the preserved source', async ({
+	page
+}) => {
+	// Record every currentTime write per element: aborted test media never
+	// reports a readable position, so the write log is the seek evidence.
+	await page.addInitScript(() => {
+		const time = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime')!;
+		Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+			configurable: true,
+			get: time.get,
+			set(value: number) {
+				this.dataset.seekWrites = `${this.dataset.seekWrites ?? ''}${this.dataset.seekWrites ? ',' : ''}${value}`;
+				time.set!.call(this, value);
+			}
+		});
+	});
+	await seed(page);
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await audio.evaluate((element: HTMLAudioElement) => {
+		element.setAttribute('data-original-source', 'yes');
+	});
+	await undo(page).click();
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	// Client-side navigation to the restored current track, as browser
+	// back/forward delivers it: the queue already shows Coral while the
+	// mounted element still plays the preserved Pine source.
+	await page.evaluate(() => {
+		const link = document.createElement('a');
+		link.id = 'undo-share-navigation';
+		link.href = '/library?track=coral&t=30';
+		link.textContent = 'Open track link';
+		document.body.append(link);
+	});
+	await page.locator('#undo-share-navigation').click();
+	await expect(page).toHaveURL(/\/library\?track=coral&t=30$/);
+	// The explicit link remounts audio on its target; the pending seek lands
+	// on Coral's element, never on the preserved Pine source.
+	await expect(audio).toHaveAttribute('src', '/test-audio/coral');
+	await expect(audio).not.toHaveAttribute('data-original-source');
+	await expect(audio).toHaveAttribute('data-seek-writes', '30');
 });
