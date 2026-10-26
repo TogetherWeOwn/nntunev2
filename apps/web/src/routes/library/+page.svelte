@@ -26,6 +26,7 @@
 		type LibraryOrder
 	} from '#lib/library/order.js';
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
+	import { groupLibraryItems } from '#lib/library/group.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -92,6 +93,15 @@
 		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
 	);
 	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
+	// Visit-local presentation only; SSR and each account start with the flat list.
+	let groupByArtist = $state(false);
+	const artistGroups = $derived(groupByArtist ? groupLibraryItems(visibleItems) : []);
+	let groupingAnnouncement = $state('');
+
+	function toggleArtistGrouping(): void {
+		groupByArtist = !groupByArtist;
+		groupingAnnouncement = groupByArtist ? 'Tracks grouped by artist.' : 'Flat track list restored.';
+	}
 	let viewSelect: HTMLSelectElement | null = $state(null);
 	let scopeSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
@@ -172,6 +182,8 @@
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
+				groupByArtist = false;
+				groupingAnnouncement = '';
 				confirmClear = false;
 				managementFeedback = '';
 			}
@@ -766,6 +778,8 @@
 			findQuery = '';
 			findScope = 'both';
 			view = 'all';
+			groupByArtist = false;
+			groupingAnnouncement = '';
 			confirmClear = false;
 			managementFeedback = '';
 			purgeSelection();
@@ -785,6 +799,8 @@
 		findQuery = '';
 		findScope = 'both';
 		view = 'all';
+		groupByArtist = false;
+		groupingAnnouncement = '';
 		confirmClear = false;
 		managementFeedback = '';
 		purgeSelection();
@@ -1007,6 +1023,15 @@
 					<option value="favorites">Favorites only</option>
 				</select>
 			</div>
+			<button
+				class="nt-button"
+				type="button"
+				aria-pressed={groupByArtist}
+				onclick={toggleArtistGrouping}
+			>
+				Group by artist
+			</button>
+			<p aria-live="polite" aria-atomic="true">{groupingAnnouncement}</p>
 			<p data-testid="library-find-count">
 				Showing {visibleItems.length} of {items.length}
 				{visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
@@ -1060,56 +1085,18 @@
 					Clear search
 				</button>
 			{:else}
-			<ul data-testid="library-list">
-				{#each visibleItems as track (track.id)}
-					{@const queued = queuedIds.has(track.id)}
-					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
-						<input
-							class="nt-library-select"
-							type="checkbox"
-							aria-label={`Select ${displayTitle(track)}`}
-							checked={selectedIds.includes(track.id)}
-							onclick={(event) => event.stopPropagation()}
-							onchange={() => toggleSelectedId(track.id)}
-						/>
-						<button
-							type="button"
-							class="nt-library-row"
-							aria-label={queued
-								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
-								: undefined}
-							aria-pressed={queued ? true : undefined}
-							onclick={() => selectTrack(track.id)}
-						>
-							{displayTitle(track)}
-							{#if displayArtist(track)}
-								<span> — {displayArtist(track)}</span>
-							{/if}
-							{#if queued}
-								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
-							{/if}
-						</button>
-						<button
-							type="button"
-							class="nt-library-copy"
-							data-testid="library-copy-link"
-							aria-label={`Copy link ${displayTitle(track)}`}
-							onclick={() => void copyTrackLink(track.id)}
-						>
-							Copy link
-						</button>
-						<button
-							type="button"
-							class="nt-library-star"
-							aria-pressed={favoriteIds.has(track.id)}
-							aria-label={starLabel(track)}
-							onclick={() => toggleFavorite(track.id)}
-						>
-							<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
-						</button>
-					</li>
-				{/each}
-			</ul>
+			<div data-testid="library-list">
+				{#if groupByArtist}
+					{#each artistGroups as group (group.key)}
+						<div class="nt-artist-group">
+							<h2>{group.label}</h2>
+							{@render trackRows(group.items)}
+						</div>
+					{/each}
+				{:else}
+					{@render trackRows(visibleItems)}
+				{/if}
+			</div>
 			{/if}
 			<!--
 				The queue panel stays mounted across background refreshes (its
@@ -1187,6 +1174,60 @@
 		</section>
 	{/if}
 </main>
+
+{#snippet trackRows(tracks: LibraryItem[])}
+	<ul>
+		{#each tracks as track (track.id)}
+			{@const queued = queuedIds.has(track.id)}
+			<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+				<input
+					class="nt-library-select"
+					type="checkbox"
+					aria-label={`Select ${displayTitle(track)}`}
+					checked={selectedIds.includes(track.id)}
+					onclick={(event) => event.stopPropagation()}
+					onchange={() => toggleSelectedId(track.id)}
+				/>
+				<button
+					type="button"
+					class="nt-library-row"
+					aria-label={queued
+						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+						: undefined}
+					aria-pressed={queued ? true : undefined}
+					onclick={() => selectTrack(track.id)}
+				>
+					{displayTitle(track)}
+					{#if displayArtist(track)}
+						<span> — {displayArtist(track)}</span>
+					{/if}
+					{#if queued}
+						<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
+					{/if}
+				</button>
+				<button
+					type="button"
+					class="nt-library-copy"
+					data-testid="library-copy-link"
+					aria-label={`Copy link ${displayTitle(track)}`}
+					onclick={() => void copyTrackLink(track.id)}
+				>
+					Copy link
+				</button>
+				<button
+					type="button"
+					class="nt-library-star"
+					aria-pressed={favoriteIds.has(track.id)}
+					aria-label={starLabel(track)}
+					onclick={() => toggleFavorite(track.id)}
+				>
+					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
+				</button>
+			</li>
+		{/each}
+	</ul>
+{/snippet}
+
 
 <style>
 	.nt-library-find {
@@ -1342,6 +1383,9 @@
 	}
 	.nt-selection-bar [data-testid='append-result'] {
 		flex-basis: 100%;
+	}
+	.nt-artist-group h2 {
+		overflow-wrap: anywhere;
 	}
 	.nt-library-select {
 		flex: 0 0 auto;
