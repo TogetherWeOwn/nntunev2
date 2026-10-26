@@ -93,6 +93,7 @@
 	);
 	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
 	let viewSelect: HTMLSelectElement | null = $state(null);
+	let scopeSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
 	let shelfSection: HTMLElement | null = $state(null);
@@ -642,6 +643,14 @@
 		return `Move favorite ${displayTitle(track)} ${direction}`;
 	}
 
+	function searchBothFields(): void {
+		findScope = 'both';
+		// The recovery button only exists under a narrowed scope, so this
+		// unmounts the focused button; land focus on the scope selector
+		// (the control whose value just changed) instead of <body>.
+		void tick().then(() => scopeSelect?.focus({ preventScroll: true }));
+	}
+
 	function clearFind(): void {
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -966,7 +975,7 @@
 					aria-describedby="library-find-hint"
 				/>
 				<label for="library-find-scope">Search in</label>
-				<select id="library-find-scope" bind:value={findScope}>
+				<select id="library-find-scope" bind:this={scopeSelect} bind:value={findScope}>
 					<option value="both">Both title and artist</option>
 					<option value="title">Title only</option>
 					<option value="artist">Artist only</option>
@@ -1043,13 +1052,7 @@
 					<p>No matches in your loaded tracks.</p>
 				{/if}
 				{#if findScope !== 'both'}
-					<button
-						class="nt-button"
-						type="button"
-						onclick={() => {
-							findScope = 'both';
-						}}
-					>
+					<button class="nt-button" type="button" onclick={searchBothFields}>
 						Search both title and artist
 					</button>
 				{/if}
