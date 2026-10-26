@@ -137,6 +137,35 @@ async function routeVault(
 	};
 }
 
+/**
+ * The shipped wire envelope nests provider fields under `provider` with
+ * an optional sibling `indexer`. Pin the exact key sets so a payload or
+ * schema drift fails here instead of slipping through as a subset match.
+ */
+function expectPayloadKeys(body: JsonBody | undefined, withIndexer: boolean): void {
+	expect(body, 'a request body was captured').toBeDefined();
+	expect(Object.keys(body ?? {}).sort()).toEqual(
+		withIndexer ? ['indexer', 'provider'] : ['provider']
+	);
+	const provider = (body?.['provider'] ?? {}) as JsonBody;
+	expect(Object.keys(provider).sort()).toEqual(PROVIDER_PAYLOAD_KEYS);
+	if (withIndexer) {
+		const indexer = (body?.['indexer'] ?? {}) as JsonBody;
+		expect(Object.keys(indexer).sort()).toEqual(['api_key', 'url']);
+	}
+}
+
+/**
+ * Click a button that is part of the new contract. Visibility is
+ * asserted first so a missing control fails as a crisp assertion
+ * instead of a long click timeout.
+ */
+async function clickButton(page: Page, name: RegExp): Promise<void> {
+	const button = page.getByRole('button', { name });
+	await expect(button).toBeVisible();
+	await button.click();
+}
+
 function expectNoCalls(traffic: Traffic): void {
 	expect(traffic.testBodies, 'no connection-test request').toHaveLength(0);
 	expect(traffic.saveBodies, 'no save request').toHaveLength(0);
@@ -272,17 +301,16 @@ test.describe('positive controls (shipped behavior)', () => {
 		const vault = await routeVault(page);
 		await reachTestedFinalStep(page, { withIndexer: true });
 
-		expect(Object.keys(vault.traffic.testBodies[0] ?? {}).sort()).toEqual([
-			...PROVIDER_PAYLOAD_KEYS,
-			'indexer'
-		]);
+		expectPayloadKeys(vault.traffic.testBodies[0], true);
 		expect(vault.traffic.testBodies[0]).toMatchObject({
-			host: HOST,
-			port: 563,
-			tls: true,
-			allow_insecure_plaintext: false,
-			username: SENTINEL_USER,
-			max_connections: 7,
+			provider: {
+				host: HOST,
+				port: 563,
+				tls: true,
+				allow_insecure_plaintext: false,
+				username: SENTINEL_USER,
+				max_connections: 7
+			},
 			indexer: { url: SENTINEL_INDEXER_URL, api_key: SENTINEL_INDEXER_KEY }
 		});
 
@@ -361,7 +389,7 @@ test.describe('edit and return', () => {
 		const vault = await routeVault(page);
 		await reachTestedFinalStep(page, { withIndexer: true });
 
-		await page.getByRole('button', { name: /edit provider/i }).click();
+		await clickButton(page, /edit provider/i);
 		await expect(page.getByRole('heading', { name: 'Provider details' })).toBeFocused();
 		await expect(page.getByText('Step 1 of 3')).toBeVisible();
 
@@ -398,9 +426,9 @@ test.describe('edit and return', () => {
 		await page.getByTestId('byop-test-connection').click();
 		await expect(page.getByTestId('byop-save')).toBeEnabled();
 		expect(vault.traffic.testBodies).toHaveLength(2);
+		expectPayloadKeys(vault.traffic.testBodies[1], true);
 		expect(vault.traffic.testBodies[1]).toMatchObject({
-			host: NEW_HOST,
-			max_connections: 9
+			provider: { host: NEW_HOST, max_connections: 9 }
 		});
 		await page.getByTestId('byop-save').click();
 		await page.waitForURL('/library');
@@ -414,7 +442,7 @@ test.describe('edit and return', () => {
 		await page.getByTestId('byop-test-connection').click();
 		await expect(page.getByTestId('byop-save')).toBeEnabled();
 
-		await page.getByRole('button', { name: /edit provider/i }).click();
+		await clickButton(page, /edit provider/i);
 		await expect(page.getByRole('heading', { name: 'Provider details' })).toBeFocused();
 		await expect(page.getByTestId('byop-tls')).not.toBeChecked();
 		await expect(
@@ -437,7 +465,7 @@ test.describe('edit and return', () => {
 		const vault = await routeVault(page);
 		await reachTestedFinalStep(page, { withIndexer: true });
 
-		await page.getByRole('button', { name: /edit indexer/i }).click();
+		await clickButton(page, /edit indexer/i);
 		await expect(page.getByRole('heading', { name: 'Indexer (optional)' })).toBeFocused();
 		await expect(page.getByText('Step 2 of 3')).toBeVisible();
 		await expect(page.getByLabel('Indexer URL')).toHaveValue(SENTINEL_INDEXER_URL);
@@ -455,6 +483,7 @@ test.describe('edit and return', () => {
 		await page.getByTestId('byop-test-connection').click();
 		await expect(page.getByTestId('byop-save')).toBeEnabled();
 		expect(vault.traffic.testBodies).toHaveLength(2);
+		expectPayloadKeys(vault.traffic.testBodies[1], true);
 		expect(vault.traffic.testBodies[1]).toMatchObject({
 			indexer: { url: SENTINEL_INDEXER_URL, api_key: SENTINEL_NEW_INDEXER_KEY }
 		});
@@ -467,7 +496,7 @@ test.describe('edit and return', () => {
 		const vault = await routeVault(page);
 		await reachTestedFinalStep(page, { withIndexer: true });
 
-		await page.getByRole('button', { name: /edit provider/i }).click();
+		await clickButton(page, /edit provider/i);
 		await page.getByRole('button', { name: 'Continue' }).click();
 		await continueToFinalStep(page);
 
@@ -490,9 +519,7 @@ test.describe('deliberate skip', () => {
 
 		// Partial indexer: a key with no URL cannot Continue normally.
 		await page.getByLabel('Indexer API key').fill(SENTINEL_INDEXER_KEY);
-		await page
-			.getByRole('button', { name: /continue without indexer/i })
-			.click();
+		await clickButton(page, /continue without indexer/i);
 
 		await expect(page.getByRole('heading', { name: 'Test the connection' })).toBeFocused();
 		await expect(page.getByRole('alert')).toHaveCount(0);
@@ -507,7 +534,7 @@ test.describe('deliberate skip', () => {
 		await expectRedacted(page, consoleLines);
 
 		// The cleared fields are really empty back on the indexer step.
-		await page.getByRole('button', { name: /edit indexer/i }).click();
+		await clickButton(page, /edit indexer/i);
 		await expect(page.getByLabel('Indexer URL')).toHaveValue('');
 		await expect(page.getByLabel('Indexer API key')).toHaveValue('');
 		await continueToFinalStep(page);
@@ -516,15 +543,15 @@ test.describe('deliberate skip', () => {
 		// no trace of the abandoned key.
 		await page.getByTestId('byop-test-connection').click();
 		await expect(page.getByTestId('byop-save')).toBeEnabled();
-		expect(Object.keys(vault.traffic.testBodies[0] ?? {}).sort()).toEqual(
-			PROVIDER_PAYLOAD_KEYS
-		);
+		expectPayloadKeys(vault.traffic.testBodies[0], false);
 		expect(vault.traffic.testBodies[0]).toMatchObject({
-			host: HOST,
-			port: 563,
-			tls: true,
-			username: SENTINEL_USER,
-			max_connections: 7
+			provider: {
+				host: HOST,
+				port: 563,
+				tls: true,
+				username: SENTINEL_USER,
+				max_connections: 7
+			}
 		});
 		expect(JSON.stringify(vault.traffic.testBodies[0])).not.toContain('sentinel-indexer');
 	});
@@ -542,9 +569,7 @@ test.describe('deliberate skip', () => {
 		await page
 			.getByLabel('Indexer URL')
 			.fill('http://indexer.example.test/sentinel-path-rvs');
-		await page
-			.getByRole('button', { name: /continue without indexer/i })
-			.click();
+		await clickButton(page, /continue without indexer/i);
 
 		await expect(page.getByRole('heading', { name: 'Test the connection' })).toBeFocused();
 		await expect(page.getByRole('alert')).toHaveCount(0);
@@ -556,9 +581,7 @@ test.describe('deliberate skip', () => {
 		await page.getByTestId('byop-test-connection').click();
 		await expect(page.getByTestId('byop-save')).toBeEnabled();
 		expect(vault.traffic.testBodies).toHaveLength(2);
-		expect(Object.keys(vault.traffic.testBodies[1] ?? {}).sort()).toEqual(
-			PROVIDER_PAYLOAD_KEYS
-		);
+		expectPayloadKeys(vault.traffic.testBodies[1], false);
 	});
 });
 
@@ -572,13 +595,11 @@ test.describe('navigation and operation fences', () => {
 		await continueToFinalStep(page);
 		expectNoCalls(vault.traffic);
 
-		await page.getByRole('button', { name: /edit provider/i }).click();
+		await clickButton(page, /edit provider/i);
 		await page.getByRole('button', { name: 'Continue' }).click();
 		await continueToFinalStep(page);
-		await page.getByRole('button', { name: /edit indexer/i }).click();
-		await page
-			.getByRole('button', { name: /continue without indexer/i })
-			.click();
+		await clickButton(page, /edit indexer/i);
+		await clickButton(page, /continue without indexer/i);
 		await expect(page.getByRole('heading', { name: 'Test the connection' })).toBeFocused();
 		expectNoCalls(vault.traffic);
 
