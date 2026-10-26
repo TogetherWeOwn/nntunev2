@@ -1104,7 +1104,7 @@
 				</p>
 			{/if}
 			<div class="nt-selection-bar">
-				<p data-testid="selection-count" role="status">{selectionCountLabel(selectedIds.length)}</p>
+				<p data-testid="selection-count" role={loading ? undefined : 'status'}>{selectionCountLabel(selectedIds.length)}</p>
 				{#if visibleItems.length > 0}
 					<button class="nt-button" type="button" onclick={selectDisplayedIds}>
 						Select all
