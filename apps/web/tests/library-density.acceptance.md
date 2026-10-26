@@ -109,6 +109,37 @@ unit suite and typecheck, then owns the combined ready PR through
 same-head CI/review gates. Suspected test defects route back to the test
 author; do not weaken a red assertion to fit an implementation.
 
+## Acceptance repair note (test-author, harness only)
+
+Three harness defects surfaced once the implementation existed; the fixes
+below change test mechanics only and preserve every behavioral assertion:
+
+- DEN-03 target identity: `rowTargets` keys now include the owning list
+  (`library-item`/`queue-item`/`favorite-item`). The same track renders as
+  identically named buttons in the browse list and the favorites shelf, and
+  the old key aliased them, comparing one list's button against the other's
+  size. A `[tabindex="-1"]` row (programmatic-focus landing spot, not an
+  interactive control) is excluded from the control-target set; its height
+  is the row height DEN-02 expects Compact to reduce.
+- DEN-04 sequential-focus origin: each capture now blurs, then explicitly
+  focuses the Density select as a common anchor before tabbing. Blur alone
+  leaves Chromium's sequential focus-navigation starting point at the last
+  click, which made the two captures rotations of one order instead of the
+  same sequence; focusing an already-focused anchor is a no-op, hence the
+  blur first. The real keyboard operation of the select and the visible
+  focus-outline assertions are unchanged.
+- DEN-05 audit lifetime: `addInitScript` resets the in-page write audit on
+  every navigation, so writes are now accumulated outside the page realm —
+  each realm's audit is collected before its reload, and the final realm is
+  collected last. A reload-time rewrite would still appear in the next
+  realm's fragment. The raw-enum-only and appearance-isolation assertions
+  compare the same expected write list as before.
+
+Re-verified after repair: browser bank 15/15 green against the
+implementation head; SSR bank and the unchanged appearance bank green;
+pre-feature base `a242bbc721f17e736757dadc4a6f85ba396e2d3f` still fails
+assertion-level on the absent Density control (DEN-00 control passes).
+
 Geometry evidence is deliberately bounded: row heights and target sizes are
 live `getBoundingClientRect` measurements in Chromium against the local
 preview fixture, not screenshots of a deployed build and not a claim about

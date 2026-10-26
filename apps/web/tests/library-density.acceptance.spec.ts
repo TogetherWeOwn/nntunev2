@@ -136,11 +136,21 @@ async function rowTargets(page: Page) {
 			for (const target of rowElement.querySelectorAll(interactive)) elements.add(target);
 		}
 		return [...elements].flatMap((element, index) => {
+			// A [tabindex="-1"] row is a programmatic-focus landing spot, not an
+			// interactive target; its height is the row height DEN-02 expects to
+			// change, so it must not enter the control target checks.
+			const nativeControl = 'button, a[href], input, select, textarea, [role="button"]';
+			if (element.getAttribute('tabindex') === '-1' && !element.matches(nativeControl)) return [];
 			if (!(element as HTMLElement).checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return [];
 			const rect = element.getBoundingClientRect();
 			if (rect.width === 0 || rect.height === 0) return [];
 			const owner = element.closest('[data-track-id], [data-id]');
 			const ownerId = owner?.getAttribute('data-track-id') ?? owner?.getAttribute('data-id') ?? '';
+			// The same track renders in several lists (browse, queue, favorites
+			// shelf) with identical tag/id/name; the owning list is part of a
+			// target's identity, or cross-list comparisons alias distinct buttons.
+			const list = element.closest('[data-testid="library-item"], [data-testid="queue-item"], [data-testid="favorite-item"]');
+			const listId = list?.getAttribute('data-testid') ?? '';
 			const name = element.getAttribute('data-testid') ?? element.getAttribute('aria-label') ?? (element.textContent ?? '').trim().slice(0, 32);
 			// Ancestor/descendant pairs (a row button wrapping its star) are one
 			// composite target for spacing purposes; record the chain as indices
@@ -148,7 +158,7 @@ async function rowTargets(page: Page) {
 			// whether each element contains another measured element instead.
 			return [{
 				index,
-				key: `${element.tagName.toLowerCase()}|${ownerId}|${name}`,
+				key: `${listId}|${element.tagName.toLowerCase()}|${ownerId}|${name}`,
 				x: rect.x, y: rect.y, width: rect.width, height: rect.height,
 				contains: [...elements].filter((other) => other !== element && element.contains(other))
 					.map((other) => [...elements].indexOf(other))
@@ -188,7 +198,17 @@ function targetSizeViolations(targets: RowTarget[]): string[] {
 }
 
 async function tabSequence(page: Page): Promise<string[]> {
+	// Pin a common sequential-focus origin. Blurring alone is not enough:
+	// Chromium retains the sequential focus-navigation starting point from
+	// the last click/focus, so two captures would be rotations of the same
+	// order rather than the same sequence. Focusing the Density select
+	// explicitly before each capture makes both start at the same anchor;
+	// blur first so the anchor focus is a real focus change in both captures
+	// (focusing the already-focused select is a no-op that leaves the
+	// previous starting point in place).
 	await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+	await density(page).focus();
+	await expect(density(page)).toBeFocused();
 	const sequence: string[] = [];
 	for (let step = 0; step < 60; step += 1) {
 		await page.keyboard.press('Tab');
@@ -197,7 +217,9 @@ async function tabSequence(page: Page): Promise<string[]> {
 			if (!element || element === document.body) return 'body';
 			const owner = element.closest('[data-track-id], [data-id]');
 			const ownerId = owner?.getAttribute('data-track-id') ?? owner?.getAttribute('data-id') ?? '';
-			return `${element.tagName.toLowerCase()}|${element.getAttribute('data-testid') ?? ''}|${ownerId}|${element.getAttribute('aria-label') ?? ''}|${(element.textContent ?? '').trim().slice(0, 24)}`;
+			const list = element.closest('[data-testid="library-item"], [data-testid="queue-item"], [data-testid="favorite-item"]');
+			const listId = list?.getAttribute('data-testid') ?? '';
+			return `${listId}|${element.tagName.toLowerCase()}|${element.getAttribute('data-testid') ?? ''}|${ownerId}|${element.getAttribute('aria-label') ?? ''}|${(element.textContent ?? '').trim().slice(0, 24)}`;
 		});
 		if (descriptor === 'body' && sequence.length > 0) break;
 		if (sequence.includes(descriptor)) break;
@@ -346,6 +368,15 @@ test('DEN-05 persistence: choice stores only the raw enum, survives reload both 
 		};
 	});
 	const { writes } = await openLibrary(page);
+	// addInitScript re-runs on every navigation and resets the in-page audit,
+	// so accumulate writes outside the page realm: collect each realm's audit
+	// before reloading destroys it (a reload-time rewrite would still land in
+	// the next realm's fragment and be caught below).
+	const storageWrites: [string, string][] = [];
+	const collectAudit = async () => {
+		storageWrites.push(...await page.evaluate(() =>
+			(window as Window & { __densityAudit: { writes: [string, string][] } }).__densityAudit.writes));
+	};
 	await queueTwo(page);
 	const comfortable = await rowHeight(row(page, 'den-alpha'));
 	await page.evaluate((key) => localStorage.setItem(key, 'dark'), APPEARANCE_KEY);
@@ -355,6 +386,7 @@ test('DEN-05 persistence: choice stores only the raw enum, survives reload both 
 
 	await chooseDensity(page, 'compact');
 	expect(await page.evaluate((key) => localStorage.getItem(key), DENSITY_KEY)).toBe('compact');
+	await collectAudit();
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expectDensityControl(page, 'compact');
@@ -362,13 +394,13 @@ test('DEN-05 persistence: choice stores only the raw enum, survives reload both 
 
 	await chooseDensity(page, 'comfortable');
 	expect(await page.evaluate((key) => localStorage.getItem(key), DENSITY_KEY)).toBe('comfortable');
+	await collectAudit();
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expectDensityControl(page, 'comfortable');
 	await expect.poll(() => rowHeight(row(page, 'den-alpha'))).toBeGreaterThanOrEqual(comfortable - 0.5);
 
-	const storageWrites = await page.evaluate(() =>
-		(window as Window & { __densityAudit: { writes: [string, string][] } }).__densityAudit.writes);
+	await collectAudit();
 	expect(storageWrites.filter(([key]) => key === DENSITY_KEY || key === APPEARANCE_KEY),
 		'density changes must write only the density enum').toEqual([
 		[DENSITY_KEY, 'compact'], [DENSITY_KEY, 'comfortable']
