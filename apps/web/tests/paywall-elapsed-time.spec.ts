@@ -51,8 +51,8 @@ async function toConnectionTestStep(page: Page): Promise<void> {
 	await page.locator('input[name="host"]').fill('news.example.com');
 	await page.locator('input[name="username"]').fill('alice');
 	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await expect(page.getByRole('button', { name: /test connection/i })).toBeVisible();
 }
 
