@@ -31,9 +31,12 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * case emits a PLAYALL-RECEIPT JSON line plus an acceptance-case.json
  * attachment with expected/actual/status/error_code/next_action.
  *
- * RED verified <pending hosted dispatch> against <pending SHA>:
- * PLAYALL-00 passes; PLAYALL-01–08 fail on the absent-action assertion
- * after successful browser/app setup. Narrow/keyboard play SUCCESS evidence
+ * RED verified in hosted CI run 40412736168 against
+ * 4a6d177244a40fa6c8c50cdabdc90cbb9eec3cc7 (base d2b4ff9bb):
+ * PLAYALL-00 passes; all nine PLAYALL-01–08 cases (08 light/dark) fail
+ * on the absent-action assertion after successful browser/app setup.
+ * The full suite has 1506 passes including the control; no harness errors
+ * in this bank. Narrow/keyboard play SUCCESS evidence
  * remains the build's GREEN obligation; these pre-feature failures are not
  * a claim the missing control is usable.
  *
