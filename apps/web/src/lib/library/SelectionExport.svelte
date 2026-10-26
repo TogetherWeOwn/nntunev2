@@ -125,7 +125,7 @@
 >
 	Copy selected as text
 </button>
-<p data-testid="selection-export-status" role="status" aria-live="polite">{status}</p>
+<p data-testid="selection-export-status" aria-live="polite">{status}</p>
 {#if fallback !== null}
 	<div class="nt-selection-export-fallback">
 		<label for="selection-export-text">Selected tracks as text</label>
