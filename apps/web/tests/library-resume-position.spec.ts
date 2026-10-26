@@ -211,6 +211,11 @@ async function noAvailableResume(page: Page) {
 	if (await resume.isVisible()) await expect(resume).toBeDisabled();
 }
 
+async function playCalls(page: Page) {
+	// Storage-free: safe under synthetic denial, where inertState's own reads throw.
+	return page.evaluate(() => window.__libraryResume.calls.play);
+}
+
 async function navigate(page: Page, path: string) {
 	await page.evaluate((path) => {
 		const anchor = document.createElement('a'); anchor.id = 'resume-test-navigation';
@@ -357,7 +362,10 @@ for (const [label, rawValue] of [
 test('LIBRESUME-09 corrupt saved state recovers on valid pause without touching unrelated keys', async ({ page }) => {
 	await openLibrary(page, { saved: '{broken' }); await select(page);
 	const before = await inertState(page); await position(page, 8.5, 'pause');
-	expect(await entries(page), receipt('LIBRESUME-09', { 'resume-coral': 8.5 }, await raw(page))).toEqual({ 'resume-coral': 8.5 });
+	const stored = await raw(page);
+	let parsed: unknown = null;
+	try { parsed = JSON.parse(stored ?? '{}'); } catch { parsed = null; }
+	expect(parsed, receipt('LIBRESUME-09', { 'resume-coral': 8.5 }, stored)).toEqual({ 'resume-coral': 8.5 });
 	expect(await inertState(page)).toEqual(before);
 });
 
@@ -488,7 +496,7 @@ for (const deny of ['context', 'resume-read', 'resume-write'] as const) {
 		const fallback = await page.evaluate((demo) => window.__libraryResume.storage.filter((call) =>
 			(call.area === 'local' && call.key.startsWith('nntune.library.resume')) || call.key === demo), DEMO_KEY);
 		expect(fallback).toEqual([]);
-		expect(await currentTime(page)).toBe(14); expect((await inertState(page)).play).toBe(0);
+		expect(await currentTime(page)).toBe(14); expect(await playCalls(page)).toBe(0);
 		expect(io.errors).toEqual([]); expect(io.unexpected).toEqual([]);
 	});
 }
