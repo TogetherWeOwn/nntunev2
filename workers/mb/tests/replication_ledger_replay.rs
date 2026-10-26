@@ -2,14 +2,15 @@
 //!
 //! Disjoint from `replication_lag_acceptance.rs` (report-cap contract) and
 //! the inline unit tests in `replication.rs`: this file pins that re-recording
-//! a sequence replaces (never duplicates), that snapshots sort by sequence,
-//! and that applying a packet clears only its own pending entry. Uses only
+//! a sequence with the same packet ID replaces (never duplicates), that
+//! snapshots sort by sequence, and that applying a packet clears only its
+//! own pending entry. Uses only
 //! the public `PacketLedger` / `ReplicationSloProbe` APIs with synthetic
 //! timestamps; no DB or network.
 use nntune_mb::replication::{PacketLedger, ReplicationSloProbe, REPLICATION_LAG_SLO_SECS};
 
 #[test]
-fn replay_applied_sequence_replaces_record_and_recomputes_lag() {
+fn same_id_replay_replaces_record_and_recomputes_lag() {
     let mut ledger = PacketLedger::default();
     ledger.record_packet("pkt-a".to_string(), 5, 1_000, 1_120);
 
@@ -24,10 +25,10 @@ fn replay_applied_sequence_replaces_record_and_recomputes_lag() {
         healthy.breaches
     );
 
-    // Replay the same sequence with a replacement packet id and timestamps
+    // Replay the same sequence and packet ID with replacement timestamps
     // whose lag exceeds the budget.
     ledger.record_packet(
-        "pkt-b".to_string(),
+        "pkt-a".to_string(),
         5,
         2_000,
         2_000 + REPLICATION_LAG_SLO_SECS + 1,
@@ -36,7 +37,7 @@ fn replay_applied_sequence_replaces_record_and_recomputes_lag() {
     let records = ledger.records();
     assert_eq!(records.len(), 1, "replay must replace, not duplicate");
     assert_eq!(records[0].sequence, 5);
-    assert_eq!(records[0].packet_id, "pkt-b");
+    assert_eq!(records[0].packet_id, "pkt-a");
     assert_eq!(records[0].published_at, 2_000);
     assert_eq!(records[0].applied_at, 2_000 + REPLICATION_LAG_SLO_SECS + 1);
     assert_eq!(records[0].lag_secs, REPLICATION_LAG_SLO_SECS + 1);
