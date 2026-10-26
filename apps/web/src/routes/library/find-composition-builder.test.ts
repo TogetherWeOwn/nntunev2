@@ -30,7 +30,7 @@ const compiled = ts.transpileModule(
 	{ compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }
 ).outputText;
 const evaluate = new Function(
-	'items', 'order', 'favorites', 'view', 'findQuery', 'selectedIds',
+	'items', 'order', 'favorites', 'view', 'findQuery', 'findScope', 'selectedIds',
 	'orderLibraryItems', 'selectFavoriteItems', 'filterLibraryItems', 'hiddenSelectedCount', '$derived',
 	`${compiled}\nreturn { visibleItems, hiddenSelectionCount };`
 );
@@ -45,7 +45,7 @@ const SELECTED = ['composition-beta', 'composition-private'];
 
 function project(view: 'all' | 'favorites', query: string, order: LibraryOrder = 'original') {
 	return evaluate(
-		ITEMS, order, FAVORITES, view, query, SELECTED,
+		ITEMS, order, FAVORITES, view, query, 'both', SELECTED,
 		orderLibraryItems, selectFavoriteItems, filterLibraryItems, hiddenSelectedCount,
 		<T>(value: T) => value
 	) as { visibleItems: LibraryItem[]; hiddenSelectionCount: number };
