@@ -56,6 +56,29 @@
 		type Track
 	} from '#lib/player/queue.js';
 
+	type Density = 'comfortable' | 'compact';
+	const DENSITY_KEY = 'nntune:density:v1';
+	let density = $state<Density>('comfortable');
+
+	function readStoredDensity(): Density {
+		try {
+			return window.localStorage.getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable';
+		} catch {
+			return 'comfortable';
+		}
+	}
+
+	function onDensityChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== 'comfortable' && value !== 'compact') return;
+		density = value;
+		try {
+			window.localStorage.setItem(DENSITY_KEY, value);
+		} catch {
+			// Storage refused: keep the choice in memory without a banner.
+		}
+	}
+
 	let items: LibraryItem[] = $state([]);
 	let order: LibraryOrder = $state('original');
 	const orderedItems = $derived(orderLibraryItems(items, order));
@@ -792,6 +815,8 @@
 	}
 
 	onMount(() => {
+		// Restore only in the browser; SSR always renders Comfortable.
+		density = readStoredDensity();
 		window.addEventListener('storage', handleAuthTransition);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
@@ -813,8 +838,16 @@
 	<meta name="description" content="Your NNTune library, available even when the API is down." />
 </svelte:head>
 
-<main class="nt-wrap">
+<main class="nt-wrap" data-density={density}>
 	<h1>Library</h1>
+
+	<div class="nt-library-density">
+		<label for="library-density">Density</label>
+		<select id="library-density" value={density} onchange={onDensityChange}>
+			<option value="comfortable">Comfortable</option>
+			<option value="compact">Compact</option>
+		</select>
+	</div>
 
 	{#if shareInvalid}
 		<p data-testid="library-share-invalid" role="alert">
@@ -1189,6 +1222,37 @@
 </main>
 
 <style>
+	main {
+		--nt-library-row-padding: 0.25rem;
+	}
+	main[data-density='compact'] {
+		--nt-library-row-padding: 0;
+	}
+	.nt-library-density {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-density select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	/* Density only changes row whitespace, never the controls or their order.
+	 * The ancestor scope keeps the shared queue's other hosts unchanged. */
+	main :global(.queue-row) {
+		padding-block: var(--nt-library-row-padding);
+	}
+	main :global(.queue-row button:not(.queue-star)) {
+		min-width: 24px;
+		min-height: 24px;
+	}
 	.nt-library-find {
 		display: flex;
 		align-items: center;
@@ -1353,7 +1417,7 @@
 	.nt-library-item {
 		display: flex;
 		align-items: center;
-		padding: 0;
+		padding: var(--nt-library-row-padding) 0;
 	}
 	.nt-library-row {
 		display: block;
