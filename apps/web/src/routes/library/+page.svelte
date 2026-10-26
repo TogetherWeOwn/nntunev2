@@ -25,7 +25,7 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
-	import { filterLibraryItems } from '#lib/library/filter.js';
+	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -66,6 +66,12 @@
 	 * same-account refreshes (including failed ones) preserve it.
 	 */
 	let findQuery = $state('');
+	/**
+	 * Which display fields the find searches. Visit-local like the query:
+	 * never persisted, reset to `'both'` at the same account/auth
+	 * boundaries that clear the query. Clearing the search text keeps it.
+	 */
+	let findScope: FindScope = $state('both');
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -85,7 +91,7 @@
 	const displayedItems = $derived(
 		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
 	);
-	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery));
+	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
 	let viewSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
@@ -163,6 +169,7 @@
 			if (state.loadError && state.items.length === 0) {
 				queueFilterQuery = '';
 				findQuery = '';
+				findScope = 'both';
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
@@ -748,6 +755,7 @@
 			favoritesAnnouncement = '';
 			queueFilterQuery = '';
 			findQuery = '';
+			findScope = 'both';
 			view = 'all';
 			confirmClear = false;
 			managementFeedback = '';
@@ -766,6 +774,7 @@
 		favoritesAnnouncement = '';
 		queueFilterQuery = '';
 		findQuery = '';
+		findScope = 'both';
 		view = 'all';
 		confirmClear = false;
 		managementFeedback = '';
@@ -956,6 +965,12 @@
 					bind:value={findQuery}
 					aria-describedby="library-find-hint"
 				/>
+				<label for="library-find-scope">Search in</label>
+				<select id="library-find-scope" bind:value={findScope}>
+					<option value="both">Both title and artist</option>
+					<option value="title">Title only</option>
+					<option value="artist">Artist only</option>
+				</select>
 				<p id="library-find-hint">
 					Searches only the tracks already loaded here, not the remote catalog.
 				</p>
@@ -985,7 +1000,11 @@
 			</div>
 			<p data-testid="library-find-count">
 				Showing {visibleItems.length} of {items.length}
-				{visibleItems.length === 1 ? 'track' : 'tracks'}
+				{visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
+					? ' (title only)'
+					: findScope === 'artist'
+						? ' (artist only)'
+						: ''}
 			</p>
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
@@ -1016,7 +1035,24 @@
 				{/if}
 			</div>
 			{#if displayedItems.length > 0 && visibleItems.length === 0}
-				<p>No matches in your loaded tracks.</p>
+				{#if findScope === 'title'}
+					<p>No title matches in your loaded tracks.</p>
+				{:else if findScope === 'artist'}
+					<p>No artist matches in your loaded tracks.</p>
+				{:else}
+					<p>No matches in your loaded tracks.</p>
+				{/if}
+				{#if findScope !== 'both'}
+					<button
+						class="nt-button"
+						type="button"
+						onclick={() => {
+							findScope = 'both';
+						}}
+					>
+						Search both title and artist
+					</button>
+				{/if}
 				<button class="nt-button" type="button" onclick={clearFind}>
 					Clear search
 				</button>
@@ -1159,6 +1195,16 @@
 	.nt-library-find input {
 		box-sizing: border-box;
 		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find select {
+		max-width: 100%;
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
