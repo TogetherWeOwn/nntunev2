@@ -165,7 +165,8 @@ entry; an omitted table is not.
 ### 3. Infrastructure cost basis
 
 Unit prices are public list prices captured on the `Price source` date,
-per the formulas in `docs/cost-basis.md` (§1–§7, checked 2026-10-17);
+per the formulas in `docs/cost-basis.md` (§1–§7, checked dates per section
+as stated in the worksheet);
 usage volumes are either measured on staging (labelled `measured`, with the
 evidence ID proving the volume in the usage-basis cell) or stated
 assumptions (labelled `assumed`). A `measured` volume with no evidence ID
@@ -301,7 +302,7 @@ included allowances at these volumes, so they contribute $0.00 here. Not
 metered or priced: Workers CPU (no CPU-ms volume stated), R2 operations,
 KV writes and storage, Postgres storage, and egress — plus the
 `docs/cost-basis.md` out-of-scope services (Durable Objects, Containers,
-Workers Logs, domain/DNS, and any non-Cloudflare, non-PlanetScale
+domain/DNS, and any non-Cloudflare, non-PlanetScale
 services), none of which this synthetic example prices. The total is
 therefore a floor, not an all-in bill.
 
@@ -359,6 +360,6 @@ VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rul
   `product lead, 2026-01-15`
 - What could not be verified: the unmetered/unpriced costs listed in
   section 3 (Workers CPU, R2 operations, KV writes and storage, Postgres
-  storage, and egress, plus Durable Objects, Containers, Workers Logs,
+  storage, and egress, plus Durable Objects, Containers,
   domain/DNS, and any non-Cloudflare, non-PlanetScale services); K2 is
   therefore `INCONCLUSIVE`, not `NOT TRIGGERED`.

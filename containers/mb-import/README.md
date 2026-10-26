@@ -143,9 +143,10 @@ not Cargo, psql, credentials or a database:
 bash containers/mb-import/tests/test_input_admission.sh
 ```
 
-Its 40 cases capture SQL attempts and payloads with command doubles: deterministic
+Its 44 cases capture SQL attempts and payloads with command doubles: deterministic
 publication switches (A during the first run, B on the next), all-file admission,
-sequence boundaries, ordinary directories, rerun/resume and poison/FK routing.
+sequence boundaries, ordinary directories, directory-shaped TSV refusal,
+rerun/resume and poison/FK routing.
 Run unprivileged so unreadable-file controls execute rather than skip. It does
 not execute PostgreSQL; the existing integration suite remains the DB-semantics
 control. CI runs both (`.github/workflows/ci.yml`, `mb-import-etl` and `mb-import`).
