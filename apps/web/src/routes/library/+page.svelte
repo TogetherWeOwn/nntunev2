@@ -146,6 +146,7 @@
 	// purges the queue, so a previous track or account never lingers.
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
+	let restartStatusVersion = $state(0);
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -466,6 +467,8 @@
 		);
 		const source = resolveStreamUrl(queueCurrentTrack(queue));
 		if (!source) return;
+		// This navigation is a new gesture, not the seek that restart superseded.
+		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
@@ -534,19 +537,25 @@
 			restartCanSeek = false;
 			return;
 		}
-		let duration = Number.NaN;
-		let position = Number.NaN;
+		restartCanSeek = restartIsAvailable(element);
+	}
+
+	function restartIsAvailable(element: HTMLAudioElement): boolean {
 		try {
-			duration = element.duration;
-			position = element.currentTime;
+			return (
+				Number.isFinite(element.duration) &&
+				element.duration > 0 &&
+				Number.isFinite(element.currentTime) &&
+				seekableIncludesStart(element)
+			);
 		} catch {
-			// Refuse below: unreadable media stays unavailable.
+			return false;
 		}
-		restartCanSeek =
-			Number.isFinite(duration) &&
-			duration > 0 &&
-			Number.isFinite(position) &&
-			seekableIncludesStart(element);
+	}
+
+	function setRestartStatus(text: string): void {
+		restartStatus = text;
+		restartStatusVersion += 1;
 	}
 
 	/**
@@ -578,6 +587,12 @@
 			pendingShareSeek = null;
 		}
 		restartSupersededSources.add(`${current.id}\n${source}`);
+		// Native state can change after the last media event and before this click.
+		if (!restartIsAvailable(element)) {
+			restartCanSeek = false;
+			setRestartStatus(withTitle('Could not restart'));
+			return;
+		}
 		let position = Number.NaN;
 		try {
 			position = element.currentTime;
@@ -585,7 +600,7 @@
 			// Handled below: an unreadable position cannot restart.
 		}
 		if (!Number.isFinite(position)) {
-			restartStatus = withTitle('Could not restart');
+			setRestartStatus(withTitle('Could not restart'));
 			return;
 		}
 		if (Math.abs(position) <= 0.05) {
@@ -594,7 +609,7 @@
 			} catch {
 				// Already at the start; a refusal changes nothing there.
 			}
-			restartStatus = withTitle('Already at the start of');
+			setRestartStatus(withTitle('Already at the start of'));
 			return;
 		}
 		let refused = false;
@@ -611,10 +626,11 @@
 				// Handled below: no readback means no success claim.
 			}
 		}
-		restartStatus =
+		setRestartStatus(
 			!refused && Number.isFinite(readback) && Math.abs(readback) <= 0.05
 				? withTitle('Restarted')
-				: withTitle('Could not restart');
+				: withTitle('Could not restart')
+		);
 	}
 
 	if (typeof window !== 'undefined') {
@@ -1325,7 +1341,7 @@
 			{#if !restartCanSeek}
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
-			<p data-testid="library-restart-status" aria-live="polite">{restartStatus}</p>
+			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
 		</section>
 	{/if}
 </main>

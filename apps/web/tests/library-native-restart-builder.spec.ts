@@ -8,7 +8,9 @@ import { expect, test, type Page } from '@playwright/test';
  * edits that change the current source without going through the shared
  * queue-replacement path must still clear the restart outcome and its
  * availability snapshot, and a long track title must keep the outcome
- * under 100 characters. Same harness shape as the protected bank: the
+ * under 100 characters. Review supplements cover later same-source share
+ * navigation, native changes between events, and repeated live outcomes.
+ * Same harness shape as the protected bank: the
  * real `/library` route with `/api/library` fulfilled in-test and
  * `/test-audio/**` held pending. No real decoder, no network media.
  */
@@ -109,6 +111,79 @@ test('removing the current queue row clears the restart outcome and availability
 	await expect(restartStatus(page)).toHaveText('');
 	await expect(restartButton(page)).toBeDisabled();
 });
+
+test('a new same-source share navigation applies after restarting', async ({ page }) => {
+	await openLibrary(page);
+	await restartCoral(page);
+	await audio(page).evaluate((el) => { el.setAttribute('data-original-node', 'yes'); });
+	await page.evaluate(() => {
+		const link = document.createElement('a');
+		link.href = '/library?track=rb-coral&t=42';
+		link.textContent = 'Open another share position';
+		document.body.append(link);
+	});
+	await page.getByRole('link', { name: 'Open another share position' }).click();
+	await expect.poll(() => audio(page).evaluate((el: HTMLAudioElement) => el.currentTime)).toBe(42);
+	await expect(audio(page)).toHaveAttribute('data-original-node', 'yes');
+});
+
+for (const invalid of ['range', 'duration'] as const) {
+	test(`a stale native ${invalid} snapshot refuses restart without a seek write`, async ({ page }) => {
+		await openLibrary(page);
+		await restartCoral(page);
+		await mockMedia(page, 30);
+		await signalMedia(page);
+		await audio(page).evaluate((el: HTMLAudioElement, mode: string) => {
+			el.dataset['writes'] = '0';
+			Object.defineProperty(el, 'currentTime', {
+				get: () => 30,
+				set: () => { el.dataset['writes'] = String(Number(el.dataset['writes']) + 1); },
+				configurable: true
+			});
+			if (mode === 'range') {
+				Object.defineProperty(el, 'seekable', {
+					get: () => ({ length: 1, start: () => 10, end: () => 120 }), configurable: true
+				});
+			} else {
+				Object.defineProperty(el, 'duration', { value: Number.NaN, configurable: true });
+			}
+		}, invalid);
+		await restartButton(page).click();
+		await expect(audio(page)).toHaveAttribute('data-writes', '0');
+		await expect(restartButton(page)).toBeDisabled();
+		await expect(restartStatus(page)).toContainText('Could not restart Coral Night');
+	});
+}
+
+for (const outcome of ['Restarted', 'Already at the start of', 'Could not restart'] as const) {
+	test(`repeating ${outcome} replaces the text inside the single polite region`, async ({ page }) => {
+		await openLibrary(page);
+		await selectRow(page, 'rb-coral', 'Coral Night');
+		await mockMedia(page, outcome === 'Already at the start of' ? 0 : 30);
+		await signalMedia(page);
+		if (outcome === 'Could not restart') {
+			await audio(page).evaluate((el) => {
+				Object.defineProperty(el, 'currentTime', {
+					get: () => 30, set: () => { throw new Error('native seek refused'); }, configurable: true
+				});
+			});
+		}
+		await restartButton(page).click();
+		await expect(restartStatus(page)).toHaveText(`${outcome} Coral Night.`);
+		const previousText = await restartStatus(page).evaluateHandle((el) =>
+			Array.from(el.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim())
+		);
+		if (outcome === 'Restarted') await audio(page).evaluate((el: HTMLAudioElement) => { el.currentTime = 30; });
+		await restartButton(page).click();
+		await expect(restartStatus(page)).toHaveText(`${outcome} Coral Night.`);
+		expect(await restartStatus(page).evaluate((el, previous) =>
+			Array.from(el.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) !== previous,
+			previousText
+		)).toBe(true);
+		await expect(page.locator('main [data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
+		await previousText.dispose();
+	});
+}
 
 test('a long track title keeps the restart outcome under 100 characters', async ({ page }) => {
 	expect(LONG_TITLE.length).toBeGreaterThan(80);
