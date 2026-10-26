@@ -1,27 +1,8 @@
-import { createServer, request } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { extname, join, resolve, sep } from 'node:path';
+import { request } from 'node:http';
 import { chromium } from '@playwright/test';
+import { createProbeServer } from './server.mjs';
 
-const distRoot = resolve(new URL('./dist', import.meta.url).pathname);
-const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
-const server = createServer(async (req, res) => {
-	const path = (req.url === '/' ? '/index.html' : req.url ?? '').split('?')[0];
-	// Confine every request to the built probe output: a raw `../` path
-	// must never read sources or anything else outside dist/.
-	const filePath = resolve(join(distRoot, `.${path}`));
-	if (filePath !== distRoot && !filePath.startsWith(distRoot + sep)) {
-		res.writeHead(404).end();
-		return;
-	}
-	try {
-		const body = await readFile(filePath);
-		res.writeHead(200, { 'content-type': types[extname(path)] ?? 'application/octet-stream' });
-		res.end(body);
-	} catch {
-		res.writeHead(404).end();
-	}
-});
+const server = await createProbeServer(new URL('./dist', import.meta.url));
 await new Promise((r) => server.listen(43173, '127.0.0.1', r));
 
 // Raw-path traversal self-check (fetch would normalize `..` away first).
@@ -45,17 +26,23 @@ try {
 	await page.goto('http://127.0.0.1:43173/');
 	const version = browser.version();
 	await page.click('#open');
-	await page.waitForTimeout(1500);
+	await page.waitForFunction(() => window.__probe?.mountedText || window.__probe?.errorName, null, { timeout: 10000 });
 	const probe = await page.evaluate(() => window.__probe);
 	let afterClose = null;
 	if (probe?.opened) {
 		await page.evaluate(() => window.__pipWindow?.close());
-		await page.waitForTimeout(500);
+		await page.waitForFunction(() => window.__probe?.pagehideFired, null, { timeout: 10000 });
 		afterClose = await page.evaluate(() => window.__probe);
 	}
 	console.log(JSON.stringify({ channel: channel ?? 'default-headless-shell', version, traversalStatus, probe, afterClose }, null, 2));
+	if (traversalStatus !== 404 || !probe?.isSecureContext || !probe?.hasApi || !probe?.opened ||
+		probe?.errorName || probe?.mountedText !== 'Probe mounted' ||
+		probe?.computedColor !== 'rgb(255, 0, 0)' || !(probe?.clonedRules > 0) || !afterClose?.pagehideFired) {
+		process.exitCode = 1;
+	}
 } catch (error) {
 	console.log(JSON.stringify({ channel: channel ?? 'default-headless-shell', launchError: String(error).split('\n').slice(0, 6) }, null, 2));
+	process.exitCode = 1;
 } finally {
 	await browser?.close().catch(() => {});
 	server.close();

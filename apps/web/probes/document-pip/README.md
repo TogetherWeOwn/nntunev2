@@ -15,7 +15,16 @@ node probes/document-pip/run.mjs
 ```
 
 Set `PROBE_CHANNEL=chromium` to drive the full Chromium channel instead
-of the default headless shell.
+of the default headless shell. The runner waits for mount completion and
+`pagehide` (10 seconds each), not fixed delays, and exits nonzero on a
+launch, API, mount, style, traversal-check or close-event failure.
+
+The local server snapshots regular build outputs before listening; it
+never reads a request-selected disk path and does not follow symlinks.
+Run its offline HTTP regression tests with
+`node --test probes/document-pip/server.test.mjs` (also included in
+`pnpm test`). They cover traversal, symlinks, snapshot isolation and
+build directories containing spaces.
 
 ## Recorded result (2026-10-26): GO
 
