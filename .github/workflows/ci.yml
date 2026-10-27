@@ -225,6 +225,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Fail stalled transfers so checkout's bounded fetch retry can run
+        # instead of consuming the entire job before the offline tests.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: '1'
+          GIT_HTTP_LOW_SPEED_TIME: '60'
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -460,12 +465,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
 
   # KV config staging/prod parity: both env fixtures must validate against
   # config/schema.json with identical key sets (values may differ). Also runs
@@ -527,12 +532,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
   rust-repair:
     name: rust (workers/repair)
@@ -549,13 +554,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/repair/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
       # Durable Object runtime) must check and lint on that target.
-      - run: cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo check --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
   # Repair container image: the server's native tests ride the workspace
   # `rust-test` job (containers/repair is a member); this job proves the
@@ -1071,9 +1076,9 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Slow Ubuntu dependency downloads can consume 17 minutes; leave room
-    # for the full browser suite (normally about five minutes) after setup.
-    timeout-minutes: 30
+    # Slow Ubuntu dependency downloads can consume 17 minutes; the full
+    # browser suite now takes about 21 minutes. Include cleanup headroom.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/web
