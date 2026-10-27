@@ -510,6 +510,66 @@ test('a third delayed receive bucket preserves coverage loss if two pending wind
   assert.equal(h.storage.alarm, null);
 });
 
+// Lost-coverage fixture: two healthy pending windows, then a breach receipt at
+// START+120000 that no pending window can retain (coverage lost until +180000).
+async function tombstone(h) {
+  await h.ingest(input(batch(0)));
+  h.clock.now = START + 60000; await h.ingest(input(batch(0)));
+  h.clock.now = START + 120000; await h.ingest(input(batch(20)));
+}
+
+test('a consumed closed window leaves no retained observation rows in durable storage', async () => {
+  const h = await harness();
+  await ingestBreach(h);
+  assert.equal(recordCount(h.storage.snapshot()), 20, 'control: pending observations are durable');
+  await h.restart(); await h.close();
+  assertPost(h);
+  assert.equal(recordCount(h.storage.snapshot()), 0, 'closed-window observations must be deleted once consumed');
+  assert.equal(h.storage.alarm, null);
+});
+
+test('an expired lost-coverage tombstone is cleared and stops arming the alarm', async () => {
+  const h = await harness();
+  await tombstone(h);
+  await h.restart(); await h.close(START + 120000);
+  assert.notEqual(h.storage.alarm, null, 'control: unexpired lost coverage stays durable/alarmed');
+  await h.close(START + 180000);
+  assert.equal(h.storage.alarm, null, 'an alarm must not stay armed at an already-reached tombstone deadline');
+  await h.restart(); await settle(h.alarm());
+  assert.equal(h.storage.alarm, null);
+  assert.equal(h.calls.fetch.length, 0);
+  bounded(h);
+});
+
+test('receipts inside a lost-coverage tombstone cannot open a complete window; its half-open end can', async () => {
+  const h = await harness();
+  await tombstone(h);
+  // Both pending windows are consumed, so capacity is free while coverage is still lost.
+  await h.restart(); await h.close(START + 120000);
+  h.clock.now = START + 120001; await ingestBreach(h);
+  // Delayed alarm: ingress exactly at the tombstone end arrives before it runs.
+  h.clock.now = START + 180000; await ingestBreach(h);
+  await h.restart(); await h.close(START + 240000);
+  assertPost(h);
+  const breaches = h.calls.evaluate.filter(({ result }) => result?.counts.failed > 0)
+    .map(({ result }) => [result.counts.total, result.counts.failed]);
+  assert.deepEqual(breaches, [[20, 2]], 'only the post-tombstone receipt may form a complete window');
+  assert.equal(h.storage.alarm, null);
+  bounded(h);
+});
+
+test('a 257-observation RPC batch is incomplete; its complete 256-row prefix cannot alert', async () => {
+  const h = await harness();
+  const reply = await h.ingest(input(batch(257, 257)));
+  await h.restart(); await h.close();
+  assert.equal(h.calls.fetch.length, 0, 'over-cap RPC batches must not alert from a retained prefix');
+  assert.equal(h.calls.evaluate.some(({ result }) => result?.counts.total === 256), false);
+  incompleteEffects(h, [reply]);
+  assert.equal(h.storage.alarm, null);
+  await independentBreach(h, START + 60000);
+  assertPost(h); // The cap marks only that receive window incomplete.
+});
+
 test('alarm reservation is durable before fetch; ingress can proceed while network I/O is pending', async () => {
   const gate = deferred();
   const entered = deferred();
