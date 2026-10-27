@@ -19,6 +19,10 @@ timeout suite reciprocally pins this suite's step).
 
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -147,16 +151,28 @@ def step_level_field(step_chunk, field):
     ``env:`` or ``with:`` sit deeper, so an ``env.run`` value cannot
     pose as the step's executed ``run`` command. Quoted,
     space-before-colon, and explicit-key spellings count too, for the
-    same reason as in ``job_level_field``.
+    same reason as in ``job_level_field``. A deeper non-comment line
+    before the next key is scalar continuation content. Retain a newline
+    and that content so it cannot equal a required single-line command;
+    this reader deliberately rejects multiline commands instead of
+    approximating YAML folding.
     """
     key = _key_token(field)
     prefix = r"(?:      - |        )"
     explicit = re.compile(rf"^{prefix}\?\s+{key}(?:\s*:\s*(.*?)\s*)?$")
     plain = re.compile(rf"^{prefix}{key}\s*:\s*(.*?)\s*$")
-    for line in step_chunk.splitlines():
+    lines = step_chunk.splitlines()
+    for index, line in enumerate(lines):
         match = explicit.match(line) or plain.match(line)
         if match:
-            return _field_value(match)
+            value = _field_value(match)
+            for following in lines[index + 1:]:
+                if not following.strip() or following.lstrip().startswith("#"):
+                    continue
+                if len(following) - len(following.lstrip(" \t")) > 8:
+                    return value + "\n" + following.strip()
+                break
+            return value
     return None
 
 
@@ -631,6 +647,68 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
                 step = f"      - {first}\n        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
                 errors = wiring_errors(public_text_with(step))
                 self.assertTrue(any("plain `key:`" in e for e in errors), errors)
+
+    def test_folded_run_continuations_fail_closed(self):
+        """A later physical line is part of the command, not ignorable data."""
+        for command in (
+            WEB_E2E_TIMEOUT_COMMAND,
+            "python3 .github/scripts/test_ci_pnpm_retry.py",
+        ):
+            for dash_run in (False, True):
+                first = (
+                    f"      - run: {command}\n" if dash_run else
+                    f"      - name: guard\n        run: {command}\n"
+                )
+                for indent in (9, 10, 12, 16):
+                    for prefix in ("", "\n", "          # note\n\n"):
+                        with self.subTest(
+                            command=command, dash_run=dash_run,
+                            indent=indent, prefix=prefix,
+                        ):
+                            step = first + prefix + " " * indent + "|| true\n"
+                            errors = check_required_step(
+                                "public-text", public_text_with(step), command
+                            )
+                            self.assertTrue(any("must be exactly" in e for e in errors), errors)
+
+    def test_single_line_run_with_later_nested_data_stays_clean(self):
+        """Comments, blanks and a subsequent mapping are not continuations."""
+        step = (
+            f"      - run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+            "          # a comment is not scalar content\n\n"
+            "        env:\n"
+            "          NOTE: harmless nested data\n"
+            "      - run: echo later-step\n"
+        )
+        self.assertEqual(wiring_errors(public_text_with(step)), [])
+
+    def test_folded_pnpm_mask_fails_reciprocal_whole_workflow_suite(self):
+        """Execute the surviving suite against the composed real-workflow mutant."""
+        with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+            text = handle.read()
+        command = "python3 .github/scripts/test_ci_pnpm_retry.py"
+        line = f"        run: {command}\n"
+        self.assertEqual(text.count(line), 1)
+        mutant = text.replace(line, line + "          || true\n").replace(
+            RETRY_GATE, "steps.pnpm-setup.outcome == 'success'", 1
+        )
+        with tempfile.TemporaryDirectory() as root:
+            scripts = os.path.join(root, ".github", "scripts")
+            workflows = os.path.join(root, ".github", "workflows")
+            os.makedirs(scripts)
+            os.makedirs(workflows)
+            for name in ("test_ci_pnpm_retry.py", "test_ci_web_e2e_timeout.py"):
+                shutil.copyfile(os.path.join(REPO_ROOT, ".github", "scripts", name),
+                                os.path.join(scripts, name))
+            with open(os.path.join(workflows, "ci.yml"), "w", encoding="utf-8") as handle:
+                handle.write(mutant)
+            result = subprocess.run(
+                [sys.executable, os.path.join(scripts, "test_ci_web_e2e_timeout.py")],
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("test_pnpm_guard_step_is_required_in_public_text", result.stderr)
+        self.assertIn("must be exactly", result.stderr)
 
     def test_extra_dash_spacing_fails_closed(self):
         """Reject layouts that move masking keys past the eight-space reader."""
