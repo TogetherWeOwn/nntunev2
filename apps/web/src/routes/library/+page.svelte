@@ -592,9 +592,12 @@
 		const title = current.title?.trim() ? current.title : current.id;
 		const withTitle = (words: string): string => {
 			const suffix = ` ${title}.`;
-			return words.length + suffix.length <= 99
-				? `${words}${suffix}`
-				: `${words} ${title.slice(0, 97 - words.length)}…`;
+			if (words.length + suffix.length <= 99) return `${words}${suffix}`;
+			let end = 97 - words.length;
+			// Never cut between the halves of a surrogate pair.
+			const last = title.charCodeAt(end - 1);
+			if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+			return `${words} ${title.slice(0, end)}…`;
 		};
 		// The explicit gesture supersedes a pending share seek for this
 		// source even if the native write is refused: later metadata for
@@ -657,8 +660,8 @@
 		const moved = queue.tracks[from];
 		if (moved === undefined) return;
 		const reordered = moveTrack(queue, from, to);
-		// Announce real moves only: a no-op reorder must not chatter the
-		// live region.
+		// Announce real moves only: a no-op reorder must not chatter the live
+		// region.
 		if (reordered === queue) return;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
