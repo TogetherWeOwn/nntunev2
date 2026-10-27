@@ -11,6 +11,8 @@
 //! - [`grant`]: signed play grants issued by the `api` Worker; the stream
 //!   Worker authorizes every play against them.
 //! - [`range`]: HTTP `Range` parsing / `206` resolution for seeking.
+//! - [`choose`]: pure profile-artifact choice over caller-supplied rows
+//!   (exact-profile hit, documented fallback, typed miss); unwired.
 //! - [`cache`]: content-addressed audio cache + multipart write staging
 //!   (the R2 shape; in-memory here).
 //! - [`yenc`]: yEnc decode for NNTP segments.
@@ -41,6 +43,7 @@
 pub mod api_error;
 pub mod body;
 pub mod cache;
+pub mod choose;
 pub mod grant;
 pub mod loader;
 pub mod meter;
