@@ -16,13 +16,19 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * as an assertion (missing control), never as a click error. Fully offline
  * and deterministic: no backend, no provider, no spend.
  *
- * Hooks (new component-owned literals, following the `selection-count` /
- * `append-result` / `queue-announcement` precedent):
- * - `selection-announcement` (`data-testid`, `role="status"`): the single
- *   polite live region for selection outcomes. After every gesture that
- *   changes the selection its text is exactly the selection-count text
- *   (for example `4 selected`); gestures that change nothing leave the text
- *   untouched. Exactly one such region exists; selection gestures never
+ * Hooks (existing component-owned literals, following the
+ * `selection-count` / `append-result` / `queue-announcement` precedent):
+ * - `selection-count` (`data-testid`, `role="status"` in steady state):
+ *   the single polite live region for selection outcomes. It is the
+ *   visible count itself, so every selection change — plain toggle,
+ *   range, Select all, Clear, prune — announces through it reactively
+ *   with exactly its displayed text (for example `4 selected`) and no
+ *   gesture can leave it stale. While a refresh is loading its role is
+ *   suspended (pinned by SA-R01 in
+ *   `library-select-all-refresh-regression.spec.ts`); every assertion in
+ *   this file runs in steady state. There is NO separate
+ *   `selection-announcement` region: a second status region carrying the
+ *   same text announces every change twice. Selection gestures never
  *   introduce an assertive (`role="alert"`) region.
  *
  * Contract under test (paired build):
@@ -50,10 +56,13 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * RNG-B-07 view-hidden untouched, RNG-B-08 clear resets anchor, RNG-B-09
  * auth purge resets anchor, RNG-B-10 anchor prune resets, RNG-B-11 plain
  * click unchanged, RNG-B-12 Shift on anchor is a no-op, RNG-B-13 range
- * purity, RNG-B-14 narrow both-theme. RNG-U-* live in the sibling
- * range-select unit acceptance file.
+ * purity, RNG-B-14 narrow both-theme, RNG-B-15 one live region across
+ * range, Select all and Clear. RNG-U-* live in the sibling range-select
+ * unit acceptance file.
  *
- * Out of scope (not pinned): all-select controls, drag selection, queue/star
+ * Out of scope (not pinned): all-select membership semantics (SA-B-* own
+ * those; RNG-B-15 pins only that Select all speaks through the same
+ * single region), drag selection, queue/star
  * side effects of ranges, grid-role refactor, touch-specific gestures (the
  * native checkbox carries touch), server playlists, saved selections,
  * cross-device state, backend search, audio transport, deployed streaming.
@@ -113,6 +122,10 @@ function clearButton(page: Page): Locator {
 	return page.getByRole('button', { name: 'Clear selection', exact: true });
 }
 
+function selectAllButton(page: Page): Locator {
+	return page.locator('main').getByRole('button', { name: 'Select all', exact: true });
+}
+
 function appendButton(page: Page): Locator {
 	return page.getByRole('button', { name: 'Append selected', exact: true });
 }
@@ -144,14 +157,31 @@ async function queueOrder(page: Page): Promise<(string | null)[]> {
 }
 
 /**
- * The single polite selection announcement carries exactly the expected
- * count text through a `role="status"` (polite) region.
+ * The single polite selection live region is the visible count itself:
+ * exactly one `selection-count`, `role="status"` in steady state,
+ * exactly the expected text, no separate `selection-announcement`
+ * region, and no other polite region in `main` carrying the same text
+ * (a duplicate would announce every selection change twice). Other
+ * `role="status"` regions (loading, append result, queue) carry
+ * different text and are not selection regions.
  */
 async function expectAnnouncement(page: Page, expected: string): Promise<void> {
-	const region = page.getByTestId('selection-announcement');
-	await expect(region, 'selection announcement missing').toHaveCount(1);
+	const region = selectionCount(page);
+	await expect(region, 'selection count live region missing').toHaveCount(1);
 	await expect(region).toHaveAttribute('role', 'status');
 	await expect(region).toHaveText(expected);
+	await expect(
+		page.getByTestId('selection-announcement'),
+		'duplicate selection announcer must not exist'
+	).toHaveCount(0);
+	const carriers = await page
+		.locator('main [role="status"], main [aria-live="polite"]')
+		.evaluateAll(
+			(elements, text) =>
+				elements.filter((element) => (element.textContent ?? '').trim() === text).length,
+			expected
+		);
+	expect(carriers, 'exactly one polite region may carry the selection text').toBe(1);
 }
 
 async function expectNoAssertiveFeedback(page: Page): Promise<void> {
@@ -596,5 +626,31 @@ test('[RNG-B-14] narrow-screen light and dark keep range selection visible and o
 	expect(await checkedIds(page)).toEqual(['row-mike', 'row-bravo', 'row-kilo', 'row-delta']);
 	await expect(selectionCount(page)).toHaveText('4 selected');
 	await expectAnnouncement(page, '4 selected');
+	await expectNoAssertiveFeedback(page);
+});
+
+test('[RNG-B-15] range, Select all and Clear all speak through the one selection-count live region', async ({
+	page
+}) => {
+	await seedLibrary(page);
+
+	const anchor = checkbox(page, 'row-alpha');
+	await expect(anchor, 'checkbox missing on row-alpha').toBeVisible();
+	await anchor.click();
+	await checkbox(page, 'row-bravo').click({ modifiers: ['Shift'] });
+	expect(await checkedIds(page)).toEqual(['row-alpha', 'row-mike', 'row-bravo']);
+	await expectAnnouncement(page, '3 selected');
+
+	// Select all must not leave a separate announcer stale at the range
+	// count: the same count region carries the new total.
+	const selectAll = selectAllButton(page);
+	await expect(selectAll, 'Select all missing').toBeVisible();
+	await selectAll.click();
+	expect(await checkedIds(page)).toEqual(API_ORDER);
+	await expectAnnouncement(page, '6 selected');
+
+	await clearButton(page).click();
+	expect(await checkedIds(page)).toEqual([]);
+	await expectAnnouncement(page, '0 selected');
 	await expectNoAssertiveFeedback(page);
 });
