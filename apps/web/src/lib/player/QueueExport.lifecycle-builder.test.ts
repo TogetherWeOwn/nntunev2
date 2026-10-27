@@ -134,6 +134,25 @@ for (const boundary of ['account before effect', 'teardown', 'new download'] as 
 	}
 }
 
+for (const outcome of ['resolve', 'reject'] as const) {
+	test(`a second copy supersedes a pending first copy ${outcome}`, async () => {
+		const writes: { resolve: () => void; reject: (reason: unknown) => void }[] = [];
+		vi.stubGlobal('navigator', { clipboard: { writeText: () => new Promise<void>((yes, no) => {
+			writes.push({ resolve: yes, reject: no });
+		}) } });
+		const exportUI = component();
+		const first = exportUI.copyQueueText();
+		const second = exportUI.copyQueueText();
+		if (outcome === 'resolve') writes[0].resolve();
+		else writes[0].reject(new Error('Denied'));
+		await first;
+		expect(exportUI.read()).toEqual({ status: '', fallback: null });
+		writes[1].resolve();
+		await second;
+		expect(exportUI.read()).toEqual({ status: 'Copied queue as text.', fallback: null });
+	});
+}
+
 test('throwing clipboard getter exposes the exact manual-copy text, not a success', async () => {
 	const navigator = {};
 	Object.defineProperty(navigator, 'clipboard', { get: () => { throw new Error('Denied'); } });
