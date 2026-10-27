@@ -43,6 +43,8 @@ const ITEMS = [
 const ORIGINAL = ['bulk-z', 'bulk-a', 'bulk-untitled', 'bulk-m'];
 const TITLE = ['bulk-a', 'bulk-untitled', 'bulk-m', 'bulk-z'];
 const ARTIST = ['bulk-m', 'bulk-z', 'bulk-a', 'bulk-untitled'];
+/** Session key LIBQR persists the arranged queue under. */
+const QUEUE_KEY = 'nntune.library.queue.v1';
 
 type Reply = { items: unknown; status?: number };
 
@@ -126,6 +128,10 @@ async function storage(page: Page) {
 	}));
 }
 
+function withoutQueue({ local, session }: Awaited<ReturnType<typeof storage>>) {
+	return { local, session: Object.fromEntries(Object.entries(session).filter(([key]) => key !== QUEUE_KEY)) };
+}
+
 test.beforeEach(async ({ context }) => {
 	// Per-page library mocks take precedence. Everything else stays local and
 	// any unmocked API call is refused rather than touching a backend.
@@ -192,7 +198,7 @@ test('BULK-02 mixed queued IDs preserve arranged prefix/current index, count onl
 	await expect(action(page)).toBeDisabled();
 });
 
-test('BULK-03 artist order uses title/artist fallbacks without storage, favorites, network or media effects', async ({ page }) => {
+test('BULK-03 artist order uses title/artist fallbacks; only the session queue persists, no other storage, favorites, network or media effects', async ({ page }) => {
 	let playCalls = 0;
 	await page.exposeFunction('bulkUnexpectedPlay', () => { playCalls += 1; });
 	await page.addInitScript(() => {
@@ -218,7 +224,16 @@ test('BULK-03 artist order uses title/artist fallbacks without storage, favorite
 	await expect(page.getByTestId('now-playing')).toContainText('Middle Song — Alpha Band');
 	await expect(row(page, 'bulk-z').getByRole('button', { name: 'Unstar Zulu Song', exact: true })).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
-	expect(await storage(page), 'bulk is in-memory only; even existing snapshots/favorites are untouched').toEqual(before);
+	// Session queue persistence (LIBQR) records the arranged queue under its own
+	// key on every queue change; every other local/session entry is untouched.
+	const after = await storage(page);
+	expect(after.session[QUEUE_KEY], 'the queue key holds exactly the bulk-built arrangement').toBe(
+		JSON.stringify({ orderIds: ARTIST, currentId: 'bulk-m' })
+	);
+	expect(
+		withoutQueue(after),
+		'bulk writes only the queue key; existing snapshots/favorites are untouched'
+	).toEqual(withoutQueue(before));
 	expect(api.mutations).toEqual([]);
 	expect(api.media).toEqual([]);
 	expect(api.reads()).toBe(1);
