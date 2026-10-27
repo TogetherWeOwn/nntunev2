@@ -6,8 +6,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * bank cannot reach because its fake clipboard settles in the same task and
  * no case crosses an auth boundary or leaves the page:
  * - feedback is fenced to the arranged list it was exported from;
- * - a superseded pending copy cannot overwrite newer feedback;
- * - an auth transition clears feedback and releases the retained Blob URL;
+ * - the selectable fallback text is fenced the same way;
+ * - a superseded pending copy, settling as success or as a rejection,
+ *   cannot overwrite newer feedback;
+ * - an auth transition clears feedback and releases the retained Blob URL,
+ *   including the library-refresh 401/403 invalidation path;
  * - leaving the page releases the retained Blob URL.
  * Real library page and storage; only HTTP is mocked.
  */
@@ -57,7 +60,13 @@ async function settleCopy(page: Page, index: number): Promise<void> {
 	);
 }
 
-async function open(page: Page, clipboard: 'immediate' | 'deferred'): Promise<void> {
+type ClipboardMode = 'immediate' | 'deferred' | 'reject' | 'deferred-reject';
+
+async function open(
+	page: Page,
+	clipboard: ClipboardMode
+): Promise<{ libraryStatus: { current: number } }> {
+	const libraryStatus = { current: 200 };
 	await page.addInitScript(
 		({ contextKey, context, key, ids, mode }) => {
 			if (!sessionStorage.getItem('test.favorites-export-lifecycle.seeded')) {
@@ -69,10 +78,13 @@ async function open(page: Page, clipboard: 'immediate' | 'deferred'): Promise<vo
 			(window as unknown as { __lifePending: typeof pending }).__lifePending = pending;
 			Object.defineProperty(navigator, 'clipboard', {
 				value: {
-					writeText: () =>
-						mode === 'deferred'
-							? new Promise<void>((resolve) => pending.push(resolve))
-							: Promise.resolve()
+					writeText: () => {
+						if (mode === 'immediate') return Promise.resolve();
+						if (mode === 'reject') return Promise.reject(new Error('denied'));
+						return new Promise<void>((resolve, reject) =>
+							pending.push(mode === 'deferred' ? resolve : () => reject(new Error('denied')))
+						);
+					}
 				},
 				configurable: true
 			});
@@ -96,14 +108,15 @@ async function open(page: Page, clipboard: 'immediate' | 'deferred'): Promise<vo
 	);
 	await page.route('**/api/library', (route) =>
 		route.fulfill({
-			status: 200,
+			status: libraryStatus.current,
 			contentType: 'application/json',
-			body: JSON.stringify(ITEMS)
+			body: JSON.stringify(libraryStatus.current === 200 ? ITEMS : {})
 		})
 	);
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expect(page.getByTestId('favorite-item')).toHaveCount(ALL.length);
+	return { libraryStatus };
 }
 
 test.beforeEach(async ({ page }) => {
@@ -206,4 +219,55 @@ test('[FAVEXPORT-L05] leaving the page releases the retained Blob URL', async ({
 	await page.getByRole('link', { name: 'Select NZB locally', exact: true }).click();
 	await expect(page).toHaveURL(/\/library\/import/);
 	await expect.poll(() => blobLive(page)).toBe(0);
+});
+
+test('[FAVEXPORT-L06] the fallback text disappears when the arranged favorites change', async ({
+	page
+}) => {
+	await open(page, 'reject');
+	await copyButton(page).click();
+	await expect(page.getByTestId('favorites-export-fallback')).toBeVisible();
+
+	await unstar(page, 'life-m').click();
+	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
+	await expect(
+		page.getByTestId('favorites-export-fallback'),
+		'fallback text for the old list must not be offered for the edited list'
+	).toHaveCount(0);
+});
+
+test('[FAVEXPORT-L07] a copy that is rejected after a newer download cannot overwrite the download feedback', async ({
+	page
+}) => {
+	await open(page, 'deferred-reject');
+	await copyButton(page).click();
+	await expect.poll(() => pendingCopies(page)).toBe(1);
+
+	await downloadButton(page).click();
+	await expect(statusRegion(page)).toContainText(/download/i);
+
+	await settleCopy(page, 0);
+	await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 100)));
+	await expect(
+		statusRegion(page),
+		'a late clipboard rejection must not replace the download status'
+	).toContainText(/download/i);
+	await expect(statusRegion(page)).not.toContainText(/clipboard/i);
+	await expect(page.getByTestId('favorites-export-fallback')).toHaveCount(0);
+});
+
+test('[FAVEXPORT-L08] a library refresh refused with 401 releases the retained Blob URL', async ({
+	page
+}) => {
+	const { libraryStatus } = await open(page, 'immediate');
+	await downloadButton(page).click();
+	await expect.poll(() => blobLive(page)).toBe(1);
+
+	libraryStatus.current = 401;
+	await page.getByRole('button', { name: 'Refresh' }).click();
+
+	await expect(page.getByTestId('favorite-item')).toHaveCount(0);
+	await expect
+		.poll(() => blobLive(page), 'the refused session export URL must be revoked')
+		.toBe(0);
 });
