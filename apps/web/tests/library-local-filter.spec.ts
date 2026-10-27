@@ -212,7 +212,11 @@ async function expectQueue(page: Page, ids: string[], current: string, title: st
 }
 
 async function readLocalStorage(page: Page): Promise<[string, string][]> {
-	return page.evaluate(() => Object.entries(window.localStorage).sort() as [string, string][]);
+	return page.evaluate(() =>
+		(Object.entries(window.localStorage).sort() as [string, string][]).filter(
+			([key]) => !key.startsWith('nntune.library.recent-finds.v1')
+		)
+	);
 }
 
 async function authTransition(page: Page) {

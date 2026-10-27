@@ -521,9 +521,7 @@ test('[RF-07] auth boundary purges recents so the next account starts empty', as
 
 	reply.items = NEXT_ACCOUNT;
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
-	await expect(
-		page.getByTestId('library-item').evaluateAll((rows) => rows.map((r) => r.getAttribute('data-id')))
-	).resolves.toEqual(['next-rec', 'next-other']);
+	await expectRows(page, ['next-rec', 'next-other']);
 	await expect(recentEmpty(page)).toBeVisible();
 	await expect(recentChips(page)).toHaveCount(0);
 	const fresh = await requireFind(page);
@@ -738,13 +736,13 @@ test('[RF-12] leaving via clear, refresh or navigation records the applied query
 
 	// A successful refresh commits first, then records the preserved query.
 	reply.items = ITEMS.map((item) =>
-		item.id === 'rec-beta' ? { ...item, title: 'Beta Song refreshed' } : item
+		item.id === 'rec-gamma' ? { ...item, title: 'Gamma Tune refreshed' } : item
 	);
 	await field.fill('gamma');
 	await expectRows(page, ['rec-gamma']);
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await expect(page.locator('[data-testid="library-item"][data-id="rec-beta"]')).toContainText(
-		'Beta Song refreshed'
+	await expect(page.locator('[data-testid="library-item"][data-id="rec-gamma"]')).toContainText(
+		'Gamma Tune refreshed'
 	);
 	await expect(field, 'same-account refresh preserves the query').toHaveValue('gamma');
 	await expectChips(page, ['gamma', 'beta']);
