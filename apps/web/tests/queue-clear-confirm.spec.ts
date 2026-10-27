@@ -32,6 +32,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - Auth teardown while a confirm is open dismisses the dialog without acting;
  *   confirm state never survives unmount or an account change (Retry starts
  *   clean with no dialog).
+ * - A prompt whose precondition disappears while the panel stays mounted
+ *   (nothing left upcoming) dismisses itself and does not reappear when the
+ *   precondition returns on that same mount.
  * - Focus recovery matches the existing queue-removal focus recovery
  *   (`library-queue-remove-focus.spec.ts`): cancel restores the trigger;
  *   confirmed whole-clear lands on queue-empty-focus; confirmed trim lands
@@ -66,7 +69,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * If 4173 is busy, use a run-owned config extending the repository config with
  * a free port/baseURL and reuseExistingServer:false; do not stop/reuse a peer.
  *
- * Expected pre-feature RED: QC-B01..B04 and QC-B06..B09 fail on dialog or
+ * Expected pre-feature RED: QC-B01..B04 and QC-B06..B10 fail on dialog or
  * preservation assertions (queue already wiped/trimmed, confirm/cancel absent);
  * QC-B00 and QC-B05 pass as controls. Builder next action: implement the
  * in-page confirms in the shared queue component plus host clear/trim
@@ -139,6 +142,10 @@ function trimDialog(page: Page): Locator {
 
 function announcement(page: Page): Locator {
 	return page.getByTestId('queue-announcement');
+}
+
+function confirmFeedback(page: Page): Locator {
+	return page.getByTestId('queue-confirm-feedback');
 }
 
 function emptyTarget(page: Page): Locator {
@@ -321,6 +328,9 @@ test('QC-B01 Clear opens an explicit in-page confirm disclosing removal and irre
 		clearDialog(page),
 		'confirm must disclose removal and irreversibility together'
 	).toBeVisible();
+	await expect(
+		page.getByText('Remove all 3 tracks from the queue? This cannot be undone.', { exact: true })
+	).toBeVisible();
 	expect(dialogs, 'native dialogs are not an in-page confirmation').toBe(0);
 });
 
@@ -375,6 +385,7 @@ test('QC-B03 Cancel changes nothing and restores focus to the Clear trigger', as
 
 	await cancelButton(page).click();
 
+	await expect(confirmFeedback(page)).toHaveText('Clear queue cancelled. Queue kept.');
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
 	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-mike');
 	await expect(page.getByTestId('now-playing')).toContainText('Mike Song');
@@ -388,10 +399,17 @@ test('QC-B03 Cancel changes nothing and restores focus to the Clear trigger', as
 	expect(await favoritesStorage(page)).toEqual(storageBefore);
 	await expectNoPlayback(page, harness);
 
-	// The trigger stays usable: a second open still discloses before acting.
+	// The trigger stays usable: a second open still discloses before acting,
+	// and reopening the prompt clears the earlier cancel note.
 	await clearTrigger(page).click();
 	await expect(confirmButton(page)).toBeVisible();
+	await expect(confirmFeedback(page)).toHaveText('');
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
+
+	// Confirming after that reopen also leaves no stale cancel note behind.
+	await confirmButton(page).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await expect(confirmFeedback(page)).toHaveText('');
 });
 
 test('QC-B04 trim-upcoming carries the same confirm/cancel contract and keeps the current track', async ({
@@ -413,15 +431,24 @@ test('QC-B04 trim-upcoming carries the same confirm/cancel contract and keeps th
 		trimDialog(page),
 		'trim confirm must disclose upcoming removal and irreversibility together'
 	).toBeVisible();
+	await expect(
+		page.getByText(
+			'Remove 1 upcoming track from the queue? The current track stays. This cannot be undone.',
+			{ exact: true }
+		)
+	).toBeVisible();
 	await cancelButton(page).click();
+	await expect(confirmFeedback(page)).toHaveText('Clear upcoming cancelled. Queue kept.');
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
 	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-zulu');
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	await expect(trimTrigger(page)).toBeFocused();
 
 	// Confirm path: only upcoming rows go; current stays highlighted and focused.
+	// Reopening the prompt clears the trim cancel note before the choice.
 	await trimTrigger(page).click();
 	await expect(confirmButton(page)).toBeVisible();
+	await expect(confirmFeedback(page)).toHaveText('');
 	await confirmButton(page).click();
 	await expect.poll(() => queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-zulu');
@@ -436,6 +463,7 @@ test('QC-B04 trim-upcoming carries the same confirm/cancel contract and keeps th
 	await expect(trimTrigger(page)).toBeDisabled();
 	await expect(confirmButton(page)).toHaveCount(0);
 	await expect(cancelButton(page)).toHaveCount(0);
+	await expect(confirmFeedback(page)).toHaveText('');
 	await expectNoPlayback(page, harness);
 
 	// The trimmed arrangement survives a same-id background refresh.
@@ -615,4 +643,36 @@ test('QC-B09 confirm flows leave favorites and playback untouched', async ({ pag
 	expect(await shelfIds(page)).toEqual(shelfBefore);
 	expect(await favoritesStorage(page)).toEqual(storageBefore);
 	await expectNoPlayback(page, harness);
+});
+
+test('QC-B10 a trim prompt invalidated while open dismisses itself and stays dismissed when upcoming returns', async ({
+	page
+}) => {
+	await seedQueue(page);
+	await trimTrigger(page).click();
+	await expect(confirmButton(page), 'trim prompt must be open before invalidation').toBeVisible();
+	await expect(cancelButton(page)).toBeVisible();
+
+	// Advance the current track to the tail on the same mounted panel: with
+	// nothing left upcoming the open prompt's precondition is gone.
+	await page.getByTestId('player-next').click();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-zulu');
+	await expect(confirmButton(page)).toBeVisible();
+	await page.getByTestId('player-next').click();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-alpha');
+	await expect(trimTrigger(page)).toBeDisabled();
+	await expect(confirmButton(page)).toHaveCount(0);
+	await expect(cancelButton(page)).toHaveCount(0);
+
+	// Restore the precondition by selecting an earlier row: the dismissed
+	// prompt must not resurrect, and nothing was trimmed behind it.
+	await queueItem(page, 'row-mike')
+		.getByRole('button', { name: 'Select Mike Song', exact: true })
+		.click();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-mike');
+	await expect(trimTrigger(page)).toBeEnabled();
+	await settle(page);
+	await expect(confirmButton(page)).toHaveCount(0);
+	await expect(cancelButton(page)).toHaveCount(0);
+	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
 });

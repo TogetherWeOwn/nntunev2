@@ -262,6 +262,22 @@ test('TRIM-C05 background prop replacements never autofocus and refresh boundary
 	}
 });
 
+test('TRIM-C06 panel without the confirm opt-in reports clear-all once in one step, with no prompt', async ({ componentPage: page }) => {
+	const value = { ...createQueue(TRACKS), currentIndex: 1 };
+	await replace(page, value);
+	const clearAll = button(page, 'Clear queue');
+	await expect(clearAll).toBeVisible();
+	await expect(clearAll).toHaveAttribute('type', 'button');
+	await clearAll.focus();
+	await page.keyboard.press('Space');
+	await settle(page);
+	expect(await page.evaluate(() => window.queueTrim.inspect())).toEqual({ state: value, calls: ['clear-all'] });
+	await expect(button(page, 'Yes, clear queue')).toHaveCount(0);
+	await expect(button(page, 'Cancel')).toHaveCount(0);
+	await expect(page.getByTestId('queue-clear-confirm')).toHaveCount(0);
+	expect(await page.evaluate(() => window.trimProbe)).toEqual({ media: [], positions: [], sources: [] });
+});
+
 const EXAMPLES = [
 	{ id: 'TRIM-B01', index: 0, name: KEEP, want: ['trim-zulu', 'trim-apple', 'trim-mango', 'trim-kiwi'], position: 'Track 1 of 4', removed: 0, key: 'Enter' },
 	{ id: 'TRIM-B02', index: 2, name: KEEP, want: ['trim-mango', 'trim-kiwi'], position: 'Track 1 of 2', removed: 2, key: 'Enter' },
