@@ -75,6 +75,26 @@ export function pruneSelection(
 	return kept;
 }
 
+/**
+ * Project `items` to the rows whose ID is selected: exact case-sensitive
+ * membership, input-list order (never activation order), the same row
+ * references in a new array. Unknown/pruned, duplicate, non-string and
+ * empty selected entries contribute nothing; loaded rows sharing a
+ * selected ID all survive (dedupe stays the append path's job). Pure and
+ * nonmutating, so the library page composes it with the existing find
+ * and ordering steps as the single Selected-only projection.
+ */
+export function selectSelectedItems(
+	items: readonly LibraryItem[],
+	selectedIds: readonly string[]
+): LibraryItem[] {
+	const selected = new Set<string>();
+	for (const entry of selectedIds as readonly unknown[]) {
+		if (isValidId(entry)) selected.add(entry);
+	}
+	return items.filter((item) => selected.has(item.id));
+}
+
 /** Count valid selected IDs absent from `visibleIds` (exact match). */
 export function hiddenSelectedCount(
 	selection: readonly string[],
