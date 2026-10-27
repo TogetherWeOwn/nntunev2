@@ -103,6 +103,38 @@ test('a pruned anchor that returns still plain-toggles the next Shift+click', as
 	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
 });
 
+for (const refusal of [401, 403, 404]) {
+	test(`refresh ${refusal} purges an anchor even after its checkbox was toggled off`, async ({ page }) => {
+		let status = 200;
+		await page.route('**/api/library', (route) => route.fulfill({
+			status,
+			contentType: 'application/json',
+			body: JSON.stringify(status === 200 ? ITEMS : { error: 'refused' })
+		}));
+		await page.goto('/library');
+		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+
+		// Plain toggle-off empties membership without clearing the last anchor.
+		await checkbox(page, 'row-zulu').click();
+		await checkbox(page, 'row-zulu').click();
+		await expect(page.getByTestId('selection-count')).toHaveText('0 selected');
+
+		status = refusal;
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await expect(page.getByTestId('library-item')).toHaveCount(0);
+		const retry = page.getByRole('button', { name: refusal === 404 ? 'Refresh' : 'Retry', exact: true });
+		await expect(retry).toBeVisible();
+
+		// Reusing IDs after Retry must not revive a prior account's anchor.
+		status = 200;
+		await retry.click();
+		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
+		await checkbox(page, 'row-mike').click({ modifiers: ['Shift'] });
+		await expect.poll(() => checkedIds(page)).toEqual(['row-mike']);
+		await expect(page.getByTestId('selection-count')).toHaveText('1 selected');
+	});
+}
+
 for (const gesture of ['click', 'space'] as const) {
 	test(`grouped ${gesture} range follows rendered groups, not the flat API order`, async ({ page }) => {
 		await seedLibrary(page);

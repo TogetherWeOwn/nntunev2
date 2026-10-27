@@ -333,7 +333,9 @@
 			// there; failures without a snapshot have no rows selected.
 			if (!state.loading) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
-					if (selectedIds.length > 0 || appendFeedback !== null) purgeSelection();
+					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
+						purgeSelection();
+					}
 				} else if (!state.loadError) {
 					const snapshotIds = state.items.map((track) => track.id);
 					selectedIds = pruneSelection(selectedIds, snapshotIds);
