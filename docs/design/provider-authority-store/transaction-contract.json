@@ -1,0 +1,455 @@
+{
+  "status": "NON-AUTHORITATIVE / NOT INSTALLED",
+  "note": "Definition only. No writer or transaction is integrated; the model in the test support adapter is synthetic and is not a PostgreSQL race proof.",
+  "outbox_is_synchronous_fence": false,
+  "shared_lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+  "snapshot_fields": ["environment", "owner", "actual_owner", "session", "user_security", "deletion_tombstone", "library", "source_tuple", "material_tuple", "publication_tuple", "consumed_permit_ownership", "origin_plan_mapping", "material_lease", "entitlement", "provider", "owner_epoch", "permission_epoch", "policy", "key_acceptance", "scope", "progress", "dispatch_claim", "admission", "job_generation", "selected_plan", "attempt", "absolute_deadlines", "monotonic_deadline", "audit_ack"],
+  "transactions": {
+    "permit_consume": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "manifest permit row consumed exactly once under the common locks",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "play_release": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "final release transaction: origin, plan, mapping and exact lease freeze atomically",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "material_lease_check": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "lease row read under permit, lease and material locks",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "provider_reserve": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "reservation row insert plus replay nonce and JTI state change",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "provider_finalize": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "JTI state change to consumed, with lease activation and tombstone",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "scope_progress": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "progress counter compare-and-set under current_scope",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "import_enroll": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "import attempt row insert under import_attempt and own_library",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "import_material_delivery": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "material lease activation under material and lease",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "import_report": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "receipt row insert under receipt and import_attempt",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "import_publish": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "publication operation commit under publication_operation and target_pointer",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "probe_dispatch": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "dispatch claim compare-and-set under dispatch_claim",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "nonce_admission": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "replay nonce insert under nonce_jti",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    },
+    "key_activation": {
+      "integrated": false,
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "snapshot": "shared_snapshot",
+      "linearization_point": "key acceptance row change under key",
+      "post_unwrap_and_post_audit_rereads": "reacquire the common locks and recheck the full snapshot after unwrap and after each audit acknowledgement"
+    }
+  },
+  "writers": {
+    "library_remove": {
+      "integrated": false,
+      "group": "library",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["library", "current_source", "lease", "origin_mapping", "own_library", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "playback_session_revoke": {
+      "integrated": false,
+      "group": "session",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["session", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "session_logout": {
+      "integrated": false,
+      "group": "session",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["session", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "session_expire": {
+      "integrated": false,
+      "group": "session",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["session", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "admitting_session_expire": {
+      "integrated": false,
+      "group": "session",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["session", "lease", "origin_mapping", "import_attempt", "pending_envelope", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "user_disable": {
+      "integrated": false,
+      "group": "user",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "session", "user_security", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "user_delete_tombstone": {
+      "integrated": false,
+      "group": "user",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "security_epoch_reset": {
+      "integrated": false,
+      "group": "user",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["session", "user_security", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "playback_entitlement_remove": {
+      "integrated": false,
+      "group": "entitlement",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "library", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "import_entitlement_remove": {
+      "integrated": false,
+      "group": "entitlement",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "import_attempt", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "permission_remove": {
+      "integrated": false,
+      "group": "entitlement",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "source_withdraw": {
+      "integrated": false,
+      "group": "source",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["current_source", "lease", "origin_mapping", "source_selection_plan", "publication_operation", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "source_replace": {
+      "integrated": false,
+      "group": "source",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["current_source", "lease", "origin_mapping", "source_selection_plan", "publication_operation", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "target_source_delete": {
+      "integrated": false,
+      "group": "source",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["current_source", "lease", "origin_mapping", "target_pointer", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "target_source_replace": {
+      "integrated": false,
+      "group": "source",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["current_source", "lease", "origin_mapping", "target_pointer", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "track_selection_change": {
+      "integrated": false,
+      "group": "source",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["current_source", "lease", "origin_mapping", "source_selection_plan", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "material_replace": {
+      "integrated": false,
+      "group": "material",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["material", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "material_revoke": {
+      "integrated": false,
+      "group": "material",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["material", "lease", "origin_mapping", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "provider_update": {
+      "integrated": false,
+      "group": "provider",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "current_scope", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "provider_delete": {
+      "integrated": false,
+      "group": "provider",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "current_scope", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "owner_disable": {
+      "integrated": false,
+      "group": "provider",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "current_scope", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "policy_change": {
+      "integrated": false,
+      "group": "provider",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "current_scope", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "plan_decrease": {
+      "integrated": false,
+      "group": "provider",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["owner_policy", "lease", "origin_mapping", "current_scope", "progress", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "issuer_key_revoke": {
+      "integrated": false,
+      "group": "key",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "key", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "caller_key_revoke": {
+      "integrated": false,
+      "group": "key",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "key", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "import_cancel": {
+      "integrated": false,
+      "group": "import",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "import_attempt", "pending_envelope", "receipt", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "import_expire": {
+      "integrated": false,
+      "group": "import",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "import_attempt", "pending_envelope", "receipt", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "job_generation_change": {
+      "integrated": false,
+      "group": "import",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "import_attempt", "dispatch_claim", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "probe_attempt_replace": {
+      "integrated": false,
+      "group": "probe",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "import_attempt", "progress", "dispatch_claim", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "probe_dispatch_invalidate": {
+      "integrated": false,
+      "group": "probe",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "probe_plan_change": {
+      "integrated": false,
+      "group": "probe",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "source_selection_plan", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    },
+    "probe_target_change": {
+      "integrated": false,
+      "group": "probe",
+      "lock_keys": ["owner_policy", "session", "user_security", "deletion_tombstone", "library", "current_source", "material", "permit", "lease", "origin_mapping", "import_attempt", "source_selection_plan", "pending_envelope", "receipt", "publication_operation", "target_pointer", "own_library", "key", "current_scope", "progress", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "cas_keys": ["lease", "origin_mapping", "target_pointer", "dispatch_claim", "accepted_projection", "nonce_jti", "audit_outbox"],
+      "current_snapshot": "take the shared snapshot with every lock_key held in canonical order, then compare epochs and tuples",
+      "post_unwrap_reread": "a reserve or finalize that unwrapped before this writer must reread and deny after it commits",
+      "post_audit_reread": "a finalize that acknowledged intent or terminal audit before this writer must reread and deny after it commits",
+      "linearization_point": "commit of the writer transaction that moves the origin to the fenced state and closes its lease",
+      "atomic_fence_and_outbox": "fence change and secret-free outbox row commit in the same transaction; the outbox is never the fence"
+    }
+  },
+  "reader_only": ["import.discovery"]
+}
