@@ -1363,10 +1363,13 @@ fn dry_run_multi_batch_paginates_and_leaves_the_run_untouched() {
     for (user_id, blob) in &before {
         let (after, updated_at, rewrapped_at) = vault_row(&db, user_id);
         assert_eq!(after.kek_version, OLD_VERSION, "dry run must not rewrap");
-        assert_eq!(after.dek_wrapped, blob.dek_wrapped);
-        assert_eq!(after.dek_wrapped_nonce, blob.dek_wrapped_nonce);
-        assert_eq!(after.payload, blob.payload);
-        assert_eq!(after.payload_nonce, blob.payload_nonce);
+        assert_eq!(after.dek_wrapped_b64url, blob.dek_wrapped_b64url);
+        assert_eq!(
+            after.dek_wrapped_nonce_b64url,
+            blob.dek_wrapped_nonce_b64url
+        );
+        assert_eq!(after.payload_b64url, blob.payload_b64url);
+        assert_eq!(after.payload_nonce_b64url, blob.payload_nonce_b64url);
         assert_eq!(updated_at, 20, "dry run must not touch updated_at");
         assert_eq!(rewrapped_at, None);
     }
