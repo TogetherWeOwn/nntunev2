@@ -140,15 +140,17 @@ def job_level_field(job_chunk, field):
 def step_level_field(step_chunk, field):
     """First `field: value` scalar at step-key indent, comment-stripped.
 
-    Step keys sit on the step's dash line (six spaces plus ``- ``) or
-    at exactly eight spaces. Keys nested under a step mapping such as
+    The guarded layout requires one ASCII space after the step dash,
+    so step keys sit on that line or at exactly eight spaces. Other
+    layouts are rejected by ``non_plain_key_lines``. Keys nested under
+    a step mapping such as
     ``env:`` or ``with:`` sit deeper, so an ``env.run`` value cannot
     pose as the step's executed ``run`` command. Quoted,
     space-before-colon, and explicit-key spellings count too, for the
     same reason as in ``job_level_field``.
     """
     key = _key_token(field)
-    prefix = r"(?:      -\s+|        )"
+    prefix = r"(?:      - |        )"
     explicit = re.compile(rf"^{prefix}\?\s+{key}(?:\s*:\s*(.*?)\s*)?$")
     plain = re.compile(rf"^{prefix}{key}\s*:\s*(.*?)\s*$")
     for line in step_chunk.splitlines():
@@ -199,7 +201,7 @@ def job_needs(job_chunk):
 
 _PLAIN_KEY = r"[A-Za-z_][A-Za-z0-9_-]*:(?:\s|$)"
 _JOB_KEY_LINE = re.compile(rf"^    (?!\s)(.*)$")
-_STEP_DASH_LINE = re.compile(r"^      -(?:\s+(.*))?$")
+_STEP_DASH_LINE = re.compile(r"^      -(.*)$")
 _STEP_KEY_LINE = re.compile(r"^        (?!\s)(.*)$")
 
 
@@ -212,8 +214,10 @@ def non_plain_key_lines(job_chunk):
     explicit keys, flow-mapping steps, merge keys. A guard that fails
     open on an unknown spelling lets a masking ``if`` or
     ``continue-on-error`` hide. So the required job and its steps may
-    use only plain ``key:`` at job- and step-key indent; anything else
-    is reported and fails closed instead of being parsed.
+    use only plain ``key:`` at job- and step-key indent, with exactly
+    one ASCII space after a step dash. Consuming arbitrary whitespace
+    there would shift subsequent keys beyond the eight-space reader.
+    Anything else is reported and fails closed instead of being parsed.
     """
     bad = []
     for line in job_chunk.splitlines():
@@ -222,7 +226,9 @@ def non_plain_key_lines(job_chunk):
         dash = _STEP_DASH_LINE.match(line)
         if dash:
             rest = dash.group(1)
-            if rest and not re.match(_PLAIN_KEY, rest):
+            if rest and (
+                not rest.startswith(" ") or not re.match(_PLAIN_KEY, rest[1:])
+            ):
                 bad.append(line)
             continue
         for pattern in (_JOB_KEY_LINE, _STEP_KEY_LINE):
@@ -243,8 +249,8 @@ def check_required_step(job_id, job_chunk, command):
     be silently dropped or neutralized without CI turning red.
     """
     errors = [
-        f"{job_id}: key line must be a plain `key:` (any other YAML spelling "
-        f"can hide a masking key): {line.strip()!r}"
+        f"{job_id}: key line must be a plain `key:` with exactly one ASCII "
+        f"space after a step dash (other layouts can hide masking keys): {line.strip()!r}"
         for line in non_plain_key_lines(job_chunk)
     ]
     # Job keys are unordered YAML, so `if` and `continue-on-error` count
@@ -625,6 +631,55 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
                 step = f"      - {first}\n        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
                 errors = wiring_errors(public_text_with(step))
                 self.assertTrue(any("plain `key:`" in e for e in errors), errors)
+
+    def test_extra_dash_spacing_fails_closed(self):
+        """Reject layouts that move masking keys past the eight-space reader."""
+        for command in (
+            WEB_E2E_TIMEOUT_COMMAND,
+            "python3 .github/scripts/test_ci_pnpm_retry.py",
+        ):
+            for spaces in (2, 3, 4, 8):
+                indent = " " * (7 + spaces)
+                for key_line in (
+                    "continue-on-error: true",
+                    "if: false",
+                    '"continue-on\\u002derror": true',
+                    "&a continue-on-error: true",
+                    "!!str if: false",
+                ):
+                    for first_key in ("run", "name"):
+                        with self.subTest(
+                            command=command, spaces=spaces,
+                            key_line=key_line, first_key=first_key,
+                        ):
+                            first = f"run: {command}" if first_key == "run" else "name: guard"
+                            step = "      -" + " " * spaces + first + "\n"
+                            if first_key != "run":
+                                step += f"{indent}run: {command}\n"
+                            step += f"{indent}{key_line}\n"
+                            errors = check_required_step(
+                                "public-text", public_text_with(step), command
+                            )
+                            self.assertTrue(
+                                any("plain `key:`" in e for e in errors), errors
+                            )
+
+    def test_canonical_dash_spacing_stays_clean(self):
+        """A one-space dash and nested data remain valid for both commands."""
+        for command in (
+            WEB_E2E_TIMEOUT_COMMAND,
+            "python3 .github/scripts/test_ci_pnpm_retry.py",
+        ):
+            with self.subTest(command=command):
+                step = (
+                    f"      - run: {command}\n"
+                    "        env:\n"
+                    "          if: data-not-a-step-gate\n"
+                    "          continue-on-error: data-not-a-step-control\n"
+                )
+                self.assertEqual(
+                    check_required_step("public-text", public_text_with(step), command), []
+                )
 
     def test_plain_keys_comments_and_blank_lines_stay_clean(self):
         """Negative control: plain keys, comments and blanks are not flagged."""
