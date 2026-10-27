@@ -214,6 +214,87 @@ fn freeze_is_immutable_and_mapping_is_one_to_one_in_environment() {
     cross.origin.env = "production".into();
     assert_eq!(m.freeze(cross), Err(Denial::Denied));
 }
+// P1 §8 (retained by P2 §1 and S §1): JTI identity includes issuer.
+// Distinct origins/scopes avoid confusing another uniqueness rule with JTI scope.
+fn other_issuer_seed(base: u32) -> Seed {
+    let mut s = seed();
+    s.origin.play_intent_id = id(base);
+    s.origin.authorization_id = id(base + 1);
+    s.origin.playback_request_id = id(base + 2);
+    s.scope_id = id(base + 3);
+    s.issuer = "synthetic_other_issuer".into();
+    s.material_lease_until = 1013;
+    s
+}
+
+#[test]
+fn equal_jti_in_distinct_issuers_is_not_a_duplicate_but_full_namespace_is() {
+    let mut m = frozen();
+    assert_eq!(m.freeze(other_issuer_seed(31)), Ok(()));
+    assert_eq!(m.freeze(other_issuer_seed(41)), Err(Denial::Conflict));
+    assert!(m.inspect(&id(41)).is_none());
+    assert_eq!(m.inspect(&id(1)).unwrap().state, State::Frozen);
+    assert_eq!(m.inspect(&id(31)).unwrap().state, State::Frozen);
+}
+
+#[test]
+fn equal_jti_issuers_keep_reservations_and_bare_jti_leases_independent() {
+    let mut m = frozen();
+    assert_eq!(m.freeze(other_issuer_seed(31)), Ok(()));
+    let first = reserved(&mut m);
+    let second = m.reserve(&id(31), &id(10), call(), nonce(2)).unwrap();
+    assert_ne!(first.reservation_id, second.reservation_id);
+    assert_eq!(second.until, 1002);
+    // Finalize in reverse order to expose a JTI-keyed reservation alias.
+    assert_eq!(
+        m.first_finalize(finalize(&second)),
+        Ok(Delivery {
+            lease_id: id(10),
+            until: 1013
+        })
+    );
+    assert_eq!(
+        m.first_finalize(finalize(&first)),
+        Ok(Delivery {
+            lease_id: id(10),
+            until: 1015
+        })
+    );
+    for (origin, until) in [(1, 1015), (31, 1013)] {
+        let view = m.inspect(&id(origin)).unwrap();
+        assert_eq!(view.deliveries, 1);
+        assert_eq!(view.state, State::Consumed);
+        assert_eq!(view.lease_until, Some(until));
+    }
+    assert_eq!(m.invalidate(&id(1), "issuer_key_revoke", 1001), Ok(()));
+    assert!(m.inspect(&id(1)).unwrap().synchronous_fenced);
+    let other = m.inspect(&id(31)).unwrap();
+    assert!(!other.synchronous_fenced);
+    assert_eq!(other.state, State::Consumed);
+    assert_eq!(other.lease_until, Some(1013));
+    assert!(m.first_finalize(finalize(&first)).is_err());
+    assert!(m.first_finalize(finalize(&second)).is_err());
+}
+
+#[test]
+fn equal_jti_issuer_revocation_does_not_redirect_another_finalization() {
+    let mut m = frozen();
+    assert_eq!(m.freeze(other_issuer_seed(31)), Ok(()));
+    let first = reserved(&mut m);
+    let second = m.reserve(&id(31), &id(10), call(), nonce(2)).unwrap();
+    assert_eq!(m.invalidate(&id(1), "issuer_key_revoke", 1001), Ok(()));
+    assert!(m.first_finalize(finalize(&first)).is_err());
+    assert_eq!(
+        m.first_finalize(finalize(&second)),
+        Ok(Delivery {
+            lease_id: id(10),
+            until: 1013
+        })
+    );
+    assert_eq!(m.inspect(&id(1)).unwrap().deliveries, 0);
+    assert_eq!(m.inspect(&id(31)).unwrap().deliveries, 1);
+}
+
 #[test]
 fn mutual_distinct_ids_and_stable_steps_reject_corruption() {
     for field in 0..7 {
@@ -499,6 +580,83 @@ fn unsupported_catalogue_cannot_reset_steps_credit_deadline_or_recover_delivery(
     assert_eq!(v.content_steps, seed().content_steps);
     assert_eq!(v.connection_steps, seed().connection_steps);
 }
+#[test]
+fn audit_event_ids_do_not_collide_when_environment_scoped_origins_repeat() {
+    // Global event_id storage is compatible: allocate distinct server IDs, not
+    // a new audit field or an inferred mandatory composite environment key.
+    let mut event_ids = std::collections::BTreeSet::new();
+    for env in ["staging", "production"] {
+        let mut m = adapter::new(env);
+        let mut s = seed();
+        s.origin.env = env.into();
+        assert_eq!(m.freeze(s), Ok(()));
+        let c = Call {
+            env: env.into(),
+            ..call()
+        };
+        let n = Nonce {
+            env: env.into(),
+            ..nonce(1)
+        };
+        let r = m.reserve(&id(1), &id(10), c.clone(), n).unwrap();
+        let mut f = finalize(&r);
+        f.call = Call { now: 1001, ..c };
+        assert_eq!(
+            m.first_finalize(f),
+            Ok(Delivery {
+                lease_id: id(10),
+                until: 1015
+            })
+        );
+        assert_eq!(m.invalidate(&id(1), "issuer_key_revoke", 1001), Ok(()));
+        let view = m.inspect(&id(1)).unwrap();
+        assert_eq!(view.deliveries, 1);
+        assert!(view.outbox.len() >= 2, "reserve and terminal audit facts");
+        for event in &view.outbox {
+            let ids: Vec<_> = event.iter().filter(|(k, _)| k == "event_id").collect();
+            assert_eq!(ids.len(), 1, "one server event ID per audit fact");
+            assert!(!ids[0].1.is_empty());
+            let environments: Vec<_> = event.iter().filter(|(k, _)| k == "environment").collect();
+            assert_eq!(environments.len(), 1);
+            assert_eq!(environments[0].1, env);
+            assert!(
+                event_ids.insert(ids[0].1.clone()),
+                "event_id collision in {env}"
+            );
+        }
+    }
+}
+
+#[test]
+fn audit_event_id_uses_only_the_accepted_server_uuid_correlation_domain() {
+    // S §2 Uuid and §8 audit allowlist: shape only, not entropy/custody proof.
+    let mut m = frozen();
+    let r = reserved(&mut m);
+    m.first_finalize(finalize(&r)).unwrap();
+    for event in &m.inspect(&id(1)).unwrap().outbox {
+        let value = &event
+            .iter()
+            .find(|(k, _)| k == "event_id")
+            .expect("server event ID")
+            .1;
+        let bytes = value.as_bytes();
+        assert_eq!(
+            bytes.len(),
+            36,
+            "event_id must remain an allowed UUID correlation"
+        );
+        for (i, byte) in bytes.iter().copied().enumerate() {
+            if [8, 13, 18, 23].contains(&i) {
+                assert_eq!(byte, b'-');
+            } else {
+                assert!(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            }
+        }
+        assert_eq!(bytes[14], b'4');
+        assert!(b"89ab".contains(&bytes[19]));
+    }
+}
+
 #[test]
 fn audit_outbox_is_closed_allowlist_and_debug_is_not_an_identity_or_bearer_dump() {
     let mut m = frozen();

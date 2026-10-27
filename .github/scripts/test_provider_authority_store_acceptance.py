@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,8 +52,8 @@ COLUMNS = {
     "connection_step": "env scope_id step_id pair operation state",
     "provider_jti": "env issuer jti claim_digest issuer_key cnf owner_epoch permission_epoch provider_version policy_version context_digest scope_id scope_digest plan_digest issued_at expires_at state reservation_id reservation_until consuming_request_id lease_until terminal_outcome audit_event_id",
     "proof_nonce": "env caller kid kv proof_jti",
-    "provider_reservation": "env reservation_id jti resolver_role cnf reserved_at reservation_until state",
-    "provider_lease": "env lease_id jti scope_id scope_digest context_digest plan_digest cnf issuer_key lease_until state",
+    "provider_reservation": "env issuer reservation_id jti resolver_role cnf reserved_at reservation_until state",
+    "provider_lease": "env issuer lease_id jti scope_id scope_digest context_digest plan_digest cnf issuer_key lease_until state",
     "authority_fence": "env owner generation state",
     "authority_tombstone": "env parent_id closed_at retain_until replacement_used",
     "audit_outbox": "event_id environment role purpose contract_version outcome reason timestamp",
@@ -172,6 +173,39 @@ class StaticAcceptance(unittest.TestCase):
         self.assertRegex(sql, r"play_intent_id\s*(?:<>|!=)\s*playback_request_id")
         self.assertRegex(sql, r"86400|24\s+hours")
 
+    def test_reservations_and_leases_retain_the_full_ledger_identity(self):
+        # P1 §8, incorporated by P2 §1 and S §1; storage only, no new wire ID.
+        sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", (ROOT / SQL).read_text(), flags=re.S).lower()
+        namespace = {"env", "issuer", "jti"}
+        for table in ("provider_reservation", "provider_lease"):
+            with self.subTest(table=table):
+                match = re.search(r"create\s+table\s+" + table + r"\s*\((.*?)\)\s*;", sql, re.S)
+                self.assertIsNotNone(match, "missing " + table)
+                body = match[1]
+                for field in namespace:
+                    self.assertRegex(body, r"\b" + field + r"\s+text\s+not\s+null\b", table + "." + field)
+                keys = re.findall(r"(?:primary\s+key|unique)\s*\(([^)]+)\)", body)
+                keys += re.findall(r"create\s+unique\s+index\s+\w+\s+on\s+" + table + r"\s*\(([^)]+)\)", sql)
+                keys += re.findall(r"(?m)^\s*(\w+)\s+[^,\n]*?\b(?:primary\s+key|unique)\b(?!\s*\()", body)
+                normalized = [{f.strip().replace("lease_id", "jti") for f in key.split(",")} for key in keys]
+                self.assertIn(namespace, normalized, table + " must reject duplicate full ledger identities")
+                for key in normalized:
+                    if key <= namespace:
+                        self.assertEqual(key, namespace, table + " has a narrower uniqueness key")
+                bindings = re.findall(r"foreign\s+key\s*\(([^)]+)\)\s*references\s+provider_jti\s*\(([^)]+)\)", body)
+                self.assertTrue(any(
+                    set(zip((f.strip() for f in local.split(",")), (f.strip() for f in remote.split(","))))
+                    == {(f, f) for f in namespace}
+                    for local, remote in bindings
+                ), table + " must bind its retained issuer/JTI to the exact ledger row")
+
+    def test_lease_storage_cannot_silently_replace_the_bare_jti_identity(self):
+        sql = re.sub(r"--[^\n]*|/\*.*?\*/", "", (ROOT / SQL).read_text(), flags=re.S).lower()
+        match = re.search(r"create\s+table\s+provider_lease\s*\((.*?)\)\s*;", sql, re.S)
+        self.assertIsNotNone(match, "missing provider_lease")
+        self.assertRegex(match[1], r"\blease_id\s+text\s+not\s+null\b")
+        self.assertRegex(match[1], r"check\s*\(\s*(?:lease_id\s*=\s*jti|jti\s*=\s*lease_id)\s*\)")
+
     def test_every_writer_contract_is_unintegrated_with_synchronous_fence(self):
         import json
         path = ROOT / CONTRACT
@@ -208,7 +242,9 @@ class StaticAcceptance(unittest.TestCase):
 def mutants(root):
     """Non-executed text mutants; each must be rejected by containment."""
     def plus(p, extra):
-        return {p: (root / p).read_text() + "\n" + extra + "\n"}
+        path = root / p
+        original = path.read_text() if path.is_file() else ""
+        return {p: original + "\n" + extra + "\n"}
     stub = (root / PROVIDER_STUB).read_text()
     return {
         "changed provider stub": ({PROVIDER_STUB: stub.replace(
@@ -230,6 +266,18 @@ def mutants(root):
 
 
 class ContainmentMutants(unittest.TestCase):
+    def test_missing_optional_mutant_targets_are_still_checked_as_overlays(self):
+        with tempfile.TemporaryDirectory(prefix="inert-mutant-targets-") as directory:
+            root = Path(directory)
+            stub = root / PROVIDER_STUB
+            stub.parent.mkdir(parents=True)
+            stub.write_text((ROOT / PROVIDER_STUB).read_text())
+            overlays = mutants(root)
+            for name, (overlay, expect) in overlays.items():
+                with self.subTest(name=name):
+                    errors = containment_errors(ROOT, overlay)
+                    self.assertTrue(any(expect in e for e in errors), (name, errors))
+
     def test_control_and_every_mutant(self):
         self.assertEqual(containment_errors(ROOT), [])
         for name, (overlay, expect) in mutants(ROOT).items():
