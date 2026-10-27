@@ -16,15 +16,34 @@ import { displayArtist, displayTitle } from './order.js';
  * matches keep input order — no secondary key, no resort. Titled rows are
  * never matched by id: the id is searched ONLY through the title fallback.
  */
+/** Which display fields a find searches. `'both'` is the shipped OR. */
+export type FindScope = 'both' | 'title' | 'artist';
+
+/**
+ * Resolve any external scope input to a valid scope. Only the exact tokens
+ * `'title'` and `'artist'` narrow the find; anything else (missing, unknown,
+ * non-string) resolves to `'both'` so bad input can never narrow by accident.
+ */
+export function resolveFindScope(scope: unknown): FindScope {
+	return scope === 'title' || scope === 'artist' ? scope : 'both';
+}
+
 export function filterLibraryItems(
 	items: readonly LibraryItem[],
-	query: unknown
+	query: unknown,
+	scope?: unknown
 ): LibraryItem[] {
 	if (typeof query !== 'string') return [...items];
 	const needle = query.trim().toLowerCase();
 	if (needle.length === 0) return [...items];
+	const resolved = resolveFindScope(scope);
 	return items.filter((item) => {
-		if (displayTitle(item).toLowerCase().includes(needle)) return true;
+		if (
+			resolved !== 'artist' &&
+			displayTitle(item).toLowerCase().includes(needle)
+		)
+			return true;
+		if (resolved === 'title') return false;
 		const artist = displayArtist(item);
 		return artist !== null && artist.toLowerCase().includes(needle);
 	});
