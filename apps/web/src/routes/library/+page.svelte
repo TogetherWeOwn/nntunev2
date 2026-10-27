@@ -899,6 +899,18 @@
 	}
 
 	/**
+	 * Announce a recent-find outcome within the 140-char polite cap. A
+	 * max-length (120-char) query would breach it verbatim, so the embedded
+	 * query is truncated with an ellipsis to fit; short queries announce whole.
+	 */
+	function announceRecentFind(verb: 'Saved' | 'Applied', query: string): string {
+		const middle = ' recent search ';
+		const budget = 140 - verb.length - middle.length - '.'.length;
+		const shown = query.length > budget ? `${query.slice(0, budget - 1)}…` : query;
+		return `${verb}${middle}${shown}.`;
+	}
+
+	/**
 	 * Record the applied query when it is left. Memory is authoritative once
 	 * bootstrapped; before that (or after an auth purge) there is no
 	 * account-scoped list to extend, so nothing is recorded. Announces only
@@ -910,17 +922,20 @@
 		if (next === recentFinds) return;
 		recentFinds = [...next];
 		saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
-		recentFindsAnnouncement = `Saved recent search ${recentFinds[0]}.`;
+		recentFindsAnnouncement = announceRecentFind('Saved', recentFinds[0]);
 	}
 
 	function applyRecentFind(query: string): void {
+		// Preserve a pending unrecorded query first: a chip mousedown keeps
+		// focus in the field (no blur), so record here before replacing it.
+		recordFindQuery();
 		findQuery = query;
 		const next = recordRecentFind(recentFinds, query);
 		if (next !== recentFinds) {
 			recentFinds = [...next];
 			saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
 		}
-		recentFindsAnnouncement = `Applied recent search ${query}.`;
+		recentFindsAnnouncement = announceRecentFind('Applied', query);
 	}
 
 	function clearRecentFinds(): void {
@@ -1402,10 +1417,17 @@
 					<ul class="nt-recent-find-body nt-recent-find-list">
 						{#each recentFinds as query (query)}
 							<li>
+								<!--
+									Keep focus in the find field on mousedown: a blur here
+									would record a pending query and shift every chip
+									before mouseup, so the click would miss its chip.
+									applyRecentFind records the pending query instead.
+								-->
 								<button
 									class="nt-recent-find-chip"
 									type="button"
 									data-testid="recent-find-chip"
+									onmousedown={(event) => event.preventDefault()}
 									onclick={() => applyRecentFind(query)}
 								>
 									{query}
