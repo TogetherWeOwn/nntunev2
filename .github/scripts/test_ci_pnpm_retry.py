@@ -90,19 +90,50 @@ def step_field(step_chunk, field):
     return None
 
 
+def _key_token(field):
+    """`field` as a YAML mapping key in any equivalent spelling.
+
+    The same key can be written plain (``if:``), single- or
+    double-quoted (``"if":``), with whitespace before the colon
+    (``if :``), or with an explicit-key marker (``? if``, value on
+    the following ``: value`` line). Absence checks fail open on any
+    spelling they do not recognize, so every spelling counts.
+    """
+    plain = re.escape(field)
+    return rf"(?:{plain}|\"{plain}\"|'{plain}')"
+
+
+def _field_value(match):
+    """Comment-stripped value for a key-token match.
+
+    The bare explicit-key form (``? key`` with no colon) carries its
+    value on the next line, so it reads as present-but-unknown: the
+    empty string trips absence checks while failing positive reads.
+    """
+    value = match.group(1)
+    if value is None:
+        return ""
+    return re.sub(r"\s+#.*$", "", value)
+
+
 def job_level_field(job_chunk, field):
     """First `field: value` scalar at job-key indent (four spaces).
 
     ``step_field`` matches a field at any depth, so a key nested under
     a job mapping such as ``strategy.matrix`` or ``defaults`` can pose
     as the job's own field. Job keys sit at exactly four spaces (job
-    ids at two); anything deeper belongs to a nested mapping.
+    ids at two); anything deeper belongs to a nested mapping. Quoted,
+    space-before-colon, and explicit-key spellings of the same key
+    count too: GitHub resolves them identically, so treating them as
+    absent would let a masking key hide from the wiring checks.
     """
-    pattern = re.compile(rf"^    {re.escape(field)}:\s*(.*?)\s*$")
+    key = _key_token(field)
+    explicit = re.compile(rf"^    \?\s+{key}(?:\s*:\s*(.*?)\s*)?$")
+    plain = re.compile(rf"^    {key}\s*:\s*(.*?)\s*$")
     for line in job_chunk.splitlines():
-        match = pattern.match(line)
+        match = explicit.match(line) or plain.match(line)
         if match:
-            return re.sub(r"\s+#.*$", "", match.group(1))
+            return _field_value(match)
     return None
 
 
@@ -112,15 +143,18 @@ def step_level_field(step_chunk, field):
     Step keys sit on the step's dash line (six spaces plus ``- ``) or
     at exactly eight spaces. Keys nested under a step mapping such as
     ``env:`` or ``with:`` sit deeper, so an ``env.run`` value cannot
-    pose as the step's executed ``run`` command.
+    pose as the step's executed ``run`` command. Quoted,
+    space-before-colon, and explicit-key spellings count too, for the
+    same reason as in ``job_level_field``.
     """
-    pattern = re.compile(
-        rf"^(?:      -\s+|        ){re.escape(field)}:\s*(.*?)\s*$"
-    )
+    key = _key_token(field)
+    prefix = r"(?:      -\s+|        )"
+    explicit = re.compile(rf"^{prefix}\?\s+{key}(?:\s*:\s*(.*?)\s*)?$")
+    plain = re.compile(rf"^{prefix}{key}\s*:\s*(.*?)\s*$")
     for line in step_chunk.splitlines():
-        match = pattern.match(line)
+        match = explicit.match(line) or plain.match(line)
         if match:
-            return re.sub(r"\s+#.*$", "", match.group(1))
+            return _field_value(match)
     return None
 
 
@@ -448,6 +482,59 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
         """Step-level `if` text deeper than job keys stays a step concern."""
         step = timeout_step() + "      - name: later\n        if: always()\n        run: echo ok\n"
         self.assertEqual(wiring_errors(public_text_with(step)), [])
+
+    # Alternate YAML spellings of one `{key}: {value}` line. The
+    # explicit-key form carries its value on the next `: value` line.
+    ALTERNATE_SPELLINGS = (
+        '"{key}": {value}\n',
+        "'{key}': {value}\n",
+        "{key} : {value}\n",
+        '"{key}" : {value}\n',
+        "? {key}\n{indent}: {value}\n",
+        '? "{key}"\n{indent}: {value}\n',
+    )
+    MASKING_KEYS = (
+        ("continue-on-error", "true", "not continue-on-error"),
+        ("if", "${{ false }}", "no job-level if"),
+    )
+
+    def test_alternate_job_key_spellings_fail(self):
+        """Every spelling of a masking job-level key turns this suite red."""
+        for key, value, expected in self.MASKING_KEYS:
+            for spelling in self.ALTERNATE_SPELLINGS:
+                with self.subTest(key=key, spelling=spelling):
+                    line = "    " + spelling.format(
+                        key=key, value=value, indent="    "
+                    )
+                    errors = wiring_errors(
+                        public_text_with(timeout_step(), job_extra=line)
+                    )
+                    self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_alternate_step_key_spellings_fail(self):
+        """Every spelling of a masking step-level key turns this suite red."""
+        for key, value, expected in (
+            ("continue-on-error", "true", "not continue-on-error"),
+            ("if", "always()", "must be unconditional"),
+        ):
+            for spelling in self.ALTERNATE_SPELLINGS:
+                with self.subTest(key=key, spelling=spelling):
+                    line = "        " + spelling.format(
+                        key=key, value=value, indent="        "
+                    )
+                    errors = wiring_errors(
+                        public_text_with(timeout_step(line))
+                    )
+                    self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_quoted_job_key_after_steps_fails(self):
+        """Spelling and placement compose: quoted key after steps counts."""
+        errors = wiring_errors(
+            public_text_with(
+                timeout_step(), job_after_steps='    "continue-on-error": true\n'
+            )
+        )
+        self.assertTrue(any("not continue-on-error" in e for e in errors), errors)
 
 
 if __name__ == "__main__":
