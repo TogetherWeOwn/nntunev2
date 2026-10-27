@@ -57,6 +57,38 @@ test('content-identical refresh preserves pending copy but changed selection inv
 	await expect(page.getByTestId('selection-export-status')).toHaveText('');
 });
 
+test('changing the selection clears stale fallback text and status', async ({ page }) => {
+	await page.addInitScript(() => {
+		let reject = true;
+		Object.defineProperty(navigator, 'clipboard', {
+			configurable: true,
+			value: {
+				writeText: () => (reject ? Promise.reject(new Error('denied')) : Promise.resolve())
+			}
+		});
+		(window as unknown as { allowCopy: () => void }).allowCopy = () => {
+			reject = false;
+		};
+	});
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ json: [...items, { id: 'export-two', title: 'Two', artist: 'Artist' }] })
+	);
+	await page.goto('/library');
+	await page.getByRole('checkbox', { name: 'Select One', exact: true }).check();
+
+	await page.getByTestId('selection-export-copy').click();
+	await expect(page.getByTestId('selection-export-fallback')).toHaveValue(text);
+	await page.getByRole('checkbox', { name: 'Select Two', exact: true }).check();
+	await expect(page.getByTestId('selection-export-fallback')).toHaveCount(0);
+	await expect(page.getByTestId('selection-export-status')).toHaveText('');
+
+	await page.evaluate(() => (window as unknown as { allowCopy: () => void }).allowCopy());
+	await page.getByTestId('selection-export-copy').click();
+	await expect(page.getByTestId('selection-export-status')).toHaveText('Copied selected tracks as text.');
+	await page.getByRole('checkbox', { name: 'Select Two', exact: true }).uncheck();
+	await expect(page.getByTestId('selection-export-status')).toHaveText('');
+});
+
 test('auth teardown revokes the retained export Blob URL', async ({ page }) => {
 	await page.addInitScript(() => {
 		const live: string[] = [];
