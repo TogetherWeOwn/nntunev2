@@ -50,6 +50,7 @@ pub mod queue_consumer;
 pub mod rate_limit;
 pub mod repair;
 pub mod retry;
+pub mod track_writers;
 pub mod transcode;
 pub mod verify;
 
@@ -156,6 +157,14 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 /// of the request.
 pub(crate) fn build_sha_from_env(env: &Env) -> String {
     nntune_logging::parse_build_sha(env_string(env, "BUILD_SHA").as_deref())
+}
+
+/// Audio bucket name behind the `AUDIO_PUBLISH` binding (worker var
+/// or secret, `nntunev2-audio-{staging,prod}`), bound into the
+/// published `cache_objects` row. `None` when unconfigured: the
+/// `Transcoding` step fails transiently so a redeploy heals it.
+pub(crate) fn audio_bucket_from_env(env: &Env) -> Option<String> {
+    env_string(env, crate::transcode::AUDIO_BUCKET_NAME_VAR)
 }
 
 /// Emit one structured log line for this request (`docs/logging-standard.md`).

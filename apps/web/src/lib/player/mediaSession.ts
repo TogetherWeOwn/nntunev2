@@ -20,10 +20,26 @@ export interface MediaMetadataInit {
 	artwork?: MediaArtworkInit[];
 }
 
+export interface MediaSessionSeekDetails {
+	action: string;
+	seekTime?: number;
+	seekOffset?: number;
+	fastSeek?: boolean;
+}
+
+export interface MediaSessionPosition {
+	duration: number;
+	position: number;
+	playbackRate: number;
+}
+
+type ActionHandler = (details?: MediaSessionSeekDetails) => void;
+
 /** Structural subset of `navigator.mediaSession` (injectable for tests). */
 export interface MediaSessionLike {
 	metadata: unknown;
-	setActionHandler(action: string, handler: (() => void) | null): void;
+	setActionHandler(action: string, handler: ActionHandler | null): void;
+	setPositionState?(state?: MediaSessionPosition): void;
 }
 
 export interface MediaSessionHandlers {
@@ -31,6 +47,9 @@ export interface MediaSessionHandlers {
 	onPrevious: () => void;
 	onPlay?: () => void;
 	onPause?: () => void;
+	onSeekTo?: (details: MediaSessionSeekDetails) => void;
+	onSeekForward?: (details: MediaSessionSeekDetails) => void;
+	onSeekBackward?: (details: MediaSessionSeekDetails) => void;
 }
 
 export interface ApplyMediaSessionOptions {
@@ -40,6 +59,8 @@ export interface ApplyMediaSessionOptions {
 	MetadataCtor?: new (init: MediaMetadataInit) => unknown;
 	/** Base for absolutizing artwork; defaults to `location.origin`. */
 	baseUrl?: string;
+	/** Unknown/omitted duration clears any previous track's position state. */
+	positionState?: MediaSessionPosition | null;
 }
 
 const ARTWORK_SIZES = '512x512';
@@ -83,13 +104,52 @@ function defaultMetadataCtor(): (new (init: MediaMetadataInit) => unknown) | nul
 function setHandler(
 	session: MediaSessionLike,
 	action: string,
-	handler: (() => void) | null | undefined
+	handler: ActionHandler | null | undefined
 ): void {
 	try {
 		session.setActionHandler(action, handler ?? null);
 	} catch {
 		// Some engines throw for unknown actions; one bad action must not
 		// take down the rest of the transport wiring.
+	}
+}
+
+const SEEK_HANDLERS = [
+	['seekto', 'onSeekTo'],
+	['seekforward', 'onSeekForward'],
+	['seekbackward', 'onSeekBackward']
+] as const;
+const seekingSessions = new WeakSet<MediaSessionLike>();
+
+function setSeekHandlers(session: MediaSessionLike, handlers?: MediaSessionHandlers): void {
+	// Legacy consumers need not opt into seeking. Once opted in, every seek
+	// action is replaced/cleared, even if one registration was unsupported.
+	if (!seekingSessions.has(session) && !SEEK_HANDLERS.some(([, key]) => handlers?.[key])) return;
+	seekingSessions.add(session);
+	for (const [action, key] of SEEK_HANDLERS) {
+		const callback = handlers?.[key];
+		setHandler(session, action, callback ? (details = { action }) => callback(details) : null);
+	}
+}
+
+/** Event-driven position updates without rebuilding metadata or transport handlers. */
+export function setMediaSessionPosition(
+	state: MediaSessionPosition | null,
+	options: Pick<ApplyMediaSessionOptions, 'session'> = {}
+): void {
+	const session = options.session === undefined ? defaultSession() : options.session;
+	if (session === null) return;
+	const valid =
+		state !== null &&
+		Number.isFinite(state.duration) && state.duration > 0 &&
+		Number.isFinite(state.position) && state.position >= 0 && state.position <= state.duration &&
+		Number.isFinite(state.playbackRate) && state.playbackRate > 0;
+	try {
+		// Calling without a state clears it. Unsupported/throwing position APIs
+		// must not break metadata, transport controls or their cleanup.
+		session.setPositionState?.(valid ? state : undefined);
+	} catch {
+		// Best effort on engines with only partial Media Session support.
 	}
 }
 
@@ -126,6 +186,8 @@ export function applyMediaSession(
 		setHandler(session, 'previoustrack', null);
 		setHandler(session, 'play', null);
 		setHandler(session, 'pause', null);
+		setSeekHandlers(session);
+		setMediaSessionPosition(null, { session });
 		return true;
 	}
 
@@ -135,6 +197,8 @@ export function applyMediaSession(
 	setHandler(session, 'previoustrack', handlers.onPrevious);
 	setHandler(session, 'play', handlers.onPlay);
 	setHandler(session, 'pause', handlers.onPause);
+	setSeekHandlers(session, handlers);
+	setMediaSessionPosition(options.positionState ?? null, { session });
 	const MetadataCtor = options.MetadataCtor ?? defaultMetadataCtor();
 	if (MetadataCtor !== null) {
 		const baseUrl =

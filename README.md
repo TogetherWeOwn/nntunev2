@@ -95,18 +95,17 @@ cargo test --workspace
 # Standalone Worker crates (excluded from the workspace in Cargo.toml; each
 # carries a committed lockfile: Cargo.lock plus workers/{api,ingest,mb,
 # repair}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
-# Committed lockfiles are not the same as --locked enforcement: the
-# cargo-deny job's `Prove committed lockfiles are fresh` step proves all
-# five Cargo lockfiles fresh (.github/workflows/ci.yml), but of the Worker
-# jobs only the api job passes --locked to test/clippy/check
-# (.github/workflows/ci.yml); the rust (workers/mb), rust (workers/ingest)
-# and rust (workers/repair) jobs resolve without --locked
-# (.github/workflows/ci.yml). (The workspace rust-test job separately pins
-# one --locked probe: nntune-core --no-default-features.)
+# The cargo-deny job's `Prove committed lockfiles are fresh` step checks
+# the workspace and api/mb/ingest/repair lockfiles (.github/workflows/ci.yml).
+# Those four Worker jobs also pass --locked to every test/clippy/check
+# invocation, including wasm32 checks and clippy, so CI cannot silently
+# re-resolve their dependency graphs. Formatting checks are unchanged.
+# The workspace rust-test job separately pins one --locked probe:
+# nntune-core --no-default-features.
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
-cargo test --manifest-path workers/mb/Cargo.toml --all-targets
-cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
-cargo test --manifest-path workers/repair/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
 # Web frontend (from apps/web): unit tests, then typecheck
 pnpm test
 pnpm check

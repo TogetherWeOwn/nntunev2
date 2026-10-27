@@ -319,14 +319,14 @@ stub whose NZB references fixture message-ids.
   `POST /repair`; missing blocks with no par2 set fails the job.
 - Repair re-verify guard (status only — no runtime change): the re-verify
   feedback loop is still open. After a repair round, `Verifying` re-runs
-  the verify driver over the pool body route (`src/queue_consumer.rs:696-699`,
+  the verify driver over the pool body route (`src/queue_consumer.rs:701-704`,
   `PoolBodySource::fetch_body` via `call_pool_body` at
-  `src/queue_consumer.rs:872`) and does not yet consume the repair
+  `src/queue_consumer.rs:897`) and does not yet consume the repair
   round's `out/` objects (the repair Worker streams outputs back to `out/`
   per `workers/repair/README.md:23-28`; key shapes in
   `workers/repair/src/contract.rs:278-286`), so the `Repairing` step must
   not be exercised live until that consumption lands
-  (`src/queue_consumer.rs:245-253`). The consumer stays disabled meanwhile:
+  (`src/queue_consumer.rs:257-265`). The consumer stays disabled meanwhile:
   the `[[queues.consumers]]` entry stays commented out
   (`workers/ingest/wrangler.toml.example:30-31`,
   `workers/ingest/wrangler.toml.example:58-59`), and ingest stays unable
@@ -336,11 +336,11 @@ stub whose NZB references fixture message-ids.
   (`workers/ingest/wrangler.toml.example:52-56`).
   A checkpoint reaching `Repairing` without a recorded `par2_set_id` is a
   permanent failure — there is nothing a redelivery could add
-  (`src/queue_consumer.rs:251-253`; the missing-inputs arm at
-  `src/queue_consumer.rs:257-262`); with `missing_blocks == 0` (the
+  (`src/queue_consumer.rs:258-266`; the missing-inputs arm at
+  `src/queue_consumer.rs:270-275`); with `missing_blocks == 0` (the
   `#[serde(default)]` zero at `src/jobs.rs:78-81`) the step takes the
   `Ok(None)` arm (`src/repair.rs:43-45`,
-  `src/queue_consumer.rs:272-278`) and returns to `Verifying`. The ingest
+  `src/queue_consumer.rs:276-283`) and returns to `Verifying`. The ingest
   Worker owns repair dispatch and queue behavior (`src/repair.rs`,
   `src/queue_consumer.rs`); the repair Worker owns the Container runtime,
   whose contract is `workers/repair/README.md`; this note only records

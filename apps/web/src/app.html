@@ -4,6 +4,10 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+		<!-- Render-blocking same-origin init: applies a saved Light/Dark
+			override before first paint. External file, so the strict CSP
+			(script-src 'self', no unsafe-inline) is unchanged. -->
+		<script src="/appearance-init.js"></script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

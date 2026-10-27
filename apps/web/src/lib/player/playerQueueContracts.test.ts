@@ -104,6 +104,71 @@ describe('PlayerQueue artist-less tracks', () => {
 		const body = renderQueue(createQueue([noArtist]));
 
 		expect(nowPlayingText(body)).toBe('Now playing: Solo Song');
-		expect(queueItemTexts(body)).toEqual(['Solo Song']);
+		expect(queueItemTexts(body)).toEqual(['Solo Song Up Down Next Remove']);
 	});
 });
+
+describe('PlayerQueue management controls', () => {
+	it('labels every per-row control with its track title', () => {
+		const body = renderQueue(createQueue([FIRST, SECOND]));
+
+		for (const title of ['Mango Season', 'Apple Cart']) {
+			expect(body).toContain(`aria-label="Move ${title} up"`);
+			expect(body).toContain(`aria-label="Move ${title} down"`);
+			expect(body).toContain(`aria-label="Play ${title} next"`);
+			expect(body).toContain(`aria-label="Remove ${title} from queue"`);
+		}
+	});
+
+	it('disables only the move that would leave the queue', () => {
+		const body = renderQueue(createQueue([FIRST, SECOND, THIRD]));
+		const upTags = [...body.matchAll(/<button\b[^>]*aria-label="Move [^"]* up"[^>]*>/g)].map(
+			(m) => m[0]
+		);
+		const downTags = [...body.matchAll(/<button\b[^>]*aria-label="Move [^"]* down"[^>]*>/g)].map(
+			(m) => m[0]
+		);
+
+		expect(upTags).toHaveLength(3);
+		expect(downTags).toHaveLength(3);
+		expect(upTags[0]).toMatch(/disabled/);
+		expect(upTags[1]).not.toMatch(/disabled/);
+		expect(upTags[2]).not.toMatch(/disabled/);
+		expect(downTags[0]).not.toMatch(/disabled/);
+		expect(downTags[1]).not.toMatch(/disabled/);
+		expect(downTags[2]).toMatch(/disabled/);
+	});
+
+	it('renders a queue-level clear control, disabled only when empty', () => {
+		const filledAttrs = clearButtonAttrs(renderQueue(createQueue([FIRST])));
+		const emptyAttrs = clearButtonAttrs(renderQueue(createQueue([])));
+
+		expect(filledAttrs).not.toBeNull();
+		expect(filledAttrs).not.toMatch(/disabled/);
+		expect(emptyAttrs).not.toBeNull();
+		expect(emptyAttrs).toMatch(/disabled/);
+	});
+
+	it('exposes a polite announcement region fed by the host', () => {
+		const body = render(PlayerQueue, {
+			props: { state: createQueue([FIRST]), announcement: 'Mango Season moved to 1 of 1' }
+		}).body;
+		const tag = body.match(/<[a-zA-Z][^>]*data-testid="queue-announcement"[^>]*>/)?.[0];
+
+		expect(tag).toContain('role="status"');
+		expect(body).toContain('Mango Season moved to 1 of 1');
+	});
+
+	it('keeps the announcement region attached when there is nothing to announce', () => {
+		const tag = renderQueue(createQueue([FIRST])).match(
+			/<[a-zA-Z][^>]*data-testid="queue-announcement"[^>]*>/
+		)?.[0];
+
+		expect(tag).toContain('role="status"');
+	});
+});
+
+/** Attribute string of the `Clear queue` button, or null when absent. */
+function clearButtonAttrs(body: string): string | null {
+	return body.match(/<button\b([^>]*)>\s*Clear queue\s*<\/button>/)?.[1] ?? null;
+}

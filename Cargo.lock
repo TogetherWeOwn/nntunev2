@@ -984,6 +984,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nntune-transcode-server"
+version = "0.1.0"
+dependencies = [
+ "nntune-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nntune-youtube"
 version = "0.1.0"
 dependencies = [
