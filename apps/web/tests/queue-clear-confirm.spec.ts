@@ -16,9 +16,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - Confirm wipes the whole queue into the empty state (now-playing reads
  *   "Queue is empty", player-next and "Clear queue" disabled), announces a
  *   concise cleared outcome through the polite queue-announcement region, and
- *   moves focus to the queue-empty-focus target (TOG-39467 semantics: never
- *   the now-disabled Clear button, never the body). Reload-after-clear stays
- *   cleared through the restore channel.
+ *   moves focus to the queue-empty-focus target (the existing queue-removal
+ *   focus-recovery semantics: never the now-disabled Clear button, never
+ *   the body). Reload-after-clear stays cleared through the restore channel.
  * - Cancel changes nothing (order, current track, now-playing, announcement,
  *   storage) and restores focus to the "Clear queue" trigger.
  * - "Clear upcoming" (trim-upcoming) carries the same confirm/cancel contract:
@@ -32,10 +32,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - Auth teardown while a confirm is open dismisses the dialog without acting;
  *   confirm state never survives unmount or an account change (Retry starts
  *   clean with no dialog).
- * - Focus recovery matches TOG-39467: cancel restores the trigger; confirmed
- *   whole-clear lands on queue-empty-focus; confirmed trim lands on the
- *   surviving current row. Keyboard: Tab reaches every control, Enter/Space
- *   activates, focus stays visible.
+ * - Focus recovery matches the existing queue-removal focus recovery
+ *   (`library-queue-remove-focus.spec.ts`): cancel restores the trigger;
+ *   confirmed whole-clear lands on queue-empty-focus; confirmed trim lands
+ *   on the surviving current row. Keyboard: Tab reaches every control,
+ *   Enter/Space activates, focus stays visible.
  * - No favorites or playback side effects: the favorites shelf and its scoped
  *   storage are untouched, no media play/pause/load/seek/src writes, no audio
  *   element appears, and no request beyond GET /api/library is issued.
@@ -344,7 +345,8 @@ test('QC-B02 Confirm wipes the queue, announces once, focuses the empty target, 
 	await expect(announcement(page)).toContainText(/cleared/i);
 	expect((await announcement(page).textContent())!.length).toBeLessThanOrEqual(160);
 
-	// TOG-39467: focus lands on the empty target, never the disabled trigger or body.
+	// Like queue removal: focus lands on the empty target, never the
+	// disabled trigger or body.
 	await expect(emptyTarget(page)).toBeFocused();
 	await expect(emptyTarget(page)).toHaveAttribute('tabindex', '-1');
 	expect(await emptyTarget(page).evaluate((element) => element.tagName)).not.toBe('BUTTON');
