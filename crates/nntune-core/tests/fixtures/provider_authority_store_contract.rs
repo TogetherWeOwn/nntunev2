@@ -125,9 +125,9 @@ pub struct Nonce {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    PostUnwrap,
-    PostIntentAck,
-    PostTerminalAck,
+    Unwrapped,
+    IntentAcked,
+    TerminalAcked,
 }
 #[derive(Clone, Debug)]
 pub struct Finalize {

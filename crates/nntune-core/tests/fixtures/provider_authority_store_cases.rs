@@ -312,6 +312,24 @@ fn wrong_authority_never_reserves_even_with_known_ids() {
     assert!(m.reserve(&id(1), &id(999), call(), nonce(2)).is_err());
 }
 #[test]
+fn proof_nonce_must_bind_the_frozen_cnf_key_and_stream_caller() {
+    for field in 0..4 {
+        let mut m = frozen();
+        let mut n = nonce(1);
+        match field {
+            0 => n.kid = "synthetic_other_key_ref".into(),
+            1 => n.kv = 2,
+            2 => n.caller = "nntune-vault-provider".into(),
+            _ => n.env = "production".into(),
+        }
+        assert!(
+            m.reserve(&id(1), &id(10), call(), n).is_err(),
+            "field {field}"
+        );
+        assert_eq!(m.inspect(&id(1)).unwrap().state, State::Frozen);
+    }
+}
+#[test]
 fn native_owner_equality_does_not_normalize_or_trim() {
     for owner in [
         "synthetic_owner_e\u{301}",
@@ -358,11 +376,7 @@ fn every_invalidator_orders_before_reserve_and_finalize_and_after_finalize() {
 }
 #[test]
 fn post_unwrap_and_both_post_ack_rereads_cannot_release_stale_state() {
-    for phase in [
-        Phase::PostUnwrap,
-        Phase::PostIntentAck,
-        Phase::PostTerminalAck,
-    ] {
+    for phase in [Phase::Unwrapped, Phase::IntentAcked, Phase::TerminalAcked] {
         for &writer in WRITERS {
             let mut m = frozen();
             let r = reserved(&mut m);
@@ -438,6 +452,17 @@ fn strict_deadlines_and_minimum_remaining_lease_do_not_renew_on_receive() {
             })
         );
         assert_eq!(m.inspect(&id(1)).unwrap().lease_until, Some(want));
+    }
+    for (cap, hard) in [(1000, 1900), (1030, 1000)] {
+        let mut m = adapter::new("staging");
+        let mut s = seed();
+        s.cap_expires_at = cap;
+        s.origin.hard_deadline = hard;
+        assert_eq!(m.freeze(s), Ok(()));
+        assert!(
+            m.reserve(&id(1), &id(10), call(), nonce(1)).is_err(),
+            "strict cap/origin expiry at reserve {cap}/{hard}"
+        );
     }
     let mut m = adapter::new("staging");
     let mut s = seed();
