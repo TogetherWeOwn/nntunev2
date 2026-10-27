@@ -128,7 +128,7 @@ function assertPost(h, count = 1) {
   for (const call of h.calls.fetch) {
     assert.equal(call.url, h.env.OPS_ALERT_WEBHOOK_URL);
     assert.equal(call.method, 'POST');
-    assert.equal(call.redirect, 'error');
+    assert.equal(call.redirect, 'manual', 'Workers supports manual no-follow, not redirect:error');
     assert.match(call.headers['content-type'], /^application\/json(?:;|$)/i);
     assert.ok(call.signal instanceof AbortSignal, 'delivery must carry an abort signal');
     const payload = JSON.parse(call.body);
@@ -568,6 +568,33 @@ for (const kind of ['success', 'http-429', 'http-503', 'redirect', 'network']) {
       assert.equal(audit.cancelled, true, 'endless error/success response body must be cancelled');
     }
     assertPost(h, 2);
+    bounded(h);
+  });
+}
+
+// Fetch is local-only: return each redirect unchanged, as Workers manual mode
+// does. Follow mode, an explicit Location fetch or a retry must fail acceptance.
+for (const [status, location] of [
+  [301, 'https://redirect.example.invalid/collect'],
+  [302, 'https://discord.com/api/webhooks/456/synthetic-other-target'],
+  [303, '/redirect-target'],
+  [307, 'http://redirect.example.invalid/collect'],
+  [308, 'https://redirect.example.invalid/permanent'],
+]) {
+  test(`HTTP ${status} with Location is cancelled without following or retrying`, async () => {
+    const h = await harness({ deliver: async () => {
+      const reply = response(status, { Location: location });
+      h.calls.responses.push(reply.audit);
+      return reply.value;
+    } });
+    await ingestBreach(h); await h.close(START + 60000);
+    assert.equal(h.calls.fetch.length, 1, 'Location must not trigger another request');
+    assert.equal(h.calls.responses[0].cancelled, true, 'redirect body must be cancelled');
+    await h.restart(); await Promise.all([h.alarm(), h.alarm()]);
+    await h.clock.tick(5000);
+    // Close another eligible window 1ms before the durable 300000ms cooldown.
+    await independentBreach(h, START + 299999);
+    assertPost(h);
     bounded(h);
   });
 }

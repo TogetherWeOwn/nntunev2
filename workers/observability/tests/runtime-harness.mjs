@@ -143,7 +143,7 @@ export function deferred() {
 
 // An endless response forces the consumer to cancel or cap reads. Calling
 // text/json/arrayBuffer/blob is deliberately forbidden: those are unbounded.
-export function response(status = 200) {
+export function response(status = 200, headers = {}) {
   const audit = { readBytes: 0, cancelled: false };
   const body = new ReadableStream({
     pull(controller) {
@@ -152,7 +152,7 @@ export function response(status = 200) {
     },
     cancel() { audit.cancelled = true; },
   }, { highWaterMark: 0 });
-  const value = new Response(body, { status });
+  const value = new Response(body, { status, headers });
   for (const name of ['text', 'json', 'arrayBuffer', 'blob', 'formData']) {
     Object.defineProperty(value, name, { value: async () => assert.fail('response body must be consumed/cancelled boundedly') });
   }
