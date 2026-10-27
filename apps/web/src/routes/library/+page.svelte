@@ -502,8 +502,8 @@
 			return;
 		}
 		if (!shareAlive || generation !== shareGeneration) return;
-		const title = displayTitle(item);
-		shareStatus = `Copied link for ${title.length > 70 ? `${title.slice(0, 69)}…` : title}.`;
+		const title = shortTitle(displayTitle(item));
+		shareStatus = `Copied link for ${title}.`;
 	}
 
 	function applyShareLink(): void {

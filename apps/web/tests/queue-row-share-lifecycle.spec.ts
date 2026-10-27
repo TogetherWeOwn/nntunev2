@@ -5,7 +5,8 @@ import { expect, test, type Page } from '@playwright/test';
  * It pins three queue-share mechanisms the protected bank cannot see:
  * feedback hidden on any queue change, the auth-teardown generation fence
  * (no previous-session title resurrected), and code-point-safe title
- * truncation in the announcement.
+ * truncation in the announcement. QSL-05 pins the same truncation on the
+ * browse-row sibling path, which shares the helper.
  */
 
 const ITEMS = [
@@ -172,6 +173,37 @@ test('[QSL-04] a long title with an astral character is truncated by code point,
 
 	await queueRow(page, 'qsl-long').getByTestId('queue-copy-link').click();
 	const status = page.getByTestId('queue-share-status');
+	await expect(status).toContainText(/^\s*Copied link for /);
+	const text = ((await status.textContent()) ?? '').trim();
+
+	expect(text.length, `announcement must stay concise (actual ${text.length})`).toBeLessThan(100);
+	expect(text, 'a long title must be truncated with an ellipsis').toContain('…');
+	expect(text, 'the astral character before the cut must survive whole').toContain('\u{1F600}');
+	expect(
+		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text),
+		'announcement must not contain a lone surrogate'
+	).toBe(false);
+});
+
+test('[QSL-05] a browse-row copy truncates a long astral title by code point, never a lone surrogate', async ({
+	page
+}) => {
+	await openLibrary(page, {
+		items: [
+			{
+				id: 'qsl-long-browse',
+				title: ASTRAL_TITLE,
+				artist: 'Long Artist',
+				streamUrl: '/test-audio/qsl-long-browse'
+			}
+		]
+	});
+
+	await page
+		.locator('[data-testid="library-item"][data-id="qsl-long-browse"]')
+		.getByTestId('library-copy-link')
+		.click();
+	const status = page.getByTestId('library-share-status');
 	await expect(status).toContainText(/^\s*Copied link for /);
 	const text = ((await status.textContent()) ?? '').trim();
 
