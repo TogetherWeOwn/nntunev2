@@ -248,6 +248,17 @@ class ConfigAndFreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(guard.GuardError, "ACCOUNT_ID_SHAPE"):
                 guard.logs_url(account)
 
+    def test_guard_identity_constants_are_literal(self):
+        self.assertEqual(guard.WORKER, "nntune-alerts-staging")
+        self.assertEqual(guard.PRODUCER, "nntune-api-staging")
+        self.assertEqual(guard.COMPATIBILITY_DATE, "2026-10-01")
+        self.assertEqual(guard.MODULES, (
+            "workers/observability/runtime.mjs",
+            "workers/observability/project-tail-event.mjs",
+            "workers/observability/evaluate-error-window.mjs",
+            "workers/observability/render-verdict-alert.mjs",
+        ))
+
     def test_generated_config_is_staging_only_with_no_secret_or_routes(self):
         config = tomllib.loads(guard.generate_config(ACCOUNT))
         self.assertEqual(config["name"], guard.WORKER)
