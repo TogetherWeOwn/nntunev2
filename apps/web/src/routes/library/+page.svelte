@@ -42,6 +42,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import SelectionExport from '#lib/library/SelectionExport.svelte';
 	import {
 		addTrack,
 		clearQueue,
@@ -1337,6 +1338,7 @@
 				>
 					Append selected
 				</button>
+				<SelectionExport {items} {selectedIds} />
 				{#if appendFeedback}
 					<p data-testid="append-result" role="status">{appendFeedback}</p>
 				{/if}
