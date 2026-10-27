@@ -76,7 +76,7 @@ function restartFixture() {
 	};
 	page.refresh();
 	expect(page.read().restartCanSeek).toBe(true);
-	return { page, media, writes, location };
+	return { page, media, writes, location, track };
 }
 
 test('a new same-source share navigation supersedes an earlier restart marker', async () => {
@@ -118,5 +118,23 @@ for (const outcome of ['Restarted', 'Already at the start of', 'Could not restar
 		expect(first.restartStatus).toBe(`${outcome} Coral Night.`);
 		expect(second.restartStatus).toBe(first.restartStatus);
 		expect(second.restartStatusVersion).toBe(first.restartStatusVersion + 1);
+	});
+}
+
+for (const outcome of ['Restarted', 'Already at the start of', 'Could not restart'] as const) {
+	test(`${outcome} truncation never splits a surrogate pair`, () => {
+		const { page, media, track } = restartFixture();
+		if (outcome === 'Already at the start of') media.position = 0;
+		if (outcome === 'Could not restart') media.refuse = true;
+		// Place an astral character on the truncation boundary for every offset
+		// so the cut lands between its surrogate halves.
+		for (let lead = 70; lead < 100; lead += 1) {
+			track.title = `${'A'.repeat(lead)}\u{1F3B5}${'B'.repeat(60)}`;
+			media.position = outcome === 'Already at the start of' ? 0 : 30;
+			page.restart();
+			const status = page.read().restartStatus;
+			expect(status.length).toBeLessThan(100);
+			expect(status.isWellFormed()).toBe(true);
+		}
 	});
 }
