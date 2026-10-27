@@ -9,6 +9,8 @@ import { expect, test, type Page } from '@playwright/test';
  *   makes the appended queue tail disagree with the grouped rows.
  * - Feeding Select all the pre-group order makes Append selected queue
  *   tracks in a different order than the grouped rows.
+ * - Feeding the Selected-view focus recovery the pre-group order lands
+ *   focus on a row that is not the next displayed row.
  * - Removing the direct 401/403 grouping reset leaves a recovered account
  *   grouped even though no storage-event auth transition occurred.
  */
@@ -154,6 +156,46 @@ test('[GA-R02] grouped Select all appends in rendered group order', async ({ pag
 	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
 
 	await expectQueueOrder(page, GROUPED_ROW_ORDER, GROUPED_ROW_ORDER[0]);
+});
+
+test('[GA-R03] grouped Selected only deselect recovers focus to the next displayed row', async ({
+	page
+}) => {
+	await mockLibrary(page, { status: 200, body: GROUPED_ITEMS });
+	await page.goto('/library');
+	await groupToggle(page).click();
+	await expectRowOrder(page, GROUPED_ROW_ORDER);
+
+	await page
+		.locator('main')
+		.getByRole('button', { name: 'Select all', exact: true })
+		.click();
+	await page.getByRole('combobox', { name: 'Show', exact: true }).selectOption({
+		label: 'Selected only'
+	});
+	await expectRowOrder(page, GROUPED_ROW_ORDER);
+
+	const firstAlpha = page
+		.locator('[data-testid="library-item"][data-id="grouped-alpha-first"]')
+		.getByRole('checkbox');
+	await firstAlpha.focus();
+	await page.keyboard.press('Space');
+
+	// The next displayed row is grouped-zulu-first; the pre-group order would
+	// skip it and land on grouped-zulu-second.
+	await expectRowOrder(
+		page,
+		GROUPED_ROW_ORDER.filter((id) => id !== 'grouped-alpha-first')
+	);
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				document.activeElement
+					?.closest('[data-testid="library-item"]')
+					?.getAttribute('data-id')
+			)
+		)
+		.toBe('grouped-zulu-first');
 });
 
 for (const status of [401, 403] as const) {
