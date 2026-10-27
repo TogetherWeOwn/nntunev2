@@ -496,8 +496,8 @@
 		const moved = queue.tracks[from];
 		if (moved === undefined) return;
 		const reordered = moveTrack(queue, from, to);
-		// Announce real moves only: a no-op reorder must not chatter the live
-		// region.
+		// Announce real moves only: a no-op reorder must not chatter the
+		// live region.
 		if (reordered === queue) return;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
