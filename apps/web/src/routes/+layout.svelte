@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { tick, untrack } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
+	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY, LIBRARY_RECENTLY_PLAYED_KEY } from '#lib/library/cache.js';
 	import { afterNavigate } from '$app/navigation';
 	import { page } from '$app/state';
 	import favicon from '#lib/assets/favicon.svg';
@@ -9,6 +10,21 @@
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
+
+	onMount(() => {
+		// A tab may be on another route when an account changes elsewhere.
+		// Purge its session history here too; never broadcast listening data.
+		const purgeRecentPlayback = (event: StorageEvent) => {
+			if (event.key !== LIBRARY_AUTH_TRANSITION_KEY) return;
+			try {
+				browserStorage('session')?.removeItem(LIBRARY_RECENTLY_PLAYED_KEY);
+			} catch {
+				// Storage denial must not interrupt auth teardown.
+			}
+		};
+		window.addEventListener('storage', purgeRecentPlayback);
+		return () => window.removeEventListener('storage', purgeRecentPlayback);
+	});
 
 	type Appearance = 'system' | 'light' | 'dark';
 

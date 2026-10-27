@@ -7,6 +7,7 @@
 		clearSnapshot,
 		invalidateLibraryCache,
 		LIBRARY_AUTH_TRANSITION_KEY,
+		LIBRARY_RECENTLY_PLAYED_KEY,
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
@@ -50,6 +51,12 @@
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
+	import RecentlyPlayed from '#lib/library/RecentlyPlayed.svelte';
+	import {
+		createRecentlyPlayedStore,
+		type RecentlyPlayedStore,
+		type RecentEntry
+	} from '#lib/player/recentlyPlayed.js';
 	import QueueExport from '#lib/player/QueueExport.svelte';
 	import {
 		addTrack,
@@ -202,6 +209,103 @@
 	 * Background refreshes keep the panel mounted, making this a no-op there.
 	 */
 	let restoreFilterFocus = false;
+	let recentStore: RecentlyPlayedStore | undefined;
+	let recentEntries: RecentEntry[] = $state([]);
+	let recentAnnouncement = $state('');
+	let recentAnnouncementVersion = $state(0);
+
+	function announceRecent(text: string): void {
+		recentAnnouncement = text;
+		recentAnnouncementVersion += 1;
+	}
+
+	function resetRecentPlayback(): void {
+		// Clear the known-good cache too: denied storage must not resurrect an
+		// outgoing account's list when the same store serves the next Retry.
+		recentStore?.clear();
+		recentEntries = [];
+		recentAnnouncement = '';
+	}
+
+	function replayRecentTrack(id: string): void {
+		if (!recentStore || !recentEntries.some((entry) => entry.trackId === id)) return;
+		const item = items.find((track) => track.id === id);
+		if (!item || loading || loadError || libraryUnavailable) return;
+		// Explicit history replay is selection-only, just like the demo list:
+		// ensure one queue entry, select it, refresh its existing history entry.
+		selectTrack(id);
+		const index = queue.tracks.findIndex((track) => track.id === id);
+		let next = queue;
+		// Bulk additions carry metadata only. Upgrade that existing entry from
+		// the loaded library instead of leaving Replay without a player.
+		if (index >= 0 && !resolveStreamUrl(queue.tracks[index])) {
+			next = {
+				...queue,
+				tracks: queue.tracks.map((track, position) => position === index
+					? { ...track, streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl }) }
+					: track)
+			};
+		}
+		replaceQueue(selectQueueIndex(next, index));
+		recentStore.replay(id);
+		recentEntries = recentStore.entries();
+		announceRecent(`Replay selected ${shortTitle(displayTitle(item))}. Use the player to listen.`);
+	}
+
+	function forgetRecentTrack(id: string): void {
+		if (!recentStore || !recentEntries.some((entry) => entry.trackId === id)) return;
+		const item = items.find((track) => track.id === id);
+		recentStore.forget(id);
+		recentEntries = recentStore.entries();
+		announceRecent(`Forgot ${item ? shortTitle(displayTitle(item)) : 'the unavailable track'} from recent history.`);
+	}
+
+	function clearRecentPlayback(): void {
+		recentStore?.clear();
+		recentEntries = [];
+		announceRecent('Recently played history cleared.');
+	}
+
+	/** Each keyed element owns one start latch; buffering is not a new play. */
+	function observeRecentPlayback(
+		element: HTMLAudioElement,
+		source: { trackId: string | undefined; streamUrl: string }
+	) {
+		let recorded = false;
+		function matchesCurrent(): boolean {
+			const current = queueCurrentTrack(queue);
+			if (!shareAlive || !element.isConnected || element !== audioEl || !source.trackId) return false;
+			if (current?.id !== source.trackId || resolveStreamUrl(current) !== source.streamUrl) return false;
+			if (element.getAttribute('src') !== source.streamUrl) return false;
+			// Pending synthetic media has no currentSrc. A selected native
+			// resource, when present, must also agree with the intended source.
+			return !element.currentSrc || element.currentSrc === new URL(source.streamUrl, document.baseURI).href;
+		}
+		function playing(): void {
+			if (!recentStore || recorded || !matchesCurrent() || element.paused || element.ended || element.error) return;
+			recorded = true;
+			recentStore.record(source.trackId!);
+			recentEntries = recentStore.entries();
+			const current = queueCurrentTrack(queue);
+			announceRecent(`Added ${shortTitle(current?.title || source.trackId!)} to recently played.`);
+		}
+		function stopped(): void {
+			if (matchesCurrent()) recorded = false;
+		}
+		element.addEventListener('playing', playing);
+		element.addEventListener('pause', stopped);
+		element.addEventListener('ended', stopped);
+		element.addEventListener('error', stopped);
+		return {
+			destroy() {
+				element.removeEventListener('playing', playing);
+				element.removeEventListener('pause', stopped);
+				element.removeEventListener('ended', stopped);
+				element.removeEventListener('error', stopped);
+			}
+		};
+	}
+
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
@@ -268,6 +372,7 @@
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
 			resetRecentFinds();
+			resetRecentPlayback();
 			invalidateLibraryCache();
 		},
 		onStateChange: (state) => {
@@ -1385,6 +1490,7 @@
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
 			resetRecentFinds();
+			resetRecentPlayback();
 			queueFilterQuery = '';
 			findQuery = '';
 			findScope = 'both';
@@ -1410,6 +1516,7 @@
 		favoritesInitialized = false;
 		favoritesAnnouncement = '';
 		resetRecentFinds();
+		resetRecentPlayback();
 		queueFilterQuery = '';
 		findQuery = '';
 		findScope = 'both';
@@ -1425,6 +1532,17 @@
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
+		const session = browserStorage('session');
+		// A missing/denied storage area is optional, never a playback dependency.
+		recentStore = createRecentlyPlayedStore({
+			storageKey: LIBRARY_RECENTLY_PLAYED_KEY,
+			storage: {
+				getItem: (key) => session?.getItem(key) ?? null,
+				setItem: (key, value) => session?.setItem(key, value),
+				removeItem: (key) => session?.removeItem(key)
+			}
+		});
+		recentEntries = recentStore.entries();
 		window.addEventListener('storage', handleAuthTransition);
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
@@ -1858,6 +1976,16 @@
 				{/if}
 			</div>
 			{/if}
+			<RecentlyPlayed
+				entries={recentEntries}
+				{items}
+				announcement={recentAnnouncement}
+				announcementVersion={recentAnnouncementVersion}
+				liveRegions={!loading}
+				onreplay={replayRecentTrack}
+				onforget={forgetRecentTrack}
+				onclear={clearRecentPlayback}
+			/>
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1926,6 +2054,7 @@
 				{#key `${currentTrack?.id}:${streamUrl}`}
 					<audio
 						bind:this={audioEl}
+						use:observeRecentPlayback={{ trackId: currentTrack?.id, streamUrl }}
 						data-testid="audio-player"
 						controls
 						src={streamUrl}

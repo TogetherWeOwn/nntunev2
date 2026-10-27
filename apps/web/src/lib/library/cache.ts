@@ -31,6 +31,8 @@ export interface LibrarySnapshot {
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
+/** Tab-session listening history, isolated from demo and selection history. */
+export const LIBRARY_RECENTLY_PLAYED_KEY = 'nntune:library-recently-played:v1';
 /**
  * Base key for device-local favorites. Values live in `localStorage` under
  * `${LIBRARY_FAVORITES_KEY}.${auth-context}` — the same session auth-context
@@ -266,6 +268,12 @@ function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | n
  */
 export function invalidateLibraryCache(): void {
 	const session = browserStorage('session');
+	try {
+		// Also purge when login/sign-out happens off the library route.
+		session?.removeItem(LIBRARY_RECENTLY_PLAYED_KEY);
+	} catch {
+		// Storage denial never prevents auth teardown.
+	}
 	// Capture the auth context before clearSnapshot revokes it: the scoped
 	// favorites key in localStorage derives from it.
 	let context: string | null = null;
