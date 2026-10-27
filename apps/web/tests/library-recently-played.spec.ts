@@ -507,12 +507,12 @@ test('LR-B-09 a playing event for a stale source records nothing', async ({ page
 	await expect.poll(() => storedEntries(page)).toEqual(recorded);
 
 	// The element now points at a source that is not the current track's.
-	await page.getByTestId('audio-player').evaluate((el) => {
-		el.setAttribute('src', `${AUDIO_PREFIX}/stale.wav`);
+	await page.getByTestId('audio-player').evaluate((el, staleUrl) => {
+		el.setAttribute('src', staleUrl);
 		Object.defineProperty(el, 'paused', { value: false, configurable: true });
 		Object.defineProperty(el, 'ended', { value: false, configurable: true });
 		el.dispatchEvent(new Event('playing'));
-	});
+	}, `${AUDIO_PREFIX}/stale.wav`);
 	expect(await recentIds(page)).toEqual(['row-alpha']);
 	expect(await storedEntries(page)).toEqual(recorded);
 
