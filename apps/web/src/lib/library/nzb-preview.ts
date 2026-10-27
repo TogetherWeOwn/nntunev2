@@ -49,6 +49,15 @@ const scanError = (errorCode: NzbpErrorCode): Prescan => ({ ok: false, errorCode
  * and CDATA deliberately false-reject: no attempt is made to rescue them. */
 export function prescanNzbProlog(text: string): Prescan {
 	if (text.includes('<!ENTITY')) return scanError('NZBP_DOCTYPE_NOT_ALLOWED');
+	// Conservative parser-exposure bound, over the ORIGINAL pre-excision text.
+	// Every literal opener counts (closing tags, comments, CDATA and PIs too).
+	// Constant auxiliary memory; deliberately no region-aware rescue or token array.
+	let markupOpeners = 0;
+	for (let i = 0; i < text.length; i++) {
+		if (text.charCodeAt(i) === 60 && ++markupOpeners > NZBP_LIMITS.maxElements) {
+			return scanError('NZBP_TOO_MANY_NODES');
+		}
+	}
 	let cursor = text.startsWith('﻿') ? 1 : 0;
 	if (text.startsWith('<?xml', cursor) && space(text[cursor + 5])) {
 		const end = text.indexOf('?>', cursor + 5);

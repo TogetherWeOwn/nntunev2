@@ -7,12 +7,14 @@ metadata only. Import remains unavailable. Results are aggregate claims, not
 content availability, safety, ownership, playability or server intake acceptance.
 No network, storage, telemetry or provider access is part of the preview.
 
-**Not ready to ship:** the near-2-MiB tiny-element synthetic exceeds the fixed
-parser/whole-preview budgets on the measured Chromium runner. Firefox and WebKit
-are not verified on that runner because required system libraries are absent.
-The current client bundle also exceeds the slice's 300 KiB ceiling. These are
-holds, not waived checks. No budget, CSP, parser approach or dependency was changed
-to hide them.
+**Not ready to ship:** a conservative pre-parser markup guard now rejects the
+original near-2-MiB tiny-element reproducer without invoking the parser. However,
+a parser-eligible element/comment-density case still exceeded the unchanged
+1,000 ms whole-preview budget in two of five local Chromium repetitions. Firefox
+and WebKit remain unverified on the local runner because system libraries are
+absent; the existing CI Playwright container is the supported all-engine runner.
+The independently merged 330 KiB repository bundle policy now applies explicitly;
+no further budget increase, CSP change or new dependency is authorized.
 
 ## One implementation and offline checker
 
@@ -60,11 +62,16 @@ and metadata validation cap. Additional local caps are depth 16, 150,000 element
 512 trimmed descendant-text units per segment and a 256-byte XML declaration
 window. Root depth is one. There are no partial or truncated summaries.
 
-Only the byte cap and fail-closed prolog framing run before parsing. The built-in
-parser materializes the entire XML document synchronously **before** traversal
-can enforce depth, element, attribute and text caps. The current approach has no
-pre-parser markup-count ceiling; this is why density evidence is a shipment gate,
-not a claim of pre-parse structural protection.
+The byte cap, fail-closed prolog framing and a conservative literal-markup bound
+run before parsing. A linear, constant-memory scan counts every literal `<` in
+the original decoded pre-excision text and rejects the 150,001st with
+`NZBP_TOO_MANY_NODES`. Exactly 150,000 remains eligible, not guaranteed valid.
+Closing tags, declarations, DTDs, comments, PIs and CDATA literals all count;
+false rejection is deliberate, with no region-aware rescue. This is not an exact
+element count or a changed intake limit. The separate 150,000-element traversal
+cap remains. The built-in parser still materializes the entire eligible document
+synchronously **before** depth, actual-element, attribute and text checks run;
+passing the markup guard is not proof of the timing budgets.
 
 The prolog grammar skips whole comments and processing instructions, accepts at
 most one subset-free exact-case DOCTYPE, excises it and asserts that the exact
@@ -134,5 +141,35 @@ Measured on Linux x86_64 with Playwright 1.64.1, Chromium 156.0.8078.4, one work
 The less-dense independent bank's six cases passed five repetitions each, but
 that does not supersede this failure. Near-cap comment/text density and deep
 markup also passed five repetitions each. No file contents are included in these
-receipts. The failure requires security disposition and a new measured result
-before shipment, not retries until a favorable timing appears.
+receipts. The failure required security disposition and a new measured result
+before shipment, not retries until a favorable timing appears. The approved
+remediation adds only the conservative 150,000-literal-markup bound above.
+
+## Guarded worktree remeasurement (not an exact-head pass)
+
+The guarded original reproducer was rejected with zero parser invocations in all
+five repetitions (197 ms maximum total). Parser durations are **not invoked / N/A**,
+not a fabricated measured zero. Six pure guard cases pass, including the boundary,
+comment/CDATA/PI literal false rejection, pre-excision counting and numeric
+references not becoming markup syntax. The all-engine browser checker now covers
+16 shapes, five individual repetitions each; the existing CI container runs it
+without new host provisioning.
+
+A guarded, parser-eligible 1,200,011-byte case (60,000 tiny elements and 40,000
+comments) still failed the unchanged total budget on the local Chromium runner:
+
+| Repetition | Parser ms | Whole preview ms | Verdict |
+| --- | ---: | ---: | --- |
+| 1 | 110.50 | 764 | PASS |
+| 2 | 168.70 | 1275 | FAIL whole-preview bound |
+| 3 | 115.40 | 772 | PASS |
+| 4 | 115.60 | 647 | PASS |
+| 5 | 82.30 | 1181 | FAIL whole-preview bound |
+
+This was a pre-commit guarded worktree measurement based on the initial draft
+head, not exact-head shipping proof. The remaining 15 Chromium shapes passed;
+that does not discard these failures. No cap was lowered ad hoc and no cold run
+was discarded. Shipment STOP remains for the new finding and the unverified
+engines. Guarded rejections must stay under 1,000 ms without invoking the parser;
+parser-eligible cases still require every parser step under 500 ms and every
+whole preview under 1,000 ms on all three engines.
