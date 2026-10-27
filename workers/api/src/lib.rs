@@ -8,6 +8,7 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+pub mod billing_reader;
 pub mod handlers;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;

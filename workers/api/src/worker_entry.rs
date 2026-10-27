@@ -24,6 +24,7 @@ use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseClaim,
     SingleUseStore,
 };
+use crate::billing_reader::SubscriptionSource;
 use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
     QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
@@ -531,6 +532,29 @@ pub async fn with_deadline<T, E>(
 struct PgStore {
     env: Env,
     trace_id: String,
+}
+
+/// Inert subscription-source adapter for the unwired effective-plan reader:
+/// runs the reader-supplied SELECT with its single authoritative binding
+/// through the existing Hyperdrive connection. Read-only by construction —
+/// one connection, one query, no retry loop, no second statement, no
+/// writes — with driver failures mapped to the opaque [`StoreError`].
+/// Nothing invokes this yet; the serving path stays unwired.
+impl SubscriptionSource for PgStore {
+    type Row = tokio_postgres::Row;
+
+    async fn select_subscription(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Self::Row>, StoreError> {
+        let client = self.connect().await?;
+        let rows = client
+            .query(sql, &[&params[0]])
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(rows)
+    }
 }
 
 impl PgStore {
