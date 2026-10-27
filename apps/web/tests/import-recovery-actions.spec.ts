@@ -76,14 +76,48 @@ for (const colorScheme of ['light', 'dark'] as const) {
 		await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
 		const input = page.getByTestId('import-file');
 		const feedback = page.getByTestId('import-status');
-		const normalColor = await page.getByRole('main').evaluate((element) => getComputedStyle(element).color);
+		// Compare against main's live colour: right after emulateMedia it can still be mid-transition.
+		const matchesMain = () => page.evaluate(() => {
+			const main = getComputedStyle(document.querySelector('main')!).color;
+			return getComputedStyle(document.querySelector('[data-testid="import-status"]')!).color === main;
+		});
 		for (let action = 0; action < 10; action += 1) {
 			await input.setInputFiles({ name: 'bad.txt', mimeType: 'text/plain', buffer: Buffer.from('fixture') });
 			await expect(feedback).toHaveAttribute('role', 'alert');
-			await expect(feedback).not.toHaveCSS('color', normalColor);
+			await expect.poll(matchesMain).toBe(false);
 			await input.setInputFiles({ name: 'good.nzb', mimeType: 'application/octet-stream', buffer: Buffer.from('fixture') });
 			await expect(feedback).toHaveAttribute('role', 'status');
-			await expect(feedback).toHaveCSS('color', normalColor);
+			await expect.poll(matchesMain).toBe(true);
 		}
 	});
 }
+
+test('second Clear announces a fresh outcome after the first one was reset by reselection', async ({ page }) => {
+	const input = page.getByTestId('import-file');
+	const clear = page.getByRole('button', { name: 'Clear selection', exact: true });
+	const outcome = page.locator('main [aria-live="polite"]');
+	const file = { name: 'again.nzb', mimeType: 'application/octet-stream', buffer: Buffer.from('fixture') };
+	await input.setInputFiles(file);
+	await clear.click();
+	await expect(outcome).toHaveText('Local selection cleared.');
+	// A new selection retires the stale cleared text instead of leaving it beside the status.
+	await input.setInputFiles(file);
+	await expect(page.getByTestId('import-status')).toHaveAttribute('role', 'status');
+	await expect(outcome).toHaveText('');
+	await observeFeedback(outcome);
+	await clear.click();
+	await expect(outcome).toHaveText('Local selection cleared.');
+	await expect(input).toBeFocused();
+	expect(await nonEmptyCommits(outcome)).toEqual(['Local selection cleared.']);
+});
+
+test('an empty change on the pristine page announces no clear outcome', async ({ page }) => {
+	const input = page.getByTestId('import-file');
+	const outcome = page.locator('main [aria-live="polite"]');
+	await observeFeedback(outcome);
+	await input.setInputFiles([]);
+	await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+	await expect(outcome).toHaveText('');
+	await expect(page.getByTestId('import-status')).toHaveCount(0);
+	expect(await nonEmptyCommits(outcome)).toEqual([]);
+});
