@@ -474,14 +474,7 @@
 		pendingShareSeek = null;
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
-		replaceQueue(
-			addTrack(queue, {
-				id: item.id,
-				title: displayTitle(item),
-				artist: displayArtist(item) ?? '',
-				streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl })
-			})
-		);
+		replaceQueue(addTrack(queue, playableTrackFor(item)));
 	}
 
 	/**
@@ -519,12 +512,16 @@
 		const index = base.tracks.findIndex((track) => track.id === first?.id);
 		const target = base.tracks[index];
 		if (!target) return;
+		// Bulk-added slots are metadata-only. This explicit play gesture
+		// hydrates only its selected slot, preserving every other queued row.
+		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
+		base.tracks[index] = { ...target, streamUrl: source };
 		replaceQueue(selectQueueIndex(base, index));
 		const epoch = playEpoch;
-		const title = (target.title.trim() || target.id).slice(0, 60);
+		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
 		let lead = `Selected ${title}; no stream to play.`;
-		if (resolveStreamUrl(target)) {
+		if (source) {
 			await tick();
 			if (epoch !== playEpoch) return;
 			const element = audioEl;

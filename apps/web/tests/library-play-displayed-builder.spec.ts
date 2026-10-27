@@ -11,6 +11,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - with Group by artist on, "displayed" means the rendered grouped row
  *   order: an empty queue loads in that order, and an all-queued activation
  *   selects the first grouped row rather than the first flat row;
+ * - bulk then play hydrates only the selected existing slot; no-stream
+ *   feedback never claims Playing and title truncation keeps emoji whole;
  * - a resolving play() announces the exact Playing outcome, and a rejected
  *   play() names paused/blocked without ever claiming Playing;
  * - a deferred play() outcome is fenced by each direct queue edit and by an
@@ -217,8 +219,77 @@ test('grouped by artist, an all-queued activation selects the first grouped row 
 	await expectQueue(page, FLAT_ORDER, 'shown-middle');
 	await expect(page.getByTestId('now-playing')).toContainText('Middle Song');
 	const region = announcement(page);
-	await expect(region).toContainText('Middle Song');
-	await expect(region).toContainText(/Added 0, 5 already queued\./);
+	await expect(region).toHaveText('Selected Middle Song; no stream to play. Added 0, 5 already queued.');
+	await expect(region).not.toContainText(/Playing /);
+	await expect(page.locator('audio')).toHaveCount(0);
+	expect(await playCalls(page)).toBe(0);
+});
+
+for (const grouped of [false, true]) {
+	test(`bulk then play hydrates only the selected existing slot (${grouped ? 'grouped' : 'flat'})`, async ({ page }) => {
+		await mockLibrary(page, STREAM_ITEMS);
+		await stubResolvePlay(page);
+		await openLibrary(page, STREAM_ITEMS.length);
+		await bulkAction(page).click();
+		const ids = ['shown-zulu', 'shown-alpha', 'shown-middle'];
+		await expectQueue(page, ids, 'shown-zulu');
+		await expect(page.locator('audio')).toHaveCount(0);
+		expect(await playCalls(page)).toBe(0);
+		if (grouped) {
+			await page.getByRole('button', { name: 'Group by artist', exact: true }).click();
+			await expect.poll(() => page.getByTestId('library-item').evaluateAll(
+				(rows) => rows.map((item) => item.getAttribute('data-id'))
+			)).toEqual(['shown-middle', 'shown-zulu', 'shown-alpha']);
+		}
+		await action(page).click();
+		const target = grouped ? 'middle' : 'zulu';
+		await expectQueue(page, ids, `shown-${target}`);
+		await expect.poll(() => playCalls(page)).toBe(1);
+		await expect(page.locator('audio[data-testid="audio-player"]')).toHaveAttribute(
+			'src', `/__playall-build__/${target}.mp3`
+		);
+		await expect(announcement(page)).toHaveText(
+			`Playing ${grouped ? 'Middle' : 'Zulu'} Song. Added 0, 3 already queued.`
+		);
+		// Other slots remain metadata-only; only this explicit play gesture
+		// hydrates its target, without reordering or replacing other tracks.
+		await page.getByRole('button', { name: 'Select Alpha Song', exact: true }).click();
+		await expectQueue(page, ids, 'shown-alpha');
+		await expect(page.locator('audio')).toHaveCount(0);
+		expect(await playCalls(page)).toBe(1);
+	});
+}
+
+test('bulk then rejected play hydrates the existing slot but reports selected and paused', async ({ page }) => {
+	await mockLibrary(page, SOLO_ITEM);
+	await stubRejectPlay(page);
+	await openLibrary(page, SOLO_ITEM.length);
+	await bulkAction(page).click();
+	await expect(page.locator('audio')).toHaveCount(0);
+	await action(page).click();
+	await expectQueue(page, ['solo-track'], 'solo-track');
+	await expect.poll(() => playCalls(page)).toBe(1);
+	await expect(page.locator('audio[data-testid="audio-player"]')).toHaveAttribute('src', SOLO_ITEM[0].streamUrl);
+	await expect(announcement(page)).toHaveText(
+		'Selected Solo Song, paused: playback was blocked. Added 0, 1 already queued.'
+	);
+	await expect(announcement(page)).not.toContainText(/Playing /);
+	await page.waitForTimeout(500);
+	expect(await playCalls(page)).toBe(1);
+});
+
+test('no-stream title truncation keeps the boundary emoji whole and feedback truthful', async ({ page }) => {
+	const prefix = 'a'.repeat(59);
+	await mockLibrary(page, [{ id: 'emoji-boundary', title: `${prefix}😀 beyond the limit` }]);
+	await stubResolvePlay(page);
+	await openLibrary(page, 1);
+	await action(page).click();
+	await expectQueue(page, ['emoji-boundary'], 'emoji-boundary');
+	await expect(announcement(page)).toHaveText(`Selected ${prefix}😀; no stream to play. Added 1.`);
+	await expect(announcement(page)).not.toContainText(/Playing /);
+	expect(await announcement(page).evaluate((node) => (node.textContent ?? '').isWellFormed())).toBe(true);
+	await expect(page.getByTestId('now-playing')).toContainText(`${prefix}😀 beyond the limit`);
+	await expect(page.locator('audio')).toHaveCount(0);
 	expect(await playCalls(page)).toBe(0);
 });
 
