@@ -1430,6 +1430,7 @@
 				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
+				confirmDestructive
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
