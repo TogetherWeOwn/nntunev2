@@ -563,7 +563,7 @@ test('[RNG-B-13] range application queues, stars, fetches and persists nothing',
 	).toEqual([]);
 	expect(await storageSnapshot(page), 'range selection must not persist').toBe(beforeStorage);
 	expect(
-		(await storageKeys()).filter((key) => key.toLowerCase().includes('select')),
+		(await storageKeys(page)).filter((key) => key.toLowerCase().includes('select')),
 		'selection must not persist under a selection key'
 	).toEqual([]);
 });
