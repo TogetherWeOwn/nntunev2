@@ -3,6 +3,7 @@ import ts from 'typescript';
 import { tick } from 'svelte';
 import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
+import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { moveFavoriteId } from '#lib/library/favorites-order.js';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
@@ -32,6 +33,8 @@ import {
 	createSelection,
 	hiddenSelectedCount,
 	pruneSelection,
+	selectAllDisplayed,
+	selectSelectedItems,
 	selectionCountLabel,
 	toggleSelected
 } from '#lib/library/selection.js';
@@ -238,12 +241,15 @@ function pageHarness(): PageHarness {
 		displayTitle,
 		orderLibraryItems,
 		filterLibraryItems,
+		libraryTabTitle,
 		appendResultLabel,
 		appendSelection,
 		clearSelection,
 		createSelection,
 		hiddenSelectedCount,
 		pruneSelection,
+		selectAllDisplayed,
+		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected,
 		buildShareQuery,
