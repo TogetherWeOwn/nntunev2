@@ -58,6 +58,13 @@
 		 * exposed; component harnesses leave it on.
 		 */
 		liveRegions?: boolean;
+		/**
+		 * Opt-in two-step guard for the two destructive intents (Clear queue,
+		 * Clear upcoming): the panel opens an inline Cancel/Confirm prompt and
+		 * reports the intent only after Confirm. Hosts that omit it keep the
+		 * one-step behavior.
+		 */
+		confirmDestructive?: boolean;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
@@ -79,8 +86,11 @@
 		announcement = '',
 		announcementVersion = 0,
 		filterQuery = $bindable(''),
-		liveRegions = true
+		liveRegions = true,
+		confirmDestructive = false
 	}: Props = $props();
+
+	const confirmId = $props.id();
 
 	let current = $derived(currentTrack(queue));
 
@@ -227,6 +237,85 @@
 		await tick();
 		if (!focusStranded(heldFocus, button)) return;
 		focusEmptyTarget();
+	}
+
+	/**
+	 * Pending destructive confirm. Panel-local on purpose: it dies with the
+	 * panel (route unmount, access-refusal alert branch) and dismisses itself
+	 * the moment its precondition goes away (queue emptied by an auth
+	 * transition, nothing left upcoming), so it can never act on, or survive
+	 * into, another account's queue.
+	 */
+	let pending: 'clear' | 'trim' | null = $state(null);
+	let pendingTrigger: HTMLButtonElement | null = null;
+	let cancelButtonEl: HTMLButtonElement | null = $state(null);
+	let cancelNote = $state('');
+	let cancelNoteVersion = $state(0);
+
+	let pendingValid = $derived(
+		pending === 'clear' ? trackCount > 0 : pending === 'trim' ? upcoming > 0 : false
+	);
+
+	$effect(() => {
+		if (pending !== null && !pendingValid) pending = null;
+	});
+
+	async function openConfirm(kind: 'clear' | 'trim', event: Event): Promise<void> {
+		const button = event.currentTarget;
+		pendingTrigger = button instanceof HTMLButtonElement ? button : null;
+		cancelNote = '';
+		pending = kind;
+		await tick();
+		// Safe default first; Tab reaches Confirm next.
+		cancelButtonEl?.focus({ preventScroll: true });
+	}
+
+	function requestClear(event: Event): void {
+		if (!confirmDestructive) {
+			void reportClear(event);
+			return;
+		}
+		if (trackCount === 0) return;
+		void openConfirm('clear', event);
+	}
+
+	function requestTrim(event: Event): void {
+		if (!confirmDestructive) {
+			void reportTrim(event, onclearupcoming);
+			return;
+		}
+		if (upcoming <= 0) return;
+		void openConfirm('trim', event);
+	}
+
+	/** Cancel is a pure UI reset: nothing is reported, focus returns to the trigger. */
+	async function cancelConfirm(): Promise<void> {
+		const trigger = pendingTrigger;
+		const kind = pending;
+		pending = null;
+		pendingTrigger = null;
+		cancelNote = kind === 'trim' ? 'Clear upcoming cancelled. Queue kept.' : 'Clear queue cancelled. Queue kept.';
+		cancelNoteVersion += 1;
+		await tick();
+		trigger?.focus({ preventScroll: true });
+	}
+
+	async function acceptConfirm(): Promise<void> {
+		const kind = pending;
+		if (kind === null || !pendingValid) return;
+		pending = null;
+		pendingTrigger = null;
+		cancelNote = '';
+		if (kind === 'clear') onclear?.();
+		else onclearupcoming?.();
+		await tick();
+		// The Confirm button unmounted with focus on it (or never held it):
+		// recover onto the same stable targets as the one-step flows, unless
+		// focus has already moved on to a live element.
+		const active = document.activeElement;
+		if (active !== null && active !== document.body) return;
+		if (kind === 'clear') focusEmptyTarget();
+		else currentRowElement()?.focus({ preventScroll: true });
 	}
 
 	let normalizedQuery = $derived(filterQuery.trim().toLowerCase());
@@ -495,7 +584,7 @@
 	<button
 		type="button"
 		disabled={selectedIndex < 0 || selectedIndex >= trackCount - 1}
-		onclick={(event) => void reportTrim(event, onclearupcoming)}
+		onclick={requestTrim}
 	>
 		Clear upcoming
 	</button>
@@ -513,10 +602,42 @@
 <button
 	type="button"
 	disabled={queue.tracks.length === 0}
-	onclick={(event) => void reportClear(event)}
+	onclick={requestClear}
 >
 	Clear queue
 </button>
+
+{#if pending !== null && pendingValid}
+	<!-- A fieldset keeps the prompt a labelled group without a dialog trap:
+		the rest of the page stays reachable and nothing is modal. -->
+	<fieldset class="queue-confirm" data-testid="queue-clear-confirm">
+		<legend>{pending === 'clear' ? 'Clear queue?' : 'Clear upcoming?'}</legend>
+		<p id="{confirmId}-message">
+			{#if pending === 'clear'}
+				Remove all {trackCount} {trackCount === 1 ? 'track' : 'tracks'} from the queue? This cannot be undone.
+			{:else}
+				Remove {upcoming} upcoming {upcoming === 1 ? 'track' : 'tracks'} from the queue? The current track stays. This cannot be undone.
+			{/if}
+		</p>
+		<div class="queue-confirm-actions">
+			<button
+				type="button"
+				bind:this={cancelButtonEl}
+				aria-describedby="{confirmId}-message"
+				onclick={() => void cancelConfirm()}
+			>
+				Cancel
+			</button>
+			<button type="button" onclick={() => void acceptConfirm()}>
+				{pending === 'clear' ? 'Yes, clear queue' : 'Yes, clear upcoming'}
+			</button>
+		</div>
+	</fieldset>
+{/if}
+
+<!-- Polite outcome for a cancelled confirm; the queue-announcement region
+	stays reserved for real queue changes. -->
+<p data-testid="queue-confirm-feedback" aria-live={liveRegions ? 'polite' : undefined}>{#key cancelNoteVersion}{cancelNote}{/key}</p>
 
 <style>
 	.queue-filter {
@@ -570,6 +691,38 @@
 
 	.queue-star:focus-visible,
 	.queue-copy-link:focus-visible {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+
+	.queue-confirm {
+		min-width: 0;
+		margin-inline: 0;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.queue-confirm p {
+		overflow-wrap: anywhere;
+	}
+
+	.queue-confirm-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+
+	/* Touch-sized, with a ring that holds without the app stylesheet. */
+	.queue-confirm button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	.queue-confirm button:focus-visible {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}
