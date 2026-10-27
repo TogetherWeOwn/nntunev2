@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod body;
 pub mod endpoints;
 pub mod envelope;
 pub mod library;
@@ -17,6 +18,7 @@ pub use app::{
     oversized_body_response, unreadable_body_response, HttpResponse, SubsonicApp, MAX_BODY_BYTES,
 };
 pub use auth::{AuthStore, Credentials, Identity};
+pub use body::{BodyFault, FormBody};
 pub use endpoints::Params;
 pub use library::{Library, MemStore, UserAccount};
 pub use routes::{PUBLIC_ENDPOINTS, SUPPORTED_ENDPOINTS, UNSUPPORTED_ENDPOINTS};

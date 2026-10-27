@@ -107,7 +107,7 @@ mod logging_tests {
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
 use nntune_subsonic::{
-    oversized_body_response, unreadable_body_response, MemStore, SubsonicApp, MAX_BODY_BYTES,
+    oversized_body_response, unreadable_body_response, BodyFault, FormBody, MemStore, SubsonicApp,
 };
 #[cfg(target_arch = "wasm32")]
 use worker::*;
@@ -181,23 +181,26 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
         .get("content-type")
         .unwrap_or_default()
         .unwrap_or_default();
+    let is_form_post = method.eq_ignore_ascii_case("POST")
+        && content_type.contains("application/x-www-form-urlencoded");
+    let declared = req
+        .headers()
+        .get("content-length")
+        .unwrap_or_default()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let fault_response = |fault: BodyFault| match fault {
+        BodyFault::Oversized => oversized_body_response(&query),
+        BodyFault::Unreadable => unreadable_body_response(&query),
+    };
+    let mut form = FormBody::new(declared);
     // v1 `MergeFormPostParams` refuses bodies over 10 MB on `Content-Length`
     // before buffering: answer error 10 without reading the body at all.
-    if method.eq_ignore_ascii_case("POST")
-        && content_type.contains("application/x-www-form-urlencoded")
-        && req
-            .headers()
-            .get("content-length")
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .parse::<usize>()
-            .is_ok_and(|declared| declared > MAX_BODY_BYTES)
-    {
-        let res = oversized_body_response(&query);
-        return respond(&res);
+    if is_form_post {
+        if let Err(fault) = form.check_declared() {
+            return respond(&fault_response(fault));
+        }
     }
-    let body = if method.eq_ignore_ascii_case("POST")
-        && content_type.contains("application/x-www-form-urlencoded")
+    let body = if is_form_post
         // Request::stream() errors on a null JS body. That is a valid empty
         // form POST, distinct from a stream that exists but cannot be read.
         && req.inner().body().is_some()
@@ -206,21 +209,18 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
             Ok(stream) => stream,
             Err(_) => return respond(&unreadable_body_response(&query)),
         };
-        let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => return respond(&unreadable_body_response(&query)),
+            let pushed = match chunk {
+                Ok(chunk) => form.push(&chunk),
+                Err(_) => Err(BodyFault::Unreadable),
             };
-            if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-                let res = oversized_body_response(&query);
-                return respond(&res);
+            if let Err(fault) = pushed {
+                return respond(&fault_response(fault));
             }
-            bytes.extend_from_slice(&chunk);
         }
-        match String::from_utf8(bytes) {
+        match form.finish() {
             Ok(body) => body,
-            Err(_) => return respond(&unreadable_body_response(&query)),
+            Err(fault) => return respond(&fault_response(fault)),
         }
     } else {
         String::new()

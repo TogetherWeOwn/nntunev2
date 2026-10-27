@@ -536,7 +536,11 @@ impl Library for MemStore {
             "byGenre" => {
                 albums.retain(|album| {
                     self.songs.iter().any(|song| {
-                        song.album_id == album.id && Some(song.genre.as_str()) == query.genre
+                        // Case-insensitive, like `getSongsByGenre`.
+                        song.album_id == album.id
+                            && query.genre.is_some_and(|genre| {
+                                song.genre.to_lowercase() == genre.to_lowercase()
+                            })
                     })
                 });
                 albums.sort_by(|a, b| a.name.cmp(&b.name));

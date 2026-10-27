@@ -55,7 +55,8 @@ data, R2 for bytes.
 - The two album-list routes have different v1 backends. Legacy `getAlbumList`
   supports all ten validated types: frequent/recent use authenticated-user
   play history, reversed year bounds request descending order, and random
-  ignores offset. Catalogue `getAlbumList2` supports newest, random, byYear,
+  ignores offset; `byGenre` matches the genre case-insensitively, like
+  `getSongsByGenre`. Catalogue `getAlbumList2` supports newest, random, byYear,
   alphabeticalByName and alphabeticalByArtist; the other validated types
   return error 0. Its reversed year bounds return an empty list, and its year
   ordering uses album release date, then catalogue curation time (not legacy
