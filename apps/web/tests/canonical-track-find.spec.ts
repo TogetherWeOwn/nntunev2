@@ -498,8 +498,8 @@ test('CF-B07 finding makes no request and touches no queue, selection, favorites
 		expect(stillChecked).toBe(true);
 		expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual(stored);
 		const effects = await probe(page);
-		expect(await page.locator('audio')).toHaveCount(0);
-		expect(await page.getByTestId('queue-item')).toHaveCount(0);
+		await expect(page.locator('audio')).toHaveCount(0);
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		const unstarred = await page.getByRole('button', { name: /^Unstar / }).count();
 		return { restored, hidden: hidden?.replace(/\s+/g, ' ').trim(), libraryCalls: library.requests() - callsBefore + 1, requests, media: effects.media, storageWrites: effects.storage, unstarred };
 	});
@@ -542,7 +542,7 @@ test('CF-B08 library queue filter matches canonically equivalent queued names', 
 		const restored = await queueOrder(page);
 		const effects = await probe(page);
 		expect(effects.media).toEqual([]);
-		expect(await page.locator('audio')).toHaveCount(0);
+		await expect(page.locator('audio')).toHaveCount(0);
 		return { control, canonical, count: count?.trim(), currentHidden, restored, libraryCalls: library.requests() - callsBefore + 1, requests };
 	});
 });
