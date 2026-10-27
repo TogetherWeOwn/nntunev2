@@ -165,7 +165,8 @@ entry; an omitted table is not.
 ### 3. Infrastructure cost basis
 
 Unit prices are public list prices captured on the `Price source` date,
-per the formulas in `docs/cost-basis.md` (§1–§7, checked 2026-10-17);
+per the formulas in `docs/cost-basis.md` (§1–§7, checked dates per section
+as stated in the worksheet);
 usage volumes are either measured on staging (labelled `measured`, with the
 evidence ID proving the volume in the usage-basis cell) or stated
 assumptions (labelled `assumed`). A `measured` volume with no evidence ID
@@ -188,6 +189,7 @@ be listed as unpriced here before any total is quoted as complete.
 | KV reads/writes/storage | | | | | | |
 | Queues operations | | | | | | |
 | Analytics Engine events | | | | | | |
+| Workers Logs (prospective; excluded from currently-billed total) | | | | | | |
 | Postgres (app + mirror clusters) | | | | | | |
 | Egress / other metered items | | | | | | |
 | **Total at stated usage** | | | | | | |
@@ -288,6 +290,7 @@ All prices and volumes invented for format demonstration.
 | KV reads/writes/storage | 1M reads | $0.50 | <https://example.invalid/pricing-kv> (2026-01-01) | assumed, 1M reads | max(0, 1 − 10) × $0.50 | $0.00 |
 | Queues operations | 1M operations | $0.40 | <https://example.invalid/pricing-queues> (2026-01-01) | assumed, 0.2M operations | max(0, 0.2 − 1) × $0.40 | $0.00 |
 | Analytics Engine events (prospective; not currently billed, excluded from the currently-billed total per `docs/cost-basis.md` §5 and §7) | 1M events | $0.25 | <https://example.invalid/pricing-analytics> (2026-01-01) | assumed, 1M written / 0 reads | max(0, 1 − 10) × $0.25 + max(0, 0 − 1) × $1.00 | $0.00 |
+| Workers Logs (prospective; no measured volume, excluded from currently-billed total per `docs/cost-basis.md` §5b and §7) | 1M events | $0.60 | <https://example.invalid/pricing-workers-logs> (2026-01-01) | not measured; `L` unknown | max(0, L/1e6 − 20) × $0.60 | not estimated — no volume |
 | Postgres (app + mirror clusters) | cluster-month (fixed) | $10.00 | <https://example.invalid/pricing-postgres> (2026-01-01) | fixed fee at current tier; storage/egress excluded | flat | $10.00 |
 | Egress / other metered items | — | $0.00 | not metered in this synthetic example | not measured | — | $0.00 |
 | **Total currently billed at stated usage (excludes prospective Analytics Engine)** | | | | | | **$15.45** |
@@ -301,9 +304,12 @@ included allowances at these volumes, so they contribute $0.00 here. Not
 metered or priced: Workers CPU (no CPU-ms volume stated), R2 operations,
 KV writes and storage, Postgres storage, and egress — plus the
 `docs/cost-basis.md` out-of-scope services (Durable Objects, Containers,
-Workers Logs, domain/DNS, and any non-Cloudflare, non-PlanetScale
+domain/DNS, and any non-Cloudflare, non-PlanetScale
 services), none of which this synthetic example prices. The total is
-therefore a floor, not an all-in bill.
+therefore a floor, not an all-in bill. Both totals above exclude prospective
+Workers Logs: no log-event volume was measured, so its cost is unknown,
+not $0.00. The $15.45 including Analytics Engine is not a total including
+all prospective costs.
 
 ### 4. Explicit non-goals
 
@@ -359,6 +365,8 @@ VERDICT: NO-GO — must-pass step 5 (play/seek) failed per E10 and cost kill rul
   `product lead, 2026-01-15`
 - What could not be verified: the unmetered/unpriced costs listed in
   section 3 (Workers CPU, R2 operations, KV writes and storage, Postgres
-  storage, and egress, plus Durable Objects, Containers, Workers Logs,
+  storage, and egress, plus Durable Objects, Containers,
   domain/DNS, and any non-Cloudflare, non-PlanetScale services); K2 is
-  therefore `INCONCLUSIVE`, not `NOT TRIGGERED`.
+  therefore `INCONCLUSIVE`, not `NOT TRIGGERED`. Prospective Workers Logs
+  also has no measured volume and is excluded from both totals, not
+  assumed to cost $0.00.

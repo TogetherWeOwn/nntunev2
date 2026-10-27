@@ -25,7 +25,7 @@ pub const MAX_MANIFEST_BYTES: usize = 1 << 20;
 pub const MAX_RESULT_BYTES: usize = 1 << 20;
 
 /// Stable API fault: HTTP status plus a machine-readable code. Ingest
-/// maps statuses (400/404/409/413 permanent, 5xx transient); codes are
+/// maps statuses (400/401/403/404/409/413 permanent, 5xx transient); codes are
 /// for logs and operators, so they carry no user data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiFault {
