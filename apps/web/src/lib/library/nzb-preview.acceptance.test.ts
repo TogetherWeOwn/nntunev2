@@ -306,8 +306,8 @@ describe('NZBP contract presence', () => {
 				version: 'number',
 				namespace: 'string',
 				limitKeys: [
-					'maxAttributesPerElement',
 					'maxAttributeValueChars',
+					'maxAttributesPerElement',
 					'maxBytes',
 					'maxDeclaredBytes',
 					'maxDepth',
