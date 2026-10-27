@@ -1,3 +1,4 @@
+import { HOME_SUMMARY } from '#lib/publicCopy.js';
 import type { RequestHandler } from './$types';
 
 // PWA install manifest. A server route (not a static file) guarantees the
@@ -8,8 +9,7 @@ import type { RequestHandler } from './$types';
 const MANIFEST = {
 	name: 'NNTune',
 	short_name: 'NNTune',
-	description:
-		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.',
+	description: HOME_SUMMARY,
 	start_url: '/',
 	scope: '/',
 	display: 'standalone',
