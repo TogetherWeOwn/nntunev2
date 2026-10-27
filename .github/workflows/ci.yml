@@ -914,7 +914,9 @@ jobs:
           env -i PATH="$tools:$PATH" jq --version
 
       - name: Browser image and preflight self-tests (offline doubles only)
-        run: python3 .github/scripts/test_ci_playwright_image.py
+        run: |
+          python3 .github/scripts/test_ci_playwright_image.py
+          python3 .github/scripts/test_ci_web_e2e_image.py
 
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
@@ -1076,8 +1078,11 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Slow Ubuntu dependency downloads can consume 17 minutes; the full
-    # browser suite now takes about 21 minutes. Include cleanup headroom.
+    # Reuse e2e-lint's preinstalled browser/OS libraries: slow apt mirrors
+    # otherwise consume the full suite's deadline. Re-pin with the web lock.
+    # The full browser suite now takes about 21 minutes; include cleanup
+    # headroom above setup plus suite.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 45
     defaults:
       run:
@@ -1105,8 +1110,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preinstalled web Playwright chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
       - name: Upload failure artifacts

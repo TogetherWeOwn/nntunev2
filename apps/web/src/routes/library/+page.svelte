@@ -178,6 +178,18 @@
 		seconds: number;
 		appliedSeconds: number | null;
 	} | null = null;
+	// Restart availability is live native state of the mounted matching
+	// element, re-evaluated on media events — never cached coordinates.
+	// The outcome lives only in one polite status inside the Player region
+	// and clears whenever the current source changes or an auth boundary
+	// purges the queue, so a previous track or account never lingers.
+	let restartCanSeek = $state(false);
+	let restartStatus = $state('');
+	let restartStatusVersion = $state(0);
+	// Sources whose pending inbound-share seek was superseded by an
+	// explicit restart (live position may still sit at the share target,
+	// so a remembered position must be fenced here, not re-derived).
+	const restartSupersededSources = new Set<string>();
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -381,6 +393,22 @@
 	 * invalidates it; clearing it here also keeps a previous account's
 	 * track title from lingering across the auth-boundary clears below.
 	 */
+	/**
+	 * A current-source change invalidates the restart outcome and its
+	 * availability snapshot, whichever queue edit caused it — including
+	 * the direct-assign handlers that bypass replaceQueue, so a stale
+	 * "Restarted …" can never describe the new current track.
+	 */
+	function resetRestartOnSourceChange(
+		before: Track | null | undefined,
+		after: Track | null | undefined
+	): void {
+		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			restartCanSeek = false;
+			restartStatus = '';
+		}
+	}
+
 	function replaceQueue(next: QueueState): void {
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
@@ -388,6 +416,7 @@
 			clearShareFeedback();
 			pendingShareSeek = null;
 		}
+		resetRestartOnSourceChange(before, after);
 		queue = next;
 		queueAnnouncement = '';
 	}
@@ -401,6 +430,9 @@
 	function resetShareAtAuthBoundary(): void {
 		clearShareFeedback();
 		pendingShareSeek = null;
+		restartSupersededSources.clear();
+		restartCanSeek = false;
+		restartStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 	}
@@ -475,6 +507,8 @@
 		);
 		const source = resolveStreamUrl(queueCurrentTrack(queue));
 		if (!source) return;
+		// This navigation is a new gesture, not the seek that restart superseded.
+		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
@@ -486,6 +520,12 @@
 		const current = queueCurrentTrack(queue);
 		if (!pending || !element || element !== audioEl || !shareAlive) return;
 		if (current?.id !== pending.trackId || resolveStreamUrl(current) !== pending.streamUrl) return;
+		// An explicit restart of this source supersedes the remembered
+		// share position: later metadata must not move it away from zero.
+		if (restartSupersededSources.has(`${pending.trackId}\n${pending.streamUrl}`)) {
+			pendingShareSeek = null;
+			return;
+		}
 		const knownDuration = Number.isFinite(element.duration) && element.duration >= 0;
 		const seconds = knownDuration ? Math.min(pending.seconds, element.duration) : pending.seconds;
 		try {
@@ -506,6 +546,134 @@
 		) {
 			pendingShareSeek = null;
 		}
+	}
+
+	// True when position 0 lies inside a native seekable range. Any unreadable
+	// or non-finite range bound is unusable media, never an exception.
+	function seekableIncludesStart(element: HTMLAudioElement): boolean {
+		try {
+			const ranges = element.seekable;
+			for (let index = 0; index < ranges.length; index += 1) {
+				const start = ranges.start(index);
+				const end = ranges.end(index);
+				if (Number.isFinite(start) && Number.isFinite(end) && start <= 0 && end >= 0) {
+					return true;
+				}
+			}
+		} catch {
+			// Fall through: an unreadable range set cannot restart.
+		}
+		return false;
+	}
+
+	// Media events re-evaluate restart availability from the live element.
+	// Events from a detached or replaced element are ignored, so stale
+	// nodes can never enable, disable, or complete a restart.
+	function refreshRestartAvailability(event: Event): void {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		if (!element || element !== audioEl || !shareAlive) return;
+		const current = queueCurrentTrack(queue);
+		if (!current || resolveStreamUrl(current) !== element.getAttribute('src')) {
+			restartCanSeek = false;
+			return;
+		}
+		restartCanSeek = restartIsAvailable(element);
+	}
+
+	function restartIsAvailable(element: HTMLAudioElement): boolean {
+		try {
+			return (
+				Number.isFinite(element.duration) &&
+				element.duration > 0 &&
+				Number.isFinite(element.currentTime) &&
+				seekableIncludesStart(element)
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	function setRestartStatus(text: string): void {
+		restartStatus = text;
+		restartStatusVersion += 1;
+	}
+
+	/**
+	 * Explicit restart: seek the currently mounted matching element to zero
+	 * and claim success only on readback. Touches nothing but currentTime,
+	 * so paused/playing intent, source, queue/current identity, rate and
+	 * volume survive; never calls play/pause/load, never advances tracks,
+	 * and needs no keyboard shortcut. A throwing or silently-ignoring
+	 * setter is a truthful failure, not success inferred from the write.
+	 * The gesture supersedes any pending inbound-share seek for the source.
+	 */
+	function restartCurrentTrack(): void {
+		const element = audioEl;
+		const current = queueCurrentTrack(queue);
+		if (!element || !current) return;
+		const source = resolveStreamUrl(current);
+		if (!source || element.getAttribute('src') !== source) return;
+		const title = current.title?.trim() ? current.title : current.id;
+		const withTitle = (words: string): string => {
+			const suffix = ` ${title}.`;
+			if (words.length + suffix.length <= 99) return `${words}${suffix}`;
+			let end = 97 - words.length;
+			// Never cut between the halves of a surrogate pair.
+			const last = title.charCodeAt(end - 1);
+			if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+			return `${words} ${title.slice(0, end)}…`;
+		};
+		// The explicit gesture supersedes a pending share seek for this
+		// source even if the native write is refused: later metadata for
+		// the same source must never move the position to the share time.
+		if (pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === source) {
+			pendingShareSeek = null;
+		}
+		restartSupersededSources.add(`${current.id}\n${source}`);
+		// Native state can change after the last media event and before this click.
+		if (!restartIsAvailable(element)) {
+			restartCanSeek = false;
+			setRestartStatus(withTitle('Could not restart'));
+			return;
+		}
+		let position = Number.NaN;
+		try {
+			position = element.currentTime;
+		} catch {
+			// Handled below: an unreadable position cannot restart.
+		}
+		if (!Number.isFinite(position)) {
+			setRestartStatus(withTitle('Could not restart'));
+			return;
+		}
+		if (Math.abs(position) <= 0.05) {
+			try {
+				element.currentTime = 0;
+			} catch {
+				// Already at the start; a refusal changes nothing there.
+			}
+			setRestartStatus(withTitle('Already at the start of'));
+			return;
+		}
+		let refused = false;
+		try {
+			element.currentTime = 0;
+		} catch {
+			refused = true;
+		}
+		let readback = Number.NaN;
+		if (!refused) {
+			try {
+				readback = element.currentTime;
+			} catch {
+				// Handled below: no readback means no success claim.
+			}
+		}
+		setRestartStatus(
+			!refused && Number.isFinite(readback) && Math.abs(readback) <= 0.05
+				? withTitle('Restarted')
+				: withTitle('Could not restart')
+		);
 	}
 
 	if (typeof window !== 'undefined') {
@@ -531,6 +699,9 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		// Removing the current row advances the current source; the restart
+		// outcome for the removed track must not carry onto its successor.
+		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
 		queue = next;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
@@ -560,6 +731,9 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		// Direct selection always changes the current source (reselecting
+		// the current row returned above), so restart state resets here.
+		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
 		queue = selected;
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
@@ -902,6 +1076,7 @@
 			shareAlive = false;
 			clearShareFeedback();
 			pendingShareSeek = null;
+			restartSupersededSources.clear();
 			refresher.dispose();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
@@ -1293,17 +1468,42 @@
 					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
 				</p>
 			{/if}
-			{#key `${currentTrack?.id}:${streamUrl}`}
-				<audio
-					bind:this={audioEl}
-					data-testid="audio-player"
-					controls
-					src={streamUrl}
-					onloadedmetadata={(event) => applyPendingShareSeek(event.currentTarget)}
-					ondurationchange={(event) => applyPendingShareSeek(event.currentTarget)}
-					onseeking={handleSeeking}
-				></audio>
-			{/key}
+			<div class="nt-library-player-controls">
+				{#key `${currentTrack?.id}:${streamUrl}`}
+					<audio
+						bind:this={audioEl}
+						data-testid="audio-player"
+						controls
+						src={streamUrl}
+						onloadedmetadata={(event) => {
+							applyPendingShareSeek(event.currentTarget);
+							refreshRestartAvailability(event);
+						}}
+						ondurationchange={(event) => {
+							applyPendingShareSeek(event.currentTarget);
+							refreshRestartAvailability(event);
+						}}
+						oncanplay={refreshRestartAvailability}
+						onprogress={refreshRestartAvailability}
+						ontimeupdate={refreshRestartAvailability}
+						onseeking={handleSeeking}
+					></audio>
+				{/key}
+				<button
+					class="nt-button nt-library-restart"
+					type="button"
+					data-testid="library-restart"
+					disabled={!restartCanSeek}
+					aria-describedby={restartCanSeek ? undefined : 'library-restart-hint'}
+					onclick={restartCurrentTrack}
+				>
+					Restart current track
+				</button>
+			</div>
+			{#if !restartCanSeek}
+				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
+			{/if}
+			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
 		</section>
 	{/if}
 </main>
@@ -1377,6 +1577,27 @@
 	}
 	audio {
 		max-width: 100%;
+	}
+	.nt-library-player-controls {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-player-controls audio {
+		flex: 1 1 12rem;
+		min-width: 0;
+	}
+	.nt-library-restart {
+		flex: 0 0 auto;
+		min-height: 2.75rem;
+		border: 0;
+		cursor: pointer;
+		font: inherit;
+	}
+	.nt-library-restart:disabled {
+		cursor: default;
+		opacity: 0.5;
 	}
 	.nt-library-order {
 		display: flex;
