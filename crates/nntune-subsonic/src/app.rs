@@ -147,7 +147,7 @@ pub fn oversized_body_response(query: &str) -> HttpResponse {
 }
 
 /// A failed or invalid form-body read must not dispatch partial parameters.
-/// Like the size cap, use only query parameters to choose the error envelope.
+/// Like the size cap, use only query parameters to select the error envelope.
 pub fn unreadable_body_response(query: &str) -> HttpResponse {
     body_error_response(query, "Unable to read request body.")
 }
