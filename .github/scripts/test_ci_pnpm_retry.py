@@ -173,10 +173,12 @@ def check_required_step(job_id, job_chunk, command):
     be silently dropped or neutralized without CI turning red.
     """
     errors = []
-    header = job_chunk.split("    steps:", 1)[0]
-    if job_level_field(header, "if") is not None:
+    # Job keys are unordered YAML, so `if` and `continue-on-error` count
+    # on either side of `steps:`. The four-space pattern cannot match
+    # inside the steps list, whose keys sit at six spaces or deeper.
+    if job_level_field(job_chunk, "if") is not None:
         errors.append(f"{job_id}: job must be unconditional (no job-level if)")
-    if job_level_field(header, "continue-on-error") is not None:
+    if job_level_field(job_chunk, "continue-on-error") is not None:
         errors.append(f"{job_id}: job must fail on a failed step, not continue-on-error")
     script = command.rsplit("/", 1)[-1]
     candidates = [
@@ -314,14 +316,18 @@ class TestPnpmRetryShape(unittest.TestCase):
         self.assertTrue(any("must set continue-on-error" in e for e in errors), errors)
 
 
-def public_text_with(step_block, job_extra=""):
-    """A minimal public-text job chunk carrying `step_block`."""
+def public_text_with(step_block, job_extra="", job_after_steps=""):
+    """A minimal public-text job chunk carrying `step_block`.
+
+    `job_extra` lands before the steps block, `job_after_steps` after it.
+    """
     return (
         "  public-text:\n"
         "    runs-on: ubuntu-latest\n"
         f"{job_extra}"
         "    steps:\n"
         f"{step_block}"
+        f"{job_after_steps}"
     )
 
 
@@ -424,6 +430,24 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
             public_text_with(timeout_step(), job_extra="    continue-on-error: true\n")
         )
         self.assertTrue(any("not continue-on-error" in e for e in errors), errors)
+
+    def test_job_level_keys_after_steps_fail(self):
+        """Job-level `if`/`continue-on-error` after the steps block count too."""
+        cases = (
+            ("    continue-on-error: true\n", "not continue-on-error"),
+            ("    if: ${{ false }}\n", "no job-level if"),
+        )
+        for after, expected in cases:
+            with self.subTest(after=after):
+                errors = wiring_errors(
+                    public_text_with(timeout_step(), job_after_steps=after)
+                )
+                self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_step_keys_are_not_job_level(self):
+        """Step-level `if` text deeper than job keys stays a step concern."""
+        step = timeout_step() + "      - name: later\n        if: always()\n        run: echo ok\n"
+        self.assertEqual(wiring_errors(public_text_with(step)), [])
 
 
 if __name__ == "__main__":
