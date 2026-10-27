@@ -394,12 +394,14 @@ fn authorize(env: &str, o: &Origin, c: &Call) -> Result<(), Denial> {
     if !c.authoritative || c.rollback_detected {
         return Err(Denial::Unavailable);
     }
+    // o.owner == o.pool_owner holds for every frozen record: validate_shape
+    // rejects a mismatched origin at freeze (schema.sql check), so authorize
+    // only rechecks the caller-selected identities.
     let allowed = c.resolver_role == RESOLVER_ROLE
         && c.stream_role == STREAM_ROLE
         && c.env == env
         && o.env == env
         && c.owner == o.owner
-        && o.owner == o.pool_owner
         && c.actual_pool_owner == o.pool_owner
         && c.purpose == PURPOSE
         && c.operation == OPERATION
@@ -417,6 +419,7 @@ fn validate_shape(seed: &Seed) -> Result<(), Denial> {
         || o.playback_request_id == o.authorization_id
         || o.playback_request_id == o.play_intent_id
         || o.hard_deadline < o.issued_at
+        || o.owner != o.pool_owner
     {
         return Err(Denial::Denied);
     }
@@ -459,6 +462,8 @@ pub struct AuthorityStore {
     by_authorization: BTreeSet<Id>,
     by_request: BTreeSet<Id>,
     by_jti: BTreeSet<(String, Id)>,
+    connection_claims: BTreeSet<(Id, Id)>,
+    connection_pairs: BTreeSet<(Id, u8, String)>,
     nonces: BTreeSet<(String, String, u64, Id)>,
     reservations: BTreeMap<Id, Id>,
     next_reservation: u64,
@@ -482,6 +487,8 @@ impl AuthorityStore {
             by_authorization: BTreeSet::new(),
             by_request: BTreeSet::new(),
             by_jti: BTreeSet::new(),
+            connection_claims: BTreeSet::new(),
+            connection_pairs: BTreeSet::new(),
             nonces: BTreeSet::new(),
             reservations: BTreeMap::new(),
             next_reservation: 0,
@@ -489,7 +496,8 @@ impl AuthorityStore {
     }
 
     /// Freeze origin, plan and stable step identity once. Every later change is
-    /// a conflict; there is no update path.
+    /// a conflict; there is no update path. A connection step already claimed
+    /// under the same scope also conflicts (schema.sql `connection_step` keys).
     pub fn freeze(&mut self, seed: Seed) -> Result<(), Denial> {
         if seed.origin.env != self.env {
             return Err(Denial::Denied);
@@ -505,6 +513,25 @@ impl AuthorityStore {
         {
             return Err(Denial::Conflict);
         }
+        // validate_shape already rejects duplicates inside this seed, so a
+        // disjoint check against every frozen record is the whole key.
+        let claims: BTreeSet<(Id, Id)> = seed
+            .connection_steps
+            .iter()
+            .map(|s| (seed.scope_id.clone(), s.step_id.clone()))
+            .collect();
+        let pairs: BTreeSet<(Id, u8, String)> = seed
+            .connection_steps
+            .iter()
+            .map(|s| (seed.scope_id.clone(), s.pair, s.operation.clone()))
+            .collect();
+        if !claims.is_disjoint(&self.connection_claims)
+            || !pairs.is_disjoint(&self.connection_pairs)
+        {
+            return Err(Denial::Conflict);
+        }
+        self.connection_claims.extend(claims);
+        self.connection_pairs.extend(pairs);
         self.by_authorization.insert(o.authorization_id.clone());
         self.by_request.insert(o.playback_request_id.clone());
         self.by_jti.insert((seed.issuer.clone(), seed.jti.clone()));
@@ -581,7 +608,9 @@ impl AuthorityStore {
         let until = now
             .saturating_add(RESERVE_WINDOW)
             .min(s.cap_expires_at)
-            .min(s.origin.hard_deadline);
+            .min(s.origin.hard_deadline)
+            .min(s.origin.grant_expires_at)
+            .min(s.material_lease_until);
         self.next_reservation += 1;
         let reservation = Reservation {
             reservation_id: format!("reservation-{:06}", self.next_reservation),
@@ -631,6 +660,7 @@ impl AuthorityStore {
             .saturating_add(LEASE_TERM)
             .min(s.cap_expires_at)
             .min(s.origin.hard_deadline)
+            .min(s.origin.grant_expires_at)
             .min(s.material_lease_until);
         if lease_until.saturating_sub(now) < MIN_REMAINING {
             rec.end(State::Failed, &role, "lease_too_short", now);
@@ -712,5 +742,273 @@ impl AuthorityStore {
     /// foundation. They fail closed and change nothing.
     pub fn unsupported(&mut self, _operation: &str) -> Result<(), Denial> {
         Err(Denial::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod review_pins {
+    //! Builder-owned pins for the model guards the frozen acceptance bank
+    //! does not isolate. The frozen bank is never edited; these cases pin the
+    //! lease/grant caps, the scope-step key, owner equality, the lease term,
+    //! each mapping key and unknown-writer rejection.
+    use super::*;
+
+    fn id(n: u32) -> Id {
+        format!("00000000-0000-4000-8000-{n:012x}")
+    }
+
+    fn seed() -> Seed {
+        Seed {
+            origin: Origin {
+                env: "staging".into(),
+                play_intent_id: id(1),
+                authorization_id: id(2),
+                playback_request_id: id(3),
+                owner: "synthetic_owner".into(),
+                pool_owner: "synthetic_owner".into(),
+                track_id: "synthetic_track".into(),
+                session_id: "synthetic_session".into(),
+                session_epoch: 1,
+                user_epoch: 1,
+                library_epoch: 1,
+                track_epoch: 1,
+                material_epoch: 1,
+                grant_digest: "1".repeat(64),
+                grant_expires_at: 1900,
+                metadata_contract: "nntune.playback-manifest/2".into(),
+                admission_id: id(4),
+                publication_id: id(5),
+                manifest_id: id(6),
+                manifest_revision: 1,
+                manifest_digest: "2".repeat(64),
+                source: Source {
+                    job_id: "job_0123456789abcdef".into(),
+                    job_generation: 1,
+                    source_selection_id: id(7),
+                    selection_version: 1,
+                    plan_digest: "3".repeat(64),
+                    audio_ordinal: 1,
+                },
+                material_ref: Material {
+                    material_id: id(8),
+                    material_version: 1,
+                    algorithm: "XSalsa20-Poly1305".into(),
+                },
+                selection: Selection::All,
+                issued_at: 1000,
+                hard_deadline: 1900,
+                plan_digest: "4".repeat(64),
+            },
+            actions: (0..2)
+                .map(|n| Action {
+                    ordinal: n,
+                    manifest_ordinal: n,
+                    message_id_sha256: (5 + n).to_string().repeat(64),
+                    decoded_offset: u64::from(n) * 32768,
+                    decoded_length: if n == 0 { 32768 } else { 32833 },
+                    decoded_sha256: "8".repeat(64),
+                    wire_max_bytes: 65536,
+                })
+                .collect(),
+            content_steps: (0..2)
+                .map(|n| ContentStep {
+                    step_id: id(20 + n),
+                    action_ordinal: n as u16,
+                })
+                .collect(),
+            connection_steps: (0..50)
+                .flat_map(|n| {
+                    [
+                        ConnectionStep {
+                            step_id: id(100 + n * 2),
+                            pair: n as u8,
+                            operation: "connect".into(),
+                        },
+                        ConnectionStep {
+                            step_id: id(101 + n * 2),
+                            pair: n as u8,
+                            operation: "checkout".into(),
+                        },
+                    ]
+                })
+                .collect(),
+            scope_id: id(9),
+            jti: id(10),
+            issuer: "nntune-provider-authority".into(),
+            cnf_kid: "synthetic_stream_key_ref".into(),
+            cnf_kv: 1,
+            provider_version: 1,
+            owner_epoch: 1,
+            permission_epoch: 1,
+            policy_version: 1,
+            cap_expires_at: 1030,
+            material_lease_until: 1015,
+            replacement_used: true,
+        }
+    }
+
+    fn call_at(now: Time) -> Call {
+        Call {
+            resolver_role: RESOLVER_ROLE.into(),
+            stream_role: STREAM_ROLE.into(),
+            env: "staging".into(),
+            owner: "synthetic_owner".into(),
+            actual_pool_owner: "synthetic_owner".into(),
+            purpose: PURPOSE.into(),
+            operation: OPERATION.into(),
+            evidence: Evidence::SyntheticVerified,
+            authoritative: true,
+            rollback_detected: false,
+            now,
+        }
+    }
+
+    fn nonce(n: u32) -> Nonce {
+        Nonce {
+            env: "staging".into(),
+            caller: STREAM_ROLE.into(),
+            kid: "synthetic_stream_key_ref".into(),
+            kv: 1,
+            nonce: id(500 + n),
+        }
+    }
+
+    fn finalize_request(reservation_id: Id, now: Time) -> FinalizeRequest {
+        FinalizeRequest {
+            reservation_id,
+            call: call_at(now),
+            intent_ack: true,
+            terminal_ack: true,
+            interleave: None,
+        }
+    }
+
+    #[test]
+    fn lease_and_reservation_never_outlive_grant_or_material() {
+        let mut m = AuthorityStore::new("staging");
+        let mut s = seed();
+        s.origin.grant_expires_at = 1010;
+        s.cap_expires_at = 1030;
+        s.origin.hard_deadline = 1900;
+        s.material_lease_until = 1015;
+        m.freeze(s).unwrap();
+        let r = m.reserve(&id(1), &id(10), call_at(1000), nonce(1)).unwrap();
+        assert_eq!(r.until, 1002);
+        let d = m
+            .first_finalize(finalize_request(r.reservation_id.clone(), 1001))
+            .unwrap();
+        assert_eq!(d.until, 1010);
+        assert_eq!(m.inspect(&id(1)).unwrap().lease_until, Some(1010));
+
+        // The reservation window is capped by the grant and the material lease
+        // independently: each sub-case varies one bound alone.
+        for (n, (grant, material)) in [(1001, 1900), (1900, 1001)].iter().enumerate() {
+            let mut m = AuthorityStore::new("staging");
+            let mut s = seed();
+            s.origin.grant_expires_at = *grant;
+            s.material_lease_until = *material;
+            m.freeze(s).unwrap();
+            let r = m
+                .reserve(&id(1), &id(10), call_at(1000), nonce(20 + n as u32))
+                .unwrap();
+            assert_eq!(r.until, 1001, "grant {grant} material {material}");
+        }
+
+        for (n, (grant, material)) in [(1000, 1015), (1900, 1000)].iter().enumerate() {
+            let mut m = AuthorityStore::new("staging");
+            let mut s = seed();
+            s.origin.grant_expires_at = *grant;
+            s.material_lease_until = *material;
+            m.freeze(s).unwrap();
+            assert_eq!(
+                m.reserve(&id(1), &id(10), call_at(1000), nonce(10 + n as u32)),
+                Err(Denial::Expired),
+                "grant {grant} material {material}"
+            );
+        }
+    }
+
+    #[test]
+    fn lease_term_fifteen_seconds_is_the_binding_cap() {
+        let mut m = AuthorityStore::new("staging");
+        let mut s = seed();
+        s.origin.grant_expires_at = 1900;
+        s.cap_expires_at = 1900;
+        s.origin.hard_deadline = 1900;
+        s.material_lease_until = 1900;
+        m.freeze(s).unwrap();
+        let r = m.reserve(&id(1), &id(10), call_at(1000), nonce(1)).unwrap();
+        assert_eq!(r.until, 1002);
+        let d = m
+            .first_finalize(finalize_request(r.reservation_id.clone(), 1001))
+            .unwrap();
+        assert_eq!(d.until, 1001 + LEASE_TERM);
+        assert_eq!(d.until, 1016);
+    }
+
+    #[test]
+    fn freeze_enforces_scope_step_key_across_records() {
+        let mut m = AuthorityStore::new("staging");
+        m.freeze(seed()).unwrap();
+        let mut same_scope = seed();
+        same_scope.origin.play_intent_id = id(31);
+        same_scope.origin.authorization_id = id(32);
+        same_scope.origin.playback_request_id = id(33);
+        same_scope.jti = id(35);
+        assert_eq!(m.freeze(same_scope), Err(Denial::Conflict));
+        // A fresh scope may reuse the same step shape.
+        let mut fresh_scope = seed();
+        fresh_scope.origin.play_intent_id = id(41);
+        fresh_scope.origin.authorization_id = id(42);
+        fresh_scope.origin.playback_request_id = id(43);
+        fresh_scope.scope_id = id(44);
+        fresh_scope.jti = id(45);
+        assert_eq!(m.freeze(fresh_scope), Ok(()));
+    }
+
+    #[test]
+    fn freeze_rejects_owner_pool_owner_mismatch() {
+        let mut m = AuthorityStore::new("staging");
+        let mut s = seed();
+        s.origin.owner = "synthetic_owner_a".into();
+        s.origin.pool_owner = "synthetic_owner_b".into();
+        assert_eq!(m.freeze(s), Err(Denial::Denied));
+    }
+
+    #[test]
+    fn freeze_rejects_each_duplicated_mapping_key_alone() {
+        // Duplicate exactly one mapping key; every other identity is fresh so
+        // only that key's check can fire.
+        for (field, intent, auth, req) in [
+            ("play_intent", id(1), id(32), id(33)),
+            ("authorization", id(31), id(2), id(33)),
+            ("request", id(31), id(32), id(3)),
+        ] {
+            let mut m = AuthorityStore::new("staging");
+            m.freeze(seed()).unwrap();
+            let mut s = seed();
+            s.origin.play_intent_id = intent;
+            s.origin.authorization_id = auth;
+            s.origin.playback_request_id = req;
+            s.scope_id = id(34);
+            s.jti = id(35);
+            assert_eq!(m.freeze(s), Err(Denial::Conflict), "{field}");
+        }
+    }
+
+    #[test]
+    fn unknown_writer_is_unsupported_at_invalidate_and_reread() {
+        let mut m = AuthorityStore::new("staging");
+        m.freeze(seed()).unwrap();
+        assert_eq!(
+            m.invalidate(&id(1), "not_a_writer", 1000),
+            Err(Denial::Unsupported)
+        );
+        assert!(!m.inspect(&id(1)).unwrap().synchronous_fenced);
+        let r = m.reserve(&id(1), &id(10), call_at(1000), nonce(1)).unwrap();
+        let mut req = finalize_request(r.reservation_id.clone(), 1001);
+        req.interleave = Some((Phase::Unwrapped, "not_a_writer"));
+        assert_eq!(m.first_finalize(req), Err(Denial::Unsupported));
+        assert_eq!(m.inspect(&id(1)).unwrap().deliveries, 0);
     }
 }
