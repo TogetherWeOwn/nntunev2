@@ -42,7 +42,8 @@ data, R2 for bytes.
   capture exists yet — see the fixtures README); the Rust fixture suite
   asserts byte equality, and a dependency-free Python script validates
   fixture shape in CI. The root workspace and standalone API commit the
-  lockfiles used for verification; their CI builds use `--locked`.
+  lockfiles used for verification; the standalone API jobs and the lockfile-freshness check
+  use `--locked`, the root workspace test and clippy jobs do not.
 - Two deliberate deviations from v1, both client-invisible in practice:
   envelope `type` is `nntune` (v1 inherited `koel`); per-client API keys
   (`subsonic_clients`: HMAC-peppered lookup index plus sealed legacy

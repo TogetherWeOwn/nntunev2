@@ -10,7 +10,7 @@
 //! seam. Until then the Worker uses `MemStore::empty()`, which holds no
 //! credentials and rejects every auth attempt. Per-client `apiKey`
 //! credentials will resolve against `subsonic_clients`
-//! (`migrations/0001_subsonic_clients.sql`).
+//! (`migrations/0023_subsonic_clients.sql`).
 
 pub mod account_deletion;
 pub mod api_error;
