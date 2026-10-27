@@ -100,6 +100,7 @@ test('[QSL-01] a completed copy announcement is hidden once its row leaves the q
 	await queueRow(page, 'qsl-coral').getByTestId('queue-copy-link').click();
 	await expect(status).toContainText(/copied link for coral night/i);
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(status, 'Clear queue must not keep a stale confirmation').toHaveText('');
 });
