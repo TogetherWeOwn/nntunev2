@@ -76,9 +76,10 @@ test('QF-R01 equal-title keyboard removals each update the same polite region on
 for (const action of ['remove', 'clear'] as const) {
 	test(`QF-R0${action === 'remove' ? '2' : '3'} newer focus after ${action} dispatch wins over recovery`, async ({ page }) => {
 		await seedQueue(page);
+		if (action === 'clear') await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
 		const trigger = action === 'remove'
 			? removeButton(page, 'intro-one')
-			: page.getByRole('button', { name: 'Clear queue', exact: true });
+			: page.getByRole('button', { name: 'Yes, clear queue', exact: true });
 		await trigger.focus();
 		await expect(trigger).toBeFocused();
 

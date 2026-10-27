@@ -283,6 +283,7 @@ for (const example of EXAMPLES) {
 			await expect(action).toBeEnabled();
 			await tabTo(page, action);
 			await page.keyboard.press(example.key);
+			if (example.name === CLEAR) await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).click();
 			await expect(currentRow(page)).toBeFocused();
 			await expect(announcement).toHaveAttribute('role', 'status');
 			await expect(announcement).not.toHaveAttribute('aria-live', 'assertive');
@@ -327,12 +328,14 @@ test('TRIM-B07 touch at narrow dark viewport trims the middle and keeps whole-cl
 		await button(page, KEEP).tap();
 		await expect.poll(() => order(page)).toEqual(['trim-apple', 'trim-mango', 'trim-kiwi']);
 		await button(page, CLEAR).tap();
+		await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).tap();
 		await expect.poll(() => order(page)).toEqual(['trim-apple']);
 		await expect(currentRow(page)).toHaveAttribute('data-track-id', 'trim-apple');
 		await expect(button(page, KEEP)).toBeDisabled();
 		await expect(button(page, CLEAR)).toBeDisabled();
 		await noPlayback(page, calls);
 		await button(page, 'Clear queue').tap();
+		await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).tap();
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 		await expect(button(page, 'Clear queue')).toBeDisabled();
@@ -364,6 +367,7 @@ test('TRIM-B09 auth purge discards the trimmed queue before another account retr
 	const { payload } = await seedLibrary(page, baseURL!, 1);
 	await requireControls(page);
 	await button(page, CLEAR).click();
+	await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).click();
 	await expect.poll(() => order(page)).toEqual(['trim-zulu', 'trim-apple']);
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');
