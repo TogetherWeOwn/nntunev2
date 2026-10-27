@@ -54,16 +54,17 @@ export function jumpMedia(media: JumpMedia, direction: JumpDirection): JumpOutco
 
 /** Polite status text; only a jump that happened is described as one. */
 export function describeJump(direction: JumpDirection, outcome: JumpOutcome): string {
+	const back = direction === 'back';
+	const word = back ? 'Back' : 'Forward';
 	switch (outcome.kind) {
 		case 'jumped': {
 			const at = formatDuration(outcome.target);
-			if (outcome.clamped) {
-				return direction === 'back' ? `Back to the start, ${at}.` : `Forward to the end, ${at}.`;
-			}
-			return `${direction === 'back' ? 'Back' : 'Forward'} ${RELATIVE_JUMP_SECONDS} seconds, now at ${at}.`;
+			return outcome.clamped
+				? `${word} to the ${back ? 'start' : 'end'}, ${at}.`
+				: `${word} ${RELATIVE_JUMP_SECONDS} seconds, now at ${at}.`;
 		}
 		case 'boundary':
-			return outcome.edge === 'start' ? 'Already at the start.' : 'Already at the end.';
+			return `Already at the ${outcome.edge}.`;
 		case 'unavailable':
 			return 'Cannot jump yet: this track has not reported its length.';
 		case 'refused':

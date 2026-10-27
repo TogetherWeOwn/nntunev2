@@ -15,7 +15,8 @@ function jumpFixture() {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
-		'resetShareAtAuthBoundary', 'selectQueuedTrack', 'removeQueuedTrack', 'jumpRelative'
+		'resetShareAtAuthBoundary', 'clearQueueShareFeedback', 'setQueueShareOutcome',
+		'selectQueuedTrack', 'removeQueuedTrack', 'jumpRelative'
 	]);
 	const handlers = parsed.statements.filter((node) =>
 		ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text)
@@ -41,6 +42,9 @@ function jumpFixture() {
 		let queue = addTrack(createQueue([coral]), ember), audioEl = element;
 		let shareGeneration = 0, shareStatus = '', shareFallbackUrl = null, pendingShareSeek = null;
 		let queueAnnouncement = '', queueAnnouncementVersion = 0;
+		let queueExportAuthGeneration = 0, queueShareGeneration = 0, handledShareSearch = null;
+		let queueShareOutcome = { status: '', fallbackUrl: null, forQueue: null };
+		let shareInvalid = false;
 		let restartCanSeek = false, restartStatus = '';
 		const restartSupersededSources = new Set();
 		let jumpFeedback = '', jumpStatusVersion = 0;
