@@ -54,20 +54,45 @@ export function loadFavorites(
 	}
 }
 
-/** Persist the current context's favorites; a no-op without storage/context. */
+/** Truthful result of a save attempt; carries the status only. */
+export type FavoritesSaveOutcome = { status: 'saved' | 'unavailable' | 'write-failed' };
+
+/**
+ * Persist the current context's favorites and report what happened.
+ * `unavailable`: no storage, no auth context or a denied context read —
+ * nothing is written. `write-failed`: the write was refused (quota or
+ * privacy mode) — the last saved set is kept. Memory remains authoritative
+ * this visit; callers decide whether to retry. Never throws.
+ */
 export function saveFavorites(
 	session: SnapshotStorage | null,
 	local: SnapshotStorage | null,
 	ids: readonly string[]
-): void {
+): FavoritesSaveOutcome {
 	const key = favoritesKey(session);
-	if (!local || !key) return;
+	if (!local || !key) return { status: 'unavailable' };
 	try {
 		local.setItem(key, JSON.stringify(ids.filter(isStoredId)));
+		return { status: 'saved' };
 	} catch {
-		// Quota or privacy mode: memory remains authoritative this visit.
-		// A later toggle retries the full set; reload reads the last saved set.
+		return { status: 'write-failed' };
 	}
+}
+
+/**
+ * Count how many starred ids resolve against the loaded rows. Pure:
+ * distinct ids only, matched by stable id, invalid entries ignored.
+ * Unresolved ids are absent from the loaded rows, not known to be deleted.
+ */
+export function projectFavoriteCounts<T extends { id: string }>(
+	orderedItems: readonly T[],
+	favoriteIds: readonly string[]
+): { resolved: number; unresolved: number } {
+	const loaded = new Set(orderedItems.map((item) => item.id));
+	const distinct = new Set(favoriteIds.filter(isStoredId));
+	let resolved = 0;
+	for (const id of distinct) if (loaded.has(id)) resolved += 1;
+	return { resolved, unresolved: distinct.size - resolved };
 }
 
 /**

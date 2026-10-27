@@ -14,6 +14,7 @@
 	import {
 		clearFavoritesAtAuthBoundary,
 		loadFavorites,
+		projectFavoriteCounts,
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
@@ -105,6 +106,9 @@
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
 	let favorites: string[] = $state([]);
+	// True while the latest user edit is held in memory only (the scoped write
+	// failed or storage is unavailable). Cleared by a confirmed write or an auth boundary.
+	let favoritesUnsaved = $state(false);
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
 	/**
@@ -197,6 +201,7 @@
 		invalidateLibraryCache: () => {
 			resetShareAtAuthBoundary();
 			favorites = [];
+			favoritesUnsaved = false;
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
 			invalidateLibraryCache();
@@ -318,6 +323,10 @@
 			.map((id) => items.find((track) => track.id === id) ?? null)
 			.filter((track): track is LibraryItem => track !== null)
 	);
+
+	// Saved favorites absent from the loaded tracks stay stored but unlisted;
+	// they are counted, never pruned, and not known to be deleted.
+	const favoriteCounts = $derived(projectFavoriteCounts(items, favorites));
 
 	function trackCountLabel(count: number): string {
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
@@ -764,6 +773,24 @@
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
+	/**
+	 * Single writer for favorites: one attempt per user edit, no timers. The
+	 * outcome decides whether the visit-local notice shows; memory stays
+	 * authoritative either way.
+	 */
+	function persistFavorites(ids: readonly string[]): boolean {
+		const outcome = saveFavorites(browserStorage('session'), browserStorage('local'), ids);
+		favoritesUnsaved = outcome.status !== 'saved';
+		return !favoritesUnsaved;
+	}
+
+	/** Explicit retry of the complete current ordered in-memory set. */
+	function retrySaveFavorites(): void {
+		if (!persistFavorites(favorites)) return;
+		managementFeedback = 'Favorites saved on this device.';
+		void tick().then(() => shelfHeading?.focus({ preventScroll: true }));
+	}
+
 	function toggleFavorite(id: string): void {
 		// Toggle visible state, not the last successful write. The next write
 		// persists the full set, including edits made while storage failed.
@@ -772,7 +799,7 @@
 			: [...favorites, id];
 		favorites = next;
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), next);
+		persistFavorites(next);
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
 		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
@@ -819,7 +846,7 @@
 		const next = moveFavoriteId(favorites, visibleIds, id, direction);
 		if (next === favorites) return;
 		favorites = [...next];
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
+		persistFavorites(favorites);
 		const visible = new Set(visibleIds);
 		const position = next.filter((storedId) => visible.has(storedId)).indexOf(id) + 1;
 		const track = items.find((candidate) => candidate.id === id);
@@ -880,7 +907,7 @@
 		const title = track ? displayTitle(track) : 'track';
 		favorites = favorites.filter((favorite) => favorite !== id);
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
+		persistFavorites(favorites);
 		managementFeedback = `Removed ${title} from favorites.`;
 		void tick().then(() => {
 			const controls = shelfSection?.querySelectorAll<HTMLButtonElement>('[data-shelf-unstar]');
@@ -909,7 +936,7 @@
 	function confirmClearFavorites(): void {
 		favorites = [];
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), []);
+		persistFavorites([]);
 		confirmClear = false;
 		managementFeedback = 'Cleared local favorites.';
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
@@ -1037,6 +1064,7 @@
 			// session auth context the scoped key derives from.
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
+			favoritesUnsaved = false;
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
 			queueFilterQuery = '';
@@ -1056,6 +1084,7 @@
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
+		favoritesUnsaved = false;
 		favoritesInitialized = false;
 		favoritesAnnouncement = '';
 		queueFilterQuery = '';
@@ -1159,9 +1188,27 @@
 			{#if managementFeedback}
 				<p role="status">{managementFeedback}</p>
 			{/if}
+			{#if favoritesUnsaved}
+				<div data-testid="favorites-save-notice" role="status" aria-live="polite" class="nt-favorites-notice">
+					<p>
+						Favorites not saved on this device. Your changes last for this visit only.
+					</p>
+					<button class="nt-button" type="button" onclick={retrySaveFavorites}>Save again</button>
+				</div>
+			{/if}
+			{#if favoriteCounts.unresolved > 0}
+				<p data-testid="favorites-summary">
+					{#if favoriteCounts.resolved > 0}
+						{favoriteCounts.resolved} shown below.
+					{/if}
+					{favoriteCounts.unresolved} saved {favoriteCounts.unresolved === 1 ? 'favorite is' : 'favorites are'} not in the loaded tracks.
+				</p>
+			{/if}
 			{#if favoriteTracks.length === 0}
 				<p data-testid="favorites-empty" tabindex="-1">
-					No favorites yet. Star a track to pin it here.
+					{favoriteCounts.unresolved > 0
+						? 'Star a loaded track to pin it here.'
+						: 'No favorites yet. Star a track to pin it here.'}
 				</p>
 			{:else}
 				<button class="nt-button" type="button" onclick={queueFavorites}>Queue favorites</button>
@@ -1699,6 +1746,17 @@
 		font: inherit;
 		color: inherit;
 		text-align: left;
+	}
+	.nt-favorites-notice {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-favorites-notice p {
+		margin: 0;
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 	.nt-shelf-clear {
 		display: flex;
