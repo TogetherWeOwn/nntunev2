@@ -467,12 +467,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
 
   # KV config staging/prod parity: both env fixtures must validate against
   # config/schema.json with identical key sets (values may differ). Also runs
@@ -534,12 +534,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
   rust-repair:
     name: rust (workers/repair)
@@ -556,13 +556,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/repair/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
       # Durable Object runtime) must check and lint on that target.
-      - run: cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo check --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
   # Repair container image: the server's native tests ride the workspace
   # `rust-test` job (containers/repair is a member); this job proves the
@@ -916,7 +916,9 @@ jobs:
           env -i PATH="$tools:$PATH" jq --version
 
       - name: Browser image and preflight self-tests (offline doubles only)
-        run: python3 .github/scripts/test_ci_playwright_image.py
+        run: |
+          python3 .github/scripts/test_ci_playwright_image.py
+          python3 .github/scripts/test_ci_web_e2e_image.py
 
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
@@ -1078,13 +1080,15 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Budget measured 2026-10-25/26: suite (1,425-1,478 tests) reports
-    # 18.8-20.6 minutes; "Install Playwright chromium" took 11 minutes on
-    # a slow-download run vs 22 seconds on a fast run, and dependency
-    # downloads have consumed up to 17 minutes. 45 = 17 worst setup + 21
-    # suite (20.6 rounded up) + 7 headroom. Re-measure when the reported
-    # suite duration exceeds 25 minutes or the test count passes ~1,800;
-    # test_ci_web_e2e_timeout.py pins this value.
+    # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
+    # 18.8-20.6 minutes; container setup (image pull + pnpm install)
+    # takes under a minute on the fast path. Pre-container worst setup
+    # was 17m of apt/browser downloads; slow image pulls are unmeasured,
+    # so keep headroom. 45 = 21 suite (20.6 rounded up) + 24
+    # setup/headroom. Re-measure when the reported suite exceeds
+    # 25 minutes or the test count passes ~1,800; re-pin the container
+    # with the web lock; test_ci_web_e2e_timeout.py pins this value.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 45
     defaults:
       run:
@@ -1112,8 +1116,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preinstalled web Playwright chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
       - name: Upload failure artifacts

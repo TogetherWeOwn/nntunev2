@@ -41,6 +41,25 @@ export function toggleSelected(selection: readonly string[], id: unknown): strin
 	return [...selection, id];
 }
 
+/**
+ * Select displayed IDs without dropping hidden selections: existing valid
+ * IDs keep activation order, new IDs append in displayed order. Exact
+ * membership, first occurrence wins; invalid entries in either input are
+ * ignored. Inputs are never mutated, and no undisplayed ID is added.
+ */
+export function selectAllDisplayed(
+	selection: readonly string[],
+	displayedIds: readonly string[]
+): string[] {
+	const selected = new Set<string>();
+	for (const ids of [selection, displayedIds]) {
+		for (const id of ids) {
+			if (isValidId(id)) selected.add(id);
+		}
+	}
+	return [...selected];
+}
+
 /** Empty the selection; the input is never mutated. */
 export function clearSelection(selection: readonly string[]): string[] {
 	void selection;

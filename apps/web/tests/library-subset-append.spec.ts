@@ -31,8 +31,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   skipped.
  * - `selection-hidden-count` (`data-testid`) only when a filter exists and
  *   hides selected rows.
- * There is deliberately NO `Select all` / `Select displayed` control and no
- * new route: each checkbox is an explicit user choice.
+ * This slice deliberately added NO `Select all` / `Select displayed`
+ * control and no new route: each checkbox was an explicit user choice. A
+ * later slice added the one-action Select all for the displayed set; that
+ * affordance is pinned by `tests/library-select-all-displayed.spec.ts`,
+ * and this file no longer asserts its absence.
  *
  * Contract under test (paired build):
  * - Checking never queues, stars, plays, seeks, fetches, favorites-mutates,
@@ -62,9 +65,10 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * enablement, SUB-B-22 per-track names. SUB-U-* live in the sibling
  * selection-subset unit acceptance file.
  *
- * Out of scope (not pinned): Select all/displayed, Add displayed,
- * queue removal/multi-select, server playlists, saved selections,
- * cross-device state, backend search, audio transport, deployed streaming.
+ * Out of scope (not pinned here): Add displayed, queue
+ * removal/multi-select, server playlists, saved selections, cross-device
+ * state, backend search, audio transport, deployed streaming. Select
+ * all/displayed is pinned by `tests/library-select-all-displayed.spec.ts`.
  */
 
 // Rendered order is API order; ids are deliberately not in sorted order.
@@ -181,12 +185,9 @@ test('[SUB-B-01] each row carries a labeled checkbox with count and actions, app
 	await expect(appendButton(page), 'Append selected missing').toBeVisible();
 	await expect(appendButton(page)).toBeDisabled();
 
-	// No bulk-select escape hatch and no new route for this slice.
-	await expect(page.getByRole('button', { name: /select all|select displayed/i })).toHaveCount(0);
-	await expect(
-		page.getByRole('checkbox', { name: /select all|select displayed/i })
-	).toHaveCount(0);
-	await expect(page.getByRole('link', { name: /select all|select displayed/i })).toHaveCount(0);
+	// This slice added no new route. (Its former no-bulk-select absence
+	// pins were retired when the displayed-set Select all action landed
+	// under its own acceptance spec; see the header.)
 	expect(page.url()).toContain('/library');
 });
 
