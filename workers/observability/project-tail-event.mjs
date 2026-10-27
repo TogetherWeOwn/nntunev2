@@ -17,7 +17,8 @@
 // <=4 messages/log, <=16384 UTF-8 bytes/string before parsing. Any
 // truncated/oversized scan or malformed logs/message container makes all
 // identity/grouping unknown while platform outcome/status/exceptions stay
-// usable. This module is not wired or deployed; it performs no delivery.
+// usable. The source-only runtime imports this pure helper; no deployment
+// or delivery occurs in this module.
 
 const SCHEMA_VERSION = 1;
 const MAX_LOGS = 64;

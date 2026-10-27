@@ -16,6 +16,7 @@ pub mod native_rest;
 pub mod plan_limits;
 pub mod random;
 pub mod rate_limit;
+pub mod rotation;
 pub mod session;
 pub mod vault;
 pub mod webauthn;
