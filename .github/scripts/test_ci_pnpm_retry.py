@@ -197,6 +197,42 @@ def job_needs(job_chunk):
     return []
 
 
+_PLAIN_KEY = r"[A-Za-z_][A-Za-z0-9_-]*:(?:\s|$)"
+_JOB_KEY_LINE = re.compile(rf"^    (?!\s)(.*)$")
+_STEP_DASH_LINE = re.compile(r"^      -(?:\s+(.*))?$")
+_STEP_KEY_LINE = re.compile(r"^        (?!\s)(.*)$")
+
+
+def non_plain_key_lines(job_chunk):
+    """Job- and step-key lines not written as a plain `key:` mapping key.
+
+    ``job_level_field``/``step_level_field`` can only recognize the
+    spellings they enumerate, and YAML has more than anyone lists:
+    escaped double-quoted keys, anchored or tagged keys, block-scalar
+    explicit keys, flow-mapping steps, merge keys. A guard that fails
+    open on an unknown spelling lets a masking ``if`` or
+    ``continue-on-error`` hide. So the required job and its steps may
+    use only plain ``key:`` at job- and step-key indent; anything else
+    is reported and fails closed instead of being parsed.
+    """
+    bad = []
+    for line in job_chunk.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash = _STEP_DASH_LINE.match(line)
+        if dash:
+            rest = dash.group(1)
+            if rest and not re.match(_PLAIN_KEY, rest):
+                bad.append(line)
+            continue
+        for pattern in (_JOB_KEY_LINE, _STEP_KEY_LINE):
+            match = pattern.match(line)
+            if match and not re.match(_PLAIN_KEY, match.group(1)):
+                bad.append(line)
+                break
+    return bad
+
+
 def check_required_step(job_id, job_chunk, command):
     """Error strings unless `command` runs as a required step of the job.
 
@@ -206,7 +242,11 @@ def check_required_step(job_id, job_chunk, command):
     gated nor continue-on-error. Anything weaker lets the guarded suite
     be silently dropped or neutralized without CI turning red.
     """
-    errors = []
+    errors = [
+        f"{job_id}: key line must be a plain `key:` (any other YAML spelling "
+        f"can hide a masking key): {line.strip()!r}"
+        for line in non_plain_key_lines(job_chunk)
+    ]
     # Job keys are unordered YAML, so `if` and `continue-on-error` count
     # on either side of `steps:`. The four-space pattern cannot match
     # inside the steps list, whose keys sit at six spaces or deeper.
@@ -535,6 +575,68 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
             )
         )
         self.assertTrue(any("not continue-on-error" in e for e in errors), errors)
+
+
+    # Spellings GitHub's parser resolves to the same key but that no
+    # enumerated regex can be trusted to cover: the guard rejects any
+    # non-plain key line instead of decoding it.
+    EXOTIC_JOB_LINES = (
+        '    "continue-on\\u002derror": true\n',
+        '    "i\\x66": ${{ false }}\n',
+        "    &a continue-on-error: true\n",
+        "    !!str continue-on-error: true\n",
+        "    ? |-\n      continue-on-error\n    : true\n",
+        "    <<: {continue-on-error: true}\n",
+        "    - indentless\n",
+    )
+    EXOTIC_STEP_LINES = (
+        '        "continue-on\\u002derror": true\n',
+        "        &a continue-on-error: true\n",
+        "        !!str if: always()\n",
+        "        ? |-\n          if\n        : always()\n",
+    )
+
+    def test_exotic_job_key_spellings_fail_closed(self):
+        """Escaped, anchored, tagged, block-scalar, merge keys are rejected."""
+        for line in self.EXOTIC_JOB_LINES:
+            for placement in ("job_extra", "job_after_steps"):
+                with self.subTest(line=line, placement=placement):
+                    errors = wiring_errors(
+                        public_text_with(timeout_step(), **{placement: line})
+                    )
+                    self.assertTrue(any("plain `key:`" in e for e in errors), errors)
+
+    def test_exotic_step_key_spellings_fail_closed(self):
+        """Exotic step-level spellings are rejected, even composed with a masked run."""
+        for line in self.EXOTIC_STEP_LINES:
+            with self.subTest(line=line):
+                errors = wiring_errors(public_text_with(timeout_step(line)))
+                self.assertTrue(any("plain `key:`" in e for e in errors), errors)
+
+    def test_flow_mapping_and_tagged_step_start_fail_closed(self):
+        """A step written as a flow mapping or with a node property is rejected."""
+        for first in (
+            '{"if": false, run: ' + WEB_E2E_TIMEOUT_COMMAND + "}",
+            "&s name: guard",
+            "!!str name: guard",
+            '"name": guard',
+        ):
+            with self.subTest(first=first):
+                step = f"      - {first}\n        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+                errors = wiring_errors(public_text_with(step))
+                self.assertTrue(any("plain `key:`" in e for e in errors), errors)
+
+    def test_plain_keys_comments_and_blank_lines_stay_clean(self):
+        """Negative control: plain keys, comments and blanks are not flagged."""
+        step = (
+            "      # note\n\n"
+            "      - name: guard\n"
+            "        # note\n"
+            "        env:\n          A: b\n"
+            f"        run: {WEB_E2E_TIMEOUT_COMMAND}\n"
+        )
+        self.assertEqual(non_plain_key_lines(public_text_with(step, job_extra="    # c\n")), [])
+        self.assertEqual(wiring_errors(public_text_with(step)), [])
 
 
 if __name__ == "__main__":
