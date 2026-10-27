@@ -17,6 +17,12 @@
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
+	import {
+		clearRecentFindsAtAuthBoundary,
+		loadRecentFinds,
+		recordRecentFind,
+		saveRecentFinds
+	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import {
@@ -102,6 +108,18 @@
 	 * boundaries that clear the query. Clearing the search text keeps it.
 	 */
 	let findScope: FindScope = $state('both');
+	/**
+	 * Recent applied find queries (device-local, bounded, per auth context).
+	 * Recorded only when an applied query is left (blur, Clear search, a
+	 * successful refresh, navigation away) and re-applied only by an explicit
+	 * chip activation: loading, restoring or purging them never fills the
+	 * field, filters rows or fetches. Purged at the same auth boundaries as
+	 * favorites.
+	 */
+	let recentFinds: string[] = $state([]);
+	let recentFindsInitialized = false;
+	let recentFindsAnnouncement = $state('');
+	let recentFindsEmpty: HTMLParagraphElement | null = $state(null);
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -234,6 +252,7 @@
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
+			resetRecentFinds();
 			invalidateLibraryCache();
 		},
 		onStateChange: (state) => {
@@ -254,6 +273,9 @@
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
+				recentFinds = [];
+				recentFindsInitialized = false;
+				recentFindsAnnouncement = '';
 			}
 			if (state.loading || state.items.length === 0) {
 				clearShareFeedback();
@@ -299,6 +321,15 @@
 			if (!state.loading && !state.loadError && !state.libraryUnavailable && !favoritesInitialized) {
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
+			}
+			if (
+				!state.loading &&
+				!state.loadError &&
+				!state.libraryUnavailable &&
+				!recentFindsInitialized
+			) {
+				recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+				recentFindsInitialized = true;
 			}
 			if (!state.loading) applyShareLink();
 			// Same-account refresh completion: the panel may have remounted
@@ -1097,7 +1128,62 @@
 		void tick().then(() => scopeSelect?.focus({ preventScroll: true }));
 	}
 
+	function resetRecentFinds(): void {
+		recentFinds = [];
+		recentFindsInitialized = false;
+		recentFindsAnnouncement = '';
+	}
+
+	/**
+	 * Announce a recent-find outcome within the 140-char polite cap. A
+	 * max-length (120-char) query would breach it verbatim, so the embedded
+	 * query is truncated with an ellipsis to fit; short queries announce whole.
+	 */
+	function announceRecentFind(verb: 'Saved' | 'Applied', query: string): string {
+		const middle = ' recent search ';
+		const budget = 140 - verb.length - middle.length - '.'.length;
+		const shown = query.length > budget ? `${query.slice(0, budget - 1)}…` : query;
+		return `${verb}${middle}${shown}.`;
+	}
+
+	/**
+	 * Record the applied query when it is left. Memory is authoritative once
+	 * bootstrapped; before that (or after an auth purge) there is no
+	 * account-scoped list to extend, so nothing is recorded. Announces only
+	 * a real change, never an empty, duplicate or already-first query.
+	 */
+	function recordFindQuery(): void {
+		if (!recentFindsInitialized) return;
+		const next = recordRecentFind(recentFinds, findQuery);
+		if (next === recentFinds) return;
+		recentFinds = [...next];
+		saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+		recentFindsAnnouncement = announceRecentFind('Saved', recentFinds[0]);
+	}
+
+	function applyRecentFind(query: string): void {
+		// Preserve a pending unrecorded query first: a chip mousedown keeps
+		// focus in the field (no blur), so record here before replacing it.
+		recordFindQuery();
+		findQuery = query;
+		const next = recordRecentFind(recentFinds, query);
+		if (next !== recentFinds) {
+			recentFinds = [...next];
+			saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+		}
+		recentFindsAnnouncement = announceRecentFind('Applied', query);
+	}
+
+	function clearRecentFinds(): void {
+		recentFinds = [];
+		saveRecentFinds(browserStorage('session'), browserStorage('local'), []);
+		recentFindsAnnouncement = 'Cleared recent searches.';
+		// The focused clear button unmounts with the list; keep focus in the section.
+		void tick().then(() => recentFindsEmpty?.focus({ preventScroll: true }));
+	}
+
 	function clearFind(): void {
+		recordFindQuery();
 		findQuery = '';
 		if (typeof document !== 'undefined') {
 			document.getElementById('library-find')?.focus({ preventScroll: true });
@@ -1255,6 +1341,9 @@
 	 */
 	async function refreshFromButton(): Promise<void> {
 		await refresh();
+		// Commit first: only a successful same-account refresh records the
+		// preserved query (a failure or auth purge leaves history alone).
+		if (!loadError && !libraryUnavailable) recordFindQuery();
 		await tick();
 		if (document.activeElement === null || document.activeElement === document.body) {
 			refreshButton?.focus({ preventScroll: true });
@@ -1274,9 +1363,11 @@
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
+			resetRecentFinds();
 			queueFilterQuery = '';
 			findQuery = '';
 			findScope = 'both';
@@ -1295,9 +1386,11 @@
 		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;
 		favoritesAnnouncement = '';
+		resetRecentFinds();
 		queueFilterQuery = '';
 		findQuery = '';
 		findScope = 'both';
@@ -1312,6 +1405,8 @@
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
 		window.addEventListener('storage', handleAuthTransition);
+		// Leaving the page with a query applied (tab close, hard navigation).
+		window.addEventListener('pagehide', recordFindQuery);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
@@ -1328,8 +1423,11 @@
 			pendingShareSeek = null;
 			restartSupersededSources.clear();
 			refresher.dispose();
+			// Client-side navigation away with the query applied.
+			recordFindQuery();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
+			window.removeEventListener('pagehide', recordFindQuery);
 		};
 	});
 </script>
@@ -1560,6 +1658,7 @@
 					type="search"
 					bind:value={findQuery}
 					aria-describedby="library-find-hint"
+					onblur={recordFindQuery}
 				/>
 				<label for="library-find-scope">Search in</label>
 				<select id="library-find-scope" bind:this={scopeSelect} bind:value={findScope}>
@@ -1576,6 +1675,63 @@
 					</button>
 				{/if}
 			</div>
+			<!--
+				Fixed-height rows (no wrapping chip row, hidden live text): recording
+				on blur must not shift the list under a pointer that is mid-click.
+			-->
+			<section
+				class="nt-library-recent-finds"
+				data-testid="recent-finds"
+				aria-labelledby="recent-finds-heading"
+			>
+				<div class="nt-recent-find-head">
+					<h2 id="recent-finds-heading">Recent searches</h2>
+					{#if recentFinds.length > 0}
+						<button class="nt-button nt-button--ghost" type="button" onclick={clearRecentFinds}>
+							Clear recent searches
+						</button>
+					{/if}
+				</div>
+				<p
+					class="nt-visually-hidden"
+					data-testid="recent-finds-announcement"
+					aria-live="polite"
+				>
+					{recentFindsAnnouncement}
+				</p>
+				{#if recentFinds.length === 0}
+					<p
+						class="nt-recent-find-body"
+						data-testid="recent-finds-empty"
+						tabindex="-1"
+						bind:this={recentFindsEmpty}
+					>
+						No recent searches yet.
+					</p>
+				{:else}
+					<ul class="nt-recent-find-body nt-recent-find-list">
+						{#each recentFinds as query (query)}
+							<li>
+								<!--
+									Keep focus in the find field on mousedown: a blur here
+									would record a pending query and shift every chip
+									before mouseup, so the click would miss its chip.
+									applyRecentFind records the pending query instead.
+								-->
+								<button
+									class="nt-recent-find-chip"
+									type="button"
+									data-testid="recent-find-chip"
+									onmousedown={(event) => event.preventDefault()}
+									onclick={() => applyRecentFind(query)}
+								>
+									{query}
+								</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
 				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
@@ -1997,6 +2153,67 @@
 		font: inherit;
 		color: inherit;
 		text-align: left;
+	}
+	.nt-library-recent-finds {
+		margin-block: var(--nt-space-2);
+	}
+	.nt-recent-find-head {
+		display: flex;
+		flex-wrap: nowrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--nt-space-2);
+		min-height: 2.75rem;
+	}
+	.nt-recent-find-head h2 {
+		font-size: 1rem;
+		margin: 0;
+	}
+	.nt-recent-find-body {
+		display: flex;
+		align-items: center;
+		min-height: 3.25rem;
+		margin: 0;
+	}
+	.nt-recent-find-list {
+		flex-wrap: nowrap;
+		gap: var(--nt-space-2);
+		list-style: none;
+		padding: 4px;
+		overflow-x: auto;
+	}
+	.nt-recent-find-list li {
+		flex: 0 0 auto;
+		max-width: 100%;
+	}
+	.nt-visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+	.nt-recent-find-chip {
+		min-width: 2.75rem;
+		min-height: 2.75rem;
+		max-width: 16rem;
+		padding: var(--nt-space-1) var(--nt-space-3);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		cursor: pointer;
+	}
+	.nt-recent-find-chip:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
 	}
 	.nt-shelf-clear {
 		display: flex;
