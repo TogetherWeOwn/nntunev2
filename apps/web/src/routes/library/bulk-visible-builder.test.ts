@@ -23,12 +23,12 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'missingDisplayedTracks', 'queuedTrackFor', 'replaceQueue', 'persistQueue',
-		'addDisplayedTracksToQueue', 'clearShareFeedback'
+		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange'
 	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -44,7 +44,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		view, favorites, queue, findQuery, order, items: ITEMS,
+		view, favorites, queue, findQuery, findScope: 'both', order, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,

@@ -26,7 +26,8 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
-	import { filterLibraryItems } from '#lib/library/filter.js';
+	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
+	import { libraryTabTitle } from '#lib/library/tab-title.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -35,6 +36,8 @@
 		createSelection,
 		hiddenSelectedCount,
 		pruneSelection,
+		selectAllDisplayed,
+		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected
 	} from '#lib/library/selection.js';
@@ -59,6 +62,29 @@
 		type Track
 	} from '#lib/player/queue.js';
 
+	type Density = 'comfortable' | 'compact';
+	const DENSITY_KEY = 'nntune:density:v1';
+	let density = $state<Density>('comfortable');
+
+	function readStoredDensity(): Density {
+		try {
+			return window.localStorage.getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable';
+		} catch {
+			return 'comfortable';
+		}
+	}
+
+	function onDensityChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== 'comfortable' && value !== 'compact') return;
+		density = value;
+		try {
+			window.localStorage.setItem(DENSITY_KEY, value);
+		} catch {
+			// Storage refused: keep the choice in memory without a banner.
+		}
+	}
+
 	let items: LibraryItem[] = $state([]);
 	let order: LibraryOrder = $state('original');
 	const orderedItems = $derived(orderLibraryItems(items, order));
@@ -69,6 +95,12 @@
 	 * same-account refreshes (including failed ones) preserve it.
 	 */
 	let findQuery = $state('');
+	/**
+	 * Which display fields the find searches. Visit-local like the query:
+	 * never persisted, reset to `'both'` at the same account/auth
+	 * boundaries that clear the query. Clearing the search text keeps it.
+	 */
+	let findScope: FindScope = $state('both');
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -82,36 +114,44 @@
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
 	/**
-	 * Transient Favorites-only view over the loaded list. Plain component
-	 * state: never persisted, never fetched, reset on reload (fresh state)
-	 * and at the auth boundary. Filters after ordering via the pure
-	 * selectFavoriteItems projection; the queue never sees it.
+	 * Explicit subset selection: page-local ordered stable IDs in checkbox
+	 * activation order. Never persisted, never fetched, never shared across
+	 * tabs; purged only at auth/account boundaries, pruned only against a
+	 * successful snapshot. Declared here because the Selected-only
+	 * projection below consumes it.
 	 */
-	let view: 'all' | 'favorites' = $state('all');
+	let selectedIds: string[] = $state(createSelection());
+	/**
+	 * Transient view over the loaded list. Plain component state: never
+	 * persisted, never fetched, reset on reload (fresh state) and at the
+	 * auth boundary. Filters after ordering via the pure
+	 * selectFavoriteItems/selectSelectedItems projections (loaded order as
+	 * reshaped by ordering, never activation order); the queue never sees
+	 * it, and switching views never mutates the selection.
+	 */
+	let view: 'all' | 'favorites' | 'selected' = $state('all');
 	const displayedItems = $derived(
-		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+		view === 'all'
+			? orderedItems
+			: view === 'favorites'
+				? selectFavoriteItems(orderedItems, favorites)
+				: selectSelectedItems(orderedItems, selectedIds)
 	);
-	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery));
+	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
 	let viewSelect: HTMLSelectElement | null = $state(null);
+	let scopeSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
 	let shelfSection: HTMLElement | null = $state(null);
 	let shelfHeading: HTMLHeadingElement | null = $state(null);
 	let clearButton: HTMLButtonElement | null = $state(null);
-	/**
-	 * Explicit subset selection: page-local ordered stable IDs in checkbox
-	 * activation order. Never persisted, never fetched, never shared across
-	 * tabs; purged only at auth/account boundaries, pruned only against a
-	 * successful snapshot. The last append outcome stays until the next
-	 * append or a boundary purge.
-	 */
-	let selectedIds: string[] = $state(createSelection());
 	const hiddenSelectionCount = $derived(
 		hiddenSelectedCount(
 			selectedIds,
 			visibleItems.map((track) => track.id)
 		)
 	);
+	// The last append outcome stays until the next append or a boundary purge.
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
@@ -145,6 +185,18 @@
 		seconds: number;
 		appliedSeconds: number | null;
 	} | null = null;
+	// Restart availability is live native state of the mounted matching
+	// element, re-evaluated on media events — never cached coordinates.
+	// The outcome lives only in one polite status inside the Player region
+	// and clears whenever the current source changes or an auth boundary
+	// purges the queue, so a previous track or account never lingers.
+	let restartCanSeek = $state(false);
+	let restartStatus = $state('');
+	let restartStatusVersion = $state(0);
+	// Sources whose pending inbound-share seek was superseded by an
+	// explicit restart (live position may still sit at the share target,
+	// so a remembered position must be fenced here, not re-derived).
+	const restartSupersededSources = new Set<string>();
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -171,6 +223,7 @@
 			if (state.loadError && state.items.length === 0) {
 				queueFilterQuery = '';
 				findQuery = '';
+				findScope = 'both';
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
@@ -295,6 +348,9 @@
 		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
 	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const tabTitle = $derived(libraryTabTitle(currentTrack));
+	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
+	const priorDocumentTitle = typeof document === 'undefined' ? null : document.title;
 	const favoriteIds = $derived(new Set(favorites));
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
@@ -382,6 +438,22 @@
 	 * invalidates it; clearing it here also keeps a previous account's
 	 * track title from lingering across the auth-boundary clears below.
 	 */
+	/**
+	 * A current-source change invalidates the restart outcome and its
+	 * availability snapshot, whichever queue edit caused it — including
+	 * the direct-assign handlers that bypass replaceQueue, so a stale
+	 * "Restarted …" can never describe the new current track.
+	 */
+	function resetRestartOnSourceChange(
+		before: Track | null | undefined,
+		after: Track | null | undefined
+	): void {
+		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
+			restartCanSeek = false;
+			restartStatus = '';
+		}
+	}
+
 	function replaceQueue(next: QueueState, persist = true): void {
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
@@ -389,6 +461,7 @@
 			clearShareFeedback();
 			pendingShareSeek = null;
 		}
+		resetRestartOnSourceChange(before, after);
 		queue = next;
 		queueAnnouncement = '';
 		if (persist) persistQueue();
@@ -426,6 +499,9 @@
 	function resetShareAtAuthBoundary(): void {
 		clearShareFeedback();
 		pendingShareSeek = null;
+		restartSupersededSources.clear();
+		restartCanSeek = false;
+		restartStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 	}
@@ -500,6 +576,8 @@
 		);
 		const source = resolveStreamUrl(queueCurrentTrack(queue));
 		if (!source) return;
+		// This navigation is a new gesture, not the seek that restart superseded.
+		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
@@ -511,6 +589,12 @@
 		const current = queueCurrentTrack(queue);
 		if (!pending || !element || element !== audioEl || !shareAlive) return;
 		if (current?.id !== pending.trackId || resolveStreamUrl(current) !== pending.streamUrl) return;
+		// An explicit restart of this source supersedes the remembered
+		// share position: later metadata must not move it away from zero.
+		if (restartSupersededSources.has(`${pending.trackId}\n${pending.streamUrl}`)) {
+			pendingShareSeek = null;
+			return;
+		}
 		const knownDuration = Number.isFinite(element.duration) && element.duration >= 0;
 		const seconds = knownDuration ? Math.min(pending.seconds, element.duration) : pending.seconds;
 		try {
@@ -531,6 +615,134 @@
 		) {
 			pendingShareSeek = null;
 		}
+	}
+
+	// True when position 0 lies inside a native seekable range. Any unreadable
+	// or non-finite range bound is unusable media, never an exception.
+	function seekableIncludesStart(element: HTMLAudioElement): boolean {
+		try {
+			const ranges = element.seekable;
+			for (let index = 0; index < ranges.length; index += 1) {
+				const start = ranges.start(index);
+				const end = ranges.end(index);
+				if (Number.isFinite(start) && Number.isFinite(end) && start <= 0 && end >= 0) {
+					return true;
+				}
+			}
+		} catch {
+			// Fall through: an unreadable range set cannot restart.
+		}
+		return false;
+	}
+
+	// Media events re-evaluate restart availability from the live element.
+	// Events from a detached or replaced element are ignored, so stale
+	// nodes can never enable, disable, or complete a restart.
+	function refreshRestartAvailability(event: Event): void {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		if (!element || element !== audioEl || !shareAlive) return;
+		const current = queueCurrentTrack(queue);
+		if (!current || resolveStreamUrl(current) !== element.getAttribute('src')) {
+			restartCanSeek = false;
+			return;
+		}
+		restartCanSeek = restartIsAvailable(element);
+	}
+
+	function restartIsAvailable(element: HTMLAudioElement): boolean {
+		try {
+			return (
+				Number.isFinite(element.duration) &&
+				element.duration > 0 &&
+				Number.isFinite(element.currentTime) &&
+				seekableIncludesStart(element)
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	function setRestartStatus(text: string): void {
+		restartStatus = text;
+		restartStatusVersion += 1;
+	}
+
+	/**
+	 * Explicit restart: seek the currently mounted matching element to zero
+	 * and claim success only on readback. Touches nothing but currentTime,
+	 * so paused/playing intent, source, queue/current identity, rate and
+	 * volume survive; never calls play/pause/load, never advances tracks,
+	 * and needs no keyboard shortcut. A throwing or silently-ignoring
+	 * setter is a truthful failure, not success inferred from the write.
+	 * The gesture supersedes any pending inbound-share seek for the source.
+	 */
+	function restartCurrentTrack(): void {
+		const element = audioEl;
+		const current = queueCurrentTrack(queue);
+		if (!element || !current) return;
+		const source = resolveStreamUrl(current);
+		if (!source || element.getAttribute('src') !== source) return;
+		const title = current.title?.trim() ? current.title : current.id;
+		const withTitle = (words: string): string => {
+			const suffix = ` ${title}.`;
+			if (words.length + suffix.length <= 99) return `${words}${suffix}`;
+			let end = 97 - words.length;
+			// Never cut between the halves of a surrogate pair.
+			const last = title.charCodeAt(end - 1);
+			if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+			return `${words} ${title.slice(0, end)}…`;
+		};
+		// The explicit gesture supersedes a pending share seek for this
+		// source even if the native write is refused: later metadata for
+		// the same source must never move the position to the share time.
+		if (pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === source) {
+			pendingShareSeek = null;
+		}
+		restartSupersededSources.add(`${current.id}\n${source}`);
+		// Native state can change after the last media event and before this click.
+		if (!restartIsAvailable(element)) {
+			restartCanSeek = false;
+			setRestartStatus(withTitle('Could not restart'));
+			return;
+		}
+		let position = Number.NaN;
+		try {
+			position = element.currentTime;
+		} catch {
+			// Handled below: an unreadable position cannot restart.
+		}
+		if (!Number.isFinite(position)) {
+			setRestartStatus(withTitle('Could not restart'));
+			return;
+		}
+		if (Math.abs(position) <= 0.05) {
+			try {
+				element.currentTime = 0;
+			} catch {
+				// Already at the start; a refusal changes nothing there.
+			}
+			setRestartStatus(withTitle('Already at the start of'));
+			return;
+		}
+		let refused = false;
+		try {
+			element.currentTime = 0;
+		} catch {
+			refused = true;
+		}
+		let readback = Number.NaN;
+		if (!refused) {
+			try {
+				readback = element.currentTime;
+			} catch {
+				// Handled below: no readback means no success claim.
+			}
+		}
+		setRestartStatus(
+			!refused && Number.isFinite(readback) && Math.abs(readback) <= 0.05
+				? withTitle('Restarted')
+				: withTitle('Could not restart')
+		);
 	}
 
 	if (typeof window !== 'undefined') {
@@ -557,6 +769,8 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		// replaceQueue resets the restart outcome for the removed track when
+		// the current source advances, and persists the removal.
 		replaceQueue(next);
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
@@ -586,6 +800,9 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		// Direct selection always changes the current source (reselecting
+		// the current row returned above); replaceQueue resets restart
+		// state and persists the selection.
 		replaceQueue(selected);
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
@@ -703,6 +920,14 @@
 		return `Move favorite ${displayTitle(track)} ${direction}`;
 	}
 
+	function searchBothFields(): void {
+		findScope = 'both';
+		// The recovery button only exists under a narrowed scope, so this
+		// unmounts the focused button; land focus on the scope selector
+		// (the control whose value just changed) instead of <body>.
+		void tick().then(() => scopeSelect?.focus({ preventScroll: true }));
+	}
+
 	function clearFind(): void {
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -757,12 +982,79 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
+	/** ID of the library row holding focus, or null when focus is elsewhere. */
+	function focusedLibraryRowId(): string | null {
+		if (typeof document === 'undefined') return null;
+		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
+		return holder?.getAttribute('data-id') ?? null;
+	}
+
+	/**
+	 * After a selected row unmounts, land focus on the checkbox of the next
+	 * surviving displayed row, else the previous one, else the Show
+	 * control. Runs after rendering and only when the removed control took
+	 * focus with it (active element fell back to the body), so controls
+	 * that remain mounted — including the Clear selection button itself —
+	 * and any focus the user has already moved keep it.
+	 */
+	function focusAfterSelectedRowRemoval(nextId: string | null, previousId: string | null): void {
+		void tick().then(() => {
+			if (typeof document === 'undefined') return;
+			const active = document.activeElement;
+			if (active && active !== document.body) return;
+			for (const id of [nextId, previousId]) {
+				if (id === null) continue;
+				// Find the row by attribute comparison, never selector
+				// interpolation: track ids are opaque server strings.
+				const rowEl = [...document.querySelectorAll('[data-testid="library-item"]')].find(
+					(element) => element.getAttribute('data-id') === id
+				);
+				const target = rowEl?.querySelector<HTMLElement>(
+					'input[type="checkbox"]:not([disabled]), button:not([disabled])'
+				);
+				if (target) {
+					target.focus({ preventScroll: true });
+					return;
+				}
+			}
+			viewSelect?.focus({ preventScroll: true });
+		});
+	}
+
 	function toggleSelectedId(id: string): void {
+		// Deselecting inside Selected only unmounts the row; when that row
+		// held focus, recover it to a surviving row or the Show control.
+		if (view !== 'selected' || !selectedIds.includes(id) || focusedLibraryRowId() !== id) {
+			selectedIds = toggleSelected(selectedIds, id);
+			return;
+		}
+		const displayedIds = visibleItems.map((track) => track.id);
+		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
+		const survivors = new Set(selectedIds);
+		const nextId =
+			removedIndex < 0
+				? null
+				: (displayedIds.slice(removedIndex + 1).find((candidate) => survivors.has(candidate)) ?? null);
+		const previousId =
+			removedIndex <= 0
+				? null
+				: ([...displayedIds.slice(0, removedIndex)]
+						.reverse()
+						.find((candidate) => survivors.has(candidate)) ?? null);
+		focusAfterSelectedRowRemoval(nextId, previousId);
+	}
+
+	function selectDisplayedIds(): void {
+		selectedIds = selectAllDisplayed(selectedIds, visibleItems.map((track) => track.id));
 	}
 
 	function clearSelectedIds(): void {
+		// Clearing inside Selected only unmounts every row; only focus that
+		// sat inside one of them needs the Show-control fallback.
+		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		selectedIds = clearSelection(selectedIds);
+		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
 	function appendSelectedIds(): void {
@@ -817,6 +1109,7 @@
 			favoritesAnnouncement = '';
 			queueFilterQuery = '';
 			findQuery = '';
+			findScope = 'both';
 			view = 'all';
 			confirmClear = false;
 			managementFeedback = '';
@@ -836,6 +1129,7 @@
 		favoritesAnnouncement = '';
 		queueFilterQuery = '';
 		findQuery = '';
+		findScope = 'both';
 		view = 'all';
 		confirmClear = false;
 		managementFeedback = '';
@@ -844,15 +1138,22 @@
 	}
 
 	onMount(() => {
+		// Restore only in the browser; SSR always renders Comfortable.
+		density = readStoredDensity();
 		window.addEventListener('storage', handleAuthTransition);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
+			// Restore only while this page still owns the title; a newer route's title wins.
+			if (priorDocumentTitle !== null && document.title === tabTitle) {
+				document.title = priorDocumentTitle;
+			}
 			shareAlive = false;
 			clearShareFeedback();
 			pendingShareSeek = null;
+			restartSupersededSources.clear();
 			refresher.dispose();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
@@ -861,12 +1162,20 @@
 </script>
 
 <svelte:head>
-	<title>Library — NNTune</title>
+	<title>{tabTitle}</title>
 	<meta name="description" content="Your NNTune library, available even when the API is down." />
 </svelte:head>
 
-<main class="nt-wrap">
+<main class="nt-wrap" data-density={density}>
 	<h1>Library</h1>
+
+	<div class="nt-library-density">
+		<label for="library-density">Density</label>
+		<select id="library-density" value={density} onchange={onDensityChange}>
+			<option value="comfortable">Comfortable</option>
+			<option value="compact">Compact</option>
+		</select>
+	</div>
 
 	{#if shareInvalid}
 		<p data-testid="library-share-invalid" role="alert">
@@ -1026,6 +1335,12 @@
 					bind:value={findQuery}
 					aria-describedby="library-find-hint"
 				/>
+				<label for="library-find-scope">Search in</label>
+				<select id="library-find-scope" bind:this={scopeSelect} bind:value={findScope}>
+					<option value="both">Both title and artist</option>
+					<option value="title">Title only</option>
+					<option value="artist">Artist only</option>
+				</select>
 				<p id="library-find-hint">
 					Searches only the tracks already loaded here, not the remote catalog.
 				</p>
@@ -1051,11 +1366,15 @@
 				<select id="library-view" bind:this={viewSelect} bind:value={view}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
+					<option value="selected">Selected only</option>
 				</select>
 			</div>
 			<p data-testid="library-find-count">
-				Showing {visibleItems.length} of {items.length}
-				{visibleItems.length === 1 ? 'track' : 'tracks'}
+				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
+					? ' (title only)'
+					: findScope === 'artist'
+						? ' (artist only)'
+						: ''}
 			</p>
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
@@ -1063,8 +1382,19 @@
 					<button type="button" onclick={showAllTracks}>Show all tracks</button>
 				</p>
 			{/if}
+			{#if view === 'selected' && selectedIds.length === 0}
+				<p>
+					No tracks selected. Select tracks to review them here.
+					<button type="button" onclick={showAllTracks}>Show all tracks</button>
+				</p>
+			{/if}
 			<div class="nt-selection-bar">
-				<p data-testid="selection-count">{selectionCountLabel(selectedIds.length)}</p>
+				<p data-testid="selection-count" role={loading ? undefined : 'status'}>{selectionCountLabel(selectedIds.length)}</p>
+				{#if visibleItems.length > 0}
+					<button class="nt-button" type="button" onclick={selectDisplayedIds}>
+						Select all
+					</button>
+				{/if}
 				<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
 					Clear selection
 				</button>
@@ -1086,7 +1416,18 @@
 				{/if}
 			</div>
 			{#if displayedItems.length > 0 && visibleItems.length === 0}
-				<p>No matches in your loaded tracks.</p>
+				{#if findScope === 'title'}
+					<p>No title matches in your loaded tracks.</p>
+				{:else if findScope === 'artist'}
+					<p>No artist matches in your loaded tracks.</p>
+				{:else}
+					<p>No matches in your loaded tracks.</p>
+				{/if}
+				{#if findScope !== 'both'}
+					<button class="nt-button" type="button" onclick={searchBothFields}>
+						Search both title and artist
+					</button>
+				{/if}
 				<button class="nt-button" type="button" onclick={clearFind}>
 					Clear search
 				</button>
@@ -1204,22 +1545,78 @@
 					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
 				</p>
 			{/if}
-			{#key `${currentTrack?.id}:${streamUrl}`}
-				<audio
-					bind:this={audioEl}
-					data-testid="audio-player"
-					controls
-					src={streamUrl}
-					onloadedmetadata={(event) => applyPendingShareSeek(event.currentTarget)}
-					ondurationchange={(event) => applyPendingShareSeek(event.currentTarget)}
-					onseeking={handleSeeking}
-				></audio>
-			{/key}
+			<div class="nt-library-player-controls">
+				{#key `${currentTrack?.id}:${streamUrl}`}
+					<audio
+						bind:this={audioEl}
+						data-testid="audio-player"
+						controls
+						src={streamUrl}
+						onloadedmetadata={(event) => {
+							applyPendingShareSeek(event.currentTarget);
+							refreshRestartAvailability(event);
+						}}
+						ondurationchange={(event) => {
+							applyPendingShareSeek(event.currentTarget);
+							refreshRestartAvailability(event);
+						}}
+						oncanplay={refreshRestartAvailability}
+						onprogress={refreshRestartAvailability}
+						ontimeupdate={refreshRestartAvailability}
+						onseeking={handleSeeking}
+					></audio>
+				{/key}
+				<button
+					class="nt-button nt-library-restart"
+					type="button"
+					data-testid="library-restart"
+					disabled={!restartCanSeek}
+					aria-describedby={restartCanSeek ? undefined : 'library-restart-hint'}
+					onclick={restartCurrentTrack}
+				>
+					Restart current track
+				</button>
+			</div>
+			{#if !restartCanSeek}
+				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
+			{/if}
+			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
 		</section>
 	{/if}
 </main>
 
 <style>
+	main {
+		--nt-library-row-padding: 0.25rem;
+	}
+	main[data-density='compact'] {
+		--nt-library-row-padding: 0;
+	}
+	.nt-library-density {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-density select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	/* Density only changes row whitespace, never the controls or their order.
+	 * The ancestor scope keeps the shared queue's other hosts unchanged. */
+	main :global(.queue-row) {
+		padding-block: var(--nt-library-row-padding);
+	}
+	main :global(.queue-row button:not(.queue-star)) {
+		min-width: 24px;
+		min-height: 24px;
+	}
 	.nt-library-find {
 		display: flex;
 		align-items: center;
@@ -1229,6 +1626,16 @@
 	.nt-library-find input {
 		box-sizing: border-box;
 		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find select {
+		max-width: 100%;
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
@@ -1247,6 +1654,27 @@
 	}
 	audio {
 		max-width: 100%;
+	}
+	.nt-library-player-controls {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-library-player-controls audio {
+		flex: 1 1 12rem;
+		min-width: 0;
+	}
+	.nt-library-restart {
+		flex: 0 0 auto;
+		min-height: 2.75rem;
+		border: 0;
+		cursor: pointer;
+		font: inherit;
+	}
+	.nt-library-restart:disabled {
+		cursor: default;
+		opacity: 0.5;
 	}
 	.nt-library-order {
 		display: flex;
@@ -1374,7 +1802,7 @@
 	.nt-library-item {
 		display: flex;
 		align-items: center;
-		padding: 0;
+		padding: var(--nt-library-row-padding) 0;
 	}
 	.nt-library-row {
 		display: block;

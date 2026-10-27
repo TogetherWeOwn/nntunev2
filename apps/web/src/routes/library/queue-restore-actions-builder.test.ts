@@ -15,7 +15,7 @@ function actions() {
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'removeQueuedTrack', 'clearQueuedTracks', 'selectQueuedTrack',
-		'replaceQueue', 'persistQueue', 'clearShareFeedback'
+		'replaceQueue', 'persistQueue', 'clearShareFeedback', 'resetRestartOnSourceChange'
 	]);
 	const body = parsed.statements.filter((node) =>
 		ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? '')
@@ -33,6 +33,7 @@ function actions() {
 		queue, queueInitialized: true, LIBRARY_QUEUE_KEY,
 		queueAnnouncement: '', queueAnnouncementVersion: 0,
 		shareGeneration: 0, shareStatus: '', shareFallbackUrl: null, pendingShareSeek: null,
+		restartCanSeek: false, restartStatus: '',
 		browserStorage: () => ({
 			setItem: (key: string, value: string) => storage.set(key, value),
 			removeItem: (key: string) => storage.delete(key)

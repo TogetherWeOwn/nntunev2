@@ -901,7 +901,22 @@ test('[LIBSHARE-20] links resolve only against loaded items; empty library stays
 	expect(await audioCount(page)).toBe(0);
 });
 
-test('[LIBSHARE-21] items without stream URLs keep select-only behavior', async ({ page }) => {
+/** Stream-less open-link outcome shared by the fresh-tab and same-tab steps. */
+async function expectStreamlessLinkOpen(page: Page) {
+	expect(await currentQueueId(page)).toBe('plain-pine');
+	await expect(page.getByTestId('now-playing')).toContainText('Plain Pine');
+	expect(await audioCount(page), 'stream-less open must not summon audio').toBe(0);
+	expect(
+		await page.getByTestId('library-share-invalid').count(),
+		'a resolving link must not show the invalid notice'
+	).toBe(0);
+	expect(await mediaCallCounts(page), 'stream-less open must not autoplay').toEqual({
+		play: 0,
+		pause: 0
+	});
+}
+
+test('[LIBSHARE-21] items without stream URLs keep select-only behavior', async ({ page, context }) => {
 	await openLibrary(page, { items: PLAIN_ITEMS });
 	await selectRow(page, 'plain-coral', 'Plain Coral');
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
@@ -918,20 +933,18 @@ test('[LIBSHARE-21] items without stream URLs keep select-only behavior', async 
 	expectShareUrl(written ?? '', { track: 'plain-coral', t: 0 }, page.url());
 
 	// Opening a link selects without audio, without the invalid notice, without crashing.
+	// A fresh tab (empty sessionStorage) is the recipient's view: only the linked track.
+	const fresh = await context.newPage();
+	await openLibrary(fresh, { url: '/library?track=plain-pine&t=45', items: PLAIN_ITEMS });
+	await expect(fresh.getByTestId('queue-item')).toHaveCount(1);
+	await expectStreamlessLinkOpen(fresh);
+
+	// Same tab: the session-restored arrangement (LIBQR) is kept and the link
+	// selects on top of it, so the linked track becomes current after it.
 	await page.goto('/library?track=plain-pine&t=45');
 	await expect(page.getByTestId('library-item')).toHaveCount(PLAIN_ITEMS.length);
-	await expect(page.getByTestId('queue-item')).toHaveCount(1);
-	expect(await currentQueueId(page)).toBe('plain-pine');
-	await expect(page.getByTestId('now-playing')).toContainText('Plain Pine');
-	expect(await audioCount(page), 'stream-less open must not summon audio').toBe(0);
-	expect(
-		await page.getByTestId('library-share-invalid').count(),
-		'a resolving link must not show the invalid notice'
-	).toBe(0);
-	expect(await mediaCallCounts(page), 'stream-less open must not autoplay').toEqual({
-		play: 0,
-		pause: 0
-	});
+	await expect.poll(() => queueOrder(page)).toEqual(['plain-coral', 'plain-pine']);
+	await expectStreamlessLinkOpen(page);
 });
 
 test('[LIBSHARE-22] successive copies read live state at activation (no stale snapshot)', async ({

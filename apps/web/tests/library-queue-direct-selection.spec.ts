@@ -54,6 +54,8 @@ const TRACKS: Track[] = [
 	{ id: 'pick-alpha', title: 'Alpha Song', artist: 'Pick Band', streamUrl: '', artworkUrl: null }
 ];
 const IDS = ['pick-mike', 'pick-zulu', 'pick-alpha'];
+/** Session key LIBQR persists the arranged queue under. */
+const QUEUE_KEY = 'nntune.library.queue.v1';
 const LIBRARY = TRACKS.map(({ id, title, artist }) => ({ id, title, artist }));
 const item = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 const action = (page: Page, id: string, name: string) => item(page, id).getByRole('button', { name, exact: true });
@@ -106,7 +108,9 @@ async function instrument(page: Page) {
 		for (const method of ['setItem', 'removeItem', 'clear'] as const) {
 			const original = Storage.prototype[method];
 			Object.defineProperty(Storage.prototype, method, { configurable: true, value(...args: unknown[]) {
-				probe.storage.push(method); return Reflect.apply(original, this, args);
+				const area = this === window.localStorage ? 'local' : 'session';
+				probe.storage.push(args.length > 0 ? `${area}:${method}:${String(args[0])}` : `${area}:${method}`);
+				return Reflect.apply(original, this, args);
 			} });
 		}
 	});
@@ -235,7 +239,7 @@ for (const example of [
 	});
 }
 
-test('PICK-B04 selection and current-row reselection have zero transport, source, persistence or provider side effects', async ({ page, baseURL }) => {
+test('PICK-B04 selection and current-row reselection have zero transport, source, provider or non-queue persistence side effects', async ({ page, baseURL }) => {
 	const calls: string[] = [];
 	await seed(page, baseURL!, undefined, calls);
 	const target = select(page, 'pick-zulu', 'Zulu Song');
@@ -250,7 +254,15 @@ test('PICK-B04 selection and current-row reselection have zero transport, source
 	await settle(page);
 	await selected(page, 'pick-zulu', 'Zulu Song', 2);
 	expect(await page.getByTestId('queue-announcement').textContent()).toBe(feedback);
-	expect(await page.evaluate(() => window.pickProbe)).toEqual({ media: [], sources: [], storage: [] });
+	// Session queue persistence (LIBQR) is the only storage effect allowed: every
+	// write is the queue key in sessionStorage and it holds the unchanged
+	// arrangement with the selected track current.
+	const probe = await page.evaluate(() => window.pickProbe);
+	expect({ media: probe.media, sources: probe.sources }).toEqual({ media: [], sources: [] });
+	for (const entry of probe.storage) expect(entry).toBe(`session:setItem:${QUEUE_KEY}`);
+	expect(await page.evaluate((key) => window.sessionStorage.getItem(key), QUEUE_KEY)).toBe(
+		JSON.stringify({ orderIds: IDS, currentId: 'pick-zulu' })
+	);
 	expect(calls).toEqual([]);
 	expect(await page.locator('audio[src], video[src], source[src]').count()).toBe(0);
 });
