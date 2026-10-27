@@ -30,44 +30,174 @@ fn play_ledger_alphabet_contract() {
     fs::create_dir_all(&scratch).expect("create native contract harness");
     let harness_lock = fs::File::create(scratch.join("harness.lock")).expect("open harness lock");
     harness_lock.lock().expect("lock native contract harness");
-    let manifest = format!(
-        "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-         [workspace]\n\
-         [dependencies]\nnntune-stream = {{ path = {stream:?} }}\nnntune-api = {{ path = {api:?} }}\n\
-         [[test]]\nname = \"alphabet\"\npath = \"alphabet.rs\"\n"
-    );
-    fs::write(scratch.join("Cargo.toml"), manifest).expect("write test-only manifest");
-    fs::write(scratch.join("alphabet.rs"), CONTRACT_TESTS).expect("write contract tests");
-    // Seed the API's resolved versions while Cargo adds stream-only
-    // dependencies. The generated lockfile belongs only to scratch.
-    fs::copy(api.join("Cargo.lock"), scratch.join("Cargo.lock")).expect("seed API lockfile");
-    let cargo = std::env::var_os("CARGO").expect("Cargo test runner");
-    let lock = Command::new(&cargo)
-        .args(["metadata", "--format-version", "1", "--manifest-path"])
-        .arg(scratch.join("Cargo.toml"))
-        .output()
-        .expect("resolve native contract harness");
+    // Remove the generated manifest, test source, and lockfile when the
+    // inner scope ends, on success or on harness failure. The scratch
+    // directory lives inside Cargo-owned target storage, where leftover
+    // generated sources would fail later pool admission; the nested
+    // target/ and harness.lock stay for bounded build reuse and
+    // cross-process serialization. The inner scope drops the guard while
+    // harness_lock is still held (preserving drop order) so the post-run
+    // assertions below observe the real cleanup; `_generated` (not `_`)
+    // so the guard drops at scope end rather than immediately.
+    {
+        let _generated = GeneratedInputs {
+            paths: [
+                scratch.join("Cargo.toml"),
+                scratch.join("alphabet.rs"),
+                scratch.join("Cargo.lock"),
+            ],
+        };
+        let manifest = format!(
+            "[package]\nname = \"play-ledger-alphabet-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [workspace]\n\
+             [dependencies]\nnntune-stream = {{ path = {stream:?} }}\nnntune-api = {{ path = {api:?} }}\n\
+             [[test]]\nname = \"alphabet\"\npath = \"alphabet.rs\"\n"
+        );
+        fs::write(scratch.join("Cargo.toml"), manifest).expect("write test-only manifest");
+        fs::write(scratch.join("alphabet.rs"), CONTRACT_TESTS).expect("write contract tests");
+        // Seed the API's resolved versions while Cargo adds stream-only
+        // dependencies. The generated lockfile belongs only to scratch.
+        fs::copy(api.join("Cargo.lock"), scratch.join("Cargo.lock")).expect("seed API lockfile");
+        let cargo = std::env::var_os("CARGO").expect("Cargo test runner");
+        let lock = Command::new(&cargo)
+            .args(["metadata", "--format-version", "1", "--manifest-path"])
+            .arg(scratch.join("Cargo.toml"))
+            .output()
+            .expect("resolve native contract harness");
+        assert!(
+            lock.status.success(),
+            "harness setup is not assertion-level RED:\n{}\n{}",
+            String::from_utf8_lossy(&lock.stdout),
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let result = Command::new(cargo)
+            .args(["test", "--locked", "--manifest-path"])
+            .arg(scratch.join("Cargo.toml"))
+            // Do not compete for the outer Cargo invocation's target lock.
+            .arg("--target-dir")
+            .arg(scratch.join("target"))
+            .args(["--test", "alphabet", "--", "--nocapture"])
+            .output()
+            .expect("run native stream/API contract assertions");
+        assert!(
+            result.status.success(),
+            "native stream/API contract failed (compile errors are not RED):\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    // Pin the real harness wiring: deleting the guard above leaves the
+    // generated inputs behind and must fail the suite, so observe the
+    // actual scratch instead of trusting the probes alone.
+    assert_inputs_removed(&[
+        scratch.join("Cargo.toml"),
+        scratch.join("alphabet.rs"),
+        scratch.join("Cargo.lock"),
+    ]);
     assert!(
-        lock.status.success(),
-        "harness setup is not assertion-level RED:\n{}\n{}",
-        String::from_utf8_lossy(&lock.stdout),
-        String::from_utf8_lossy(&lock.stderr)
+        scratch.join("target").is_dir(),
+        "harness must keep its nested target/ for bounded build reuse"
     );
-    let result = Command::new(cargo)
-        .args(["test", "--locked", "--manifest-path"])
-        .arg(scratch.join("Cargo.toml"))
-        // Do not compete for the outer Cargo invocation's target lock.
-        .arg("--target-dir")
-        .arg(scratch.join("target"))
-        .args(["--test", "alphabet", "--", "--nocapture"])
-        .output()
-        .expect("run native stream/API contract assertions");
     assert!(
-        result.status.success(),
-        "native stream/API contract failed (compile errors are not RED):\n{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
+        scratch.join("harness.lock").is_file(),
+        "harness must keep harness.lock for cross-process serialization"
     );
+}
+
+/// Removes generated harness inputs when the scope ends, on success or failure.
+///
+/// Only the generated manifest, test source, and lockfile are removed; the
+/// nested `target/` (bounded build reuse) and `harness.lock` (same-inode
+/// cross-process serialization) stay. Best-effort: cleanup must never panic.
+struct GeneratedInputs {
+    paths: [std::path::PathBuf; 3],
+}
+
+impl Drop for GeneratedInputs {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Probe scratch for cleanup regressions: stable per-test names under
+/// Cargo-owned tmp storage (bounded: one dir per probe, reused across runs),
+/// serialized across processes like the real harness. The returned lock must
+/// stay alive for the whole probe; cleanup guards drop before it.
+fn cleanup_probe(name: &str) -> (std::path::PathBuf, fs::File) {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    fs::create_dir_all(&dir).expect("create cleanup probe dir");
+    let lock = fs::File::create(dir.join("probe.lock")).expect("open probe lock");
+    lock.lock().expect("lock cleanup probe");
+    (dir, lock)
+}
+
+fn probe_inputs(dir: &std::path::Path) -> [std::path::PathBuf; 3] {
+    [
+        dir.join("Cargo.toml"),
+        dir.join("alphabet.rs"),
+        dir.join("Cargo.lock"),
+    ]
+}
+
+fn assert_inputs_removed(inputs: &[std::path::PathBuf; 3]) {
+    for path in inputs {
+        assert!(
+            !path.exists(),
+            "generated input not removed: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn harness_cleanup_removes_generated_inputs() {
+    let (dir, _probe_lock) = cleanup_probe("play-ledger-alphabet-probe-success");
+    let inputs = probe_inputs(&dir);
+    {
+        let _generated = GeneratedInputs {
+            paths: inputs.clone(),
+        };
+        for path in &inputs {
+            fs::write(path, b"probe input").expect("write probe input");
+        }
+    }
+    assert_inputs_removed(&inputs);
+}
+
+#[test]
+fn harness_cleanup_removes_generated_inputs_on_failure() {
+    let (dir, _probe_lock) = cleanup_probe("play-ledger-alphabet-probe-failure");
+    let inputs = probe_inputs(&dir);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _generated = GeneratedInputs {
+            paths: inputs.clone(),
+        };
+        for path in &inputs {
+            fs::write(path, b"probe input").expect("write probe input");
+        }
+        panic!("representative harness failure (expected probe panic)");
+    }));
+    assert!(outcome.is_err(), "probe failure did not unwind");
+    assert_inputs_removed(&inputs);
+}
+
+#[test]
+fn harness_cleanup_repeated_runs_leave_no_generated_inputs() {
+    let (dir, _probe_lock) = cleanup_probe("play-ledger-alphabet-probe-repeat");
+    let inputs = probe_inputs(&dir);
+    for _ in 0..3 {
+        {
+            let _generated = GeneratedInputs {
+                paths: inputs.clone(),
+            };
+            for path in &inputs {
+                fs::write(path, b"probe input").expect("write probe input");
+            }
+        }
+        assert_inputs_removed(&inputs);
+    }
 }
 
 const CONTRACT_TESTS: &str = r#"
