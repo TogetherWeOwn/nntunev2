@@ -124,6 +124,8 @@
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
+	// Bumped by every queue replacement; fences late play-from-top outcomes.
+	let playEpoch = 0;
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -269,6 +271,9 @@
 	const bulkAllQueued = $derived(
 		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
 	);
+	// Play-from-top stays enabled while everything is queued: selecting the
+	// first displayed track's slot is still useful.
+	const playDisplayedDisabled = $derived(libraryUnavailable || visibleItems.length === 0);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const favoriteIds = $derived(new Set(favorites));
 	// Favorites render in star order; ids absent from the current library
@@ -295,14 +300,26 @@
 		});
 	}
 
-	function queuedTrackFor(item: LibraryItem): Track {
-		// No stream URL until the streaming slice: playback wiring is out of
-		// scope, so the queue carries library display fields only.
+	function queuedTrackFor(item: LibraryItem, carryStream = false): Track {
+		// The bulk append carries library display fields only; the play path
+		// carries the item's stream URL like row selection does.
 		return {
 			id: item.id,
 			title: displayTitle(item),
 			artist: displayArtist(item) ?? '',
-			streamUrl: ''
+			streamUrl: carryStream ? resolveStreamUrl({ streamUrl: item.streamUrl }) : ''
+		};
+	}
+
+	/**
+	 * The append core shared by the bulk action and play-from-top: missing
+	 * tracks join the end in displayed order, the existing arrangement and
+	 * current selection survive, and an empty queue starts at its first row.
+	 */
+	function appendMissingTracks(missing: readonly LibraryItem[], carryStream = false): QueueState {
+		return {
+			tracks: [...queue.tracks, ...missing.map((item) => queuedTrackFor(item, carryStream))],
+			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
 		};
 	}
 
@@ -334,11 +351,57 @@
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		replaceQueue({
-			tracks: [...queue.tracks, ...missing.map(queuedTrackFor)],
-			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
-		});
+		replaceQueue(appendMissingTracks(missing));
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
+	}
+
+	/**
+	 * Non-destructive play-from-top: append the missing displayed tracks
+	 * through the shared core, then select the first appended one (or the
+	 * first displayed track's existing slot when everything is queued).
+	 * Playback is attempted once, inside the gesture's activation window; a
+	 * rejected play() leaves the track selected but paused and is reported
+	 * as such — never retried. Any queue replacement after this activation
+	 * (another action, an auth teardown) fences the late outcome.
+	 */
+	async function playDisplayedFromTop(): Promise<void> {
+		if (playDisplayedDisabled) return;
+		const displayedCount = missingDisplayedTracks(visibleItems, new Set()).length;
+		const missing = bulkMissing;
+		const index =
+			missing.length > 0
+				? queue.tracks.length
+				: queue.tracks.findIndex((track) => track.id === visibleItems[0]?.id);
+		const base = missing.length > 0 ? appendMissingTracks(missing, true) : queue;
+		const selected = selectQueueIndex(base, index);
+		const target = selected.tracks[selected.currentIndex];
+		if (selected.currentIndex !== index || !target) return;
+		replaceQueue(selected);
+		const epoch = playEpoch;
+		const title = (target.title.trim() || target.id).slice(0, 60);
+		const skipped = displayedCount - missing.length;
+		const counts =
+			missing.length === 0
+				? `All ${displayedCount} displayed ${displayedCount === 1 ? 'track is' : 'tracks are'} already queued.`
+				: `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
+		let lead = `Selected ${title}; no stream to play.`;
+		if (resolveStreamUrl(target)) {
+			await tick();
+			if (epoch !== playEpoch) return;
+			const element = audioEl;
+			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (element) {
+				try {
+					await element.play();
+					lead = `Playing ${title}.`;
+				} catch {
+					// Selected-but-paused is the truthful fallback; no retry.
+				}
+			}
+			if (epoch !== playEpoch) return;
+		}
+		queueAnnouncement = `${lead} ${counts}`;
+		queueAnnouncementVersion += 1;
 	}
 
 	function queueFavorites(): void {
@@ -358,6 +421,7 @@
 	 * track title from lingering across the auth-boundary clears below.
 	 */
 	function replaceQueue(next: QueueState): void {
+		playEpoch += 1;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
@@ -1027,6 +1091,18 @@
 			</button>
 			{#if bulkAllQueued}
 				<p id="bulk-queue-hint">All displayed tracks are already in the queue.</p>
+			{/if}
+			<button
+				class="nt-button nt-bulk-queue-action"
+				type="button"
+				disabled={playDisplayedDisabled}
+				aria-describedby={playDisplayedDisabled ? 'play-displayed-hint' : undefined}
+				onclick={() => void playDisplayedFromTop()}
+			>
+				Play displayed from the top
+			</button>
+			{#if playDisplayedDisabled}
+				<p id="play-displayed-hint">No displayed tracks to play.</p>
 			{/if}
 		</div>
 
