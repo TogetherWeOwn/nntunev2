@@ -15,8 +15,10 @@ sources and bind dispositions to a document revision before any future build.
 Add a **Passkeys** section to the existing `/account/security` page: private
 inventory, add another passkey, individually confirmed remove. Keep sign-out
 controls and their behavior intact. Do not reuse signup as authenticated add.
-Do not overlap native REST credentials, change magic links/session management,
+Do not redesign native REST credentials, magic links or session management,
 add a sign-in method, run credential operations or create implementation cards.
+The standing passkey-recovery revocation requirements below remain prerequisites;
+this scope limit does not authorize omitting them.
 
 Minimal first version: optional label at creation, no rename, at most eight
 passkeys, unknown metadata shown honestly. Last-passkey removal is unavailable
@@ -26,9 +28,32 @@ a session through a magic link is not that proof. A second passkey permits
 removing the first, but is not an independent fallback sign-in method.
 
 **NO-GO today:** authenticated add/list/remove, management-bound proof, atomic
-last-key enforcement, metadata and fallback verification are missing contracts.
-The proposals below specify the boundary to review; none is an installed API.
-No UI-only implementation may expose working mutation controls against signup.
+last-key enforcement, recovery revocation, metadata and fallback verification
+are missing contracts. The proposals below specify the boundary to review; none
+is an installed API. No UI-only implementation may expose working mutation
+controls against signup.
+
+### Binding recovery policy — no no-revocation exception
+
+The accepted threat model requires explicit revoke-all on **both passkey add
+and remove**; ADR 0008 identifies that model as binding. ADR 0010 additionally
+requires every unrevoked native REST credential to be revoked atomically with
+these recovery events, with recovery-path tests. Sources:
+`docs/security/threat-model.md:83`, `docs/adr/0008-auth-vault-sessions.md:28`,
+`docs/adr/0010-native-rest-credentials.md:139-146`,
+`docs/adr/0010-native-rest-credentials.md:237-240`.
+
+The earlier no-revocation proposal conflicted with those requirements and is
+withdrawn, not an accepted alternative. This revision preserves the standing
+policy: a successful add/remove must revoke all account sessions (including the
+caller) and all unrevoked native REST credentials. No cookie-only change or
+browser follow-up revoke-all request substitutes for the required atomic recovery
+contract. The existing revoke-all handler's separate sweeps are observations,
+not proof of that contract. No session/credential implementation is authorized
+here; mutations remain **NO-GO until a separately authorized recovery integration
+satisfies this prerequisite**. CISO must disposition the exact-revision atomic
+recovery/proof contract, and CEO must accept the sign-out/recovery UX and any
+separate integration scope. Neither can be inferred from approval of this spec.
 
 ## 2. Source-verified current behavior
 
@@ -217,8 +242,8 @@ ceremony; they must not be logged or persisted by the client.
 | POST `/v1/passkeys/authorize/start` | `{action:"add"\|"remove",target_id?:string,revision}` | 200 `{intent_id,challenge,rp_id,allow_credentials,expires_at}`; target required only for remove; authenticated account's eligible existing credentials only; exclude target from remove proof |
 | POST `/v1/passkeys/authorize/finish` | `{intent_id,challenge,credential_id,authenticator_data,client_data_json,signature}` | 200 `{authorized:true,expires_at}`; authorization remains server-side, one action, no bearer grant returned |
 | POST `/v1/passkeys/add/start` | `{intent_id,label?:string}` | 200 `{challenge,user_id,rp_id,exclude_credentials,expires_at}`; fresh, authorized add intent only; exclude this account's existing credentials; distinct management-add purpose |
-| POST `/v1/passkeys/add/finish` | `{intent_id,challenge,credential_id,attestation_object,client_data_json}` | 201 `{id,revision}` after atomic insert and intent consumption; no new account/session, mail or invite; no reuse of signup finish |
-| POST `/v1/passkeys/{id}/remove` | `{intent_id,revision}` | 200 `{removed:true,revision}` after atomic guard/delete/intent consumption; path ID must equal bound target; same-intent retry may replay only the same authenticated result |
+| POST `/v1/passkeys/add/finish` | `{intent_id,challenge,credential_id,attestation_object,client_data_json}` | 201 `{id,revision}` only after atomic insert/intent consumption plus required session/native-REST revocation; clear caller cookie after commit; no new account/session, mail or invite; no reuse of signup finish |
+| POST `/v1/passkeys/{id}/remove` | `{intent_id,revision}` | 200 `{removed:true,revision}` only after atomic guard/delete/intent consumption plus required session/native-REST revocation; clear caller cookie after commit; path ID must equal bound target; revoked caller cannot replay a successful result |
 
 Strings, lengths, enums and unknown fields are validated before any effect.
 Existing 32-KiB body cap is retained. Labels: trim surrounding whitespace,
@@ -247,8 +272,13 @@ approved complete-list design. Read retries cannot fix this structural condition
 - Inventory version changes on add/remove. At commit, serialize changes per
   account; recheck active session, fresh timestamp, unexpired authorized intent,
   ownership, expected inventory version, proof-key continued existence, max-eight
-  cap and last-key guard. Effect, version and proof consumption commit together.
-  A failed write must roll back the effect. No check-count-then-delete race.
+  cap and last-key guard. Passkey effect, version, proof consumption, revoke-all
+  of account sessions (including caller), and revocation of all unrevoked native
+  REST credentials must commit together. A failed write must roll back the whole
+  recovery effect. Serialize against concurrent credential issuance and other
+  recovery events; this shared-writer integration is an unproven prerequisite,
+  not a property of the existing separate store calls. No check-count-then-delete
+  race or passkey-only partial success.
 - Two removes observing two keys must not both leave zero. A changed inventory
   returns a generic conflict before effect, forces refetch and a new confirmation
   plus proof. No automatic rebasing/replay of user intent to another row.
@@ -263,17 +293,23 @@ approved complete-list design. Read retries cannot fix this structural condition
   recently proven by its owner and rechecked atomically at removal; client flags,
   email presence or “another passkey exists” are not substitutes. No fallback
   enrollment or new method is part of this specification.
-- On uncertain commit/network timeout, read inventory before offering a new
-  attempt. Do not assert success from a vanished row alone if another actor could
-  have removed it; say “This passkey is no longer listed.” Same-intent result
-  replay must remain session-bound and cannot authorize another effect.
-- Removing a passkey prevents future assertions with that credential; it does
-  not erase authenticator/sync-provider copies or end previously issued sessions.
-  Do not claim otherwise or invoke revoke-all automatically. Show the existing
-  “Sign out everywhere” action separately for active-session concerns.
-- If revoke-all wins before a management commit, the commit fails through the
-  session recheck. If mutation commits first, its completed effect remains;
-  later revoke-all ends sessions. No additional session semantics are introduced.
+- On uncertain commit/network timeout, reconcile inventory before offering a new
+  attempt; if recovery revoked the caller, sign in again before that read. Do not
+  assert success from a vanished row or 401 alone if another actor could have
+  caused it; say “Sign in again to check whether your passkeys changed.” The old
+  session is rejected on replay after success; no idempotent-result exception
+  bypasses session revocation, and a new session cannot reuse the old intent.
+- Removing a passkey prevents future assertions with that credential, but does
+  not erase authenticator/sync-provider copies. Both add and remove additionally
+  perform the binding recovery revocations above. Do not promise that existing
+  sessions or native REST credentials remain usable. Preserve the independent
+  “Sign out everywhere” action, but do not require a second browser/API call for
+  mutation recovery: the server-side atomic contract is mandatory.
+- If independent revoke-all wins before a management commit, the commit fails
+  through the session recheck. If management commits first, its passkey effect
+  and required recovery revocations all remain. Clear the caller cookie only
+  after that commit; do not mint a replacement session. No current session route
+  is changed by this design-only card.
 - Secret-free audit events are proposed for management add/remove outcome and
   denied intent category, using existing internal user attribution and opaque
   management record IDs only. Never capture assertion material, email, label,
@@ -325,12 +361,12 @@ If trustworthy backup flags are later supported, copy can say “Can sync” ver
 | Loaded | rows plus “Add another passkey”; optional label input only when add is chosen; no automatic ceremony on mount |
 | Read failed | “Could not load passkeys. Your passkeys have not been changed.” and Retry; no mutations from stale rows |
 | Historical inventory overflow | “Your full passkey list cannot be shown here. No passkeys have been changed.”; show no partial rows, add/remove unavailable, no retry loop; an approved complete-list design is required |
-| Add proving/creating | “Confirm it’s you to add a passkey” then “Create another passkey”; disable conflicting actions; explicit Cancel, one in-flight action |
-| Add complete | refetch confirmed row, polite “Passkey added.”, focus new row heading; never replace the signed-in identity or navigate to onboarding |
-| Remove confirmation | “Remove ‘<label / ordinal>’?” and “You won’t be able to use this passkey to sign in to NNTune. It may remain on your device or in your passkey provider. Existing sessions stay signed in.”; Cancel primary/default focus, separate destructive “Confirm remove” |
+| Add proving/creating | before proof, disclose “Adding a passkey signs out every device and revokes native REST credentials. You’ll need to sign in again.” with explicit Continue/Cancel; then “Confirm it’s you to add a passkey” and “Create another passkey”; disable conflicting actions, one in-flight action |
+| Add complete | after committed success, clear private inventory/identity/intents and broadcast the auth boundary; polite “Passkey added. All sessions were signed out and native REST credentials revoked. Sign in again.” with focused Sign in again link to existing `/login`; no automatic onboarding navigation or session creation |
+| Remove confirmation | “Remove ‘<label / ordinal>’?” and “You won’t be able to use this passkey to sign in to NNTune. It may remain on your device or in your passkey provider. This also signs out every device and revokes native REST credentials. You’ll need to sign in again.”; Cancel primary/default focus, separate destructive “Confirm remove” |
 | Remove proof | “Use a different passkey to confirm removal.”; cancel means no finish/removal call; never fall back to a login ceremony |
 | Final key | Remove unavailable with adjacent explanation: “Add another passkey before removing this one. Removing your last passkey requires a verified fallback sign-in method, which is not available here.” |
-| Removed | only after confirmed result, “Passkey removed from NNTune.” plus separate active-session/provider-residue explanation |
+| Removed | only after committed success, clear private inventory/identity/intents and broadcast the auth boundary; “Passkey removed from NNTune. All sessions were signed out and native REST credentials revoked. Sign in again.” with focused Sign in again link to existing `/login`; provider-residue copy remains, no private row retained |
 | Conflict/unknown row | “Your passkeys changed. Review the updated list before trying again.”; refetch, no automatic destructive retry |
 | Dismissal/timeout | “Passkey confirmation didn’t complete. Nothing was changed by this attempt. Try again or cancel.”; distinguish local cancellation from server rejection; if finish was sent and outcome uncertain, use reconciliation copy instead |
 | Storage/network failure | “Could not confirm the change. Reload the list before trying again.”; never claim rollback when outcome is unknown |
@@ -338,8 +374,10 @@ If trustworthy backup flags are later supported, copy can say “Can sync” ver
 
 One disclosure at section level: “Removing a passkey here does not remove it
 from your device or passkey provider.” Optional labels are not trustworthy
-hardware identities. No sensitive label is stored outside the authenticated
-in-memory view; denied browser storage must not break the page.
+hardware identities. The authoritative server inventory retains each label and
+returns it on later authenticated reads. In the browser, labels are confined to
+the current authenticated in-memory view, never persisted in client storage;
+denied browser storage must not break the page.
 
 ### Keyboard, focus, screen reader, light/dark and bounds
 
@@ -350,10 +388,13 @@ in-memory view; denied browser storage must not break the page.
 - Confirmation is an accessible labelled dialog with text description, focus
   containment, initial Cancel focus, Escape cancel and restoration to the exact
   triggering row. No focus may enter background controls while open.
-- After confirmed removal, focus next surviving row heading (temporary tabindex
-  -1), else previous row, else Passkeys heading. After cancel/failure restore
-  the trigger when still present; otherwise use the same fallback. Announce a
-  result once in the current section, not after abandonment or navigation.
+- After successful add/remove recovery, remove private rows and focus the Sign
+  in again link in the current completion notice, not a now-signed-out row.
+  After cancel/failure while still authenticated, restore the trigger when
+  present; if a concurrent removal/refetch removed it, focus the next surviving
+  row heading (temporary tabindex -1), else previous row, else Passkeys heading.
+  Announce a result once in the current section, not after abandonment,
+  navigation or an intervening account transition.
 - Pending uses aria-busy plus one polite status; errors use one associated
   alert, not duplicated global/section messages. Row counts and dates have
   sensible spoken text. Scope announcement assertions to this section because
@@ -373,7 +414,7 @@ in-memory view; denied browser storage must not break the page.
 | Threat | Required mitigation / evidence before build approval |
 | --- | --- |
 | Stolen cookie, remove-then-add takeover | active/fresh session plus existing-key management-bound proof for each mutation (add/remove), not the cookie-authenticated inventory read; new key never self-authorizes; remove proof uses a surviving key; test action/session/target substitution and chained attempts |
-| Shared-device or synced credential residue | no claim of provider erasure/session revocation; no inventory persistence; explicit residue copy and separate sign-out-everywhere action |
+| Shared-device or synced credential residue | no claim of provider erasure; no browser inventory persistence; explicit residue copy; both add/remove require server-side account-session and native-REST recovery revocation, not a separate UI request |
 | Login/signup/reauth ceremony confusion | dedicated management purposes, RP/origin checks and intent scope; reject login or registration proof in management, and vice versa; no email/account selector |
 | Cross-account enumeration/residue | authenticate before lookup, opaque management IDs, no public lists, generic foreign/missing/duplicate outcomes, no response/log metadata leaks, late-result account fence |
 | Concurrent remove/add, replay, stale confirmation | per-account serialization, expected revision and atomic guard/effect/consumption; session/proof-key recheck; single-use outcome bound to session |
@@ -385,14 +426,21 @@ in-memory view; denied browser storage must not break the page.
 revision's management-only proof (not existing reauth by implication), RP/origin,
 method/freshness and session bindings, account/no-oracle checks, rate/cap limits,
 atomicity and replay contract, last-key fallback policy, metadata/privacy,
-audit/retention and session-revocation races. Require a source-bound proof/test
-plan and explicitly list unresolved terms; silence or spec admission is not
-approval. Any host/schema/privilege boundary remains with its authorized owner.
+audit/retention and session-revocation races. The disposition must explicitly
+cover the binding recovery policy in section 1: both add/remove atomically revoke
+all account sessions and all unrevoked native REST credentials, including races
+with issuance and failpoint rollback. This is a required integration gate, not
+permission to accept the withdrawn no-revocation variant. Require a source-bound
+proof/test plan and explicitly list unresolved terms; silence or spec admission
+is not approval. Any host/schema/privilege boundary remains with its authorized
+owner; no recovery implementation work is authorized by this card.
 
 **CEO design disposition required before implementation:** accept/reject the
 same revision's minimal UX and labels/no-rename choice, metadata unknown copy,
-last-key NO-GO/recovery limitation, residue and existing-session copy, accessibility
-contract and slice order. Must explicitly authorize any later build scope;
+last-key NO-GO/recovery limitation, provider-residue and all-sessions-sign-out /
+native-REST-revocation copy, accessibility contract and slice order. CEO must
+separately authorize any recovery-integration scope outside this static spec.
+Must explicitly authorize any later build scope;
 completion of this design card cannot create build cards or waive CISO terms.
 
 **Host alignment required before build execution:** authorized executor confirms
@@ -416,15 +464,19 @@ GET item shape with label “Passkey”, created_at=1799999000, last_used_at=nul
 and backup_state="unknown". Proof keys below belong to the stated actor's rows;
 all other proof checks pass unless a case overrides them. The last-key fixture
 is a preflight/guard denial: proof_key=null because no surviving key is eligible,
-not a claim that removal can proceed without proof.
+not a claim that removal can proceed without proof. Each fixture starts with two
+active sessions and two unrevoked native REST credentials owned by its actor.
+Recovery count expectations include the caller and never expose key material.
+The success fixture's row-count check is an offline store check; a subsequent
+HTTP inventory read requires a new sign-in, never the revoked caller session.
 
 ```json
 [
-  {"fixture":"two","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"error_code":null,"next_action":"announce_removed"},
-  {"fixture":"last","actor":"A","revision":7,"rows":["pk_a"],"proof_key":null,"target":"pk_a","expect_count":1,"error_code":"last_passkey","next_action":"add_another"},
-  {"fixture":"foreign","actor":"B","revision":7,"rows":["pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"error_code":"unknown_or_foreign","next_action":"refetch"},
-  {"fixture":"stale","actor":"A","revision":6,"current_revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"error_code":"stale_inventory","next_action":"refetch_then_reconfirm"},
-  {"fixture":"storage","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"error_code":"storage_unavailable","next_action":"retain_safe_state_then_retry_read"}
+  {"fixture":"two","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"expect_sessions":0,"expect_native_credentials":0,"error_code":null,"next_action":"sign_in_then_reconcile"},
+  {"fixture":"last","actor":"A","revision":7,"rows":["pk_a"],"proof_key":null,"target":"pk_a","expect_count":1,"expect_sessions":2,"expect_native_credentials":2,"error_code":"last_passkey","next_action":"add_another"},
+  {"fixture":"foreign","actor":"B","revision":7,"rows":["pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"expect_sessions":2,"expect_native_credentials":2,"error_code":"unknown_or_foreign","next_action":"refetch"},
+  {"fixture":"stale","actor":"A","revision":6,"current_revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"expect_sessions":2,"expect_native_credentials":2,"error_code":"stale_inventory","next_action":"refetch_then_reconfirm"},
+  {"fixture":"storage","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"expect_sessions":2,"expect_native_credentials":2,"error_code":"storage_unavailable","next_action":"retain_safe_state_then_retry_read"}
 ]
 ```
 
@@ -434,10 +486,10 @@ not a claim that removal can proceed without proof.
 | PASS-02 | Given zero rows, when an authenticated read succeeds, then empty copy appears without signup/add mutation. | screenshot + zero mutation count |
 | PASS-03 | Given a held read, when the page loads, then loading rather than empty inventory appears. | held response + status assertion |
 | PASS-04 | Given a failed read, when Retry succeeds, then usable rows replace the error with no mutation. | request count + UI snapshot |
-| PASS-05 | Given two rows and eligible existing-key proof, when add completes, then one new row appears without account/session creation. | mocked traffic allow-list + row count |
+| PASS-05 | Given two rows and eligible existing-key proof, when add commits and the user signs in again, then inventory contains exactly one new row without account/session creation by add. | committed response + fresh-sign-in/read sequence + row count |
 | PASS-06 | Given an existing credential ID collision (owned or foreign), when add finishes, then identical duplicate copy appears without another row. | paired response/UI comparison |
 | PASS-07 | Given a row, when remove confirmation is cancelled, then no proof/finish/remove request occurs. | keyboard trace + zero request count |
-| PASS-08 | Given two rows and distinct surviving-key proof, when confirmed remove resolves, then exactly the named row disappears. | two fixture rows to one + named assertion |
+| PASS-08 | Given two rows and distinct surviving-key proof, when remove commits and the user signs in again, then inventory no longer contains exactly the named removed row. | store two-to-one + fresh-sign-in/read sequence + named assertion |
 | PASS-09 | Given the final key with no authoritative fallback, when removal is attempted, then no key is deleted. | UI guard plus backend fixture invariant |
 | PASS-10 | Given a missing versus foreign ID, when a removal is attempted, then public outcomes are indistinguishable. | body/status equality + unchanged rows |
 | PASS-11 | Given an old inventory revision, when removal is submitted, then it requires refetch and a new confirmation. | conflict response + no automatic resend |
@@ -445,12 +497,12 @@ not a claim that removal can proceed without proof.
 | PASS-13 | Given stale/expired session or wrong/denied proof, when add/remove is attempted, then no credential changes. | denial matrix + zero writes |
 | PASS-14 | Given login/signup proof or another action/session/target's intent, when submitted to management, then it cannot authorize a change. | replay/substitution fixture matrix |
 | PASS-15 | Given cancelled/timed-out/unsupported credential double, when the ceremony ends, then retry/cancel copy appears without a finish request. | error-name matrix + zero finish count |
-| PASS-16 | Given server storage failure before commit, when add/remove is attempted, then state is unchanged and read retry is offered. | failure-injected store row count + screenshot |
-| PASS-17 | Given a network break after possible commit, when the UI recovers, then it reconciles before another destructive attempt. | held/lost response + read-before-write order |
-| PASS-18 | Given denied browser storage, when inventory/add/remove UI is used with mocks, then no private data is persisted or required to continue. | throwing storage doubles + traffic/DOM assertions |
+| PASS-16 | Given failure at each passkey/session/native-credential recovery write before commit, when add/remove is attempted, then all affected state rolls back. | failpoint matrix + unchanged passkey/session/native-credential counts; no success cookie/body |
+| PASS-17 | Given a network break after possible commit, when the UI recovers, then it reconciles before another destructive attempt, signing in again if recovery revoked its session. | held/lost response + optional new sign-in + read-before-write order; 401 alone never proves success |
+| PASS-18 | Given denied browser storage, when inventory/add/remove UI is used with mocks, then no private data is persisted in browser storage or required there to continue. | throwing storage doubles + traffic/DOM assertions; server label survives an authenticated reload |
 | PASS-19 | Given actor A's held response, when sign-out/account B/navigation wins, then A's rows and success cannot appear in B's/current view. | auth-boundary harness + late-resolution assertions |
 | PASS-20 | Given a keyboard-opened confirmation, when Escape/cancel closes it, then focus returns to its own trigger. | activeElement + tab containment trace |
-| PASS-21 | Given the focused row is removed, when removal resolves, then focus follows next/previous/heading fallback. | activeElement after each list position |
+| PASS-21 | Given focused management UI, when successful add/remove recovery clears private rows, then focus moves to Sign in again. | activeElement and private-row absence; concurrent authenticated refetch still tests next/previous/heading fallback |
 | PASS-22 | Given 320/375-pixel light/dark views at 200% zoom, when long/RTL labels render, then all actions remain visible without overflow. | theme/width screenshots + bounds/contrast evidence |
 | PASS-23 | Given a screen reader, when pending/error/success resolves, then the section announces each outcome once with named controls. | accessibility snapshot + recorded manual speech transcript |
 | PASS-24 | Given markup, Unicode, bidi controls, empty/64/65-scalar or >256-byte labels, when submitted, then valid labels render literally and invalid labels cannot commit. | input boundary matrix + escaped DOM assertion |
@@ -459,7 +511,7 @@ not a claim that removal can proceed without proof.
 | PASS-27 | Given existing signup/login/session actions, when their unchanged flows run, then management has not altered redirects, denial copy or cache invalidation. | existing auth/security regression bank results |
 | PASS-28 | Given successful/denied/failed actions, when audit is inspected, then events contain no label, email, token or assertion material. | secret-free synthetic audit capture |
 | PASS-29 | Given active proof/add, when revoke-all wins before commit, then the revoked session cannot complete management. | controlled race plus write count; reverse-order case too |
-| PASS-30 | Given a removed row, when success copy is shown, then it does not claim provider erasure or sign-out of sessions. | exact copy snapshot + no revoke-all call |
+| PASS-30 | Given existing account sessions and unrevoked native REST credentials, when either add or remove commits, then every old session and native REST credential is revoked. | store counts zero in the same transaction; old cookie/bearer rejected; no substitute browser revoke-all call; copy reports recovery but never provider erasure |
 | PASS-31 | Given nine historical rows, when inventory is read, then no partial list or mutation controls are exposed and incomplete-inventory copy replaces Retry. | bounded ninth-row fixture + nonretryable error/body + zero mutation count |
 
 ### Proposed executable checks and existing test seams
@@ -470,7 +522,7 @@ are a future acceptance handoff, not claims that a runnable management feature
 or suite exists today. Every future file must name the relevant PASS-* IDs.
 
 ```sh
-# Future deterministic store adapter: PASS-09..14,16..17,25,28..29,31.
+# Future deterministic store adapter: PASS-09..14,16..17,25,28..31.
 python3 scripts/cargo_cache.py run -- test --manifest-path workers/api/Cargo.toml --test passkey_management_acceptance
 # Future local mocked UI bank (run from apps/web): PASS-01..08,15,18..27,30..31.
 pnpm exec playwright test tests/passkey-management.spec.ts --workers=1
@@ -499,8 +551,9 @@ These were inspected statically, not executed as feature evidence.
 
 Unknown: live RP/origin and schema state; existing fallback proofability and
 independent recovery; provider/authenticator interoperability; backup metadata
-retention; authoritative audit durability; migration/locking fit for intents,
-opaque IDs and revision; tested maximum inventory in deployed accounts; real
+retention; authoritative audit durability; shared-writer transaction/locking fit
+for passkey effects, session/native-REST recovery revocation, intents, opaque IDs
+and revision; tested maximum inventory in deployed accounts; real
 browser timings and accessibility outcomes. No deployment, credential ceremony,
 API probe, migration, host change or production validation was performed.
 
@@ -509,8 +562,12 @@ possible **at-most-one-day** slices are: (1) read-only owned inventory/opaque-ID
 contract with tests; (2) offline inventory UI/unknown states; (3) management-proof
 intent model and race tests; (4) authenticated add contract; (5) guarded remove
 contract; (6) mocked accessible UI and regression evidence. Each slice must stay
-disabled/nonoperational until its dependencies and security gates pass. These
-are estimates, not authorizations. If any transaction/proof/backend slice cannot
+disabled/nonoperational until its dependencies and security gates pass. Add and
+remove specifically depend on the separately authorized atomic recovery
+integration in section 1; its scope/one-day feasibility is not established here,
+so it is explicitly **NO-GO**, not silently included in these estimates. No
+recovery build card is created. These are estimates, not authorizations. If any
+transaction/proof/backend slice cannot
 be independently reviewed inside one day, it is **NO-GO pending a smaller design**,
 not permission to start a multi-day implementation. Last-key removal and rename
 remain separate NO-GO/deferred work, never silently bundled.
