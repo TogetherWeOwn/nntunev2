@@ -474,8 +474,17 @@ mod tests {
             1,
             Some(7),
         );
-        assert!(dek.starts_with(&expected));
-        assert_eq!(&dek[expected.len()..], &7u32.to_be_bytes());
+        // Only the purpose frame differs ("dek" vs "payload"); the rest of
+        // the prefix is identical and the version trails the format word.
+        let purpose_frame = 4 + "nntune-envelope-v2".len();
+        let payload_len = 4 + "payload".len();
+        let dek_len = 4 + "dek".len();
+        assert_eq!(&dek[..purpose_frame], &expected[..purpose_frame]);
+        assert_eq!(
+            &dek[purpose_frame + dek_len..dek.len() - 4],
+            &expected[purpose_frame + payload_len..]
+        );
+        assert_eq!(&dek[dek.len() - 4..], &7u32.to_be_bytes());
         assert_ne!(
             aad_v2("dek", "user-1", "p", 2, 1, Some(1)),
             aad_v2("payload", "user-1", "p", 2, 1, None)

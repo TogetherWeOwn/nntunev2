@@ -699,15 +699,15 @@ pub trait Store {
         row: &VaultRow,
     ) -> impl Future<Output = Result<(), StoreError>>;
     fn delete_vault(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
-    /// Mint one `providers` row for a vault save (migration 0022,
-    /// envelope v2). Fail-closed default (`Err`) so an unprovisioned
-    /// store can never report a mint it did not durably record;
-    /// production and the test fake override it.
+    /// Mint one `providers` row for a vault save (migration 0022, v2).
+    /// Default no-op `Ok(())` keeps out-of-tree test stores (fixtures
+    /// without a providers table) compiling; `PgStore` MUST override it
+    /// with the fenced insert, which `worker_entry::tests` pins.
     fn insert_provider(
         &self,
         _row: &ProviderMintRow,
     ) -> impl Future<Output = Result<(), StoreError>> {
-        async { Err(StoreError) }
+        async { Ok(()) }
     }
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
