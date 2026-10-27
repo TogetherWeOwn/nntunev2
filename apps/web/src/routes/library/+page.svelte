@@ -422,7 +422,10 @@
 	}
 
 	function shortTitle(title: string): string {
-		return title.length > 70 ? `${title.slice(0, 69)}…` : title;
+		// Count code points, not UTF-16 units: slicing between a surrogate pair
+		// would announce a lone surrogate before the ellipsis.
+		const points = Array.from(title);
+		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
 	}
 
 	/**
