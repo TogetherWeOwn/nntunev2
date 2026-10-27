@@ -1,8 +1,8 @@
 /**
  * Playback queue: pure, immutable state transitions so the panel, the
  * transport buttons and the MediaSession handlers all share one model.
- * Navigation clamps at both ends (no wrap): `next` on the last track is
- * where playback ends, which is what the `ended` event relies on.
+ * Explicit navigation clamps at both ends (no wrap). Natural completion
+ * uses its own policy so repeat never traps a deliberate Next.
  */
 
 export interface Track {
@@ -64,6 +64,40 @@ export function nextTrack(state: QueueState): QueueState {
 	return { ...state, currentIndex: state.currentIndex + 1 };
 }
 
+export type RepeatMode = 'off' | 'one' | 'queue';
+
+export interface NaturalEndContext {
+	repeat: RepeatMode;
+	radioActive: boolean;
+	continueRadio: boolean;
+	/** Playback intent before completion, not the native element's paused flag. */
+	playing: boolean;
+	validEnd: boolean;
+	sleepComplete: boolean;
+}
+
+export interface NaturalEndResult {
+	queue: QueueState;
+	/** `play` starts from zero; `radio` delegates to the existing radio pass. */
+	action: 'play' | 'stop' | 'radio' | 'ignore';
+}
+
+/** Natural completion may replay/wrap; explicit navigation remains clamped. */
+export function naturalEndPolicy(state: QueueState, context: NaturalEndContext): NaturalEndResult {
+	if (!context.validEnd || !context.playing || !currentTrack(state)) {
+		return { queue: state, action: 'ignore' };
+	}
+	if (context.sleepComplete) return { queue: state, action: 'stop' };
+	if (context.radioActive) return { queue: state, action: 'radio' };
+	if (context.repeat === 'one') return { queue: state, action: 'play' };
+	const advanced = nextTrack(state);
+	if (advanced !== state) return { queue: advanced, action: 'play' };
+	if (context.repeat === 'queue') {
+		return { queue: selectTrack(state, 0), action: 'play' };
+	}
+	return { queue: state, action: context.continueRadio ? 'radio' : 'stop' };
+}
+
 export function previousTrack(state: QueueState): QueueState {
 	if (state.currentIndex <= 0) return state;
 	return { ...state, currentIndex: state.currentIndex - 1 };
@@ -113,6 +147,127 @@ export function moveTrack(state: QueueState, from: number, to: number): QueueSta
 		tracks,
 		currentIndex: currentId === null ? state.currentIndex : tracks.findIndex((t) => t.id === currentId)
 	};
+}
+
+/** Jump to either end without changing the current track or allocating on a no-op. */
+export function moveToTop(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, 0);
+}
+
+export function moveToBottom(state: QueueState, index: number): QueueState {
+	return moveTrack(state, index, state.tracks.length - 1);
+}
+
+/** One-shot Fisher–Yates over the upcoming suffix; prefix/current stay fixed. */
+export function shuffleUpcoming(state: QueueState, random: () => number = Math.random): QueueState {
+	const start = state.currentIndex + 1;
+	if (state.currentIndex < 0 || state.tracks.length - start < 2) return state;
+	const tracks = [...state.tracks];
+	for (let i = tracks.length - 1; i > start; i -= 1) {
+		const j = start + Math.floor(random() * (i - start + 1));
+		[tracks[i], tracks[j]] = [tracks[j]!, tracks[i]!];
+	}
+	return { ...state, tracks };
+}
+
+/**
+ * Remove the track at `index`. The current *track* (not the slot) stays
+ * current: removing ahead of it shifts the index down, removing it advances
+ * playback to the following track (or the new last track when the tail
+ * played), and removing the only track empties the queue.
+ */
+export function removeTrack(state: QueueState, index: number): QueueState {
+	const len = state.tracks.length;
+	if (!Number.isInteger(index) || index < 0 || index >= len) return state;
+	const tracks = [...state.tracks];
+	tracks.splice(index, 1);
+	if (tracks.length === 0) return { tracks, currentIndex: -1 };
+	let currentIndex = state.currentIndex;
+	if (index < currentIndex) currentIndex -= 1;
+	else if (index === currentIndex) currentIndex = Math.min(currentIndex, tracks.length - 1);
+	return { tracks, currentIndex };
+}
+
+/**
+ * Move the track at `index` to play immediately after the current track,
+ * reusing `moveTrack` so the current track identity is preserved and the
+ * track is never duplicated. A no-op on the current track itself.
+ */
+export function playNext(state: QueueState, index: number): QueueState {
+	const len = state.tracks.length;
+	if (!Number.isInteger(index) || index < 0 || index >= len) return state;
+	if (state.currentIndex < 0 || index === state.currentIndex) return state;
+	const to = index < state.currentIndex ? state.currentIndex : state.currentIndex + 1;
+	return moveTrack(state, index, to);
+}
+
+/**
+ * Drop every track before the current one, keeping the current track and
+ * everything after it in arranged order. The current *track* (not the
+ * slot) stays current, so the index rewinds to 0. Queue-only edit: never
+ * touches transport, position or providers. A no-op (same state) without
+ * a valid in-range integer selection or when nothing precedes current.
+ */
+export function keepCurrentAndUpcoming(state: QueueState): QueueState {
+	if (
+		!Number.isInteger(state.currentIndex) ||
+		state.currentIndex <= 0 ||
+		state.currentIndex >= state.tracks.length
+	) {
+		return state;
+	}
+	return { tracks: state.tracks.slice(state.currentIndex), currentIndex: 0 };
+}
+
+/**
+ * Drop every track after the current one, keeping the prefix and the
+ * current track in arranged order. The current track keeps its slot, so
+ * the index is unchanged. Queue-only edit: never touches transport,
+ * position or providers. A no-op (same state) without a valid in-range
+ * integer selection or when nothing follows current.
+ */
+export function clearUpcoming(state: QueueState): QueueState {
+	if (
+		!Number.isInteger(state.currentIndex) ||
+		state.currentIndex < 0 ||
+		state.currentIndex >= state.tracks.length - 1
+	) {
+		return state;
+	}
+	return {
+		tracks: state.tracks.slice(0, state.currentIndex + 1),
+		currentIndex: state.currentIndex
+	};
+}
+
+/** Keep display metadata on one line, including title/id fallbacks. */
+function exportField(value: string | null | undefined): string {
+	return (value ?? '').replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+}
+
+function exportLabel(track: Track): string {
+	const title = exportField(track.title) || exportField(track.id);
+	const artist = exportField(track.artist);
+	return artist ? `${title} — ${artist}` : title;
+}
+
+/** Read-only export of the whole arranged queue, independent of selection. */
+export function formatQueueText(state: QueueState): string {
+	return state.tracks.map((track, index) => `${index + 1}. ${exportLabel(track)}`).join('\n');
+}
+
+/** Preserve identifier-shaped catalogue ids exactly; never turn an id into a URL or directive. */
+function exportTrackId(id: string): string {
+	if (!/^[\p{L}\p{N}_-]+$/u.test(id)) throw new Error('Cannot export an unsafe track id.');
+	return id;
+}
+
+/** Offline list of stable ids, deliberately not a playlist of stream URLs. */
+export function formatQueueM3U(state: QueueState): string {
+	return [
+		'#EXTM3U',
+		...state.tracks.flatMap((track) => [`#EXTINF:-1,${exportLabel(track)}`, exportTrackId(track.id)])
+	].join('\n');
 }
 
 /** In-session persistence (sessionStorage): order + current track id only. */

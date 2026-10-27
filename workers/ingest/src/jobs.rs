@@ -92,6 +92,18 @@ pub struct JobCheckpoint {
     /// checkpoints readable (they resume unattributed).
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Verified audio inputs awaiting `Transcoding`, recorded by
+    /// `Verifying` on `Complete` (see
+    /// [`TranscodeInput`](crate::transcode::TranscodeInput)). Empty
+    /// until verify runs; `#[serde(default)]` keeps pre-existing
+    /// checkpoints readable (they record on their next verify).
+    #[serde(default)]
+    pub transcode_inputs: Vec<crate::transcode::TranscodeInput>,
+    /// Index of the next input `Transcoding` must encode. Advances
+    /// past each published artifact; `#[serde(default)]` restarts
+    /// pre-existing checkpoints at the first input.
+    #[serde(default)]
+    pub transcode_next: usize,
 }
 
 /// Advance one step on success. `repair_needed` is only read in `Verifying`.
@@ -334,6 +346,8 @@ mod tests {
             failure_code: None,
             failure_reason: None,
             provider_id: None,
+            transcode_inputs: Vec::new(),
+            transcode_next: 0,
         }
     }
 
@@ -423,6 +437,37 @@ mod tests {
         });
         let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
         assert!(legacy_cp.provider_id.is_none());
+    }
+
+    #[test]
+    fn checkpoint_transcode_cursor_roundtrips_with_legacy_default() {
+        let mut cp = checkpoint_at(JobState::Transcoding);
+        cp.transcode_inputs = vec![crate::transcode::TranscodeInput {
+            file_index: 0,
+            key: "ingest-scratch/job_0123456789abcdef/r1/in/0000-aabb".to_string(),
+            sha256: "a".repeat(64),
+            size: 512,
+            scratch_prefix: "ingest-scratch/job_0123456789abcdef/r1/".to_string(),
+        }];
+        cp.transcode_next = 1;
+        let back: JobCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(back, cp);
+        assert_eq!(back.transcode_inputs.len(), 1);
+        assert_eq!(back.transcode_next, 1);
+
+        let legacy = serde_json::json!({
+            "job_id": "job_0123456789abcdef",
+            "user_id": "user_01",
+            "idempotency_key": format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            "source": "nzb_upload",
+            "state": "transcoding",
+            "attempt": 1,
+            "failure_reason": null,
+        });
+        let legacy_cp: JobCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_cp.transcode_inputs.is_empty());
+        assert_eq!(legacy_cp.transcode_next, 0);
     }
 
     #[test]
