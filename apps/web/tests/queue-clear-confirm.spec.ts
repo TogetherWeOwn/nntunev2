@@ -499,7 +499,7 @@ test('QC-B06 auth teardown dismisses an open confirm without acting; Retry start
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(confirmButton(page)).toHaveCount(0);
 	await expect(cancelButton(page)).toHaveCount(0);
-	await expect(announcement(page)).toHaveText('');
+	await expect(announcement(page)).toHaveCount(0);
 
 	// The next account retries into a clean queue with no resurrected dialog.
 	payload.current = [{ id: 'row-bravo', title: 'Bravo Song' }];
