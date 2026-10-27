@@ -213,7 +213,7 @@ ceremony; they must not be logged or persisted by the client.
 
 | Proposed route | Request | Response and policy |
 | --- | --- | --- |
-| GET `/v1/passkeys` | no account selector | 200 `{revision,items:[{id,label,created_at,last_used_at:null,backup_state:"unknown"}],can_remove_last:false}`; stable creation-time then ID ordering, max eight rows; times Unix seconds, nullable where not known |
+| GET `/v1/passkeys` | no account selector | 200 `{revision,items:[{id,label,created_at,last_used_at:null,backup_state:"unknown"}],can_remove_last:false}`; stable creation-time then ID ordering, max eight rows; times Unix seconds, nullable where not known; historical overflow is a non-200 passkey_inventory_overflow error, never partial success |
 | POST `/v1/passkeys/authorize/start` | `{action:"add"\|"remove",target_id?:string,revision}` | 200 `{intent_id,challenge,rp_id,allow_credentials,expires_at}`; target required only for remove; authenticated account's eligible existing credentials only; exclude target from remove proof |
 | POST `/v1/passkeys/authorize/finish` | `{intent_id,challenge,credential_id,authenticator_data,client_data_json,signature}` | 200 `{authorized:true,expires_at}`; authorization remains server-side, one action, no bearer grant returned |
 | POST `/v1/passkeys/add/start` | `{intent_id,label?:string}` | 200 `{challenge,user_id,rp_id,exclude_credentials,expires_at}`; fresh, authorized add intent only; exclude this account's existing credentials; distinct management-add purpose |
@@ -238,8 +238,9 @@ unbounded row growth, and deny storage failure closed. Authenticated throttle
 uses registered rate_limited plus Retry-After; never silently retry mutations.
 These numbers are review proposals, not observed limits. Detect historical
 inventory overflow with a bounded ninth-row sentinel; never silently truncate
-an account to eight rows. Overflow returns service_unavailable with incomplete
-inventory copy and disables mutations pending an approved complete-list design.
+an account to eight rows. Overflow returns nonretryable 409
+passkey_inventory_overflow with no items, and disables mutations pending an
+approved complete-list design. Read retries cannot fix this structural condition.
 
 ### 3.3 Atomicity, removal and failure semantics
 
@@ -294,6 +295,7 @@ current registry (they would become internal_error). Offline `error_code` and
 | 409 passkey_inventory_changed (new) | stale_inventory | refetch_then_reconfirm |
 | 409 passkey_last_required (new) | last_passkey | add_another; final removal stays unavailable |
 | 409 passkey_limit_reached (new) | inventory_limit | remove_an_unneeded_key_first |
+| 409 passkey_inventory_overflow (new; nonretryable) | inventory_overflow | stop_mutations_pending_complete_list_design |
 | 409 passkey_duplicate (new) | duplicate_credential | choose_another_authenticator; generic for foreign collision too |
 | 422 validation_failed | invalid_label | correct_label |
 | 429 rate_limited | rate_limited | wait_retry_after; explicit retry only |
@@ -322,6 +324,7 @@ If trustworthy backup flags are later supported, copy can say “Can sync” ver
 | Empty, authenticated success | “No passkeys are listed.”; explain initial signup is not add; add unavailable until a supported enrollment/recovery path is approved; do not call signup or infer a lost account |
 | Loaded | rows plus “Add another passkey”; optional label input only when add is chosen; no automatic ceremony on mount |
 | Read failed | “Could not load passkeys. Your passkeys have not been changed.” and Retry; no mutations from stale rows |
+| Historical inventory overflow | “Your full passkey list cannot be shown here. No passkeys have been changed.”; show no partial rows, add/remove unavailable, no retry loop; an approved complete-list design is required |
 | Add proving/creating | “Confirm it’s you to add a passkey” then “Create another passkey”; disable conflicting actions; explicit Cancel, one in-flight action |
 | Add complete | refetch confirmed row, polite “Passkey added.”, focus new row heading; never replace the signed-in identity or navigate to onboarding |
 | Remove confirmation | “Remove ‘<label / ordinal>’?” and “You won’t be able to use this passkey to sign in to NNTune. It may remain on your device or in your passkey provider. Existing sessions stay signed in.”; Cancel primary/default focus, separate destructive “Confirm remove” |
@@ -369,7 +372,7 @@ in-memory view; denied browser storage must not break the page.
 
 | Threat | Required mitigation / evidence before build approval |
 | --- | --- |
-| Stolen cookie, remove-then-add takeover | active/fresh session plus existing-key management-bound proof for each action; new key never self-authorizes; remove proof uses a surviving key; test action/session/target substitution and chained attempts |
+| Stolen cookie, remove-then-add takeover | active/fresh session plus existing-key management-bound proof for each mutation (add/remove), not the cookie-authenticated inventory read; new key never self-authorizes; remove proof uses a surviving key; test action/session/target substitution and chained attempts |
 | Shared-device or synced credential residue | no claim of provider erasure/session revocation; no inventory persistence; explicit residue copy and separate sign-out-everywhere action |
 | Login/signup/reauth ceremony confusion | dedicated management purposes, RP/origin checks and intent scope; reject login or registration proof in management, and vice versa; no email/account selector |
 | Cross-account enumeration/residue | authenticate before lookup, opaque management IDs, no public lists, generic foreign/missing/duplicate outcomes, no response/log metadata leaks, late-result account fence |
@@ -407,15 +410,21 @@ credential doubles before navigation; unexpected external/product traffic fails
 the test. No actual navigator ceremony, account, inbox token or stored passkey.
 Use synthetic actor A/B, opaque IDs pk_a/pk_b and fixed Unix times only.
 
-Compact future fixture set (embedded here to avoid a second source of truth):
+Compact future fixture set (embedded here to avoid a second source of truth).
+Use clock now=1800000000 and browser timezone UTC. Expand each row ID into the
+GET item shape with label “Passkey”, created_at=1799999000, last_used_at=null
+and backup_state="unknown". Proof keys below belong to the stated actor's rows;
+all other proof checks pass unless a case overrides them. The last-key fixture
+is a preflight/guard denial: proof_key=null because no surviving key is eligible,
+not a claim that removal can proceed without proof.
 
 ```json
 [
   {"fixture":"two","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"error_code":null,"next_action":"announce_removed"},
-  {"fixture":"last","actor":"A","revision":7,"rows":["pk_a"],"target":"pk_a","expect_count":1,"error_code":"last_passkey","next_action":"add_another"},
-  {"fixture":"foreign","actor":"B","revision":7,"rows":["pk_b"],"target":"pk_a","expect_count":1,"error_code":"unknown_or_foreign","next_action":"refetch"},
-  {"fixture":"stale","actor":"A","revision":6,"current_revision":7,"rows":["pk_a","pk_b"],"target":"pk_a","expect_count":2,"error_code":"stale_inventory","next_action":"refetch_then_reconfirm"},
-  {"fixture":"storage","actor":"A","revision":7,"rows":["pk_a","pk_b"],"target":"pk_a","expect_count":2,"error_code":"storage_unavailable","next_action":"retain_safe_state_then_retry_read"}
+  {"fixture":"last","actor":"A","revision":7,"rows":["pk_a"],"proof_key":null,"target":"pk_a","expect_count":1,"error_code":"last_passkey","next_action":"add_another"},
+  {"fixture":"foreign","actor":"B","revision":7,"rows":["pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":1,"error_code":"unknown_or_foreign","next_action":"refetch"},
+  {"fixture":"stale","actor":"A","revision":6,"current_revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"error_code":"stale_inventory","next_action":"refetch_then_reconfirm"},
+  {"fixture":"storage","actor":"A","revision":7,"rows":["pk_a","pk_b"],"proof_key":"pk_b","target":"pk_a","expect_count":2,"error_code":"storage_unavailable","next_action":"retain_safe_state_then_retry_read"}
 ]
 ```
 
@@ -451,6 +460,7 @@ Compact future fixture set (embedded here to avoid a second source of truth):
 | PASS-28 | Given successful/denied/failed actions, when audit is inspected, then events contain no label, email, token or assertion material. | secret-free synthetic audit capture |
 | PASS-29 | Given active proof/add, when revoke-all wins before commit, then the revoked session cannot complete management. | controlled race plus write count; reverse-order case too |
 | PASS-30 | Given a removed row, when success copy is shown, then it does not claim provider erasure or sign-out of sessions. | exact copy snapshot + no revoke-all call |
+| PASS-31 | Given nine historical rows, when inventory is read, then no partial list or mutation controls are exposed and incomplete-inventory copy replaces Retry. | bounded ninth-row fixture + nonretryable error/body + zero mutation count |
 
 ### Proposed executable checks and existing test seams
 
@@ -460,9 +470,9 @@ are a future acceptance handoff, not claims that a runnable management feature
 or suite exists today. Every future file must name the relevant PASS-* IDs.
 
 ```sh
-# Future deterministic store adapter: PASS-09..14,16..17,25,28..29.
+# Future deterministic store adapter: PASS-09..14,16..17,25,28..29,31.
 python3 scripts/cargo_cache.py run -- test --manifest-path workers/api/Cargo.toml --test passkey_management_acceptance
-# Future local mocked UI bank (run from apps/web): PASS-01..08,15,18..27,30.
+# Future local mocked UI bank (run from apps/web): PASS-01..08,15,18..27,30..31.
 pnpm exec playwright test tests/passkey-management.spec.ts --workers=1
 ```
 
@@ -506,8 +516,8 @@ not permission to start a multi-day implementation. Last-key removal and rename
 remain separate NO-GO/deferred work, never silently bundled.
 
 **Static-spec acceptance is distinct from product QA.** Source contracts,
-proposal boundaries, 30 stable cases and missing proof are inspectable here.
-Runtime cases PASS-01 through PASS-30 are NOT RUN. There is no staging PASS or
+proposal boundaries, 31 stable cases and missing proof are inspectable here.
+Runtime cases PASS-01 through PASS-31 are NOT RUN. There is no staging PASS or
 launch GO. A later QA verdict must identify the exact tested head and attach
 actual per-case evidence before claiming the feature works.
 
