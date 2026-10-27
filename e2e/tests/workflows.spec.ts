@@ -1150,16 +1150,12 @@ test.describe('locked-dependency coverage builds (static pin)', () => {
 });
 
 test.describe('locked-dependency ci builds (static pin)', () => {
-  // The api job is the audited auth/vault-crypto set: its test/clippy/check
-  // steps pass --locked so a missing or stale workers/api/Cargo.lock fails
-  // the build instead of silently re-resolving. Nothing stops a future edit
-  // from dropping one flag while every suite stays green — these cases pin
-  // the three flags offline so such an edit reds test:unit. The
-  // mb/ingest/repair jobs deliberately resolve unlocked (README Test
-  // section); that asymmetry is pinned here too, so a deliberate policy
-  // change must update prose + pin together instead of drifting apart.
-  // `cargo fmt` takes no --locked flag and is excluded from both pins; the
-  // fmt steps still have to exist so the exclusion stays deliberate.
+  // All four standalone Worker jobs pass --locked to every compiling
+  // test/clippy/check invocation, including wasm32 checks and clippy, so
+  // missing or stale committed lockfiles fail instead of silently
+  // re-resolving. Pin each invocation independently and keep the README's
+  // four-Worker scope distinct from the workspace's single locked probe.
+  // `cargo fmt` takes no --locked flag; its commands stay unchanged.
   const stripFullLineComments = (text: string): string =>
     text.replace(/^[ \t]*#.*$/gm, '');
   const ciCode = stripFullLineComments(ciWorkflow);
@@ -1263,39 +1259,19 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       .filter((invocation) => !literalEcho.test(stripRunPrefix(invocation)))
       .filter((invocation) => cargoVerb.test(invocation));
   };
-  // `--frozen` is cargo's alias for `--locked --offline` (cargo --help), so
-  // it resolves locked and the unlocked pin must see it. Token boundaries
-  // keep pnpm's `--frozen-lockfile` from ever matching.
+  // `--frozen` is cargo's alias for `--locked --offline` (cargo --help).
+  // Token boundaries keep pnpm's `--frozen-lockfile` from ever matching.
   const hasLockedFlag = (command: string): boolean =>
     /(?:^|\s)--(?:locked|frozen)(?:\s|$)/.test(command);
 
-  const assertApiLocked = (workflow: string) => {
-    for (const verb of ['test', 'clippy', 'check']) {
-      const steps = jobCargoSteps(workflow, 'api', verb);
-      expect(steps.length, `api job must keep a cargo ${verb} step`).toBeGreaterThan(0);
-      for (const step of steps) {
-        expect(step, `api cargo ${verb} step must target workers/api`).toContain(
-          'workers/api/Cargo.toml',
-        );
-        expect(
-          hasLockedFlag(step),
-          `api cargo ${verb} step lost its --locked flag: ${step.trim()}`,
-        ).toBe(true);
-      }
-    }
-    expect(
-      jobCargoSteps(workflow, 'api', 'fmt').length,
-      'api job must keep a cargo fmt step',
-    ).toBeGreaterThan(0);
-  };
-
-  const UNLOCKED_JOBS = [
+  const LOCKED_JOBS = [
+    { job: 'api', crate: 'api' },
     { job: 'rust-mb', crate: 'mb' },
     { job: 'rust-ingest', crate: 'ingest' },
     { job: 'rust-repair', crate: 'repair' },
   ] as const;
 
-  const assertJobUnlocked = (workflow: string, job: string, crate: string) => {
+  const assertJobLocked = (workflow: string, job: string, crate: string) => {
     for (const verb of ['test', 'clippy', 'check']) {
       const steps = jobCargoSteps(workflow, job, verb);
       expect(steps.length, `${job} must keep a cargo ${verb} step`).toBeGreaterThan(0);
@@ -1305,104 +1281,55 @@ test.describe('locked-dependency ci builds (static pin)', () => {
         );
         expect(
           hasLockedFlag(step),
-          `${job} cargo ${verb} step resolves unlocked per the README Test section: ${step.trim()}`,
-        ).toBe(false);
+          `${job} cargo ${verb} step lost its --locked flag: ${step.trim()}`,
+        ).toBe(true);
       }
     }
     expect(
-      jobCargoSteps(workflow, job, 'fmt').length,
-      `${job} must keep a cargo fmt step`,
-    ).toBeGreaterThan(0);
+      jobCargoSteps(workflow, job, 'fmt').map((step) => step.trim()),
+      `${job} formatting stays unchanged`,
+    ).toEqual([`- run: cargo fmt --manifest-path workers/${crate}/Cargo.toml -- --check`]);
   };
 
-  const assertReadmeAsymmetry = (prose: string) => {
-    // The exact policy sentences: only api locks, the other three Worker
-    // jobs resolve unlocked. A policy change rewrites these lines and the
-    // job pins above in the same PR — or this reds.
-    expect(prose).toContain('only the api job passes --locked to test/clippy/check');
-    expect(prose).toContain('rust (workers/mb)');
-    expect(prose).toContain('rust (workers/ingest)');
-    expect(prose).toContain('rust (workers/repair)');
-    expect(prose).toContain('jobs resolve without --locked');
-  };
-
-  test('api job passes --locked to test/clippy/check', () => {
-    assertApiLocked(ciCode);
-  });
-
-  test('mb/ingest/repair jobs resolve without --locked (documented asymmetry)', () => {
-    for (const { job, crate } of UNLOCKED_JOBS) {
-      assertJobUnlocked(ciCode, job, crate);
+  const assertReadmeLockedWorkers = (prose: string) => {
+    const testSection = prose.split('### Test\n')[1]!.split('\n## ')[0]!;
+    expect(testSection).toContain('the workspace and api/mb/ingest/repair lockfiles');
+    expect(testSection).toContain('Those four Worker jobs also pass --locked to every test/clippy/check');
+    expect(testSection).toContain('including wasm32 checks and clippy');
+    expect(testSection).toContain('Formatting checks are unchanged.');
+    expect(testSection).toContain('The workspace rust-test job separately pins one --locked probe:');
+    expect(testSection).toContain('nntune-core --no-default-features.');
+    expect(testSection).not.toContain('only the api job passes --locked');
+    expect(testSection).not.toContain('jobs resolve without --locked');
+    for (const { crate } of LOCKED_JOBS) {
+      expect(testSection).toContain(
+        `cargo test --locked --manifest-path workers/${crate}/Cargo.toml --all-targets`,
+      );
     }
+  };
+
+  for (const { job, crate } of LOCKED_JOBS) {
+    test(`${job} passes --locked to every test/clippy/check, leaving fmt unchanged`, () => {
+      assertJobLocked(ciCode, job, crate);
+    });
+  }
+
+  test('README Test section documents all four locked Workers and the workspace distinction', () => {
+    assertReadmeLockedWorkers(readme);
   });
 
-  test('README Test section documents the locked/unlocked asymmetry', () => {
-    assertReadmeAsymmetry(readme);
-  });
-
-  test('mutants dropping or adding a --locked flag trip the pins above', () => {
-    // Regression proof for the shared guards: each mutant models one flag
-    // edit and must throw the same helpers the real pins call (not a
-    // restated copy of the expectations).
-    const dropTest = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --manifest-path workers/api/Cargo.toml',
-    );
-    const dropClippy = ciCode.replace(
-      'cargo clippy --locked --manifest-path workers/api/Cargo.toml',
-      'cargo clippy --manifest-path workers/api/Cargo.toml',
-    );
-    const dropCheck = ciCode.replace(
-      'cargo check --locked --manifest-path workers/api/Cargo.toml',
-      'cargo check --manifest-path workers/api/Cargo.toml',
-    );
-    // Trailing-comment bypass: the flag in a `#` comment is not a flag.
-    const commentFlag = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --manifest-path workers/api/Cargo.toml # --locked',
-    );
-    // Chained-invocation bypass: splitting the api test step into two
-    // `cargo test` invocations on one run line must not let one --locked
-    // token credit the sibling. Both orders must throw.
-    const chainLockedFirst = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && cargo test --manifest-path workers/api/Cargo.toml --doc',
-    );
-    const chainLockedSecond = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --manifest-path workers/api/Cargo.toml --lib && cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
-    );
-    // Separator-branch coverage: every alternative in the split pattern
-    // needs its own mutant, or narrowing the split stays green. Semicolon
-    // locked-first, OR locked-second (&& covers both orders above).
-    const chainSemiLockedFirst = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib; cargo test --manifest-path workers/api/Cargo.toml --doc',
-    );
-    const chainOrLockedSecond = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --manifest-path workers/api/Cargo.toml --lib || cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
-    );
-    // Bare-separator bypass: background (&) and pipe (|) chain invocations
-    // too. Ampersand locked-first with a trailing wait, pipe locked-second.
-    const chainAmpLockedFirst = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib & cargo test --manifest-path workers/api/Cargo.toml --doc & wait',
-    );
-    const chainPipeLockedSecond = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --manifest-path workers/api/Cargo.toml --lib | cargo test --locked --manifest-path workers/api/Cargo.toml --doc',
-    );
-    // Quoted-cargo false positive: an echo printing an unlocked cargo
-    // command after a locked one must NOT trip the pin — echo writes its
-    // argument, it does not execute it.
-    const echoPrintsUnlocked = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml',
-      'cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo "cargo test --manifest-path workers/api/Cargo.toml --doc"',
-    );
-    // Wrappers must not hide a sibling invocation while a plain command
-    // still satisfies the verb-presence check. Exercise both policy sides,
-    // and keep correctly locked/unlocked wrappers valid (not blanket-red).
+  test('mutants dropping any compiling flag or hiding an unlocked sibling trip the pins', () => {
+    // Every mutation must change exactly one real command, then exercise
+    // the same guard as the live workflow. A stale replacement cannot pass
+    // just because another command already violates the policy.
+    const replaceCommand = (command: string, replacement: string): string => {
+      expect(ciCode.split(command), `unique mutation target: ${command}`).toHaveLength(2);
+      expect(replacement).not.toBe(command);
+      return ciCode.replace(command, () => replacement);
+    };
+    // Wrappers must not hide an unlocked sibling while a plain locked
+    // command still satisfies verb presence. Correctly locked wrappers
+    // remain valid, rather than making every wrapped command blanket-red.
     const wrappers: Array<(command: string) => string> = [
       (command) => `timeout 600 ${command}`,
       (command) => `(${command})`,
@@ -1431,7 +1358,7 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       (command) => `${String.raw`echo step \#2`} && ${command}`,
       (command) => `${String.raw`echo step\ #2`} && ${command}`,
       // ANSI-C quotes allow escaped apostrophes; hashes later in the quoted
-      // word must not truncate the executed sibling on either policy side.
+      // word must not truncate the executed sibling in any Worker job.
       (command) => `${String.raw`echo $'step \' #2'`} && ${command}`,
       (command) => `echo step#2 && ${command}`,
       (command) => `echo "note; stage" && ${command}`,
@@ -1442,120 +1369,117 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       (command) => `${command};# --locked`,
       (command) => `echo "step #2" && ${command} # "unterminated --locked`,
     ];
-    for (const wrap of wrappers) {
-      for (const locked of [false, true]) {
-        const apiCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml --doc`;
-        const apiSibling = ciCode.replace(
-          'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
-          () => `cargo test --locked --manifest-path workers/api/Cargo.toml --lib && ${wrap(apiCommand)}`,
-        );
-        const mbCommand = `cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml --doc`;
-        const mbSibling = ciCode.replace(
-          'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
-          () => `cargo test --manifest-path workers/mb/Cargo.toml --lib && ${wrap(mbCommand)}`,
-        );
-        if (locked) {
-          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).not.toThrow();
-          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).toThrow();
-        } else {
-          expect(() => assertApiLocked(apiSibling), wrap(apiCommand)).toThrow();
-          expect(() => assertJobUnlocked(mbSibling, 'rust-mb', 'mb'), wrap(mbCommand)).not.toThrow();
-        }
-      }
-    }
-    const echoPrintsSingleQuoted = ciCode.replace(
-      'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
-      "cargo test --locked --manifest-path workers/api/Cargo.toml --lib && echo 'cargo test --manifest-path workers/api/Cargo.toml --doc'",
-    );
-    expect(() => assertApiLocked(echoPrintsSingleQuoted)).not.toThrow();
-    // A separator inside literal echo text must not fabricate an executed
-    // Cargo step. Replace the only test invocation so the presence guard
-    // must reject it, regardless of the flags printed in that text.
-    for (const separator of [';', '&&', '||', '&', '|', '|&']) {
-      for (const quote of ["'", '"']) {
-        for (const locked of [false, true]) {
-          const apiEchoOnly = ciCode.replace(
-            'cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets',
-            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/api/Cargo.toml${quote}`,
-          );
-          const mbEchoOnly = ciCode.replace(
-            'cargo test --manifest-path workers/mb/Cargo.toml --all-targets',
-            `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}--manifest-path workers/mb/Cargo.toml${quote}`,
-          );
-          expect(() => assertApiLocked(apiEchoOnly), 'literal echo is not an api test step').toThrow();
-          expect(
-            () => assertJobUnlocked(mbEchoOnly, 'rust-mb', 'mb'),
-            'literal echo is not an mb test step',
-          ).toThrow();
-        }
-      }
-    }
-    // Policy drift the other way: locking an unlocked job without updating
-    // the README asymmetry must trip the unlocked pin.
-    const lockMb = ciCode.replace(
-      'cargo test --manifest-path workers/mb/Cargo.toml',
-      'cargo test --locked --manifest-path workers/mb/Cargo.toml',
-    );
-    const lockIngest = ciCode.replace(
-      'cargo test --manifest-path workers/ingest/Cargo.toml',
-      'cargo test --locked --manifest-path workers/ingest/Cargo.toml',
-    );
-    const lockRepair = ciCode.replace(
-      'cargo test --manifest-path workers/repair/Cargo.toml',
-      'cargo test --locked --manifest-path workers/repair/Cargo.toml',
-    );
-    // `--frozen` is cargo's `--locked --offline` alias: it resolves locked,
-    // so it must trip the unlocked pin exactly like `--locked` does.
-    const frozenMbClippy = ciCode.replace(
-      'cargo clippy --manifest-path workers/mb/Cargo.toml',
-      'cargo clippy --frozen --manifest-path workers/mb/Cargo.toml',
-    );
-    const frozenMbCheck = ciCode.replace(
-      'cargo check --manifest-path workers/mb/Cargo.toml',
-      'cargo check --frozen --manifest-path workers/mb/Cargo.toml',
-    );
-    const frozenRepairWasmClippy = ciCode.replace(
-      'cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
-      'cargo clippy --frozen --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown',
-    );
-    // Prose drift: rewriting the policy sentence without the job pins (or
-    // vice versa) must trip the prose pin.
-    const proseLocksAll = readme.replace(
-      'only the api job passes --locked to test/clippy/check',
-      'every Worker job passes --locked to test/clippy/check',
-    );
-    const proseUnlocksApi = readme.replace(
-      'jobs resolve without --locked',
-      'jobs resolve with --locked',
-    );
+    for (const { job, crate } of LOCKED_JOBS) {
+      assertJobLocked(ciCode, job, crate);
+      const manifest = `--manifest-path workers/${crate}/Cargo.toml`;
+      const testCommand = `cargo test --locked ${manifest} --all-targets`;
+      const lockedCommand = `cargo test --locked ${manifest} --lib`;
+      const unlockedCommand = `cargo test ${manifest} --doc`;
+      const assertLocked = (workflow: string) => assertJobLocked(workflow, job, crate);
 
-    for (const mutant of [
-      dropTest,
-      dropClippy,
-      dropCheck,
-      commentFlag,
-      chainLockedFirst,
-      chainLockedSecond,
-      chainSemiLockedFirst,
-      chainOrLockedSecond,
-      chainAmpLockedFirst,
-      chainPipeLockedSecond,
+      // Mutate every compiling invocation independently. In repair this
+      // includes BOTH clippy invocations, not just the first/native one.
+      const compilingCommands = [
+        testCommand,
+        `cargo clippy --locked ${manifest} --all-targets -- -D warnings`,
+        `cargo check --locked ${manifest} --target wasm32-unknown-unknown`,
+        ...(crate === 'repair'
+          ? [`cargo clippy --locked ${manifest} --target wasm32-unknown-unknown -- -D warnings`]
+          : []),
+      ];
+      for (const command of compilingCommands) {
+        for (const replacement of [
+          command.replace(' --locked', ''),
+          `${command.replace(' --locked', '')} # --locked`,
+          command.replace('--locked', '--frozen-lockfile'),
+        ]) {
+          const mutant = replaceCommand(command, replacement);
+          expect(() => assertLocked(mutant), replacement).toThrow();
+        }
+        // Frozen is a genuine locked/offline alias, not an unlocked path.
+        const frozen = command.replace('--locked', '--frozen');
+        expect(() => assertLocked(replaceCommand(command, frozen)), frozen).not.toThrow();
+      }
+
+      // No separator may let one flag credit its unlocked sibling, in
+      // either order (including background and pipe-stderr execution).
+      for (const separator of ['&&', '||', ';', '&', '|', '|&']) {
+        for (const commands of [
+          [lockedCommand, unlockedCommand],
+          [unlockedCommand, lockedCommand],
+        ]) {
+          const chain = commands.join(` ${separator} `) + (separator === '&' ? ' & wait' : '');
+          const mutant = replaceCommand(testCommand, chain);
+          expect(() => assertLocked(mutant), chain).toThrow();
+        }
+      }
+      for (const wrap of wrappers) {
+        for (const locked of [false, true]) {
+          const command = `cargo test ${locked ? '--locked ' : ''}${manifest} --doc`;
+          const sibling = replaceCommand(testCommand, `${lockedCommand} && ${wrap(command)}`);
+          if (locked) {
+            expect(() => assertLocked(sibling), wrap(command)).not.toThrow();
+          } else {
+            expect(() => assertLocked(sibling), wrap(command)).toThrow();
+          }
+        }
+      }
+      for (const quote of ["'", '"']) {
+        // Printing Cargo text after a real command is harmless.
+        const echoSibling = `${lockedCommand} && echo ${quote}${unlockedCommand}${quote}`;
+        expect(() => assertLocked(replaceCommand(testCommand, echoSibling))).not.toThrow();
+        // An echo cannot replace the only real invocation, even if it
+        // prints a flag or shell separator that would fool a text search.
+        for (const separator of [';', '&&', '||', '&', '|', '|&']) {
+          for (const locked of [false, true]) {
+            const echoOnly = `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}${manifest}${quote}`;
+            const mutant = replaceCommand(testCommand, echoOnly);
+            expect(
+              () => assertLocked(mutant),
+              `literal echo is not a ${job} test step: ${echoOnly}`,
+            ).toThrow();
+          }
+        }
+      }
+      for (const verb of ['test', 'clippy', 'check', 'fmt']) {
+        // Full-line comments cannot supply a missing verb. Remove all
+        // clippy steps together so repair's second step cannot mask it.
+        const commented = ciCode.replace(
+          new RegExp(`^([ \\t]*)- run: cargo ${verb}[^\\n]*workers/${crate}/Cargo\\.toml[^\\n]*$`, 'gm'),
+          '$1# removed compiling/formatting step',
+        );
+        expect(commented, `${job} ${verb} comment mutation must change the workflow`).not.toBe(ciCode);
+        expect(() => assertLocked(commented), `${job} must keep a real ${verb} step`).toThrow();
+      }
+      const fmtCommand = `cargo fmt ${manifest} -- --check`;
+      const lockedFmt = replaceCommand(fmtCommand, `cargo fmt --locked ${manifest} -- --check`);
+      expect(() => assertLocked(lockedFmt), `${job} fmt must not gain --locked`).toThrow();
+    }
+  });
+
+  test('README policy drift trips the same four-Worker contract guard', () => {
+    assertReadmeLockedWorkers(readme);
+    for (const [original, replacement] of [
+      ['api/mb/ingest/repair lockfiles', 'api lockfile'],
+      ['Those four Worker jobs also pass --locked to every test/clippy/check', 'only the api job passes --locked to test/clippy/check'],
+      ['including wasm32 checks and clippy', 'excluding wasm32 checks and clippy'],
+      ['Formatting checks are unchanged.', 'Formatting checks now pass --locked.'],
+      ['The workspace rust-test job separately pins one --locked probe:', 'The workspace rust-test job locks every invocation:'],
+      ['nntune-core --no-default-features.', 'nntune-core --all-features.'],
+      ...LOCKED_JOBS.map(({ crate }) => [
+        `cargo test --locked --manifest-path workers/${crate}/Cargo.toml --all-targets`,
+        `cargo test --manifest-path workers/${crate}/Cargo.toml --all-targets`,
+      ]),
     ]) {
-      expect(() => assertApiLocked(mutant), 'mutant must violate the api locked pin').toThrow();
+      expect(readme.split(original!), `unique prose mutation target: ${original}`).toHaveLength(2);
+      const mutant = readme.replace(original!, replacement!);
+      expect(() => assertReadmeLockedWorkers(mutant), replacement).toThrow();
     }
-    expect(
-      () => assertApiLocked(echoPrintsUnlocked),
-      'echo printing cargo text must not trip the api locked pin',
-    ).not.toThrow();
-    expect(() => assertJobUnlocked(lockMb, 'rust-mb', 'mb')).toThrow();
-    expect(() => assertJobUnlocked(lockIngest, 'rust-ingest', 'ingest')).toThrow();
-    expect(() => assertJobUnlocked(lockRepair, 'rust-repair', 'repair')).toThrow();
-    expect(() => assertJobUnlocked(frozenMbClippy, 'rust-mb', 'mb')).toThrow();
-    expect(() => assertJobUnlocked(frozenMbCheck, 'rust-mb', 'mb')).toThrow();
-    expect(() => assertJobUnlocked(frozenRepairWasmClippy, 'rust-repair', 'repair')).toThrow();
-    for (const mutant of [proseLocksAll, proseUnlocksApi]) {
-      expect(() => assertReadmeAsymmetry(mutant), 'mutant must violate the prose pin').toThrow();
-    }
+    const stalePolicy = readme.replace(
+      'Formatting checks are unchanged.',
+      'Formatting checks are unchanged. Worker jobs resolve without --locked.',
+    );
+    expect(() => assertReadmeLockedWorkers(stalePolicy)).toThrow();
   });
 });
 

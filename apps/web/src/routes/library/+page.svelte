@@ -34,6 +34,7 @@
 		createSelection,
 		hiddenSelectedCount,
 		pruneSelection,
+		selectAllDisplayed,
 		selectRange,
 		selectSelectedItems,
 		selectionCountLabel,
@@ -824,6 +825,10 @@
 		focusAfterSelectedRowRemoval(nextId, previousId);
 	}
 
+	function selectDisplayedIds(): void {
+		selectedIds = selectAllDisplayed(selectedIds, visibleItems.map((track) => track.id));
+	}
+
 	function clearSelectedIds(): void {
 		// Clearing inside Selected only unmounts every row; only focus that
 		// sat inside one of them needs the Show-control fallback.
@@ -1152,11 +1157,16 @@
 				</p>
 			{/if}
 			<div class="nt-selection-bar">
-				<p data-testid="selection-count">{selectionCountLabel(selectedIds.length)}</p>
+				<p data-testid="selection-count" role={loading ? undefined : 'status'}>{selectionCountLabel(selectedIds.length)}</p>
 				{#if selectionAnnouncerMounted}
 					<p class="nt-sr-only" data-testid="selection-announcement" role="status">
 						{selectionAnnouncement}
 					</p>
+				{/if}
+				{#if visibleItems.length > 0}
+					<button class="nt-button" type="button" onclick={selectDisplayedIds}>
+						Select all
+					</button>
 				{/if}
 				<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
 					Clear selection
