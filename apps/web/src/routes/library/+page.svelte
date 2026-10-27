@@ -26,6 +26,7 @@
 		type LibraryOrder
 	} from '#lib/library/order.js';
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
+	import { libraryTabTitle } from '#lib/library/tab-title.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -306,6 +307,9 @@
 		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
 	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const tabTitle = $derived(libraryTabTitle(currentTrack));
+	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
+	const priorDocumentTitle = typeof document === 'undefined' ? null : document.title;
 	const favoriteIds = $derived(new Set(favorites));
 	// Favorites render in star order; ids absent from the current library
 	// stay stored but unlisted (there is no title to show for them).
@@ -1073,6 +1077,10 @@
 		clearSnapshot(browserStorage('local'));
 		void refresh();
 		return () => {
+			// Restore only while this page still owns the title; a newer route's title wins.
+			if (priorDocumentTitle !== null && document.title === tabTitle) {
+				document.title = priorDocumentTitle;
+			}
 			shareAlive = false;
 			clearShareFeedback();
 			pendingShareSeek = null;
@@ -1085,7 +1093,7 @@
 </script>
 
 <svelte:head>
-	<title>Library — NNTune</title>
+	<title>{tabTitle}</title>
 	<meta name="description" content="Your NNTune library, available even when the API is down." />
 </svelte:head>
 
