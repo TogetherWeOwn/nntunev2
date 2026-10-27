@@ -257,7 +257,7 @@ test('LIBTITLE-15 teardown cannot overwrite a newer route title', async ({ mount
 	await check(info, [CORAL_TITLE, 'Newer route — owned elsewhere'], [selected, await page.title()]);
 });
 
-test('LIBTITLE-16 SPA navigation owns the destination title and a new library visit starts empty', async ({ page, baseURL }, info) => {
+test('LIBTITLE-16 SPA navigation owns the destination title and restores the session selection on return', async ({ page, baseURL }, info) => {
 	await seed(page, baseURL!); await add(page, 'title-coral'); await settle(page);
 	const selected = await page.title();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
@@ -267,8 +267,9 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	const destination = await page.title();
 	await navigation.getByRole('link', { name: 'Library', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
-	await expect(page.getByTestId('queue-item')).toHaveCount(0); await settle(page);
-	await check(info, { titles: [CORAL_TITLE, 'NNTune — local NZB selection', BASELINE], marker: 'same-document' }, {
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(queueRow(page, 'title-coral')).toHaveAttribute('aria-current', 'true'); await settle(page);
+	await check(info, { titles: [CORAL_TITLE, 'NNTune — local NZB selection', CORAL_TITLE], marker: 'same-document' }, {
 		titles: [selected, destination, await page.title()],
 		marker: await page.evaluate(() => (window as unknown as { titleNavMarker: string }).titleNavMarker)
 	});
@@ -289,7 +290,11 @@ test('LIBTITLE-17 title updates add no transport, storage, timers, focus, scroll
 		for (const method of ['setItem', 'removeItem', 'clear'] as const) {
 			const original = Storage.prototype[method];
 			Object.defineProperty(Storage.prototype, method, { configurable: true, value(...args: unknown[]) {
-				probe.storage.push(method); return Reflect.apply(original, this, args);
+				// Session queue persistence is independent of title updates.
+				if (!(method === 'setItem' && this === window.sessionStorage && args[0] === 'nntune.library.queue.v1')) {
+					probe.storage.push(method);
+				}
+				return Reflect.apply(original, this, args);
 			} });
 		}
 		for (const method of ['setTimeout', 'setInterval'] as const) {
