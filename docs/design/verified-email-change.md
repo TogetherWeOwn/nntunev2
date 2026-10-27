@@ -51,8 +51,9 @@ is prior art, not evidence that NNTune already supports multiple addresses.
 
 ## 2. Source-verified baseline and gaps
 
-Examined head: `0052c8434924b267f3c7a998312f9051e9779418`. Citations identify
-that snapshot; check named handlers again before implementation.
+Source snapshot: `0052c8434924b267f3c7a998312f9051e9779418`. Citations were
+verified against that snapshot and remain subject to the normal citation lint;
+check named handlers again before implementation.
 
 | Current fact | Evidence / consequence |
 | --- | --- |
@@ -267,7 +268,7 @@ operation is idle. An optional supplied unknown or wrong-owner operation ID
 gets the same 400 cannot_complete without affecting any real operation.
 A freshly authenticated same-user session can rediscover its latest receipt
 without an old tab/operation ID; the 24-hour forward-change hold guarantees no
-second completed transition inside the 48-hour result window's first day.
+second completed forward change inside the 48-hour result window's first day.
 After that, latest means newest creation order; older IDs remain owner-readable
 for their own 48-hour retention. No unauthenticated receipt lookup or listing
 of another user's transitions exists.
@@ -527,7 +528,7 @@ account recovery is performed or promised by completing this document.
 
 | Binding / hook | Source-verified behavior |
 | --- | --- |
-| User and unique email | `workers/api/src/handlers.rs:393-398,1039-1046,1550-1566` separates opaque random ID from email; `migrations/0002_auth_vault.sql:9-25` gives unique email and user-ID-owned passkeys. Normalization is application-level, not a database canonicalization constraint. |
+| User and unique email | `workers/api/src/handlers.rs:393-398,1550-1566` separates opaque user ID from email; `migrations/0002_auth_vault.sql:9-25` gives unique email and user-ID-owned passkeys. Normalization is application-level, not a database canonicalization constraint. |
 | Sessions | `workers/api/src/session.rs:67-79,316-346` contains user/session ID, not email, and checks the live stored row. `workers/api/src/handlers.rs:1231-1284` performs the row lookup on authenticated requests. Native credentials also consult their own live record, independently of sessions (`workers/api/src/handlers.rs:3116-3161`). These are not stateless-only authenticators. |
 | Passkeys | `apps/web/src/lib/webauthn.ts:65-85,95-103` uses stable ID bytes as user handle and email only as name/displayName. `workers/api/src/handlers.rs:2046-2064,2133-2168` checks stored credential owner against challenge/session owner. Authenticator-visible old-email labels may remain; changing them is out of scope, and UI must explain that they still identify the same passkey. |
 | Vault | `migrations/0002_auth_vault.sql:62-75` keys vault by user ID; `workers/api/src/vault.rs:541-547,555-597,603-649` binds DEK wrap to user ID plus KEK version, payload to user ID only. No email-derived key or AAD. Preserve ciphertext/nonces/wrapped DEK/version; no KEK rotation for an email change. |
