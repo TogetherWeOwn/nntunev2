@@ -900,18 +900,32 @@ mod review_pins {
         assert_eq!(d.until, 1010);
         assert_eq!(m.inspect(&id(1)).unwrap().lease_until, Some(1010));
 
-        // The reservation window is capped by the grant and the material lease
-        // independently: each sub-case varies one bound alone.
-        for (n, (grant, material)) in [(1001, 1900), (1900, 1001)].iter().enumerate() {
+        // The reservation window is capped by the grant, the material lease,
+        // the capability expiry and the hard deadline independently: each
+        // sub-case varies one bound alone.
+        for (n, (grant, material, cap, hard)) in [
+            (1001, 1900, 1900, 1900),
+            (1900, 1001, 1900, 1900),
+            (1900, 1900, 1001, 1900),
+            (1900, 1900, 1900, 1001),
+        ]
+        .iter()
+        .enumerate()
+        {
             let mut m = AuthorityStore::new("staging");
             let mut s = seed();
             s.origin.grant_expires_at = *grant;
             s.material_lease_until = *material;
+            s.cap_expires_at = *cap;
+            s.origin.hard_deadline = *hard;
             m.freeze(s).unwrap();
             let r = m
                 .reserve(&id(1), &id(10), call_at(1000), nonce(20 + n as u32))
                 .unwrap();
-            assert_eq!(r.until, 1001, "grant {grant} material {material}");
+            assert_eq!(
+                r.until, 1001,
+                "grant {grant} material {material} cap {cap} hard {hard}"
+            );
         }
 
         for (n, (grant, material)) in [(1000, 1015), (1900, 1000)].iter().enumerate() {
@@ -947,6 +961,26 @@ mod review_pins {
     }
 
     #[test]
+    fn lease_never_outlives_hard_deadline_alone() {
+        // The hard deadline is the sole binding bound: every other bound is
+        // 1900, so only the finalize `.min(hard_deadline)` operand can cap
+        // the lease at 1012.
+        let mut m = AuthorityStore::new("staging");
+        let mut s = seed();
+        s.origin.grant_expires_at = 1900;
+        s.cap_expires_at = 1900;
+        s.origin.hard_deadline = 1012;
+        s.material_lease_until = 1900;
+        m.freeze(s).unwrap();
+        let r = m.reserve(&id(1), &id(10), call_at(1000), nonce(1)).unwrap();
+        assert_eq!(r.until, 1002);
+        let d = m
+            .first_finalize(finalize_request(r.reservation_id.clone(), 1001))
+            .unwrap();
+        assert_eq!(d.until, 1012);
+    }
+
+    #[test]
     fn freeze_enforces_scope_step_key_across_records() {
         let mut m = AuthorityStore::new("staging");
         m.freeze(seed()).unwrap();
@@ -956,6 +990,22 @@ mod review_pins {
         same_scope.origin.playback_request_id = id(33);
         same_scope.jti = id(35);
         assert_eq!(m.freeze(same_scope), Err(Denial::Conflict));
+        // Same scope with fresh step ids: the (scope_id, step_id) claims are
+        // disjoint but the (scope_id, pair, operation) keys clash, so only
+        // the pairs operand can fire.
+        let mut same_scope_fresh_steps = seed();
+        same_scope_fresh_steps.origin.play_intent_id = id(51);
+        same_scope_fresh_steps.origin.authorization_id = id(52);
+        same_scope_fresh_steps.origin.playback_request_id = id(53);
+        same_scope_fresh_steps.jti = id(55);
+        for (i, step) in same_scope_fresh_steps
+            .connection_steps
+            .iter_mut()
+            .enumerate()
+        {
+            step.step_id = id(1000 + i as u32);
+        }
+        assert_eq!(m.freeze(same_scope_fresh_steps), Err(Denial::Conflict));
         // A fresh scope may reuse the same step shape.
         let mut fresh_scope = seed();
         fresh_scope.origin.play_intent_id = id(41);
