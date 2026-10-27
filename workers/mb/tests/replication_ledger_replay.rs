@@ -98,11 +98,13 @@ fn republish_pending_sequence_replaces_publication_time_and_flips_verdict() {
 #[test]
 fn out_of_order_inserts_return_sorted_snapshots() {
     let mut ledger = PacketLedger::default();
-    ledger.record_packet("pkt-9".to_string(), 9, 900, 960);
-    ledger.record_packet("pkt-7".to_string(), 7, 700, 760);
+    // Timestamps run opposite to sequence so a sort keyed on time would
+    // produce a different order than the sequence order asserted below.
+    ledger.record_packet("pkt-9".to_string(), 9, 700, 760);
+    ledger.record_packet("pkt-7".to_string(), 7, 900, 960);
     ledger.record_packet("pkt-8".to_string(), 8, 800, 860);
-    ledger.record_published(12, 1_200);
-    ledger.record_published(10, 1_000);
+    ledger.record_published(12, 1_000);
+    ledger.record_published(10, 1_200);
     ledger.record_published(11, 1_100);
 
     let sequences: Vec<i64> = ledger.records().iter().map(|r| r.sequence).collect();
@@ -115,14 +117,16 @@ fn out_of_order_inserts_return_sorted_snapshots() {
 #[test]
 fn apply_one_pending_packet_clears_only_its_matching_entry() {
     let mut ledger = PacketLedger::default();
-    ledger.record_published(20, 2_000);
+    // Pending 20 shares the applied packet's publication time, so only a
+    // clear keyed on sequence (not on time) leaves it in place.
+    ledger.record_published(20, 2_100);
     ledger.record_published(21, 2_100);
     ledger.record_published(22, 2_200);
 
     ledger.record_packet("pkt-21".to_string(), 21, 2_100, 2_200);
 
     assert_eq!(ledger.pending_published_at(21), None);
-    assert_eq!(ledger.pending_published_at(20), Some(2_000));
+    assert_eq!(ledger.pending_published_at(20), Some(2_100));
     assert_eq!(ledger.pending_published_at(22), Some(2_200));
     let remaining: Vec<i64> = ledger.pending().iter().map(|p| p.sequence).collect();
     assert_eq!(remaining, vec![20, 22]);
