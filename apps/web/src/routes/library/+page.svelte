@@ -43,6 +43,7 @@
 		hiddenSelectedCount,
 		pruneSelection,
 		selectAllDisplayed,
+		selectRange,
 		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected
@@ -184,6 +185,15 @@
 	);
 	// The last append outcome stays until the next append or a boundary purge.
 	let appendFeedback: string | null = $state(null);
+	/**
+	 * Range anchor: the most recently activated selection checkbox, or null
+	 * after Clear selection, a boundary purge or a prune that dropped it.
+	 * Plain component state, never persisted; an anchor hidden by find or
+	 * view degrades Shift+click to a plain toggle inside `selectRange`.
+	 */
+	let rangeAnchorId: string | null = null;
+	// Shift state of the checkbox click whose change event is in flight.
+	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
 	let queueExportAuthGeneration = $state(0);
@@ -323,12 +333,15 @@
 			// there; failures without a snapshot have no rows selected.
 			if (!state.loading) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
-					if (selectedIds.length > 0 || appendFeedback !== null) purgeSelection();
+					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
+						purgeSelection();
+					}
 				} else if (!state.loadError) {
-					selectedIds = pruneSelection(
-						selectedIds,
-						state.items.map((track) => track.id)
-					);
+					const snapshotIds = state.items.map((track) => track.id);
+					selectedIds = pruneSelection(selectedIds, snapshotIds);
+					if (rangeAnchorId !== null && !snapshotIds.includes(rangeAnchorId)) {
+						rangeAnchorId = null;
+					}
 				}
 			}
 			// Bootstrap once after an authenticated load has minted the context.
@@ -1293,6 +1306,25 @@
 		});
 	}
 
+	/**
+	 * Checkbox activation: Shift extends from the anchor through the
+	 * displayed rows (additive, so focus never leaves with a row); a plain
+	 * activation, or Shift without a displayed anchor, toggles exactly one
+	 * ID. Selection changes announce the count once; no-ops stay silent.
+	 */
+	function activateSelectionRow(id: string, extend: boolean, box: HTMLInputElement): void {
+		const displayedIds = renderedItems.map((track) => track.id);
+		if (extend && rangeAnchorId !== null && displayedIds.includes(rangeAnchorId)) {
+			selectedIds = selectRange(selectedIds, displayedIds, rangeAnchorId, id);
+		} else {
+			toggleSelectedId(id);
+		}
+		rangeAnchorId = id;
+		// A native toggle the selection did not follow (Shift on a selected
+		// anchor) would leave the box out of sync: re-assert the truth.
+		box.checked = selectedIds.includes(id);
+	}
+
 	function toggleSelectedId(id: string): void {
 		// Deselecting inside Selected only unmounts the row; when that row
 		// held focus, recover it to a surviving row or the Show control.
@@ -1326,6 +1358,7 @@
 		// sat inside one of them needs the Show-control fallback.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		selectedIds = clearSelection(selectedIds);
+		rangeAnchorId = null;
 		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
@@ -1337,6 +1370,7 @@
 
 	function purgeSelection(): void {
 		selectedIds = createSelection();
+		rangeAnchorId = null;
 		appendFeedback = null;
 	}
 
@@ -1973,8 +2007,15 @@
 					type="checkbox"
 					aria-label={`Select ${displayTitle(track)}`}
 					checked={selectedIds.includes(track.id)}
-					onclick={(event) => event.stopPropagation()}
-					onchange={() => toggleSelectedId(track.id)}
+					onclick={(event) => {
+						event.stopPropagation();
+						extendSelection = event.shiftKey;
+					}}
+					onchange={(event) => {
+						const extend = extendSelection;
+						extendSelection = false;
+						activateSelectionRow(track.id, extend, event.currentTarget);
+					}}
 				/>
 				<button
 					type="button"
