@@ -5378,7 +5378,7 @@ mod tests {
             },
             "indexer": null
         });
-        h.store.fail_vault_saves.borrow_mut().replace(true);
+        *h.store.fail_vault_saves.borrow_mut() = true;
         let audits_before = h.store.audits.borrow().len();
         let resp = h.call_full(
             "PUT",
@@ -5403,7 +5403,7 @@ mod tests {
             "no audit for a write that never landed"
         );
         // The outage clears: the retry saves normally.
-        h.store.fail_vault_saves.borrow_mut().replace(false);
+        *h.store.fail_vault_saves.borrow_mut() = false;
         let resp = h.call_full(
             "PUT",
             "/v1/vault",
