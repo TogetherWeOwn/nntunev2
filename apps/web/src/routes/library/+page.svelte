@@ -25,7 +25,7 @@
 		orderLibraryItems,
 		type LibraryOrder
 	} from '#lib/library/order.js';
-	import { filterLibraryItems } from '#lib/library/filter.js';
+	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -34,6 +34,7 @@
 		createSelection,
 		hiddenSelectedCount,
 		pruneSelection,
+		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected
 	} from '#lib/library/selection.js';
@@ -66,6 +67,12 @@
 	 * same-account refreshes (including failed ones) preserve it.
 	 */
 	let findQuery = $state('');
+	/**
+	 * Which display fields the find searches. Visit-local like the query:
+	 * never persisted, reset to `'both'` at the same account/auth
+	 * boundaries that clear the query. Clearing the search text keeps it.
+	 */
+	let findScope: FindScope = $state('both');
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -76,36 +83,44 @@
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
 	/**
-	 * Transient Favorites-only view over the loaded list. Plain component
-	 * state: never persisted, never fetched, reset on reload (fresh state)
-	 * and at the auth boundary. Filters after ordering via the pure
-	 * selectFavoriteItems projection; the queue never sees it.
+	 * Explicit subset selection: page-local ordered stable IDs in checkbox
+	 * activation order. Never persisted, never fetched, never shared across
+	 * tabs; purged only at auth/account boundaries, pruned only against a
+	 * successful snapshot. Declared here because the Selected-only
+	 * projection below consumes it.
 	 */
-	let view: 'all' | 'favorites' = $state('all');
+	let selectedIds: string[] = $state(createSelection());
+	/**
+	 * Transient view over the loaded list. Plain component state: never
+	 * persisted, never fetched, reset on reload (fresh state) and at the
+	 * auth boundary. Filters after ordering via the pure
+	 * selectFavoriteItems/selectSelectedItems projections (loaded order as
+	 * reshaped by ordering, never activation order); the queue never sees
+	 * it, and switching views never mutates the selection.
+	 */
+	let view: 'all' | 'favorites' | 'selected' = $state('all');
 	const displayedItems = $derived(
-		view === 'all' ? orderedItems : selectFavoriteItems(orderedItems, favorites)
+		view === 'all'
+			? orderedItems
+			: view === 'favorites'
+				? selectFavoriteItems(orderedItems, favorites)
+				: selectSelectedItems(orderedItems, selectedIds)
 	);
-	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery));
+	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
 	let viewSelect: HTMLSelectElement | null = $state(null);
+	let scopeSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
 	let managementFeedback = $state('');
 	let shelfSection: HTMLElement | null = $state(null);
 	let shelfHeading: HTMLHeadingElement | null = $state(null);
 	let clearButton: HTMLButtonElement | null = $state(null);
-	/**
-	 * Explicit subset selection: page-local ordered stable IDs in checkbox
-	 * activation order. Never persisted, never fetched, never shared across
-	 * tabs; purged only at auth/account boundaries, pruned only against a
-	 * successful snapshot. The last append outcome stays until the next
-	 * append or a boundary purge.
-	 */
-	let selectedIds: string[] = $state(createSelection());
 	const hiddenSelectionCount = $derived(
 		hiddenSelectedCount(
 			selectedIds,
 			visibleItems.map((track) => track.id)
 		)
 	);
+	// The last append outcome stays until the next append or a boundary purge.
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
@@ -163,6 +178,7 @@
 			if (state.loadError && state.items.length === 0) {
 				queueFilterQuery = '';
 				findQuery = '';
+				findScope = 'both';
 				view = 'all';
 				confirmClear = false;
 				managementFeedback = '';
@@ -635,6 +651,14 @@
 		return `Move favorite ${displayTitle(track)} ${direction}`;
 	}
 
+	function searchBothFields(): void {
+		findScope = 'both';
+		// The recovery button only exists under a narrowed scope, so this
+		// unmounts the focused button; land focus on the scope selector
+		// (the control whose value just changed) instead of <body>.
+		void tick().then(() => scopeSelect?.focus({ preventScroll: true }));
+	}
+
 	function clearFind(): void {
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -689,12 +713,75 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
+	/** ID of the library row holding focus, or null when focus is elsewhere. */
+	function focusedLibraryRowId(): string | null {
+		if (typeof document === 'undefined') return null;
+		const holder = document.activeElement?.closest?.('[data-testid="library-item"]');
+		return holder?.getAttribute('data-id') ?? null;
+	}
+
+	/**
+	 * After a selected row unmounts, land focus on the checkbox of the next
+	 * surviving displayed row, else the previous one, else the Show
+	 * control. Runs after rendering and only when the removed control took
+	 * focus with it (active element fell back to the body), so controls
+	 * that remain mounted — including the Clear selection button itself —
+	 * and any focus the user has already moved keep it.
+	 */
+	function focusAfterSelectedRowRemoval(nextId: string | null, previousId: string | null): void {
+		void tick().then(() => {
+			if (typeof document === 'undefined') return;
+			const active = document.activeElement;
+			if (active && active !== document.body) return;
+			for (const id of [nextId, previousId]) {
+				if (id === null) continue;
+				// Find the row by attribute comparison, never selector
+				// interpolation: track ids are opaque server strings.
+				const rowEl = [...document.querySelectorAll('[data-testid="library-item"]')].find(
+					(element) => element.getAttribute('data-id') === id
+				);
+				const target = rowEl?.querySelector<HTMLElement>(
+					'input[type="checkbox"]:not([disabled]), button:not([disabled])'
+				);
+				if (target) {
+					target.focus({ preventScroll: true });
+					return;
+				}
+			}
+			viewSelect?.focus({ preventScroll: true });
+		});
+	}
+
 	function toggleSelectedId(id: string): void {
+		// Deselecting inside Selected only unmounts the row; when that row
+		// held focus, recover it to a surviving row or the Show control.
+		if (view !== 'selected' || !selectedIds.includes(id) || focusedLibraryRowId() !== id) {
+			selectedIds = toggleSelected(selectedIds, id);
+			return;
+		}
+		const displayedIds = visibleItems.map((track) => track.id);
+		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
+		const survivors = new Set(selectedIds);
+		const nextId =
+			removedIndex < 0
+				? null
+				: (displayedIds.slice(removedIndex + 1).find((candidate) => survivors.has(candidate)) ?? null);
+		const previousId =
+			removedIndex <= 0
+				? null
+				: ([...displayedIds.slice(0, removedIndex)]
+						.reverse()
+						.find((candidate) => survivors.has(candidate)) ?? null);
+		focusAfterSelectedRowRemoval(nextId, previousId);
 	}
 
 	function clearSelectedIds(): void {
+		// Clearing inside Selected only unmounts every row; only focus that
+		// sat inside one of them needs the Show-control fallback.
+		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		selectedIds = clearSelection(selectedIds);
+		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
 	function appendSelectedIds(): void {
@@ -748,6 +835,7 @@
 			favoritesAnnouncement = '';
 			queueFilterQuery = '';
 			findQuery = '';
+			findScope = 'both';
 			view = 'all';
 			confirmClear = false;
 			managementFeedback = '';
@@ -766,6 +854,7 @@
 		favoritesAnnouncement = '';
 		queueFilterQuery = '';
 		findQuery = '';
+		findScope = 'both';
 		view = 'all';
 		confirmClear = false;
 		managementFeedback = '';
@@ -956,6 +1045,12 @@
 					bind:value={findQuery}
 					aria-describedby="library-find-hint"
 				/>
+				<label for="library-find-scope">Search in</label>
+				<select id="library-find-scope" bind:this={scopeSelect} bind:value={findScope}>
+					<option value="both">Both title and artist</option>
+					<option value="title">Title only</option>
+					<option value="artist">Artist only</option>
+				</select>
 				<p id="library-find-hint">
 					Searches only the tracks already loaded here, not the remote catalog.
 				</p>
@@ -981,15 +1076,25 @@
 				<select id="library-view" bind:this={viewSelect} bind:value={view}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
+					<option value="selected">Selected only</option>
 				</select>
 			</div>
 			<p data-testid="library-find-count">
-				Showing {visibleItems.length} of {items.length}
-				{visibleItems.length === 1 ? 'track' : 'tracks'}
+				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
+					? ' (title only)'
+					: findScope === 'artist'
+						? ' (artist only)'
+						: ''}
 			</p>
 			{#if view === 'favorites' && displayedItems.length === 0}
 				<p>
 					No favorites in this list.
+					<button type="button" onclick={showAllTracks}>Show all tracks</button>
+				</p>
+			{/if}
+			{#if view === 'selected' && selectedIds.length === 0}
+				<p>
+					No tracks selected. Select tracks to review them here.
 					<button type="button" onclick={showAllTracks}>Show all tracks</button>
 				</p>
 			{/if}
@@ -1016,7 +1121,18 @@
 				{/if}
 			</div>
 			{#if displayedItems.length > 0 && visibleItems.length === 0}
-				<p>No matches in your loaded tracks.</p>
+				{#if findScope === 'title'}
+					<p>No title matches in your loaded tracks.</p>
+				{:else if findScope === 'artist'}
+					<p>No artist matches in your loaded tracks.</p>
+				{:else}
+					<p>No matches in your loaded tracks.</p>
+				{/if}
+				{#if findScope !== 'both'}
+					<button class="nt-button" type="button" onclick={searchBothFields}>
+						Search both title and artist
+					</button>
+				{/if}
 				<button class="nt-button" type="button" onclick={clearFind}>
 					Clear search
 				</button>
@@ -1159,6 +1275,16 @@
 	.nt-library-find input {
 		box-sizing: border-box;
 		width: min(100%, 20rem);
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-find select {
+		max-width: 100%;
 		min-height: 2.75rem;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
