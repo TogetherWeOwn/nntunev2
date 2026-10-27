@@ -7,6 +7,7 @@ import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
+import { libraryTabTitle } from '#lib/library/tab-title.js';
 import {
 	appendResultLabel,
 	appendSelection,
@@ -95,6 +96,7 @@ function pageScript() {
 		displayTitle,
 		orderLibraryItems,
 		filterLibraryItems,
+		libraryTabTitle,
 		appendResultLabel,
 		appendSelection,
 		clearSelection,
