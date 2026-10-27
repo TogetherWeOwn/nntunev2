@@ -1094,13 +1094,55 @@ function largeValidXml(segmentCount: number): string {
 	return nzbXml(fileXml(Array.from({ length: segmentCount }, (_, index) => segmentXml({ bytes: '100', number: `${index + 1}`, text: `bulk-mid-${index}` })), 'bulk-entry'));
 }
 
+async function holdNextStreamRead(page: Page) {
+	const gate = await page.evaluateHandle(() => {
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => { entered = resolve; });
+		const held = new Promise<void>((resolve) => { release = resolve; });
+		const originalStream = Blob.prototype.stream;
+		Blob.prototype.stream = function (this: Blob) {
+			Blob.prototype.stream = originalStream;
+			const stream = originalStream.call(this);
+			const getReader = stream.getReader.bind(stream);
+			Object.defineProperty(stream, 'getReader', {
+				value() {
+					const reader = getReader();
+					const read = reader.read.bind(reader);
+					reader.read = async () => {
+						reader.read = read;
+						// Hold only the delivery: native bytes, cancel and release stay real.
+						const result = await read();
+						entered();
+						await held;
+						return result;
+					};
+					return reader;
+				}
+			});
+			return stream;
+		};
+		return { started, release };
+	});
+	return {
+		waitUntilReading: () => gate.evaluate((state) => state.started),
+		async release() {
+			await gate.evaluate((state) => state.release());
+			await gate.dispose();
+		}
+	};
+}
+
 test.describe('NZBP cancellation and staleness', () => {
 	test('NZBP-R6-01 cancel during the read discards and releases the reader', async ({ page, baseURL, nzbp }, info) => {
 		await openImport(page, baseURL);
 		await selectNzb(page, 'r6-01.nzb', largeValidXml(20000));
+		const read = await holdNextStreamRead(page);
 		await (await requirePreview(page, 'NZBP-R6-01')).click();
+		await read.waitUntilReading();
 		await expect(page.getByTestId('import-status'), 'NZBP-R6-01: local read is announced').toContainText(/Reading the file locally…/, { timeout: 5000 });
 		await cancelButton(page).click();
+		await read.release();
 		const outcome = await settled(page);
 		const engine = await engineOf(page);
 		await receipt(
@@ -1295,6 +1337,7 @@ test.describe('NZBP interaction contract', () => {
 	test('NZBP-UX-02 keyboard order keeps focus through the busy swap', async ({ page, baseURL, nzbp }, info) => {
 		await openImport(page, baseURL);
 		await selectNzb(page, 'ux-02.nzb', largeValidXml(5000));
+		const read = await holdNextStreamRead(page);
 		const engine = await engineOf(page);
 		await receipt(
 			info,
@@ -1309,10 +1352,12 @@ test.describe('NZBP interaction contract', () => {
 				const afterSecondTab = await page.evaluate(() => document.activeElement?.textContent?.trim() ?? '');
 				await page.keyboard.press('Shift+Tab');
 				await page.keyboard.press('Enter');
+				await read.waitUntilReading();
 				await expect.poll(() => page.evaluate(() => document.activeElement?.textContent?.trim() ?? ''), 'NZBP-UX-02: focus lands on Cancel').toBe('Cancel');
 				const busyFocus = await page.evaluate(() => document.activeElement?.textContent?.trim() ?? '');
 				await cancelButton(page).click();
-				await settled(page);
+				await read.release();
+				expect(await settled(page), 'NZBP-UX-02: cancellation survives the released read').toEqual({ status: 'cancelled' });
 				return { afterFirstTab, afterSecondTab, busyFocus, activation: 'keyboard' as const };
 			},
 			'NZBP_FOCUS',
@@ -1371,8 +1416,11 @@ test.describe('NZBP interaction contract', () => {
 		await selectNzb(page, 'ux-06.nzb', largeValidXml(5000));
 		await (await requirePreview(page, 'NZBP-UX-06')).click();
 		const first = await settled(page);
+		const read = await holdNextStreamRead(page);
 		await (await requirePreview(page, 'NZBP-UX-06')).click();
+		await read.waitUntilReading();
 		await expect(cancelButton(page), 'NZBP-UX-06: second read starts').toBeVisible({ timeout: 5000 });
+		await read.release();
 		const second = await settled(page);
 		await receipt(info, await engineOf(page), 'NZBP-UX-06', { repeated: true }, async () => ({ repeated: JSON.stringify(first) === JSON.stringify(second) && (second as { status?: unknown }).status === 'ok' }), 'NZBP_GESTURE', FIX_PAGE);
 		await expectCleanRun(page, nzbp, 'NZBP-UX-06');

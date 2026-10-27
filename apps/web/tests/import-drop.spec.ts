@@ -295,6 +295,8 @@ test('DROP-16 native file picker and Clear remain keyboard operable with visible
 	await expect(page.getByTestId('import-status')).toHaveAttribute('role', 'status');
 	const clear = page.getByRole('button', { name: /^clear/i });
 	await page.keyboard.press('Tab');
+	await expect(page.getByRole('button', { name: 'Preview', exact: true })).toBeFocused();
+	await page.keyboard.press('Tab');
 	await expect(clear).toBeFocused();
 	await page.keyboard.press('Enter');
 	await expect(input).toHaveJSProperty('value', '');
