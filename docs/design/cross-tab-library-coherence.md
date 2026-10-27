@@ -129,10 +129,13 @@ prefix matches authorize reading another context.
 4. On an explicit foreground action to apply the change, use the existing
    authenticated refresh path first; then reread **current** storage through
    the current-context helpers only if the same mount/auth generation and key
-   still hold and no unsaved edits exist. A new implementation must distinguish
-   readable absence from denied/malformed storage; existing helpers alone
-   collapse these into an empty list. Until that distinction is proven without
-   a persistent schema change, this apply action is **NO-GO**.
+   still hold and no unsaved edits exist. Those checks do not prove principal
+   continuity after a missed cookie/account transition: that also needs proof
+   from the existing authentication contract, not context/email equality.
+   A new implementation must distinguish readable absence from denied/malformed
+   storage; existing helpers alone collapse these into an empty list. Until both
+   continuity and that distinction are proven without changing the storage or
+   authentication boundary, this apply action is **NO-GO**.
 5. A key removal is still only a hint; accepting readable absence means an
    empty saved set, not the event's null payload. `clear()` has `key === null`:
    the prospective data handler may invalidate its pending prompt/read intent,
@@ -301,7 +304,7 @@ cards**. No slice is authorized by this document's acceptance.
 | --- | --- |
 | Offline fake-tab contract bank | At most 1 day; XTAB-01..12, exact-key routing, dirty-state and auth-fence oracles; no real multi-tab automation |
 | Same-context favorites notice only | At most 0.5 day after accepted spec and tests; one listener/notice, no hydration, network or write side effect |
-| Explicit clean-state apply | At most 1 day only after readable-absence vs denial/corruption and unsaved-write detection are proven without changing persistence; otherwise NO-GO, keep notice/reload explanation only |
+| Explicit clean-state apply | At most 1 day only after principal continuity, readable-absence vs denial/corruption and unsaved-write detection are proven within the existing boundaries; otherwise NO-GO, keep notice/reload explanation only |
 | Account-wide favorites/history sharing; live queue/cache sync; new storage schema or auth transport | NO-GO in this scope. Separate identity/provenance and conflict design plus applicable dispositions are prerequisites |
 
 Rollback for any later narrow UI slice: remove the listener/notice/apply wiring;
