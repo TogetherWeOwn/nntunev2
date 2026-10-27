@@ -227,6 +227,8 @@ jobs:
         run: python3 .github/scripts/test_public_text_read_errors.py
       - name: Structural-test the pnpm bootstrap retry
         run: python3 .github/scripts/test_ci_pnpm_retry.py
+      - name: Structural-test the web-e2e timeout budget
+        run: python3 .github/scripts/test_ci_web_e2e_timeout.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -1091,10 +1093,14 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Reuse e2e-lint's preinstalled browser/OS libraries: slow apt mirrors
-    # otherwise consume the full suite's deadline. Re-pin with the web lock.
-    # The full browser suite now takes about 21 minutes; include cleanup
-    # headroom above setup plus suite.
+    # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
+    # 18.8-20.6 minutes; container setup (image pull + pnpm install)
+    # takes under a minute on the fast path. Pre-container worst setup
+    # was 17m of apt/browser downloads; slow image pulls are unmeasured,
+    # so keep headroom. 45 = 21 suite (20.6 rounded up) + 24
+    # setup/headroom. Re-measure when the reported suite exceeds
+    # 25 minutes or the test count passes ~1,800; re-pin the container
+    # with the web lock; test_ci_web_e2e_timeout.py pins this value.
     container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 45
     defaults:
