@@ -60,6 +60,19 @@ jobs:
       # Same job, so failures fail rust-test and the ci-ok aggregate.
       - run: cargo test --locked -p nntune-core --no-default-features
 
+  # Validate fixture shape separately; byte-exact handler comparison runs
+  # in the nntune-subsonic tests in rust-test.
+  fixture-check:
+    name: fixture-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate golden fixtures
+        run: python3 scripts/check-subsonic-fixtures.py
+
   rust-wasm:
     name: rust check (wasm32)
     runs-on: ubuntu-latest
@@ -914,7 +927,9 @@ jobs:
           env -i PATH="$tools:$PATH" jq --version
 
       - name: Browser image and preflight self-tests (offline doubles only)
-        run: python3 .github/scripts/test_ci_playwright_image.py
+        run: |
+          python3 .github/scripts/test_ci_playwright_image.py
+          python3 .github/scripts/test_ci_web_e2e_image.py
 
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
@@ -1076,8 +1091,11 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Slow Ubuntu dependency downloads can consume 17 minutes; the full
-    # browser suite now takes about 21 minutes. Include cleanup headroom.
+    # Reuse e2e-lint's preinstalled browser/OS libraries: slow apt mirrors
+    # otherwise consume the full suite's deadline. Re-pin with the web lock.
+    # The full browser suite now takes about 21 minutes; include cleanup
+    # headroom above setup plus suite.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 45
     defaults:
       run:
@@ -1105,8 +1123,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preinstalled web Playwright chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
       - name: Upload failure artifacts
@@ -1117,9 +1142,9 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
-  # Privacy-safe Tail observation projection: pure, dependency-free ESM
-  # projector with VM-isolated acceptance tests. No Cloudflare API,
-  # network, or deploy. Keep this job id in ci-ok's needs.
+  # Privacy-safe Tail helpers and integrated durable alert runtime. The Node
+  # VM acceptance harness fakes Cloudflare, storage, time and all delivery:
+  # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
   tail-projection:
     name: tail-projection
     runs-on: ubuntu-latest
@@ -1143,6 +1168,11 @@ jobs:
           node --check workers/observability/tests/evaluate-health-window.test.mjs
           node --check workers/observability/render-health-alert.mjs
           node --check workers/observability/tests/render-health-alert.test.mjs
+          node --check workers/observability/runtime.mjs
+          node --check workers/observability/tests/runtime-harness.mjs
+          node --check workers/observability/tests/runtime.test.mjs
+      - name: Run durable Tail alert runtime acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/runtime.test.mjs
       - name: Run Tail projection acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
       - name: Run error-window acceptance tests
@@ -1158,7 +1188,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

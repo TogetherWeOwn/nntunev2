@@ -20,7 +20,8 @@
 // String labels not exactly equal to the policy pair => excluded, never
 // merged. Otherwise in scope: any flag true => failed (counted once);
 // breakdown keys that are invalid fold to an ordinary 'unknown' bucket.
-// This module is not wired or deployed; it performs no delivery.
+// The source-only runtime imports this pure helper; no deployment or
+// delivery occurs in this module.
 
 const SCHEMA_VERSION = 1;
 const MIN_INVOCATIONS_MIN = 1;

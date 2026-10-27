@@ -3,6 +3,7 @@ import ts from 'typescript';
 import { displayArtist, displayTitle, orderLibraryItems, type LibraryOrder } from '#lib/library/order.js';
 import { selectFavoriteItems } from '#lib/library/favorites.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
+import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 
@@ -17,22 +18,22 @@ const ITEMS = [
 	{ id: 'zulu', title: 'Zulu Song', artist: 'North Harbor' }
 ];
 
-function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueState, findQuery = '', order: LibraryOrder = 'original') {
+function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueState, findQuery = '', order: LibraryOrder = 'original', groupByArtist = false) {
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'missingDisplayedTracks', 'queuedTrackFor', 'replaceQueue',
-		'addDisplayedTracksToQueue', 'clearShareFeedback'
+		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange'
 	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek', 'restartCanSeek', 'restartStatus']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
-	const derived = ['orderedItems', 'displayedItems', 'visibleItems', 'bulkMissing', 'bulkDisabled', 'bulkAllQueued'].map((name) => {
+	const derived = ['orderedItems', 'displayedItems', 'visibleItems', 'artistGroups', 'renderedItems', 'bulkMissing', 'bulkDisabled', 'bulkAllQueued'].map((name) => {
 		const node = parsed.statements.find((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 			(declaration) => declaration.name.getText(parsed) === name
 		));
@@ -44,11 +45,11 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		view, favorites, queue, findQuery, findScope: 'both', order, items: ITEMS,
+		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
 		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		queueCurrentTrack, resolveStreamUrl,
+		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
@@ -101,6 +102,18 @@ test('All tracks bulk still appends the full displayed ordering', () => {
 	page.add();
 	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['alpha', 'middle', 'zulu']);
 	expect(page.read().announcement).toBe('Added 3 tracks to the queue.');
+});
+
+test('grouped bulk appends missing IDs in flattened artist-section order', () => {
+	const before = { ...queued(['outside', 'alpha']), currentIndex: 1 };
+	const page = actions('all', [], before, '', 'original', true);
+	expect(page.disabled).toBe(false);
+	page.add();
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual([
+		'outside', 'alpha', 'zulu', 'middle'
+	]);
+	expect(page.read().queue.currentIndex).toBe(1);
+	expect(page.read().announcement).toBe('Added 2 tracks to the queue.');
 });
 
 test('a title query excludes hidden loaded tracks from the append and added count', () => {

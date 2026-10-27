@@ -102,3 +102,36 @@ test('a pruned anchor that returns still plain-toggles the next Shift+click', as
 	expect(await checkedIds(page)).toEqual(['row-bravo', 'row-kilo']);
 	await expect(page.getByTestId('selection-count')).toHaveText('2 selected');
 });
+
+for (const gesture of ['click', 'space'] as const) {
+	test(`grouped ${gesture} range follows rendered groups, not the flat API order`, async ({ page }) => {
+		await seedLibrary(page);
+		await page.getByRole('button', { name: 'Group by artist', exact: true }).click();
+		await expect.poll(() => page.getByTestId('library-item').evaluateAll((rows) =>
+			rows.map((item) => item.getAttribute('data-id'))
+		)).toEqual(['row-zulu', 'row-mike', 'row-kilo', 'row-bravo', 'row-alpha', 'row-delta']);
+
+		await checkbox(page, 'row-mike').click();
+		const endpoint = checkbox(page, 'row-alpha');
+		if (gesture === 'click') {
+			await endpoint.click({ modifiers: ['Shift'] });
+		} else {
+			await endpoint.focus();
+			await endpoint.press('Shift+Space');
+		}
+		await expect.poll(() => checkedIds(page)).toEqual([
+			'row-mike', 'row-kilo', 'row-bravo', 'row-alpha'
+		]);
+		await expect(page.getByTestId('selection-count')).toHaveText('4 selected');
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
+
+		// Backwards spans the same rendered run, including the middle group.
+		await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
+		await endpoint.click();
+		await checkbox(page, 'row-mike').click({ modifiers: ['Shift'] });
+		await expect.poll(() => checkedIds(page)).toEqual([
+			'row-mike', 'row-kilo', 'row-bravo', 'row-alpha'
+		]);
+		await expect(page.getByTestId('selection-count')).toHaveText('4 selected');
+	});
+}
