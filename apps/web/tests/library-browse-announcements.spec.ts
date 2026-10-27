@@ -158,6 +158,30 @@ async function expectOutcomeOnce(page: Page, text: string): Promise<Locator> {
 }
 
 /**
+ * Document-relative box: viewport boxes move whenever check()/click()
+ * scroll the page, which is not a layout change.
+ */
+async function pageBox(
+	node: Locator
+): Promise<{ x: number; y: number; width: number; height: number } | null> {
+	const box = await node.boundingBox();
+	if (box === null) return null;
+	const scroll = await node.evaluate((element) => {
+		const win = element.ownerDocument.defaultView as Window;
+		return { x: win.scrollX, y: win.scrollY };
+	});
+	return { ...box, x: box.x + scroll.x, y: box.y + scroll.y };
+}
+
+/** One outcome is one short label-only string, checked while it is current. */
+async function expectConcise(page: Page, text: string): Promise<void> {
+	const body = ((await outcome(page, text).first().textContent()) ?? '').trim();
+	// Long enough for the longest locked wording, far too short for a token
+	// or metadata dump.
+	expect(body.length, `outcome "${text}" must stay concise`).toBeLessThan(120);
+}
+
+/**
  * A count outcome is exposed to assistive tech only through a polite
  * atomic live region: role=status (atomic by implication) or an explicit
  * aria-live=polite with aria-atomic=true. Fails on the
@@ -410,19 +434,21 @@ test('BA-B-08 announcing changes no visual layout beyond AT needs', async ({ pag
 	// a layout change caused by the announcement nodes, not by the action.
 	const findCount = page.getByTestId('library-find-count');
 	const list = page.getByTestId('library-list');
-	const beforeCount = await findCount.boundingBox();
-	const beforeList = await list.boundingBox();
+	const beforeCount = await pageBox(findCount);
+	const beforeList = await pageBox(list);
 	expect(beforeCount, 'find-count must be laid out before the actions').not.toBeNull();
 	expect(beforeList, 'library list must be laid out before the actions').not.toBeNull();
 
 	await order.selectOption({ label: 'Title A–Z' });
-	const node = await expectOutcomeOnce(page, 'List ordered: Title A–Z');
+	await expectOutcomeOnce(page, 'List ordered: Title A–Z');
 	await view.selectOption({ label: 'Favorites only' });
 	await expectOutcomeOnce(page, 'Showing Favorites only');
 	await view.selectOption({ label: 'All tracks' });
 	await page.getByRole('checkbox', { name: 'Select Beta Song', exact: true }).check();
 	await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
-	await expectOutcomeOnce(page, 'Selection cleared');
+	// The shared node now carries the latest outcome; replaced texts are
+	// gone from it (BA-B-05..07), so locate it by the current one.
+	const node = await expectOutcomeOnce(page, 'Selection cleared');
 
 	// The shared outcome node is AT-only: visually hidden (sr-only sized
 	// or removed from flow), never a new visible status line.
@@ -433,8 +459,8 @@ test('BA-B-08 announcing changes no visual layout beyond AT needs', async ({ pag
 		`shared outcome node must be visually hidden (box=${JSON.stringify(box)} position=${position})`
 	).toBe(true);
 
-	const afterCount = await findCount.boundingBox();
-	const afterList = await list.boundingBox();
+	const afterCount = await pageBox(findCount);
+	const afterList = await pageBox(list);
 	for (const [name, before, after] of [
 		['find-count', beforeCount, afterCount],
 		['library-list', beforeList, afterList]
@@ -458,32 +484,25 @@ test('BA-B-09 announcements never leak account, token or raw metadata content', 
 	await expect(order.locator('option')).toHaveCount(5);
 	const view = viewSelect(page);
 	await expect(view.locator('option')).toHaveCount(3);
+	// Each outcome replaces the previous one in the shared node
+	// (BA-B-05..07), so each is checked while it is the current text.
 	await order.selectOption({ label: 'Title Z–A' });
 	await expectOutcomeOnce(page, 'List ordered: Title Z–A');
+	await expectConcise(page, 'List ordered: Title Z–A');
 	await view.selectOption({ label: 'Favorites only' });
 	await expectOutcomeOnce(page, 'Showing Favorites only');
+	await expectConcise(page, 'Showing Favorites only');
 	await view.selectOption({ label: 'All tracks' });
 	await page.getByRole('checkbox', { name: 'Select Alpha Song', exact: true }).check();
 	await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
 	await expectOutcomeOnce(page, 'Selection cleared');
+	await expectConcise(page, 'Selection cleared');
 	const field = await requireFind(page);
 	await field.fill('zzz');
 	await expectView(page, []);
 	await clearSearch(page).click();
 	await expectOutcomeOnce(page, 'Search cleared');
-
-	// Every outcome is one short label-only string: long enough for the
-	// longest locked wording, far too short for a token or metadata dump.
-	for (const text of [
-		'List ordered: Title Z–A',
-		'Showing Favorites only',
-		'Selection cleared',
-		'Search cleared'
-	]) {
-		const node = outcome(page, text);
-		const body = ((await node.first().textContent()) ?? '').trim();
-		expect(body.length, `outcome "${text}" must stay concise`).toBeLessThan(120);
-	}
+	await expectConcise(page, 'Search cleared');
 	const liveTexts = await page
 		.locator('main [role="status"], main [aria-live]')
 		.evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ''));
