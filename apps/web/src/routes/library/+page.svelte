@@ -477,7 +477,11 @@
 	}
 
 	function replaceQueue(next: QueueState): void {
-		playEpoch += 1;
+		// A no-op replacement (same queue object: Next on the last track,
+		// a duplicate row tap) still clears a stale move announcement —
+		// pinned by the queue-announcement banks — but must not fence a
+		// pending play() outcome: the selection it describes is unchanged.
+		if (next !== queue) playEpoch += 1;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
