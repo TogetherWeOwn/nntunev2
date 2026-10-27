@@ -769,8 +769,7 @@ test('LIBJUMP10-12 source change and auth teardown invalidate pending share stat
 		await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
 		await page.getByTestId('player-next').click();
 		await expect(player(page)).toHaveCount(0);
-		await page.getByTestId('player-next').click();
-		await page.getByTestId('player-next').click();
+		await page.getByRole('button', { name: 'Select Coral Night', exact: true }).click();
 		await expect(player(page).getByTestId('library-now-playing')).toContainText('Coral Night');
 		await mockMedia(page, { currentTime: 5, duration: 120 });
 		await audio(page).evaluate((el: HTMLAudioElement) => {
