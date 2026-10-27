@@ -233,8 +233,10 @@ SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
 ```
 
 `providers` rows (migration 0022, envelope v2) carry KEK-wrapped DEKs
-too, so the pass claims them in the same run — a separate batch with
-its own cursor (composite owner + row, since one user owns many rows):
+too, so a complete rotation MUST also claim them — a separate batch with
+its own cursor (composite owner + row, since one user owns many rows).
+The provider scan is a required runner extension, not implemented by the
+mint path; a vault-only pass cannot satisfy the combined retire gate:
 
 ```sql
 -- claim a providers batch (cursor = last (user_id, id))
@@ -244,6 +246,20 @@ SELECT id, user_id, creds_kek_version, creds_dek_wrapped, creds_dek_wrapped_nonc
  ORDER BY user_id, id LIMIT 100;
 ```
 
+Durable resume contract for that extension: retain `rotation_runs.cursor`
+as the last fully visited vault `user_id` (NULL before the first batch),
+and add separate nullable `providers_cursor_user_id` and
+`providers_cursor_id` fields for the last fully visited provider tuple.
+The two provider fields are NULL together before the first batch and
+advance together; never encode a provider tuple into the existing scalar
+vault cursor. After each batch, persist only that scan's cursor and its
+count deltas in one progress write. Reload both positions after eviction
+and resume each SELECT strictly after its own cursor. A pass is complete
+only after **both** scans return no remaining eligible rows; the combined
+counts below still gate key retirement. These extra progress fields and
+the provider scan must land before enabling provider re-wrap; they are
+not added to the vault-only runner by this mint change.
+
 Per row (either table):
 
 1. `DEK = decrypt(KEK[row.kek_version], dek_wrapped)` (version-pinned §4).
@@ -251,7 +267,11 @@ Per row (either table):
    via `vault::rewrap_dek` (never rebuild AAD by hand). For a
    `providers` row the same step re-wraps under the v2 DEK AAD (bound
    to user + row + KEK version, `workers/api/src/providers.rs`),
-   never the v1 helper.
+   never the v1 helper. The provider-specific same-DEK re-wrap helper
+   is still a prerequisite for that runner extension; do not substitute
+   `encrypt_provider_creds` (it generates a new DEK and payload), and
+   never hand-roll the private v2 AAD. Until the helper lands, provider
+   re-wrap is unavailable and the combined retire gate remains closed.
 3. Conditional write — a compare-and-swap on the captured envelope,
    not on user/version alone. A vault PUT replaces the whole envelope
    (fresh DEK and payload) at the same KEK version, so a version-only

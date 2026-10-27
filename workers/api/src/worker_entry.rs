@@ -1464,22 +1464,31 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 let transaction = client.transaction().await.map_err(|_| StoreError)?;
-                // Purge first: the user's unreferenced providers rows go
-                // with the vault, so removed credentials stop being
-                // decryptable. Grant-referenced rows survive (RESTRICT).
+                // Serialize with the save's users-row FOR SHARE fence,
+                // including first saves when no vault row exists to lock.
+                // Removal remains allowed for a deleting account; a gone
+                // user makes this and the deletes harmless no-ops.
+                transaction
+                    .query_opt("SELECT id FROM users WHERE id = $1 FOR UPDATE", &[&user_id])
+                    .await
+                    .map_err(|_| StoreError)?;
                 if transaction
-                    .execute(purge_unreferenced_providers_sql(), &[&user_id])
+                    .execute(
+                        "DELETE FROM provider_vaults WHERE user_id = $1",
+                        &[&user_id],
+                    )
                     .await
                     .is_err()
                 {
                     transaction.rollback().await.map_err(|_| StoreError)?;
                     return Err(StoreError);
                 }
+                // Purge after the vault delete: a save serialized before
+                // us is visible to this READ COMMITTED statement; a later
+                // save cannot start writing until our commit releases the
+                // owner lock. Grant-referenced rows survive (RESTRICT).
                 if transaction
-                    .execute(
-                        "DELETE FROM provider_vaults WHERE user_id = $1",
-                        &[&user_id],
-                    )
+                    .execute(purge_unreferenced_providers_sql(), &[&user_id])
                     .await
                     .is_err()
                 {
@@ -4091,6 +4100,58 @@ mod tests {
             delete.contains(".transaction()"),
             "delete_vault must purge and delete atomically"
         );
+        let vault_delete = delete
+            .find("\"DELETE FROM provider_vaults")
+            .expect("delete_vault must remove the vault row");
+        let purge = delete
+            .find(".execute(purge_unreferenced_providers_sql()")
+            .expect("delete_vault must purge unreferenced providers");
+        assert!(
+            vault_delete < purge,
+            "delete the vault before purging, so a concurrent save cannot leave orphaned credentials"
+        );
+        let commit = delete
+            .find("transaction.commit().await.map_err(|_| StoreError)?")
+            .expect("delete_vault must commit and propagate commit failure");
+        let ok = delete.find("Ok(())").expect("delete_vault must return Ok");
+        assert!(
+            purge < commit && commit < ok,
+            "commit both deletes before reporting success"
+        );
+    }
+
+    #[test]
+    fn vault_delete_locks_the_owner_before_touching_credential_rows() {
+        // Locking only an existing vault row misses first-save races. The
+        // owner lock also conflicts with the save's in-statement FOR SHARE
+        // fence when no vault exists; lock errors must fail closed.
+        let source = include_str!("worker_entry.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let delete = production
+            .split_once("async fn delete_vault(")
+            .unwrap()
+            .1
+            .split_once("\n    async fn ")
+            .unwrap()
+            .0;
+        let lock = delete
+            .find("\"SELECT id FROM users WHERE id = $1 FOR UPDATE\"")
+            .expect("delete_vault must lock the owner even when the vault is absent");
+        let lock_call = delete[..lock]
+            .rfind("transaction")
+            .expect("the owner lock must use the delete transaction");
+        let lock_end = delete[lock..]
+            .find(".map_err(|_| StoreError)?")
+            .expect("owner-lock failure must propagate before any deletes")
+            + lock;
+        let vault_delete = delete.find("\"DELETE FROM provider_vaults").unwrap();
+        let purge = delete
+            .find(".execute(purge_unreferenced_providers_sql()")
+            .unwrap();
+        assert!(delete[lock_call..lock].contains(".query_opt("));
+        assert!(delete[lock..lock_end].contains("&[&user_id]"));
+        assert!(delete[lock..lock_end].contains(".await"));
+        assert!(lock < lock_end && lock_end < vault_delete && lock_end < purge);
     }
 
     #[test]
