@@ -205,7 +205,7 @@ async function deliver(endpoint, payload) {
   const attempt = (async () => {
     try {
       const response = await fetch(endpoint, {
-        method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
+        method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload), signal: controller.signal,
       });
       // No response text is useful here, for success or failure. Cancellation

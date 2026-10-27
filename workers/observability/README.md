@@ -52,8 +52,9 @@ unconnected; this runtime is not a health probe, synthetic or auto-rollback.
   only HTTPS `discord.com`, numeric webhook ID and one URL-safe token path
   segment; credentials, ports (including explicitly written default ports),
   queries, fragments, other hosts and extra segments are rejected. It uses
-  JSON POST, `redirect: 'error'`, a 5000ms abort/race deadline, and immediate
-  response-body cancellation (zero body bytes retained). Errors/responses,
+  JSON POST, `redirect: 'manual'` (the Workers-supported no-follow mode: a 3xx
+  is returned unfollowed and treated as a failed attempt, never a retry), a
+  5000ms abort/race deadline, and immediate response-body cancellation (zero body bytes retained). Errors/responses,
   webhook URL and token are never logged, stored, rendered or returned.
 - `LOGS_URL` must be an absolute HTTP(S) log-view link without credentials or
   whitespace, at most 1024 characters; delivery endpoints are not log links.
