@@ -360,27 +360,37 @@ test('CF-B01 decomposed and composed title queries match both stored spellings',
 test('CF-B02 keyboard entry preserves the typed spelling and rendered metadata', async ({ page }, info) => {
 	await mockLibrary(page);
 	await openLibrary(page);
-	await receipt(info, { rows: ['canon-eclair', 'canon-decomposed'], valuePoints: points(`${E_DECOMPOSED}clair`), renderedPoints: points(`${E_ACUTE}clair`) }, async () => {
+	await receipt(info, {
+		rows: ['canon-eclair', 'canon-decomposed'],
+		valuePoints: points(`${E_DECOMPOSED}clair`),
+		renderedTitles: [`${E_ACUTE}clair`, `${E_DECOMPOSED}clair Tune`],
+		renderedPoints: [points(`${E_ACUTE}clair`), points(`${E_DECOMPOSED}clair Tune`)]
+	}, async () => {
 		const field = findField(page);
 		await field.tap();
 		await field.pressSequentially(`${E_DECOMPOSED}clair`, { delay: 5 });
 		await expectRows(page, ['canon-eclair', 'canon-decomposed']);
 		await expectFindCount(page, 2);
-		// The input keeps the exact typed spelling: the find never rewrites
-		// the query to its normalized form.
+		// Observe the exact input value, not a normalized fixture copy.
 		const value = await field.inputValue();
-		// Rendered metadata keeps its stored spelling: the composed row
-		// still renders the composed title.
-		const rendered = await page
-			.locator('[data-testid="library-item"][data-id="canon-eclair"]')
-			.textContent();
-		expect(rendered).toContain(`${E_ACUTE}clair`);
-		const decomposedRendered = await page
-			.locator('[data-testid="library-item"][data-id="canon-decomposed"]')
-			.textContent();
-		expect(decomposedRendered).toContain(`${E_DECOMPOSED}clair`);
+		const renderedTitles: string[] = [];
+		for (const id of ['canon-eclair', 'canon-decomposed']) {
+			// The row button's direct text nodes hold the title; child spans
+			// hold the artist/badge. Whole-row substring checks can hide an
+			// extra combining mark or another control's copy of the title.
+			const rendered = await page
+				.locator(`[data-testid="library-item"][data-id="${id}"] button.nt-library-row`)
+				.evaluate((button) => [...button.childNodes]
+					.filter((node) => node.nodeType === Node.TEXT_NODE)
+					.map((node) => node.textContent ?? '')
+					.join('')
+					.trim());
+			renderedTitles.push(rendered);
+		}
 		const rows = await page.getByTestId('library-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-id')));
-		return { rows, valuePoints: points(value), renderedPoints: points(`${E_ACUTE}clair`) };
+		// receipt compares the complete observed strings AND their scalars,
+		// preserving both composed and decomposed stored spellings exactly.
+		return { rows, valuePoints: points(value), renderedTitles, renderedPoints: renderedTitles.map(points) };
 	});
 });
 

@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { appendSelection } from '../library/selection.js';
+import { createQueue } from './queue.js';
 
 /**
  * Acceptance: find queued tracks across canonically equivalent Unicode
@@ -50,7 +52,9 @@ import { describe, expect, it } from 'vitest';
  * directions, CF-Q03 combined marks and Hangul, CF-Q04 accent-negative,
  * CF-Q05 compatibility-negative, CF-Q06 id fallback byte-literal, CF-Q07
  * named tracks never match by id, CF-Q08 empty queries, CF-Q09 literals
- * and boundary semantics, CF-Q10 immutability.
+ * and boundary semantics, CF-Q10 immutability, CF-Q11 fallback artists,
+ * CF-Q12 literal-id/canonical-artist boundaries, CF-Q13 constructed fallback
+ * id controls, CF-Q14 real metadata titles equal to ids, CF-Q15 named boundaries.
  *
  * Focused command (repo root, deterministic, offline):
  *   pnpm --dir apps/web exec vitest run src/lib/player/canonical-queue-find-acceptance.test.ts
@@ -322,5 +326,164 @@ describe('canonical queue find: pure matching over queued tracks', () => {
 		// Stored metadata keeps its original spelling.
 		expect(track.title).toBe(`${E_DECOMPOSED}clair Song`);
 		expect(track.artist).toBe(`${A_RING_DECOMPOSED}ngstrom`);
+	});
+});
+
+function enqueueLibraryItem(id: string, title: string, artist?: string): MatchTrack {
+	const result = appendSelection(createQueue([]), [id], [{ id, title, artist }]);
+	expect(result.added).toBe(1);
+	expect(result.skipped).toBe(0);
+	expect(result.queue.tracks).toHaveLength(1);
+	return result.queue.tracks[0]!;
+}
+
+// Missing-title provenance comes from the real library-to-queue conversion,
+// never from a hand-built { title: id } object or an invented marker.
+const fallbackForms = [
+	{ label: 'blank title', queued: false, title: '' },
+	{ label: 'whitespace title', queued: false, title: '   ' },
+	{ label: 'queued blank library title', queued: true, title: '' },
+	{ label: 'queued whitespace library title', queued: true, title: '   ' }
+];
+
+describe.each(fallbackForms)('canonical queue fallback: $label', ({ label, queued, title }) => {
+	function fallback(id: string, artist?: string): MatchTrack {
+		if (!queued) return { id, title, artist };
+		const track = enqueueLibraryItem(id, title, artist);
+		expect(track.id).toBe(id);
+		expect(track.title).toBe(id);
+		return track;
+	}
+
+	it.each([
+		{
+			direction: 'composed artist, decomposed query',
+			artist: `Caf${E_ACUTE} Band`, query: `caf${E_DECOMPOSED} band`
+		},
+		{
+			direction: 'decomposed artist, composed query',
+			artist: `Caf${E_DECOMPOSED} Band`, query: `CAF${E_ACUTE_UPPER} BAND`
+		}
+	])('[CF-Q11] artist-only equivalence: $direction', async ({ direction, artist, query }) => {
+		const matches = await requireMatcher();
+		await check(`[CF-Q11] ${label}: ${direction}`, true, () =>
+			matches(fallback('plain-fallback-id', artist), query)
+		);
+	});
+
+	it.each([
+		{ query: `caf${E_ACUTE}`, artist: undefined },
+		{ query: `caf${E_DECOMPOSED}`, artist: '' },
+		{ query: 'undefined', artist: undefined },
+		{ query: 'null', artist: undefined }
+	])('[CF-Q11] missing artist never matches $query', async ({ query, artist }) => {
+		const matches = await requireMatcher();
+		await check(`[CF-Q11] ${label}: missing artist / ${query}`, false, () =>
+			matches(fallback('plain-fallback-id', artist), query)
+		);
+	});
+
+	it.each([
+		{
+			direction: 'ASCII id, composed artist',
+			id: 'track-1', artist: `Caf${E_ACUTE}`,
+			query: `track-1 caf${E_DECOMPOSED}`, expected: true
+		},
+		{
+			direction: 'ASCII id, decomposed artist',
+			id: 'track-1', artist: `Caf${E_DECOMPOSED}`,
+			query: `track-1 caf${E_ACUTE}`, expected: true
+		},
+		{
+			direction: 'ASCII id, literal decomposed artist and query',
+			id: 'track-1', artist: `Caf${E_DECOMPOSED}`,
+			query: `track-1 caf${E_DECOMPOSED}`, expected: true
+		},
+		{
+			direction: 'spaced decomposed id, composed artist',
+			id: `disc ${E_DECOMPOSED} side`, artist: `Caf${E_ACUTE} Live Band`,
+			query: `${E_DECOMPOSED} side caf${E_DECOMPOSED} live`, expected: true
+		},
+		{
+			direction: 'spaced composed id, decomposed artist',
+			id: `disc ${E_ACUTE} side`, artist: `Caf${E_DECOMPOSED} Live Band`,
+			query: `${E_ACUTE} side caf${E_ACUTE} live`, expected: true
+		},
+		{
+			direction: 'decomposed id must not match composed query id',
+			id: `disc ${E_DECOMPOSED} side`, artist: `Caf${E_DECOMPOSED} Live Band`,
+			query: `${E_ACUTE} side caf${E_ACUTE} live`, expected: false
+		},
+		{
+			direction: 'composed id must not match decomposed query id',
+			id: `disc ${E_ACUTE} side`, artist: `Caf${E_ACUTE} Live Band`,
+			query: `${E_DECOMPOSED} side caf${E_DECOMPOSED} live`, expected: false
+		}
+	])('[CF-Q12] literal id plus canonical artist: $direction', async ({ direction, id, artist, query, expected }) => {
+		const matches = await requireMatcher();
+		await check(`[CF-Q12] ${label}: ${direction}`, expected, () =>
+			matches(fallback(id, artist), query)
+		);
+	});
+
+	it.each([
+		{
+			direction: 'decomposed id, literal query', id: `canon-${E_DECOMPOSED}-id`,
+			query: ` CANON-${E_DECOMPOSED}-ID `, expected: true
+		},
+		{
+			direction: 'composed id, literal query', id: `canon-${E_ACUTE}-id`,
+			query: `CANON-${E_ACUTE_UPPER}-ID`, expected: true
+		},
+		{
+			direction: 'decomposed id, composed query', id: `canon-${E_DECOMPOSED}-id`,
+			query: `canon-${E_ACUTE}-id`, expected: false
+		},
+		{
+			direction: 'composed id, decomposed query', id: `canon-${E_ACUTE}-id`,
+			query: `canon-${E_DECOMPOSED}-id`, expected: false
+		}
+	])('[CF-Q13] fallback ids stay literal: $direction', async ({ direction, id, query, expected }) => {
+		const matches = await requireMatcher();
+		await check(`[CF-Q13] ${label}: ${direction}`, expected, () =>
+			matches(fallback(id), query)
+		);
+	});
+});
+
+describe('canonical queue find: real metadata must not be mistaken for an id fallback', () => {
+	it.each([
+		{
+			direction: 'decomposed metadata, composed query',
+			title: `caf${E_DECOMPOSED}`, query: `caf${E_ACUTE}`
+		},
+		{
+			direction: 'composed metadata, decomposed query',
+			title: `caf${E_ACUTE}`, query: `caf${E_DECOMPOSED}`
+		}
+	])('[CF-Q14] a nonblank title equal to its id stays metadata: $direction', async ({ direction, title, query }) => {
+		const matches = await requireMatcher();
+		const named = enqueueLibraryItem(title, title);
+		expect(named.id).toBe(title);
+		expect(named.title).toBe(title);
+		await check(`[CF-Q14] ${direction}`, true, () => matches(named, query));
+	});
+
+	it.each([
+		{
+			direction: 'composed title, decomposed artist',
+			title: `Caf${E_ACUTE} Night`, artist: `${A_RING_DECOMPOSED}ngstrom Band`,
+			query: `caf${E_DECOMPOSED} night ${A_RING}ngstrom`
+		},
+		{
+			direction: 'decomposed title, composed artist',
+			title: `Caf${E_DECOMPOSED} Night`, artist: `${A_RING}ngstrom Band`,
+			query: `caf${E_ACUTE} night ${A_RING_DECOMPOSED}ngstrom`
+		}
+	])('[CF-Q15] ordinary metadata boundaries stay canonical: $direction', async ({ direction, title, artist, query }) => {
+		const matches = await requireMatcher();
+		await check(`[CF-Q15] ${direction}`, true, () =>
+			matches({ id: 'ordinary-metadata-id', title, artist }, query)
+		);
 	});
 });
