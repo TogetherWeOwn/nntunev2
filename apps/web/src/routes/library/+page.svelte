@@ -145,6 +145,19 @@
 	let shareInvalid = $state(false);
 	let shareGeneration = 0;
 	let shareAlive = true;
+	// Queue-row share outcomes live apart from the browse share feedback so a
+	// queue action never touches browse-row announcements (and vice versa).
+	// An outcome belongs to the queue it was produced for: any queue or
+	// selection change swaps the queue object and hides it (no effect needed).
+	let queueShareOutcome: { status: string; fallbackUrl: string | null; forQueue: QueueState | null } =
+		$state({ status: '', fallbackUrl: null, forQueue: null });
+	let queueShareGeneration = 0;
+	const queueShareStatus = $derived(
+		queueShareOutcome.forQueue === queue ? queueShareOutcome.status : ''
+	);
+	const queueShareFallbackUrl = $derived(
+		queueShareOutcome.forQueue === queue ? queueShareOutcome.fallbackUrl : null
+	);
 	// A link is consumed once per navigation, never replayed by Refresh or
 	// across an account boundary. Deferred seeks belong to one loaded source.
 	let handledShareSearch: string | null = null;
@@ -374,11 +387,89 @@
 		shareFallbackUrl = null;
 	}
 
+	/**
+	 * Drop visible queue-share feedback. Only a new activation or the auth
+	 * boundary supersedes a pending write (`supersede`); a queue edit merely
+	 * clears what is shown, and the late completion re-checks its row.
+	 */
+	function clearQueueShareFeedback(supersede = false): void {
+		if (supersede) queueShareGeneration += 1;
+		setQueueShareOutcome('', null);
+	}
+
+	function setQueueShareOutcome(status: string, fallbackUrl: string | null): void {
+		queueShareOutcome = { status, fallbackUrl, forQueue: queue };
+	}
+
 	function resetShareAtAuthBoundary(): void {
 		clearShareFeedback();
+		clearQueueShareFeedback(true);
 		pendingShareSeek = null;
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
+	}
+
+	type ClipboardWriter = { writeText: (text: string) => Promise<void> };
+
+	/** Match demo copy: feature-detect inside a try (even the getter may throw). */
+	function clipboardWriter(): ClipboardWriter | undefined {
+		try {
+			const candidate = navigator.clipboard;
+			return typeof candidate?.writeText === 'function' ? candidate : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	function shortTitle(title: string): string {
+		return title.length > 70 ? `${title.slice(0, 69)}…` : title;
+	}
+
+	/**
+	 * Copy the browse-format link for one queued row. Never selects, seeks,
+	 * plays, fetches or persists; the position is read live and only for the
+	 * current track, so a queued row is never stamped with another track's
+	 * time. A row that left the queue before the write finished reports
+	 * unavailable instead of a stale success.
+	 */
+	async function copyQueuedTrackLink(id: string): Promise<void> {
+		clearQueueShareFeedback(true);
+		const generation = queueShareGeneration;
+		const queued = queue.tracks.find((track) => track.id === id);
+		if (!queued) {
+			setQueueShareOutcome('Link unavailable — that track is no longer in the queue.', null);
+			return;
+		}
+		const title = shortTitle(queued.title?.trim() ? queued.title : queued.id);
+		const unavailable = `Link unavailable — ${title} is no longer in the queue.`;
+		const current = queueCurrentTrack(queue);
+		const position = current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+		const seconds = typeof position === 'number' && Number.isFinite(position) && position >= 0 ? position : 0;
+		let url: string;
+		try {
+			url = `${window.location.origin}/library?${buildShareQuery(id, seconds)}`;
+		} catch {
+			setQueueShareOutcome(unavailable, null);
+			return;
+		}
+		const clipboard = clipboardWriter();
+		if (!clipboard) {
+			setQueueShareOutcome('', url);
+			return;
+		}
+		let written = true;
+		try {
+			await clipboard.writeText(url);
+		} catch {
+			written = false;
+		}
+		if (!shareAlive || generation !== queueShareGeneration) return;
+		if (!queue.tracks.some((track) => track.id === id)) {
+			setQueueShareOutcome(unavailable, null);
+			return;
+		}
+		if (written) setQueueShareOutcome(`Copied link for ${title}.`, null);
+		else setQueueShareOutcome('', url);
 	}
 
 	async function copyTrackLink(id: string): Promise<void> {
@@ -396,16 +487,7 @@
 		} catch {
 			return;
 		}
-		// Match demo copy: feature-detect inside a try (even the getter may
-		// throw), and offer manual copy for missing/denied clipboard access.
-		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
-		let clipboard: ClipboardWriter | undefined;
-		try {
-			const candidate = navigator.clipboard;
-			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
-		} catch {
-			clipboard = undefined;
-		}
+		const clipboard = clipboardWriter();
 		if (!clipboard) {
 			shareFallbackUrl = url;
 			return;
@@ -909,6 +991,23 @@
 		</div>
 	{/if}
 
+	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareStatus}</div>
+	{#if queueShareFallbackUrl}
+		<div class="nt-library-share-fallback">
+			<label for="queue-share-url">Queued track link</label>
+			<input
+				id="queue-share-url"
+				data-testid="queue-share-fallback"
+				aria-describedby="queue-share-instructions"
+				readonly
+				value={queueShareFallbackUrl}
+			/>
+			<p id="queue-share-instructions" data-testid="queue-share-instructions">
+				Select the link and press Ctrl+C or Cmd+C to copy it.
+			</p>
+		</div>
+	{/if}
+
 	{#if loading && items.length === 0}
 		<p role="status">Loading your library…</p>
 	{:else if loadError && items.length === 0}
@@ -1211,6 +1310,7 @@
 				onremove={removeQueuedTrack}
 				onclear={clearQueuedTracks}
 				onselect={selectQueuedTrack}
+				oncopylink={(id) => void copyQueuedTrackLink(id)}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
