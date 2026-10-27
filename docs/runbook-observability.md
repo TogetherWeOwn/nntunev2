@@ -2,13 +2,20 @@
 
 This runbook covers the Cloudflare-hosted NNTune v2 app. It does not cover the legacy service or use an external uptime monitor. **The escape-detection kit is not live yet.** The current repository does not configure Discord alert rules, a two-minute health alert, five-minute user-flow synthetics, production synthetics, release-tagged error tracking, or a gradual-rollout/error-rate rollback action. Do not treat this runbook or a green CI run as proof of deployed monitoring.
 
-## Integrated error-rate runtime: source only, not activated
+## Integrated error-rate runtime: staging deployment lane, delivery not activated
 
 [`workers/observability/runtime.mjs`](../workers/observability/runtime.mjs)
 integrates the staging API Tail projector, durable receive-time error windows,
-reducer, renderer and secret-bound Discord delivery. Its only configuration is an
-inactive [example](../workers/observability/wrangler.toml.example); **there is no
-live consumer, Tail attachment or provisioned alert secret in this slice**.
+reducer, renderer and secret-bound Discord delivery. The
+[`deploy-alerts-staging` workflow](../.github/workflows/deploy-alerts-staging.yml)
+deploys only `nntune-alerts-staging` after a qualifying push to `main`, when the
+existing repository deployment token is configured. It derives a temporary
+staging config from the [inactive local example](../workers/observability/wrangler.toml.example).
+It does not provision a secret or attach the consumer to `nntune-api-staging`.
+An already provisioned `OPS_ALERT_WEBHOOK_URL` is allowed only as `secret_text`;
+its value is never read by the verifier. **A merged lane is not evidence that the
+consumer is deployed, attached or delivering messages.** Check the workflow's
+actual deploy and verify results; a credential-gate skip is not a deployment.
 Producer deployment settings are unchanged. The [runtime contract and local
 verification](../workers/observability/README.md#runtime-contract) describe the
 frozen interfaces, retention caps and deterministic local tests. A green local
@@ -31,14 +38,56 @@ inspect or paste. A missing/invalid webhook or `LOGS_URL` disables delivery whil
 cleanup continues. Consumer logs/traces must stay disabled to avoid secret URL
 capture in automatic subrequest spans. Public HTTP is always empty 404.
 
-Later activation is a separate staging-first machine contract: exact-head CI and
-review, existing-plan/cost and secret-version checks, approved consumer/attachment,
-controlled staging breach plus real message/log-link evidence, health and recorded
-rollback. Do not run live delivery, provision secrets, attach Tail or deploy from
-this source-only change. Source undo is a normal gated revert PR; no live runtime
-rollback was exercised here. Any later live rollback must remove/restore the
-approved consumer attachment and serving version without changing producer data;
-never delete durable history as a diagnostic shortcut. Production stays passive.
+The deployment guard freezes four runtime modules to
+`818e57680414c4414cc3c96e2f3f9a6ca38d80bf` and rejects config drift before deploying.
+The generated config disables consumer observability/logs/invocation logs/traces,
+workers.dev and preview URLs; it has no routes and only the `v1` SQLite
+`ErrorRateAlerts` migration. Verification lists every namespace page, matches the
+binding's namespace ID/class/script, and rejects unexpected bindings or enabled
+logging. The required `tail-projection` CI job executes the same freeze guard and
+offline rejection fixtures. The verifier prints IDs and binding names, not values.
+A verification failure happens **after deployment**: it does not automatically
+undo a serving version. Do not rerun a failed deployment as a diagnostic shortcut.
+
+Secret provisioning and Tail attachment remain a separate staging-first machine
+contract: exact-head CI and review, existing-plan/cost and secret-version checks,
+approved attachment, controlled staging breach plus real message/log-link evidence,
+health and a tested rollback. This lane supplies only the consumer deployment;
+it is not permission to provision secrets, attach Tail, run live delivery or change
+production. Missing/invalid configuration keeps delivery fail-closed.
+
+### Staging consumer rollback
+
+This is a recorded procedure, **not an exercised live rollback receipt**. Before
+any activation or later redeploy, the authorized executor records the workflow
+run/head, current serving deployment/version (from Cloudflare Deployments, not
+just the newest uploaded version), last known-good version, namespace ID and
+attachment state in the private deployment record. Never record secret values.
+
+1. Pause further staging consumer deployments through the approved workflow
+   control, and retain the failed run's evidence. Producer and production data
+   remain untouched. If a separately approved Tail attachment is active, its
+   authorized executor restores/removes only that attachment under its own
+   recorded rollback contract; this lane does not manage producer settings.
+2. For an existing known-good version with the same DO migration lineage, use
+   pinned Wrangler 4.150.0:
+   `wrangler rollback "$LAST_KNOWN_GOOD_VERSION" --name nntune-alerts-staging`.
+   Select the recorded version explicitly; never rely on implicit "previous".
+   [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+   prohibit crossing a DO lifecycle migration. No new migration, Worker deletion,
+   namespace deletion or durable-history deletion is an undo step here.
+3. On the first deployment there is no pre-creation version to restore. Keep the
+   consumer unattached, pause the lane and preserve the Worker/namespace. Fix
+   forward through an exact-head reviewed PR; do not invent a rollback ID.
+4. Recheck Cloudflare's active deployment against the selected version and run
+   `python3 .github/scripts/alerts_staging.py verify` using existing scoped
+   credentials. Confirm observability remains off and attachment state matches the
+   approved record. Record version/namespace IDs and staging API health; require
+   controlled delivery evidence separately before calling monitoring live.
+
+Source undo is a normal gated revert PR. Reverting workflow source does not undo
+a Cloudflare deployment. No live deployment, delivery test or rollback drill was
+performed while adding this lane. Production stays passive.
 
 ## Current baseline and gaps
 
@@ -46,7 +95,7 @@ never delete durable history as a diagnostic shortcut. Production stays passive.
 - **Cloudflare Issues:** **Workers & Pages → [service] → Observability → Issues** can show grouped Worker failures when enabled. Error-class grouping and release-to-commit linkage are not configured by this repository yet. Use the issue as a starting point, not proof of release attribution.
 - **Staging synthetic:** `.github/workflows/e2e-staging.yml` triggers at minute 17 every six hours (`17 */6 * * *`). Each configured scheduled or manually dispatched run executes only the health-only `synthetic` job (monitoring-only); the full staging journey runs solely on the post-deploy call from `deploy.yml` after a successful `staging-web` deploy of the same run. The journey includes signup and other writes and is staging-only. This is not the required five-minute user-flow synthetic. Jobs skip when staging is not configured; check the workflow run and job results before relying on it.
 - **Production synthetic:** none is configured (no workflow in `.github/workflows/` targets production; `e2e-staging.yml` exercises the staging URL only). Do not attempt production signup, playback setup, or other writes. Any later production synthetic must be explicitly read-only and passive.
-- **Alerts:** no Discord alert destination or app alert rule is configured in this repository as of this baseline (no alert/destination config in `.github/workflows/` or the Wrangler configs). No two-minute sustained-red threshold is configured. The expected Discord destination and secret injection still need environment-level verification; do not infer they exist from a secret name mentioned in a task.
+- **Alerts:** `deploy-alerts-staging.yml` now defines a staging-only consumer deployment lane with frozen error-rate logic; it neither provisions the Discord destination/secret nor attaches Tail. Check the actual run and environment before calling any monitoring live. No two-minute sustained-red threshold is configured. The expected Discord destination and secret injection still need environment-level verification; do not infer they exist from a secret name mentioned in a task.
 - **Rollout/rollback:** no shared gradual-promotion action or error-rate auto-rollback is wired here (no shared action under `.github/`; only the api staging lane deploys a backend Worker — see the future-lanes section of [`docs/ops.md`](ops.md#staging-promotion-checklist)). The current staging checklist in [`docs/ops.md`](ops.md#staging-promotion-checklist) documents the web-only redeploy rollback; it explicitly does not cover Worker rollback or prove which SHA is serving. Production promotion remains unwired.
 
 ## Where to look after the kit is enabled
