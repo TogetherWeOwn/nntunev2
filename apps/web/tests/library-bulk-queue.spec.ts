@@ -246,6 +246,7 @@ test('BULK-05 singleton reports one; clear re-enables; already-queued starts dis
 	await rowAction(page, 'bulk-z').click();
 	await expect(action(page)).toBeDisabled();
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await expect(action(page)).toBeEnabled();
 	await action(page).click();
 	await expectQueue(page, ['bulk-z'], 'bulk-z');

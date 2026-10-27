@@ -245,6 +245,7 @@ test('clear empties the queue and disables transport', async ({ page }) => {
 	await expect(clear).toBeVisible();
 	await expect(clear).toBeEnabled();
 	await clear.click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
