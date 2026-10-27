@@ -109,6 +109,11 @@ target = "app"
 sha256 = "f28d63c5b585c98aecaa2949c962481a05abf93dff199388ce17f7190434a62a"
 
 [[migration]]
+file = "0023_subsonic_clients.sql"
+target = "app"
+sha256 = "38d6c4a05665d4a8149fced4aed3f9025626226d2a0843f39b5a7e052280df12"
+
+[[migration]]
 file = "0024_rotation_runs.sql"
 target = "app"
 sha256 = "8167dfe073d5498e31e01cfc00f694b60429eac1f189d7596c8837d2ec1f71bc"
