@@ -560,12 +560,12 @@ test('[FAVTRUTH-E09] unsaved edits preserve queue, player, audio and keyboard fo
 	expect(await page.getByTestId('now-playing').textContent()).toBe(nowPlayingBefore);
 
 	// A failed move keeps focus inside the moved track's controls.
-	const mover = moveButton(page, 'Mike Song', 'up');
+	const mover = moveButton(page, 'Alpha Song', 'up');
 	await mover.focus();
 	await page.keyboard.press('Enter');
-	expect(await orderedFavoriteIds(page)).toEqual(['truth-mike', 'truth-alpha']);
+	expect(await orderedFavoriteIds(page)).toEqual(['truth-alpha', 'truth-mike']);
 	await expect(
-		page.locator('[data-testid="favorite-item"][data-id="truth-mike"] :focus')
+		page.locator('[data-testid="favorite-item"][data-id="truth-alpha"] :focus')
 	).toHaveCount(1);
 	expect(await queueIds(page)).toEqual(queuedBefore);
 });

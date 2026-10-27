@@ -265,7 +265,7 @@ describe('favorites-truth resolved/unresolved projection', () => {
 	it('[FAVTRUTH-U14] invalid entries are ignored, never counted, never thrown on', () => {
 		const ids = Object.freeze(['truth-unit-zulu', '', 'truth-ghost-a', 42, null, undefined]);
 		expect(projectCounts([ZULU, ALPHA], ids)).toEqual({ resolved: 1, unresolved: 1 });
-		expect(projectCounts([], ids)).toEqual({ resolved: 0, unresolved: 1 });
+		expect(projectCounts([], ids)).toEqual({ resolved: 0, unresolved: 2 });
 	});
 
 	it('[FAVTRUTH-U15] matching uses stable ids only; loaded order and duplicate rows are irrelevant', () => {
