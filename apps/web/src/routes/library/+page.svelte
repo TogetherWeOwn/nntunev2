@@ -124,7 +124,7 @@
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
-	// Bumped by every queue replacement; fences late play-from-top outcomes.
+	// Bumped by every queue edit; fences late play-from-top outcomes.
 	let playEpoch = 0;
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -559,6 +559,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
+		playEpoch += 1;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
@@ -571,6 +572,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		playEpoch += 1;
 		queue = next;
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
@@ -581,6 +583,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
+		playEpoch += 1;
 		queue = next;
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
@@ -600,6 +603,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		playEpoch += 1;
 		queue = selected;
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
@@ -612,6 +616,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
@@ -622,6 +627,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
