@@ -2,7 +2,7 @@
 name = "nntune-api"
 version = "0.1.0"
 edition = "2021"
-description = "NNTune v2 accounts/auth (passkey challenges + email magic link), sessions, BYOP credential vault (Cloudflare Worker, Rust; native + wasm32)"
+description = "NNTune v2 API worker: Subsonic-compatible surface, accounts/auth, sessions and BYOP credential vault (native + wasm32)"
 license = "MIT"
 
 [lib]
@@ -50,6 +50,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Handler deadlines also run under native synthetic executors without Tokio.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-timer = "3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-util = "0.3"
+nntune-subsonic = { version = "0.1.0", path = "../../crates/nntune-subsonic" }
+worker = "0.8"
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
