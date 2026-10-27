@@ -50,6 +50,8 @@
 		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		formatQueueM3U,
+		formatQueueText,
 		keepCurrentAndUpcoming,
 		moveTrack,
 		nextTrack,
@@ -182,6 +184,21 @@
 		seconds: number;
 		appliedSeconds: number | null;
 	} | null = null;
+	/**
+	 * Favorites export feedback. Exporting is read-only: the handlers only
+	 * snapshot `favoriteTracks` and write feedback here. The feedback is
+	 * fenced to the arranged favorites it was produced from (see
+	 * `favoritesExportCurrentKey` below): arranging, unstarring or an auth
+	 * boundary retires it instead of leaving a stale success claim or a
+	 * previous account's fallback text on screen.
+	 */
+	let favoritesExportStatus = $state('');
+	let favoritesExportFallback: string | null = $state(null);
+	let favoritesExportFeedbackKey: string | null = $state(null);
+	let favoritesExportGeneration = 0;
+	let favoritesExportAlive = true;
+	let favoritesDownloadUrl: string | null = null;
+
 	// Restart availability is live native state of the mounted matching
 	// element, re-evaluated on media events — never cached coordinates.
 	// The outcome lives only in one polite status inside the Player region
@@ -199,6 +216,8 @@
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
 			resetShareAtAuthBoundary();
+			clearFavoritesExportFeedback();
+			releaseFavoritesDownload();
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
@@ -225,6 +244,7 @@
 			}
 			if (state.loading || state.items.length === 0) {
 				clearShareFeedback();
+				clearFavoritesExportFeedback();
 				pendingShareSeek = null;
 			}
 			// The queue is per-account: drop tracks the new library no longer
@@ -321,6 +341,19 @@
 			.map((id) => items.find((track) => track.id === id) ?? null)
 			.filter((track): track is LibraryItem => track !== null)
 	);
+	// Feedback stays visible only while the arranged favorites (ids and
+	// display labels, in order) are exactly the ones it was exported from.
+	const favoritesExportCurrentKey = $derived(currentFavoritesExportKey());
+	const favoritesExportStatusShown = $derived(
+		favoritesExportFeedbackKey !== null && favoritesExportFeedbackKey === favoritesExportCurrentKey
+			? favoritesExportStatus
+			: ''
+	);
+	const favoritesExportFallbackShown = $derived(
+		favoritesExportFeedbackKey !== null && favoritesExportFeedbackKey === favoritesExportCurrentKey
+			? favoritesExportFallback
+			: null
+	);
 
 	function trackCountLabel(count: number): string {
 		return `${count} ${count === 1 ? 'track' : 'tracks'}`;
@@ -392,6 +425,120 @@
 		for (const track of favoriteTracks) selectTrack(track.id);
 		const added = queue.tracks.length - before;
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
+	}
+
+	/** Snapshot the listed favorites, in arranged order, as queue display tracks. */
+	function favoritesExportSnapshot(): QueueState {
+		return createQueue(favoriteTracks.map(queuedTrackFor));
+	}
+
+	function currentFavoritesExportKey(): string {
+		return favoritesExportSnapshot()
+			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
+			.join('\u0001');
+	}
+
+	function clearFavoritesExportFeedback(): void {
+		favoritesExportGeneration += 1;
+		favoritesExportStatus = '';
+		favoritesExportFallback = null;
+		favoritesExportFeedbackKey = null;
+	}
+
+	function releaseFavoritesDownload(): void {
+		if (favoritesDownloadUrl !== null) URL.revokeObjectURL(favoritesDownloadUrl);
+		favoritesDownloadUrl = null;
+	}
+
+	const FAVORITES_EXPORT_UNSAFE_ID =
+		'Could not export favorites: a favorite has an unsafe track id.';
+
+	async function copyFavoritesText(): Promise<void> {
+		clearFavoritesExportFeedback();
+		const generation = favoritesExportGeneration;
+		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
+		const snapshot = favoritesExportSnapshot();
+		const key = currentFavoritesExportKey();
+		let text: string;
+		try {
+			// formatQueueText never applies the shared id guard, so run the
+			// M3U formatter first (its output is discarded): an unsafe
+			// favorite id must refuse the copy before the clipboard is
+			// touched, for this action just as for the download.
+			formatQueueM3U(snapshot);
+			text = formatQueueText(snapshot);
+		} catch {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
+			return;
+		}
+		try {
+			// Both the API getter and the write can fail. Neither is proof
+			// of a successful copy: expose selectable text instead.
+			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
+			await navigator.clipboard.writeText(text);
+		} catch {
+			if (
+				!favoritesExportAlive ||
+				generation !== favoritesExportGeneration ||
+				currentFavoritesExportKey() !== key
+			) {
+				return;
+			}
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = 'Clipboard unavailable. Copy the favorites manually below.';
+			favoritesExportFallback = text;
+			return;
+		}
+		if (
+			!favoritesExportAlive ||
+			generation !== favoritesExportGeneration ||
+			currentFavoritesExportKey() !== key
+		) {
+			return;
+		}
+		favoritesExportFeedbackKey = key;
+		favoritesExportStatus = 'Copied favorites as text.';
+	}
+
+	function downloadFavoritesM3U(): void {
+		clearFavoritesExportFeedback();
+		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
+		const key = currentFavoritesExportKey();
+		let m3u: string;
+		try {
+			m3u = formatQueueM3U(favoritesExportSnapshot());
+		} catch {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
+			return;
+		}
+		const link = document.createElement('a');
+		try {
+			// Retain at most one Blob URL until the next download or
+			// teardown, not an arbitrary timer while the browser may
+			// still be saving it.
+			releaseFavoritesDownload();
+			const blob = new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' });
+			favoritesDownloadUrl = URL.createObjectURL(blob);
+			link.href = favoritesDownloadUrl;
+			link.download = 'favorites.m3u';
+			link.hidden = true;
+			document.body.append(link);
+			link.click();
+			// The browser owns the save dialog: initiating it cannot
+			// prove that a file was saved to disk.
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus =
+				'Download started. Check your browser’s saved downloads for favorites.m3u.';
+		} catch {
+			releaseFavoritesDownload();
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus =
+				'Could not start the download. Try again or copy the favorites as text.';
+		} finally {
+			link.remove();
+		}
 	}
 
 	/**
@@ -1035,6 +1182,8 @@
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			resetShareAtAuthBoundary();
+			clearFavoritesExportFeedback();
+			releaseFavoritesDownload();
 			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
@@ -1056,6 +1205,8 @@
 
 	function handleLocalAuthTransition(): void {
 		resetShareAtAuthBoundary();
+		clearFavoritesExportFeedback();
+		releaseFavoritesDownload();
 		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
@@ -1086,6 +1237,8 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			favoritesExportAlive = false;
+			releaseFavoritesDownload();
 			clearShareFeedback();
 			pendingShareSeek = null;
 			restartSupersededSources.clear();
@@ -1212,6 +1365,42 @@
 						</li>
 					{/each}
 				</ul>
+				<div class="nt-favorites-export">
+					<div class="nt-favorites-export-actions">
+						<button
+							class="nt-button"
+							type="button"
+							data-testid="favorites-export-copy"
+							aria-describedby="favorites-export-status"
+							onclick={() => void copyFavoritesText()}>Copy favorites as text</button
+						>
+						<button
+							class="nt-button"
+							type="button"
+							data-testid="favorites-export-download"
+							aria-describedby="favorites-export-status"
+							onclick={downloadFavoritesM3U}>Download favorites (.m3u)</button
+						>
+					</div>
+					<p id="favorites-export-status" data-testid="favorites-export-status" aria-live="polite">
+						{favoritesExportStatusShown}
+					</p>
+					{#if favoritesExportFallbackShown !== null}
+						<label for="favorites-export-fallback-field">Favorites as text</label>
+						<textarea
+							id="favorites-export-fallback-field"
+							data-testid="favorites-export-fallback"
+							readonly
+							rows="4"
+							value={favoritesExportFallbackShown}
+							aria-describedby="favorites-export-instructions"
+						></textarea>
+						<p id="favorites-export-instructions" data-testid="favorites-export-instructions">
+							Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or
+							Cmd+C). On touch screens, long-press the text, select all and choose Copy.
+						</p>
+					{/if}
+				</div>
 			{/if}
 			<div class="nt-shelf-clear">
 				<button
@@ -1716,6 +1905,33 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-favorites-export {
+		margin-block: var(--nt-space-3);
+	}
+	.nt-favorites-export-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-favorites-export-actions .nt-button {
+		min-height: 2.75rem;
+		max-width: 100%;
+	}
+	.nt-favorites-export p {
+		margin-block: var(--nt-space-2);
+	}
+	.nt-favorites-export textarea {
+		display: block;
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
 	}
 	.nt-selection-bar {
 		display: flex;
