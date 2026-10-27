@@ -437,15 +437,22 @@
 		});
 	}
 
-	function queuedTrackFor(item: LibraryItem, carryStream = false): Track {
-		// The bulk append carries library display fields only; the play path
-		// carries the item's stream URL like row selection does.
+	function queuedTrackFor(item: LibraryItem): Track {
+		// Library display fields only: the bulk append and the favorites
+		// export snapshot never carry a stream URL.
 		return {
 			id: item.id,
 			title: displayTitle(item),
 			artist: displayArtist(item) ?? '',
-			streamUrl: carryStream ? resolveStreamUrl({ streamUrl: item.streamUrl }) : ''
+			streamUrl: ''
 		};
+	}
+
+	// The play path carries the item's stream URL like row selection does.
+	// A separate one-parameter mapper (no positional flag), so a bare
+	// `.map(...)` reference can never bind the array index to it.
+	function playableTrackFor(item: LibraryItem): Track {
+		return { ...queuedTrackFor(item), streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl }) };
 	}
 
 	/**
@@ -453,9 +460,9 @@
 	 * tracks join the end in displayed order, the existing arrangement and
 	 * current selection survive, and an empty queue starts at its first row.
 	 */
-	function appendMissingTracks(missing: readonly LibraryItem[], carryStream = false): QueueState {
+	function appendMissingTracks(missing: readonly Track[]): QueueState {
 		return {
-			tracks: [...queue.tracks, ...missing.map((item) => queuedTrackFor(item, carryStream))],
+			tracks: [...queue.tracks, ...missing],
 			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
 		};
 	}
@@ -488,7 +495,7 @@
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		replaceQueue(appendMissingTracks(missing));
+		replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)));
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
 	}
 
@@ -509,7 +516,7 @@
 			missing.length > 0
 				? queue.tracks.length
 				: queue.tracks.findIndex((track) => track.id === visibleItems[0]?.id);
-		const base = missing.length > 0 ? appendMissingTracks(missing, true) : queue;
+		const base = missing.length > 0 ? appendMissingTracks(missing.map(playableTrackFor)) : queue;
 		const selected = selectQueueIndex(base, index);
 		const target = selected.tracks[selected.currentIndex];
 		if (selected.currentIndex !== index || !target) return;
