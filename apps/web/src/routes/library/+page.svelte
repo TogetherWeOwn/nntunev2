@@ -196,6 +196,7 @@
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
 	let restartStatusVersion = $state(0);
+	let jumpStatusVersion = $state(0);
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -419,6 +420,8 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			restartCanSeek = false;
 			restartStatus = '';
+			// The Back/Forward readout describes the previous source too.
+			jumpFeedback = '';
 		}
 	}
 
@@ -428,7 +431,6 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			clearShareFeedback();
 			pendingShareSeek = null;
-			jumpFeedback = '';
 		}
 		resetRestartOnSourceChange(before, after);
 		queue = next;
@@ -710,6 +712,9 @@
 			if (outcome.kind === 'jumped' || outcome.kind === 'boundary') pendingShareSeek = null;
 		}
 		jumpFeedback = describeJump(direction, outcome);
+		// A repeated identical outcome changes no text; the version re-renders
+		// the live-region content so it is announced again.
+		jumpStatusVersion += 1;
 	}
 
 	if (typeof window !== 'undefined') {
@@ -1565,7 +1570,7 @@
 				</button>
 			</div>
 			<p class="nt-player-jump-status" data-testid="player-seek-feedback" role="status">
-				{jumpFeedback}
+				{#key jumpStatusVersion}{jumpFeedback}{/key}
 			</p>
 		</section>
 	{/if}
