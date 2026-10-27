@@ -709,6 +709,25 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
     }
+    /// Atomic vault save: the vault upsert, the providers mint, and the
+    /// rotation prune of superseded unreferenced rows, as one unit — a
+    /// failed mint must never leave a committed vault row behind (the
+    /// save audit runs only after this returns `Ok`, so a partial write
+    /// would be a silent credential overwrite). `PgStore` MUST override
+    /// this with one transaction; the default runs the two writes
+    /// sequentially for out-of-tree test stores (whose no-op
+    /// `insert_provider` keeps the old upsert-only behavior).
+    fn save_vault_and_mint_provider(
+        &self,
+        user_id: &str,
+        vault: &VaultRow,
+        mint: &ProviderMintRow,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            self.upsert_vault(user_id, vault).await?;
+            self.insert_provider(mint).await
+        }
+    }
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -2527,50 +2546,50 @@ where
     }
 }
 
-/// Outcome of one [`mint_provider_row`] call: the mint either
-/// landed, the OS RNG was unavailable (retryable 503), or the write
-/// failed (fenced 409 or generic vault failure, classified downstream
-/// through [`vault_write_failure`]).
-enum MintOutcome {
-    Minted,
+/// Failure of one [`build_provider_mint_row`] call: the OS RNG was
+/// unavailable (retryable 503), or the mint inputs were invalid (a
+/// faulty caller clock — classified downstream through
+/// [`vault_write_failure`], like a failed write). The build touches no
+/// store: nothing has landed when it fails.
+enum MintBuildError {
     RandomnessUnavailable,
-    Store,
+    Invalid,
 }
 
-/// Mint the identity-bearing `providers` row for one vault save
+/// Build the identity-bearing `providers` row for one vault save
 /// (migration 0022, envelope v2): fresh UUID, host-derived label, the
 /// provider config sealed under the current write KEK. Pure mint
-/// inputs — validation, KEK selection and the vault upsert stay with
-/// the caller.
-async fn mint_provider_row<S: Store>(
-    store: &S,
+/// inputs, no store touch — the caller persists the row together with
+/// the vault upsert through
+/// [`Store::save_vault_and_mint_provider`], so a build failure fails
+/// the PUT before anything lands.
+fn build_provider_mint_row(
     kek: &[u8; 32],
     kek_version: u32,
     user_id: &str,
     provider: &ProviderConfig,
     now: u64,
-) -> MintOutcome {
+) -> Result<ProviderMintRow, MintBuildError> {
     // Fresh credential identity first: every failure below fails the
-    // PUT closed (the vault row already landed; a retry re-saves the
-    // single vault row and mints again).
+    // PUT closed before the atomic save runs.
     let id = match providers::mint_provider_id() {
         Ok(id) => id,
-        Err(_) => return MintOutcome::RandomnessUnavailable,
+        Err(_) => return Err(MintBuildError::RandomnessUnavailable),
     };
     // `ProviderConfig` as caller-serialized JSON (payload format 1);
     // serialization of a validated struct cannot fail, so a failure
-    // here collapses into the generic store outcome.
+    // here collapses into the invalid outcome.
     let plaintext = match serde_json::to_vec(provider) {
         Ok(bytes) => bytes,
-        Err(_) => return MintOutcome::Store,
+        Err(_) => return Err(MintBuildError::Invalid),
     };
     let envelope =
         match providers::encrypt_provider_creds(kek, kek_version, user_id, &id, &plaintext) {
             Ok(envelope) => envelope,
             Err(vault::VaultError::RandomnessUnavailable) => {
-                return MintOutcome::RandomnessUnavailable
+                return Err(MintBuildError::RandomnessUnavailable)
             }
-            Err(_) => return MintOutcome::Store,
+            Err(_) => return Err(MintBuildError::Invalid),
         };
     let row = ProviderMintRow {
         id,
@@ -2587,12 +2606,9 @@ async fn mint_provider_row<S: Store>(
     // By-construction values, but the clock is caller input: a faulty
     // `now` fails here instead of as a 23514 at the database.
     if providers::validate_mint_row(&row).is_err() {
-        return MintOutcome::Store;
+        return Err(MintBuildError::Invalid);
     }
-    match store.insert_provider(&row).await {
-        Ok(()) => MintOutcome::Minted,
-        Err(_) => MintOutcome::Store,
-    }
+    Ok(row)
 }
 
 /// Classify a failed vault-flow write: a fenced write (account being
@@ -2678,27 +2694,35 @@ where
         indexer_configured,
         updated_at: ctx.now,
     };
-    if ctx.store.upsert_vault(&claims.user_id, &row).await.is_err() {
-        return vault_write_failure(ctx.store, &claims.user_id).await;
-    }
-    // Mint the providers row for this save, after the vault upsert: the
-    // vault row is the primary artifact, and a mint failure fails the
-    // PUT closed (a retry re-saves the single vault row and mints again
-    // with identical plaintext; the pool resolves the latest row per
-    // user).
-    match mint_provider_row(
-        ctx.store,
+    // Mint the providers row for this save BEFORE the store touch: the
+    // build is pure, so a randomness or clock failure fails the PUT
+    // before anything lands.
+    let mint = match build_provider_mint_row(
         current_kek,
         ctx.cfg.kek_version,
         &claims.user_id,
         &payload.provider,
         ctx.now,
-    )
-    .await
+    ) {
+        Ok(row) => row,
+        Err(MintBuildError::RandomnessUnavailable) => return unavailable(),
+        Err(MintBuildError::Invalid) => {
+            return vault_write_failure(ctx.store, &claims.user_id).await
+        }
+    };
+    // One atomic save: vault upsert + providers mint + rotation prune.
+    // Either everything lands or nothing does, so the audit below
+    // describes a committed write and a failed PUT leaves no silent
+    // overwrite behind (a retry re-saves the single vault row and mints
+    // again with identical plaintext; the pool resolves the latest row
+    // per user).
+    if ctx
+        .store
+        .save_vault_and_mint_provider(&claims.user_id, &row, &mint)
+        .await
+        .is_err()
     {
-        MintOutcome::Minted => {}
-        MintOutcome::RandomnessUnavailable => return unavailable(),
-        MintOutcome::Store => return vault_write_failure(ctx.store, &claims.user_id).await,
+        return vault_write_failure(ctx.store, &claims.user_id).await;
     }
     ctx.audit(&claims.user_id, audit_action, true).await;
     summary_response(Some(&row))
@@ -3593,6 +3617,15 @@ mod tests {
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         providers: RefCell<Vec<ProviderMintRow>>,
+        /// Mirror of `user_cache_grants` attribution (`user_id`,
+        /// `provider_id` pairs): grant-referenced providers rows survive
+        /// the rotation prune and the vault-delete purge, like the
+        /// production `RESTRICT` FK.
+        provider_grants: RefCell<HashSet<(String, String)>>,
+        /// Vault-save store-error pin: when set,
+        /// `save_vault_and_mint_provider` fails like a production
+        /// outage without writing anything.
+        fail_vault_saves: RefCell<bool>,
         audits: RefCell<Vec<AuditEvent>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
@@ -4150,6 +4183,12 @@ mod tests {
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
+            // Mirror the production purge: unreferenced rows go with the
+            // vault; grant-referenced rows stay (RESTRICT).
+            let grants = self.provider_grants.borrow();
+            self.providers.borrow_mut().retain(|row| {
+                row.user_id != user_id || grants.contains(&(row.user_id.clone(), row.id.clone()))
+            });
             Ok(())
         }
         async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
@@ -4159,6 +4198,36 @@ mod tests {
                 return Err(StoreError);
             }
             self.providers.borrow_mut().push(row.clone());
+            Ok(())
+        }
+        async fn save_vault_and_mint_provider(
+            &self,
+            user_id: &str,
+            vault: &VaultRow,
+            mint: &ProviderMintRow,
+        ) -> Result<(), StoreError> {
+            // Mirror the production transaction: the fence and the
+            // outage pin fail BEFORE any write, so a failed save lands
+            // nothing — never a vault row without its mint.
+            if *self.fail_vault_saves.borrow() {
+                return Err(StoreError);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Err(StoreError);
+            }
+            self.vaults
+                .borrow_mut()
+                .insert(user_id.to_string(), vault.clone());
+            let mut providers = self.providers.borrow_mut();
+            providers.push(mint.clone());
+            // Mirror the rotation prune: superseded rows survive only
+            // while a grant references them.
+            let grants = self.provider_grants.borrow();
+            providers.retain(|row| {
+                row.user_id != user_id
+                    || row.id == mint.id
+                    || grants.contains(&(row.user_id.clone(), row.id.clone()))
+            });
             Ok(())
         }
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
@@ -5263,9 +5332,11 @@ mod tests {
         let sealed: serde_json::Value = serde_json::from_slice(&back).expect("JSON payload");
         assert_eq!(sealed["host"], "news.example.com");
         assert_eq!(sealed["username"], "synthetic-user");
+        let first_id = row.id.clone();
         drop(minted);
-        // A second save mints a second row (insert-per-save: rotations
-        // mint a fresh credential identity).
+        // A second save mints a fresh identity AND prunes the
+        // superseded unreferenced row: one live row per user, no
+        // decryptable stale copies accumulating.
         let resp = h.call_full(
             "PUT",
             "/v1/vault",
@@ -5274,7 +5345,10 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
-        assert_eq!(h.store.providers.borrow().len(), 2);
+        let minted = h.store.providers.borrow();
+        assert_eq!(minted.len(), 1, "superseded row pruned, mint kept");
+        assert_ne!(minted[0].id, first_id, "the survivor is the new mint");
+        drop(minted);
         // Fenced: the typed 409, and no further mint.
         h.store.deleting_users.borrow_mut().insert("u1".to_string());
         let resp = h.call_full(
@@ -5285,7 +5359,234 @@ mod tests {
             Some(ORIGIN),
         );
         assert_eq!(resp.status, 409, "{}", resp.body);
+        assert_eq!(h.store.providers.borrow().len(), 1);
+    }
+
+    #[test]
+    fn vault_put_store_failure_saves_nothing_and_skips_audit() {
+        // The save is one atomic unit: a store outage fails the PUT
+        // without landing the vault row, the mint, or the audit — never
+        // a committed write the client was told failed.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        h.store.fail_vault_saves.borrow_mut().replace(true);
+        let audits_before = h.store.audits.borrow().len();
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 400, "{}", resp.body);
+        assert_eq!(resp.body, r#"{"error":"vault unavailable"}"#);
+        assert!(
+            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
+            "no vault row on a failed save"
+        );
+        assert!(
+            h.store.providers.borrow().is_empty(),
+            "no mint on a failed save"
+        );
+        assert_eq!(
+            h.store.audits.borrow().len(),
+            audits_before,
+            "no audit for a write that never landed"
+        );
+        // The outage clears: the retry saves normally.
+        h.store.fail_vault_saves.borrow_mut().replace(false);
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(h.store.providers.borrow().len(), 1);
+    }
+
+    #[test]
+    fn vault_put_for_a_fenced_account_saves_nothing_and_skips_audit() {
+        // Fenced from the start: the typed 409, with no vault row, no
+        // mint, and no audit entry.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        h.store.deleting_users.borrow_mut().insert("u1".to_string());
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let audits_before = h.store.audits.borrow().len();
+        let resp = h.call_full(
+            "PUT",
+            "/v1/vault",
+            Some(put_body.to_string()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert!(
+            block_on(h.store.vault_by_user("u1")).unwrap().is_none(),
+            "no vault row behind the fence"
+        );
+        assert!(
+            h.store.providers.borrow().is_empty(),
+            "no mint behind the fence"
+        );
+        assert_eq!(
+            h.store.audits.borrow().len(),
+            audits_before,
+            "no audit for a fenced save"
+        );
+    }
+
+    #[test]
+    fn vault_put_prunes_superseded_rows_unless_a_grant_references_them() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let save = || {
+            h.call_full(
+                "PUT",
+                "/v1/vault",
+                Some(put_body.to_string()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        let resp = save();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let live: Vec<String> = h
+            .store
+            .providers
+            .borrow()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(live.len(), 1);
+        // A grant references the live row (pool attribution): the next
+        // save keeps it alongside the fresh mint.
+        h.store
+            .provider_grants
+            .borrow_mut()
+            .insert(("u1".to_string(), live[0].clone()));
+        let resp = save();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let live: Vec<String> = h
+            .store
+            .providers
+            .borrow()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(live.len(), 2, "referenced row survives the prune");
+        // Drop the grant: the following save prunes the now-unreferenced
+        // superseded row and keeps only the fresh mint.
+        h.store.provider_grants.borrow_mut().clear();
+        let resp = save();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let live: Vec<String> = h
+            .store
+            .providers
+            .borrow()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(live.len(), 1, "unreferenced rows pruned, mint kept");
+    }
+
+    #[test]
+    fn vault_delete_purges_unreferenced_rows_but_keeps_grant_referenced_ones() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let put_body = serde_json::json!({
+            "provider": {
+                "host": "news.example.com", "port": 563, "tls": true,
+                "username": "synthetic-user", "password": "synthetic-pass",
+                "max_connections": 4
+            },
+            "indexer": null
+        });
+        let save = || {
+            h.call_full(
+                "PUT",
+                "/v1/vault",
+                Some(put_body.to_string()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        let resp = save();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let first = h.store.providers.borrow()[0].id.clone();
+        // Reference the first row, then rotate: two rows live.
+        h.store
+            .provider_grants
+            .borrow_mut()
+            .insert(("u1".to_string(), first.clone()));
+        let resp = save();
+        assert_eq!(resp.status, 200, "{}", resp.body);
         assert_eq!(h.store.providers.borrow().len(), 2);
+        // Delete removes the vault and the unreferenced row; the
+        // grant-referenced row survives (RESTRICT attribution).
+        let resp = h.call_full("DELETE", "/v1/vault", None, Some(cookie), Some(ORIGIN));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(
+            resp.body.contains("\"provider_configured\":false"),
+            "{}",
+            resp.body
+        );
+        let remaining = h.store.providers.borrow();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, first);
+    }
+
+    #[test]
+    fn mint_build_rejects_a_faulty_clock_before_any_store_touch() {
+        // The mint build is pure: a caller clock past the schema bound
+        // fails here (Invalid → generic vault failure downstream),
+        // never as a 23514 at the database. The build takes no store,
+        // so a failure cannot have landed anything by construction.
+        let provider = vault::ProviderConfig {
+            host: "news.example.com".to_string(),
+            port: 563,
+            tls: true,
+            username: "synthetic-user".to_string(),
+            password: "synthetic-pass".to_string(),
+            max_connections: 4,
+            allow_insecure_plaintext: false,
+        };
+        let bad = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, u64::MAX);
+        assert!(
+            matches!(bad, Err(MintBuildError::Invalid)),
+            "faulty clock must fail the build"
+        );
+        let good = build_provider_mint_row(&[9u8; 32], 1, "u1", &provider, NOW);
+        assert!(good.is_ok(), "sane clock must build");
     }
 
     #[test]

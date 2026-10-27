@@ -232,11 +232,26 @@ SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
  ORDER BY user_id LIMIT 100;
 ```
 
-Per row:
+`providers` rows (migration 0022, envelope v2) carry KEK-wrapped DEKs
+too, so the pass claims them in the same run — a separate batch with
+its own cursor (composite owner + row, since one user owns many rows):
+
+```sql
+-- claim a providers batch (cursor = last (user_id, id))
+SELECT id, user_id, creds_kek_version, creds_dek_wrapped, creds_dek_wrapped_nonce
+  FROM providers
+ WHERE creds_kek_version < $1 AND (user_id, id) > ($2, $3)
+ ORDER BY user_id, id LIMIT 100;
+```
+
+Per row (either table):
 
 1. `DEK = decrypt(KEK[row.kek_version], dek_wrapped)` (version-pinned §4).
 2. `dek_wrapped' = encrypt(KEK[current], fresh_nonce, dek_aad(user, current), DEK)`
-   via `vault::rewrap_dek` (never rebuild AAD by hand).
+   via `vault::rewrap_dek` (never rebuild AAD by hand). For a
+   `providers` row the same step re-wraps under the v2 DEK AAD (bound
+   to user + row + KEK version, `workers/api/src/providers.rs`),
+   never the v1 helper.
 3. Conditional write — a compare-and-swap on the captured envelope,
    not on user/version alone. A vault PUT replaces the whole envelope
    (fresh DEK and payload) at the same KEK version, so a version-only
@@ -254,6 +269,17 @@ Per row:
     WHERE user_id = $u AND kek_version = $old
       AND dek_wrapped = $captured_wrapped
       AND dek_wrapped_nonce = $captured_wrapped_nonce;
+   ```
+   The `providers` CAS keys the row by id (one user owns many rows)
+   and touches only the wrap columns, so the payload AAD — which
+   excludes the KEK version by design — never needs re-sealing:
+   ```sql
+   UPDATE providers
+      SET creds_kek_version = $new, creds_dek_wrapped = $w,
+          creds_dek_wrapped_nonce = $n
+    WHERE id = $id AND creds_kek_version = $old
+      AND creds_dek_wrapped = $captured_wrapped
+      AND creds_dek_wrapped_nonce = $captured_wrapped_nonce;
    ```
    Exactly one affected row is success: it rewrites only the wrap
    fields, so `payload` and `payload_nonce` are preserved untouched.
@@ -278,6 +304,16 @@ SELECT kek_version, COUNT(*) AS row_count
   FROM provider_vaults
  GROUP BY kek_version
  ORDER BY kek_version;
+```
+
+and the same cut for the minted rows (both tables must read clean
+before a retire gate passes):
+
+```sql
+SELECT creds_kek_version, COUNT(*) AS row_count
+  FROM providers
+ GROUP BY creds_kek_version
+ ORDER BY creds_kek_version;
 ```
 
 Job properties:
@@ -342,7 +378,8 @@ back); rotation window announced.
 5. Re-wrap:   trigger Workflow pass (dry-run first on staging);
               watch rotation_runs until rows_failed=0 and
               SELECT count(*) FROM provider_vaults WHERE kek_version < N+1; → 0
-              re-run once more; require 0 twice
+              SELECT count(*) FROM providers WHERE creds_kek_version < N+1; → 0
+              re-run once more; require 0 twice on BOTH tables
 6. Retire:    record the retire-after date in the version table (latest
               of re-wrap-complete + one window, oldest restorable
               backup/PITR horizon expiry); only after that date:
@@ -446,7 +483,11 @@ Instead:
    at the same KEK version and within the same `updated_at` tick), so
    the stale re-key is discarded, the row is reloaded and re-driven
    against the current envelope, and the newer envelope is never
-   overwritten.
+   overwritten. Every `providers` row at the exposed version gets the
+   same re-key (new random DEK, payload re-encrypted, wrap under
+   KEK[M] with the v2 DEK AAD via `providers::encrypt_provider_creds`,
+   same captured-envelope CAS as the §6 providers UPDATE): the minted
+   copies keep DEKs wrapped under the exposed key until they do.
 3. Treat provider and indexer credentials in ANY pre-rotation snapshot,
    backup, replica, or branch as EXPOSED: affected users re-enter (or
    rotate at the provider/indexer) their credentials; the old rows are

@@ -12,6 +12,11 @@
 -- coverage in library_artifacts.sql; this file pins the mint statement
 -- itself (fence, insert-per-save, literal constants) plus the columns
 -- only the mint binds (payload nonce, wrapped length, label, clock).
+-- A trailing PREPARE/EXECUTE section then binds the parameterized
+-- shape through a typed prepared statement (the production
+-- tokio-postgres path: the id binds as text and casts server-side),
+-- and two sections pin the rotation prune and the vault-delete purge
+-- (unreferenced rows go, grant-referenced rows stay).
 
 BEGIN;
 
@@ -223,6 +228,157 @@ BEGIN
     EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
         NULL;
     END;
+END $$;
+
+-- Typed bind (the production tokio-postgres path): the minter binds
+-- the id as a Rust String (text), and the statement casts server-side
+-- ($1::text::uuid). PREPARE the exact parameterized shape of
+-- insert_provider_sql() and EXECUTE it with a text id: without the
+-- cast the bind fails before the statement runs. Top-level (not in a
+-- DO block) so the prepared statement binds exactly like the
+-- driver's. Keep in sync with insert_provider_sql(); the
+-- mint_sql_shape_is_pinned unit test pins that side.
+INSERT INTO users (id, email, created_at)
+VALUES ('user-pm-3', 'pm-3@example.com', 1700000000);
+
+PREPARE providers_mint_typed(text, text, text, bytea, integer, bytea, bytea, bytea, bigint, bigint) AS
+INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version,
+     creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+     creds_payload_format, created_at, last_verified_at)
+SELECT $1::text::uuid, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10
+FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+
+EXECUTE providers_mint_typed('33333333-3333-4333-8333-333333333333', 'user-pm-3', 'news.example.com',
+       '\x0102'::bytea, 1,
+       '\x000000000000000000000000'::bytea,
+       '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+       '\x000000000000000000000000'::bytea,
+       1700000000, 1700000000);
+
+DEALLOCATE providers_mint_typed;
+
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM providers
+        WHERE id = '33333333-3333-4333-8333-333333333333'
+          AND user_id = 'user-pm-3') <> 1 THEN
+        RAISE EXCEPTION 'typed-bind mint did not land one row';
+    END IF;
+END $$;
+
+-- Rotation prune (mirror of prune_superseded_providers_sql): after a
+-- save mints the keep-id, the user's older rows go unless a grant
+-- references them. Vault-delete purge (mirror of
+-- purge_unreferenced_providers_sql): every unreferenced row goes.
+DO $$
+DECLARE
+    row_count_var INTEGER;
+BEGIN
+    INSERT INTO users (id, email, created_at)
+    VALUES ('user-pm-4', 'pm-4@example.com', 1700000000),
+           ('user-pm-5', 'pm-5@example.com', 1700000000);
+
+    -- Two live rows for user-pm-4; a grant references the older one
+    -- (reusing the cache object seeded above).
+    INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version,
+         creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+         creds_payload_format, created_at, last_verified_at)
+    SELECT '44444444-4444-4444-8444-444444444444', 'user-pm-4', 'news.example.com',
+           '\x0102'::bytea,
+           2, 1,
+           '\x000000000000000000000000'::bytea,
+           '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+           '\x000000000000000000000000'::bytea,
+           1,
+           1700000000, 1700000000
+    FROM (SELECT id FROM users WHERE id = 'user-pm-4' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version,
+         creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+         creds_payload_format, created_at, last_verified_at)
+    SELECT '55555555-5555-4555-8555-555555555555', 'user-pm-4', 'news.example.com',
+           '\x0304'::bytea,
+           2, 1,
+           '\x000000000000000000000000'::bytea,
+           '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+           '\x000000000000000000000000'::bytea,
+           1,
+           1700000001, 1700000001
+    FROM (SELECT id FROM users WHERE id = 'user-pm-4' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    VALUES ('user-pm-4',
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            '44444444-4444-4444-8444-444444444444', 1700000000);
+
+    -- Prune with the fresh row as the keep-id: the referenced older
+    -- row AND the keep-id survive.
+    DELETE FROM providers
+    WHERE user_id = 'user-pm-4' AND id <> '55555555-5555-4555-8555-555555555555'
+      AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
+                      WHERE g.user_id = 'user-pm-4' AND g.provider_id = providers.id);
+    SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-4';
+    IF row_count_var <> 2 THEN
+        RAISE EXCEPTION 'prune removed a referenced or kept row';
+    END IF;
+
+    -- The grant drains: the same prune now removes the superseded row
+    -- and keeps only the fresh mint.
+    DELETE FROM user_cache_grants
+    WHERE user_id = 'user-pm-4' AND provider_id = '44444444-4444-4444-8444-444444444444';
+    DELETE FROM providers
+    WHERE user_id = 'user-pm-4' AND id <> '55555555-5555-4555-8555-555555555555'
+      AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
+                      WHERE g.user_id = 'user-pm-4' AND g.provider_id = providers.id);
+    SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-4';
+    IF row_count_var <> 1 THEN
+        RAISE EXCEPTION 'prune kept an unreferenced superseded row';
+    END IF;
+    IF (SELECT count(*) FROM providers
+        WHERE id = '55555555-5555-4555-8555-555555555555') <> 1 THEN
+        RAISE EXCEPTION 'prune removed the kept mint';
+    END IF;
+
+    -- Purge: one referenced and one unreferenced row for user-pm-5;
+    -- the purge takes only the unreferenced one.
+    INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version,
+         creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+         creds_payload_format, created_at, last_verified_at)
+    SELECT '66666666-6666-4666-8666-666666666666', 'user-pm-5', 'news.example.com',
+           '\x0102'::bytea,
+           2, 1,
+           '\x000000000000000000000000'::bytea,
+           '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+           '\x000000000000000000000000'::bytea,
+           1,
+           1700000000, 1700000000
+    FROM (SELECT id FROM users WHERE id = 'user-pm-5' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version,
+         creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
+         creds_payload_format, created_at, last_verified_at)
+    SELECT '77777777-7777-4777-8777-777777777777', 'user-pm-5', 'news.example.com',
+           '\x0304'::bytea,
+           2, 1,
+           '\x000000000000000000000000'::bytea,
+           '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
+           '\x000000000000000000000000'::bytea,
+           1,
+           1700000001, 1700000001
+    FROM (SELECT id FROM users WHERE id = 'user-pm-5' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
+    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    VALUES ('user-pm-5',
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            '66666666-6666-4666-8666-666666666666', 1700000000);
+    DELETE FROM providers
+    WHERE user_id = 'user-pm-5'
+      AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
+                      WHERE g.user_id = 'user-pm-5' AND g.provider_id = providers.id);
+    SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-5';
+    IF row_count_var <> 1 THEN
+        RAISE EXCEPTION 'purge took the wrong rows';
+    END IF;
+    IF (SELECT count(*) FROM providers
+        WHERE id = '66666666-6666-4666-8666-666666666666') <> 1 THEN
+        RAISE EXCEPTION 'purge removed a grant-referenced row';
+    END IF;
 END $$;
 
 ROLLBACK;

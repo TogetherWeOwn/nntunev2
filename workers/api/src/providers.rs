@@ -20,11 +20,14 @@
 //! raw bytes into `BYTEA` columns).
 //!
 //! Mint shape: one `INSERT` per save (no `ON CONFLICT` — each save mints
-//! a fresh credential identity). A re-save (rotation) mints a new row;
-//! the pool resolves the latest row per user; historical grants keep
-//! pointing at the row whose credentials fetched them (the `RESTRICT`
-//! FK is that guarantee). `label` is display-only, derived from the
-//! provider host ([`provider_label_for_host`]); identity is the UUID.
+//! a fresh credential identity). A re-save (rotation) mints a new row and
+//! prunes the user's superseded rows that no grant references
+//! ([`prune_superseded_providers_sql`]); the pool resolves the latest row
+//! per user; historical grants keep pointing at the row whose credentials
+//! fetched them (the `RESTRICT` FK is that guarantee — a referenced row
+//! survives both the rotation prune and the vault-delete purge).
+//! `label` is display-only, derived from the provider host
+//! ([`provider_label_for_host`]); identity is the UUID.
 //! `last_verified_at` equals `created_at` at mint ("minted, verification
 //! pending") until the test-connection-success bump lands (follow-up;
 //! no landed code reads the column as a verification signal today).
@@ -39,11 +42,14 @@
 //! checkpoint from the pool reply at the `call_pool_body` site) is a
 //! follow-up, not this module.
 //!
-//! Delete path (explicitly deferred): `DELETE /v1/vault` does not touch
-//! `providers` rows yet. Revoke/GC semantics (vault delete must stop
-//! the pool from dialling removed credentials; `RESTRICT` grants block
-//! naive row deletion) are decided with the pool-reader slice, which is
-//! what first consumes these rows. No landed code reads them today.
+//! Delete path: `DELETE /v1/vault` purges the user's `providers` rows
+//! that no grant references ([`purge_unreferenced_providers_sql`]), so
+//! removed credentials stop being decryptable. Rows a
+//! `user_cache_grants` row still references survive (the `RESTRICT` FK
+//! is the attribution guarantee); their post-delete lifecycle —
+//! tombstone the row so the pool stops dialling it, purge once the
+//! grants drain — is decided with the pool-reader slice, which is what
+//! first consumes these rows. No landed code reads them today.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -336,9 +342,31 @@ pub const PROVIDER_MINT_PARAM_ORDER: [&str; 10] = [
 /// 0 rows; the handler classifies that through `account_deleting`
 /// into the typed 409, like the vault upsert. No `ON CONFLICT`: a
 /// UUID collision raises 23505 and fails closed, never converging two
-/// saves onto one row.
+/// saves onto one row. The id binds as `$1::text::uuid` (like the
+/// ingest writers): `tokio-postgres` accepts Rust strings for text,
+/// not for uuid, so the cast runs server-side.
 pub fn insert_provider_sql() -> &'static str {
-    "INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version, creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce, creds_payload_format, created_at, last_verified_at) SELECT $1, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+    "INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version, creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce, creds_payload_format, created_at, last_verified_at) SELECT $1::text::uuid, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+}
+
+/// Rotation prune: after a save mints `$2`, delete the user's older
+/// rows that no `user_cache_grants` row references. Runs in the save
+/// transaction, after the fenced upsert already holds the owner's
+/// `users` row `FOR SHARE` to commit — the scheduling `UPDATE users`
+/// cannot slip a marker in between, so the prune needs no fence of
+/// its own. Grant-referenced rows survive (the `RESTRICT` attribution
+/// guarantee); zero pruned rows is success, never a guard failure.
+pub fn prune_superseded_providers_sql() -> &'static str {
+    "DELETE FROM providers WHERE user_id = $1 AND id <> $2::text::uuid AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+}
+
+/// Vault-delete purge: remove every `providers` row of `$1` that no
+/// `user_cache_grants` row references. Deliberately unfenced, like the
+/// vault delete it rides with — removal cannot restore state. Rows a
+/// grant still references survive; their tombstone/purge lifecycle
+/// lands with the pool-reader slice.
+pub fn purge_unreferenced_providers_sql() -> &'static str {
+    "DELETE FROM providers WHERE user_id = $1 AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.provider_id = providers.id)"
 }
 
 /// One mintable row: the envelope output plus the identity the vault
@@ -661,7 +689,7 @@ mod tests {
             "INSERT INTO providers (id, user_id, label, encrypted_creds, creds_envelope_version, \
              creds_kek_version, creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce, \
              creds_payload_format, created_at, last_verified_at) \
-             SELECT $1, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10 \
+             SELECT $1::text::uuid, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10 \
              FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
         );
         assert_eq!(
@@ -693,12 +721,51 @@ mod tests {
         assert!(!sql.contains("SKIP LOCKED"), "{sql}");
         // Envelope constants are literals, never caller parameters.
         assert!(
-            sql.contains("SELECT $1, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10"),
+            sql.contains("SELECT $1::text::uuid, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9, $10"),
             "{sql}"
         );
         // Fresh-identity insert: no ON CONFLICT. A UUID collision raises
         // 23505 and fails closed; it must never converge two saves onto
         // one row.
         assert!(!sql.contains("ON CONFLICT"), "{sql}");
+        // The id casts through text: tokio-postgres binds Rust strings
+        // as text, never as uuid — without the cast every production
+        // mint fails serializing parameter 0.
+        assert!(sql.contains("$1::text::uuid"), "{sql}");
+    }
+
+    #[test]
+    fn prune_and_purge_keep_grant_referenced_rows() {
+        // Rotation prune: scoped to the owner, keeps the just-minted
+        // row ($2, cast through text like the mint), and never touches
+        // a row a grant references.
+        let prune = prune_superseded_providers_sql();
+        assert!(
+            prune.starts_with("DELETE FROM providers WHERE user_id = $1"),
+            "{prune}"
+        );
+        assert!(prune.contains("AND id <> $2::text::uuid"), "{prune}");
+        assert!(
+            prune.contains(
+                "AND NOT EXISTS (SELECT 1 FROM user_cache_grants g \
+                 WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+            ),
+            "{prune}"
+        );
+        // Vault-delete purge: same owner scope and grant guard, no
+        // keep-id — every unreferenced row goes.
+        let purge = purge_unreferenced_providers_sql();
+        assert!(
+            purge.starts_with("DELETE FROM providers WHERE user_id = $1"),
+            "{purge}"
+        );
+        assert!(!purge.contains("$2"), "{purge}");
+        assert!(
+            purge.contains(
+                "AND NOT EXISTS (SELECT 1 FROM user_cache_grants g \
+                 WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+            ),
+            "{purge}"
+        );
     }
 }
