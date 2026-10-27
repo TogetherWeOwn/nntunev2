@@ -7,6 +7,8 @@ import { expect, test, type Page } from '@playwright/test';
  * Production changes named by these tests:
  * - Feeding the displayed-tracks bulk action the pre-group visible order
  *   makes the appended queue tail disagree with the grouped rows.
+ * - Feeding Select all the pre-group order makes Append selected queue
+ *   tracks in a different order than the grouped rows.
  * - Removing the direct 401/403 grouping reset leaves a recovered account
  *   grouped even though no storage-event auth transition occurred.
  */
@@ -137,6 +139,21 @@ test('[GA-R01] grouped bulk appends missing tracks in rendered group order after
 		page.getByText('All displayed tracks are already in the queue.', { exact: true })
 	).toBeVisible();
 	expect(api.requests()).toBe(1);
+});
+
+test('[GA-R02] grouped Select all appends in rendered group order', async ({ page }) => {
+	await mockLibrary(page, { status: 200, body: GROUPED_ITEMS });
+	await page.goto('/library');
+	await groupToggle(page).click();
+	await expectRowOrder(page, GROUPED_ROW_ORDER);
+
+	await page
+		.locator('main')
+		.getByRole('button', { name: 'Select all', exact: true })
+		.click();
+	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+
+	await expectQueueOrder(page, GROUPED_ROW_ORDER, GROUPED_ROW_ORDER[0]);
 });
 
 for (const status of [401, 403] as const) {
