@@ -154,7 +154,7 @@ test('home today: one heading, intact landmarks and keyboard skip navigation', a
 	await expect(page.getByRole('main')).toHaveCount(1);
 	await expect(page.getByRole('main').locator('main')).toHaveCount(0);
 	await expect(page.locator('nav:has(a[href="/library/import"])')).toHaveCount(1);
-	await expect(page.getByRole('banner')).toHaveCount(1);
+	await expect(page.getByRole('navigation', { name: 'Primary', exact: true })).toHaveCount(1);
 	await page.keyboard.press('Tab');
 	const skip = page.getByRole('link', { name: /skip to (?:main )?content/i });
 	await expect(skip).toBeFocused();
@@ -179,7 +179,12 @@ test('home today: no external assets, tracking or mutating requests', async ({ p
 		).evaluateAll((nodes) => nodes.map((node) =>
 			node.getAttribute('src') ?? node.getAttribute('href') ?? node.getAttribute('poster') ?? node.getAttribute('data') ?? ''
 		));
-		for (const asset of declaredAssets) expect(new URL(asset, page.url()).origin, asset).toBe(origin);
+		for (const asset of declaredAssets) {
+			// Inline data:/blob: assets (e.g. the embedded SVG icon) are not
+			// external assets; their URL origin is the string "null".
+			if (/^(?:data|blob):/i.test(asset)) continue;
+			expect(new URL(asset, page.url()).origin, asset).toBe(origin);
+		}
 		for (const request of requests) {
 			expect(new URL(request.url).origin, request.url).toBe(origin);
 			expect(['GET', 'HEAD'], request.url).toContain(request.method);
