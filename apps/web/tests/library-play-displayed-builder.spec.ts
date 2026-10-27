@@ -8,6 +8,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * - the first appended track (not the first displayed slot) is selected when
  *   the first displayed track is already queued while later ones are missing;
+ * - with Group by artist on, "displayed" means the rendered grouped row
+ *   order: an empty queue loads in that order, and an all-queued activation
+ *   selects the first grouped row rather than the first flat row;
  * - a resolving play() announces the exact Playing outcome, and a rejected
  *   play() names paused/blocked without ever claiming Playing;
  * - a deferred play() outcome is fenced by each direct queue edit and by an
@@ -173,6 +176,49 @@ test('selects the first appended track when the first displayed track is already
 	await expect(region).toContainText('Alpha Song');
 	await expect(region).toContainText(/\b4\b/);
 	await expect(region).toContainText(/1 already queued/);
+	expect(await playCalls(page)).toBe(0);
+});
+
+// Grouped by artist key (unknown artist last), ITEMS render as Middle (Alpha
+// Band), Zulu (Bravo Band), Echo (Echo Band), Alpha (Zulu Band), untitled.
+const FLAT_ORDER = ['shown-zulu', 'shown-alpha', 'shown-untitled', 'shown-middle', 'shown-echo'];
+const GROUPED_ORDER = ['shown-middle', 'shown-zulu', 'shown-echo', 'shown-alpha', 'shown-untitled'];
+
+async function groupByArtist(page: Page) {
+	const toggle = page.getByRole('button', { name: 'Group by artist', exact: true });
+	await toggle.click();
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	await expect.poll(() => page.getByTestId('library-item').evaluateAll(
+		(rows) => rows.map((item) => item.getAttribute('data-id'))
+	)).toEqual(GROUPED_ORDER);
+}
+
+test('grouped by artist, an empty queue loads in the rendered grouped order', async ({ page }) => {
+	await mockLibrary(page);
+	await stubRejectPlay(page);
+	await openLibrary(page, ITEMS.length);
+	await groupByArtist(page);
+	await action(page).click();
+	await expectQueue(page, GROUPED_ORDER, 'shown-middle');
+	await expect(page.getByTestId('now-playing')).toContainText('Middle Song');
+	await expect(announcement(page)).toContainText(/\b5\b/);
+});
+
+test('grouped by artist, an all-queued activation selects the first grouped row in place', async ({ page }) => {
+	await mockLibrary(page);
+	await stubRejectPlay(page);
+	await openLibrary(page, ITEMS.length);
+	await bulkAction(page).click();
+	await expectQueue(page, FLAT_ORDER, 'shown-zulu');
+	await groupByArtist(page);
+	await action(page).click();
+	// Queue order untouched; current jumps to the first grouped row's slot,
+	// not to the first row of the flat list (Zulu, already current).
+	await expectQueue(page, FLAT_ORDER, 'shown-middle');
+	await expect(page.getByTestId('now-playing')).toContainText('Middle Song');
+	const region = announcement(page);
+	await expect(region).toContainText('Middle Song');
+	await expect(region).toContainText(/Added 0, 5 already queued\./);
 	expect(await playCalls(page)).toBe(0);
 });
 

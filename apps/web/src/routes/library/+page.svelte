@@ -394,7 +394,7 @@
 	);
 	// Play-from-top stays enabled while everything is queued: selecting the
 	// first displayed track's slot is still useful.
-	const playDisplayedDisabled = $derived(libraryUnavailable || visibleItems.length === 0);
+	const playDisplayedDisabled = $derived(libraryUnavailable || renderedItems.length === 0);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const tabTitle = $derived(libraryTabTitle(currentTrack));
 	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
@@ -510,24 +510,19 @@
 	 */
 	async function playDisplayedFromTop(): Promise<void> {
 		if (playDisplayedDisabled) return;
-		const displayedCount = missingDisplayedTracks(visibleItems, new Set()).length;
 		const missing = bulkMissing;
-		const index =
-			missing.length > 0
-				? queue.tracks.length
-				: queue.tracks.findIndex((track) => track.id === visibleItems[0]?.id);
-		const base = missing.length > 0 ? appendMissingTracks(missing.map(playableTrackFor)) : queue;
-		const selected = selectQueueIndex(base, index);
-		const target = selected.tracks[selected.currentIndex];
-		if (selected.currentIndex !== index || !target) return;
-		replaceQueue(selected);
+		const skipped = missingDisplayedTracks(renderedItems, new Set()).length - missing.length;
+		// Appended IDs are new and unique, so one lookup finds the first
+		// appended track, or the first displayed track's existing slot.
+		const first = missing[0] ?? renderedItems[0];
+		const base = appendMissingTracks(missing.map(playableTrackFor));
+		const index = base.tracks.findIndex((track) => track.id === first?.id);
+		const target = base.tracks[index];
+		if (!target) return;
+		replaceQueue(selectQueueIndex(base, index));
 		const epoch = playEpoch;
 		const title = (target.title.trim() || target.id).slice(0, 60);
-		const skipped = displayedCount - missing.length;
-		const counts =
-			missing.length === 0
-				? `All ${displayedCount} displayed ${displayedCount === 1 ? 'track is' : 'tracks are'} already queued.`
-				: `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
+		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
 		let lead = `Selected ${title}; no stream to play.`;
 		if (resolveStreamUrl(target)) {
 			await tick();
