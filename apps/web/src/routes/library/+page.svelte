@@ -23,6 +23,12 @@
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
+	import {
+		clearRecentFindsAtAuthBoundary,
+		loadRecentFinds,
+		recordRecentFind,
+		saveRecentFinds
+	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import {
@@ -32,6 +38,7 @@
 		type LibraryOrder
 	} from '#lib/library/order.js';
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
+	import { groupLibraryItems } from '#lib/library/group.js';
 	import { libraryTabTitle } from '#lib/library/tab-title.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
@@ -48,12 +55,16 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import SelectionExport from '#lib/library/SelectionExport.svelte';
+	import QueueExport from '#lib/player/QueueExport.svelte';
 	import {
 		addTrack,
 		clearQueue,
 		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
+		formatQueueM3U,
+		formatQueueText,
 		keepCurrentAndUpcoming,
 		moveTrack,
 		nextTrack,
@@ -104,6 +115,18 @@
 	 * boundaries that clear the query. Clearing the search text keeps it.
 	 */
 	let findScope: FindScope = $state('both');
+	/**
+	 * Recent applied find queries (device-local, bounded, per auth context).
+	 * Recorded only when an applied query is left (blur, Clear search, a
+	 * successful refresh, navigation away) and re-applied only by an explicit
+	 * chip activation: loading, restoring or purging them never fills the
+	 * field, filters rows or fetches. Purged at the same auth boundaries as
+	 * favorites.
+	 */
+	let recentFinds: string[] = $state([]);
+	let recentFindsInitialized = false;
+	let recentFindsAnnouncement = $state('');
+	let recentFindsEmpty: HTMLParagraphElement | null = $state(null);
 	let staleAt: string | null = $state(null);
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
@@ -138,6 +161,20 @@
 				: selectSelectedItems(orderedItems, selectedIds)
 	);
 	const visibleItems = $derived(filterLibraryItems(displayedItems, findQuery, findScope));
+	// Visit-local presentation only; SSR and each account start with the flat list.
+	let groupByArtist = $state(false);
+	const artistGroups = $derived(groupByArtist ? groupLibraryItems(visibleItems) : []);
+	// The final DOM row sequence in either presentation. Display-level
+	// actions use this sequence so grouped rows and the queue agree.
+	const renderedItems = $derived(
+		groupByArtist ? artistGroups.flatMap((group) => group.items) : visibleItems
+	);
+	let groupingAnnouncement = $state('');
+
+	function toggleArtistGrouping(): void {
+		groupByArtist = !groupByArtist;
+		groupingAnnouncement = groupByArtist ? 'Tracks grouped by artist.' : 'Flat track list restored.';
+	}
 	let viewSelect: HTMLSelectElement | null = $state(null);
 	let scopeSelect: HTMLSelectElement | null = $state(null);
 	let confirmClear = $state(false);
@@ -155,6 +192,7 @@
 	let appendFeedback: string | null = $state(null);
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
+	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -179,6 +217,19 @@
 	let shareInvalid = $state(false);
 	let shareGeneration = 0;
 	let shareAlive = true;
+	// Queue-row share outcomes live apart from the browse share feedback so a
+	// queue action never touches browse-row announcements (and vice versa).
+	// An outcome belongs to the queue it was produced for: any queue or
+	// selection change swaps the queue object and hides it (no effect needed).
+	let queueShareOutcome: { status: string; fallbackUrl: string | null; forQueue: QueueState | null } =
+		$state({ status: '', fallbackUrl: null, forQueue: null });
+	let queueShareGeneration = 0;
+	const queueShareStatus = $derived(
+		queueShareOutcome.forQueue === queue ? queueShareOutcome.status : ''
+	);
+	const queueShareFallbackUrl = $derived(
+		queueShareOutcome.forQueue === queue ? queueShareOutcome.fallbackUrl : null
+	);
 	// A link is consumed once per navigation, never replayed by Refresh or
 	// across an account boundary. Deferred seeks belong to one loaded source.
 	let handledShareSearch: string | null = null;
@@ -188,6 +239,21 @@
 		seconds: number;
 		appliedSeconds: number | null;
 	} | null = null;
+	/**
+	 * Favorites export feedback. Exporting is read-only: the handlers only
+	 * snapshot `favoriteTracks` and write feedback here. The feedback is
+	 * fenced to the arranged favorites it was produced from (see
+	 * `favoritesExportCurrentKey` below): arranging, unstarring or an auth
+	 * boundary retires it instead of leaving a stale success claim or a
+	 * previous account's fallback text on screen.
+	 */
+	let favoritesExportStatus = $state('');
+	let favoritesExportFallback: string | null = $state(null);
+	let favoritesExportFeedbackKey: string | null = $state(null);
+	let favoritesExportGeneration = 0;
+	let favoritesExportAlive = true;
+	let favoritesDownloadUrl: string | null = null;
+
 	// Restart availability is live native state of the mounted matching
 	// element, re-evaluated on media events — never cached coordinates.
 	// The outcome lives only in one polite status inside the Player region
@@ -206,9 +272,12 @@
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache: () => {
 			resetShareAtAuthBoundary();
+			clearFavoritesExportFeedback();
+			releaseFavoritesDownload();
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
+			resetRecentFinds();
 			invalidateLibraryCache();
 		},
 		onStateChange: (state) => {
@@ -227,11 +296,17 @@
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
+				groupByArtist = false;
+				groupingAnnouncement = '';
 				confirmClear = false;
 				managementFeedback = '';
+				recentFinds = [];
+				recentFindsInitialized = false;
+				recentFindsAnnouncement = '';
 			}
 			if (state.loading || state.items.length === 0) {
 				clearShareFeedback();
+				clearFavoritesExportFeedback();
 				pendingShareSeek = null;
 			}
 			// The queue is per-account: drop tracks the new library no longer
@@ -274,6 +349,15 @@
 				favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 				favoritesInitialized = true;
 			}
+			if (
+				!state.loading &&
+				!state.loadError &&
+				!state.libraryUnavailable &&
+				!recentFindsInitialized
+			) {
+				recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+				recentFindsInitialized = true;
+			}
 			if (!state.loading) applyShareLink();
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
@@ -306,15 +390,15 @@
 	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
-	// One-action bulk queue: the same displayed ordered collection the rows
-	// render, so sorting or filtering changes what an activation appends. The
-	// count names only missing IDs, never the view's total.
-	const bulkMissing = $derived(missingDisplayedTracks(visibleItems, queuedIds));
+	// One-action bulk queue: the same final rendered ordered collection the
+	// rows render, so sorting, filtering or grouping changes what an
+	// activation appends. The count names only missing IDs, never the total.
+	const bulkMissing = $derived(missingDisplayedTracks(renderedItems, queuedIds));
 	const bulkDisabled = $derived(
-		libraryUnavailable || visibleItems.length === 0 || bulkMissing.length === 0
+		libraryUnavailable || renderedItems.length === 0 || bulkMissing.length === 0
 	);
 	const bulkAllQueued = $derived(
-		!libraryUnavailable && visibleItems.length > 0 && bulkMissing.length === 0
+		!libraryUnavailable && renderedItems.length > 0 && bulkMissing.length === 0
 	);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const tabTitle = $derived(libraryTabTitle(currentTrack));
@@ -327,6 +411,19 @@
 		favorites
 			.map((id) => items.find((track) => track.id === id) ?? null)
 			.filter((track): track is LibraryItem => track !== null)
+	);
+	// Feedback stays visible only while the arranged favorites (ids and
+	// display labels, in order) are exactly the ones it was exported from.
+	const favoritesExportCurrentKey = $derived(currentFavoritesExportKey());
+	const favoritesExportStatusShown = $derived(
+		favoritesExportFeedbackKey !== null && favoritesExportFeedbackKey === favoritesExportCurrentKey
+			? favoritesExportStatus
+			: ''
+	);
+	const favoritesExportFallbackShown = $derived(
+		favoritesExportFeedbackKey !== null && favoritesExportFeedbackKey === favoritesExportCurrentKey
+			? favoritesExportFallback
+			: null
 	);
 
 	function trackCountLabel(count: number): string {
@@ -401,6 +498,120 @@
 		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
 	}
 
+	/** Snapshot the listed favorites, in arranged order, as queue display tracks. */
+	function favoritesExportSnapshot(): QueueState {
+		return createQueue(favoriteTracks.map(queuedTrackFor));
+	}
+
+	function currentFavoritesExportKey(): string {
+		return favoritesExportSnapshot()
+			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
+			.join('\u0001');
+	}
+
+	function clearFavoritesExportFeedback(): void {
+		favoritesExportGeneration += 1;
+		favoritesExportStatus = '';
+		favoritesExportFallback = null;
+		favoritesExportFeedbackKey = null;
+	}
+
+	function releaseFavoritesDownload(): void {
+		if (favoritesDownloadUrl !== null) URL.revokeObjectURL(favoritesDownloadUrl);
+		favoritesDownloadUrl = null;
+	}
+
+	const FAVORITES_EXPORT_UNSAFE_ID =
+		'Could not export favorites: a favorite has an unsafe track id.';
+
+	async function copyFavoritesText(): Promise<void> {
+		clearFavoritesExportFeedback();
+		const generation = favoritesExportGeneration;
+		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
+		const snapshot = favoritesExportSnapshot();
+		const key = currentFavoritesExportKey();
+		let text: string;
+		try {
+			// formatQueueText never applies the shared id guard, so run the
+			// M3U formatter first (its output is discarded): an unsafe
+			// favorite id must refuse the copy before the clipboard is
+			// touched, for this action just as for the download.
+			formatQueueM3U(snapshot);
+			text = formatQueueText(snapshot);
+		} catch {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
+			return;
+		}
+		try {
+			// Both the API getter and the write can fail. Neither is proof
+			// of a successful copy: expose selectable text instead.
+			if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('No clipboard');
+			await navigator.clipboard.writeText(text);
+		} catch {
+			if (
+				!favoritesExportAlive ||
+				generation !== favoritesExportGeneration ||
+				currentFavoritesExportKey() !== key
+			) {
+				return;
+			}
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = 'Clipboard unavailable. Copy the favorites manually below.';
+			favoritesExportFallback = text;
+			return;
+		}
+		if (
+			!favoritesExportAlive ||
+			generation !== favoritesExportGeneration ||
+			currentFavoritesExportKey() !== key
+		) {
+			return;
+		}
+		favoritesExportFeedbackKey = key;
+		favoritesExportStatus = 'Copied favorites as text.';
+	}
+
+	function downloadFavoritesM3U(): void {
+		clearFavoritesExportFeedback();
+		if (!favoritesExportAlive || favoriteTracks.length === 0) return;
+		const key = currentFavoritesExportKey();
+		let m3u: string;
+		try {
+			m3u = formatQueueM3U(favoritesExportSnapshot());
+		} catch {
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus = FAVORITES_EXPORT_UNSAFE_ID;
+			return;
+		}
+		const link = document.createElement('a');
+		try {
+			// Retain at most one Blob URL until the next download or
+			// teardown, not an arbitrary timer while the browser may
+			// still be saving it.
+			releaseFavoritesDownload();
+			const blob = new Blob([m3u], { type: 'audio/x-mpegurl;charset=utf-8' });
+			favoritesDownloadUrl = URL.createObjectURL(blob);
+			link.href = favoritesDownloadUrl;
+			link.download = 'favorites.m3u';
+			link.hidden = true;
+			document.body.append(link);
+			link.click();
+			// The browser owns the save dialog: initiating it cannot
+			// prove that a file was saved to disk.
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus =
+				'Download started. Check your browser’s saved downloads for favorites.m3u.';
+		} catch {
+			releaseFavoritesDownload();
+			favoritesExportFeedbackKey = key;
+			favoritesExportStatus =
+				'Could not start the download. Try again or copy the favorites as text.';
+		} finally {
+			link.remove();
+		}
+	}
+
 	/**
 	 * Swap the queue for any change that is not a move. The move
 	 * announcement names a track and its position, so every other edit
@@ -443,8 +654,24 @@
 		shareFallbackUrl = null;
 	}
 
+	/**
+	 * Drop visible queue-share feedback. Only a new activation or the auth
+	 * boundary supersedes a pending write (`supersede`); a queue edit merely
+	 * clears what is shown, and the late completion re-checks its row.
+	 */
+	function clearQueueShareFeedback(supersede = false): void {
+		if (supersede) queueShareGeneration += 1;
+		setQueueShareOutcome('', null);
+	}
+
+	function setQueueShareOutcome(status: string, fallbackUrl: string | null): void {
+		queueShareOutcome = { status, fallbackUrl, forQueue: queue };
+	}
+
 	function resetShareAtAuthBoundary(): void {
+		queueExportAuthGeneration += 1;
 		clearShareFeedback();
+		clearQueueShareFeedback(true);
 		pendingShareSeek = null;
 		jumpFeedback = '';
 		restartSupersededSources.clear();
@@ -452,6 +679,72 @@
 		restartStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
+	}
+
+	type ClipboardWriter = { writeText: (text: string) => Promise<void> };
+
+	/** Match demo copy: feature-detect inside a try (even the getter may throw). */
+	function clipboardWriter(): ClipboardWriter | undefined {
+		try {
+			const candidate = navigator.clipboard;
+			return typeof candidate?.writeText === 'function' ? candidate : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	function shortTitle(title: string): string {
+		// Count code points, not UTF-16 units: slicing between a surrogate pair
+		// would announce a lone surrogate before the ellipsis.
+		const points = Array.from(title);
+		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
+	}
+
+	/**
+	 * Copy the browse-format link for one queued row. Never selects, seeks,
+	 * plays, fetches or persists; the position is read live and only for the
+	 * current track, so a queued row is never stamped with another track's
+	 * time. A row that left the queue before the write finished reports
+	 * unavailable instead of a stale success.
+	 */
+	async function copyQueuedTrackLink(id: string): Promise<void> {
+		clearQueueShareFeedback(true);
+		const generation = queueShareGeneration;
+		const queued = queue.tracks.find((track) => track.id === id);
+		if (!queued) {
+			setQueueShareOutcome('Link unavailable — that track is no longer in the queue.', null);
+			return;
+		}
+		const title = shortTitle(queued.title?.trim() ? queued.title : queued.id);
+		const unavailable = `Link unavailable — ${title} is no longer in the queue.`;
+		const current = queueCurrentTrack(queue);
+		const position = current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+		const seconds = typeof position === 'number' && Number.isFinite(position) && position >= 0 ? position : 0;
+		let url: string;
+		try {
+			url = `${window.location.origin}/library?${buildShareQuery(id, seconds)}`;
+		} catch {
+			setQueueShareOutcome(unavailable, null);
+			return;
+		}
+		const clipboard = clipboardWriter();
+		if (!clipboard) {
+			setQueueShareOutcome('', url);
+			return;
+		}
+		let written = true;
+		try {
+			await clipboard.writeText(url);
+		} catch {
+			written = false;
+		}
+		if (!shareAlive || generation !== queueShareGeneration) return;
+		if (!queue.tracks.some((track) => track.id === id)) {
+			setQueueShareOutcome(unavailable, null);
+			return;
+		}
+		if (written) setQueueShareOutcome(`Copied link for ${title}.`, null);
+		else setQueueShareOutcome('', url);
 	}
 
 	async function copyTrackLink(id: string): Promise<void> {
@@ -469,16 +762,7 @@
 		} catch {
 			return;
 		}
-		// Match demo copy: feature-detect inside a try (even the getter may
-		// throw), and offer manual copy for missing/denied clipboard access.
-		type ClipboardWriter = { writeText: (text: string) => Promise<void> };
-		let clipboard: ClipboardWriter | undefined;
-		try {
-			const candidate = navigator.clipboard;
-			clipboard = typeof candidate?.writeText === 'function' ? candidate : undefined;
-		} catch {
-			clipboard = undefined;
-		}
+		const clipboard = clipboardWriter();
 		if (!clipboard) {
 			shareFallbackUrl = url;
 			return;
@@ -490,8 +774,8 @@
 			return;
 		}
 		if (!shareAlive || generation !== shareGeneration) return;
-		const title = displayTitle(item);
-		shareStatus = `Copied link for ${title.length > 70 ? `${title.slice(0, 69)}…` : title}.`;
+		const title = shortTitle(displayTitle(item));
+		shareStatus = `Copied link for ${title}.`;
 	}
 
 	function applyShareLink(): void {
@@ -898,7 +1182,62 @@
 		void tick().then(() => scopeSelect?.focus({ preventScroll: true }));
 	}
 
+	function resetRecentFinds(): void {
+		recentFinds = [];
+		recentFindsInitialized = false;
+		recentFindsAnnouncement = '';
+	}
+
+	/**
+	 * Announce a recent-find outcome within the 140-char polite cap. A
+	 * max-length (120-char) query would breach it verbatim, so the embedded
+	 * query is truncated with an ellipsis to fit; short queries announce whole.
+	 */
+	function announceRecentFind(verb: 'Saved' | 'Applied', query: string): string {
+		const middle = ' recent search ';
+		const budget = 140 - verb.length - middle.length - '.'.length;
+		const shown = query.length > budget ? `${query.slice(0, budget - 1)}…` : query;
+		return `${verb}${middle}${shown}.`;
+	}
+
+	/**
+	 * Record the applied query when it is left. Memory is authoritative once
+	 * bootstrapped; before that (or after an auth purge) there is no
+	 * account-scoped list to extend, so nothing is recorded. Announces only
+	 * a real change, never an empty, duplicate or already-first query.
+	 */
+	function recordFindQuery(): void {
+		if (!recentFindsInitialized) return;
+		const next = recordRecentFind(recentFinds, findQuery);
+		if (next === recentFinds) return;
+		recentFinds = [...next];
+		saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+		recentFindsAnnouncement = announceRecentFind('Saved', recentFinds[0]);
+	}
+
+	function applyRecentFind(query: string): void {
+		// Preserve a pending unrecorded query first: a chip mousedown keeps
+		// focus in the field (no blur), so record here before replacing it.
+		recordFindQuery();
+		findQuery = query;
+		const next = recordRecentFind(recentFinds, query);
+		if (next !== recentFinds) {
+			recentFinds = [...next];
+			saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+		}
+		recentFindsAnnouncement = announceRecentFind('Applied', query);
+	}
+
+	function clearRecentFinds(): void {
+		recentFinds = [];
+		saveRecentFinds(browserStorage('session'), browserStorage('local'), []);
+		recentFindsAnnouncement = 'Cleared recent searches.';
+		// The focused clear button unmounts with the list; keep focus in the section.
+		void tick().then(() => recentFindsEmpty?.focus({ preventScroll: true }));
+	}
+
 	function clearFind(): void {
+		recordFindQuery();
 		findQuery = '';
 		if (typeof document !== 'undefined') {
 			document.getElementById('library-find')?.focus({ preventScroll: true });
@@ -998,7 +1337,7 @@
 			selectedIds = toggleSelected(selectedIds, id);
 			return;
 		}
-		const displayedIds = visibleItems.map((track) => track.id);
+		const displayedIds = renderedItems.map((track) => track.id);
 		const removedIndex = displayedIds.indexOf(id);
 		selectedIds = toggleSelected(selectedIds, id);
 		const survivors = new Set(selectedIds);
@@ -1016,7 +1355,7 @@
 	}
 
 	function selectDisplayedIds(): void {
-		selectedIds = selectAllDisplayed(selectedIds, visibleItems.map((track) => track.id));
+		selectedIds = selectAllDisplayed(selectedIds, renderedItems.map((track) => track.id));
 	}
 
 	function clearSelectedIds(): void {
@@ -1056,6 +1395,9 @@
 	 */
 	async function refreshFromButton(): Promise<void> {
 		await refresh();
+		// Commit first: only a successful same-account refresh records the
+		// preserved query (a failure or auth purge leaves history alone).
+		if (!loadError && !libraryUnavailable) recordFindQuery();
 		await tick();
 		if (document.activeElement === null || document.activeElement === document.body) {
 			refreshButton?.focus({ preventScroll: true });
@@ -1068,18 +1410,24 @@
 		// reconcile above is the backstop for the queue.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			resetShareAtAuthBoundary();
+			clearFavoritesExportFeedback();
+			releaseFavoritesDownload();
 			replaceQueue(clearQueue(queue));
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
 			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
 			favoritesAnnouncement = '';
+			resetRecentFinds();
 			queueFilterQuery = '';
 			findQuery = '';
 			findScope = 'both';
 			view = 'all';
+			groupByArtist = false;
+			groupingAnnouncement = '';
 			confirmClear = false;
 			managementFeedback = '';
 			purgeSelection();
@@ -1089,16 +1437,22 @@
 
 	function handleLocalAuthTransition(): void {
 		resetShareAtAuthBoundary();
+		clearFavoritesExportFeedback();
+		releaseFavoritesDownload();
 		replaceQueue(clearQueue(queue));
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;
 		favoritesAnnouncement = '';
+		resetRecentFinds();
 		queueFilterQuery = '';
 		findQuery = '';
 		findScope = 'both';
 		view = 'all';
+		groupByArtist = false;
+		groupingAnnouncement = '';
 		confirmClear = false;
 		managementFeedback = '';
 		purgeSelection();
@@ -1109,6 +1463,8 @@
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
 		window.addEventListener('storage', handleAuthTransition);
+		// Leaving the page with a query applied (tab close, hard navigation).
+		window.addEventListener('pagehide', recordFindQuery);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
@@ -1119,12 +1475,17 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			favoritesExportAlive = false;
+			releaseFavoritesDownload();
 			clearShareFeedback();
 			pendingShareSeek = null;
 			restartSupersededSources.clear();
 			refresher.dispose();
+			// Client-side navigation away with the query applied.
+			recordFindQuery();
 			unsubscribeLocal();
 			window.removeEventListener('storage', handleAuthTransition);
+			window.removeEventListener('pagehide', recordFindQuery);
 		};
 	});
 </script>
@@ -1162,6 +1523,23 @@
 				value={shareFallbackUrl}
 			/>
 			<p id="library-share-instructions" data-testid="library-share-instructions">
+				Select the link and press Ctrl+C or Cmd+C to copy it.
+			</p>
+		</div>
+	{/if}
+
+	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareStatus}</div>
+	{#if queueShareFallbackUrl}
+		<div class="nt-library-share-fallback">
+			<label for="queue-share-url">Queued track link</label>
+			<input
+				id="queue-share-url"
+				data-testid="queue-share-fallback"
+				aria-describedby="queue-share-instructions"
+				readonly
+				value={queueShareFallbackUrl}
+			/>
+			<p id="queue-share-instructions" data-testid="queue-share-instructions">
 				Select the link and press Ctrl+C or Cmd+C to copy it.
 			</p>
 		</div>
@@ -1245,6 +1623,42 @@
 						</li>
 					{/each}
 				</ul>
+				<div class="nt-favorites-export">
+					<div class="nt-favorites-export-actions">
+						<button
+							class="nt-button"
+							type="button"
+							data-testid="favorites-export-copy"
+							aria-describedby="favorites-export-status"
+							onclick={() => void copyFavoritesText()}>Copy favorites as text</button
+						>
+						<button
+							class="nt-button"
+							type="button"
+							data-testid="favorites-export-download"
+							aria-describedby="favorites-export-status"
+							onclick={downloadFavoritesM3U}>Download favorites (.m3u)</button
+						>
+					</div>
+					<p id="favorites-export-status" data-testid="favorites-export-status" aria-live="polite">
+						{favoritesExportStatusShown}
+					</p>
+					{#if favoritesExportFallbackShown !== null}
+						<label for="favorites-export-fallback-field">Favorites as text</label>
+						<textarea
+							id="favorites-export-fallback-field"
+							data-testid="favorites-export-fallback"
+							readonly
+							rows="4"
+							value={favoritesExportFallbackShown}
+							aria-describedby="favorites-export-instructions"
+						></textarea>
+						<p id="favorites-export-instructions" data-testid="favorites-export-instructions">
+							Copy manually: focus the field, select all (Ctrl+A or Cmd+A), then copy (Ctrl+C or
+							Cmd+C). On touch screens, long-press the text, select all and choose Copy.
+						</p>
+					{/if}
+				</div>
 			{/if}
 			<div class="nt-shelf-clear">
 				<button
@@ -1302,6 +1716,7 @@
 					type="search"
 					bind:value={findQuery}
 					aria-describedby="library-find-hint"
+					onblur={recordFindQuery}
 				/>
 				<label for="library-find-scope">Search in</label>
 				<select id="library-find-scope" bind:this={scopeSelect} bind:value={findScope}>
@@ -1318,6 +1733,63 @@
 					</button>
 				{/if}
 			</div>
+			<!--
+				Fixed-height rows (no wrapping chip row, hidden live text): recording
+				on blur must not shift the list under a pointer that is mid-click.
+			-->
+			<section
+				class="nt-library-recent-finds"
+				data-testid="recent-finds"
+				aria-labelledby="recent-finds-heading"
+			>
+				<div class="nt-recent-find-head">
+					<h2 id="recent-finds-heading">Recent searches</h2>
+					{#if recentFinds.length > 0}
+						<button class="nt-button nt-button--ghost" type="button" onclick={clearRecentFinds}>
+							Clear recent searches
+						</button>
+					{/if}
+				</div>
+				<p
+					class="nt-visually-hidden"
+					data-testid="recent-finds-announcement"
+					aria-live="polite"
+				>
+					{recentFindsAnnouncement}
+				</p>
+				{#if recentFinds.length === 0}
+					<p
+						class="nt-recent-find-body"
+						data-testid="recent-finds-empty"
+						tabindex="-1"
+						bind:this={recentFindsEmpty}
+					>
+						No recent searches yet.
+					</p>
+				{:else}
+					<ul class="nt-recent-find-body nt-recent-find-list">
+						{#each recentFinds as query (query)}
+							<li>
+								<!--
+									Keep focus in the find field on mousedown: a blur here
+									would record a pending query and shift every chip
+									before mouseup, so the click would miss its chip.
+									applyRecentFind records the pending query instead.
+								-->
+								<button
+									class="nt-recent-find-chip"
+									type="button"
+									data-testid="recent-find-chip"
+									onmousedown={(event) => event.preventDefault()}
+									onclick={() => applyRecentFind(query)}
+								>
+									{query}
+								</button>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
 				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
@@ -1337,6 +1809,15 @@
 					<option value="selected">Selected only</option>
 				</select>
 			</div>
+			<button
+				class="nt-button"
+				type="button"
+				aria-pressed={groupByArtist}
+				onclick={toggleArtistGrouping}
+			>
+				Group by artist
+			</button>
+			<p aria-live="polite" aria-atomic="true">{groupingAnnouncement}</p>
 			<p data-testid="library-find-count">
 				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
 					? ' (title only)'
@@ -1374,6 +1855,7 @@
 				>
 					Append selected
 				</button>
+				<SelectionExport {items} {selectedIds} />
 				{#if appendFeedback}
 					<p data-testid="append-result" role="status">{appendFeedback}</p>
 				{/if}
@@ -1400,56 +1882,18 @@
 					Clear search
 				</button>
 			{:else}
-			<ul data-testid="library-list">
-				{#each visibleItems as track (track.id)}
-					{@const queued = queuedIds.has(track.id)}
-					<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
-						<input
-							class="nt-library-select"
-							type="checkbox"
-							aria-label={`Select ${displayTitle(track)}`}
-							checked={selectedIds.includes(track.id)}
-							onclick={(event) => event.stopPropagation()}
-							onchange={() => toggleSelectedId(track.id)}
-						/>
-						<button
-							type="button"
-							class="nt-library-row"
-							aria-label={queued
-								? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
-								: undefined}
-							aria-pressed={queued ? true : undefined}
-							onclick={() => selectTrack(track.id)}
-						>
-							{displayTitle(track)}
-							{#if displayArtist(track)}
-								<span> — {displayArtist(track)}</span>
-							{/if}
-							{#if queued}
-								<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
-							{/if}
-						</button>
-						<button
-							type="button"
-							class="nt-library-copy"
-							data-testid="library-copy-link"
-							aria-label={`Copy link ${displayTitle(track)}`}
-							onclick={() => void copyTrackLink(track.id)}
-						>
-							Copy link
-						</button>
-						<button
-							type="button"
-							class="nt-library-star"
-							aria-pressed={favoriteIds.has(track.id)}
-							aria-label={starLabel(track)}
-							onclick={() => toggleFavorite(track.id)}
-						>
-							<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
-						</button>
-					</li>
-				{/each}
-			</ul>
+			<div data-testid="library-list">
+				{#if groupByArtist}
+					{#each artistGroups as group (group.key)}
+						<div class="nt-artist-group">
+							<h2>{group.label}</h2>
+							{@render trackRows(group.items)}
+						</div>
+					{/each}
+				{:else}
+					{@render trackRows(visibleItems)}
+				{/if}
+			</div>
 			{/if}
 			<!--
 				The queue panel stays mounted across background refreshes (its
@@ -1474,9 +1918,11 @@
 				onremove={removeQueuedTrack}
 				onclear={clearQueuedTracks}
 				onselect={selectQueuedTrack}
+				oncopylink={(id) => void copyQueuedTrackLink(id)}
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
+			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
 
 		<button
@@ -1575,6 +2021,60 @@
 		</section>
 	{/if}
 </main>
+
+{#snippet trackRows(tracks: LibraryItem[])}
+	<ul>
+		{#each tracks as track (track.id)}
+			{@const queued = queuedIds.has(track.id)}
+			<li class="nt-library-item" data-testid="library-item" data-id={track.id}>
+				<input
+					class="nt-library-select"
+					type="checkbox"
+					aria-label={`Select ${displayTitle(track)}`}
+					checked={selectedIds.includes(track.id)}
+					onclick={(event) => event.stopPropagation()}
+					onchange={() => toggleSelectedId(track.id)}
+				/>
+				<button
+					type="button"
+					class="nt-library-row"
+					aria-label={queued
+						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
+						: undefined}
+					aria-pressed={queued ? true : undefined}
+					onclick={() => selectTrack(track.id)}
+				>
+					{displayTitle(track)}
+					{#if displayArtist(track)}
+						<span> — {displayArtist(track)}</span>
+					{/if}
+					{#if queued}
+						<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
+					{/if}
+				</button>
+				<button
+					type="button"
+					class="nt-library-copy"
+					data-testid="library-copy-link"
+					aria-label={`Copy link ${displayTitle(track)}`}
+					onclick={() => void copyTrackLink(track.id)}
+				>
+					Copy link
+				</button>
+				<button
+					type="button"
+					class="nt-library-star"
+					aria-pressed={favoriteIds.has(track.id)}
+					aria-label={starLabel(track)}
+					onclick={() => toggleFavorite(track.id)}
+				>
+					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
+				</button>
+			</li>
+		{/each}
+	</ul>
+{/snippet}
+
 
 <style>
 	main {
@@ -1778,6 +2278,67 @@
 		color: inherit;
 		text-align: left;
 	}
+	.nt-library-recent-finds {
+		margin-block: var(--nt-space-2);
+	}
+	.nt-recent-find-head {
+		display: flex;
+		flex-wrap: nowrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--nt-space-2);
+		min-height: 2.75rem;
+	}
+	.nt-recent-find-head h2 {
+		font-size: 1rem;
+		margin: 0;
+	}
+	.nt-recent-find-body {
+		display: flex;
+		align-items: center;
+		min-height: 3.25rem;
+		margin: 0;
+	}
+	.nt-recent-find-list {
+		flex-wrap: nowrap;
+		gap: var(--nt-space-2);
+		list-style: none;
+		padding: 4px;
+		overflow-x: auto;
+	}
+	.nt-recent-find-list li {
+		flex: 0 0 auto;
+		max-width: 100%;
+	}
+	.nt-visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+	.nt-recent-find-chip {
+		min-width: 2.75rem;
+		min-height: 2.75rem;
+		max-width: 16rem;
+		padding: var(--nt-space-1) var(--nt-space-3);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		cursor: pointer;
+	}
+	.nt-recent-find-chip:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
+	}
 	.nt-shelf-clear {
 		display: flex;
 		flex-direction: column;
@@ -1788,6 +2349,33 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-favorites-export {
+		margin-block: var(--nt-space-3);
+	}
+	.nt-favorites-export-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+	.nt-favorites-export-actions .nt-button {
+		min-height: 2.75rem;
+		max-width: 100%;
+	}
+	.nt-favorites-export p {
+		margin-block: var(--nt-space-2);
+	}
+	.nt-favorites-export textarea {
+		display: block;
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
 	}
 	.nt-selection-bar {
 		display: flex;
@@ -1800,6 +2388,9 @@
 	}
 	.nt-selection-bar [data-testid='append-result'] {
 		flex-basis: 100%;
+	}
+	.nt-artist-group h2 {
+		overflow-wrap: anywhere;
 	}
 	.nt-library-select {
 		flex: 0 0 auto;
