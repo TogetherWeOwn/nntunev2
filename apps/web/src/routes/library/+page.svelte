@@ -42,6 +42,8 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import SelectionExport from '#lib/library/SelectionExport.svelte';
+	import QueueExport from '#lib/player/QueueExport.svelte';
 	import {
 		addTrack,
 		clearQueue,
@@ -151,6 +153,7 @@
 	let queueAnnouncementVersion = $state(0);
 	// Bumped by every queue edit; fences late play-from-top outcomes.
 	let playEpoch = 0;
+	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
@@ -500,6 +503,7 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		pendingShareSeek = null;
 		restartSupersededSources.clear();
@@ -1423,6 +1427,7 @@
 				>
 					Append selected
 				</button>
+				<SelectionExport {items} {selectedIds} />
 				{#if appendFeedback}
 					<p data-testid="append-result" role="status">{appendFeedback}</p>
 				{/if}
@@ -1526,6 +1531,7 @@
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
+			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
 
 		<button
