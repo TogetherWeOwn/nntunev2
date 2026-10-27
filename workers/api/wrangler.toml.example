@@ -48,6 +48,23 @@ SESSION_TTL_SECS = "86400"
 # VAULT_TEST_IP_RATE_LIMIT_MAX. Unset, the IP cap defaults to 5x the
 # configured VAULT_TEST_RATE_LIMIT_MAX (clamped to 100).
 
+# Scheduled routine rewrap: disabled until an explicit one-env ceremony.
+# These are public vars in this [vars] table, not secrets. The target must
+# equal the already-flipped serving version. Never derive it from time.
+# DEPLOYMENT_ENV = "staging"          # must equal VAULT_REWRAP_ENV
+# VAULT_REWRAP_ENABLED = "0"          # 1 only during the recorded ceremony
+# VAULT_REWRAP_ENV = "staging"
+# VAULT_REWRAP_FROM_VERSION = "1"     # actual prior version, not a default
+# VAULT_REWRAP_TO_VERSION = "2"       # actual current write version
+# VAULT_REWRAP_BATCH_LIMIT = "20"     # default 20; 1..100
+# VAULT_REWRAP_MAX_BATCHES = "1"      # default 1; whole pass has a 30s budget
+# VAULT_REWRAP_DRY_RUN = "1"          # start with rehearsal; zero DB writes
+# Optional trigger (disabled here). In named envs use [env.staging.triggers].
+# A normal CI staging deploy installs this cron but pins ENABLED=0; it
+# intentionally disarms a prior ceremony. Production promotion is separate.
+# [triggers]
+# crons = ["7 * * * *"]
+
 # Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
 # The binding name must stay HYPERDRIVE (see src/worker_entry.rs).
 # Auth reads (sessions, credentials, users, challenges, vaults) are plain
@@ -130,8 +147,8 @@ SESSION_TTL_SECS = "86400"
 #                                 selecting VAULT_KEK_V<CURRENT> for new
 #                                 rows; reads serve every provisioned
 #                                 version. Unset = legacy single-key mode.
-#                                 Routine rotation's rewrap job is NOT
-#                                 implemented (kek-rotation.md §7 banner).
+#                                 Scheduled rewrap is separately armed below;
+#                                 see kek-rotation.md §§6-8 for live gates.
 #   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
 #   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
 #                                 during a rotation window, deleted at its end.

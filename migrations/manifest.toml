@@ -107,3 +107,8 @@ sha256 = "ad1e437bff738a7a737ab8cd323fd0a9ff1e74e7e6f08730f186e5b71ab444a1"
 file = "0022_library_artifacts.sql"
 target = "app"
 sha256 = "f28d63c5b585c98aecaa2949c962481a05abf93dff199388ce17f7190434a62a"
+
+[[migration]]
+file = "0024_rotation_runs.sql"
+target = "app"
+sha256 = "8167dfe073d5498e31e01cfc00f694b60429eac1f189d7596c8837d2ec1f71bc"

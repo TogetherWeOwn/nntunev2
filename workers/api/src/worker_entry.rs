@@ -28,6 +28,11 @@ use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
     QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
+use crate::rotation::{
+    run_scheduled_rewrap, scheduled_rewrap_arming_from_lookup, validate_new_run, CasRewrapOutcome,
+    JobError, RewrapClaim, RewrapStore, RewrappedEnvelope, RunRecord, ScheduledRewrapArming,
+    CAS_REWRAP_POSTGRES_SQL, CLAIM_BATCH_SQL,
+};
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, VaultBlob, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -531,6 +536,9 @@ pub async fn with_deadline<T, E>(
 struct PgStore {
     env: Env,
     trace_id: String,
+    // Per-invocation ownership token, never progress or key material.
+    // None is read-only for the rewrap store (HTTP methods are unaffected).
+    rewrap_fence: Option<String>,
 }
 
 impl PgStore {
@@ -600,6 +608,67 @@ impl PgStore {
             StoreError,
         )
         .await
+    }
+
+    /// A database-scoped singleton, not a session advisory lock (Hyperdrive
+    /// transaction pooling would release the backend between operations).
+    /// Acquisition and every later statement serialize on this same row.
+    async fn acquire_rewrap_fence(&self, token: &str) -> Result<bool, StoreError> {
+        Self::bounded(async {
+            let client = self.connect().await?;
+            let row = client.query_opt(
+                "INSERT INTO rotation_state (id, token, expires_at)
+                 VALUES ('vault-rewrap', $1, FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + 120)
+                 ON CONFLICT (id) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
+                 WHERE rotation_state.expires_at <= FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT
+                 RETURNING id",
+                &[&token],
+            ).await.map_err(|_| StoreError)?;
+            Ok(row.is_some())
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn release_rewrap_fence(&self) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                client.execute(
+                "UPDATE rotation_state SET expires_at = 0 WHERE id = 'vault-rewrap' AND token = $1",
+                &[&self.rewrap_fence.as_deref().ok_or(StoreError)?],
+            ).await.map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// Each short transaction locks the fence before touching rows/ledger.
+    /// If eviction or a timeout leaves an operation in flight, takeover
+    /// cannot pass this lock until that operation commits/rolls back. Once
+    /// takeover replaces the token, the old Worker cannot write again.
+    /// This preserves per-batch durability without a long-lived connection.
+    async fn rewrap_transaction<'a>(
+        &self,
+        client: &'a mut tokio_postgres::Client,
+    ) -> Result<tokio_postgres::Transaction<'a>, StoreError> {
+        let tx = client.transaction().await.map_err(|_| StoreError)?;
+        tx.batch_execute(&format!(
+            "SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}; SET LOCAL lock_timeout = {TOTAL_TIMEOUT_MS}"
+        )).await.map_err(|_| StoreError)?;
+        match &self.rewrap_fence {
+            Some(token) => {
+                if tx.query_opt(
+                    "SELECT id FROM rotation_state WHERE id = 'vault-rewrap' AND token = $1
+                       AND expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT FOR UPDATE",
+                    &[&token],
+                ).await.map_err(|_| StoreError)?.is_none() {
+                    return Err(StoreError);
+                }
+            }
+            None => tx.batch_execute("SET TRANSACTION READ ONLY").await.map_err(|_| StoreError)?,
+        }
+        Ok(tx)
     }
 
     async fn connection_diagnostic<F, E>(
@@ -681,6 +750,243 @@ fn native_credential_from_row(
         created_from_ip: row.try_get("created_from_ip").map_err(|_| StoreError)?,
         last_used_at: last_used_at.map(u64_of).transpose()?,
     })
+}
+
+fn rewrap_claim_from_row(row: &tokio_postgres::Row) -> Result<RewrapClaim, StoreError> {
+    Ok(RewrapClaim {
+        user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+        kek_version: u32::try_from(
+            row.try_get::<_, i32>("kek_version")
+                .map_err(|_| StoreError)?,
+        )
+        .map_err(|_| StoreError)?,
+        dek_wrapped: row.try_get("dek_wrapped").map_err(|_| StoreError)?,
+        dek_wrapped_nonce: row.try_get("dek_wrapped_nonce").map_err(|_| StoreError)?,
+    })
+}
+
+fn rotation_run_from_row(row: &tokio_postgres::Row) -> Result<RunRecord, StoreError> {
+    Ok(RunRecord {
+        id: row.try_get("id").map_err(|_| StoreError)?,
+        env: row.try_get("env").map_err(|_| StoreError)?,
+        from_version: u32::try_from(
+            row.try_get::<_, i32>("from_version")
+                .map_err(|_| StoreError)?,
+        )
+        .map_err(|_| StoreError)?,
+        to_version: u32::try_from(
+            row.try_get::<_, i32>("to_version")
+                .map_err(|_| StoreError)?,
+        )
+        .map_err(|_| StoreError)?,
+        cursor: row.try_get("cursor").map_err(|_| StoreError)?,
+        rows_done: u64_of(row.try_get("rows_done").map_err(|_| StoreError)?)?,
+        rows_failed: u64_of(row.try_get("rows_failed").map_err(|_| StoreError)?)?,
+        rows_deferred: u64_of(row.try_get("rows_deferred").map_err(|_| StoreError)?)?,
+        claims_retried: u64_of(row.try_get("claims_retried").map_err(|_| StoreError)?)?,
+        started_at: u64_of(row.try_get("started_at").map_err(|_| StoreError)?)?,
+        updated_at: u64_of(row.try_get("updated_at").map_err(|_| StoreError)?)?,
+        finished_at: row
+            .try_get::<_, Option<i64>>("finished_at")
+            .map_err(|_| StoreError)?
+            .map(u64_of)
+            .transpose()?,
+    })
+}
+
+impl RewrapStore for PgStore {
+    async fn claim_batch(
+        &self,
+        to_version: u32,
+        after_user_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<RewrapClaim>, StoreError> {
+        Self::bounded(
+            async {
+                if limit == 0 || limit > crate::rotation::MAX_BATCH_LIMIT {
+                    return Err(StoreError);
+                }
+                let mut client = self.connect().await?;
+                let tx = self.rewrap_transaction(&mut client).await?;
+                let version = i32::try_from(to_version).map_err(|_| StoreError)?;
+                let cursor = after_user_id.unwrap_or("");
+                let rows = tx
+                    .query(CLAIM_BATCH_SQL, &[&version, &cursor, &i64::from(limit)])
+                    .await
+                    .map_err(|_| StoreError)?;
+                let claims = rows
+                    .iter()
+                    .map(rewrap_claim_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                tx.commit().await.map_err(|_| StoreError)?;
+                Ok(claims)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn reload_row(&self, user_id: &str) -> Result<Option<RewrapClaim>, StoreError> {
+        Self::bounded(async {
+            let mut client = self.connect().await?;
+            let tx = self.rewrap_transaction(&mut client).await?;
+            let row = tx.query_opt(
+                "SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce FROM provider_vaults WHERE user_id = $1",
+                &[&user_id],
+            ).await.map_err(|_| StoreError)?;
+            let claim = row.as_ref().map(rewrap_claim_from_row).transpose()?;
+            tx.commit().await.map_err(|_| StoreError)?;
+            Ok(claim)
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn cas_rewrap(
+        &self,
+        user_id: &str,
+        captured: &RewrapClaim,
+        rewrapped: &RewrappedEnvelope,
+        now_secs: u64,
+    ) -> Result<CasRewrapOutcome, StoreError> {
+        Self::bounded(
+            async {
+                if user_id != captured.user_id {
+                    return Err(StoreError);
+                }
+                let mut client = self.connect().await?;
+                let tx = self.rewrap_transaction(&mut client).await?;
+                let version = i32::try_from(rewrapped.kek_version).map_err(|_| StoreError)?;
+                let wrap = &rewrapped.dek_wrapped;
+                let nonce = &rewrapped.dek_wrapped_nonce;
+                let now = i64_of(now_secs)?;
+                let old = i32::try_from(captured.kek_version).map_err(|_| StoreError)?;
+                let changed = tx
+                    .execute(
+                        CAS_REWRAP_POSTGRES_SQL,
+                        &[
+                            &version,
+                            &wrap,
+                            &nonce,
+                            &now,
+                            &user_id,
+                            &old,
+                            &captured.dek_wrapped,
+                            &captured.dek_wrapped_nonce,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                let outcome = match changed {
+                    0 => CasRewrapOutcome::ClaimLost,
+                    1 => CasRewrapOutcome::Rewrapped,
+                    _ => return Err(StoreError),
+                };
+                tx.commit().await.map_err(|_| StoreError)?;
+                Ok(outcome)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_run(
+        &self,
+        env: &str,
+        from_version: u32,
+        to_version: u32,
+        now_secs: u64,
+    ) -> Result<RunRecord, JobError> {
+        validate_new_run(env, from_version, to_version)?;
+        let id = crate::b64::encode(
+            &crate::random::secure_random_bytes::<32>()
+                .map_err(|_| JobError::RandomnessUnavailable)?,
+        );
+        with_deadline(async {
+            let mut client = self.connect().await.map_err(|_: StoreError| JobError::Store)?;
+            let tx = self.rewrap_transaction(&mut client).await?;
+            let from = i32::try_from(from_version).map_err(|_| JobError::Store)?;
+            let to = i32::try_from(to_version).map_err(|_| JobError::Store)?;
+            let now = i64_of(now_secs)?;
+            let row = tx.query_one(
+                "INSERT INTO rotation_runs (id, env, from_version, to_version, started_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $5) RETURNING *",
+                &[&id, &env, &from, &to, &now],
+            ).await.map_err(|error| {
+                if error.as_db_error().is_some_and(|db|
+                    db.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                    && db.constraint() == Some("idx_rotation_runs_open")) {
+                    JobError::PassAlreadyRunning
+                } else { JobError::Store }
+            })?;
+            let run = rotation_run_from_row(&row)?;
+            tx.commit().await.map_err(|_| JobError::Store)?;
+            Ok(run)
+        }, TOTAL_TIMEOUT_MS, JobError::Store).await
+    }
+
+    async fn load_open_run(
+        &self,
+        env: &str,
+        to_version: u32,
+    ) -> Result<Option<RunRecord>, StoreError> {
+        Self::bounded(async {
+            let mut client = self.connect().await?;
+            let tx = self.rewrap_transaction(&mut client).await?;
+            let version = i32::try_from(to_version).map_err(|_| StoreError)?;
+            let row = tx.query_opt(
+                "SELECT * FROM rotation_runs WHERE env = $1 AND to_version = $2 AND finished_at IS NULL",
+                &[&env, &version],
+            ).await.map_err(|_| StoreError)?;
+            let run = row.as_ref().map(rotation_run_from_row).transpose()?;
+            tx.commit().await.map_err(|_| StoreError)?;
+            Ok(run)
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn save_progress(&self, run: &RunRecord) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let tx = self.rewrap_transaction(&mut client).await?;
+                let changed = tx
+                    .execute(
+                        "UPDATE rotation_runs SET cursor = $2, rows_done = $3, rows_failed = $4,
+                    rows_deferred = $5, claims_retried = $6, updated_at = $7
+                  WHERE id = $1 AND finished_at IS NULL",
+                        &[
+                            &run.id,
+                            &run.cursor,
+                            &i64_of(run.rows_done)?,
+                            &i64_of(run.rows_failed)?,
+                            &i64_of(run.rows_deferred)?,
+                            &i64_of(run.claims_retried)?,
+                            &i64_of(run.updated_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if changed != 1 {
+                    return Err(StoreError);
+                }
+                tx.commit().await.map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn close_run(&self, run_id: &str, now_secs: u64) -> Result<(), StoreError> {
+        Self::bounded(async {
+            let mut client = self.connect().await?;
+            let tx = self.rewrap_transaction(&mut client).await?;
+            tx.execute(
+                "UPDATE rotation_runs SET finished_at = $2, updated_at = $2 WHERE id = $1 AND finished_at IS NULL",
+                &[&run_id, &i64_of(now_secs)?],
+            ).await.map_err(|_| StoreError)?;
+            tx.commit().await.map_err(|_| StoreError)?;
+            Ok(())
+        }, TOTAL_TIMEOUT_MS).await
+    }
 }
 
 impl Store for PgStore {
@@ -2305,6 +2611,100 @@ fn emit_record(
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
+/// Cron is inert by default. Arming is an explicit, one-environment
+/// ceremony after the independent write-version flip and staging DDL.
+pub async fn scheduled_rewrap(env: Env) -> WorkerResult<()> {
+    let started = worker::Date::now().as_millis();
+    let ceremony = match scheduled_rewrap_arming_from_lookup(
+        |name| env_string_raw(&env, name),
+        started / 1000,
+    )
+    .map_err(|_| worker::Error::RustError("rewrap configuration unavailable".into()))?
+    {
+        ScheduledRewrapArming::Disabled => return Ok(()),
+        ScheduledRewrapArming::Armed(config) => config,
+    };
+    if env_string(&env, "DEPLOYMENT_ENV").as_deref() != Some(ceremony.env.as_str()) {
+        return Err(worker::Error::RustError(
+            "rewrap environment mismatch".into(),
+        ));
+    }
+    let config = config_from_env(&env)
+        .ok_or_else(|| worker::Error::RustError("rewrap configuration unavailable".into()))?;
+    // Rewrapping to a pre-staged future key while serving still writes the
+    // prior would never converge. Flip separately; this handler never does.
+    if config.kek_version != ceremony.to_version {
+        return Err(worker::Error::RustError(
+            "rewrap target differs from serving version".into(),
+        ));
+    }
+    ceremony
+        .validate(&config)
+        .map_err(|_| worker::Error::RustError("rewrap configuration unavailable".into()))?;
+    let trace_id = crate::logging::resolve_trace_id(None);
+    let mut store = PgStore {
+        env: env.clone(),
+        trace_id: trace_id.clone(),
+        rewrap_fence: None,
+    };
+    if !ceremony.dry_run {
+        let token = crate::b64::encode(
+            &crate::random::secure_random_bytes::<32>()
+                .map_err(|_| worker::Error::RustError("rewrap unavailable".into()))?,
+        );
+        if !store
+            .acquire_rewrap_fence(&token)
+            .await
+            .map_err(|_| worker::Error::RustError("rewrap store unavailable".into()))?
+        {
+            return Ok(()); // Another invocation owns this database's pass.
+        }
+        store.rewrap_fence = Some(token);
+    }
+    // The lease lasts 120s; this invocation never deliberately spends more
+    // than 30s on its pass. Expiry is still fenced, not trusted as exclusion.
+    let outcome = with_deadline(
+        run_scheduled_rewrap(&store, &config, &ceremony),
+        30_000,
+        JobError::Store,
+    )
+    .await;
+    let released = if ceremony.dry_run {
+        Ok(())
+    } else {
+        store.release_rewrap_fence().await
+    };
+    let build_sha = build_sha_from_env(&env);
+    match outcome {
+        Ok(report) => {
+            emit_record(
+                crate::logging::Level::Info,
+                "api.vault.rewrap_pass",
+                &trace_id,
+                serde_json::json!({"rows_scanned": report.pass.scanned, "rows_rewrapped": report.pass.done,
+                    "rows_failed": report.pass.failed, "rows_deferred": report.pass.deferred,
+                    "claims_retried": report.pass.retried, "complete": report.pass.complete,
+                    "dry_run": ceremony.dry_run, "duration_ms": worker::Date::now().as_millis().saturating_sub(started),
+                    "build_sha": build_sha, "release": build_sha}),
+            );
+            released.map_err(|_| worker::Error::RustError("rewrap store unavailable".into()))
+        }
+        Err(_) => Err(worker::Error::RustError("rewrap unavailable".into())),
+    }
+}
+
+/// One opaque boundary record, including preflight and lease-release failures.
+/// Do not accept an error argument: provider diagnostics cannot enter fields.
+pub fn scheduled_rewrap_failed(env: &Env) {
+    let build_sha = build_sha_from_env(env);
+    emit_record(
+        crate::logging::Level::Error,
+        "api.vault.rewrap_error",
+        &crate::logging::resolve_trace_id(None),
+        serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
+    );
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -2384,6 +2784,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         store: &PgStore {
             env: env.clone(),
             trace_id: trace_id.clone(),
+            rewrap_fence: None,
         },
         mailer: &WebhookMailer {
             origin: config.origin.clone(),

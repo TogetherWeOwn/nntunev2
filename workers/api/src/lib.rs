@@ -95,6 +95,19 @@ mod logging_tests {
     }
 }
 
+#[worker::event(scheduled)]
+pub async fn scheduled(
+    _event: worker::ScheduledEvent,
+    env: worker::Env,
+    _ctx: worker::ScheduleContext,
+) {
+    // worker-rs scheduled handlers return unit. Record the opaque failure
+    // explicitly rather than silently discarding the handler Result.
+    if worker_entry::scheduled_rewrap(env.clone()).await.is_err() {
+        worker_entry::scheduled_rewrap_failed(&env);
+    }
+}
+
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,

@@ -219,15 +219,15 @@ Invariants (CISO gate checks these on the vault PR):
 
 ## 6. Re-wrap job
 
-Runner: Cloudflare Workflow (cron) or Queue consumer in `workers/api`
-(Rust). Paginated, idempotent, resumable — serverless-safe (no
-in-memory cursors). The runner core HAS landed — `run_rewrap_pass` in
-`workers/api/src/rotation.rs` over the `RewrapStore` contract, proven
-against a synthetic staging-equivalent store — but no scheduled trigger
-invokes it yet (§8): no Workflow/Queue consumer wires it to Hyperdrive,
-the `rotation_runs` production DDL is fixture-validated only, and no
-production migration exists. This section stays the normative contract
-the trigger must follow.
+Runner: Cloudflare scheduled event (cron) in `workers/api` (Rust),
+paginated, idempotent and resumable without in-memory cursors.
+`run_scheduled_rewrap` in `workers/api/src/rotation.rs` orchestrates
+`load_open_run` → `open_run` → `run_rewrap_pass` → `close_run` over the
+Hyperdrive `RewrapStore` in `worker_entry.rs`. Root migration
+`migrations/0024_rotation_runs.sql` carries the durable ledger and
+invocation fence. This is implementation, not a live rotation receipt:
+production application of the migration and the staging ceremony remain
+separate gates (§7). The SQL below remains normative and unchanged.
 
 ```sql
 -- claim a batch (cursor = last user_id, never OFFSET on a hot table;
@@ -307,25 +307,61 @@ they would either wedge the pass or vanish into `rows_failed`),
 `claims_retried` (lost-claim reloads, so a drill can tell races from
 poison), and `updated_at` (stuck-pass detection) — with a partial-unique
 `(env, to_version)` open-run index as the ≤1-concurrent-pass guard. The
-DDL is fixture-validated only; production DDL, Hyperdrive store wiring,
-and the scheduled trigger land together with the trigger card.
+DDL is mirrored in `migrations/0024_rotation_runs.sql` with identical
+columns, types, defaults, and partial index. PostgreSQL binds epoch
+`BIGINT`s and application-generated `TEXT` IDs directly; no dialect
+conversion is needed for the ledger. The named normative CAS cannot be
+sent to PostgreSQL: `CAS_REWRAP_POSTGRES_SQL` renders only its placeholders
+positionally (`new,w,n,now,u,old,captured_wrapped,captured_wrapped_nonce`
+→ `$1..$8`, with both timestamps using `$4`). No predicate changes.
+
+The separate `rotation_state` singleton fences overlapping invocations
+for the whole database, including different env labels/targets: the
+unique open-run index alone is **not** a concurrency lock. A Worker
+acquires a random ownership token with a 120-second database-clock lease.
+Every store method uses a short transaction that locks that singleton
+`FOR UPDATE`, checks token and expiry, executes the operation, and commits.
+Takeover waits for in-flight transactions; stale tokens cannot mutate
+vaults or progress after takeover. There are no session advisory locks
+(Hyperdrive transaction pooling cannot retain them). Progress still commits
+per batch. The pass has a 30-second wall-time budget in addition to bounded
+batches and per-method `TOTAL_TIMEOUT_MS`; eviction recovers by lease expiry
+and the persisted cursor. Failure between vault CAS and progress save can
+under-report that interrupted batch's counts; version-count queries, not
+ledger totals, remain the retirement authority. Poison/deferred rows close
+with the completed scan and are revisited by the next fresh run.
+
+Arming is explicit and defaults off. `VAULT_REWRAP_ENABLED=1` requires
+`VAULT_REWRAP_ENV` matching `DEPLOYMENT_ENV`, explicit
+`VAULT_REWRAP_FROM_VERSION` / `VAULT_REWRAP_TO_VERSION`, and the target must
+already equal the serving write version. `VAULT_REWRAP_BATCH_LIMIT`
+defaults to 20 (1–100), `VAULT_REWRAP_MAX_BATCHES` defaults to 1 (positive),
+and `VAULT_REWRAP_DRY_RUN=1` performs no database writes, including lease or
+ledger writes. It never flips or retires secrets. Cron runs at minute 7
+hourly in the generated staging config, but normal CI deploys explicitly
+set `VAULT_REWRAP_ENABLED=0`, disarming any ceremony. Arm only via a
+recorded, gated staging deployment after DDL verification; restore off at
+close. No production cron or ceremony is enabled by this slice.
+
+Telemetry emits the standard structured `api.vault.rewrap_pass` record
+(rows scanned/rewrapped/failed/deferred, retry count, complete/dry-run
+flags, duration and build identity) and opaque `api.vault.rewrap_error`
+on failure, never per-row material or cursors. Analytics Engine export is
+not wired/proven here. The worker-rs scheduled macro returns unit, so the
+boundary explicitly records errors; the next cron resumes rather than
+assuming provider-level automatic retry.
 
 ## 7. Runbook (operator copy-paste)
 
-> **NOT EXECUTABLE end to end — do not run the steps below in an
-> incident.** The versioned KEK map HAS landed — `Config::kek_by_version`
-> + `Config::with_prior_keks` (`workers/api/src/handlers.rs`) over
-> `VAULT_KEK_V<N>` per-version secrets + the `VAULT_KEK_CURRENT`
-> write-version var (`kek_set_from_lookup`,
-> `workers/api/src/worker_entry.rs`), with legacy single-key
-> compatibility — so pre-staging a version and flipping the write
-> version (steps 3–4 mechanics) are implemented. The re-wrap runner
-> core (§6: `run_rewrap_pass` + `RewrapStore`, fixture-proven over a
-> synthetic store) HAS landed, but no scheduled trigger invokes it (no
-> Cloudflare Workflow/Queue consumer, §8) and the `rotation_runs`
-> production DDL is fixture-validated only (no production migration),
-> so no rotation can be carried through re-wrap/retire/close (steps
-> 5–7): routine KEK rotation still cannot be executed end to end. On
+> **NOT PROVEN end to end — do not use routine re-wrap for an
+> incident.** The versioned KEK map, scheduled orchestration
+> (`run_scheduled_rewrap`), Hyperdrive `RewrapStore`, and root DDL
+> (`0024_rotation_runs.sql`) are implemented. Code/native/source/SQL
+> checks are not a live staging ceremony: deployment, DDL application,
+> dry-run/live re-wrap, flip-back rollback, ≥24h bake and backup-aware
+> retirement still require their own recorded evidence. Production
+> migration and production secret rotation are not performed by this
+> slice; the normal staging deploy keeps the trigger unarmed. On
 > suspected or confirmed KEK exposure, report it through GitHub's
 > private vulnerability reporting (see `SECURITY.md`); §10 is
 > design-only and has no runner. Today's executable containment is:
@@ -345,7 +381,7 @@ and the scheduled trigger land together with the trigger card.
 |---|---|---|
 | Session secret (routine window) | ✅ Yes — dual-accept window per `docs/security/session-secret-rotation.md` | `SESSION_SECRET_BASE64`, `SESSION_SECRET_PREVIOUS_BASE64`, `SESSION_SECRET_ROTATION` — all read in `workers/api/src/worker_entry.rs` |
 | Session secret (compromise) | ✅ Yes — single-secret cutover + `UPDATE sessions SET revoked = TRUE` (§6 of that doc) | same vars as above |
-| KEK (routine re-wrap, §§5–6 below) | ❌ No — runner core landed but no scheduled trigger, no `rotation_runs` production DDL, no Hyperdrive store wiring (versioned KEK map + `CURRENT` flip landed; steps 5–7 still need the trigger) | `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT` read in `worker_entry.rs` (`kek_set_from_lookup`), `kek_by_version` in `handlers.rs`, legacy pair still supported; `run_rewrap_pass` + `RewrapStore` + `rotation_runs` DDL in `workers/api/src/rotation.rs` (fixture-proven, no production migration; **not executable end to end**) |
+| KEK (routine re-wrap, §§5–6 below) | ⚠️ Implemented, not live-proven — scheduled trigger + Hyperdrive store + root DDL exist; staging ceremony/rollback/bake and production promotion remain unproven | `VAULT_REWRAP_*` + `DEPLOYMENT_ENV`, `run_scheduled_rewrap` in `rotation.rs`, fenced `PgStore` in `worker_entry.rs`, `0024_rotation_runs.sql`; key map/serving flip unchanged. Default unarmed; no production migration performed |
 | KEK (compromise re-key, §10) | ❌ No runner — incident path is design until the §8 gate items land | versioned map as above; per-row re-key still needs its own runner — the landed §6 core only re-wraps (**not implemented**) |
 | Native REST pepper | ⚠️ Reissue only — no rotation window; rotating the pepper means provisioning a new pair and reissuing credentials (rows pinned to the old `pepper_version` fail closed) | single `NATIVE_REST_PEPPER_BASE64` + `NATIVE_REST_PEPPER_VERSION` pair in `worker_entry.rs`; no second pair / previous-pepper var (**not implemented**) |
 
@@ -360,7 +396,11 @@ back); rotation window announced.
               deploy reader release; verify /health + one test-connection
 4. Flip:      set VAULT_KEK_CURRENT=N+1 in wrangler vars; deploy
               verify: create+read one staging vault row shows kek_version=N+1
-5. Re-wrap:   trigger Workflow pass (dry-run first on staging);
+5. Re-wrap:   verify migration 0024 on staging (production promotion is
+              separate); deploy matching DEPLOYMENT_ENV/VAULT_REWRAP_ENV,
+              explicit FROM_VERSION/TO_VERSION and ENABLED=1, DRY_RUN=1
+              under the VAULT_REWRAP_ prefix; observe scheduled count-only
+              telemetry, then separately deploy DRY_RUN=0 after dry-run proof;
               watch rotation_runs until rows_failed=0 and
               SELECT count(*) FROM provider_vaults WHERE kek_version < N+1; → 0
               re-run once more; require 0 twice
@@ -419,11 +459,13 @@ CISO gate verifies each at its exact head):
       legacy single-key mode preserved.
 - [ ] Re-wrap job present, idempotent, resumable, with poison-row
       handling and count-only telemetry; re-wrap UPDATE binds the new
-      AAD (§6 step 2). Runner core landed (`run_rewrap_pass` +
-      `RewrapStore` + fixture-proven `rotation_runs` record: bounded,
-      resumable, poison-isolated, dry-run); still needs the scheduled
-      trigger (Workflow/Queue), the `rotation_runs` production DDL, and
-      the Hyperdrive store wiring before this box checks.
+      AAD (§6 step 2). Implemented: `run_rewrap_pass` +
+      `run_scheduled_rewrap`, fenced Hyperdrive `RewrapStore`,
+      `0024_rotation_runs.sql`, and scheduled-event glue. Native synthetic
+      behavior, source pins and scratch PostgreSQL checks are distinct
+      from deployed Hyperdrive/cron proof; this gate stays unchecked until
+      live staging evidence and count-only telemetry are recorded.
+      Analytics Engine export remains unimplemented.
 - [ ] Runbook §7 followed on staging (var flip + dry-run re-wrap pass);
       rollback rehearsed (flip-back deploy).
 - [ ] Retire-after date recorded and honored (backup/PITR-aware, §5
