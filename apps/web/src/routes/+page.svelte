@@ -17,7 +17,7 @@
 	<ol>
 		<li>Try the demo player without an account.</li>
 		<li>Create an account to get started with NNTune.</li>
-		<li>Connect your own Usenet provider in account settings.</li>
+		<li>Connect your own Usenet provider in the next step after signup.</li>
 	</ol>
 	<p>
 		<a class="nt-button" href="/demo/player">Try the demo player</a>
