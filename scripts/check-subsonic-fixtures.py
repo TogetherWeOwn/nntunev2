@@ -50,7 +50,7 @@ def main():
                 stripped.endswith("</subsonic-response>") or stripped.endswith("/>")
             ):
                 fail(f"{name}: envelope not closed")
-            if b"\n" in raw.strip():
+            if b"\n" in raw or b"\r" in raw:
                 fail(f"{name}: must be a single line (no pretty-printing)")
         elif name.endswith(".json"):
             try:
@@ -60,7 +60,7 @@ def main():
                 continue
             if "subsonic-response" not in doc:
                 fail(f"{name}: missing subsonic-response root")
-            if raw.strip().endswith(b"\n") or b"\n" in raw.strip():
+            if b"\n" in raw or b"\r" in raw:
                 fail(f"{name}: must be compact single-line JSON")
         elif name.endswith(".txt"):
             if b"subsonic-response" not in raw:

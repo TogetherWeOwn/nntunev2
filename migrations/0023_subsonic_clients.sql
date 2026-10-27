@@ -19,7 +19,7 @@
 
 CREATE TABLE IF NOT EXISTS subsonic_clients (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     client_name TEXT NOT NULL DEFAULT '',
     -- HMAC-SHA256(api_key, pepper) hex; pepper from SUBSONIC_INDEX_PEPPER.
     api_key_hmac TEXT NOT NULL UNIQUE,

@@ -35,13 +35,26 @@ impl Identity {
 }
 
 /// Raw credential parameters straight off the query string.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Credentials {
     pub api_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub token: Option<String>,
     pub salt: Option<String>,
+}
+
+/// Presence-only `Debug`: credential values must never reach a log line.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("api_key", &self.api_key.is_some())
+            .field("username", &self.username.is_some())
+            .field("password", &self.password.is_some())
+            .field("token", &self.token.is_some())
+            .field("salt", &self.salt.is_some())
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -241,6 +254,30 @@ pub fn md5_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_debug_redacts_values() {
+        let creds = Credentials {
+            api_key: Some("api-secret".into()),
+            username: Some("someone".into()),
+            password: Some("password-secret".into()),
+            token: Some("token-secret".into()),
+            salt: Some("salt-secret".into()),
+        };
+        let debug = format!("{creds:?}");
+        for secret in [
+            "api-secret",
+            "someone",
+            "password-secret",
+            "token-secret",
+            "salt-secret",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "debug output leaked {secret}: {debug}"
+            );
+        }
+    }
 
     struct Stub;
     impl AuthStore for Stub {
