@@ -14,6 +14,9 @@
 //!   [`session::verify_stored_session`] against the current server row
 //!   (revoked/missing/stale-counter/mismatched rows reject), and cookie-
 //!   authenticated mutations require an exact `Origin` match (CSRF).
+//!   The only stale-cookie operation is opt-in refresh recovery: it requires
+//!   a separate client secret and an atomic current-row claim, and can only
+//!   reissue the immediate successor, never authorize an application action.
 //!   `POST /v1/auth/magic/finish` mints a cookie from a pure bearer token,
 //!   so it requires the same exact `Origin` match even when unauthenticated
 //!   (login-CSRF session planting): browsers always send `Origin` on this
@@ -661,6 +664,20 @@ pub trait Store {
         new_counter: u32,
         new_expires_at: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Atomically rotate a current session OR recover its immediate successor
+    /// using a digest bound to the old cookie and a separate client retry secret.
+    /// Execute `session::ROTATE_SESSION_WITH_RETRY_SQL`; a missing/revoked/stale
+    /// row or mismatched/expired recovery must return None. The default fails
+    /// closed for stores that have not implemented the new protocol.
+    fn rotate_session_with_retry(
+        &self,
+        _previous: &SessionClaims,
+        _next: &SessionClaims,
+        _retry_hash: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Option<SessionClaims>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Atomically claim the old session for reauthentication and insert its
     /// replacement. A false result means the conditional revoke lost a race;
     /// errors must leave both rows unchanged.
@@ -2385,6 +2402,79 @@ where
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRefreshBody {
+    retry_key: Option<String>,
+}
+
+/// Optional lost-response recovery protocol. This is NOT ordinary request
+/// authentication: the stale cookie plus the separately retained client secret
+/// can ONLY retrieve the already committed successor via the atomic DB claim.
+async fn session_refresh_with_retry<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    retry_key: String,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.origin.as_deref() != Some(ctx.cfg.origin.as_str()) {
+        return generic_auth();
+    }
+    let Some(token) = session_cookie_value(req) else {
+        return generic_auth();
+    };
+    let keys = ctx.cfg.session_keys();
+    let previous = match session::verify_session_dual(&keys, &token, ctx.now) {
+        Ok(claims) => claims,
+        Err(error) => return session_error_response(error),
+    };
+    let retry_hash = match session::refresh_retry_hash(&token, &retry_key) {
+        Ok(hash) => hash,
+        Err(_) => return generic_auth(),
+    };
+    let candidate = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
+        .and_then(|next| session::verify_session(&ctx.cfg.session_secret, &next, ctx.now))
+    {
+        Ok(claims) => claims,
+        Err(error) => return session_error_response(error),
+    };
+    let committed = match ctx
+        .store
+        .rotate_session_with_retry(&previous, &candidate, &retry_hash, ctx.now)
+        .await
+    {
+        Ok(Some(claims)) => claims,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(), // Keep the original cookie and retry key.
+    };
+    // Defense in depth against an adapter returning unrelated row metadata.
+    if committed.session_id != previous.session_id
+        || committed.user_id != previous.user_id
+        || committed.created_at != previous.created_at
+        || committed.rotation_counter != candidate.rotation_counter
+    {
+        return internal();
+    }
+    let new_token = match session::sign_refreshed_claims(&ctx.cfg.session_secret, &committed) {
+        Ok(token) => token,
+        Err(error) => return session_error_response(error),
+    };
+    if session::verify_session(&ctx.cfg.session_secret, &new_token, ctx.now).is_err() {
+        return internal();
+    }
+    let mut response = json_response(200, serde_json::json!({"ok": true}));
+    response.set_cookie = Some(session::set_cookie_header(
+        &new_token,
+        committed.expires_at.saturating_sub(ctx.now),
+    ));
+    response
+}
+
 async fn session_refresh<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2392,6 +2482,16 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Empty bodies and `{}` preserve the strict one-shot rotation protocol.
+    // Recovery requires an explicit, separately bound retry secret.
+    if !req.body.is_empty() {
+        let Some(body) = parse_body::<SessionRefreshBody>(req) else {
+            return generic_auth();
+        };
+        if let Some(retry_key) = body.retry_key {
+            return session_refresh_with_retry(ctx, req, retry_key).await;
+        }
+    }
     let (claims, token) = match ctx.authenticate(req, true).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
@@ -3614,6 +3714,8 @@ mod tests {
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
+        refresh_retries: RefCell<HashMap<String, (String, u64)>>,
+        lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         providers: RefCell<Vec<ProviderMintRow>>,
@@ -4004,10 +4106,63 @@ mod tests {
                 Some(row) if row.rotation_counter == expected_counter && !row.revoked => {
                     row.rotation_counter = new_counter;
                     row.expires_at = new_expires_at;
+                    self.refresh_retries.borrow_mut().remove(id);
                     Ok(true)
                 }
                 _ => Ok(false),
             }
+        }
+        async fn rotate_session_with_retry(
+            &self,
+            previous: &SessionClaims,
+            next: &SessionClaims,
+            retry_hash: &str,
+            now: u64,
+        ) -> Result<Option<SessionClaims>, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            let Some(row) = sessions.get_mut(&previous.session_id) else {
+                return Ok(None);
+            };
+            if row.revoked
+                || row.user_id != previous.user_id
+                || row.created_at != previous.created_at
+                || now >= row.expires_at
+            {
+                return Ok(None);
+            }
+            let mut retries = self.refresh_retries.borrow_mut();
+            let issued_at = if row.rotation_counter == previous.rotation_counter
+                && row.expires_at == previous.expires_at
+            {
+                row.rotation_counter = next.rotation_counter;
+                row.expires_at = next.expires_at;
+                retries.insert(row.id.clone(), (retry_hash.to_string(), now));
+                now
+            } else {
+                match retries.get(&row.id) {
+                    Some((hash, at))
+                        if row.rotation_counter == next.rotation_counter
+                            && hash == retry_hash
+                            && *at <= now
+                            && now.saturating_sub(*at) < session::REFRESH_RETRY_SECS =>
+                    {
+                        *at
+                    }
+                    _ => return Ok(None),
+                }
+            };
+            // Simulate a committed UPDATE whose acknowledgement is lost.
+            if self.lose_next_refresh_ack.replace(false) {
+                return Err(StoreError);
+            }
+            Ok(Some(SessionClaims {
+                session_id: row.id.clone(),
+                user_id: row.user_id.clone(),
+                created_at: row.created_at,
+                issued_at,
+                expires_at: row.expires_at,
+                rotation_counter: row.rotation_counter,
+            }))
         }
         async fn replace_session_after_reauthentication(
             &self,
@@ -5104,6 +5259,258 @@ mod tests {
             .filter(|won| *won)
             .count();
         assert_eq!(wins, 1);
+    }
+
+    #[test]
+    fn refresh_retry_recovers_lost_response_only_with_original_client_secret() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let body = serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+        let refresh = |body: Option<String>, cookie: String| {
+            h.call_full(
+                "POST",
+                "/v1/session/refresh",
+                body,
+                Some(cookie),
+                Some(ORIGIN),
+            )
+        };
+        // Commit the rotation but deliberately do not install its Set-Cookie.
+        let lost = refresh(Some(body.clone()), cookie.clone());
+        assert_eq!(lost.status, 200);
+        let successor = cookie_of(&lost);
+        assert_ne!(cookie, successor);
+        assert_eq!(refresh(None, cookie.clone()).status, 401);
+        let wrong_key =
+            serde_json::json!({"retry_key": crate::b64::encode(&[43u8; 32])}).to_string();
+        assert_eq!(refresh(Some(wrong_key), cookie.clone()).status, 401);
+        let retried = refresh(Some(body.clone()), cookie.clone());
+        assert_eq!(
+            retried.status, 200,
+            "a bound retry must recover the committed cookie"
+        );
+        assert_eq!(cookie_of(&retried), successor);
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+                .status,
+            401
+        );
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(successor.clone()), None)
+                .status,
+            200
+        );
+        // A later rotation permanently closes the recovery slot.
+        assert_eq!(refresh(None, successor).status, 200);
+        assert_eq!(refresh(Some(body), cookie).status, 401);
+    }
+
+    fn bound_refresh(
+        h: &Harness,
+        cookie: &str,
+        key: &str,
+        now: u64,
+        origin: Option<&str>,
+    ) -> Response {
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1/session/refresh".into(),
+            cookie: Some(cookie.into()),
+            origin: origin.map(str::to_string),
+            authorization: None,
+            body: serde_json::json!({"retry_key": key})
+                .to_string()
+                .into_bytes(),
+        };
+        let mut ctx = h.ctx();
+        ctx.now = now;
+        block_on(handle(&ctx, &req))
+    }
+
+    #[test]
+    fn refresh_retry_is_bounded_and_does_not_extend_lifetime() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        let first = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        let before = h.store.sessions.borrow().clone();
+        let recovered = bound_refresh(&h, &cookie, &key, NOW + 119, Some(ORIGIN));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(cookie_of(&recovered), cookie_of(&first));
+        assert!(recovered.set_cookie.unwrap().contains("Max-Age=3481"));
+        for (id, row) in h.store.sessions.borrow().iter() {
+            assert_eq!(row.rotation_counter, before[id].rotation_counter);
+            assert_eq!(row.expires_at, before[id].expires_at);
+            assert_eq!(row.created_at, before[id].created_at);
+        }
+        let expired = bound_refresh(&h, &cookie, &key, NOW + 120, Some(ORIGIN));
+        assert_eq!(expired.status, 401);
+        assert!(expired.set_cookie.is_none());
+    }
+
+    #[test]
+    fn refresh_retry_rejects_revoked_and_cross_origin_requests() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        for origin in [None, Some("https://attacker.example")] {
+            assert_eq!(bound_refresh(&h, &cookie, &key, NOW, origin).status, 401);
+        }
+        let first = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        let successor = cookie_of(&first);
+        for origin in [None, Some("https://attacker.example")] {
+            assert_eq!(bound_refresh(&h, &cookie, &key, NOW, origin).status, 401);
+        }
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(successor),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+    }
+
+    #[test]
+    fn refresh_retry_recovers_a_committed_rotation_after_storage_ack_loss() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        *h.store.lose_next_refresh_ack.borrow_mut() = true;
+        let uncertain = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(uncertain.status, 500);
+        assert!(uncertain.set_cookie.is_none());
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+                .status,
+            401
+        );
+        let recovered = bound_refresh(&h, &cookie, &key, NOW + 1, Some(ORIGIN));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&recovered)), None)
+                .status,
+            200
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 1));
+    }
+
+    #[test]
+    fn refresh_retry_cannot_retrofit_recovery_onto_an_unbound_rotation() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let first = h.call_full(
+            "POST",
+            "/v1/session/refresh",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(first.status, 200);
+        let key = crate::b64::encode(&[42u8; 32]);
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&first)), None)
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn refresh_retry_cannot_bypass_signed_token_or_current_row_checks() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        let token = cookie.split_once('=').unwrap().1;
+        let claims = session::verify_session(&h.config.session_secret, token, NOW).unwrap();
+        let mut wrong_owner = claims.clone();
+        wrong_owner.user_id = "other-user".into();
+        let mut wrong_created = claims.clone();
+        wrong_created.created_at -= 1;
+        let mut wrong_expiry = claims.clone();
+        wrong_expiry.expires_at += 1;
+        for altered in [wrong_owner, wrong_created, wrong_expiry] {
+            let signed =
+                session::sign_refreshed_claims(&h.config.session_secret, &altered).unwrap();
+            let cookie = format!("{}={signed}", session::COOKIE_NAME);
+            assert_eq!(
+                bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+                401
+            );
+        }
+        assert_eq!(
+            bound_refresh(&h, &format!("{cookie}tampered"), &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 0));
+        let first = bound_refresh(&h, &cookie, &key, NOW + 3599, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        // A still-open recovery window cannot revive an expired predecessor.
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW + 3600, Some(ORIGIN)).status,
+            401
+        );
+        h.store.sessions.borrow_mut().clear();
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+    }
+
+    #[test]
+    fn refresh_retry_rejects_malformed_keys_without_rotating() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for key in [
+            "".to_string(),
+            "not-base64!".into(),
+            crate::b64::encode(&[1u8; 31]),
+            crate::b64::encode(&[1u8; 33]),
+        ] {
+            let response = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+            assert_eq!(response.status, 401);
+            assert!(response.set_cookie.is_none());
+        }
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie), None)
+                .status,
+            200
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 0));
     }
 
     #[test]

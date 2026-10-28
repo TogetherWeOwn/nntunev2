@@ -108,6 +108,50 @@ public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
 Worker secrets and the staging variable values are Operator-wired, and the
 lane skips until they are.
 
+### Session refresh retries without a stale-cookie grace period
+
+An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:
+commit the conditional counter advance, then send `Set-Cookie`. A stale
+cookie is never accepted for ordinary authentication or unbound refresh.
+Clients needing lost-response recovery can instead send JSON
+`{"retry_key":"<unpadded base64url of 32 cryptographically random bytes>"}`.
+The same exact `Origin` and signed session cookie are still required.
+
+- Generate a **new 256-bit random secret before each logical refresh** and
+  retain it privately for that operation. Never derive it from the cookie,
+  user id, timestamps, or a public request id. Never log it, put it in URLs,
+  or persist it to localStorage. The server checks encoding/length, not
+  randomness: clients must use a CSPRNG (e.g. `crypto.getRandomValues`).
+- On a lost response or retryable 5xx, retry with the **same** secret and
+  predecessor cookie. The server atomically binds a digest of both to the
+  rotation. The original cookie alone, or a different secret, cannot recover.
+  Ordinary endpoints still reject the old cookie immediately.
+- Recovery only reissues the immediate successor; it never rotates again,
+  extends expiry, resets authentication age, or reopens a revoked session.
+  The window is **strictly less than 120 seconds** from the original successor
+  issuance timestamp and is never extended by retry. The predecessor must also still
+  pass its signed-token lifetime checks. Another rotation, logout,
+  revoke-all, reauthentication, or account deletion closes recovery.
+- After success, discard the secret. After the window or either token's
+  expiry, sign in again; do not fall back to accepting a stale cookie. If
+  the browser already installed the successor cookie before reporting a
+  network failure, a retry can perform another ordinary authenticated
+  rotation; it cannot recover a different session or bypass revocation.
+- Success stays `200 {"ok":true}` with the secure HttpOnly cookie; secrets
+  and digests never appear in response bodies or audit fields. All reads
+  and writes use the current server-side row. Only the digest and original
+  issuance timestamp are stored, with one bounded slot per session.
+
+Apply app migration `0024_session_refresh_retry.sql` **before** deploying
+this Worker. Unsupported/unmigrated storage fails closed with 5xx, never an
+unbound recovery. No current web caller automatically opts into this
+protocol; adoption requires retaining the per-operation secret as above.
+The security decision is deliberate: no blanket previous-token allowance,
+no weakened replay tests, and no recovery from possession of a stale
+cookie alone. Stealing both the predecessor cookie and its separately
+retained retry secret allows recovery inside the bounded window; protect
+both as credentials.
+
 ### Test-connection routing boundary
 
 - The current path is a direct dial from the api Worker:
