@@ -1,14 +1,14 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, createQueue, currentTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { addTrack, createQueue, currentTrack, nextTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
 }) as Record<string, string>;
 
-// Run the real page handlers against a mutable media double. Rendering is
-// covered by the browser bank; these pin the readout lifecycle it cannot.
+// Run the real page handlers against a mutable media double. Mounted-page
+// rendering and Next wiring are covered by library-relative-jump-builder.spec.ts.
 function jumpFixture() {
 	const source = sources['./+page.svelte'];
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
@@ -92,6 +92,15 @@ test('removing a non-current row keeps the readout for the unchanged source', ()
 	const before = page.read().jumpFeedback;
 	page.remove(1);
 	expect(page.read().jumpFeedback).toBe(before);
+});
+
+test('replacing the queue with Next clears the previous source readout', () => {
+	const { page } = jumpFixture();
+	page.jump('forward');
+	expect(page.read().jumpFeedback).toMatch(/^Forward 10 seconds/);
+	page.replace(nextTrack(page.read().queue));
+	expect(currentTrack(page.read().queue)?.id).toBe('ember');
+	expect(page.read().jumpFeedback).toBe('');
 });
 
 test('the auth boundary clears the jump readout', () => {
