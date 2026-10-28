@@ -766,6 +766,16 @@ async fn complete_registration_on(
     now: u64,
 ) -> Result<(), StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    // Reaping locks parents before cascading to proofs. Take the compatible
+    // enrollment lock first, so a reaper skips us even after our proofs expire.
+    transaction
+        .query_opt(
+            "SELECT id FROM users WHERE id = $1 FOR KEY SHARE",
+            &[&credential.user_id],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .ok_or(StoreError)?;
     let mut claims = vec![
         SingleUseClaim::Challenge {
             record: challenge,
@@ -784,6 +794,46 @@ async fn complete_registration_on(
     insert_credential_on(&transaction, credential).await?;
     // Any earlier error or deadline drops the transaction and rolls back
     // every claim before another request can observe a partial enrollment.
+    transaction.commit().await.map_err(|_| StoreError)
+}
+
+async fn reap_unverified_users_on(
+    client: &mut tokio_postgres::Client,
+    now: u64,
+    ttl_secs: u64,
+    protected_user_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+    let now = i64_of(now)?;
+    let transaction = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(|_| StoreError)?;
+    let candidates = transaction
+        .query(
+            &handlers::lock_unverified_users_sql(),
+            &[&cutoff, &protected_user_id, &now],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let ids = candidates
+        .iter()
+        .map(|row| row.try_get::<_, String>("id").map_err(|_| StoreError))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !ids.is_empty() {
+        // Enrollment may commit between the selection snapshot and its parent
+        // lock. A second READ COMMITTED statement sees that credential before
+        // deleting; holding the parent locks prevents a new enrollment racing it.
+        transaction
+            .execute(
+                &handlers::reap_unverified_users_sql(),
+                &[&cutoff, &protected_user_id, &now, &ids],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
     transaction.commit().await.map_err(|_| StoreError)
 }
 
@@ -1883,21 +1933,8 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         Self::bounded(
             async {
-                // Single source of truth lives in `handlers` (statement-shape test
-                // pins the purpose literal and the vault/session/magic exemptions):
-                // magic-only accounts and vault owners are never reaped, so a vault
-                // saved under a magic session cannot cascade-delete 24h later.
-                let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
-                let now = i64_of(now)?;
-                let client = self.connect().await?;
-                client
-                    .execute(
-                        &handlers::reap_unverified_users_sql(),
-                        &[&cutoff, &protected_user_id, &now],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                let mut client = self.connect().await?;
+                reap_unverified_users_on(&mut client, now, ttl_secs, protected_user_id).await
             },
             TOTAL_TIMEOUT_MS,
         )

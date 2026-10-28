@@ -121,9 +121,9 @@ const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
 /// Fixed scope key for the fleet-wide auth-start and mail budgets.
 const GLOBAL_SCOPE_KEY: &str = "global";
 
-/// Canonical fleet-wide reap statement shape: the single source of truth
-/// for `PgStore::reap_unverified_users` (called from `worker_entry`) and
-/// the statement-shape test below. The purpose literal must stay
+/// Canonical fleet-wide reap eligibility: shared by the candidate lock and
+/// fresh-snapshot delete in `PgStore::reap_unverified_users` (called from
+/// `worker_entry`) and the statement-shape test below. The purpose literal must stay
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
 /// unexpired register challenges, vaults, sessions, unexpired magic links)
@@ -132,9 +132,9 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// are owned by the deletion executor, and their `delete_operations`
 /// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
 /// (`FakeStore` mirrors this through `deleting_users`).
-pub fn reap_unverified_users_sql() -> String {
+fn unverified_user_filter() -> String {
     format!(
-        "DELETE FROM users WHERE created_at <= $1 \
+        "created_at <= $1 \
          AND deleting_at IS NULL \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
@@ -150,6 +150,22 @@ pub fn reap_unverified_users_sql() -> String {
          AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
                          WHERE magic_link_tokens.user_id = users.id \
                            AND magic_link_tokens.expires_at > $3)"
+    )
+}
+
+/// Lock eligible parents without waiting on enrollment's parent-row lock.
+pub fn lock_unverified_users_sql() -> String {
+    format!(
+        "SELECT users.id FROM users WHERE {} FOR UPDATE SKIP LOCKED",
+        unverified_user_filter()
+    )
+}
+
+/// Recheck eligibility on a fresh snapshot, restricted to the locked parents.
+pub fn reap_unverified_users_sql() -> String {
+    format!(
+        "DELETE FROM users WHERE {} AND users.id = ANY($4)",
+        unverified_user_filter()
     )
 }
 

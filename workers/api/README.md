@@ -321,9 +321,11 @@ This crate remains standalone (excluded from the root workspace), so use
   before the slot loop, so denial costs O(1) statements, not one upsert per
   slot. `register_start` also reaps never-completed signups older than
   24 h only when they have no credential, vault, session, unexpired magic
-  link, or unexpired registration challenge. In-flight registration
-  challenges (including consumed challenges awaiting finish) protect the
-  signup until expiry; expired challenges are pruned. Issuing a magic link
+  link, or unexpired registration challenge. Enrollment also holds a parent
+  user lock before claiming proofs; the reaper skips locked parents even
+  after those proofs expire and rechecks eligibility on a fresh snapshot
+  before deletion. Later cleanup retries skipped users and expired
+  challenges. Issuing a magic link
    prunes that user's expired magic rows, so live accounts stay bounded. Passkey finishes
   reserve 100 lookups per client prefix
   BEFORE any DB read plus 10 attempts per challenge before verification
