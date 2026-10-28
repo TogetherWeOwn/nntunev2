@@ -262,16 +262,16 @@ for (const grouped of [false, true]) {
 	});
 }
 
-async function expectStoredQueueLabels(page: Page) {
+async function expectQueueLabels(page: Page, labels: string) {
 	await expectQueue(page, ['same'], 'same');
-	await expect(page.getByTestId('now-playing')).toHaveText('Now playing: Stored Title — Stored Artist');
+	await expect(page.getByTestId('now-playing')).toHaveText(`Now playing: ${labels}`);
 	await expect.poll(() => page.getByTestId('queue-item').evaluate((node) =>
 		Array.from(node.childNodes).filter((child) => child.nodeType === Node.TEXT_NODE)
 			.map((child) => child.textContent).join('').replace(/\s+/g, ' ').trim()
-	)).toBe('Stored Title — Stored Artist');
+	)).toBe(labels);
 }
 
-test('same-ID refresh hydrates a bulk slot without replacing its stored title or artist', async ({ page }) => {
+test('same-ID refresh updates bulk-slot labels and only explicit play hydrates its stream', async ({ page }) => {
 	const reply: { items: unknown } = {
 		items: [{ id: 'same', title: 'Stored Title', artist: 'Stored Artist' }]
 	};
@@ -281,17 +281,19 @@ test('same-ID refresh hydrates a bulk slot without replacing its stored title or
 	await stubResolvePlay(page);
 	await openLibrary(page, 1);
 	await bulkAction(page).click();
-	await expectStoredQueueLabels(page);
+	await expectQueueLabels(page, 'Stored Title — Stored Artist');
 	await expect(page.locator('audio')).toHaveCount(0);
 	reply.items = [{ id: 'same', title: 'Refreshed Title', artist: 'Refreshed Artist', streamUrl: '/__playall-build__/new.mp3' }];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expect(row(page, 'same')).toContainText('Refreshed Title — Refreshed Artist');
-	await expectStoredQueueLabels(page);
+	await expectQueueLabels(page, 'Refreshed Title — Refreshed Artist');
+	await expect(page.locator('audio')).toHaveCount(0);
+	expect(await playCalls(page)).toBe(0);
 	await action(page).click();
-	await expectStoredQueueLabels(page);
+	await expectQueueLabels(page, 'Refreshed Title — Refreshed Artist');
 	await expect.poll(() => playCalls(page)).toBe(1);
 	await expect(page.locator('audio[data-testid="audio-player"]')).toHaveAttribute('src', '/__playall-build__/new.mp3');
-	await expect(announcement(page)).toHaveText('Playing Stored Title. Added 0, 1 already queued.');
+	await expect(announcement(page)).toHaveText('Playing Refreshed Title. Added 0, 1 already queued.');
 });
 
 for (const refreshedStream of [undefined, '/__playall-build__/new.mp3']) {
@@ -305,19 +307,21 @@ for (const refreshedStream of [undefined, '/__playall-build__/new.mp3']) {
 		await stubResolvePlay(page);
 		await openLibrary(page, 1);
 		await rowAction(page, 'same').click();
-		await expectStoredQueueLabels(page);
+		await expectQueueLabels(page, 'Stored Title — Stored Artist');
 		const player = page.locator('audio[data-testid="audio-player"]');
 		await expect(player).toHaveAttribute('src', '/__playall-build__/old.mp3');
 		expect(await playCalls(page)).toBe(0);
 		reply.items = [{ id: 'same', title: 'Refreshed Title', artist: 'Refreshed Artist', streamUrl: refreshedStream }];
 		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 		await expect(row(page, 'same')).toContainText('Refreshed Title — Refreshed Artist');
-		await expectStoredQueueLabels(page);
+		await expectQueueLabels(page, 'Refreshed Title — Refreshed Artist');
+		await expect(player).toHaveAttribute('src', '/__playall-build__/old.mp3');
+		expect(await playCalls(page)).toBe(0);
 		await action(page).click();
-		await expectStoredQueueLabels(page);
+		await expectQueueLabels(page, 'Refreshed Title — Refreshed Artist');
 		await expect.poll(() => playCalls(page)).toBe(1);
 		await expect(player).toHaveAttribute('src', '/__playall-build__/old.mp3');
-		await expect(announcement(page)).toHaveText('Playing Stored Title. Added 0, 1 already queued.');
+		await expect(announcement(page)).toHaveText('Playing Refreshed Title. Added 0, 1 already queued.');
 	});
 }
 
