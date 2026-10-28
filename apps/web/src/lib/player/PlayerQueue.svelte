@@ -303,6 +303,7 @@
 	async function acceptConfirm(): Promise<void> {
 		const kind = pending;
 		if (kind === null || !pendingValid) return;
+		const trigger = pendingTrigger;
 		pending = null;
 		pendingTrigger = null;
 		cancelNote = '';
@@ -311,9 +312,15 @@
 		await tick();
 		// The Confirm button unmounted with focus on it (or never held it):
 		// recover onto the same stable targets as the one-step flows, unless
-		// focus has already moved on to a live element.
+		// focus has already moved on to a live element. A trigger that kept
+		// focus while the action disabled it (an assistive-technology virtual
+		// click activates Confirm without moving DOM focus) counts as
+		// stranded under the same rule as the one-step focusStranded check —
+		// the browser drops it to the body on the next rendering steps.
 		const active = document.activeElement;
-		if (active !== null && active !== document.body) return;
+		const strandedOnTrigger =
+			trigger instanceof HTMLButtonElement && trigger.disabled && active === trigger;
+		if (!strandedOnTrigger && active !== null && active !== document.body) return;
 		if (kind === 'clear') focusEmptyTarget();
 		else currentRowElement()?.focus({ preventScroll: true });
 	}
