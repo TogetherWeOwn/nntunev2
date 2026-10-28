@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import lockfile from '../pnpm-lock.yaml?raw';
-import deployWorkflow from '../../../.github/workflows/deploy.yml?raw';
-import productionWorkflow from '../../../.github/workflows/deploy-production.yml?raw';
+
+const workflows = import.meta.glob<string>('../../../.github/workflows/*.{yml,yaml}', {
+	query: '?raw',
+	import: 'default',
+	eager: true
+});
+const wranglerWorkflows = Object.entries(workflows)
+	.map(([path, yaml]) => [path.replace(/^.*\//, ''), yaml.replace(/^\s*#.*$/gm, '')] as const)
+	.filter(([, yaml]) => /\bWRANGLER_VERSION\b/.test(yaml));
 
 // Read pnpm's block mappings at their exact scope, not a safe version elsewhere
 // in the file. Missing or duplicate edges fail closed without a YAML dependency.
@@ -69,15 +76,29 @@ describe('Cloudflare toolchain security (offline)', () => {
 		).toBe(true);
 	});
 
-	it.each([
-		['deploy.yml', deployWorkflow],
-		['deploy-production.yml', productionWorkflow]
-	])('%s deploys with the patched Wrangler selected by the web adapter', (workflow, yaml) => {
-		const env = entry(yaml, 'env', 0).body;
-		const pin = entry(env, 'WRANGLER_VERSION', 2).value;
-		expect(pin, `${workflow} must pin patched Wrangler`).toBe('4.153.0');
-		expect(pin, `${workflow} must match the resolved web toolchain`).toBe(
-			selectedToolchain().wrangler
-		);
+	it('discovers workflow YAML and Wrangler selections instead of a fixed deployment list', () => {
+		expect(Object.keys(workflows).length, 'workflow YAML discovery must not be empty').toBeGreaterThan(0);
+		expect(wranglerWorkflows.length, 'Wrangler workflow discovery must not be empty').toBeGreaterThan(0);
 	});
+
+	it.each(wranglerWorkflows)(
+		'%s deploys with the patched Wrangler selected by the web adapter',
+		(workflow, yaml) => {
+			// Keep the supported selection shape explicit: a single workflow-level
+			// literal. Reject narrower/flow overrides rather than ignore their pins.
+			expect(
+				yaml.match(/\bWRANGLER_VERSION['"]?\s*:/g) ?? [],
+				`${workflow} must define WRANGLER_VERSION only once, at workflow scope`
+			).toHaveLength(1);
+			expect(yaml, `${workflow} must not use an explicit YAML selection key`).not.toMatch(
+				/^\s*\?\s*['"]?WRANGLER_VERSION\b/m
+			);
+			const env = entry(yaml, 'env', 0).body;
+			const pin = entry(env, 'WRANGLER_VERSION', 2).value;
+			expect(pin, `${workflow} must pin patched Wrangler`).toBe('4.153.0');
+			expect(pin, `${workflow} must match the resolved web toolchain`).toBe(
+				selectedToolchain().wrangler
+			);
+		}
+	);
 });
