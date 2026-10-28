@@ -208,6 +208,49 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
+    async fn complete_registration(
+        &self,
+        challenge: &auth::PasskeyChallenge,
+        magic: &auth::MagicLinkRecord,
+        invite: Option<&auth::InviteRecord>,
+        credential: &auth::PasskeyCredential,
+        now: u64,
+    ) -> Result<(), handlers::StoreError> {
+        // Mirror the production transaction, including rollback when a
+        // later conditional claim loses or credential insertion fails.
+        let challenges_before = self.challenges.borrow().clone();
+        let magic_before = self.magic.borrow().clone();
+        let invites_before = self.invites.borrow().clone();
+        let result = async {
+            let mut claims = vec![
+                auth::SingleUseClaim::Challenge {
+                    record: challenge,
+                    now,
+                },
+                auth::SingleUseClaim::MagicLink { record: magic, now },
+            ];
+            if let Some(record) = invite {
+                claims.push(auth::SingleUseClaim::Invite { record });
+            }
+            for claim in claims {
+                if auth::SingleUseStore::claim(self, claim)
+                    .await
+                    .map_err(|_| handlers::StoreError)?
+                    != 1
+                {
+                    return Err(handlers::StoreError);
+                }
+            }
+            self.insert_credential(credential).await
+        }
+        .await;
+        if result.is_err() {
+            *self.challenges.borrow_mut() = challenges_before;
+            *self.magic.borrow_mut() = magic_before;
+            *self.invites.borrow_mut() = invites_before;
+        }
+        result
+    }
     async fn credential_by_id(
         &self,
         cred_id_b64url: &str,
