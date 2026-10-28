@@ -7,6 +7,10 @@
 
 #[path = "support/pg_wire_peer.rs"]
 mod pg_wire_peer;
+#[path = "support/uuid_media_replay_acceptance.rs"]
+mod uuid_media_replay_acceptance;
+#[path = "support/writer_bind_type_acceptance.rs"]
+mod writer_bind_type_acceptance;
 
 use std::cell::{Cell as Counter, RefCell};
 use std::collections::BTreeMap;

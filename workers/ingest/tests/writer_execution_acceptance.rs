@@ -45,7 +45,7 @@ const OTHER_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 // source-shape pins. Keep UUID cast/projection changes coordinated with the
 // PostgreSQL fixtures; do not mistake these strings for driver acceptance.
 const ADMIT_WRITE: &str = "INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status) SELECT $1, $2, $3, $4, 'queued' FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (id) DO NOTHING";
-const ADMIT_SELECT: &str = "SELECT user_id, idempotency_key FROM ingest_jobs WHERE id = $1";
+const ADMIT_SELECT: &str = "SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id WHERE ingest_jobs.id = $1 AND users.deleting_at IS NULL FOR SHARE OF users";
 const TERMINAL_WRITE: &str = "UPDATE ingest_jobs SET status = $3 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE ingest_jobs.id = $1 AND ingest_jobs.user_id = $2 AND ingest_jobs.user_id = writer_fence.id AND ingest_jobs.status IN ('queued', 'running')";
 const TERMINAL_SELECT: &str = "SELECT status FROM ingest_jobs WHERE id = $1 AND user_id = $2";
 const TRACK_WRITE: &str = "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (release_id, medium_no, track_no) DO NOTHING";

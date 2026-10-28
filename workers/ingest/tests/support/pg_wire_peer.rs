@@ -18,6 +18,9 @@ pub const INT4: u32 = 23;
 pub const UUID: u32 = 2950;
 pub const BOOL: u32 = 16;
 pub const BYTEA: u32 = 17;
+pub const VARCHAR: u32 = 1043;
+pub const BPCHAR: u32 = 1042;
+pub const NAME: u32 = 19;
 
 // Only the test harness sends this simple query. Its completion proves all
 // earlier backend responses have reached the real client's response channels.
@@ -132,6 +135,7 @@ enum Reply {
 pub struct Step {
     sql: &'static str,
     params: Vec<Param>,
+    inferred: Option<Vec<u32>>,
     columns: Vec<Column>,
     reply: Reply,
     gate: Option<Gate>,
@@ -142,6 +146,7 @@ impl Step {
         Self {
             sql,
             params,
+            inferred: None,
             columns: vec![],
             reply: Reply::Success {
                 tag: format!("INSERT 0 {affected}"),
@@ -160,6 +165,7 @@ impl Step {
         Self {
             sql,
             params,
+            inferred: None,
             columns,
             reply: Reply::Success {
                 tag: format!("SELECT {}", rows.len()),
@@ -167,6 +173,16 @@ impl Step {
             },
             gate: None,
         }
+    }
+
+    pub fn with_param_oids(mut self, oids: Vec<u32>) -> Self {
+        assert_eq!(
+            oids.len(),
+            self.params.len(),
+            "inferred OID arity must match expected binds"
+        );
+        self.inferred = Some(oids);
+        self
     }
 
     pub fn error(mut self, stage: Stage, sqlstate: &'static str) -> Self {
@@ -275,6 +291,31 @@ impl Session {
         assert_eq!(trace.bound, 0, "expired prepare must not proceed to Bind");
         assert_eq!(trace.completed, 0);
     }
+
+    pub async fn finish_rejected_params(mut self) -> Trace {
+        let trace = self.stop().await;
+        assert_eq!(
+            self.expected, 1,
+            "rejected-params fixture must declare exactly one wire operation"
+        );
+        assert_eq!(
+            trace.prepared, 1,
+            "rejected params must still prepare to learn inferred OIDs"
+        );
+        assert_eq!(
+            trace.bound, 0,
+            "type-mismatched params must not reach wire Bind"
+        );
+        assert_eq!(
+            trace.completed, 0,
+            "type-mismatched params must not reach wire Execute"
+        );
+        trace
+    }
+
+    pub async fn finish_partial(mut self) -> Trace {
+        self.stop().await
+    }
 }
 
 impl Drop for Session {
@@ -333,7 +374,10 @@ async fn serve(
                 assert_eq!(sql, step.sql, "SQL changed or writer operations reordered");
                 let count = u16_read(&mut input);
                 let declared: Vec<_> = (0..count).map(|_| u32_read(&mut input)).collect();
-                let params: Vec<_> = step.params.iter().map(Param::oid).collect();
+                let params: Vec<_> = step
+                    .inferred
+                    .clone()
+                    .unwrap_or_else(|| step.params.iter().map(Param::oid).collect());
                 assert!(declared.is_empty() || declared.len() == params.len());
                 for (declared, inferred) in declared.iter().zip(&params) {
                     assert!(
@@ -397,7 +441,14 @@ async fn serve(
                 let count = usize::from(u16_read(&mut input));
                 assert_eq!(count, step.params.len(), "bind count changed");
                 for (index, param) in step.params.iter().enumerate() {
-                    assert_eq!(statement.params[index], param.oid());
+                    if let Some(inferred) = &step.inferred {
+                        assert_eq!(
+                            statement.params[index], inferred[index],
+                            "inferred OID changed before Bind"
+                        );
+                    } else {
+                        assert_eq!(statement.params[index], param.oid());
+                    }
                     let len = i32_read(&mut input);
                     assert!(len >= 0, "writer parameter unexpectedly NULL");
                     let mut actual = vec![0; usize::try_from(len).expect("bind length")];
@@ -407,7 +458,7 @@ async fn serve(
                         param.bytes(format_at(&formats, index, count)),
                         "wrong bind value/order at ${} (OID {})",
                         index + 1,
-                        param.oid()
+                        statement.params[index]
                     );
                 }
                 let count = u16_read(&mut input);

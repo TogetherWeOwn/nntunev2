@@ -1,6 +1,9 @@
 //! Independent acceptance of the real admission sequencer, with only its
 //! durable ledger, queue and meter boundaries replaced by recording peers.
 
+#[path = "admission_replay_fence_acceptance.rs"]
+mod admission_replay_fence_acceptance;
+
 use super::{
     drive_metered_admission_with_writer, AdmissionDecision, AdmissionLedger, AdmissionMark,
     MeterOutcome, MeterWriteError, QueueMsg,
