@@ -37,4 +37,4 @@ crc32fast = "1"
 hex = "0.4"
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false, features = ["native-tls"] }
 nntune-test-nntp = { version = "0.1.0", path = "../../crates/nntune-test-nntp" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
