@@ -1356,15 +1356,42 @@ async fn resolve_library_write(
     ))
 }
 
-/// The side effects [`run_match_write_with`] sequences, behind a trait so
-/// the meter-before-advance ordering is regression-tested with a fake
-/// instead of resting on prose (the edge impl needs an `Env`). `meter`
-/// failures are unit errors: the sequencer maps them to the failing
-/// stage's error code, so a fake cannot accidentally bless the wrong code.
-trait MatchWriteRuntime {
+/// Detailed match input for normalized tracks. File ordinals come from the
+/// original NZB; recording metadata must not be reduced to an ID-only list.
+#[derive(Debug, Clone)]
+pub struct DetailedTrackMatch {
+    pub release_mbid: Option<String>,
+    pub files: Vec<nntune_core::nzb::File>,
+    pub recordings: Vec<crate::matching::MbRecording>,
+}
+
+/// The real matching/writing sequencer's effects. The new normalized-track
+/// hooks are fail-closed test boundaries until their independent acceptance
+/// bank lands; the legacy path below does not call them yet. `meter` failures
+/// are unit errors so the sequencer, not the adapter, owns their stage code.
+#[allow(async_fn_in_trait)]
+pub trait MatchWriteRuntime {
     async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError>;
     async fn meter(&self, msg: &QueueMsg, stage: &'static str) -> Result<(), ()>;
     async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError>;
+
+    async fn resolve_tracks(&self, _msg: &QueueMsg) -> Result<DetailedTrackMatch, JobError> {
+        Err(JobError::transient(
+            ERR_MATCH_FAILED,
+            "track match unavailable",
+        ))
+    }
+
+    async fn materialize_tracks(
+        &self,
+        _user_id: &str,
+        _rows: &[crate::track_writers::TrackRow<'_>],
+    ) -> Result<std::collections::BTreeMap<usize, String>, JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "track writer unavailable",
+        ))
+    }
 }
 
 /// Edge [`MatchWriteRuntime`]: MB resolution, Analytics Engine meter, and
@@ -1486,7 +1513,7 @@ async fn execute_write_with<R: MatchWriteRuntime>(
 /// next. A delivery that enters in `Writing` (checkpoint persisted
 /// after the transcode transition) re-resolves and writes without
 /// re-emitting `match`.
-async fn run_match_write_with<R: MatchWriteRuntime>(
+pub async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
@@ -1524,12 +1551,12 @@ async fn run_match_write(
     .await
 }
 
-/// `Transcoding` edge dependencies, split for tests: the front call,
-/// scratch artifact fetch, audio-bucket put, blob-row publication,
-/// meter, config and clock. Every method is neutral (no job codes);
-/// the step owns all error mapping so it is unit-tested through the
-/// fake below.
-trait TranscodeRuntime {
+/// `Transcoding` edge dependencies, exposed for native tests of the real
+/// sequencer. Artifact methods use neutral errors; owned publication methods
+/// retain the writer's permanent/transient verdict. The new context/media
+/// hooks fail closed and remain uncalled until their integration is tested.
+#[allow(async_fn_in_trait)]
+pub trait TranscodeRuntime {
     async fn call_front(
         &self,
         req: &crate::transcode::TranscodeRequest,
@@ -1544,8 +1571,33 @@ trait TranscodeRuntime {
         publication: &crate::transcode::TranscodePublication,
     ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError>;
     async fn meter_transcode(&self, msg: &QueueMsg) -> Result<(), ()>;
+    // Preserve the existing neutral config-error contract; the sequencer maps
+    // it to the stage's JobError, just like the async artifact methods above.
+    #[allow(clippy::result_unit_err)]
     fn audio_bucket(&self) -> Result<String, ()>;
     fn now_unix_secs(&self) -> i64;
+
+    async fn validate_context(
+        &self,
+        _msg: &QueueMsg,
+        _cp: &JobCheckpoint,
+        _input: &crate::transcode::TranscodeInput,
+    ) -> Result<crate::writer_execution::PublicationContext, JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "publication context unavailable",
+        ))
+    }
+
+    async fn publish_media(
+        &self,
+        _publication: &crate::writer_execution::MediaPublication,
+    ) -> Result<(), JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "media publication unavailable",
+        ))
+    }
 }
 
 /// Edge [`TranscodeRuntime`]: transcode service binding, scratch and
@@ -1697,7 +1749,7 @@ impl TranscodeRuntime for EdgeTranscode<'_> {
 /// the R2 put overwrites identical bytes, the blob upsert converges).
 /// Per-user rows stay unwired (see the transcode module docs): this
 /// step publishes bytes plus `cache_objects` only.
-async fn run_transcode_step_with<R: TranscodeRuntime>(
+pub async fn run_transcode_step_with<R: TranscodeRuntime>(
     runtime: &R,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,

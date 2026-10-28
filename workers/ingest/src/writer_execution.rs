@@ -37,6 +37,14 @@ pub trait WriterDb {
     ) -> Result<Vec<Vec<Value>>, DbFailure>;
 }
 
+/// Database-backed identity selected before transcode/artifact side effects.
+/// The provider comes from the current checkpoint, never the stale message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationContext {
+    pub track_id: String,
+    pub provider_id: String,
+}
+
 /// Per-user publication identity, joined to a verified artifact through its
 /// original file ordinal and the selected database track ID, never a cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +200,21 @@ pub async fn materialize_tracks(
         ids.insert(row.file_ordinal, id);
     }
     Ok(ids)
+}
+
+/// Fail-closed native test boundary for the pre-artifact owner/provider/track
+/// validation. It is not implemented or called by the edge sequencer yet;
+/// independent acceptance must cover the real writer before that wiring lands.
+pub async fn publication_context(
+    _db: &impl WriterDb,
+    _msg: &crate::queue::QueueMsg,
+    _cp: &crate::jobs::JobCheckpoint,
+    _input: &crate::transcode::TranscodeInput,
+) -> Result<PublicationContext, JobError> {
+    Err(JobError::transient(
+        ERR_WRITE_FAILED,
+        "publication context unavailable",
+    ))
 }
 
 /// Execute media then grant only after verified bytes/R2/blob success. Each
