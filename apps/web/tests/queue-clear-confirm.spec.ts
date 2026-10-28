@@ -713,3 +713,148 @@ test('QC-B12 virtual-click trim recovers focus when the trigger stays focused an
 	await expect(currentRow(page)).toBeFocused();
 	await expectNoPlayback(page, harness);
 });
+
+// Filtered confirmation must not strand focus, clear the query implicitly, select
+// a displayed previous row, or override a newer live focus choice.
+const FILTERED_TRIMS = [
+	{
+		id: 13,
+		description: 'zero displayed survivors',
+		query: '  aLpHa  ',
+		visibleBefore: ['row-alpha'],
+		visibleAfter: [],
+		countAfter: '0 of 2 tracks'
+	},
+	{
+		id: 14,
+		description: 'a displayed previous row but hidden current',
+		query: '  mIkE  ',
+		visibleBefore: ['row-mike'],
+		visibleAfter: ['row-mike'],
+		countAfter: '1 of 2 tracks'
+	}
+];
+
+async function seedFilteredTrim(page: Page, query: string): Promise<Harness> {
+	const harness = await seedQueue(page);
+	await page.getByTestId('player-next').click();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-zulu');
+	await star(page, 'row-mike').click();
+	await star(page, 'row-alpha').click();
+	await expect.poll(() => shelfIds(page)).toEqual(['row-mike', 'row-alpha']);
+	await page.getByLabel('Filter queue', { exact: true }).fill(query);
+	await expect(currentRow(page)).toHaveCount(0);
+	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
+	return harness;
+}
+
+async function browserStorage(page: Page) {
+	return page.evaluate(() => ({
+		persistent: { ...localStorage },
+		session: { ...sessionStorage }
+	}));
+}
+
+for (const example of FILTERED_TRIMS) {
+	for (const activation of ['confirm', 'virtual'] as const) {
+		const id = example.id + (activation === 'virtual' ? 2 : 0);
+		test(`QC-B${id} ${activation} trim with ${example.description} focuses explicit reveal without changing the filter`, async ({
+			page
+		}) => {
+			const harness = await seedFilteredTrim(page, example.query);
+			const filter = page.getByLabel('Filter queue', { exact: true });
+			const reveal = page.getByTestId('queue-reveal-current');
+			const favoritesBefore = await shelfIds(page);
+			const storageBefore = await favoritesStorage(page);
+			expect(await queueOrder(page)).toEqual(example.visibleBefore);
+			await expect(reveal).toHaveAccessibleName('Show current track');
+			await expect(reveal).toBeEnabled();
+			await trimTrigger(page).click();
+			await expect(confirmButton(page)).toBeVisible();
+			await expect(cancelButton(page)).toBeVisible();
+			expect(await queueOrder(page)).toEqual(example.visibleBefore);
+
+			if (activation === 'virtual') {
+				await trimTrigger(page).focus();
+				await expect(trimTrigger(page)).toBeFocused();
+				// Virtual activation leaves DOM focus on the trigger that disables.
+				await confirmButton(page).evaluate((element) => (element as HTMLButtonElement).click());
+			} else {
+				await confirmButton(page).click();
+			}
+
+			await expect(confirmButton(page)).toHaveCount(0);
+			await expect(cancelButton(page)).toHaveCount(0);
+			await expect(trimTrigger(page)).toBeDisabled();
+			await expect(filter).toHaveValue(example.query);
+			expect(await queueOrder(page)).toEqual(example.visibleAfter);
+			await expect(currentRow(page)).toHaveCount(0);
+			await expect(page.getByTestId('queue-filter-count')).toHaveText(example.countAfter);
+			await expect(page.getByTestId('queue-position')).toContainText('Track 2 of 2, 0 upcoming');
+			await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
+			await expect(emptyTarget(page)).toHaveCount(0);
+			if (example.visibleAfter.length === 0) {
+				await expect(page.getByTestId('queue-filter-empty')).toHaveText('No matches in this queue');
+			} else {
+				await expect(page.getByTestId('queue-filter-empty')).toHaveCount(0);
+			}
+			await expect(announcement(page)).toContainText(/removed/i);
+			await expect(announcement(page)).toContainText(/\b1\b/);
+			await expect(announcement(page)).not.toContainText(/played/i);
+			expect(await shelfIds(page)).toEqual(favoritesBefore);
+			expect(await favoritesStorage(page)).toEqual(storageBefore);
+			await expectNoPlayback(page, harness);
+			await expect(reveal).toBeVisible();
+			await expect(reveal).toBeEnabled();
+			// Soft only so RED still exercises the explicit reveal and its invariants.
+			await expect.soft(reveal, 'hidden current requires a live Show current track focus target').toBeFocused();
+
+			// Only an explicit reveal may clear the hiding filter. It must expose
+			// both surviving tracks without selecting the displayed previous one.
+			const storageAfterTrim = await browserStorage(page);
+			await reveal.click();
+			await expect(filter).toHaveValue('');
+			expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
+			await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-zulu');
+			await expect(currentRow(page)).toBeFocused();
+			await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
+			expect(await shelfIds(page)).toEqual(favoritesBefore);
+			expect(await favoritesStorage(page)).toEqual(storageBefore);
+			expect(await browserStorage(page)).toEqual(storageAfterTrim);
+			await expectNoPlayback(page, harness);
+		});
+	}
+
+	test(`QC-B${example.id + 4} newer live focus wins over filtered trim recovery with ${example.description}`, async ({
+		page
+	}) => {
+		const harness = await seedFilteredTrim(page, example.query);
+		await trimTrigger(page).click();
+		await expect(confirmButton(page)).toBeVisible();
+		await trimTrigger(page).focus();
+		await expect(trimTrigger(page)).toBeFocused();
+
+		// A later bubbling listener places focus on a real, surviving control
+		// after dispatch but before asynchronous recovery. Pre-dispatch focus
+		// would not exercise the newer-live-focus-wins guard.
+		const dispatch = await confirmButton(page).evaluate((element, { trigger, filter }) => {
+			const triggerFocusedAtDispatch = document.activeElement === trigger;
+			document.addEventListener('click', () => (filter as HTMLInputElement).focus(), { once: true });
+			(element as HTMLButtonElement).click();
+			return { triggerFocusedAtDispatch, newerFocusPlaced: document.activeElement === filter };
+		}, {
+			trigger: await trimTrigger(page).elementHandle(),
+			filter: await page.getByLabel('Filter queue', { exact: true }).elementHandle()
+		});
+		expect(dispatch).toEqual({ triggerFocusedAtDispatch: true, newerFocusPlaced: true });
+		await expect(confirmButton(page)).toHaveCount(0);
+		await expect(trimTrigger(page)).toBeDisabled();
+		await expect(page.getByTestId('queue-position')).toContainText('Track 2 of 2, 0 upcoming');
+		await settle(page);
+		await expect(page.getByLabel('Filter queue', { exact: true })).toBeFocused();
+		await expect(page.getByLabel('Filter queue', { exact: true })).toHaveValue(example.query);
+		expect(await queueOrder(page)).toEqual(example.visibleAfter);
+		await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
+		await expectNoPlayback(page, harness);
+	});
+}
