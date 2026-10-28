@@ -29,6 +29,7 @@ function jumpFixture() {
 	const media = { position: 20, duration: 120 };
 	const element = {
 		isConnected: true,
+		paused: true,
 		get duration() { return media.duration; },
 		get currentTime() { return media.position; },
 		set currentTime(value: number) { media.position = value; },
@@ -40,6 +41,7 @@ function jumpFixture() {
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let queue = addTrack(createQueue([coral]), ember), audioEl = element;
+		let endGeneration = 0, playingElement = null;
 		let shareGeneration = 0, shareStatus = '', shareFallbackUrl = null, pendingShareSeek = null;
 		let queueAnnouncement = '', queueAnnouncementVersion = 0, playEpoch = 0;
 		let queueExportAuthGeneration = 0, queueShareGeneration = 0, handledShareSearch = null;
