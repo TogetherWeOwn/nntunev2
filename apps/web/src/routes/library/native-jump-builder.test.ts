@@ -26,13 +26,18 @@ function jumpFixture() {
 	}).outputText;
 	const coral = { id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' };
 	const ember = { id: 'ember', title: 'Ember Road', streamUrl: '/test-audio/ember' };
-	const media = { position: 20, duration: 120 };
+	const media = {
+		position: 20, duration: 120, isConnected: true, paused: true,
+		pauseCalls: 0, playCalls: 0, writes: [] as number[]
+	};
 	const element = {
-		isConnected: true,
-		paused: true,
+		get isConnected() { return media.isConnected; },
+		get paused() { return media.paused; },
+		pause() { media.pauseCalls += 1; media.paused = true; },
+		play() { media.playCalls += 1; media.paused = false; return Promise.resolve(); },
 		get duration() { return media.duration; },
 		get currentTime() { return media.position; },
-		set currentTime(value: number) { media.position = value; },
+		set currentTime(value: number) { media.writes.push(value); media.position = value; },
 		getAttribute: () => coral.streamUrl
 	};
 	const bindings = {
@@ -71,6 +76,36 @@ function jumpFixture() {
 	};
 	return { page, media };
 }
+
+test.each([
+	{ direction: 'back' as const, target: 10, paused: false },
+	{ direction: 'forward' as const, target: 30, paused: false },
+	{ direction: 'back' as const, target: 10, paused: true },
+	{ direction: 'forward' as const, target: 30, paused: true }
+])('$direction preserves paused=$paused without pausing or restarting media', ({ direction, target, paused }) => {
+	const { page, media } = jumpFixture();
+	media.paused = paused;
+	const queue = page.read().queue;
+	page.jump(direction);
+	expect(media.position).toBe(target);
+	expect(media.writes).toEqual([target]);
+	expect(media.pauseCalls).toBe(0);
+	expect(media.playCalls).toBe(0);
+	expect(media.paused).toBe(paused);
+	expect(page.read().queue).toBe(queue);
+	expect(page.read().jumpFeedback).toMatch(/10 seconds, now at/);
+});
+
+test.each(['back', 'forward'] as const)('%s refuses a detached matching-source element without writing', (direction) => {
+	const { page, media } = jumpFixture();
+	media.isConnected = false;
+	page.jump(direction);
+	expect(media.position).toBe(20);
+	expect(media.writes).toEqual([]);
+	expect(media.pauseCalls).toBe(0);
+	expect(media.playCalls).toBe(0);
+	expect(page.read().jumpFeedback).toBe('Cannot jump yet: this track has not reported its length.');
+});
 
 test('a jump readout is set, then cleared by Select of another row', () => {
 	const { page } = jumpFixture();

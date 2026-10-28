@@ -33,6 +33,15 @@ describe('jumpMedia', () => {
 		});
 	});
 
+	it.each([
+		{ position: 0, direction: 'forward' as const, target: 10 },
+		{ position: 120, direction: 'back' as const, target: 110 }
+	])('moves $direction away from the boundary at $position', ({ position, direction, target }) => {
+		const m = media(position, 120);
+		expect(jumpMedia(m, direction)).toEqual({ kind: 'jumped', target, clamped: false });
+		expect(m.currentTime).toBe(target);
+	});
+
 	it('reports bounds as no-ops without writing', () => {
 		const start = media(0, 120);
 		expect(jumpMedia(start, 'back')).toEqual({ kind: 'boundary', edge: 'start' });
