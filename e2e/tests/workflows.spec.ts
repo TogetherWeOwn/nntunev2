@@ -1483,6 +1483,165 @@ test.describe('locked-dependency ci builds (static pin)', () => {
   });
 });
 
+test.describe('generated staging API Tail config (offline)', () => {
+  function parseToml(source: string): Record<string, unknown> {
+    const result = spawnSync('python3', ['-c',
+      'import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())))',
+    ], {
+      input: source,
+      encoding: 'utf8',
+      timeout: 5_000,
+      env: { PATH: process.env.PATH },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    return JSON.parse(result.stdout) as Record<string, unknown>;
+  }
+
+  function generateConfig(overrides: Record<string, string> = {}) {
+    const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'staging-api-config-'));
+    try {
+      const apiDir = join(probe, 'workers/api');
+      mkdirSync(apiDir, { recursive: true });
+      mkdirSync(join(probe, '.github/scripts'), { recursive: true });
+      // Dummy inventory exercises the real parity preflight without reading
+      // credentials or using a live resource id. The public RP host is just
+      // an inert string here: the generator's exact-host gate requires it.
+      writeFileSync(join(probe, '.github/scripts/binding_manifest.toml'), `
+[[worker]]
+name = "api"
+[[worker.binding]]
+binding = "HYPERDRIVE"
+staging = "dummy-hyperdrive-staging"
+`);
+      const section = jobSection(deployWorkflow, 'staging-api');
+      const parts = section.split('      - name: Generate staging wrangler.toml\n');
+      expect(parts, 'exactly one staging API config generator').toHaveLength(2);
+      const step = parts[1]!.split('\n      - ')[0]!;
+      expect(step).toContain('working-directory: workers/api');
+      expect(step).toContain("if: steps.config.outputs.configured == 'true'");
+      const script = step.match(/        run: \|\n([\s\S]*)$/)?.[1];
+      expect(script, 'execute the checked-in generator, including its preflight').toBeDefined();
+      const result = runShell(script!.replace(/^ {10}/gm, ''), {
+        API_RP_ID_STAGING: 'staging.nntune.com',
+        API_RP_ORIGIN_STAGING: 'https://staging.nntune.com',
+        HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-staging',
+        ...overrides,
+      }, apiDir);
+      const configPath = join(apiDir, 'wrangler.toml');
+      return { ...result, toml: existsSync(configPath) ? readFileSync(configPath, 'utf8') : undefined };
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
+  }
+
+  function tailPaths(value: unknown, path: string[] = []): string[] {
+    if (value === null || typeof value !== 'object') return [];
+    return Object.entries(value).flatMap(([key, child]) =>
+      key === 'tail_consumers' ? [[...path, key].join('.')] : tailPaths(child, [...path, key]),
+    );
+  }
+
+  function assertStagingTail(config: Record<string, unknown>) {
+    const env = config.env as Record<string, Record<string, unknown>> | undefined;
+    expect(tailPaths(config), 'Tail declaration must exist only at env.staging.tail_consumers').toEqual([
+      'env.staging.tail_consumers',
+    ]);
+    expect(env?.staging?.tail_consumers, 'exactly the existing staging consumer, with no extra destination').toEqual([
+      { service: 'nntune-alerts-staging' },
+    ]);
+  }
+
+  test('generated TOML attaches exactly the existing consumer at staging scope', () => {
+    const result = generateConfig();
+    expect(result.status, result.output).toBe(0);
+    expect(result.toml).toBeDefined();
+    assertStagingTail(parseToml(result.toml!));
+  });
+
+  test('generated TOML preserves required routes, RP vars, Logs and Hyperdrive', () => {
+    const result = generateConfig();
+    expect(result.status, result.output).toBe(0);
+    expect(result.toml).toBeDefined();
+    expect(parseToml(result.toml!)).toMatchObject({
+      name: 'nntune-api',
+      main: 'build/worker/shim.mjs',
+      compatibility_date: '2026-10-01',
+      build: { command: 'cargo install -q worker-build --locked && worker-build --release -- --locked' },
+      env: {
+        staging: {
+          name: 'nntune-api-staging',
+          routes: [
+            { pattern: 'staging.nntune.com/v1/*', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
+          ],
+          vars: {
+            RP_ID: 'staging.nntune.com',
+            RP_ORIGIN: 'https://staging.nntune.com',
+            SESSION_TTL_SECS: '86400',
+            HYPERDRIVE_CACHING_DISABLED: '1',
+          },
+          observability: { enabled: true, head_sampling_rate: 1 },
+          hyperdrive: [{ binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' }],
+        },
+      },
+    });
+  });
+
+  test('the pinned staging deploy consumes that config and injects BUILD_SHA', () => {
+    const section = jobSection(deployWorkflow, 'staging-api');
+    const step = section.split('      - name: Deploy api to staging\n')[1]?.split('\n      - ')[0];
+    expect(step).toBeDefined();
+    expect(step).toContain('uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0');
+    expect(step).toContain("if: steps.config.outputs.configured == 'true'");
+    expect(step).toContain('workingDirectory: workers/api');
+    expect(step?.match(/^          command: (.+)$/m)?.[1]).toBe(
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+    );
+  });
+
+  for (const [name, overrides, diagnostic] of [
+    ['wrong inventory id', { HYPERDRIVE_ID_STAGING: 'dummy-other-hyperdrive' }, 'HYPERDRIVE_ID_STAGING must equal the api staging inventory id'],
+    ['stale host', { API_RP_ID_STAGING: 'obsolete.example', API_RP_ORIGIN_STAGING: 'https://obsolete.example' }, 'API_RP_ID_STAGING must equal the staging RP ID'],
+    ['noncanonical origin', { API_RP_ORIGIN_STAGING: 'https://staging.nntune.com/' }, 'API_RP_ORIGIN_STAGING must be the canonical serialized origin'],
+    ['non-https origin', { API_RP_ORIGIN_STAGING: 'http://staging.nntune.com' }, 'API_RP_ORIGIN_STAGING must be https'],
+  ] as const) {
+    test(`generator rejects ${name} before writing deploy config`, () => {
+      const result = generateConfig(overrides);
+      expect(result.status).not.toBe(0);
+      expect(result.output).toContain(diagnostic);
+      expect(result.toml).toBeUndefined();
+    });
+  }
+
+  // Hand-derived TOML controls test the same assertion as the real output.
+  // Parse outside toThrow so syntax errors cannot count as caught regressions.
+  const expectedTail = '[[env.staging.tail_consumers]]\nservice = "nntune-alerts-staging"\n';
+  test('Tail guard accepts the contract fixture', () => {
+    assertStagingTail(parseToml(expectedTail));
+  });
+  for (const [name, toml] of [
+    ['removed declaration', ''],
+    ['wrong consumer', expectedTail.replace('nntune-alerts-staging', 'other-alerts-staging')],
+    ['unexpected consumer environment', expectedTail + 'environment = "other"\n'],
+    ['duplicate consumer', expectedTail + expectedTail],
+    ['root-only consumer', expectedTail.replace('env.staging.tail_consumers', 'tail_consumers')],
+    ['production-only consumer', expectedTail.replace('env.staging.tail_consumers', 'env.production.tail_consumers')],
+    ['misnested consumer', expectedTail.replace('env.staging.tail_consumers', 'env.staging.vars.tail_consumers')],
+    ['root scope leak', expectedTail + expectedTail.replace('env.staging.tail_consumers', 'tail_consumers')],
+    ['production scope leak', expectedTail + expectedTail.replace('env.staging.tail_consumers', 'env.production.tail_consumers')],
+    ['comment-only declaration', expectedTail.replace(/^/gm, '# ')],
+    ['string-only declaration', '[env.staging.vars]\nNOTE = \'[[env.staging.tail_consumers]] service = "nntune-alerts-staging"\'\n'],
+  ] as const) {
+    test(`Tail guard rejects ${name}`, () => {
+      const parsed = parseToml(toml);
+      expect(() => assertStagingTail(parsed)).toThrow();
+    });
+  }
+});
+
 test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)', () => {
   // deploy.yml deploys apps/web plus the one authorized backend lane,
   // `staging-api` (api Worker, staging only); every further backend lane
