@@ -834,6 +834,7 @@ test('[LIBREP-11] a stop stays terminal: no advance after it under any mode', as
 			// Clearing mid-mode must not let a detached end resurrect playback.
 			const audio = await page.getByTestId('audio-player').elementHandle();
 			await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+			await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 			await expect(page.getByTestId('queue-item')).toHaveCount(0);
 			const before = await mediaCalls(page).then((calls) => calls.play);
 			await audio!.evaluate((el) => el.dispatchEvent(new Event('ended')));
