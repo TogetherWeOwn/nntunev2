@@ -676,3 +676,40 @@ test('QC-B10 a trim prompt invalidated while open dismisses itself and stays dis
 	await expect(cancelButton(page)).toHaveCount(0);
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu', 'row-alpha']);
 });
+
+test('QC-B11 virtual-click clear recovers focus when the trigger stays focused and disables', async ({
+	page
+}) => {
+	const harness = await seedQueue(page);
+	await clearTrigger(page).click();
+	await expect(confirmButton(page)).toBeVisible();
+
+	await clearTrigger(page).focus();
+	await expect(clearTrigger(page)).toBeFocused();
+	// An assistive-technology virtual click activates Confirm without moving DOM focus.
+	await confirmButton(page).evaluate((element) => (element as HTMLButtonElement).click());
+
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await expect(clearTrigger(page)).toBeDisabled();
+	await expect(emptyTarget(page)).toBeFocused();
+	await expectNoPlayback(page, harness);
+});
+
+test('QC-B12 virtual-click trim recovers focus when the trigger stays focused and disables', async ({
+	page
+}) => {
+	const harness = await seedQueue(page);
+	await trimTrigger(page).click();
+	await expect(confirmButton(page)).toBeVisible();
+
+	await trimTrigger(page).focus();
+	await expect(trimTrigger(page)).toBeFocused();
+	await confirmButton(page).evaluate((element) => (element as HTMLButtonElement).click());
+
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	expect(await queueOrder(page)).toEqual(['row-mike']);
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'row-mike');
+	await expect(trimTrigger(page)).toBeDisabled();
+	await expect(currentRow(page)).toBeFocused();
+	await expectNoPlayback(page, harness);
+});
