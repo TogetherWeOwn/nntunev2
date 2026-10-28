@@ -1,4 +1,8 @@
 //! Test-only Library tripwire: denied authentication must not reach a handler.
+//! Records the actual dispatched compatibility principal unchanged. Live bank
+//! expectations bind username to persisted users.id and require non-admin;
+//! neither email nor a generated credential name is an ownership substitute.
+//! No storage/authentication/limiter implementation belongs in this support.
 
 use nntune_subsonic::library::{
     Album, AlbumListQuery, Artist, PlayQueue, Playlist, Song, StarKind,

@@ -192,6 +192,9 @@ impl AuthStore for TestStore {
         }
     }
 
+    // Historical harness support only: live `p` passwords answer 42 before
+    // the store is consulted, so this verifier is never reached via the
+    // handler; it preserves the v1-derived TestStore shape.
     fn verify_password(&self, username: &str, password: &str) -> Option<Identity> {
         if (username == "test" && password == "test-pass")
             || (username == "other" && password == "other-pass")

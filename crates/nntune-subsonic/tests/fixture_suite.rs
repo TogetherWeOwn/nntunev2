@@ -104,16 +104,18 @@ fn auth_refusals_match_goldens() {
     );
     assert_eq!(status, 200);
     assert_eq!(body, fixture("error-auth-conflict.json"));
-    // enc: passwords decode like v1; malformed hex answers 40.
+    // Live versioned credential contract: any `p` password is 42 Unsupported,
+    // including well-formed v1 `enc:` hex (the v1 decode path is historical
+    // only, not a live success).
     let (status, _, body) = get(
         &app,
         "/rest/ping",
         "u=test&p=enc:746573742d70617373&v=1.16.1&c=x",
     );
     assert_eq!(status, 200);
-    assert!(String::from_utf8(body).unwrap().contains("status=\"ok\""));
+    assert!(String::from_utf8(body).unwrap().contains("code=\"42\""));
     let (_, _, body) = get(&app, "/rest/ping", "u=test&p=enc:zz&v=1.16.1&c=x&f=json");
-    assert!(String::from_utf8(body).unwrap().contains("\"code\":40"));
+    assert!(String::from_utf8(body).unwrap().contains("\"code\":42"));
 }
 
 #[test]

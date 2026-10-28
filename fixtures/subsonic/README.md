@@ -9,6 +9,11 @@ field against v1 source. The fixture suite
 (`crates/nntune-subsonic/tests/fixture_suite.rs`) asserts byte equality.
 A live capture against a seeded v1 instance remains future work; until
 then these fixtures pin the port's v1-derived contract, not v1 bytes.
+These 51 files are historical v1-derived pins, not live captures: the
+live credential contract is versioned separately (see the
+persisted-client-auth acceptance bank), while the `apiKey` 43/44,
+missing-credential 40, and missing-parameter 10 golden bytes below
+remain live.
 
 ## Envelope (v1 `SubsonicResponse`, ported exactly)
 
@@ -71,7 +76,9 @@ then these fixtures pin the port's v1-derived contract, not v1 bytes.
   `The {op} operation is not supported by this server.` — HTTP 200.
 - `10` required parameter missing (also token auth without `s`, and an
   invalid JSONP callback, which falls back to JSON error 10 as in v1);
-  `40` wrong username/password (incl. malformed `enc:` hex);
+  `40` wrong username/password in the historical v1 source-derived
+  contract (incl. malformed `enc:` hex; live, any `p` password is 42
+  and complete token auth is 40);
   `43` apiKey mixed with `u`/`p`/`t`/`s`;
   `44` invalid API key; `50` is always
   `User is not authorized for the given operation.`;
@@ -80,7 +87,9 @@ then these fixtures pin the port's v1-derived contract, not v1 bytes.
   (for example `Song not found.` and `Album not found.`).
   `hls.m3u8` is not a Subsonic document: plain HTTP 410 (as in v1,
   matching Navidrome).
-- `p=enc:<hex>` passwords hex-decode as in v1; query decoding is byte-based
+- Historical source-derived behavior only: `p=enc:<hex>` passwords
+  hex-decoded as in v1; live, any `p` password answers 42 Unsupported.
+  Query decoding is byte-based
   UTF-8 (no Latin-1 mojibake, no panic on stray `%`); POST form bodies merge
   with the query string as in v1 (`$request->input()`); POST bodies over
   10 MB are refused with error 10 `POST body exceeds the 10 MB limit.`
