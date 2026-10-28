@@ -122,19 +122,67 @@ def api_get(path, account_id, token):
 
 def list_namespaces(get):
     namespaces = []
-    page = 1
-    while True:
-        payload = get(f"durable_objects/namespaces?per_page=1000&page={page}")
+    seen_ids = set()
+    metadata = None
+    per_page = 1000
+    for page in range(1, 101):
+        payload = get(f"durable_objects/namespaces?per_page={per_page}&page={page}")
         batch = payload["result"]
         require(isinstance(batch, list), "NAMESPACE_LIST_SHAPE")
-        namespaces.extend(batch)
-        info = payload.get("result_info") or {}
+        require(len(batch) <= per_page, "NAMESPACE_PAGE_SIZE")
+        info = payload.get("result_info")
+        require(isinstance(info, dict), "NAMESPACE_PAGES_SHAPE")
+        require(type(info.get("page")) is int and info["page"] == page,
+                "NAMESPACE_PAGE_MISMATCH")
+        for key, minimum, maximum in (
+            ("per_page", 1, per_page), ("count", 0, per_page),
+            ("total_count", 0, per_page * 100), ("total_pages", 1, 100),
+        ):
+            if key in info:
+                require(type(info[key]) is int and minimum <= info[key] <= maximum,
+                        "NAMESPACE_PAGES_SHAPE")
+        if "per_page" in info:
+            require(info["per_page"] == per_page, "NAMESPACE_PAGE_SIZE")
+        if "count" in info:
+            require(info["count"] == len(batch), "NAMESPACE_COUNT_MISMATCH")
+
+        # Do not let later pages change or drop the evidence used to enumerate.
+        current = (info.get("per_page"), info.get("total_count"),
+                   info.get("total_pages"), "count" in info)
+        if metadata is None:
+            metadata = current
+        require(current == metadata, "NAMESPACE_METADATA_CHANGED")
         total_pages = info.get("total_pages")
-        require(type(total_pages) is int and 1 <= total_pages <= 100, "NAMESPACE_PAGES_SHAPE")
-        require(info.get("page") == page, "NAMESPACE_PAGE_MISMATCH")
-        if page >= total_pages:
+        total_count = info.get("total_count")
+        # Cloudflare documents total_pages as optional. Its alternative must be
+        # explicit count evidence, never a missing-metadata single-page fallback.
+        require(total_pages is not None or {"count", "per_page", "total_count"} <= info.keys(),
+                "NAMESPACE_PAGES_SHAPE")
+        if total_count is not None:
+            counted_pages = max(1, (total_count + per_page - 1) // per_page)
+            require(total_pages is None or total_pages == counted_pages,
+                    "NAMESPACE_COUNT_MISMATCH")
+            total_pages = counted_pages
+            require(len(batch) == min(per_page, max(0, total_count - len(namespaces))),
+                    "NAMESPACE_COUNT_MISMATCH")
+        elif page < total_pages and ("per_page" in info or "count" in info):
+            require(len(batch) == per_page, "NAMESPACE_PAGE_SIZE")
+        require(page <= total_pages, "NAMESPACE_PAGE_MISMATCH")
+        require(bool(batch) or page == total_pages == 1, "NAMESPACE_EMPTY_PAGE")
+
+        for namespace in batch:
+            require(isinstance(namespace, dict), "NAMESPACE_ITEM_SHAPE")
+            # Legacy explicit-page responses may omit IDs for unrelated entries.
+            # Counted inventories need IDs so overlap cannot fake completeness.
+            if total_count is not None or "id" in namespace:
+                namespace_id = namespace.get("id")
+                require(isinstance(namespace_id, str) and bool(namespace_id), "NAMESPACE_ID_SHAPE")
+                require(namespace_id not in seen_ids, "NAMESPACE_DUPLICATE_ID")
+                seen_ids.add(namespace_id)
+        namespaces.extend(batch)
+        if page == total_pages:
             return namespaces
-        page += 1
+    raise GuardError("NAMESPACE_PAGES_SHAPE")
 
 
 def verify(settings, namespaces, subdomain, versions, expected_logs):

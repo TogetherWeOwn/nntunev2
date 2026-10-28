@@ -63,6 +63,8 @@ jobs:
         run: python3 .github/scripts/alerts_staging.py freeze
       - name: Test staging deployment guards without network access
         run: python3 .github/scripts/test_alerts_staging.py
+      - name: Test namespace pagination contract without network access
+        run: python3 .github/scripts/test_alerts_namespace_contract.py
       - name: Generate staging wrangler.toml
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

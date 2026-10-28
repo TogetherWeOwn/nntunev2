@@ -49,6 +49,22 @@ offline rejection fixtures. The verifier prints IDs and binding names, not value
 A verification failure happens **after deployment**: it does not automatically
 undo a serving version. Do not rerun a failed deployment as a diagnostic shortcut.
 
+Namespace enumeration requests up to 100 pages of 1000 results using the
+[namespace-list API](https://developers.cloudflare.com/api/resources/durable_objects/subresources/namespaces/methods/list/).
+Its `total_pages` response field is optional. The verifier accepts either stable
+explicit page totals or explicit `page`/`per_page`/`count`/`total_count` evidence;
+it never treats absent pagination metadata as a single-page inventory. Present
+numeric fields must be integers (not booleans, strings or floats), agree with the
+requested page size and result length, and remain consistent across pages. Counted
+inventories must fill nonterminal pages, have distinct namespace IDs, and finish
+at the advertised count. Contradictory totals, premature empty/short pages or
+metadata drift fail closed, even if the target appeared on an earlier page.
+The separate `test_alerts_namespace_contract.py` bank runs in required CI and
+before staging deployment alongside `test_alerts_staging.py`. Its fixtures are
+synthetic and document a supported-response mismatch, not a capture of a live
+failure. Source/test success does not establish staging recovery; retain the
+actual workflow head, deploy version and post-deploy verification result.
+
 Secret provisioning and Tail attachment remain a separate staging-first machine
 contract: exact-head CI and review, existing-plan/cost and secret-version checks,
 approved attachment, controlled staging breach plus real message/log-link evidence,
