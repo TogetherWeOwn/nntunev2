@@ -96,8 +96,11 @@ async function gatedLibrary(page: Page, initial: Item[], refreshed: Item[], url 
 	await expect(page.getByTestId('library-item')).toHaveCount(initial.length);
 	return {
 		release,
-		async start() {
-			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		requestCount: () => requests,
+		async start({ preserveFocus = false } = {}) {
+			const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+			if (preserveFocus) await refresh.evaluate((element: HTMLButtonElement) => element.click());
+			else await refresh.click();
 			await expect.poll(() => requests).toBe(2);
 		},
 		async finish() {
@@ -432,3 +435,124 @@ for (const hidden of [true, false]) {
 		} else expect(await order(page)).toEqual([...previous, selected].map((track) => track.id));
 	});
 }
+
+// Missing inbound-share invalidation must not leave an old destructive action
+// armed merely because every queued track still exists in the library.
+for (const action of ['all', 'upcoming'] as const) {
+	test(`QCR-09 unconsumed Back share without pruning invalidates ${action} consent`, async ({ page }) => {
+		await nativeAudio(page);
+		const tracks = ITEMS.map((track) => ({ ...track, streamUrl: `/test-audio/${track.id}` }));
+		const load = await gatedLibrary(page, tracks, tracks, '/library?track=consent-second&t=0', true);
+		try {
+			// Whole-clear sees a newly appended share; trim sees an existing shared
+			// row selected with a non-empty successor, so zero-upcoming cannot mask it.
+			await enqueue(page, action === 'all' ? [tracks[0]!, tracks[2]!] : tracks);
+			const audio = page.getByTestId('audio-player');
+			await audio.evaluate((element: HTMLAudioElement) => element.pause());
+			await expect(current(page)).toHaveAttribute('data-track-id', 'consent-first');
+			await page.evaluate(() => { document.documentElement.dataset.consentDocument = 'original'; });
+			const trigger = action === 'all' ? clear(page) : trim(page);
+			await trigger.click();
+			await expect(yes(page)).toBeVisible();
+			const staleYes = await yes(page).elementHandle();
+			expect(staleYes).not.toBeNull();
+			expect(load.requestCount()).toBe(1);
+
+			await page.goBack();
+			await expect(page).toHaveURL(/\/library\?track=consent-second&t=0$/);
+			await expect(page.locator('html')).toHaveAttribute('data-consent-document', 'original');
+			await expect(current(page)).toHaveAttribute('data-track-id', 'consent-second');
+			await audio.evaluate((element: HTMLAudioElement) => element.pause());
+			const sharedOrder = action === 'all'
+				? ['consent-first', 'consent-third', 'consent-second']
+				: ['consent-first', 'consent-second', 'consent-third'];
+			expect(await order(page)).toEqual(sharedOrder);
+			await expect(page.getByTestId('library-item')).toHaveCount(3);
+			expect(load.requestCount(), 'same-document share consumption must not depend on refresh/pruning').toBe(1);
+			if (action === 'upcoming') await expect(page.getByTestId('queue-position')).toContainText('1 upcoming');
+
+			// A detached/disabled old button or an inert old handler are all safe;
+			// a live stale destructive action must fail on the resulting queue state.
+			await staleYes!.evaluate((element: HTMLButtonElement) => element.click());
+			await flush(page);
+			expect(await order(page), 'old consent cannot clear the new shared arrangement').toEqual(sharedOrder);
+			await expect(current(page)).toHaveAttribute('data-track-id', 'consent-second');
+			await trigger.click();
+			await expect(yes(page)).toBeEnabled();
+			await yes(page).click();
+			await expect.poll(() => order(page)).toEqual(action === 'all' ? [] : ['consent-first', 'consent-second']);
+		} finally {
+			load.release();
+		}
+	});
+}
+
+// Suspending routine refresh statuses must not silence the revised warning that
+// still describes an open destructive action under the user's unchanged focus.
+test('QCR-10 trusted end revises a focused upcoming warning politely during gated refresh', async ({ page }) => {
+	await nativeAudio(page);
+	const tracks = ITEMS.map((track) => ({ ...track, streamUrl: `/test-audio/${track.id}` }));
+	const load = await gatedLibrary(page, tracks, tracks);
+	try {
+		await enqueue(page, tracks);
+		await page.getByTestId('player-repeat').selectOption('off');
+		const audio = page.getByTestId('audio-player');
+		await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.readyState)).toBeGreaterThanOrEqual(2);
+		await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.duration)).toBe(4);
+		await audio.evaluate((element: HTMLAudioElement) => element.pause());
+		await trim(page).click();
+		await expect(yes(page)).toHaveAccessibleDescription(/\b2\b.*upcoming|upcoming.*\b2\b/i);
+		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
+		const liveWarnings = page.locator('main [aria-live="polite"], main [role="status"]')
+			.filter({ hasText: /upcoming/i }).filter({ hasText: /remov|clear/i });
+		await expect(liveWarnings).toHaveCount(1);
+		const beforeWarning = await liveWarnings.allTextContents();
+		await yes(page).focus();
+		await expect(yes(page)).toBeFocused();
+		await load.start({ preserveFocus: true });
+		const loading = page.getByText('Loading your library…', { exact: true });
+		await expect(loading).toHaveAttribute('role', 'status');
+		await expect(loading).toBeVisible();
+		await expect(yes(page)).toBeFocused();
+		const routineStatuses = page.locator('[data-testid="now-playing"], [data-testid="queue-announcement"], [data-testid="queue-filter-count"], button:has-text("Shuffle upcoming") + p');
+		await expect(routineStatuses).toHaveCount(4);
+		for (const region of await routineStatuses.all()) {
+			await expect(region).not.toHaveAttribute('role', 'status');
+			await expect(region).not.toHaveAttribute('aria-live', 'polite');
+		}
+
+		await audio.evaluate(async (element: HTMLAudioElement) => {
+			element.addEventListener('ended', (event) => {
+				document.documentElement.dataset.consentTrustedEnd = String(event.isTrusted);
+			}, { capture: true, once: true });
+			element.currentTime = element.duration - 0.15;
+			await element.play();
+		});
+		await expect(page.locator('html')).toHaveAttribute('data-consent-trusted-end', 'true');
+		await expect(current(page)).toHaveAttribute('data-track-id', 'consent-second');
+		await audio.evaluate((element: HTMLAudioElement) => element.pause());
+		await expect(page.getByTestId('queue-position')).toContainText('1 upcoming');
+		await expect(loading).toBeVisible();
+		await expect(yes(page)).toBeFocused();
+		await expect(yes(page)).toHaveAccessibleDescription(/\b1\b.*upcoming|upcoming.*\b1\b/i);
+		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
+		await expect(liveWarnings.filter({ hasText: /\b1\b/ }),
+			'the revised warning must stay politely live before the refresh gate is released').toHaveCount(1);
+		expect(await liveWarnings.allTextContents()).not.toEqual(beforeWarning);
+		expect(await order(page)).toEqual(['consent-first', 'consent-second', 'consent-third']);
+
+		await cancel(page).evaluate((element: HTMLButtonElement) => element.click());
+		await expect(yes(page)).toHaveCount(0);
+		await expect(page.locator('main').getByRole('status'), 'without open consent only loading may remain live').toHaveCount(1);
+		await expect(page.getByTestId('queue-confirm-feedback')).not.toHaveAttribute('aria-live', 'polite');
+		for (const region of await routineStatuses.all()) {
+			await expect(region).not.toHaveAttribute('role', 'status');
+			await expect(region).not.toHaveAttribute('aria-live', 'polite');
+		}
+		await load.finish();
+		for (const region of await routineStatuses.all()) await expect(region).toHaveAttribute('role', 'status');
+		expect(await order(page)).toEqual(['consent-first', 'consent-second', 'consent-third']);
+	} finally {
+		load.release();
+	}
+});
