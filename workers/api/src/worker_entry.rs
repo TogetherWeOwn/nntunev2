@@ -1035,6 +1035,48 @@ impl Store for PgStore {
         }, TOTAL_TIMEOUT_MS).await
     }
 
+    async fn redeem_magic_link(
+        &self,
+        magic: &MagicLinkRecord,
+        now: u64,
+        session: &SessionRecord,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(async {
+            if session.user_id != magic.user_id {
+                return Err(StoreError);
+            }
+            let claim = SingleUseClaim::MagicLink { record: magic, now };
+            let expires = i64_of(magic.expires_at)?;
+            let now = i64_of(now)?;
+            let created_at = i64_of(session.created_at)?;
+            let expires_at = i64_of(session.expires_at)?;
+            let counter = i32::try_from(session.rotation_counter).map_err(|_| StoreError)?;
+            let mut client = self.connect().await?;
+            let transaction = client.transaction().await.map_err(|_| StoreError)?;
+            let rows = transaction.query(
+                claim.statement(),
+                &[&magic.token_hash, &magic.user_id, &magic.email, &expires, &now],
+            ).await.map_err(|_| StoreError)?;
+            if rows.len() != 1 {
+                transaction.rollback().await.map_err(|_| StoreError)?;
+                return Ok(false);
+            }
+            if transaction.execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, FALSE)",
+                &[&session.id, &session.user_id, &created_at, &expires_at, &counter],
+            ).await.is_err() {
+                transaction.rollback().await.map_err(|_| StoreError)?;
+                return Err(StoreError);
+            }
+            // Dropping a timed-out/failed transaction also rolls it back. Never
+            // reset a consumed token in a separate compensating write: that can
+            // race a winning redemption and reopen a single-use credential.
+            transaction.commit().await.map_err(|_| StoreError)?;
+            Ok(true)
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
     async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
         Self::bounded(
             async {
