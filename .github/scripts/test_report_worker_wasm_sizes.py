@@ -47,10 +47,10 @@ class FormatBytesTests(unittest.TestCase):
 
 
 class WorkerTableTests(unittest.TestCase):
-    def test_covers_all_five_workers(self):
+    def test_covers_all_six_workers(self):
         self.assertEqual(
             [spec["worker"] for spec in WORKERS],
-            ["api", "ingest", "mb", "repair", "stream"],
+            ["api", "ingest", "mb", "repair", "stream", "youtube"],
         )
 
     def test_wasm_names(self):
@@ -68,6 +68,15 @@ class WorkerTableTests(unittest.TestCase):
             args,
             ["cargo", "build", "--release", "--target", TARGET,
              "-p", "nntune-stream"],
+        )
+
+    def test_cargo_args_youtube_uses_package_unlocked(self):
+        youtube = next(s for s in WORKERS if s["worker"] == "youtube")
+        args = cargo_args(youtube)
+        self.assertEqual(
+            args,
+            ["cargo", "build", "--release", "--target", TARGET,
+             "-p", "nntune-youtube"],
         )
 
     def test_cargo_args_api_locked_manifest(self):
@@ -96,6 +105,11 @@ class WorkerTableTests(unittest.TestCase):
         self.assertEqual(
             wasm_path(root, stream),
             Path("/repo/target") / TARGET / "release" / "nntune_stream.wasm",
+        )
+        youtube = next(s for s in WORKERS if s["worker"] == "youtube")
+        self.assertEqual(
+            wasm_path(root, youtube),
+            Path("/repo/target") / TARGET / "release" / "nntune_youtube.wasm",
         )
 
 
@@ -409,9 +423,9 @@ class MainWarningOnlyTests(unittest.TestCase):
 
 class BuildWorkerTimeoutTests(unittest.TestCase):
     def test_timeout_fits_inside_ci_job(self):
-        # Five Workers build sequentially; the worst case must stay under
-        # the job's 30-minute timeout.
-        self.assertLessEqual(BUILD_TIMEOUT_SECONDS * len(WORKERS), 25 * 60)
+        # Six Workers build sequentially; the worst case must stay under
+        # the job's 35-minute timeout.
+        self.assertLessEqual(BUILD_TIMEOUT_SECONDS * len(WORKERS), 30 * 60)
 
     def test_timeout_becomes_error_detail(self):
         api = next(s for s in WORKERS if s["worker"] == "api")

@@ -92,8 +92,28 @@ EXPECTED_ALL_ARGV = [
         "--release",
         "--target",
         "wasm32-unknown-unknown",
+        "--manifest-path",
+        "workers/transcode/Cargo.toml",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
         "-p",
         "nntune-stream",
+        "--locked",
+    ],
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "nntune-youtube",
         "--locked",
     ],
 ]
@@ -257,7 +277,7 @@ class MainExitTests(unittest.TestCase):
             self.assertIn("FAIL", output)
             self.assertIn("api", output)
 
-    def test_main_returns_0_when_all_five_pass(self):
+    def test_main_returns_0_when_all_six_pass(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,8 @@
 [workspace]
-members = ["crates/nntune-core", "crates/nntune-config", "crates/mb-import-validate", "crates/nntune-logging", "crates/nntune-ssrf-guard", "crates/nntune-test-nntp", "workers/stream", "containers/repair"]
-# workers/api, workers/ingest and workers/mb are standalone crates (no
-# [workspace] table): exclude them so this parent workspace never swallows
-# them. Revisit if the scaffold card unifies the workspace.
-exclude = ["workers/api", "workers/ingest", "workers/mb", "workers/repair"]
+members = ["crates/nntune-core", "crates/nntune-config", "crates/mb-import-validate", "crates/nntune-logging", "crates/nntune-ssrf-guard", "crates/nntune-subsonic", "crates/nntune-test-nntp", "workers/stream", "workers/youtube", "containers/repair", "containers/transcode"]
+# workers/api, workers/ingest, workers/mb, workers/repair and
+# workers/transcode are standalone crates (no [workspace] table):
+# exclude them so this parent workspace never swallows them. Revisit
+# if the scaffold card unifies the workspace.
+exclude = ["workers/api", "workers/ingest", "workers/mb", "workers/repair", "workers/transcode"]
 resolver = "2"

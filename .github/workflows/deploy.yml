@@ -118,11 +118,15 @@ jobs:
 
   # Api Worker staging lane (staging only; ingest/mb/stream/repair are
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
-  # on the same token gate as staging-web. Passes the public BUILD_SHA var
-  # so worker log records carry the deploy SHA (never a secret); secrets
-  # live in Cloudflare and are never written here. Fails closed on the
-  # Hyperdrive cache-disabled gate (no --allow-skip); skips with a notice
-  # until the Operator wires the staging variables (a skip is not evidence).
+  # on the same token gate as staging-web. Serves the staging host on
+  # /v1/* and /healthz plus the staging-only /api/test-codes seam
+  # (routes derived from API_RP_ID_STAGING); the web Worker owns the
+  # catch-all. Passes the
+  # public BUILD_SHA var so worker log records carry the deploy SHA (never
+  # a secret); secrets live only in Cloudflare and are never written here.
+  # Fails closed on the Hyperdrive cache-disabled gate (no --allow-skip);
+  # skips with a notice until the Operator wires the staging variables (a
+  # skip is not evidence).
   staging-api:
     name: staging-api
     needs: [gate]
@@ -136,9 +140,10 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: workers/api
+    outputs:
+      deployed: ${{ steps.deployment.outputs.deployed }}
+      outcome: ${{ steps.deployment.outputs.outcome }}
+      source_sha: ${{ steps.deployment.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -150,6 +155,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Check api staging configuration
         id: config
+        working-directory: workers/api
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
@@ -171,7 +177,9 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Hyperdrive cache-disabled gate
+        id: hyperdrive
         if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -180,6 +188,7 @@ jobs:
           ./check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"
       - name: Generate staging wrangler.toml
         if: steps.config.outputs.configured == 'true'
+        working-directory: workers/api
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
@@ -190,13 +199,21 @@ jobs:
           # serialized https origin whose host is exactly RP_ID: fail the
           # job here (names only) instead of deploying a worker that 500s.
           python3 - <<'PY'
-          import os, tomllib, urllib.parse
+          import os, re, tomllib, urllib.parse
           rp_id = os.environ["API_RP_ID_STAGING"]
           origin = os.environ["API_RP_ORIGIN_STAGING"]
           parts = urllib.parse.urlsplit(origin)
           assert parts.scheme == "https", "API_RP_ORIGIN_STAGING must be https"
           assert parts.hostname == rp_id, "API_RP_ORIGIN_STAGING host must equal API_RP_ID_STAGING"
           assert origin == f"https://{rp_id}", "API_RP_ORIGIN_STAGING must be the canonical serialized origin"
+          assert re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", rp_id or ""), \
+              "API_RP_ID_STAGING must be a bare lowercase hostname (route host)"
+          # Exact-host pin: a stale var (e.g. the superseded v2-staging
+          # host) would pass the shape checks above and silently split the
+          # api routes onto the old host while the web catch-all serves
+          # the new one. Fail the job here instead (names only).
+          assert rp_id == "staging.nntune.com", \
+              "API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)"
           # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
           # directly, bypassing binding-parity (which only reads the
           # committed example). Fail unless it equals the committed staging
@@ -224,6 +241,23 @@ jobs:
 
           [env.staging]
           name = "nntune-api-staging"
+
+          # Same-host split: this Worker serves /v1/*, /healthz, plus the
+          # staging-only /api/test-codes seam on the staging host, while
+          # the web Worker owns the catch-all (see apps/web/wrangler.toml);
+          # the most specific route wins. Route hosts derive from
+          # API_RP_ID_STAGING (asserted the exact staging host above), so
+          # the RP pair and the serving host cannot drift apart.
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/v1/*"
+          zone_name = "nntune.com"
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/api/test-codes"
+          zone_name = "nntune.com"
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/healthz"
+          zone_name = "nntune.com"
+
           [env.staging.vars]
           RP_ID = "${API_RP_ID_STAGING}"
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
@@ -242,6 +276,7 @@ jobs:
           id = "${HYPERDRIVE_ID_STAGING}"
           EOF
       - name: Deploy api to staging
+        id: deploy
         if: steps.config.outputs.configured == 'true'
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
@@ -250,14 +285,48 @@ jobs:
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           workingDirectory: workers/api
           command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
-      - name: Record deploy evidence
-        if: steps.config.outputs.configured == 'true'
+      # Always report the executed step outcomes, including safe config skips
+      # and failures. A green job alone is not evidence of a deployed Worker.
+      - name: Record API deployment outcome
+        id: deployment
+        if: always()
+        env:
+          CONFIGURED: ${{ steps.config.outputs.configured }}
+          HYPERDRIVE_OUTCOME: ${{ steps.hyperdrive.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          deployed=false
+          outcome=failed
+          source_sha=""
+          if [ "$JOB_STATUS" = cancelled ]; then
+            outcome=cancelled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
+            outcome=unconfigured
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && \
+               [ "$HYPERDRIVE_OUTCOME" = success ] && [ "$DEPLOY_OUTCOME" = success ]; then
+            deployed=true
+            outcome=deployed
+            source_sha="$SOURCE_SHA"
+          fi
           {
-            echo "### staging-api deploy evidence"
+            echo "deployed=$deployed"
+            echo "outcome=$outcome"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### staging-api deployment outcome: $outcome"
             echo "Worker: nntune-api-staging (env staging)"
-            echo "Source SHA: ${{ github.sha }}"
-            echo "BUILD_SHA var: ${{ github.sha }}"
+            echo "deployed=$deployed"
+            echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
+            echo "Deploy api to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$deployed" = true ]; then
+              echo "Source SHA: $source_sha"
+              echo "BUILD_SHA var: $source_sha"
+            fi
+            echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Post-deploy staging E2E (same run, same revision as the deploy above).

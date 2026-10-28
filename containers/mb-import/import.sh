@@ -69,7 +69,10 @@ USAGE
   exit 0
 fi
 
-dump_dir="$1"
+# Pin the published target once. Later ETL publications may replace the
+# supplied symlink, but every check/hash/read in this run must use this target.
+# Published snapshots must remain immutable and retained while importing.
+dump_dir="$(CDPATH='' cd -- "$1" && pwd -P)"
 : "${DATABASE_URL:?set DATABASE_URL via secret store, never on the command line}"
 
 VALIDATE_BIN="${MB_VALIDATE_BIN:-mb-validate}"
@@ -91,6 +94,31 @@ command -v sort >/dev/null || { echo "import: sort not on PATH" >&2; exit 1; }
 command -v uniq >/dev/null || { echo "import: uniq not on PATH" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "import: sha256sum not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan split)" >&2; exit 1; }
+
+# Admission precedes every database mutation, including cursor creation.
+# Do not reject row-level poison here: validation and FK routing stay per chunk.
+for table in artist release recording track; do
+  tsv="$dump_dir/mbdump-$table.tsv"
+  if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
+    echo "import: refusing $tsv (required curated TSV must be present, readable and nonempty)" >&2
+    exit 1
+  fi
+done
+
+if [[ -n "${DUMP_SEQ:-}" ]]; then
+  if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
+    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
+    exit 1
+  fi
+  # Strip arbitrary zero padding before checking length. Never evaluate long
+  # input as Bash arithmetic (it can wrap); at most ten digits reach arithmetic.
+  DUMP_SEQ="${DUMP_SEQ#"${DUMP_SEQ%%[!0]*}"}"
+  DUMP_SEQ="${DUMP_SEQ:-0}"
+  if (( ${#DUMP_SEQ} > 10 )) || (( 10#$DUMP_SEQ > 2147483647 )); then
+    echo "import: refusing DUMP_SEQ outside PostgreSQL INTEGER range (0..2147483647)" >&2
+    exit 1
+  fi
+fi
 
 # Deliver the connection to psql via the PG* environment, never argv.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -120,10 +148,6 @@ refuse_all_poison_dump() {
 
 for table in artist release recording track; do
   tsv="$dump_dir/mbdump-$table.tsv"
-  if [[ ! -f "$tsv" ]]; then
-    echo "import: missing $tsv (expected curated TSV; see header comment)" >&2
-    exit 1
-  fi
   prune_sql=""
   final_prune_sql=""
   case "$table" in
@@ -183,15 +207,130 @@ for table in artist release recording track; do
   psql -v ON_ERROR_STOP=1 -c "INSERT INTO mb_import_cursor (table_name, dump_id, lines_done) VALUES ('$table', '$dump_id', 0) ON CONFLICT (table_name, dump_id) DO NOTHING;" >/dev/null
   # Duplicate-key pre-check. Entity tables key on the MBID in column 1;
   # track keys on the position tuple (release, medium, track), where
-  # column 1 legitimately repeats per track of a release.
-  if [[ "$table" == "track" ]]; then
-    # Positions are normalized numerically ($3+0) so "01" and "1" cannot
-    # slip past as distinct keys for the same SMALLINT primary key.
-    awk -F '\t' 'NF >= 4 && $3 ~ /^[+-]?[0-9]+$/ && $4 ~ /^[+-]?[0-9]+$/ { print tolower($1) "/" ($3+0) "/" ($4+0) }' "$tsv" \
-      | sort -T "$work" >"$work/mbids.sorted"
-  else
-    awk -F '\t' 'length($1) == 36 && substr($1, 9, 1) == "-" && substr($1, 14, 1) == "-" && substr($1, 19, 1) == "-" && substr($1, 24, 1) == "-" { id = $1; gsub(/-/, "", id); if (length(id) == 32 && id ~ /^[[:xdigit:]]+$/) print tolower($1) }' "$tsv" \
-      | sort -T "$work" >"$work/mbids.sorted"
+  # column 1 legitimately repeats per track of a release. Keys are
+  # COPY-decoded and canonicalized the way the validator normalizes
+  # them (lowercase UUIDs, plain integers), so an octal/hex-escaped
+  # alias for an already-listed key cannot slip past as a distinct key
+  # for the same row. Lines whose key fields cannot validate
+  # (undecodable escapes, NUL, non-UTF-8, ill-shaped keys) are skipped
+  # here: the validator poisons them, and poison rows never reach the
+  # table, so they cannot collide with a loaded key.
+  if ! python3 - "$table" "$tsv" <<'EOF' | sort -T "$work" >"$work/mbids.sorted"; then
+import sys
+table, path = sys.argv[1], sys.argv[2]
+NAMED = {ord("b"): 8, ord("f"): 12, ord("n"): 10, ord("r"): 13,
+         ord("t"): 9, ord("v"): 11, ord("\\"): 92}
+HEX = b"0123456789abcdefABCDEF"
+def decode(field):
+    """COPY text decode mirroring mb-import-validate; None will poison."""
+    out = bytearray()
+    i, n = 0, len(field)
+    while i < n:
+        b = field[i]
+        if b != 92:
+            if b == 13:
+                return None
+            out.append(b)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            return None
+        c = field[i]
+        if c in NAMED:
+            out.append(NAMED[c])
+            i += 1
+        elif 48 <= c <= 55:
+            j = i
+            while j < n and j - i < 3 and 48 <= field[j] <= 55:
+                j += 1
+            if int(field[i:j], 8) > 255:
+                return None
+            out.append(int(field[i:j], 8))
+            i = j
+        elif c == 120:
+            j = i + 1
+            while j < n and j - i - 1 < 2 and field[j] in HEX:
+                j += 1
+            if j == i + 1:
+                return None
+            out.append(int(field[i + 1:j], 16))
+            i = j
+        else:
+            return None
+    if 0 in out:
+        return None
+    try:
+        return bytes(out).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+def uuid_key(token):
+    parts = token.split("-")
+    if [len(p) for p in parts] != [8, 4, 4, 4, 12]:
+        return None
+    if any(c not in "0123456789abcdefABCDEF" for p in parts for c in p):
+        return None
+    return token.lower()
+def position_key(token):
+    """Canonical medium/track position, or None when it cannot validate.
+
+    Mirrors FieldKind::Position (non-negative i16): the validator poisons
+    anything else, and poison rows never reach the table, so only loadable
+    positions participate in duplicate detection. Keep in step with the
+    schema if the position type ever widens.
+    """
+    digits = token[1:] if token[:1] in ("+", "-") else token
+    if not digits or any(c not in "0123456789" for c in digits):
+        return None
+    try:
+        n = int(token)
+    except ValueError:
+        return None
+    if n < 0 or n > 32767:
+        return None
+    return str(n)
+batch = []
+def flush():
+    if batch:
+        sys.stdout.write("".join(key + "\n" for key in batch))
+        batch.clear()
+with open(path, "rb") as f:
+    # Stream line by line with bounded batches: multi-million-line dumps
+    # must never sit wholly in memory beside their decoded key list.
+    for raw in f:
+        # One trailing newline ends the line; it is not key content (awk
+        # reads the same way), while a missing one still yields the tail.
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        if table == "track":
+            fields = raw.split(b"\t")
+            if len(fields) < 4:
+                continue
+            release = decode(fields[0])
+            medium = decode(fields[2])
+            number = decode(fields[3])
+            if release is None or medium is None or number is None:
+                continue
+            release = uuid_key(release)
+            medium = position_key(medium)
+            number = position_key(number)
+            if release is None or medium is None or number is None:
+                continue
+            batch.append(release + "/" + medium + "/" + number)
+        else:
+            first = decode(raw.split(b"\t", 1)[0])
+            if first is None:
+                continue
+            key = uuid_key(first)
+            if key is None:
+                continue
+            batch.append(key)
+        if len(batch) >= 8192:
+            flush()
+flush()
+EOF
+    echo "import: duplicate-key pre-check failed for $table ($tsv)" >&2
+    exit 1
   fi
   uniq -d "$work/mbids.sorted" >"$work/mbids.duplicates"
   if [[ -s "$work/mbids.duplicates" ]]; then
@@ -421,11 +560,8 @@ done
 # untouched so the cursor never rewinds. Unset DUMP_SEQ leaves state
 # untouched (fresh DBs stay at the migration seed 0); the operator then
 # seeds last_packet before replication.
+# DUMP_SEQ was normalized and range-checked before the first write.
 if [[ -n "${DUMP_SEQ:-}" ]]; then
-  if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
-    echo "import: refusing non-integer DUMP_SEQ '$DUMP_SEQ'" >&2
-    exit 1
-  fi
   current_last_packet="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
   if [[ ! "$current_last_packet" =~ ^[0-9]+$ ]]; then
     echo "import: unexpected last_packet '$current_last_packet' in mb_import_state" >&2

@@ -18,6 +18,8 @@ export type FetchFn = typeof fetch;
 export interface ApiClientOptions {
 	baseUrl: string;
 	fetchFn?: FetchFn;
+	/** Optional lifetime for requests owned by a mounted component. */
+	signal?: AbortSignal;
 }
 
 export class ApiError extends Error {
@@ -143,6 +145,33 @@ export interface ProviderTestResult {
 	ok: boolean;
 	latencyMs?: number;
 	error?: string;
+}
+
+/** Redacted vault metadata only; never return credentials or endpoint details. */
+export interface SavedProviderSummary {
+	provider_configured: boolean;
+	indexer_configured: boolean;
+	/** Unix seconds, or zero when no configuration is stored. */
+	updated_at: number;
+}
+
+function validateSavedProviderSummary(data: unknown, status: number): SavedProviderSummary {
+	if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+		throw vaultTestShapeFailure(status);
+	}
+	const record = data as Record<string, unknown>;
+	if (
+		typeof record.provider_configured !== 'boolean' ||
+		typeof record.indexer_configured !== 'boolean' ||
+		!isFiniteNonNegativeNumber(record.updated_at)
+	) {
+		throw vaultTestShapeFailure(status);
+	}
+	return {
+		provider_configured: record.provider_configured,
+		indexer_configured: record.indexer_configured,
+		updated_at: record.updated_at
+	};
 }
 
 function isFiniteNonNegativeNumber(value: unknown): value is number {
@@ -295,13 +324,63 @@ export function toLoginFinishBody(input: LoginFinishInput): Record<string, strin
 	};
 }
 
+/**
+ * Inputs for native-REST credential issuance. Pages pass camelCase fields
+ * and the builder emits the snake_case wire body the Worker parses
+ * (`deny_unknown_fields`). Wire shapes are pinned by
+ * `api-web-contract.json`.
+ */
+export interface CredentialsMintInput {
+	label?: string;
+	scopes: string[];
+	ttlSecs: number;
+}
+
+export function toCredentialsMintBody(input: CredentialsMintInput): Record<string, unknown> {
+	return {
+		...(input.label !== undefined ? { label: input.label } : {}),
+		scopes: input.scopes,
+		ttl_secs: input.ttlSecs
+	};
+}
+
+/**
+ * The one and only time the plaintext secret exists outside the client's
+ * hands: this 201 body. Callers must display it once and never store it.
+ */
+export interface MintedCredential {
+	id: string;
+	secret: string;
+	key_prefix: string;
+	scopes: string[];
+	expires_at: number;
+}
+
+/** One listed credential: routing and lifecycle facts only, never a secret. */
+export interface ListedCredential {
+	id: string;
+	label: string;
+	key_prefix: string;
+	scopes: string[];
+	created_at: number;
+	expires_at: number;
+	revoked_at: number | null;
+	last_used_at: number | null;
+}
+
+export interface CredentialsList {
+	credentials: ListedCredential[];
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
+	private readonly signal?: AbortSignal;
 	private token: string | null = null;
 
-	constructor({ baseUrl, fetchFn }: ApiClientOptions) {
+	constructor({ baseUrl, fetchFn, signal }: ApiClientOptions) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
+		this.signal = signal;
 		// Default to a wrapper (not a bare `fetch` reference): calling a stored
 		// `fetch` as `this.fetchFn(...)` sets `this` to the client instance and
 		// browsers/workerd reject it with "Illegal invocation".
@@ -317,10 +396,15 @@ export class ApiClient {
 	}
 
 	async post<T>(path: string, body: unknown): Promise<T> {
+		return this.postWithSignal<T>(path, body);
+	}
+
+	private async postWithSignal<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
 		return this.request<T>(path, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(body)
+			body: JSON.stringify(body),
+			signal
 		});
 	}
 
@@ -336,8 +420,8 @@ export class ApiClient {
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
 	 */
-	async requestMagicLink(email: string): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>('/v1/auth/magic/start', { email });
+	async requestMagicLink(email: string, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>('/v1/auth/magic/start', { email }, signal);
 	}
 
 	/** Redeem an emailed magic-link token (the `/auth/magic` page). */
@@ -363,27 +447,50 @@ export class ApiClient {
 	}
 
 	/**
+	 * Mint a native-REST bearer credential. Session-authenticated with a
+	 * fresh-session step-up; the 201 body carries the one-time secret, so
+	 * callers display it once and never store it.
+	 */
+	async mintCredential(input: CredentialsMintInput): Promise<MintedCredential> {
+		return this.post<MintedCredential>('/v1/credentials', toCredentialsMintBody(input));
+	}
+
+	/** List the account's native-REST credentials (lifecycle facts, no secrets). */
+	async listCredentials(): Promise<CredentialsList> {
+		return this.get<CredentialsList>('/v1/credentials');
+	}
+
+	/** Revoke one native-REST credential by id (owner-scoped, idempotent). */
+	async revokeCredential(id: string): Promise<{ ok: true }> {
+		return this.request<{ ok: true }>(`/v1/credentials/${encodeURIComponent(id)}`, {
+			method: 'DELETE'
+		});
+	}
+
+	/**
 	 * Start passkey enrollment; the API also mails the inbox-proof code. The
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string): Promise<RegisterStartResponse> {
+	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateRegisterStart(data, status);
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
-	async registerFinish(input: RegisterFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/register/finish',
-			toRegisterFinishBody(input)
+			toRegisterFinishBody(input),
+			signal
 		);
 	}
 
@@ -391,23 +498,25 @@ export class ApiClient {
 	 * Start passkey login for an email (empty allow-list response). The
 	 * success body is shape-checked before it returns, as in `registerStart`.
 	 */
-	async loginStart(email: string): Promise<LoginStartResponse> {
+	async loginStart(email: string, signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/login/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email })
+				body: JSON.stringify({ email }),
+				signal
 			}
 		);
 		return validateLoginStart(data, status);
 	}
 
 	/** Finish passkey login with the assertion. */
-	async loginFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
+	async loginFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.postWithSignal<MagicLinkResult>(
 			'/v1/auth/passkey/login/finish',
-			toLoginFinishBody(input)
+			toLoginFinishBody(input),
+			signal
 		);
 	}
 
@@ -415,10 +524,11 @@ export class ApiClient {
 	 * Start a passkey proof bound to the currently authenticated session. The
 	 * success body carries the login-start shape and is checked the same way.
 	 */
-	async reauthenticateStart(): Promise<LoginStartResponse> {
+	async reauthenticateStart(signal?: AbortSignal): Promise<LoginStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/session/reauthenticate/start',
 			{
+				signal,
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({})
@@ -428,34 +538,78 @@ export class ApiClient {
 	}
 
 	/** Complete proof-bound reauthentication without affecting ordinary login. */
-	async reauthenticateFinish(input: LoginFinishInput): Promise<MagicLinkResult> {
-		return this.post<MagicLinkResult>(
-			'/v1/session/reauthenticate/finish',
-			toLoginFinishBody(input)
-		);
+	async reauthenticateFinish(input: LoginFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/session/reauthenticate/finish', {
+			method: 'POST',
+			signal,
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toLoginFinishBody(input))
+		});
+	}
+
+	/** Read a validated, allowlisted summary of the saved vault. */
+	async getSavedProviderSummary(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'GET', signal
+		});
+		return validateSavedProviderSummary(data, status);
+	}
+
+	/** Reachability only, not provider authentication. An empty body selects the stored vault. */
+	async testSavedProviderConnection(signal?: AbortSignal): Promise<ProviderTestResult> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
+			method: 'POST', signal
+		});
+		return validateVaultTestResult(data, status);
+	}
+
+	/** No automatic retries: only a validated both-false summary proves removal. */
+	async deleteSavedProviderConfig(signal?: AbortSignal): Promise<SavedProviderSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault', {
+			method: 'DELETE', signal
+		});
+		const summary = validateSavedProviderSummary(data, status);
+		if (summary.provider_configured || summary.indexer_configured) {
+			throw vaultTestShapeFailure(status);
+		}
+		return summary;
 	}
 
 	/**
 	 * Live-test a provider (+ optional indexer) config without storing it.
 	 * The API validates (SSRF guard), dials, and returns a redacted result —
-	 * secrets never come back in the response.
+	 * secrets never come back in the response. The optional caller signal
+	 * lets the owning page fence a stale test: a pre-aborted signal sends no
+	 * request, and a response that arrives after abort — including a limit
+	 * response — rejects as an abort instead of publishing a paywall.
 	 */
-	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
+	async testProviderConnection(
+		input: ProviderTestInput,
+		retry?: () => void,
+		signal?: AbortSignal
+	): Promise<ProviderTestResult> {
 		const { data, status } = await this.requestWithStatus<unknown>('/v1/vault/test', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify(toVaultSaveBody(input))
-		});
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
+		}, retry);
 		return validateVaultTestResult(data, status);
 	}
 
 	/**
 	 * Store a tested provider (+ optional indexer) config in the encrypted
 	 * vault. The API seals secrets with envelope encryption; responses are
-	 * redacted summaries, never secret material.
+	 * redacted summaries, never secret material. The optional caller signal
+	 * fences a stale save the same way as the connection test above.
 	 */
-	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
-		return this.put<MagicLinkResult>('/v1/vault', toVaultSaveBody(input));
+	async saveProviderConfig(input: ProviderTestInput, signal?: AbortSignal): Promise<MagicLinkResult> {
+		return this.request<MagicLinkResult>('/v1/vault', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(toVaultSaveBody(input)),
+			signal
+		});
 	}
 
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
@@ -464,7 +618,8 @@ export class ApiClient {
 
 	private async requestWithStatus<T>(
 		path: string,
-		init: RequestInit
+		init: RequestInit,
+		retry?: () => void
 	): Promise<{ data: T; status: number }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -476,7 +631,8 @@ export class ApiClient {
 		// auth/vault spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
-		const callerSignal = init.signal as AbortSignal | null | undefined;
+		const callerSignal = init.signal ?? this.signal;
+		callerSignal?.throwIfAborted();
 		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
 		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
 		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
@@ -486,12 +642,15 @@ export class ApiClient {
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
+			callerSignal?.throwIfAborted();
 			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			// A transport may ignore abort; never publish an abandoned response.
+			callerSignal?.throwIfAborted();
 			if (!response.ok) {
 				// Read once (capped at 1 MiB) so the paywall and typed error
 				// share the structured contract.
@@ -512,12 +671,15 @@ export class ApiClient {
 					}
 					/* non-JSON error body: use status-based defaults */
 				}
+				callerSignal?.throwIfAborted();
 				const parsed = parseErrorBody(body, response.status);
-				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
+				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body }, retry);
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
-				return { data: (await readCappedJson(response)) as T, status: response.status };
+				const data = (await readCappedJson(response)) as T;
+				callerSignal?.throwIfAborted();
+				return { data, status: response.status };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never

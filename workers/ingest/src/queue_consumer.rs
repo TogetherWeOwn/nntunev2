@@ -62,14 +62,17 @@
 //! [`crate::verify`] over [`crate::pool_body`] and the scratch bucket),
 //! `Repairing` (the repair Worker through the `REPAIR_CONTAINER`
 //! service binding, fed by verify's staged inputs and returning to
-//! `Verifying`), and `Matching`/`Writing` are executable. Indexer
+//! `Verifying`), `Transcoding` (the transcode Worker through the
+//! `TRANSCODE_CONTAINER` service binding, publishing artifacts to
+//! the audio bucket plus `cache_objects`), and `Matching`/`Writing`
+//! are executable. Indexer
 //! search (hence probing for search-sourced jobs) has no executable
 //! consumer wiring yet, so those states settle as transient failures
 //! through the shared retry budget. The consumer therefore stays
 //! disabled in `wrangler.toml.example` until that boundary lands.
 
 use futures_util::{Stream, StreamExt};
-use worker::{console_log, Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
+use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::dispatch::{
     content_sha256_hex, make_job_id, validate_user_id, INGEST_QUEUE_BINDING, PAYLOAD_KEY_PREFIX,
@@ -86,11 +89,11 @@ use crate::pool_probe::{call_pool_probe, check_outcome, PoolProbeError};
 use crate::probe::{
     apply_probe_batch, build_probe_request_with_ranges, ProbeOutcome, ProbeRequest, ProbeTally,
 };
-use crate::queue::{validate_indexer_ref, QueueMsg};
+use crate::queue::{validate_indexer_ref, validate_provider_id, QueueMsg};
 use crate::retry::{
     decide_checkpoint, Disposition, DlqEntry, JobError, DLQ_QUEUE_BINDING, ERR_MATCH_FAILED,
     ERR_PARSE_FAILED, ERR_PAYLOAD_MISSING, ERR_PROBE_FAILED, ERR_REPAIR_FAILED, ERR_SEARCH_FAILED,
-    ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
+    ERR_TRANSCODE_FAILED, ERR_VERIFY_FAILED, ERR_WRITE_FAILED,
 };
 use crate::verify::{
     BodySource, ScratchStore, StagedFile, VerifyCaps, VerifyError, VerifyOutcome, VerifyProgress,
@@ -157,6 +160,15 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     }
     if msg.state != JobState::Queued || msg.attempt != 1 || msg.repair_rounds != 0 {
         return Err("invalid initial queue state");
+    }
+    // Attribution is optional but shape-pinned: a malformed id must fail
+    // closed here, never ride into the grant publication later. Checked
+    // before the per-source identity comparisons so both sources report
+    // the same cause.
+    if let Some(provider_id) = msg.provider_id.as_deref() {
+        if !validate_provider_id(provider_id) {
+            return Err("invalid provider id");
+        }
     }
 
     match msg.source {
@@ -237,6 +249,7 @@ fn unavailable_code(state: JobState) -> &'static str {
         JobState::Verifying => ERR_VERIFY_FAILED,
         JobState::Repairing => ERR_REPAIR_FAILED,
         JobState::Matching => ERR_MATCH_FAILED,
+        JobState::Transcoding => ERR_TRANSCODE_FAILED,
         JobState::Writing => ERR_WRITE_FAILED,
         _ => ERR_PROBE_FAILED,
     }
@@ -486,13 +499,23 @@ async fn load_upload_parse(
         {
             Ok(Some(payload)) => payload,
             Ok(None) => return Err(unavailable()),
-            Err(error) => {
-                console_log!("ingest payload read failed: {:?}", error);
+            Err(_) => {
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                    "ingest.payload.read_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 return Err(unavailable());
             }
         },
-        Err(error) => {
-            console_log!("ingest payload binding unavailable: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.payload.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(unavailable());
         }
     };
@@ -530,6 +553,8 @@ async fn load_upload_parse(
 /// persisted checkpoint; other state-advancing steps settle
 /// transiently so the next delivery runs the next state. `Repairing`
 /// dispatches to the repair Worker (see [`run_repair_step`]).
+/// `Transcoding` encodes one recorded input through the transcode
+/// Worker and publishes the artifact (see [`run_transcode_step`]).
 /// `Matching`/`Writing` run for real ([`run_match_write`]). Every
 /// other non-terminal state (including `Probing` for search-sourced
 /// jobs, whose NZB bytes do not exist until the search step is wired)
@@ -540,6 +565,9 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
     }
     if cp.state == JobState::Repairing {
         return run_repair_step(env, cp).await;
+    }
+    if cp.state == JobState::Transcoding {
+        return run_transcode_step(env, msg, cp).await;
     }
     if matches!(cp.state, JobState::Matching | JobState::Writing) {
         return run_match_write(env, msg, cp).await;
@@ -681,15 +709,6 @@ fn apply_verify_outcome(
             // reads "over cap" here, not "provider lost it" — and no
             // `decide_repair` dispatch is spent on either arm.
             if size_refused_blocks > 0 {
-                // Worker-only line (`console_log!` aborts off-wasm):
-                // the terminal reason below already distinguishes the
-                // refusal class on every target.
-                #[cfg(target_arch = "wasm32")]
-                console_log!(
-                    "ingest verify unrecoverable: size-refused damage is terminal job={} refused={}",
-                    msg.job_id,
-                    size_refused_blocks
-                );
                 return Err(JobError::permanent(
                     ERR_VERIFY_FAILED,
                     "release has size-refused blocks beyond repair",
@@ -727,8 +746,13 @@ async fn run_verifying(
 ) -> Result<(), JobError> {
     let loaded = match crate::checkpoint::get_verify(env, &msg.job_id).await {
         Ok(loaded) => loaded,
-        Err(error) => {
-            console_log!("ingest verify progress read failed: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.verify_progress.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(JobError::transient(
                 ERR_VERIFY_FAILED,
                 "verify progress unavailable",
@@ -747,8 +771,13 @@ async fn run_verifying(
     };
     let bucket = match env.bucket(SCRATCH_BINDING) {
         Ok(bucket) => bucket,
-        Err(error) => {
-            console_log!("ingest scratch binding unavailable: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.scratch.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Err(JobError::transient(
                 ERR_VERIFY_FAILED,
                 "scratch storage unavailable",
@@ -789,15 +818,61 @@ async fn run_verifying(
     // Persist progress before the checkpoint settlement so a crash
     // between the two writes resumes from the older state with the
     // newer progress (scratch adoption covers a lost progress write).
-    if let Err(error) = crate::checkpoint::put_verify(env, &msg.job_id, &progress).await {
-        console_log!("ingest verify progress write failed: {:?}", error);
+    if crate::checkpoint::put_verify(env, &msg.job_id, &progress)
+        .await
+        .is_err()
+    {
+        crate::emit(
+            nntune_logging::Level::Error,
+            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+            "ingest.verify_progress.write_failed",
+            serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+        );
         return Err(JobError::transient(
             ERR_VERIFY_FAILED,
             "verify progress unavailable",
         ));
     }
+    // A completed round records its transcode inputs before the
+    // checkpoint leaves `Verifying`: the `Transcoding` step runs
+    // deliveries later with only the checkpoint to go on. Recording
+    // failures are corrupt progress or pipeline bugs (never a
+    // retryable remote fault), so they fail permanently here with
+    // the selection's reason intact.
+    if matches!(outcome, Ok(VerifyOutcome::Complete)) {
+        if let Err(reason) = crate::transcode::record_transcode_inputs(
+            cp,
+            files,
+            &progress.staged,
+            &msg.job_id,
+            round,
+        ) {
+            return Err(JobError::permanent(ERR_VERIFY_FAILED, reason));
+        }
+    }
     match outcome {
-        Ok(outcome) => apply_verify_outcome(msg, cp, outcome, made_progress),
+        Ok(outcome) => {
+            // Log at the edge, where build identity is available; keep the
+            // outcome-to-state mapping pure on both native and wasm targets.
+            if let VerifyOutcome::Unrecoverable {
+                size_refused_blocks,
+                ..
+            } = &outcome
+            {
+                if *size_refused_blocks > 0 {
+                    crate::emit(
+                        nntune_logging::Level::Error,
+                        &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                        "ingest.verify.size_refused_terminal",
+                        serde_json::json!({
+                            "build_sha": crate::build_sha_from_env(env),
+                            "size_refused_blocks": size_refused_blocks,
+                        }),
+                    );
+                }
+            }
+            apply_verify_outcome(msg, cp, outcome, made_progress)
+        }
         Err(VerifyError::Transient(detail)) => Err(JobError::transient(ERR_VERIFY_FAILED, detail)),
         Err(VerifyError::Permanent(detail)) => Err(JobError::permanent(ERR_VERIFY_FAILED, detail)),
     }
@@ -1055,8 +1130,13 @@ async fn load_payload_for_match(env: &Env, msg: &QueueMsg) -> Result<Option<Stri
         .cache_ttl(PAYLOAD_CACHE_TTL_SECS)
         .text()
         .await
-        .map_err(|error| {
-            console_log!("ingest match payload read failed: {:?}", error);
+        .map_err(|_| {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.match_payload.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             transient("upload payload unavailable")
         })
 }
@@ -1291,6 +1371,7 @@ trait MatchWriteRuntime {
 /// the Hyperdrive library upsert.
 struct EdgeMatchWrite<'a> {
     env: &'a Env,
+    trace_id: &'a str,
 }
 
 impl MatchWriteRuntime for EdgeMatchWrite<'_> {
@@ -1303,47 +1384,70 @@ impl MatchWriteRuntime for EdgeMatchWrite<'_> {
     }
 
     async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError> {
-        let client = crate::library_db_client(self.env)
-            .await
-            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "library database unavailable"))?;
-        let params = crate::library::upsert_params(write);
-        let affected = client
-            .execute(
-                crate::library::upsert_library_sql(),
-                &[
-                    &params.job_id,
-                    &params.user_id,
-                    &params.idempotency_key,
-                    &params.release_mbid,
-                    &params.recording_mbids,
-                ],
-            )
-            .await
-            .map_err(|error| {
-                // Log the SQLSTATE only (never connection detail) and fail
-                // fast on deterministic classes: a schema mismatch such as
-                // the not-yet-migrated `library` table (42P01/42P10) must
-                // quarantine with an accurate reason, not burn the retry
-                // budget as "unavailable".
-                let sqlstate = error.as_db_error().map(|db| db.code().code());
-                console_log!(
-                    "ingest library upsert failed: sqlstate={}",
-                    sqlstate.unwrap_or("none")
-                );
-                if crate::library::is_deterministic_sqlstate(sqlstate) {
-                    JobError::permanent(ERR_WRITE_FAILED, "library database schema mismatch")
-                } else {
-                    JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
-                }
-            })?;
-        // The statement is fenced on the owner's users row: 0 affected
-        // rows means the account is being deleted. Fail permanently with
-        // the stable code — a fenced writer never queues behind the
-        // delete, and the (already-metered) match work must not settle
-        // as a phantom Done for a row that was never written. The mapping
-        // lives in [`crate::library::upsert_job_result`] (pinned there),
-        // so this arm stays a forward.
-        crate::library::upsert_job_result(affected)
+        // One deadline spans the connect plus the upsert: a stalled
+        // write expires to the same detail-free transient error a
+        // refused write returns, with the SQLSTATE fast-fail and the
+        // fenced row-count mapping kept inside the raced operation.
+        crate::library::with_db_deadline(
+            async {
+                let client = crate::library_db_client(self.env, self.trace_id)
+                    .await
+                    .map_err(|()| {
+                        JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                    })?;
+                let params = crate::library::upsert_params(write);
+                let affected = client
+                    .execute(
+                        crate::library::upsert_library_sql(),
+                        &[
+                            &params.job_id,
+                            &params.user_id,
+                            &params.idempotency_key,
+                            &params.release_mbid,
+                            &params.recording_mbids,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        // Log the SQLSTATE only (never connection detail) and fail
+                        // fast on deterministic classes: a schema mismatch such as
+                        // the not-yet-migrated `library` table (42P01/42P10) must
+                        // quarantine with an accurate reason, not burn the retry
+                        // budget as "unavailable".
+                        let sqlstate = error.as_db_error().map(|db| db.code().code());
+                        crate::emit(
+                            nntune_logging::Level::Error,
+                            self.trace_id,
+                            "ingest.library.upsert_failed",
+                            serde_json::json!({
+                                "build_sha": crate::build_sha_from_env(self.env),
+                                "sqlstate": sqlstate.unwrap_or("none"),
+                            }),
+                        );
+                        if crate::library::is_deterministic_sqlstate(sqlstate) {
+                            JobError::permanent(
+                                ERR_WRITE_FAILED,
+                                "library database schema mismatch",
+                            )
+                        } else {
+                            JobError::transient(ERR_WRITE_FAILED, "library database unavailable")
+                        }
+                    })?;
+                // The statement is fenced on the owner's users row: 0 affected
+                // rows means the account is being deleted. Fail permanently with
+                // the stable code — a fenced writer never queues behind the
+                // delete, and the (already-metered) match work must not settle
+                // as a phantom Done for a row that was never written. The mapping
+                // lives in [`crate::library::upsert_job_result`] (pinned there),
+                // so this arm stays a forward.
+                crate::library::upsert_job_result(affected)
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || JobError::transient(ERR_WRITE_FAILED, "library database unavailable"),
+        )
+        .await
     }
 }
 
@@ -1372,12 +1476,16 @@ async fn execute_write_with<R: MatchWriteRuntime>(
     Ok(())
 }
 
-/// `Matching` + `Writing` in one delivery: resolve the match, meter
-/// `match`, advance, and write. Metering happens *before* each advance,
-/// so a meter failure retries the same state (re-resolving is idempotent)
-/// instead of dropping the event. A delivery that enters in `Writing`
-/// (checkpoint persisted after the match transition) re-resolves and
-/// writes without re-emitting `match`.
+/// `Matching`, then `Writing` once `Transcoding` has run: resolve the
+/// match, meter `match`, and advance. Metering happens *before* the
+/// advance, so a meter failure retries the same state (re-resolving is
+/// idempotent) instead of dropping the event. A delivery that enters in
+/// `Matching` ends after the advance: the transcode service call (up to
+/// 660 s) cannot share this delivery's budget, so the checkpoint —
+/// now `Transcoding` — settles as progress and the artifact step runs
+/// next. A delivery that enters in `Writing` (checkpoint persisted
+/// after the transcode transition) re-resolves and writes without
+/// re-emitting `match`.
 async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
@@ -1390,6 +1498,11 @@ async fn run_match_write_with<R: MatchWriteRuntime>(
             .await
             .map_err(|()| JobError::transient(ERR_MATCH_FAILED, "meter write unavailable"))?;
         advance_checkpoint(cp, false);
+        debug_assert_eq!(cp.state, JobState::Transcoding);
+        return Err(JobError::progress(
+            ERR_TRANSCODE_FAILED,
+            "transcoding pending",
+        ));
     }
     execute_write_with(runtime, msg, cp, &write).await
 }
@@ -1399,7 +1512,361 @@ async fn run_match_write(
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
 ) -> Result<(), JobError> {
-    run_match_write_with(&EdgeMatchWrite { env }, msg, cp).await
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    run_match_write_with(
+        &EdgeMatchWrite {
+            env,
+            trace_id: &trace_id,
+        },
+        msg,
+        cp,
+    )
+    .await
+}
+
+/// `Transcoding` edge dependencies, split for tests: the front call,
+/// scratch artifact fetch, audio-bucket put, blob-row publication,
+/// meter, config and clock. Every method is neutral (no job codes);
+/// the step owns all error mapping so it is unit-tested through the
+/// fake below.
+trait TranscodeRuntime {
+    async fn call_front(
+        &self,
+        req: &crate::transcode::TranscodeRequest,
+    ) -> crate::transcode::TranscodeCall;
+    async fn fetch_artifact(
+        &self,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::transcode::ArtifactFetchError>;
+    async fn put_audio(&self, key: &str, bytes: Vec<u8>) -> Result<(), ()>;
+    async fn publish_cache_object(
+        &self,
+        publication: &crate::transcode::TranscodePublication,
+    ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError>;
+    async fn meter_transcode(&self, msg: &QueueMsg) -> Result<(), ()>;
+    fn audio_bucket(&self) -> Result<String, ()>;
+    fn now_unix_secs(&self) -> i64;
+}
+
+/// Edge [`TranscodeRuntime`]: transcode service binding, scratch and
+/// audio R2 buckets, Hyperdrive blob-row write, Analytics Engine
+/// meter, and the worker clock.
+struct EdgeTranscode<'a> {
+    env: &'a Env,
+    trace_id: &'a str,
+}
+
+impl TranscodeRuntime for EdgeTranscode<'_> {
+    async fn call_front(
+        &self,
+        req: &crate::transcode::TranscodeRequest,
+    ) -> crate::transcode::TranscodeCall {
+        crate::transcode::call_transcode(self.env, req).await
+    }
+
+    async fn fetch_artifact(
+        &self,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::transcode::ArtifactFetchError> {
+        use crate::transcode::ArtifactFetchError;
+
+        let bucket = match self.env.bucket(SCRATCH_BINDING) {
+            Ok(bucket) => bucket,
+            Err(_) => return Err(ArtifactFetchError::Transport),
+        };
+        let object = match bucket.get(key.to_string()).execute().await {
+            Ok(object) => object,
+            Err(_) => return Err(ArtifactFetchError::Transport),
+        };
+        let Some(object) = object else {
+            return Err(ArtifactFetchError::Missing);
+        };
+        if object.size() > crate::transcode::MAX_ARTIFACT_BYTES {
+            return Err(ArtifactFetchError::Oversize);
+        }
+        let Some(body) = object.body() else {
+            return Err(ArtifactFetchError::Missing);
+        };
+        body.bytes()
+            .await
+            .map_err(|_| ArtifactFetchError::Transport)
+    }
+
+    async fn put_audio(&self, key: &str, bytes: Vec<u8>) -> Result<(), ()> {
+        let bucket = match self.env.bucket(crate::transcode::AUDIO_PUBLISH_BINDING) {
+            Ok(bucket) => bucket,
+            Err(_) => return Err(()),
+        };
+        bucket
+            .put(key.to_string(), bytes)
+            .execute()
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    async fn publish_cache_object(
+        &self,
+        publication: &crate::transcode::TranscodePublication,
+    ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError> {
+        use crate::transcode::PublishError;
+
+        // One deadline spans the connect plus the write (same shape as
+        // the library upsert): expiry, refusal and transport failure
+        // are all the same transient verdict, with the SQLSTATE
+        // fast-fail and the affected-row mapping kept inside.
+        crate::library::with_db_deadline(
+            async {
+                let client = crate::library_db_client(self.env, self.trace_id)
+                    .await
+                    .map_err(|()| PublishError::Transient)?;
+                let byte_size = i64::try_from(publication.byte_size)
+                    .map_err(|_| PublishError::Deterministic)?;
+                let affected = client
+                    .execute(
+                        crate::transcode::upsert_cache_object_sql(),
+                        &[
+                            &publication.content_hash,
+                            &byte_size,
+                            &publication.r2_bucket,
+                            &publication.r2_key,
+                            &publication.verified_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        // Log the SQLSTATE only (never connection detail):
+                        // a missing `cache_objects` table quarantines at
+                        // once instead of burning the delivery budget.
+                        let sqlstate = error.as_db_error().map(|db| db.code().code());
+                        crate::emit(
+                            nntune_logging::Level::Error,
+                            self.trace_id,
+                            "ingest.transcode.publish_failed",
+                            serde_json::json!({
+                                "build_sha": crate::build_sha_from_env(self.env),
+                                "sqlstate": sqlstate.unwrap_or("none"),
+                            }),
+                        );
+                        if crate::library::is_deterministic_sqlstate(sqlstate) {
+                            PublishError::Deterministic
+                        } else {
+                            PublishError::Transient
+                        }
+                    })?;
+                // The statement is unfenced with `ON CONFLICT DO
+                // NOTHING`: 0 rows is a converged replay, never a
+                // refusal. The mapping lives in
+                // [`crate::transcode::classify_cache_object_rows`]
+                // (pinned there), so this arm stays a forward.
+                Ok(crate::transcode::classify_cache_object_rows(affected))
+            },
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            )),
+            || PublishError::Transient,
+        )
+        .await
+    }
+
+    async fn meter_transcode(&self, msg: &QueueMsg) -> Result<(), ()> {
+        crate::try_meter(
+            self.env,
+            msg,
+            "transcode",
+            crate::metering::MeterOutcome::Ok,
+        )
+        .map_err(|_| ())
+    }
+
+    fn audio_bucket(&self) -> Result<String, ()> {
+        crate::audio_bucket_from_env(self.env).ok_or(())
+    }
+
+    fn now_unix_secs(&self) -> i64 {
+        (Date::now().as_millis() / 1000) as i64
+    }
+}
+
+/// Run the `Transcoding` step: encode the next recorded input through
+/// the transcode Worker, fetch the artifact from scratch, verify it,
+/// publish the bytes plus the content-global blob row, and advance
+/// the cursor — or to `Writing` past the last input. One input per
+/// delivery (the front call alone may take 660 s); redeliveries
+/// replay the cursor idempotently (the front memoises by staging id,
+/// the R2 put overwrites identical bytes, the blob upsert converges).
+/// Per-user rows stay unwired (see the transcode module docs): this
+/// step publishes bytes plus `cache_objects` only.
+async fn run_transcode_step_with<R: TranscodeRuntime>(
+    runtime: &R,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+) -> Result<(), JobError> {
+    use crate::transcode::{ArtifactFetchError, PublishError, TranscodeCall};
+
+    if cp.transcode_inputs.is_empty() {
+        return Err(JobError::permanent(
+            ERR_TRANSCODE_FAILED,
+            "no verified audio file to transcode",
+        ));
+    }
+    let Some(input) = cp.transcode_inputs.get(cp.transcode_next).cloned() else {
+        // Defensive converge: the cursor only reaches the end through
+        // the advance below, so a redelivery that finds it there
+        // replays the transition instead of stalling.
+        advance_checkpoint(cp, false);
+        return Err(JobError::progress(ERR_WRITE_FAILED, "writing pending"));
+    };
+    // The recorded key is the full staged object key; the request
+    // carries its trailing component (validated below — a derivation
+    // that ever disagrees fails closed as a pipeline bug, never as
+    // another job's bytes).
+    let input_key = input.key.rsplit('/').next().unwrap_or("");
+    let staging_id = match crate::transcode::derive_transcode_staging(
+        &input.sha256,
+        input_key,
+        &msg.job_id,
+        &input.scratch_prefix,
+    ) {
+        Ok(staging_id) => staging_id,
+        Err(reason) => return Err(JobError::permanent(ERR_TRANSCODE_FAILED, reason)),
+    };
+    let req = match crate::transcode::decide_transcode(
+        &msg.job_id,
+        &msg.user_id,
+        &msg.idempotency_key,
+        input_key,
+        &input.sha256,
+        &input.scratch_prefix,
+        &staging_id,
+    ) {
+        Ok(req) => req,
+        Err(reason) => return Err(JobError::permanent(ERR_TRANSCODE_FAILED, reason)),
+    };
+    let (artifact_sha256, byte_size) = match runtime.call_front(&req).await {
+        TranscodeCall::Completed {
+            artifact_sha256,
+            byte_size,
+        } => (artifact_sha256, byte_size),
+        TranscodeCall::Untranscodable => {
+            return Err(JobError::permanent(
+                ERR_TRANSCODE_FAILED,
+                "transcode front reported the input untranscodable",
+            ))
+        }
+        TranscodeCall::Retry => {
+            return Err(JobError::transient(
+                ERR_TRANSCODE_FAILED,
+                "transcode runtime unavailable",
+            ))
+        }
+    };
+    let artifact_key = format!("{}out/artifact.ogg", input.scratch_prefix);
+    let bytes = match runtime.fetch_artifact(&artifact_key).await {
+        Ok(bytes) => bytes,
+        Err(ArtifactFetchError::Missing | ArtifactFetchError::Transport) => {
+            return Err(JobError::transient(
+                ERR_TRANSCODE_FAILED,
+                "transcode artifact unavailable",
+            ))
+        }
+        Err(ArtifactFetchError::Oversize) => {
+            return Err(JobError::permanent(
+                ERR_TRANSCODE_FAILED,
+                "transcode artifact outside profile ceiling",
+            ))
+        }
+    };
+    if crate::transcode::verify_transcode_artifact(&bytes, &artifact_sha256, byte_size).is_err() {
+        return Err(JobError::permanent(
+            ERR_TRANSCODE_FAILED,
+            "transcode artifact failed verification",
+        ));
+    }
+    let r2_key = match nntune_core::transcode::artifact_r2_key(&artifact_sha256) {
+        Ok(key) => key,
+        Err(_) => {
+            return Err(JobError::permanent(
+                ERR_TRANSCODE_FAILED,
+                "transcode artifact hash outside key shape",
+            ))
+        }
+    };
+    let bucket = match runtime.audio_bucket() {
+        Ok(bucket) => bucket,
+        Err(()) => {
+            return Err(JobError::transient(
+                ERR_TRANSCODE_FAILED,
+                "audio bucket not configured",
+            ))
+        }
+    };
+    if runtime.put_audio(&r2_key, bytes).await.is_err() {
+        return Err(JobError::transient(
+            ERR_TRANSCODE_FAILED,
+            "audio publication unavailable",
+        ));
+    }
+    match runtime
+        .publish_cache_object(&crate::transcode::TranscodePublication {
+            content_hash: artifact_sha256,
+            byte_size,
+            r2_bucket: bucket,
+            r2_key,
+            verified_at: runtime.now_unix_secs(),
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(PublishError::Deterministic) => {
+            return Err(JobError::permanent(
+                ERR_TRANSCODE_FAILED,
+                "artifact publication rejected",
+            ))
+        }
+        Err(PublishError::Transient) => {
+            return Err(JobError::transient(
+                ERR_TRANSCODE_FAILED,
+                "artifact publication unavailable",
+            ))
+        }
+    }
+    // Meter before the cursor advance, so a meter failure retries the
+    // same input (front replay, R2 overwrite and converging upsert
+    // make the replay idempotent) instead of dropping the event.
+    if runtime.meter_transcode(msg).await.is_err() {
+        return Err(JobError::transient(
+            ERR_TRANSCODE_FAILED,
+            "meter transcode unavailable",
+        ));
+    }
+    cp.transcode_next += 1;
+    if cp.transcode_next >= cp.transcode_inputs.len() {
+        advance_checkpoint(cp, false);
+        Err(JobError::progress(ERR_WRITE_FAILED, "writing pending"))
+    } else {
+        Err(JobError::progress(
+            ERR_TRANSCODE_FAILED,
+            "transcoding pending",
+        ))
+    }
+}
+
+async fn run_transcode_step(
+    env: &Env,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+) -> Result<(), JobError> {
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    run_transcode_step_with(
+        &EdgeTranscode {
+            env,
+            trace_id: &trace_id,
+        },
+        msg,
+        cp,
+    )
+    .await
 }
 
 /// Decide one delivery's settlement and whether the mutated checkpoint
@@ -1447,14 +1914,19 @@ fn persist_retry_delay_ms(failed_attempts: u32) -> Option<u64> {
     }
 }
 
-async fn persist(env: &Env, cp: &JobCheckpoint) -> bool {
+async fn persist(env: &Env, cp: &JobCheckpoint, trace_id: &str) -> bool {
     let mut failed_attempts = 0;
     loop {
         match crate::checkpoint::put(env, cp).await {
             Ok(()) => return true,
-            Err(error) => {
+            Err(_) => {
                 failed_attempts += 1;
-                console_log!("ingest checkpoint write failed: {:?}", error);
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    trace_id,
+                    "ingest.checkpoint.write_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 match persist_retry_delay_ms(failed_attempts) {
                     Some(delay_ms) => {
                         worker::Delay::from(std::time::Duration::from_millis(delay_ms)).await;
@@ -1480,8 +1952,13 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
             cp
         }
         Ok(None) => crate::checkpoint::initial(msg),
-        Err(error) => {
-            console_log!("ingest checkpoint read failed: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.checkpoint.read_failed",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
         }
     };
@@ -1495,7 +1972,14 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
         Ok(())
     };
     let (must_persist, settlement) = plan_settlement(msg, &mut cp, step, step_ran);
-    if must_persist && !persist(env, &cp).await {
+    if must_persist
+        && !persist(
+            env,
+            &cp,
+            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+        )
+        .await
+    {
         return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
     }
     match settlement {
@@ -1532,30 +2016,50 @@ async fn send_continuation(env: &Env, msg: &QueueMsg) -> bool {
                 .await
             {
                 Ok(()) => true,
-                Err(error) => {
-                    console_log!("ingest continuation enqueue failed: {:?}", error);
+                Err(_) => {
+                    crate::emit(
+                        nntune_logging::Level::Error,
+                        &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                        "ingest.continuation.enqueue_failed",
+                        serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                    );
                     false
                 }
             }
         }
-        Err(error) => {
-            console_log!("ingest queue binding missing: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
+                "ingest.continuation.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             false
         }
     }
 }
 
-async fn send_to_dlq(env: &Env, entry: &DlqEntry) -> bool {
+async fn send_to_dlq(env: &Env, entry: &DlqEntry, trace_id: &str) -> bool {
     match env.queue(DLQ_QUEUE_BINDING) {
         Ok(queue) => match queue.send(entry.clone()).await {
             Ok(()) => true,
-            Err(error) => {
-                console_log!("ingest DLQ send failed: {:?}", error);
+            Err(_) => {
+                crate::emit(
+                    nntune_logging::Level::Error,
+                    trace_id,
+                    "ingest.dlq.send_failed",
+                    serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+                );
                 false
             }
         },
-        Err(error) => {
-            console_log!("ingest DLQ binding missing: {:?}", error);
+        Err(_) => {
+            crate::emit(
+                nntune_logging::Level::Error,
+                trace_id,
+                "ingest.dlq.binding_missing",
+                serde_json::json!({"build_sha": crate::build_sha_from_env(env)}),
+            );
             false
         }
     }
@@ -1609,7 +2113,7 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
         Settlement::Quarantine(entry) => {
             // Never ack on DLQ-send failure: the redelivery re-plans from
             // the persisted `Failed` checkpoint and retries the send.
-            if send_to_dlq(env, &entry).await {
+            if send_to_dlq(env, &entry, &trace_id).await {
                 raw.ack()
             } else {
                 retry_raw(&raw, UNPERSISTED_RETRY_SECS)
@@ -1660,6 +2164,18 @@ mod tests {
             build_upload_dispatch("user_01", crate::fixtures::SMALL_NZB).unwrap();
         incomplete_upload.payload_ref = None;
         assert!(validate_queue_msg(&incomplete_upload).is_err());
+    }
+
+    #[test]
+    fn malformed_provider_id_fails_validation() {
+        // provider_id rides the message as pool-fetch attribution (ingest
+        // never mints it); a malformed value must fail closed here rather
+        // than ride into a grant write later. Injected through JSON so the
+        // test also covers the wire shape, not just the struct field.
+        let mut value = serde_json::to_value(search_message()).unwrap();
+        value["provider_id"] = serde_json::json!("not-a-uuid");
+        let msg: QueueMsg = serde_json::from_value(value).unwrap();
+        assert_eq!(validate_queue_msg(&msg).unwrap_err(), "invalid provider id");
     }
 
     #[test]
@@ -1909,19 +2425,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_entry_meters_match_before_advancing_then_writes() {
+    async fn matching_entry_meters_match_then_yields_to_transcoding() {
         let msg = search_message();
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
-        run_match_write_with(&runtime, &msg, &mut cp)
+        // Matching no longer writes in the same delivery: the checkpoint
+        // advances to Transcoding and settles as progress (no attempt
+        // spent), so the artifact step runs next and the write waits
+        // for a post-transcode checkpoint.
+        let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
-            .expect("matching delivery succeeds");
-        assert_eq!(
-            runtime.calls(),
-            ["resolve", "meter:match", "upsert", "meter:write"]
-        );
-        assert_eq!(cp.state, JobState::Done);
+            .expect_err("matching delivery yields to transcoding");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert!(err.made_progress);
+        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        assert_eq!(cp.state, JobState::Transcoding);
     }
 
     #[tokio::test]
@@ -1965,6 +2485,366 @@ mod tests {
         assert!(err.transient);
         assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
         assert_eq!(cp.state, JobState::Writing);
+    }
+
+    /// Fake [`TranscodeRuntime`] with scripted outcomes, recording
+    /// every effect in call order so the
+    /// front-fetch-put-publish-meter sequencing is asserted, not just
+    /// prose.
+    struct FakeTranscode {
+        calls: std::cell::RefCell<Vec<&'static str>>,
+        front: crate::transcode::TranscodeCall,
+        artifact: Result<Vec<u8>, crate::transcode::ArtifactFetchError>,
+        put_ok: bool,
+        publish: Result<crate::transcode::PublishOutcome, crate::transcode::PublishError>,
+        meter_ok: bool,
+        bucket: Result<String, ()>,
+    }
+
+    impl FakeTranscode {
+        fn succeeding(front: crate::transcode::TranscodeCall, artifact: Vec<u8>) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                front,
+                artifact: Ok(artifact),
+                put_ok: true,
+                publish: Ok(crate::transcode::PublishOutcome::Published),
+                meter_ok: true,
+                bucket: Ok("nntunev2-audio-staging".to_string()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl TranscodeRuntime for FakeTranscode {
+        async fn call_front(
+            &self,
+            _req: &crate::transcode::TranscodeRequest,
+        ) -> crate::transcode::TranscodeCall {
+            self.calls.borrow_mut().push("front");
+            self.front.clone()
+        }
+
+        async fn fetch_artifact(
+            &self,
+            _key: &str,
+        ) -> Result<Vec<u8>, crate::transcode::ArtifactFetchError> {
+            self.calls.borrow_mut().push("fetch");
+            self.artifact.clone()
+        }
+
+        async fn put_audio(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), ()> {
+            self.calls.borrow_mut().push("put");
+            if self.put_ok {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+
+        async fn publish_cache_object(
+            &self,
+            _publication: &crate::transcode::TranscodePublication,
+        ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError> {
+            self.calls.borrow_mut().push("publish");
+            self.publish
+        }
+
+        async fn meter_transcode(&self, _msg: &QueueMsg) -> Result<(), ()> {
+            self.calls.borrow_mut().push("meter");
+            if self.meter_ok {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+
+        fn audio_bucket(&self) -> Result<String, ()> {
+            self.bucket.clone()
+        }
+
+        fn now_unix_secs(&self) -> i64 {
+            1_721_000_000
+        }
+    }
+
+    fn transcode_input(msg: &QueueMsg, index: usize) -> crate::transcode::TranscodeInput {
+        let component = format!("{index:04}-{}", "a".repeat(64));
+        crate::transcode::TranscodeInput {
+            file_index: index,
+            key: format!("ingest-scratch/{}/r1/in/{component}", msg.job_id),
+            sha256: "b".repeat(64),
+            size: 512,
+            scratch_prefix: format!("ingest-scratch/{}/r1/", msg.job_id),
+        }
+    }
+
+    fn transcoding_checkpoint(msg: &QueueMsg, inputs: usize) -> JobCheckpoint {
+        let mut cp = crate::checkpoint::initial(msg);
+        cp.state = JobState::Transcoding;
+        cp.transcode_inputs = (0..inputs)
+            .map(|index| transcode_input(msg, index))
+            .collect();
+        cp
+    }
+
+    fn completed_call_for(bytes: &[u8]) -> crate::transcode::TranscodeCall {
+        crate::transcode::TranscodeCall::Completed {
+            artifact_sha256: nntune_core::par2::scratch::sha256_hex(bytes),
+            byte_size: bytes.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn transcode_entry_publishes_one_input_then_yields() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 2);
+        let artifact = b"artifact-bytes".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("mid-list delivery yields for the next input");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert!(err.made_progress);
+        assert_eq!(
+            runtime.calls(),
+            ["front", "fetch", "put", "publish", "meter"]
+        );
+        assert_eq!(cp.transcode_next, 1);
+        assert_eq!(cp.state, JobState::Transcoding);
+    }
+
+    #[tokio::test]
+    async fn transcode_last_input_advances_to_writing() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let artifact = b"artifact-bytes".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("final input advances to writing");
+        assert_eq!(err.code, ERR_WRITE_FAILED);
+        assert!(err.transient);
+        assert!(err.made_progress);
+        assert_eq!(cp.transcode_next, 1);
+        assert_eq!(cp.state, JobState::Writing);
+    }
+
+    #[tokio::test]
+    async fn transcode_without_inputs_fails_permanent() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 0);
+        let artifact = b"artifact-bytes".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("no inputs is terminal");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(!err.transient);
+        assert!(runtime.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcode_front_verdicts_map_to_retry_or_terminal() {
+        use crate::transcode::TranscodeCall;
+
+        let msg = search_message();
+        let artifact = b"artifact-bytes".to_vec();
+        // Retry rides the shared attempt budget.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let runtime = FakeTranscode::succeeding(TranscodeCall::Retry, artifact.clone());
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("front retry is transient");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert_eq!(cp.transcode_next, 0);
+        // Untranscodable burns no further budget on these bytes.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let runtime = FakeTranscode::succeeding(TranscodeCall::Untranscodable, artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("untranscodable is terminal");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(!err.transient);
+    }
+
+    #[tokio::test]
+    async fn transcode_artifact_fetch_maps_missing_vs_oversize() {
+        use crate::transcode::ArtifactFetchError;
+
+        let msg = search_message();
+        let artifact = b"artifact-bytes".to_vec();
+        let front = completed_call_for(&artifact);
+        // A missing artifact may be scratch lag: transient.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime = FakeTranscode::succeeding(front.clone(), artifact.clone());
+        runtime.artifact = Err(ArtifactFetchError::Missing);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("missing artifact is transient");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        // An oversize object at the artifact key is deterministic
+        // corruption (only this pipeline writes there, always within
+        // the ceiling): permanent.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime = FakeTranscode::succeeding(front, artifact);
+        runtime.artifact = Err(ArtifactFetchError::Oversize);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("oversize artifact is terminal");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(!err.transient);
+    }
+
+    #[tokio::test]
+    async fn transcode_artifact_mismatch_is_terminal_before_any_publish() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        // The front completed for other bytes than the fetch returns.
+        let runtime = FakeTranscode::succeeding(
+            completed_call_for(b"claimed-bytes"),
+            b"fetched-bytes".to_vec(),
+        );
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("hash mismatch is terminal");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(!err.transient);
+        assert_eq!(runtime.calls(), ["front", "fetch"]);
+    }
+
+    #[tokio::test]
+    async fn transcode_publish_path_maps_each_failure() {
+        use crate::transcode::PublishError;
+
+        let msg = search_message();
+        let artifact = b"artifact-bytes".to_vec();
+        // Unconfigured bucket heals on redeploy: transient, before any put.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime =
+            FakeTranscode::succeeding(completed_call_for(&artifact), artifact.clone());
+        runtime.bucket = Err(());
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("missing bucket config is transient");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        assert_eq!(runtime.calls(), ["front", "fetch"]);
+        // R2 put failure: transient.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime =
+            FakeTranscode::succeeding(completed_call_for(&artifact), artifact.clone());
+        runtime.put_ok = false;
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("put failure is transient");
+        assert!(err.transient);
+        assert_eq!(runtime.calls(), ["front", "fetch", "put"]);
+        // Deterministic publication rejection quarantines at once.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime =
+            FakeTranscode::succeeding(completed_call_for(&artifact), artifact.clone());
+        runtime.publish = Err(PublishError::Deterministic);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("deterministic publish failure is terminal");
+        assert!(!err.transient);
+        // Transient publication failure rides the budget.
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        let mut runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        runtime.publish = Err(PublishError::Transient);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("transient publish failure retries");
+        assert!(err.transient);
+    }
+
+    #[tokio::test]
+    async fn transcode_meter_failure_retries_the_same_input() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 2);
+        let artifact = b"artifact-bytes".to_vec();
+        let mut runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        runtime.meter_ok = false;
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("meter failure must fail the step");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(err.transient);
+        // The cursor never advanced: redelivery replays the same
+        // input's idempotent publication instead of dropping the event.
+        assert_eq!(cp.transcode_next, 0);
+        assert_eq!(
+            runtime.calls(),
+            ["front", "fetch", "put", "publish", "meter"]
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_undecidable_input_fails_before_the_front_call() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        cp.transcode_inputs[0].key = format!("ingest-scratch/{}/r1/in/NOT-A-KEY", msg.job_id);
+        let artifact = b"artifact-bytes".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("undecidable input is terminal");
+        assert_eq!(err.code, ERR_TRANSCODE_FAILED);
+        assert!(!err.transient);
+        assert!(runtime.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcode_past_end_cursor_replays_the_transition() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        cp.transcode_next = 1;
+        let artifact = b"artifact-bytes".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .expect_err("past-end cursor converges");
+        assert_eq!(err.code, ERR_WRITE_FAILED);
+        assert!(err.made_progress);
+        assert_eq!(cp.state, JobState::Writing);
+        assert!(runtime.calls().is_empty());
+    }
+
+    #[test]
+    fn edge_publish_forwards_affected_rows_through_cache_object_classifier() {
+        // The 0-row to `Duplicate` mapping is pinned pure in
+        // `transcode::classify_cache_object_rows`; pin here that the
+        // edge arm forwards through it, so weakening the arm to
+        // `Ok(Published)` unconditionally fails here. Slice from the
+        // edge impl out of the pre-test source, so this test's own
+        // literal cannot satisfy the assertion.
+        let source = include_str!("queue_consumer.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let edge = production
+            .split_once("impl TranscodeRuntime for EdgeTranscode")
+            .expect("edge impl must exist")
+            .1;
+        let body = edge
+            .split_once("async fn publish_cache_object(")
+            .expect("edge publish must exist")
+            .1
+            .split_once("async fn meter_transcode")
+            .expect("meter_transcode must bound the edge publish")
+            .0;
+        assert!(
+            body.contains("classify_cache_object_rows(affected)"),
+            "edge publish must forward the affected-row count through classify_cache_object_rows"
+        );
     }
 
     #[test]

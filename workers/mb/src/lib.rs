@@ -27,6 +27,7 @@
 
 use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use serde::Serialize;
+use std::future::Future;
 
 mod api_error;
 use api_error::ApiError;
@@ -451,10 +452,34 @@ fn cache_control(ttl_s: u32) -> String {
     format!("public, max-age={ttl_s}")
 }
 
+/// Predicate form of the width helpers, shared by the lookup and
+/// recordings validators.
+type WidthCheck = fn(&serde_json::Number) -> bool;
+
+/// Cached integers must fit the fresh DTO's Rust width: `Release.year`
+/// and `Recording::{track_no, medium_no}` serialize `Option<i16>`, while
+/// `Recording::duration_ms` serializes `Option<i32>`. Anything outside the
+/// signed range — huge `u64`, extreme `i64`, fractions — is a miss. There
+/// is no positivity rule: negative and zero values the DTOs can emit stay
+/// hits.
+fn number_fits_i16(n: &serde_json::Number) -> bool {
+    n.as_i64()
+        .is_some_and(|v| v >= i64::from(i16::MIN) && v <= i64::from(i16::MAX))
+}
+
+/// Same cached/fresh width contract at the `i32` width
+/// (`Recording::duration_ms`).
+fn number_fits_i32(n: &serde_json::Number) -> bool {
+    n.as_i64()
+        .is_some_and(|v| v >= i64::from(i32::MIN) && v <= i64::from(i32::MAX))
+}
+
 /// A cached lookup body is servable only when it matches exactly the shape
 /// a fresh lookup emits for the requested kind: the `kind` tag, the
 /// requested MBID (case-insensitive — keys and repo reads are lowercased),
-/// and every always-emitted field present and correctly typed. Extra
+/// and every always-emitted field present and correctly typed. Numeric
+/// optionals must additionally fit the fresh DTO width (`year`/`track_no`/
+/// `medium_no` are `i16`, `duration_ms` is `i32`). Extra
 /// unknown fields are ignored so forward-compatible writes still hit;
 /// anything else (truncated/non-JSON, non-object, wrong identity, missing
 /// or mistyped fields) is a miss so the poisoned entry is overwritten by
@@ -486,9 +511,13 @@ fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool
             Some(serde_json::Value::String(_)) | Some(serde_json::Value::Null)
         )
     }
-    fn optional_int(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    fn optional_int(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        fits: WidthCheck,
+    ) -> bool {
         match obj.get(key) {
-            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => true,
+            Some(serde_json::Value::Number(n)) if fits(n) => true,
             Some(serde_json::Value::Null) => true,
             _ => false,
         }
@@ -504,15 +533,15 @@ fn cached_lookup_body_is_fresh_shape(kind: Kind, mbid: &str, body: &str) -> bool
             required_str(obj, "title")
                 && optional_str(obj, "artist_mbid")
                 && optional_str(obj, "release_type")
-                && optional_int(obj, "year")
+                && optional_int(obj, "year", number_fits_i16)
                 && optional_str(obj, "caa_url")
         }
         Kind::Recording => {
             required_str(obj, "title")
                 && optional_str(obj, "release_mbid")
-                && optional_int(obj, "track_no")
-                && optional_int(obj, "duration_ms")
-                && optional_int(obj, "medium_no")
+                && optional_int(obj, "track_no", number_fits_i16)
+                && optional_int(obj, "duration_ms", number_fits_i32)
+                && optional_int(obj, "medium_no", number_fits_i16)
         }
     }
 }
@@ -625,10 +654,106 @@ impl SearchHit {
 
 // --- Core handler traits and logic ----------------------------------------
 
-/// Opaque repository failure. Carries no detail on purpose: handler
-/// responses must never leak DB/driver internals to clients.
-#[derive(Debug)]
-pub struct RepoError;
+/// Where a repository failure happened. The stage is the only operational
+/// detail a database failure ever carries: no SQL, parameters, connection
+/// details, driver text or user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoStage {
+    /// Hyperdrive binding, socket, config or `connect_raw` failure.
+    Connect,
+    /// A dispatched query the driver rejected or dropped.
+    Query,
+    /// A returned row that did not decode into the expected shape.
+    Decode,
+    /// The per-operation deadline fired before the operation finished.
+    Timeout,
+}
+
+impl RepoStage {
+    /// Stable operator-facing label, also the `stage` log field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoStage::Connect => "connect",
+            RepoStage::Query => "query",
+            RepoStage::Decode => "decode",
+            RepoStage::Timeout => "timeout",
+        }
+    }
+}
+
+/// Opaque repository failure. Carries its stage only, on purpose: handler
+/// responses must never leak DB/driver internals to clients, and the
+/// structured failure line carries the stage label, never the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoError {
+    stage: RepoStage,
+}
+
+impl RepoError {
+    pub fn new(stage: RepoStage) -> Self {
+        RepoError { stage }
+    }
+
+    pub fn stage(&self) -> RepoStage {
+        self.stage
+    }
+}
+
+/// Production per-operation database budget in milliseconds. Every
+/// Hyperdrive connect and every repository query runs under its own
+/// deadline of this length (see [`with_db_deadline`]).
+///
+/// Against the MB SLOs (lookup p95 <50 ms hit / <250 ms miss, search p95
+/// <600 ms): 1500 ms leaves headroom above the slowest SLO for a cold
+/// Hyperdrive start on a legitimate in-SLO query, while still bounding a
+/// hung socket far below Worker invocation limits. The bound shapes the
+/// failure tail only — the success path never waits for it.
+pub const DB_OPERATION_DEADLINE_MS: u64 = 1_500;
+
+/// Race one fallible operation against a finite deadline, in the style of
+/// the api worker's mail-send helper: `worker::Delay` on wasm,
+/// `futures_timer::Delay` natively. The deadline is polled before the
+/// operation, so it is armed before dispatch and expiry wins a tie; a
+/// finished operation returns at once (the deadline is released, never
+/// awaited) and an expired one fails as [`RepoStage::Timeout`]. Both
+/// futures are dropped on completion; dropping the waiter stops the wait,
+/// not the server work, so `connect` also sets `statement_timeout`.
+pub async fn with_db_deadline<T>(
+    budget: std::time::Duration,
+    op: impl std::future::Future<Output = Result<T, RepoError>>,
+) -> Result<T, RepoError> {
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(budget);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(budget);
+    let mut deadline = std::pin::pin!(deadline);
+    let mut op = std::pin::pin!(op);
+    std::future::poll_fn(|cx| {
+        // A Worker Delay arms on first poll, so poll it before starting
+        // I/O. Expiry wins if both become ready together; there is no
+        // late completion — the abandoned operation drops below.
+        if deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(RepoError::new(RepoStage::Timeout)));
+        }
+        op.as_mut().poll(cx)
+    })
+    .await
+    // Both futures are dropped here, before the caller builds a response.
+}
+
+/// Structured event for a failed repository call, emitted once per
+/// failure from the HTTP layer (which owns the trace id). The rendered
+/// line carries the stage only — see [`db_failed_fields`].
+pub const DB_FAILED_EVENT: &str = "mb.db.failed";
+
+/// The exact fields of an [`DB_FAILED_EVENT`] line: the failure stage
+/// plus the build identity, nothing else. Taking only these two inputs
+/// is what makes the no-secret guarantee structural: SQL, parameters,
+/// connection details, driver text and user input cannot reach the
+/// rendered line through this seam.
+pub fn db_failed_fields(stage: RepoStage, build_sha: &str) -> serde_json::Value {
+    serde_json::json!({"stage": stage.as_str(), "build_sha": build_sha})
+}
 
 /// Read-only mirror repository over the `MB_DB` Hyperdrive binding.
 /// `search` takes the resolved page so SQL applies `LIMIT`/`OFFSET`
@@ -689,6 +814,22 @@ fn success_response(body: String, ttl_s: u32) -> ApiResponse {
         body,
         cache_ttl: Some(ttl_s),
     }
+}
+
+/// Filter an edge response without consuming the copy returned to the caller.
+/// The body-read future is separate so read failures and legacy payloads can be
+/// exercised natively, without constructing Workers' JavaScript response types.
+async fn validated_edge_response<T, E>(
+    response: T,
+    status: u16,
+    body: impl std::future::Future<Output = Result<String, E>>,
+    validate: impl FnOnce(&str) -> bool,
+) -> Option<T> {
+    if status != 200 {
+        return None;
+    }
+    let body = body.await.ok()?;
+    validate(&body).then_some(response)
 }
 
 fn health_response() -> http::Response<Vec<u8>> {
@@ -763,7 +904,9 @@ pub async fn handle_lookup<R: MbRepo, C: SuccessCache>(
 /// longer than [`RELEASE_RECORDINGS_LIMIT`]. Each entry needs a UUID-shaped
 /// string `mbid` and a string `title`; optional fields (`release_mbid`,
 /// `track_no`, `duration_ms`, `medium_no`) may be missing or null, and when
-/// present must be correctly typed. Extra top-level or per-row fields are
+/// present must be correctly typed. Numeric optionals must additionally fit
+/// the fresh [`Recording`] width (`track_no`/`medium_no` are `i16`,
+/// `duration_ms` is `i32`). Extra top-level or per-row fields are
 /// preserved. Anything else is a miss so the repository is read instead.
 fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
     let value: serde_json::Value = match serde_json::from_str(body) {
@@ -808,11 +951,16 @@ fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
                 }
             }
         }
-        for key in ["track_no", "duration_ms", "medium_no"] {
-            if let Some(v) = map.get(key) {
-                if !v.is_null() && !(v.is_i64() || v.is_u64()) {
-                    return false;
-                }
+        let numeric_fields: [(&str, WidthCheck); 3] = [
+            ("track_no", number_fits_i16),
+            ("duration_ms", number_fits_i32),
+            ("medium_no", number_fits_i16),
+        ];
+        for (key, fits) in numeric_fields {
+            match map.get(key) {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Number(n)) if fits(n) => {}
+                _ => return false,
             }
         }
     }
@@ -881,9 +1029,13 @@ fn search_paged_cache_key(kind: Kind, normalized_q: &str, limit: u32, offset: u3
 /// `limit`/`offset` are the effective page coordinates, and whose `results`
 /// is a typed hit list no longer than the effective limit. Each hit needs a
 /// UUID-shaped string `mbid`, a numeric `score`, and the kind-aware label
-/// (`name` for artists, `title` for releases/recordings). Empty results,
-/// extra fields, null release optionals and uppercase UUIDs stay hits.
-/// Anything else is a miss so the repository is read instead.
+/// (`name` for artists, `title` for releases/recordings). Release hits
+/// additionally require `artist_mbid`/`artist_name` to be strings when
+/// present and non-null, matching fresh [`SearchHit`] output; absence and
+/// null stay compatible, and artist/recording hits never require release
+/// fields. Empty results, extra fields, null release optionals and
+/// uppercase UUIDs stay hits. Anything else is a miss so the repository is
+/// read instead.
 fn is_valid_cached_search(
     body: &str,
     kind: Kind,
@@ -936,6 +1088,14 @@ fn is_valid_cached_search(
         }
         if map.get(label_key).and_then(|v| v.as_str()).is_none() {
             return false;
+        }
+        if kind == Kind::Release {
+            for key in ["artist_mbid", "artist_name"] {
+                match map.get(key) {
+                    None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => {}
+                    _ => return false,
+                }
+            }
         }
     }
     true
@@ -1176,49 +1336,95 @@ mod http_layer {
     }
 
     impl PgRepo {
+        /// One finite budget per operation, drawn from the documented
+        /// production default. Connect and each query get their own.
+        fn db_budget() -> std::time::Duration {
+            std::time::Duration::from_millis(DB_OPERATION_DEADLINE_MS)
+        }
+
+        /// Exactly one staged failure line per failed repository call.
+        /// The stage is the only operational detail; the cause never logs.
+        fn emit_db_failed(&self, stage: RepoStage) {
+            emit(
+                Level::Error,
+                &self.trace_id,
+                DB_FAILED_EVENT,
+                db_failed_fields(stage, &build_sha_from_env(&self.env)),
+            );
+        }
+
         async fn connect(&self) -> Result<tokio_postgres::Client, RepoError> {
-            let hyperdrive = self.env.hyperdrive(MB_DB_BINDING).map_err(|_| RepoError)?;
+            let hyperdrive = self
+                .env
+                .hyperdrive(MB_DB_BINDING)
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let socket = worker::Socket::builder()
                 .secure_transport(worker::SecureTransport::StartTls)
                 .connect(hyperdrive.host(), hyperdrive.port())
-                .map_err(|_| RepoError)?;
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let config: tokio_postgres::Config = hyperdrive
                 .connection_string()
                 .parse()
-                .map_err(|_| RepoError)?;
-            let (client, connection) = config
-                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-                .await
-                .map_err(|_| RepoError)?;
+                .map_err(|_| RepoError::new(RepoStage::Connect))?;
             let trace_id = self.trace_id.clone();
             // Build identity rides the detached line too (mirrors the api
             // worker): the deploy lane's public BUILD_SHA var, or explicit
             // "unknown" when unwired.
             let build_sha = build_sha_from_env(&self.env);
-            wasm_bindgen_futures::spawn_local(async move {
-                // Detail stays out of logs: driver errors can carry
-                // host/role strings that are not needed to triage.
-                if connection.await.is_err() {
-                    emit(
-                        Level::Error,
-                        &trace_id,
-                        "mb.db.connect_failed",
-                        serde_json::json!({"stage": "connect", "build_sha": build_sha}),
-                    );
-                }
-            });
-            Ok(client)
+            let raw = async {
+                let (client, connection) = config
+                    .connect_raw(socket, worker::postgres_tls::PassthroughTls)
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Detail stays out of logs: driver errors can carry
+                    // host/role strings that are not needed to triage.
+                    if connection.await.is_err() {
+                        emit(
+                            Level::Error,
+                            &trace_id,
+                            "mb.db.connect_failed",
+                            serde_json::json!({"stage": "connect", "build_sha": build_sha}),
+                        );
+                    }
+                });
+                // Dropping the waiter does not cancel the server query:
+                // the driver keeps paging for a hung-up receiver, so a
+                // timed-out query would keep running and hold its pooled
+                // backend connection. Cap execution where the server
+                // enforces it (mirrors the api worker's connect setup).
+                client
+                    .batch_execute(&format!(
+                        "SET statement_timeout = {}",
+                        DB_OPERATION_DEADLINE_MS
+                    ))
+                    .await
+                    .map_err(|_| RepoError::new(RepoStage::Connect))?;
+                Ok(client)
+            };
+            // A timeout keeps its own stage; a refused connect stays Connect.
+            with_db_deadline(Self::db_budget(), raw).await
         }
     }
 
     impl MbRepo for PgRepo {
         async fn lookup(&self, kind: Kind, mbid: &str) -> Result<Option<Entity>, RepoError> {
-            let client = self.connect().await?;
-            let row = client
-                .query_opt(lookup_sql(kind), &[&mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            row.map(|row| entity_from_row(kind, &row)).transpose()
+            let outcome: Result<Option<Entity>, RepoError> = async {
+                let client = self.connect().await?;
+                let row = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query_opt(lookup_sql(kind), &[&mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                row.map(|row| entity_from_row(kind, &row)).transpose()
+            }
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
 
         async fn search(
@@ -1228,36 +1434,59 @@ mod http_layer {
             limit: u32,
             offset: u32,
         ) -> Result<Vec<SearchHit>, RepoError> {
-            let client = self.connect().await?;
-            let sql = search_sql(kind, limit, offset);
-            let rows = client
-                .query(sql.as_str(), &[&normalized_q])
-                .await
-                .map_err(|_| RepoError)?;
-            rows.iter().map(hit_from_row).collect()
+            let outcome: Result<Vec<SearchHit>, RepoError> = async {
+                let client = self.connect().await?;
+                let sql = search_sql(kind, limit, offset);
+                let rows = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query(sql.as_str(), &[&normalized_q])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                rows.iter().map(hit_from_row).collect()
+            }
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
 
         async fn release_recordings(
             &self,
             release_mbid: &str,
         ) -> Result<Option<Vec<Recording>>, RepoError> {
-            let client = self.connect().await?;
-            let exists = client
-                .query_opt(RELEASE_EXISTS_SQL, &[&release_mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            if exists.is_none() {
-                return Ok(None);
+            let outcome: Result<Option<Vec<Recording>>, RepoError> = async {
+                let client = self.connect().await?;
+                let exists = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query_opt(RELEASE_EXISTS_SQL, &[&release_mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows = with_db_deadline(Self::db_budget(), async {
+                    client
+                        .query(RELEASE_RECORDINGS_SQL, &[&release_mbid])
+                        .await
+                        .map_err(|_| RepoError::new(RepoStage::Query))
+                })
+                .await?;
+                let recordings = rows
+                    .iter()
+                    .map(recording_from_row)
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(recordings))
             }
-            let rows = client
-                .query(RELEASE_RECORDINGS_SQL, &[&release_mbid])
-                .await
-                .map_err(|_| RepoError)?;
-            let recordings = rows
-                .iter()
-                .map(recording_from_row)
-                .collect::<Result<_, _>>()?;
-            Ok(Some(recordings))
+            .await;
+            if let Err(err) = &outcome {
+                self.emit_db_failed(err.stage());
+            }
+            outcome
         }
     }
 
@@ -1266,19 +1495,41 @@ mod http_layer {
         // server-side schema bug, reported as an opaque read failure.
         let entity = match kind {
             Kind::Artist => Entity::Artist(Artist {
-                mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-                name: row.try_get("name").map_err(|_| RepoError)?,
-                sort_name: row.try_get("sort_name").map_err(|_| RepoError)?,
-                artist_type: row.try_get("type").map_err(|_| RepoError)?,
-                country: row.try_get("country").map_err(|_| RepoError)?,
+                mbid: row
+                    .try_get("mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                name: row
+                    .try_get("name")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                sort_name: row
+                    .try_get("sort_name")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                artist_type: row
+                    .try_get("type")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                country: row
+                    .try_get("country")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
             }),
             Kind::Release => Entity::Release(Release {
-                mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-                artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
-                title: row.try_get("title").map_err(|_| RepoError)?,
-                release_type: row.try_get("release_type").map_err(|_| RepoError)?,
-                year: row.try_get("year").map_err(|_| RepoError)?,
-                caa_url: row.try_get("caa_url").map_err(|_| RepoError)?,
+                mbid: row
+                    .try_get("mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                artist_mbid: row
+                    .try_get("artist_mbid")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                title: row
+                    .try_get("title")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                release_type: row
+                    .try_get("release_type")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                year: row
+                    .try_get("year")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
+                caa_url: row
+                    .try_get("caa_url")
+                    .map_err(|_| RepoError::new(RepoStage::Decode))?,
             }),
             Kind::Recording => Entity::Recording(recording_from_row(row)?),
         };
@@ -1287,22 +1538,44 @@ mod http_layer {
 
     fn recording_from_row(row: &tokio_postgres::Row) -> Result<Recording, RepoError> {
         Ok(Recording {
-            mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-            release_mbid: row.try_get("release_mbid").map_err(|_| RepoError)?,
-            title: row.try_get("title").map_err(|_| RepoError)?,
-            track_no: row.try_get("track_no").map_err(|_| RepoError)?,
-            duration_ms: row.try_get("duration_ms").map_err(|_| RepoError)?,
-            medium_no: row.try_get("medium_no").map_err(|_| RepoError)?,
+            mbid: row
+                .try_get("mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            release_mbid: row
+                .try_get("release_mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            title: row
+                .try_get("title")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            track_no: row
+                .try_get("track_no")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            duration_ms: row
+                .try_get("duration_ms")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            medium_no: row
+                .try_get("medium_no")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
         })
     }
 
     fn hit_from_row(row: &tokio_postgres::Row) -> Result<SearchHit, RepoError> {
         Ok(SearchHit {
-            mbid: row.try_get("mbid").map_err(|_| RepoError)?,
-            label: row.try_get("label").map_err(|_| RepoError)?,
-            score: row.try_get("score").map_err(|_| RepoError)?,
-            artist_mbid: row.try_get("artist_mbid").map_err(|_| RepoError)?,
-            artist_name: row.try_get("artist_name").map_err(|_| RepoError)?,
+            mbid: row
+                .try_get("mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            label: row
+                .try_get("label")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            score: row
+                .try_get("score")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            artist_mbid: row
+                .try_get("artist_mbid")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
+            artist_name: row
+                .try_get("artist_name")
+                .map_err(|_| RepoError::new(RepoStage::Decode))?,
         })
     }
 
@@ -1339,13 +1612,19 @@ mod http_layer {
         Ok(response)
     }
 
-    async fn edge_hit(req: &Request) -> Option<Response> {
+    async fn edge_hit(req: &Request, validate: impl FnOnce(&str) -> bool) -> Option<Response> {
         let url = req.url().ok()?.to_string();
-        Cache::default()
+        let mut hit = Cache::default()
             .get(canonical_edge_url(&url), false)
             .await
             .ok()
-            .flatten()
+            .flatten()?;
+        let status = hit.status_code();
+        // Deploys need not evict old edge entries. Apply the same DTO check as
+        // KV before serving them; read a clone so valid responses keep their
+        // body, headers and remaining edge TTL unchanged.
+        let mut copy = hit.cloned().ok()?;
+        validated_edge_response(hit, status, copy.text(), validate).await
     }
 
     pub async fn lookup_route(
@@ -1360,7 +1639,12 @@ mod http_layer {
         // Build identity rides every line (mirrors the api worker): the deploy
         // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
         let build_sha = build_sha_from_env(&ctx.env);
-        if let Some(hit) = edge_hit(req).await {
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && cached_lookup_body_is_fresh_shape(kind, mbid, body)
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1369,7 +1653,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1397,7 +1680,12 @@ mod http_layer {
         // Build identity rides every line (mirrors the api worker): the deploy
         // lane's public BUILD_SHA var, or explicit "unknown" when unwired.
         let build_sha = build_sha_from_env(&ctx.env);
-        if let Some(hit) = edge_hit(req).await {
+        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            is_valid_mbid(mbid) && is_valid_cached_recordings(body, mbid)
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1406,7 +1694,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let mbid = ctx.param("mbid").map(String::as_str).unwrap_or("");
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1449,10 +1736,38 @@ mod http_layer {
                 .map(|kind| kind.as_str())
                 .unwrap_or("unknown")
         };
-        if let Some(hit) = edge_hit(req).await {
-            let url = req.url()?;
-            let query: std::collections::HashMap<String, String> =
-                url.query_pairs().into_owned().collect();
+        let url = req.url()?;
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
+        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
+        let raw_q = query.get("q").map(String::as_str).unwrap_or("");
+        if let Some(hit) = edge_hit(req, |body| {
+            let Some(kind) = Kind::parse(query.get("type").cloned()) else {
+                return false;
+            };
+            let q = raw_q.trim();
+            // Match the core's request bounds too: an edge body cannot turn
+            // an invalid request or an above-cap page into a cached success.
+            if !(2..=MAX_QUERY_CHARS).contains(&q.chars().count())
+                || q.chars().any(char::is_control)
+                || limit == Some(0)
+                || offset.unwrap_or(0) > MAX_SEARCH_OFFSET
+            {
+                return false;
+            }
+            is_valid_cached_search(
+                body,
+                kind,
+                &normalize_query(q),
+                limit
+                    .unwrap_or(MAX_PAGE_SIZE as u32)
+                    .min(MAX_PAGE_SIZE as u32),
+                offset.unwrap_or(0),
+            )
+        })
+        .await
+        {
             emit(
                 Level::Info,
                 &trace_id,
@@ -1461,9 +1776,6 @@ mod http_layer {
             );
             return Ok(with_trace(hit, &trace_id));
         }
-        let url = req.url()?;
-        let query: std::collections::HashMap<String, String> =
-            url.query_pairs().into_owned().collect();
         let repo = PgRepo {
             env: ctx.env.clone(),
             trace_id: trace_id.clone(),
@@ -1472,13 +1784,11 @@ mod http_layer {
         // Unparsable `limit`/`offset` fall back to the defaults (`None`):
         // a full first page. An explicit `limit=0` still reaches the handler
         // as `Some(0)` and is rejected there, never silently defaulted.
-        let limit = query.get("limit").and_then(|v| v.parse::<u32>().ok());
-        let offset = query.get("offset").and_then(|v| v.parse::<u32>().ok());
         let api = handle_search_paged(
             &repo,
             &cache,
             query.get("type").cloned(),
-            query.get("q").map(String::as_str).unwrap_or(""),
+            raw_q,
             limit,
             offset,
         )
@@ -1582,7 +1892,7 @@ mod tests {
         async fn lookup(&self, _kind: Kind, _mbid: &str) -> Result<Option<Entity>, RepoError> {
             *self.lookup_calls.borrow_mut() += 1;
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             Ok(self.entity.clone())
         }
@@ -1597,7 +1907,7 @@ mod tests {
             *self.search_calls.borrow_mut() += 1;
             *self.last_search_q.borrow_mut() = q.to_string();
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             // Mirror SQL `LIMIT`/`OFFSET` so paging tests exercise the slice.
             let from = (offset as usize).min(self.hits.len());
@@ -1612,7 +1922,7 @@ mod tests {
             *self.recordings_calls.borrow_mut() += 1;
             *self.last_recordings_mbid.borrow_mut() = release_mbid.to_string();
             if self.fail {
-                return Err(RepoError);
+                return Err(RepoError::new(RepoStage::Query));
             }
             Ok(self.recordings.clone())
         }
@@ -1657,6 +1967,106 @@ mod tests {
             artist_mbid: None,
             artist_name: None,
         }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_lookup_width_but_preserves_valid_response() {
+        let body = serde_json::json!({
+            "kind": "release", "mbid": MBID.to_uppercase(), "title": "Album",
+            "artist_mbid": null, "release_type": null, "year": 32767,
+            "caa_url": null, "extra": true,
+        });
+        for (year, servable) in [
+            (32767, true),
+            (-32768, true),
+            (32768, false),
+            (-32769, false),
+        ] {
+            let mut payload = body.clone();
+            payload["year"] = year.into();
+            let raw = payload.to_string();
+            let response = success_response(raw.clone(), LOOKUP_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| cached_lookup_body_is_fresh_shape(Kind::Release, MBID, body),
+            ));
+            if servable {
+                assert_eq!(result, Some(success_response(raw, LOOKUP_CACHE_TTL_S)));
+            } else {
+                assert_eq!(result, None, "legacy year {year} must miss at the edge");
+            }
+        }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_recordings_width() {
+        for (duration, servable) in [(2147483647_i64, true), (2147483648, false)] {
+            let raw = serde_json::json!({
+                "release_mbid": MBID,
+                "recordings": [{"mbid": MBID, "title": "Track", "duration_ms": duration}],
+            })
+            .to_string();
+            let response = success_response(raw.clone(), LOOKUP_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| is_valid_cached_recordings(body, MBID),
+            ));
+            assert_eq!(result.is_some(), servable, "duration {duration}");
+        }
+    }
+
+    #[test]
+    fn edge_response_rejects_legacy_release_search_artist_fields() {
+        for (artist, servable) in [
+            (serde_json::json!("Artist"), true),
+            (serde_json::Value::Null, true),
+            (serde_json::json!({"name": "Artist"}), false),
+            (serde_json::json!(42), false),
+        ] {
+            let raw = serde_json::json!({
+                "q": "album", "type": "release", "limit": 25, "offset": 10,
+                "results": [{"mbid": MBID, "title": "Album", "score": 0.75,
+                             "artist_name": artist}],
+            })
+            .to_string();
+            let response = success_response(raw.clone(), SEARCH_CACHE_TTL_S);
+            let status = response.status;
+            let result = block_on(validated_edge_response(
+                response,
+                status,
+                async { Ok::<_, ()>(raw.clone()) },
+                |body| is_valid_cached_search(body, Kind::Release, "album", 25, 10),
+            ));
+            assert_eq!(result.is_some(), servable, "artist field {artist}");
+        }
+    }
+
+    #[test]
+    fn edge_response_read_error_is_a_miss() {
+        let result = block_on(validated_edge_response(
+            "cached response",
+            200,
+            async { Err::<String, _>(()) },
+            |_| panic!("a failed body read must not reach validation"),
+        ));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn edge_response_non_success_is_a_miss_without_reading_body() {
+        let result = block_on(validated_edge_response(
+            "cached error",
+            500,
+            std::future::pending::<Result<String, ()>>(),
+            |_| panic!("cached errors must not reach validation"),
+        ));
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -2464,9 +2874,11 @@ mod build_sha_tests {
         // `build_sha_from_env` needs a wasm Env, so pin the call sites in
         // source the way the healthz test pins the route shape: slice the
         // pre-test source so this test's own literals cannot satisfy it.
-        // All eight emit sites (three routes x2, detached connect failure,
-        // catch-all 404) must carry the normalized key — never a missing
-        // key or a raw var.
+        // All eight inline emit sites (three routes x2, detached connect
+        // failure, catch-all 404) must carry the normalized key — never a
+        // missing key or a raw var. The ninth line, the staged
+        // `mb.db.failed` failure, builds its fields through the shared
+        // `db_failed_fields` seam instead of an inline literal.
         let source = include_str!("lib.rs");
         let production = source
             .split_once("#[cfg(test)]")
@@ -2485,18 +2897,24 @@ mod build_sha_tests {
             "mb.release_recordings.completed",
             "mb.search.completed",
             "mb.db.connect_failed",
+            "mb.db.failed",
             "mb.request.not_found",
         ] {
             assert!(production.contains(event), "mb entry must emit {event}");
         }
+        assert!(
+            production.contains("db_failed_fields("),
+            "the staged failure line must build its fields through the shared seam"
+        );
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // Eight emit sites carry the key, so a dropped key at any one of
-        // them drops the count below eight.
+        // Eight inline emit sites carry the key, plus the shared
+        // `db_failed_fields` seam that builds the ninth line's fields, so
+        // a dropped key at any one of them drops the count below nine.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            8,
-            "all eight mb lines must carry the build_sha key"
+            9,
+            "all eight inline mb lines plus the staged-failure seam must carry the build_sha key"
         );
     }
 }

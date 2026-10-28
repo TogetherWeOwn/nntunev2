@@ -7,7 +7,8 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  * OWNERSHIP: this file is acceptance-owned. The paired build lands the
  * refresh-retention fixes on top of this branch and must make these tests
  * pass WITHOUT editing this file; a wrong test comes back to acceptance
- * instead.
+ * instead. Maintenance below strengthens settle barriers and targets the
+ * row action explicitly now that rows have additional controls.
  *
  * Contract under test:
  * - Initial load keeps today's behavior: a loading status until the first
@@ -32,7 +33,7 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
  *   old-account response cannot restore purged state.
  *
  * Out of scope (not pinned): audio playback and stream URLs (the player
- * keeps its empty-src placeholder), prev/seek, queue reorder, and the
+ * does not mount for display-only tracks), prev/seek, queue reorder, and the
  * refresher's body caps, timeout/cancellation and single-flight behavior
  * (pinned by the refresher unit suite, which stays unchanged).
  *
@@ -137,7 +138,7 @@ async function holdLibraryRequests(page: Page): Promise<HeldLibraryRequests> {
 }
 
 function row(page: Page, id: string): Locator {
-	return page.locator(`[data-testid="library-item"][data-id="${id}"]`);
+	return page.locator(`[data-testid="library-item"][data-id="${id}"] .nt-library-row`);
 }
 
 function queueItem(page: Page, id: string): Locator {
@@ -215,6 +216,8 @@ test('initial load still shows the loading state until the first response lands'
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 });
 
@@ -238,6 +241,8 @@ test('background refresh keeps the loaded list and queue mounted while the refre
 	await expect(page.getByText('Loading your library…')).toHaveCount(0);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(list).not.toHaveAttribute('aria-busy', 'true');
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 });
@@ -254,7 +259,7 @@ test('background refresh preserves DOM node identity and row focus for surviving
 	await markNodes(rows);
 	await markNodes(queued);
 
-	const focusTarget = page.locator('[data-testid="library-item"][data-id="row-alpha"] button');
+	const focusTarget = page.locator('[data-testid="library-item"][data-id="row-alpha"] .nt-library-row');
 	await focusTarget.focus();
 	await expect(focusTarget).toBeFocused();
 
@@ -270,6 +275,8 @@ test('background refresh preserves DOM node identity and row focus for surviving
 	expect(await keptMarks(queued)).toEqual(['kept', 'kept']);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(focusTarget).toBeFocused();
 	expect(await keptMarks(rows)).toEqual(['kept', 'kept', 'kept']);
 	expect(await keptMarks(queued)).toEqual(['kept', 'kept']);
@@ -293,6 +300,8 @@ test('background refresh disables the refresh trigger and sends no redundant req
 	await refreshButton.evaluate((element) => (element as HTMLElement).click());
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(refreshButton).toBeEnabled();
 	expect(hold.requestCount()).toBe(1);
 	await expect(page.getByTestId('library-list')).not.toHaveAttribute('aria-busy', 'true');
@@ -314,6 +323,8 @@ test('queue Next stays usable while a background refresh is pending', async ({ p
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(page.getByTestId('now-playing')).toContainText('Zulu Song');
 	expect(await queueOrder(page)).toEqual(['row-mike', 'row-zulu']);
 });
@@ -331,6 +342,8 @@ test('selecting a row while a background refresh is pending queues it', async ({
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 
 	await hold.releaseJson(ITEMS);
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveAttribute('aria-busy', 'false');
 	await expect(page.getByTestId('queue-item')).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Alpha Song');
 });
@@ -361,8 +374,10 @@ test('same-ID title and artist corrections reach queued entries without reorderi
 	expect(await ariaCurrent(queueItem(page, 'row-zulu'))).toBe('true');
 	expect(await ariaCurrent(queueItem(page, 'row-mike'))).toBeNull();
 	expect(await ariaCurrent(queueItem(page, 'row-alpha'))).toBeNull();
-	// Metadata flows to display entries only; the audio placeholder is untouched.
-	await expect(page.getByTestId('audio-player')).toHaveAttribute('src', '');
+	// Main renders media only for a usable stream URL; refreshing metadata
+	// must not manufacture a player or source for these display-only tracks.
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect(page.locator('audio, video')).toHaveCount(0);
 });
 
 test('refresh to a subset drops absent ids and moves current to the first survivor', async ({
@@ -402,7 +417,7 @@ test('refresh to an empty library clears the queue and shows the empty state', a
 	payload.current = [];
 	await page.getByRole('button', { name: 'Refresh' }).click();
 
-	await expect(page.getByRole('status')).toContainText(/library is empty/i);
+	await expect(page.getByRole('status').filter({ hasText: /library is empty/i })).toContainText(/library is empty/i);
 	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveAttribute(
 		'href',
 		'/library/import'
@@ -507,7 +522,7 @@ test('404 during a background refresh purges the library and queue without expos
 	);
 	await page.getByRole('button', { name: 'Refresh' }).click();
 
-	await expect(page.getByRole('status')).toContainText(/listing is not available yet/i);
+	await expect(page.getByRole('status').filter({ hasText: /listing is not available yet/i })).toContainText(/listing is not available yet/i);
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
@@ -538,7 +553,8 @@ test('auth transition during a background refresh purges immediately and a late 
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 
-	// The late old-account response cannot restore state.
+	// The late old-account response cannot restore state. The list stays
+	// purged here, so unlike successful refreshes it cannot be a settle hook.
 	await hold.releaseJson(ITEMS);
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);

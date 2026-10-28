@@ -1,7 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { readSignedInEmail } from '#lib/signed-in-email.js';
+	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
+	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
+	import { clearSignedInEmail, readSignedInEmail } from '#lib/signed-in-email.js';
 	import { serializePublicKeyCredential, toRequestOptions } from '#lib/webauthn.js';
 	import {
 		ApiClient,
@@ -14,7 +16,12 @@
 		isProviderAuthExpired,
 		reauthPromptFor
 	} from '#lib/provider-reauth.js';
-	import { validateIndexerUrl, validateProviderConfig } from '#lib/vault-validation.js';
+	import {
+		validateIndexerFields,
+		validateProviderFields,
+		type IndexerFieldErrors,
+		type ProviderFieldErrors
+	} from '#lib/vault-validation.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 
@@ -22,8 +29,19 @@
 	// these provider credentials will be saved to, shown before anything
 	// is typed.
 	let signedInEmail = $state<string | null>(null);
+	// Fail-closed restart latch: set synchronously on a local or delivered
+	// auth transition and never cleared on this mount. Recovery is explicit
+	// user navigation/sign-in followed by a fresh mount; no replayed draft,
+	// pending intent or automatic save.
+	let resetRequired = $state(false);
 	onMount(() => {
 		signedInEmail = readSignedInEmail();
+		window.addEventListener('storage', handleStorageTransition);
+		const unsubscribeLocal = subscribeLocalAuthTransition(handleAuthTransitionReset);
+		return () => {
+			window.removeEventListener('storage', handleStorageTransition);
+			unsubscribeLocal();
+		};
 	});
 
 	let step = $state<1 | 2 | 3>(1);
@@ -41,7 +59,9 @@
 	let indexerUrl = $state('');
 	let indexerApiKey = $state('');
 
-	let errors = $state<string[]>([]);
+	type FieldErrors = ProviderFieldErrors & IndexerFieldErrors;
+	let errors = $state<FieldErrors>({});
+	let stepHeading: HTMLHeadingElement;
 	let testState = $state<'idle' | 'testing' | 'ok' | 'failed'>('idle');
 	let testDetail = $state('');
 	let reauthRequired = $state(false);
@@ -51,6 +71,63 @@
 	let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle');
 	let testedConfigKey = $state<string | null>(null);
 	let testRunId = 0;
+	// Independent of result state: invalidating a configuration must not release
+	// an operation that is still awaiting a response or a passkey ceremony.
+	let busy = $state(false);
+	let disposed = false;
+	// Page-owned cancellation: every test/save/reauth request and the passkey
+	// ceremony run under these controllers so an auth-transition reset fences
+	// work the transport itself ignores. Aborting sends nothing new. Plain
+	// unmount intentionally does NOT abort: in-flight work survives
+	// navigation and settles to nothing via the disposed checks below.
+	let requestController: AbortController | null = null;
+	let ceremonyController: AbortController | null = null;
+
+	function abortOwnedWork(): void {
+		requestController?.abort();
+		requestController = null;
+		ceremonyController?.abort();
+		ceremonyController = null;
+	}
+
+	onDestroy(() => {
+		disposed = true;
+		invalidateTest();
+		busy = false;
+	});
+
+	/**
+	 * Fail-closed reset for a local or delivered auth transition. Enters the
+	 * restart-required state synchronously, then clears identity display,
+	 * typed secrets, tested state and recovery UI and fences pending
+	 * test/save/passkey/reauth continuations and stale submits. Makes zero
+	 * API calls, never rebroadcasts, never navigates; idempotent so double
+	 * delivery settles safely.
+	 */
+	function handleAuthTransitionReset(): void {
+		if (disposed) return;
+		resetRequired = true;
+		abortOwnedWork();
+		invalidateTest();
+		signedInEmail = null;
+		clearSignedInEmail();
+		host = '';
+		port = 563;
+		tls = true;
+		allowInsecurePlaintext = false;
+		username = '';
+		password = '';
+		maxConnections = 4;
+		indexerUrl = '';
+		indexerApiKey = '';
+		step = 1;
+		errors = {};
+		busy = false;
+	}
+
+	function handleStorageTransition(event: StorageEvent): void {
+		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) handleAuthTransitionReset();
+	}
 
 	// Keep the wire payload honest: a TLS connection never carries the
 	// plaintext opt-in, so clear a stale acknowledgement when TLS is on.
@@ -76,6 +153,14 @@
 		return JSON.stringify(currentTestInput());
 	}
 
+	function isCurrentTest(runId: number, inputKey: string) {
+		return !disposed && !resetRequired && runId === testRunId && inputKey === currentTestKey();
+	}
+
+	function isCurrentRun(runId: number) {
+		return !disposed && !resetRequired && runId === testRunId;
+	}
+
 	function invalidateTest() {
 		testRunId += 1;
 		testedConfigKey = null;
@@ -87,60 +172,103 @@
 		saveState = 'idle';
 	}
 
-	function backTo(previousStep: 1 | 2) {
+	async function goTo(nextStep: 1 | 2 | 3) {
+		step = nextStep;
+		await tick();
+		stepHeading.focus();
+	}
+
+	async function focusFirstError() {
+		await tick();
+		const field = Object.keys(errors)[0];
+		if (field) document.getElementById(`byop-${field}`)?.focus();
+	}
+
+	function handleInput() {
 		invalidateTest();
-		errors = [];
-		step = previousStep;
+		// Only clear corrected errors after a submit; typing never moves focus
+		// or starts announcing new validation failures.
+		if (Object.keys(errors).length === 0) return;
+		const current: FieldErrors = step === 1
+			? validateProviderFields(providerInput())
+			: validateIndexerFields(indexerUrl, indexerApiKey);
+		for (const field of Object.keys(errors) as (keyof FieldErrors)[]) {
+			if (!current[field]) delete errors[field];
+		}
+	}
+
+	function backTo(previousStep: 1 | 2) {
+		if (disposed || busy || saveState === 'saved') return;
+		invalidateTest();
+		errors = {};
+		void goTo(previousStep);
 	}
 
 	function nextFromProvider() {
-		errors = validateProviderConfig(providerInput());
-		if (errors.length === 0) {
-			step = 2;
+		errors = validateProviderFields(providerInput());
+		if (Object.keys(errors).length === 0) {
+			void goTo(2);
+		} else {
+			void focusFirstError();
 		}
 	}
 
 	function nextFromIndexer() {
-		const problem = validateIndexerUrl(indexerUrl, indexerApiKey);
-		errors = problem === null ? [] : [problem];
-		if (errors.length === 0) {
-			step = 3;
+		errors = validateIndexerFields(indexerUrl, indexerApiKey);
+		if (Object.keys(errors).length === 0) {
+			void goTo(3);
+		} else {
+			void focusFirstError();
 		}
 	}
 
 	async function runTest() {
+		if (disposed || resetRequired || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
-		errors = validateProviderConfig(providerInput());
-		const indexerProblem = validateIndexerUrl(indexerUrl, indexerApiKey);
-		if (indexerProblem !== null) errors = [...errors, indexerProblem];
-		if (errors.length > 0) {
+		const providerErrors = validateProviderFields(providerInput());
+		errors = { ...providerErrors, ...validateIndexerFields(indexerUrl, indexerApiKey) };
+		if (Object.keys(errors).length > 0) {
 			invalidateTest();
+			step = Object.keys(providerErrors).length > 0 ? 1 : 2;
+			await focusFirstError();
 			return;
 		}
 
+		busy = true;
 		const runId = ++testRunId;
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
 		testedConfigKey = null;
 		testState = 'testing';
 		testDetail = '';
 		reauthRequired = false;
 		try {
-			const result: ProviderTestResult = await client.testProviderConnection(input);
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			const result: ProviderTestResult = await client.testProviderConnection(input, () => {
+				// Only an explicit Retry may repeat this UI action, and never
+				// after navigation, reset, changed input, or a newer test run.
+				// The retained closure holds only the run id — non-secret
+				// local operation identity, never the secret-bearing draft:
+				// any input edit invalidates the run, and the repeated run
+				// re-reads the current inputs.
+				if (isCurrentRun(runId) && step === 3) void runTest();
+			}, requestSignal);
+			if (!isCurrentTest(runId, inputKey)) return;
 			// The response is a redacted summary: never echo credentials.
 			if (result.ok) {
 				testedConfigKey = inputKey;
 				testState = 'ok';
 				testDetail =
 					result.latencyMs !== undefined
-						? `Connected in ${result.latencyMs} ms.`
-						: 'Connected.';
+						? `Provider connectivity and configuration checks passed in ${result.latencyMs} ms.`
+						: 'Provider connectivity and configuration checks passed.';
 			} else {
 				testState = 'failed';
 				testDetail = 'The server could not reach that provider.';
 			}
 		} catch (error) {
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				// The global paywall owns the limit response; avoid a duplicate
 				// inline failure state beneath the modal.
@@ -168,6 +296,9 @@
 						? 'The API is not deployed yet — try again later.'
 						: 'Connection test failed. Check the details and try again.';
 			}
+		} finally {
+			if (testState === 'testing') testState = 'idle';
+			busy = false;
 		}
 	}
 
@@ -183,23 +314,34 @@
 	}
 
 	async function reauthenticateAndSave() {
-		if (reauthState === 'working') return;
+		if (disposed || resetRequired || busy || saveState === 'saved' || !saveReauthRequired) return;
+		const runId = testRunId;
 		const inputKey = currentTestKey();
 		if (testState !== 'ok' || testedConfigKey !== inputKey) return;
 		if (typeof PublicKeyCredential === 'undefined') {
 			reauthState = 'failed';
 			return;
 		}
+		busy = true;
 		reauthState = 'working';
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
+		ceremonyController?.abort();
+		ceremonyController = new AbortController();
+		const ceremonySignal = ceremonyController.signal;
 		try {
-			const options = await client.reauthenticateStart();
+			const options = await client.reauthenticateStart(requestSignal);
+			if (!isCurrentTest(runId, inputKey)) return;
 			const assertion = await navigator.credentials.get({
 				publicKey: toRequestOptions({
 					challenge: options.challenge,
 					rpId: options.rp_id,
 					allowCredentials: []
-				})
+				}),
+				signal: ceremonySignal
 			});
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (!(assertion instanceof PublicKeyCredential)) throw new Error('no public-key credential');
 			const serialized = serializePublicKeyCredential(assertion);
 			const response = serialized.response as Record<string, unknown>;
@@ -220,11 +362,10 @@
 				authenticatorData,
 				clientDataJson,
 				signature
-			});
-			if (currentTestKey() !== inputKey || testedConfigKey !== inputKey) {
-				throw new Error('provider configuration changed after testing');
-			}
+			}, requestSignal);
+			if (!isCurrentTest(runId, inputKey) || testedConfigKey !== inputKey) return;
 		} catch (error) {
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				// The global paywall owns the limit response; avoid a duplicate
 				// inline failure state beneath the modal.
@@ -237,39 +378,51 @@
 			}
 			reauthState = 'failed';
 			return;
+		} finally {
+			if (reauthState === 'working') reauthState = 'idle';
+			busy = false;
 		}
 
+		// Transfer to save synchronously after releasing the ceremony guard.
 		// Reuse the normal save path so the in-flight state, tested-input guard,
 		// and paywall/error handling stay identical after reauthentication.
 		await save();
 	}
 
 	async function save() {
+		if (disposed || resetRequired || busy || saveState === 'saved') return;
 		const input = currentTestInput();
 		const inputKey = JSON.stringify(input);
-		if (testState !== 'ok' || testedConfigKey !== inputKey || saveState === 'saving') {
+		if (testState !== 'ok' || testedConfigKey !== inputKey) {
 			if (testedConfigKey !== inputKey) invalidateTest();
 			return;
 		}
 
+		busy = true;
 		const runId = testRunId;
+		requestController?.abort();
+		requestController = new AbortController();
+		const requestSignal = requestController.signal;
 		saveReauthRequired = false;
 		reauthState = 'idle';
 		saveState = 'saving';
 		try {
-			await client.saveProviderConfig(input);
-			if (runId === testRunId && inputKey === currentTestKey()) {
+			await client.saveProviderConfig(input, requestSignal);
+			if (isCurrentTest(runId, inputKey)) {
 				saveState = 'saved';
 				window.location.href = '/library';
 			}
 		} catch (error) {
-			if (runId !== testRunId || inputKey !== currentTestKey()) return;
+			if (!isCurrentTest(runId, inputKey)) return;
 			if (error instanceof ApiError && error.paywall) {
 				saveState = 'idle';
 				return;
 			}
 			saveReauthRequired = error instanceof ApiError && error.code === 'reauth_required';
 			saveState = 'failed';
+		} finally {
+			if (saveState === 'saving') saveState = 'idle';
+			busy = false;
 		}
 	}
 </script>
@@ -284,35 +437,53 @@
 
 <main class="nt-wrap">
 	<h1>Connect your provider</h1>
+	{#if resetRequired}
+		<p role="alert">
+			This setup was reset after an authentication change. Sign in and start setup again;
+			re-enter and retest your credentials. Requests already submitted may still complete.
+			<a href="/login">Sign in</a>
+		</p>
+	{/if}
 	{#if signedInEmail !== null}
 		<p role="status">
 			Signed in as <strong>{signedInEmail}</strong> — the provider details you save go to
 			this account. If that's not you, stop here and <a href="/login">sign in again</a>.
 		</p>
 	{/if}
-	<p>Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
+	<p role="status" aria-atomic="true">Step {step} of 3: {step === 1 ? 'Provider' : step === 2 ? 'Indexer (optional)' : 'Test'}</p>
+	<h2 id="byop-step-heading" bind:this={stepHeading} tabindex="-1">
+		{step === 1 ? 'Provider details' : step === 2 ? 'Indexer (optional)' : 'Test the connection'}
+	</h2>
+	<p role="status" aria-atomic="true">
+		{testState === 'testing' ? 'Testing the connection…' : saveState === 'saving' ? 'Saving provider details…' : reauthState === 'working' ? 'Verifying your passkey…' : ''}
+	</p>
 
-	{#if errors.length > 0}
+	{#if Object.keys(errors).length > 0}
 		<ul role="alert">
-			{#each errors as problem}
-				<li>{problem}</li>
+			{#each Object.entries(errors) as [field, problem] (field)}
+				<li id={`byop-${field}-error`}>
+					<a href={`#byop-${field}`} onclick={(event) => {
+						event.preventDefault();
+						document.getElementById(`byop-${field}`)?.focus();
+					}}>{problem}</a>
+				</li>
 			{/each}
 		</ul>
 	{/if}
 
 	{#if step === 1}
 		<form
-			oninput={invalidateTest}
-			onchange={invalidateTest}
+			oninput={handleInput}
+			onchange={handleInput}
 			onsubmit={(event) => {
 				event.preventDefault();
 				nextFromProvider();
 			}}
 		>
-			<label>Hostname <input data-testid="byop-host" name="host" required autocomplete="off" bind:value={host} /></label>
+			<label>Hostname <input id="byop-host" aria-invalid={errors.host ? 'true' : undefined} aria-describedby={errors.host ? 'byop-host-error' : undefined} data-testid="byop-host" name="host" required autocomplete="off" bind:value={host} /></label>
 			<label>
 				Port
-				<select data-testid="byop-port" name="port" required bind:value={port}>
+				<select id="byop-port" aria-invalid={errors.port ? 'true' : undefined} aria-describedby={errors.port ? 'byop-port-error' : undefined} data-testid="byop-port" name="port" required bind:value={port}>
 					<option value={119}>119 (plaintext NNTP)</option>
 					<option value={563}>563 (TLS)</option>
 				</select>
@@ -325,6 +496,9 @@
 				</p>
 				<label>
 					<input
+						id="byop-allowInsecurePlaintext"
+						aria-invalid={errors.allowInsecurePlaintext ? 'true' : undefined}
+						aria-describedby={errors.allowInsecurePlaintext ? 'byop-allowInsecurePlaintext-error' : undefined}
 						name="allowInsecurePlaintext"
 						type="checkbox"
 						bind:checked={allowInsecurePlaintext}
@@ -332,14 +506,17 @@
 					I understand my password will be sent unencrypted
 				</label>
 			{/if}
-			<label>Username <input data-testid="byop-user" name="username" required autocomplete="username" bind:value={username} /></label>
+			<label>Username <input id="byop-username" aria-invalid={errors.username ? 'true' : undefined} aria-describedby={errors.username ? 'byop-username-error' : undefined} data-testid="byop-user" name="username" required autocomplete="username" bind:value={username} /></label>
 			<label>
 				Password
-				<input data-testid="byop-pass" name="password" type="password" required autocomplete="current-password" bind:value={password} />
+				<input id="byop-password" aria-invalid={errors.password ? 'true' : undefined} aria-describedby={errors.password ? 'byop-password-error' : undefined} data-testid="byop-pass" name="password" type="password" required autocomplete="current-password" bind:value={password} />
 			</label>
 			<label>
 				Connections
 				<input
+					id="byop-maxConnections"
+					aria-invalid={errors.maxConnections ? 'true' : undefined}
+					aria-describedby={errors.maxConnections ? 'byop-maxConnections-error' : undefined}
 					name="maxConnections"
 					type="number"
 					min="1"
@@ -351,34 +528,33 @@
 		</form>
 	{:else if step === 2}
 		<form
-			oninput={invalidateTest}
-			onchange={invalidateTest}
+			oninput={handleInput}
+			onchange={handleInput}
 			onsubmit={(event) => {
 				event.preventDefault();
 				nextFromIndexer();
 			}}
 		>
 			<p>An indexer improves search. You can skip this and add one later.</p>
-			<label>Indexer URL <input name="indexerUrl" type="url" autocomplete="off" bind:value={indexerUrl} /></label>
+			<label>Indexer URL <input id="byop-indexerUrl" aria-invalid={errors.indexerUrl ? 'true' : undefined} aria-describedby={errors.indexerUrl ? 'byop-indexerUrl-error' : undefined} name="indexerUrl" type="url" autocomplete="off" bind:value={indexerUrl} /></label>
 			<label>
 				Indexer API key
-				<input name="indexerApiKey" type="password" autocomplete="off" bind:value={indexerApiKey} />
+				<input id="byop-indexerApiKey" aria-invalid={errors.indexerApiKey ? 'true' : undefined} aria-describedby={errors.indexerApiKey ? 'byop-indexerApiKey-error' : undefined} name="indexerApiKey" type="password" autocomplete="off" bind:value={indexerApiKey} />
 			</label>
 			<button class="nt-button" type="button" onclick={() => backTo(1)}>Back</button>
 			<button class="nt-button" type="submit">Continue</button>
 		</form>
 	{:else}
-		<section aria-labelledby="test-heading">
-			<h2 id="test-heading">Test the connection</h2>
+		<section aria-labelledby="byop-step-heading" aria-busy={testState === 'testing' || saveState === 'saving' || reauthState === 'working'}>
 			<p>
-				We test <strong>{host || 'your provider'}</strong>
-				{indexerUrl.trim().length > 0 ? 'and your indexer ' : ''}without storing anything yet.
+				We check connectivity to <strong>{host || 'your provider'}</strong> and validate the configuration and addresses{indexerUrl.trim().length > 0 ? ' (including your indexer URL)' : ''}, without storing anything yet.
+				This does not verify provider credentials{indexerUrl.trim().length > 0 ? ' or contact or authenticate to your indexer' : ''}.
 			</p>
 			<button
 				class="nt-button nt-button--ghost"
 				type="button"
 				onclick={() => backTo(2)}
-				disabled={saveState === 'saving' || reauthState === 'working'}
+				disabled={busy || saveState === 'saved'}
 			>
 				Back
 			</button>
@@ -387,7 +563,7 @@
 				type="button"
 				onclick={runTest}
 					data-testid="byop-test-connection"
-				disabled={testState === 'testing'}
+				disabled={busy || saveState === 'saved' || resetRequired}
 			>
 				{testState === 'testing' ? 'Testing…' : 'Test connection'}
 			</button>
@@ -398,7 +574,7 @@
 					type="button"
 					onclick={save}
 						data-testid="byop-save"
-					disabled={saveState === 'saving' || saveState === 'saved' || reauthState === 'working'}
+					disabled={busy || saveState === 'saved' || resetRequired}
 				>
 					{saveState === 'saved'
 						? 'Saved'
@@ -412,8 +588,8 @@
 						<h3 id="reauth-heading">Provider credentials expired</h3>
 						<p>{testDetail}</p>
 						<p>
-							Re-enter your password below and test again — your session stays
-							signed in, and the new password is tested before it is saved.
+							Re-enter your password below and repeat the connectivity and configuration checks before saving.
+							These checks do not verify your password. Your session stays signed in.
 						</p>
 						<label>
 							Password
@@ -432,7 +608,7 @@
 								}}
 							/>
 						</label>
-						<button class="nt-button" type="button" onclick={runTest}>Test again</button>
+						<button class="nt-button" type="button" onclick={runTest} disabled={busy || resetRequired}>Test again</button>
 					</div>
 				{:else}
 					<p data-testid="byop-status" role="alert">{testDetail}</p>
@@ -447,7 +623,7 @@
 						class="nt-button"
 						type="button"
 						onclick={reauthenticateAndSave}
-						disabled={reauthState === 'working'}
+						disabled={busy || resetRequired}
 					>
 						{reauthState === 'working' ? 'Verifying…' : 'Reauthenticate and save'}
 					</button>

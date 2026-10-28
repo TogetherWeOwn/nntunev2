@@ -1,19 +1,36 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import type { PageProps } from './$types';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { notifyLocalAuthTransition } from '#lib/auth-transition.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 
 	type Props = { data?: Partial<PageProps['data']> | void };
 	let { data = { sessionCheckFailed: false } }: Props = $props();
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 
-	function redirectToLogin() {
-		// Crossing an auth boundary: drop this tab's library snapshots and
-		// broadcast the transition so other open tabs stop showing them.
+	/**
+	 * A qualifying security result crosses the auth boundary whether this
+	 * route is live or abandoned: drop this tab's library snapshots and
+	 * identity label, broadcast the transition so other open tabs stop
+	 * showing them, and notify mounted same-window consumers. Never
+	 * navigates and never throws; every UI/navigation continuation below
+	 * stays behind its own liveness guard.
+	 */
+	function crossAuthBoundary() {
 		invalidateLibraryCache();
 		clearSignedInEmail();
+		notifyLocalAuthTransition();
+	}
+
+	function redirectToLogin() {
+		if (!alive) return;
 		window.location.href = '/login';
 	}
 
@@ -22,7 +39,7 @@
 	let revokeIncomplete = $state(false);
 
 	async function signOut() {
-		if (busy !== null) return;
+		if (!alive || busy !== null) return;
 		busy = 'local';
 		actionError = null;
 		revokeIncomplete = false;
@@ -30,18 +47,26 @@
 			await client.logout();
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 401) {
+				// Qualifying 401: this session is confirmed gone. Cross the
+				// boundary even when abandoned; navigation stays live-only.
+				crossAuthBoundary();
 				redirectToLogin();
 				return;
 			}
+			if (!alive) return;
 			actionError = 'Could not sign out. Please try again.';
 			busy = null;
 			return;
+		} finally {
+			if (!alive) busy = null;
 		}
+		// Fulfilled success is qualifying live or abandoned.
+		crossAuthBoundary();
 		redirectToLogin();
 	}
 
 	async function signOutEverywhere() {
-		if (busy !== null || !window.confirm('Sign out on every device?')) return;
+		if (!alive || busy !== null || !window.confirm('Sign out on every device?')) return;
 		busy = 'everywhere';
 		actionError = null;
 		revokeIncomplete = false;
@@ -54,19 +79,25 @@
 				// the failure distinguishable from a successful revocation
 				// (which navigates to /login with no message). The local
 				// session is confirmed gone, so local library snapshots
-				// still cross the auth boundary and are invalidated here.
-				invalidateLibraryCache();
-				clearSignedInEmail();
+				// still cross the auth boundary and are invalidated here —
+				// even when abandoned, but then with no message or redirect.
+				crossAuthBoundary();
+				if (!alive) return;
 				actionError =
 					'Your session expired before other devices were signed out. Sign in again and repeat Sign out everywhere.';
 				revokeIncomplete = true;
 				busy = null;
 				return;
 			}
+			if (!alive) return;
 			actionError = 'Could not confirm sign out everywhere. Please try again.';
 			busy = null;
 			return;
+		} finally {
+			if (!alive) busy = null;
 		}
+		// Fulfilled success is qualifying live or abandoned.
+		crossAuthBoundary();
 		redirectToLogin();
 	}
 </script>

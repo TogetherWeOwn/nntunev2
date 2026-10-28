@@ -8,7 +8,10 @@
 //! par2 set + missing blocks means the job is unrepairable: the caller
 //! fails it instead of dispatching.
 
-use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
+use std::future::Future;
+use std::time::Duration;
+
+use worker::{wasm_bindgen::JsValue, Delay, Env, Headers, Method, Request, RequestInit};
 
 use futures_util::StreamExt;
 
@@ -29,6 +32,14 @@ pub const REPAIR_URL: &str = "https://repair-worker/repair";
 /// in `out/result.json`), so anything larger is not a repair reply
 /// we can trust.
 const MAX_REPAIR_REPLY_BYTES: usize = 64 << 10;
+/// Total service-hop cutoff: the repair front's 600 s DO budget plus 60 s
+/// for forwarding and capped reply completion. A single 660 s wait leaves
+/// 240 s of the enclosing queue invocation's 900 s contract for other work,
+/// NOT a guarantee that a serial multi-message batch fits. Consumer activation
+/// must reconcile batching separately (it remains disabled here). The child's
+/// 150 s repair exchange excludes staging/output; see workers/repair/README.md
+/// for why these outer cutoffs do not cover every resource-permitted round.
+pub const REPAIR_CALL_DEADLINE_MS: u64 = 660_000;
 
 /// Fold one more reply chunk into the buffer, enforcing `cap` on the running
 /// total. Pure so the streaming policy is unit-tested without a service
@@ -145,6 +156,41 @@ pub fn classify_repair_reply(status: u16, body: &[u8]) -> RepairCall {
 /// is never retained and no truncated prefix reaches
 /// `classify_repair_reply`.
 pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
+    call_repair_with_deadline(env, req, REPAIR_CALL_DEADLINE_MS).await
+}
+
+/// Settle headers and the capped reply under one owned, cancellable deadline.
+/// The same deadline is polled first at both stages; body progress never
+/// replenishes it. Ownership releases the timer on every return (including
+/// transport failure). Local settlement does not prove remote cancellation.
+/// Generic chunks let the runtime retain its zero-copy HTTP body adapter.
+pub async fn settle_repair_call<F, S, D, C, E>(fetch: F, mut deadline: D) -> RepairCall
+where
+    F: Future<Output = Result<(u16, S), ()>> + Unpin,
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    D: Future<Output = ()> + Unpin,
+{
+    use crate::pool_deadline::race_against_deadline;
+
+    let (status, stream) = match race_against_deadline(fetch, &mut deadline).await {
+        Some(Ok(reply)) => reply,
+        Some(Err(())) | None => return RepairCall::Retry,
+    };
+    let drain = Box::pin(drain_repair_stream(stream, MAX_REPAIR_REPLY_BYTES));
+    let body = match race_against_deadline(drain, &mut deadline).await {
+        Some(Ok(body)) => body,
+        Some(Err(_)) | None => return RepairCall::Retry,
+    };
+    classify_repair_reply(status, &body)
+}
+
+/// Dispatch with an injectable total headers-plus-body budget in milliseconds.
+pub async fn call_repair_with_deadline(
+    env: &Env,
+    req: &RepairRequest,
+    deadline_ms: u64,
+) -> RepairCall {
     let Ok(body) = serde_json::to_string(req) else {
         return RepairCall::Retry;
     };
@@ -167,23 +213,17 @@ pub async fn call_repair(env: &Env, req: &RepairRequest) -> RepairCall {
         Ok(request) => request,
         Err(_) => return RepairCall::Retry,
     };
-    // With the `http` feature the fetcher answers `http::Response`; drain
-    // its body stream within the ceiling so an oversized reply fails closed
-    // from its length instead of buffering the whole body first.
-    let response = match fetcher.fetch_request(request).await {
-        Ok(response) => response,
-        Err(error) => {
+    // Delay registers on first poll: the settlement polls it before the
+    // lazy fetch, then reuses it through the capped HTTP body drain. Dropping
+    // the owned Delay cancels its local timer, not necessarily remote work.
+    let deadline = Box::pin(Delay::from(Duration::from_millis(deadline_ms)));
+    let fetch = Box::pin(async {
+        let response = fetcher.fetch_request(request).await.map_err(|error| {
             worker::console_log!("repair call failed job={}: {:?}", req.job_id, error);
-            return RepairCall::Retry;
-        }
-    };
-    let status = response.status().as_u16();
-    let stream = response.into_body();
-    let buf = match drain_repair_stream(stream, MAX_REPAIR_REPLY_BYTES).await {
-        Ok(buf) => buf,
-        Err(retry) => return retry,
-    };
-    classify_repair_reply(status, &buf)
+        })?;
+        Ok((response.status().as_u16(), response.into_body()))
+    });
+    settle_repair_call(fetch, deadline).await
 }
 
 #[cfg(test)]

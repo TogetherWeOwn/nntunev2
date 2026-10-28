@@ -25,7 +25,7 @@ pub const MAX_MANIFEST_BYTES: usize = 1 << 20;
 pub const MAX_RESULT_BYTES: usize = 1 << 20;
 
 /// Stable API fault: HTTP status plus a machine-readable code. Ingest
-/// maps statuses (400/404/409/413 permanent, 5xx transient); codes are
+/// maps statuses (400/401/403/404/409/413 permanent, 5xx transient); codes are
 /// for logs and operators, so they carry no user data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiFault {
@@ -304,6 +304,42 @@ pub fn validate_repaired_output_set(
         }
     }
     Ok(())
+}
+
+/// Settle the front door's object headers and capped body under ONE owned
+/// deadline. Like the ingest race, `select` polls its first argument first:
+/// an expired deadline wins even when the operation is ready. Carrying the
+/// same future into the body race prevents dribbles from extending it. Every
+/// return drops the timer and unfinished local operation; this is not proof
+/// that the remote object or Container stopped executing.
+pub async fn settle_do_reply<F, S, D>(fetch: F, deadline: D) -> Result<(u16, Vec<u8>), ApiFault>
+where
+    F: std::future::Future<Output = Result<(u16, S), ()>> + Unpin,
+    S: futures_util::Stream<Item = Result<Vec<u8>, ()>> + Unpin,
+    D: std::future::Future<Output = ()> + Unpin,
+{
+    use futures_util::future::{select, Either};
+    use futures_util::StreamExt;
+
+    let (reply, deadline) = match select(deadline, fetch).await {
+        Either::Left(_) => return Err(repair_unavailable_fault()),
+        Either::Right((reply, deadline)) => (reply, deadline),
+    };
+    let (status, mut stream) = reply.map_err(|()| repair_unavailable_fault())?;
+    let drain = Box::pin(async move {
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|()| repair_unavailable_fault())?;
+            if !push_chunk_capped(&mut body, &chunk, MAX_RESULT_BYTES) {
+                return Err(repair_unavailable_fault());
+            }
+        }
+        Ok((status, body))
+    });
+    match select(deadline, drain).await {
+        Either::Left(_) => Err(repair_unavailable_fault()),
+        Either::Right((reply, _deadline)) => reply,
+    }
 }
 
 #[cfg(test)]

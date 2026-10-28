@@ -54,6 +54,14 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         missing_blocks: 0,
         failure_code: None,
         failure_reason: None,
+        // Attribution starts here and lives on the checkpoint after:
+        // redelivered Queue bodies are immutable, so the message copy
+        // must never be read back over this field.
+        provider_id: msg.provider_id.clone(),
+        // Transcode inputs record at the first verify `Complete`; the
+        // cursor starts at the first input.
+        transcode_inputs: Vec::new(),
+        transcode_next: 0,
     }
 }
 
@@ -214,6 +222,22 @@ mod tests {
     }
 
     #[test]
+    fn initial_projects_provider_attribution_onto_the_checkpoint() {
+        // The checkpoint is the live attribution copy: whatever the
+        // (validated) admission message carries starts here, and the
+        // redelivered message never writes back over it.
+        let plain = msg();
+        assert!(plain.provider_id.is_none());
+        assert!(initial(&plain).provider_id.is_none());
+        let mut attributed = msg();
+        attributed.provider_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        assert_eq!(
+            initial(&attributed).provider_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+    }
+
+    #[test]
     fn admission_write_resets_a_matching_failed_checkpoint() {
         let msg = msg();
         let mut failed = initial(&msg);
@@ -299,8 +323,10 @@ mod tests {
             include_str!("queue_consumer.rs").matches(&put_call).count(),
             1
         );
-        // The consumer plans exactly one persist per delivery.
-        let persist_call = ["!persist", "(env, &cp).await"].concat();
+        // The consumer plans exactly one persist per delivery. The call
+        // carries the delivery trace alongside the checkpoint, so pin the
+        // negated call head rather than the full argument list.
+        let persist_call = ["!persist", "("].concat();
         assert_eq!(
             include_str!("queue_consumer.rs")
                 .matches(&persist_call)

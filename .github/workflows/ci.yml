@@ -60,6 +60,19 @@ jobs:
       # Same job, so failures fail rust-test and the ci-ok aggregate.
       - run: cargo test --locked -p nntune-core --no-default-features
 
+  # Validate fixture shape separately; byte-exact handler comparison runs
+  # in the nntune-subsonic tests in rust-test.
+  fixture-check:
+    name: fixture-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate golden fixtures
+        run: python3 scripts/check-subsonic-fixtures.py
+
   rust-wasm:
     name: rust check (wasm32)
     runs-on: ubuntu-latest
@@ -87,6 +100,10 @@ jobs:
       # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
+      # The YouTube measurement Worker entry (YtExtract Durable Object) only
+      # compiles on wasm32: check and lint it on the target it deploys to.
+      - run: cargo check -p nntune-youtube --target wasm32-unknown-unknown
+      - run: cargo clippy -p nntune-youtube --target wasm32-unknown-unknown -- -D warnings
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # every committed lockfile (workspace root, workers/api, workers/ingest,
@@ -113,7 +130,8 @@ jobs:
           # fails closed instead of executing. Re-pin deliberately when the
           # version above changes, verifying the digest out-of-band first.
           expected_sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
-          curl -sSL --retry 3 -o "/tmp/${asset}" "${base}/${asset}"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "/tmp/${asset}" "${base}/${asset}"
           echo "${expected_sha256}  /tmp/${asset}" | (cd /tmp && sha256sum -c -)
           mkdir -p "$HOME/.cargo/bin"
           tar -xzf "/tmp/${asset}" -C /tmp
@@ -168,7 +186,9 @@ jobs:
   worker-wasm-sizes:
     name: worker wasm sizes (report-only)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
+    # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
+    timeout-minutes: 35
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -205,6 +225,10 @@ jobs:
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
         run: python3 .github/scripts/test_public_text_read_errors.py
+      - name: Structural-test the pnpm bootstrap retry
+        run: python3 .github/scripts/test_ci_pnpm_retry.py
+      - name: Structural-test the web-e2e timeout budget
+        run: python3 .github/scripts/test_ci_web_e2e_timeout.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -216,11 +240,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Fail stalled transfers so checkout's bounded fetch retry can run
+        # instead of consuming the entire job before the offline tests.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: '1'
+          GIT_HTTP_LOW_SPEED_TIME: '60'
         with:
           fetch-depth: 1
           persist-credentials: false
       - name: Run the bounded-pool offline suite
         run: python3 scripts/test_cargo_cache.py
+      - name: Run the pool capacity acceptance suite
+        run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy
         run: |
           python3 - <<'EOF'
@@ -256,10 +287,12 @@ jobs:
   # in both staging and prod and match the docs/ops.md inventory. The
   # fixture pair proves the job goes red on drift: `match` must pass,
   # `drift-missing` / `drift-skew` must fail.
+  # These short Python guard jobs allow bounded runner-finalization headroom:
+  # hosted runners can hit a five-minute job limit after all steps pass.
   binding-parity:
     name: binding-parity
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -292,7 +325,7 @@ jobs:
   migrations-gate:
     name: migrations-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     # Compare pushes with their previous tip; comparing main to itself would miss drift.
     env:
       MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
@@ -369,6 +402,8 @@ jobs:
         run: bash containers/mb-import/tests/test_etl.sh
       - name: Run mb-import ETL reference-graph tests
         run: bash containers/mb-import/tests/test_etl_reference_graphs.sh
+      - name: Run mb-import input-admission tests (mock-only)
+        run: bash containers/mb-import/tests/test_input_admission.sh
       - name: Run mb-import argv-hygiene tests
         run: bash containers/mb-import/tests/test_argv_hygiene.sh
       - name: Run mb-import pg-env tests
@@ -445,12 +480,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
 
   # KV config staging/prod parity: both env fixtures must validate against
   # config/schema.json with identical key sets (values may differ). Also runs
@@ -512,12 +547,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
   rust-repair:
     name: rust (workers/repair)
@@ -534,13 +569,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/repair/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
       # Durable Object runtime) must check and lint on that target.
-      - run: cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo check --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
   # Repair container image: the server's native tests ride the workspace
   # `rust-test` job (containers/repair is a member); this job proves the
@@ -559,6 +594,10 @@ jobs:
       # after a revert that drops the flag from the build command.
       - name: Pin repair image build uses --locked
         run: grep -q '^RUN cargo build --locked --release -p nntune-repair-server' containers/repair/Dockerfile
+      - name: Run repair runtime-user pin test
+        run: bash containers/repair/tests/test_runtime_user.sh
+      - name: Run repair runtime-user pin self-test
+        run: bash containers/repair/tests/test_runtime_user.sh --self-test
       - name: Build repair image from clean checkout
         run: docker build -f containers/repair/Dockerfile -t nntune-repair:ci .
       - name: Smoke the shipped server and pinned par2 binary
@@ -571,6 +610,70 @@ jobs:
           curl -fsS http://127.0.0.1:18080/health | grep -q '"ok":true'
           docker exec repair-smoke /usr/local/bin/par2 --version | head -1
           docker rm -f repair-smoke
+
+  rust-transcode:
+    name: rust (workers/transcode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate (including the Container
+      # Durable Object runtime) must check and lint on that target.
+      - run: cargo check --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+  # Transcode container image: the server's native tests ride the workspace
+  # `rust-test` job (containers/transcode is a member); this job proves the
+  # shipped image (Debian ffmpeg + server) builds from a clean checkout,
+  # carries libopus, and encodes deterministically. Keep this job id in
+  # ci-ok's needs.
+  transcode-container:
+    name: transcode-container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pin the RUN line itself (anchored ^RUN): the comments above the COPY
+      # also name --locked, so a file-wide contains check would stay green
+      # after a revert that drops the flag from the build command.
+      - name: Pin transcode image build uses --locked
+        run: grep -q '^RUN cargo build --locked --release -p nntune-transcode-server' containers/transcode/Dockerfile
+      - name: Run transcode runtime-user pin test
+        run: bash containers/transcode/tests/test_runtime_user.sh
+      - name: Run transcode runtime-user pin self-test
+        run: bash containers/transcode/tests/test_runtime_user.sh --self-test
+      - name: Build transcode image from clean checkout
+        run: docker build -f containers/transcode/Dockerfile -t nntune-transcode:ci .
+      - name: Smoke the shipped server and pinned ffmpeg binary
+        run: |
+          docker run -d --name transcode-smoke -p 18082:8080 nntune-transcode:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18082/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18082/health | grep -q '"ok":true'
+          docker exec transcode-smoke ffmpeg -version
+          # Consume the listing before matching so pipefail cannot mistake
+          # grep's early pipe close for an ffmpeg capability failure.
+          docker exec transcode-smoke ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/transcode-encoders.txt"
+          grep -Eq '^[[:space:]]*A[^[:space:]]{5}[[:space:]]+libopus[[:space:]]' "$RUNNER_TEMP/transcode-encoders.txt"
+          docker rm -f transcode-smoke
+      - name: Run transcode determinism self-test
+        run: bash containers/transcode/tests/determinism_self_test.sh nntune-transcode:ci 18081
 
   # mb-import container job: unit tests ride the workspace `rust-test` job
   # (mb-import-validate is a member); this job runs the migrations plus the
@@ -629,7 +732,7 @@ jobs:
   cache-policy:
     name: cache-policy
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -681,7 +784,11 @@ jobs:
   # a PR that introduces breakage (source or target side) can go red;
   # external links are out of scope. The fixture pair proves the job goes
   # red on breakage: `match` must pass, `broken-file` / `broken-anchor`
-  # must fail. Keep this job id in ci-ok's needs.
+  # must fail. The same job also runs the citation lint: backticked
+  # `path:N` / `path:N-M` citations must resolve, stay in range, and land
+  # on their anchor symbols, with the same changed-file scope, whole-tree
+  # pin (so drift from a concurrent merge reds main), and fixture proofs.
+  # Keep this job id in ci-ok's needs.
   docs-links:
     name: docs-links
     runs-on: ubuntu-latest
@@ -734,6 +841,39 @@ jobs:
             printf '%s\n' "$output" | sed 's/^/| /'
             echo "docs-links: $fixture fixture correctly failed"
           done
+      - name: Check citations in changed docs
+        run: python3 .github/scripts/docs_citation_lint.py --root . --base-ref "$DOCS_LINKS_BASE_REF"
+      - name: Run citation lint self-tests
+        run: python3 .github/scripts/test_docs_citation_lint.py
+      - name: Pin citation lint on whole tree
+        run: python3 .github/scripts/docs_citation_lint.py --root .
+      - name: Citation lint passes on the matching fixture
+        run: python3 .github/scripts/docs_citation_lint.py --root .github/scripts/fixtures/docs-citations/match
+      - name: Citation lint goes red on broken-citation fixtures
+        run: |
+          for fixture in broken-path broken-eof broken-order broken-symbol; do
+            case "$fixture" in
+              broken-path) expected="citation target does not resolve" ;;
+              broken-eof) expected="cited line out of range" ;;
+              broken-order) expected="invalid citation range" ;;
+              broken-symbol) expected="citation does not land on" ;;
+            esac
+            rc=0
+            output=$(python3 .github/scripts/docs_citation_lint.py \
+              --root ".github/scripts/fixtures/docs-citations/$fixture" 2>&1) || rc=$?
+            if [ "$rc" -ne 1 ] || ! printf '%s\n' "$output" | grep -Fq "docs-citations: $expected"; then
+              printf '%s\n' "$output" >&2
+              echo "docs-citations: $fixture must report '$expected' and exit 1, got $rc" >&2
+              exit 1
+            fi
+            # Neutralise workflow commands: the fixture output holds
+            # ::error lines for fixture-relative paths, which would post
+            # phantom annotations on a green job if echoed raw. The
+            # runner strips leading whitespace before matching "::"
+            # (TrimStart), so prefix with "| " instead of a space.
+            printf '%s\n' "$output" | sed 's/^/| /'
+            echo "docs-citations: $fixture fixture correctly failed"
+          done
 
   # E2E harness static checks: typecheck + spec discovery with no staging
   # needed, so every PR proves the harness still compiles. The live suite
@@ -741,6 +881,10 @@ jobs:
   e2e-lint:
     name: e2e-lint
     runs-on: ubuntu-latest
+    # Preinstalled browsers + OS libraries avoid per-job apt mirror stalls.
+    # linux/amd64 v1.64.1-noble manifest verified 2026-10-23. Re-pin with
+    # e2e/package-lock.json; the offline image test rejects version drift.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -754,13 +898,58 @@ jobs:
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 
+      # The Node browser image does not promise Python; provision it for the
+      # existing traceability gate and the offline browser-image regression test.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      # The existing workflow helpers intentionally retain PATH alone. A
+      # setup-python interpreter also needs its private shared-library path;
+      # carry that in a launcher rather than weakening helper isolation.
+      - name: Preserve Python runtime for isolated helper subprocesses
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/e2e-tools"
+          mkdir -p "$tools"
+          printf '#!/bin/bash\nexport LD_LIBRARY_PATH=%q\nexec %q "$@"\n' \
+            "$pythonLocation/lib" "$(command -v python3)" > "$tools/python3"
+          chmod +x "$tools/python3"
+          echo "$tools" >> "$GITHUB_PATH"
+          env -i PATH="$tools:$PATH" python3 --version
+
+      - name: Install pinned standalone jq for shell-contract helpers
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/e2e-tools"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "$tools/jq" https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  $tools/jq" | sha256sum -c -
+          chmod +x "$tools/jq"
+          env -i PATH="$tools:$PATH" jq --version
+
+      - name: Browser image and preflight self-tests (offline doubles only)
+        run: |
+          python3 .github/scripts/test_ci_playwright_image.py
+          python3 .github/scripts/test_ci_web_e2e_image.py
+
+      - name: Smoke checker self-tests (offline fixtures only)
+        run: node --test bin/test-smoke-acceptance.mjs
+
       - name: Install e2e dependencies
         working-directory: e2e
         run: npm ci
 
-      - name: Install Playwright chromium (browser-level self-tests)
+      - name: Verify preinstalled Playwright chromium (browser-level self-tests)
         working-directory: e2e
-        run: npx playwright install --with-deps chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
 
       - name: Typecheck
         working-directory: e2e
@@ -806,7 +995,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -828,7 +1027,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -850,7 +1059,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -874,7 +1093,16 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
+    # 18.8-20.6 minutes; container setup (image pull + pnpm install)
+    # takes under a minute on the fast path. Pre-container worst setup
+    # was 17m of apt/browser downloads; slow image pulls are unmeasured,
+    # so keep headroom. 45 = 21 suite (20.6 rounded up) + 24
+    # setup/headroom. Re-measure when the reported suite exceeds
+    # 25 minutes or the test count passes ~1,800; re-pin the container
+    # with the web lock; test_ci_web_e2e_timeout.py pins this value.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/web
@@ -882,7 +1110,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      # The pinned self-installer runs one `npm ci` with no retry, so retry
+      # it once in-job. Each attempt recreates its bootstrap dir and exports
+      # PATH/PNPM_HOME only on success; a second failure fails the job.
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -891,8 +1129,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preinstalled web Playwright chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
       - name: Upload failure artifacts
@@ -903,11 +1148,58 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
+  # Privacy-safe Tail helpers and integrated durable alert runtime. The Node
+  # VM acceptance harness fakes Cloudflare, storage, time and all delivery:
+  # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
+  tail-projection:
+    name: tail-projection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Test staging deploy guards with offline fixtures
+        run: python3 .github/scripts/test_alerts_staging.py
+      - name: Assert frozen staging alert runtime bytes
+        run: python3 .github/scripts/alerts_staging.py freeze
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Observability scripts parse clean
+        run: |
+          node --check workers/observability/project-tail-event.mjs
+          node --check workers/observability/tests/project-tail-event.test.mjs
+          node --check workers/observability/evaluate-error-window.mjs
+          node --check workers/observability/tests/evaluate-error-window.test.mjs
+          node --check workers/observability/render-verdict-alert.mjs
+          node --check workers/observability/tests/render-verdict-alert.test.mjs
+          node --check workers/observability/evaluate-health-window.mjs
+          node --check workers/observability/tests/evaluate-health-window.test.mjs
+          node --check workers/observability/render-health-alert.mjs
+          node --check workers/observability/tests/render-health-alert.test.mjs
+          node --check workers/observability/runtime.mjs
+          node --check workers/observability/tests/runtime-harness.mjs
+          node --check workers/observability/tests/runtime.test.mjs
+      - name: Run durable Tail alert runtime acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/runtime.test.mjs
+      - name: Run Tail projection acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
+      - name: Run error-window acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/evaluate-error-window.test.mjs
+      - name: Run verdict-alert acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/render-verdict-alert.test.mjs
+      - name: Run health-window acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/evaluate-health-window.test.mjs
+      - name: Run health-alert acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/render-health-alert.test.mjs
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

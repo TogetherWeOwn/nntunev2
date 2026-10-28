@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import {
 		formatCountdown,
 		trackPaywallShown,
@@ -9,7 +9,7 @@
 
 	interface Props {
 		model: PaywallModel;
-		onclose: () => void;
+		onclose: (retry?: () => void, navigating?: boolean) => void;
 		/**
 		 * Analytics sink; defaults to re-dispatching the documented event as a
 		 * same-named CustomEvent on window (see planLimit.ts). Props only —
@@ -32,13 +32,47 @@
 		model.retryAfterSeconds === null ? null : Date.now() + model.retryAfterSeconds * 1000
 	);
 
+	const shownModels = new WeakSet<PaywallModel>();
+	const readyModels = new WeakSet<PaywallModel>();
+	let hasShownModel = false;
+	let announcement = $state('');
+	let announcementVersion = 0;
+	let closing = false;
+	let retryAction: (() => void) | undefined;
+	let navigating = false;
+
+	async function announce(text: string) {
+		const version = ++announcementVersion;
+		// Empty first so equal-text replacement responses are still delivered.
+		announcement = '';
+		await tick();
+		if (version === announcementVersion && !closing) announcement = text;
+	}
+
+	onDestroy(() => { announcementVersion += 1; });
+
 	$effect(() => {
-		// Track the model object itself (not just its seconds) so a new
-		// limit response with the same wait still starts a fresh deadline.
+		// Identity, not seconds: equal waits from new responses get a fresh
+		// deadline and one display event each, without timer-driven duplicates.
 		const current = model;
 		const seconds = current.retryAfterSeconds;
 		remaining = seconds;
 		deadline = seconds === null ? null : Date.now() + seconds * 1000;
+		if (!shownModels.has(current)) {
+			shownModels.add(current);
+			untrack(() => trackPaywallShown(track ?? defaultTrack, current));
+			if (hasShownModel && seconds !== 0) {
+				void announce(`${current.headline}.${seconds === null ? '' : ` ${formatCountdown(seconds)}`}`);
+			}
+			hasShownModel = true;
+		}
+	});
+
+	$effect(() => {
+		if (model.kind === 'retryable' && remaining === 0 && !readyModels.has(model)) {
+			readyModels.add(model);
+			void announce(formatCountdown(0));
+		}
 	});
 
 	const countdownText = $derived(
@@ -49,16 +83,9 @@
 		window.dispatchEvent(new CustomEvent(name, { detail: props }));
 	};
 
-	let displayed = false;
-
-	// Fire the analytics event exactly once per modal mount, and open natively
-	// so Esc, focus trapping, and ::backdrop come from the platform. Effects
-	// may re-run when props/bindings update; never re-open an open dialog.
+	// Open natively for Esc and focus trapping; replacements never reopen it.
 	$effect(() => {
-		if (displayed || !dialog) return;
-		displayed = true;
-		trackPaywallShown(track ?? defaultTrack, model);
-		if (!dialog.open) dialog.showModal();
+		if (dialog && !dialog.open && !closing) dialog.showModal();
 	});
 
 	// Count down the retry wait by elapsed wall-clock time from the
@@ -82,17 +109,66 @@
 	});
 
 	function close() {
+		if (closing) return;
+		closing = true;
+		announcementVersion += 1;
 		dialog?.close();
+	}
+
+	function upgrade(event: MouseEvent) {
+		if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+			navigating = new URL(model.ctaHref, window.location.href).href !== window.location.href;
+			// Already on pricing: don't run a redundant router navigation
+			// that resets the focus we are returning to the plan control.
+			if (!navigating) event.preventDefault();
+		}
+		close();
+	}
+
+	function retry() {
+		retryAction = model.retry;
+		close();
+	}
+
+	function backdrop(event: MouseEvent) {
+		if (event.target !== dialog || !dialog) return;
+		const bounds = dialog.getBoundingClientRect();
+		if (event.clientX < bounds.left || event.clientX > bounds.right
+			|| event.clientY < bounds.top || event.clientY > bounds.bottom) close();
+	}
+
+	// Native showModal trapping stutters in Chromium: Tab from the last
+	// control lands on <body> once before wrapping back in (verified with
+	// and without the app-shell nav in the DOM). Wrap explicitly at the
+	// boundaries so keyboard focus never leaves the open dialog.
+	function wrapTab(event: KeyboardEvent) {
+		if (event.key !== 'Tab' || !dialog) return;
+		const controls = [...dialog.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)')]
+			.filter((control) => control.getClientRects().length > 0);
+		if (controls.length === 0) return;
+		const first = controls[0];
+		const last = controls[controls.length - 1];
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault();
+			last.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first.focus();
+		}
 	}
 </script>
 
 <dialog
 	bind:this={dialog}
+	role="dialog"
 	class="paywall"
 	data-testid="plan-limit-notice"
 	aria-labelledby="paywall-headline"
 	aria-describedby="paywall-detail"
-	onclose={onclose}
+	onclose={() => { closing = true; announcementVersion += 1; onclose(retryAction, navigating); }}
+	oncancel={(event) => { event.preventDefault(); close(); }}
+	onclick={backdrop}
+	onkeydown={wrapTab}
 >
 	<h2 id="paywall-headline">{model.headline}</h2>
 	<p id="paywall-detail">{model.detail}</p>
@@ -102,8 +178,14 @@
 		<p class="paywall-countdown" role="timer" data-testid="paywall-countdown">{countdownText}</p>
 	{/if}
 
+	<p class="paywall-announcement" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
+
 	<div class="paywall-actions">
-		<a class="nt-button" href={model.ctaHref} onclick={close}>Upgrade your plan</a>
+		<a class="nt-button" href={model.ctaHref} onclick={upgrade}>Upgrade your plan</a>
+		{#if model.kind === 'retryable'}
+			<button type="button" class="nt-button nt-button--ghost" onclick={retry}
+				disabled={remaining !== null && remaining > 0}>Retry</button>
+		{/if}
 		<button type="button" class="nt-button nt-button--ghost" onclick={close}>Not now</button>
 	</div>
 </dialog>
@@ -137,6 +219,21 @@
 		font-weight: 600;
 		color: var(--nt-fg);
 		font-variant-numeric: tabular-nums;
+	}
+
+	.paywall-announcement {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+
+	.paywall-actions button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 
 	.paywall-actions {

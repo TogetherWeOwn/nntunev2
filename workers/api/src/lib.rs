@@ -1,20 +1,32 @@
 //! NNTune v2 accounts/auth/session/vault/library: security-critical core
 //! (`auth`, `session`, `vault`, `webauthn`, `library`), the
 //! framework-agnostic HTTP handlers (`handlers`, native-tested against
-//! fake stores), and the Worker + Hyperdrive entry (`worker_entry`).
+//! fake stores), the Worker + Hyperdrive entry (`worker_entry`), and the
+//! Subsonic-compatible `/rest/*` surface (wasm32 only), which adapts to
+//! the transport-free `nntune-subsonic` dispatcher.
+//!
+//! The production Subsonic `Library` (PlanetScale via Hyperdrive, R2
+//! audio/artwork via the stream worker) plugs in behind the `Library`
+//! seam. Until then the Worker uses `MemStore::empty()`, which holds no
+//! credentials and rejects every auth attempt. Per-client `apiKey`
+//! credentials will resolve against `subsonic_clients`
+//! (`migrations/0023_subsonic_clients.sql`).
 
 pub mod account_deletion;
 pub mod api_error;
 pub mod auth;
 pub mod b64;
+pub mod billing;
 pub mod handlers;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
 pub mod native_rest;
 pub mod plan_limits;
+pub mod providers;
 pub mod random;
 pub mod rate_limit;
+pub mod rotation;
 pub mod session;
 pub mod vault;
 pub mod webauthn;
@@ -93,11 +105,140 @@ mod logging_tests {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+use futures_util::StreamExt;
+#[cfg(target_arch = "wasm32")]
+use nntune_subsonic::{
+    oversized_body_response, unreadable_body_response, BodyFault, FormBody, MemStore, SubsonicApp,
+};
+#[cfg(target_arch = "wasm32")]
+use worker::*;
+
 #[worker::event(fetch)]
 pub async fn main(
     req: worker::Request,
     env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    // The Subsonic `/rest/*` surface (wasm32 only) adapts to the
+    // transport-free `nntune-subsonic` dispatcher. Every other path keeps
+    // `worker_entry::dispatch` behavior; the path peek only borrows, so an
+    // unclaimed request still moves into dispatch untouched.
+    #[cfg(target_arch = "wasm32")]
+    if is_subsonic_request(&req) {
+        let mut req = req;
+        return subsonic_response(&mut req).await;
+    }
     worker_entry::dispatch(req, env).await
+}
+
+/// True when this request targets the Subsonic `/rest/*` surface.
+#[cfg(target_arch = "wasm32")]
+fn is_subsonic_request(req: &Request) -> bool {
+    req.url().is_ok_and(|url| is_subsonic_path(url.path()))
+}
+
+/// Pure path predicate behind [`is_subsonic_request`]. Compiled natively
+/// for tests so the routing boundary the wasm32 entry depends on is
+/// pinned without a Worker runtime.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn is_subsonic_path(path: &str) -> bool {
+    path == "/rest" || path.starts_with("/rest/")
+}
+
+#[cfg(test)]
+mod subsonic_routing_tests {
+    use super::is_subsonic_path;
+
+    #[test]
+    fn rest_prefix_claims_subsonic_paths_only() {
+        for claimed in ["/rest", "/rest/", "/rest/ping", "/rest/getArtists.view"] {
+            assert!(is_subsonic_path(claimed), "{claimed} routes to Subsonic");
+        }
+        for unclaimed in [
+            "/",
+            "/healthz",
+            "/v1/auth/magic/start",
+            "/restless",
+            "/api/rest/ping",
+            "/REST/ping",
+        ] {
+            assert!(!is_subsonic_path(unclaimed), "{unclaimed} keeps dispatch");
+        }
+    }
+}
+
+/// Serve one Subsonic request: v1 reads params from query plus POST form
+/// body (`$request->input()`), refusing bodies over 10 MB with error 10.
+#[cfg(target_arch = "wasm32")]
+async fn subsonic_response(req: &mut Request) -> Result<Response> {
+    let url = req.url()?;
+    let path = url.path().to_string();
+    let query = url.query().unwrap_or("").to_string();
+    let method = req.method().to_string();
+
+    // v1 reads params from query plus POST form body (`$request->input()`).
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let is_form_post = method.eq_ignore_ascii_case("POST")
+        && content_type.contains("application/x-www-form-urlencoded");
+    let declared = req
+        .headers()
+        .get("content-length")
+        .unwrap_or_default()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let fault_response = |fault: BodyFault| match fault {
+        BodyFault::Oversized => oversized_body_response(&query),
+        BodyFault::Unreadable => unreadable_body_response(&query),
+    };
+    let mut form = FormBody::new(declared);
+    // v1 `MergeFormPostParams` refuses bodies over 10 MB on `Content-Length`
+    // before buffering: answer error 10 without reading the body at all.
+    if is_form_post {
+        if let Err(fault) = form.check_declared() {
+            return respond(&fault_response(fault));
+        }
+    }
+    let body = if is_form_post
+        // Request::stream() errors on a null JS body. That is a valid empty
+        // form POST, distinct from a stream that exists but cannot be read.
+        && req.inner().body().is_some()
+    {
+        let mut stream = match req.stream() {
+            Ok(stream) => stream,
+            Err(_) => return respond(&unreadable_body_response(&query)),
+        };
+        while let Some(chunk) = stream.next().await {
+            let pushed = match chunk {
+                Ok(chunk) => form.push(&chunk),
+                Err(_) => Err(BodyFault::Unreadable),
+            };
+            if let Err(fault) = pushed {
+                return respond(&fault_response(fault));
+            }
+        }
+        match form.finish() {
+            Ok(body) => body,
+            Err(fault) => return respond(&fault_response(fault)),
+        }
+    } else {
+        String::new()
+    };
+
+    let app = SubsonicApp::new(MemStore::empty());
+    let res = app.handle(&method, &path, &query, &body);
+    respond(&res)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn respond(res: &nntune_subsonic::HttpResponse) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", &res.content_type)?;
+    let mut response = Response::from_bytes(res.body.clone())?;
+    response = response.with_status(res.status);
+    *response.headers_mut() = headers;
+    Ok(response)
 }

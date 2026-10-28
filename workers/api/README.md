@@ -1,8 +1,9 @@
-# nntune-api: accounts, auth, sessions, BYOP vault, library
+# nntune-api: Subsonic, accounts, auth, sessions, BYOP vault, library
 
 Rust core + Worker HTTP entry for NNTune v2 accounts/auth (passkeys +
 email magic link), signed-cookie sessions, the BYOP credential
-vault, and the genre/playlist library. Compiles to native (tests)
+vault, and the genre/playlist library, with a Subsonic-compatible
+Worker entry on `/rest/*`. Compiles to native (tests)
 and `wasm32` (Cloudflare Worker).
 
 ## Layout
@@ -63,8 +64,8 @@ the core and require exactly one row before any response.
 | `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
 
-`OPTIONS` on any listed route except the staging-only `POST /api/test-codes`
-seam answers an empty 204. Credentialed CORS
+`OPTIONS` on any listed route (and the scope-map-served native paths, never
+the staging-only `POST /api/test-codes` seam) answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
@@ -203,6 +204,17 @@ behavior changes here.
   `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
   is set (`e2e/helpers/accounts.ts`).
 
+The Subsonic-compatible `/rest/*` surface (wasm32 only) is routed in
+`src/lib.rs` and delegates to `crates/nntune-subsonic`. Its
+`MemStore::empty()` contains no credentials and refuses all
+authentication; PlanetScale `Library` and stream Worker wiring are
+still pending. This is not a deployed, usable music API yet. See
+[`docs/subsonic-client-smoke.md`](../../docs/subsonic-client-smoke.md)
+for the client verification procedure.
+
+This crate remains standalone (excluded from the root workspace), so use
+`--manifest-path workers/api/Cargo.toml` for its checks.
+
 ## Security contract (threat-model §3–§4)
 
 - **Envelope encryption:** per-user random 256-bit DEK, wrapped by the KEK
@@ -211,7 +223,8 @@ behavior changes here.
   fails to decrypt. Rotation via `rewrap_dek` without touching ciphertext.
   (Sources: `workers/api/src/vault.rs` — `encrypt_vault`, `decrypt_vault`,
   `dek_aad`/`payload_aad`, `rewrap_dek`; KEK from `VAULT_KEK_BASE64` +
-  `VAULT_KEK_VERSION` in `workers/api/src/worker_entry.rs`; marker/index in
+  `VAULT_KEK_VERSION` (legacy) or `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`
+  (versioned) in `workers/api/src/worker_entry.rs`; marker/index in
   `migrations/0015_kek_rotation.sql`, design `docs/security/kek-rotation.md` §1–§2.)
 - **Never logged, never returned:** reads return booleans only
   (`redacted_summary`); `test connection` returns a boolean, never provider
@@ -408,13 +421,13 @@ behavior changes here.
   This worker performs no indexer fetches; indexer URLs are validated at
   save/test time only (`IndexerConfig::validate`). Saved indexer URLs are
   refused with `VaultError::Invalid` when the shape is wrong: a non-`https`
-  scheme (`vault.rs:354-356`), parsed userinfo (`vault.rs:364-366`), raw
-  whitespace or backslash (`vault.rs:375-377`), a non-literal `https://`
-  scheme prefix (`vault.rs:378-391`), an empty authority or a raw `@` in
+  scheme (`vault.rs:363-365`), parsed userinfo (`vault.rs:373-375`), raw
+  whitespace or backslash (`vault.rs:384-386`), a non-literal `https://`
+  scheme prefix (`vault.rs:387-400`), an empty authority or a raw `@` in
   it — including empty `@host`/`:@host` and obfuscated shapes
   (`https:/@host`, tab/newline splits, backslashes, extra slashes) that
-  the parser would strip or normalize (`vault.rs:401-406`), an explicit
-  non-443 port (`vault.rs:411-415`), or any fragment (`vault.rs:418-420`).
+  the parser would strip or normalize (`vault.rs:410-415`), an explicit
+  non-443 port (`vault.rs:420-424`), or any fragment (`vault.rs:427-429`).
   Indexer fetches must
   forbid redirects (`INDEXER_ALLOW_REDIRECTS = false`, threat-model
   F-INGEST-01). No live indexer fetch transport exists yet;
@@ -446,16 +459,22 @@ behavior changes here.
 
 ## Test
 
+Run these commands from the repository root:
+
 ```sh
 cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
 cargo fmt --manifest-path workers/api/Cargo.toml -- --check
 cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
 bash workers/api/check_hyperdrive_cache.sh --self-test
+cargo test -p nntune-subsonic --locked
+python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI job `api`; `fmt` takes no `--locked` (it resolves no
-dependencies), so the asymmetry is intentional.
-Sources: `.github/workflows/ci.yml:271-296`.)
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:366-391`) and
+`fixture-check` (`.github/workflows/ci.yml:65-74`); `fmt` takes no
+`--locked` (it resolves no dependencies), so the asymmetry is
+intentional. `cargo test -p nntune-subsonic` also runs under
+`rust-test --workspace`.)
 
 Fixtures use synthetic credentials only (`news.example.com`, `203.0.113.7`).

@@ -12,9 +12,9 @@ which buckets a Worker may never consume.
 
 | Bucket | Env | Consumer | Edge `Cache-Control` on reads | R2 object lifetime / eviction |
 |---|---|---|---|---|
-| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | content-addressed blobs per `workers/stream/src/cache.rs` (`audio/<sha256>` + `track/<id>` pointers; ADR-0003 prescribes `{hh}/{hh}/{sha}` and replaces `track` lookups — see sources); no R2 lifecycle rule reported for this bucket (`docs/ops.md` audio-bucket R2 lifecycle subsection; see TTL section); timed `track` pointers hard-miss after 3,900 s (see TTL section) |
+| `nntunev2-audio-staging` | staging | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | content-addressed blobs per `workers/stream/src/cache.rs` (`audio/<sha256>` + `track/<id>` pointers; ADR-0003 prescribes `audio/{hh}/{hh}/{sha}` and replaces `track` lookups — see sources); no R2 lifecycle rule reported for this bucket (`docs/ops.md` audio-bucket R2 lifecycle subsection; see TTL section); timed `track` pointers hard-miss after 3,900 s (see TTL section) |
 | `nntunev2-audio-prod` | prod | stream Worker (`AUDIO_CACHE`) | prescribed `no-store`; not yet wired (see deltas) | same as staging |
-| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | immutable objects per mb test fixture (`art/{hh}/{hh}/{sha}-{size}`; ADR-0003 prescribes `{hh}/{hh}/{sha}` with no prefix/suffix — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section) |
+| `nntunev2-art-staging` | staging | MusicBrainz Worker artwork cache (`ART_CACHE`) | `public, max-age=86400, immutable` prescribed where art bytes are served; lookup/search JSON headers below are implemented | immutable objects per mb test fixture (`art/{hh}/{hh}/{sha}-{size}`; ADR-0003 prescribes `art/{hh}/{hh}/{sha}` with no `-{size}` suffix — see sources); R2 lifecycle metadata not reported in `docs/ops.md` (see TTL section) |
 | `nntunev2-art-prod` | prod | MusicBrainz Worker artwork cache (`ART_CACHE`) | same as staging | same as staging |
 | `nntunev2-archive-staging` | staging | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
 | `nntunev2-archive-prod` | prod | **none — reserved; no Worker binding in this repo (CI-enforced)** | n/a (no reads) | reserved; no bucket lock configured; no object expiry |
@@ -30,7 +30,7 @@ which buckets a Worker may never consume.
   `ContentCache` as the in-memory stand-in that production swaps for R2
   calls with identical semantics. This shape is unreconciled with
   `docs/adr/0003-cache-scope.md`: the ADR R2 layout is
-  `{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}` with no `audio/` prefix,
+  `audio/{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}`,
   and Stream readers must replace global `track/<track_id>` lookups with
   per-user mapping and grant checks (ADR-0003 R2 layout and consequences
   sections). Edge `no-store` is prescribed but unwired: no `Cache-Control`
@@ -68,20 +68,23 @@ which buckets a Worker may never consume.
   `caa_url_builder_embeds_bucket_and_key`); `caa_url_for_art`
   (`workers/mb/src/lib.rs`) only formats `r2://{bucket}/{key}` on a
   caller-supplied key and is unused by runtime response handling; ADR-0003
-  prescribes `{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}` with no `art/`
-  prefix and no `-{size}` suffix, original only at launch (ADR-0003 R2
-  layout section). R2 lifetime: `docs/ops.md` does not report lifecycle
+  prescribes `art/{sha256hex[0:2]}/{sha256hex[2:4]}/{sha256hex}` with no
+  `-{size}` suffix, original only at launch (ADR-0003 R2 layout section).
+  R2 lifetime: `docs/ops.md` does not report lifecycle
   metadata for the art buckets — see TTL section.
 - `nntunev2-archive-staging` / `nntunev2-archive-prod`: reserved with no
   Worker consumer per the reservation guard below (CI-enforced). No
   `archive` `bucket_name` appears in `workers/stream/wrangler.toml`,
   `workers/mb/wrangler.toml.example` (commented art names only),
   `workers/repair/wrangler.toml` (`INGEST_SCRATCH` only),
-  `workers/ingest/wrangler.toml.example` (`INGEST_SCRATCH` placeholder plus
-  its never-bind-archive comment), or `apps/web/wrangler.toml` (no R2
-  bindings); `docs/ops.md` lists both as reserved with no consumer and the
-  binding manifest intentionally leaves archive unmapped. No reads, no
-  bucket lock, and no object expiry per the TTL and guard sections.
+  `workers/transcode/wrangler.toml` (`INGEST_SCRATCH` only),
+  `workers/ingest/wrangler.toml.example` (`INGEST_SCRATCH` and
+  `AUDIO_PUBLISH` placeholders plus its never-bind-archive comment with
+  the documented §4.2 audio-publication exception), or
+  `apps/web/wrangler.toml` (no R2 bindings); `docs/ops.md` lists both as
+  reserved with no consumer and the binding manifest intentionally leaves
+  archive unmapped. No reads, no bucket lock, and no object expiry per
+  the TTL and guard sections.
 
 ## What "TTL" means here
 

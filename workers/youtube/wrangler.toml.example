@@ -1,0 +1,34 @@
+# Binding map for workers/youtube (Day-1 spike measurement Worker). Copy to
+# wrangler.toml locally; replace every `<...>` placeholder with the real id
+# and never commit real ids or secrets (see repo root .gitignore).
+name = "nntune-youtube"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
+# Extraction gate (code: src/runtime.rs, src/routes.rs). Same-script
+# `YtExtract` Durable Object: rate limits + circuit breakers on `/player`
+# extraction. The measurement routes address it through this binding; until
+# the extraction wiring lands `POST /extract` answers retryable 503.
+[[durable_objects.bindings]]
+name = "YT_EXTRACT"
+class_name = "YtExtract"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["YtExtract"]
+
+# Runtime config (code: src/client.rs): ordered client try-order + the
+# Innertube API key, extracted from YouTube's public homepage JS at deploy
+# time. The compiled default is VISIONOS only.
+[[kv_namespaces]]
+binding = "YT_CONFIG"
+id = "<KV_NAMESPACE_ID_FOR_CONFIG>"
+
+# Cached `/player` responses by client + video ID (TTL under the measured
+# URL lifetime; see docs/youtube-backend-spike.md).
+[[kv_namespaces]]
+binding = "YT_PLAYER_CACHE"
+id = "<KV_NAMESPACE_ID_FOR_PLAYER_CACHE>"

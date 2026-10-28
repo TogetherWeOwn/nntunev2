@@ -43,16 +43,20 @@ class CacheTests(unittest.TestCase):
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,time,pathlib\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"fixture").write_bytes(b"x"*4096)\n'
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"fixture").write_bytes(b"x"*4096)\n'
                              'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
-                             'assert scratch == target.parent/"scratch"\n'
+                             'assert scratch.name == target.name\n'
+                             'assert scratch.parent.name == "scratch"\n'
+                             'assert target.parent.name == "target"\n'
+                             'assert scratch.parent.parent == target.parent.parent\n'
                              'assert os.environ["TMP"] == os.environ["TEMP"] == str(scratch)\n'
                              '(scratch/"fixture").write_bytes(b"x"*4096)\n'
                              'assert os.environ["CARGO_INCREMENTAL"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_DEV_DEBUG"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_TEST_DEBUG"] == "0"\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
         self.fake.chmod(0o700)
 
     def save_policy(self):
@@ -69,8 +73,10 @@ class CacheTests(unittest.TestCase):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def finish():
-            for slot in self.pool.glob('slot-*'):
-                (slot / 'target' / 'release').touch()
+            for parent in self.pool.glob('slot-*/target/*'):
+                if parent.is_dir():
+                    (parent / 'debug').mkdir(exist_ok=True)
+                    (parent / 'debug' / 'release').touch()
             if child.poll() is None:
                 child.terminate()
             child.communicate(timeout=5)
@@ -80,7 +86,7 @@ class CacheTests(unittest.TestCase):
 
     def wait_ready(self, count):
         deadline = time.monotonic() + 5
-        while len(list(self.pool.glob('slot-*/target/ready'))) < count:
+        while len(list(self.pool.glob('slot-*/target/*/debug/ready'))) < count:
             if time.monotonic() > deadline:
                 self.fail('fixture child did not become ready')
             time.sleep(.01)
@@ -98,19 +104,369 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(first.poll())
         self.assertIsNone(second.poll())
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         total = sum(cache.usage(p) for p in self.pool.glob('slot-*'))
         self.assertLessEqual(total, 2 * self.policy['slot_budget_bytes'])
         print(f'concurrency receipt: 2 running slots, third refused, {total} allocated bytes')
-        for slot in self.pool.glob('slot-*'):
-            (slot / 'target' / 'release').touch()
+        for parent in self.pool.glob('slot-*/target/*'):
+            if parent.is_dir():
+                (parent / 'debug').mkdir(exist_ok=True)
+                (parent / 'debug' / 'release').touch()
         for child in (first, second):
             output, error = child.communicate(timeout=5)
             self.assertEqual(child.returncode, 0, error.decode())
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
-        slot, _, fd = cache.acquire(self.pool, self.policy)
+        slot, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(slot.name, 'slot-0')
+
+    def test_different_workspaces_get_isolated_target_subdirs(self):
+        # A shared slot target/ once allowed cross-worktree artifact
+        # reuse (relative dep-info + mtime-only freshness). Each worktree
+        # must get its own subdir; artifacts from A must never be visible
+        # to B, and B's acquire must evict A's subdirs to preserve budget.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        slot_a, target_a, fd_a = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            self.assertEqual(slot_a.name, 'slot-0')
+            self.assertTrue(cache.WS_DIR_RE.fullmatch(target_a.name))
+            self.assertEqual(target_a.parent, slot_a / 'target')
+            (target_a / 'debug').mkdir()
+            (target_a / 'debug' / 'marker-a').write_text('a')
+            ws_a = cache.workspace_subdir_name(work_a)
+            self.assertEqual(target_a.name, ws_a)
+            self.assertTrue((slot_a / 'scratch' / ws_a).is_dir())
+        finally:
+            os.close(fd_a)
+        # Same worktree re-acquiring with no intervening other worktree
+        # keeps its incremental build cache.
+        slot_a1, target_a1, fd_a1 = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            self.assertEqual(slot_a1.name, 'slot-0')
+            self.assertEqual(target_a1, target_a)
+            self.assertTrue((target_a1 / 'debug' / 'marker-a').exists())
+        finally:
+            os.close(fd_a1)
+        slot_b, target_b, fd_b = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(slot_b.name, 'slot-0')
+            self.assertNotEqual(target_a, target_b)
+            self.assertFalse((target_b / 'debug' / 'marker-a').exists())
+            self.assertEqual(list((slot_b / 'target').iterdir()), [target_b])
+            ws_b = cache.workspace_subdir_name(work_b)
+            self.assertEqual(target_b.name, ws_b)
+            self.assertEqual(list((slot_b / 'scratch').iterdir()),
+                             [slot_b / 'scratch' / ws_b])
+        finally:
+            os.close(fd_b)
+        # Same worktree re-acquiring the same slot reuses its subdir.
+        slot_a2, target_a2, fd_a2 = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            (target_a2 / 'debug').mkdir()
+            (target_a2 / 'debug' / 'marker-a2').write_text('a2')
+            self.assertEqual(target_a2.name, ws_a)
+        finally:
+            os.close(fd_a2)
+
+    def test_legacy_shared_target_migrates_to_worktree_subdir(self):
+        # Legacy slots hold Cargo output directly under target/.
+        # First acquire migrates build-output-only legacy trees to the
+        # per-worktree layout instead of refusing all builds.
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug' / 'deps').mkdir(parents=True)
+        (slot / 'target' / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        (slot / 'scratch' / 'tmpfile').write_bytes(b'x' * 64)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, target, fd = cache.acquire(self.pool, self.policy, self.root)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+            self.assertTrue(cache.WS_DIR_RE.fullmatch(target.name))
+            self.assertEqual(list(target.iterdir()), [])
+            ws_name = cache.workspace_subdir_name(self.root)
+            self.assertEqual(target.name, ws_name)
+            self.assertEqual(list((slot / 'scratch').iterdir()),
+                             [slot / 'scratch' / ws_name])
+        finally:
+            os.close(fd)
+        self.assertIn('worktree_layout_migrated', err.getvalue())
+
+    def test_legacy_foreign_material_blocks_migration(self):
+        # Foreign/evidence material in a legacy slot must not be
+        # auto-deleted: the slot is skipped for Operator inspection.
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        (slot / 'target' / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 16)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, self.root)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue((slot / 'target' / 'debug' / 'stashed-source.rs').exists())
+
+    def test_worktree_veto_checks_each_subdir(self):
+        # Retention vetoes understand the per-worktree layout: clean
+        # subdirs pass, preserved files inside any subdir veto.
+        target = self.pool / 'slot-0' / 'target'
+        scratch = self.pool / 'slot-0' / 'scratch'
+        ws_a = cache.workspace_subdir_name(self.root / 'a')
+        ws_b = cache.workspace_subdir_name(self.root / 'b')
+        (target / ws_a / 'debug').mkdir(parents=True)
+        (target / ws_b / 'debug').mkdir(parents=True)
+        (scratch / ws_a).mkdir(parents=True)
+        (scratch / ws_b).mkdir(parents=True)
+        self.assertIsNone(cache.preservation_veto(target))
+        self.assertIsNone(cache.scratch_preservation_veto(scratch))
+        (target / ws_b / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 16)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (target / ws_b / 'debug' / 'stashed-source.rs').unlink()
+        (target / ws_a / 'debug' / 'backup.tar.gz').write_bytes(b'x' * 16)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (target / ws_a / 'debug' / 'backup.tar.gz').unlink()
+        (scratch / ws_a / 'backup.tar.gz').write_bytes(b'x' * 16)
+        # backup stem is protected even under an arbitrary temp name
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+        (scratch / ws_a / 'backup.tar.gz').unlink()
+        (scratch / ws_a / 'backup').mkdir()
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+
+    def test_evict_refuses_worktree_subdir_with_protected_content(self):
+        # Eviction runs the preservation veto first: another worktree's
+        # subdir holding protected material is left for Operator
+        # inspection instead of being deleted as build output.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / ws_a / 'debug').mkdir(parents=True)
+        stashed = slot / 'target' / ws_a / 'debug' / 'stashed-source.rs'
+        stashed.write_bytes(b'x' * 16)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue(stashed.exists())
+        self.assertEqual(list((slot / 'target').iterdir()), [slot / 'target' / ws_a])
+
+    def test_refused_scratch_leaves_target_unevicted(self):
+        # Both parents preflight before either mutates: when scratch
+        # refuses, target eviction must not have happened (a refused
+        # slot is left unchanged, never partially evicted).
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        kept = slot / 'target' / ws_a / 'debug' / 'libfixture.rlib'
+        kept.parent.mkdir(parents=True)
+        kept.write_bytes(b'x' * 64)
+        backup = slot / 'scratch' / ws_a / 'backup'
+        backup.mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue(kept.exists())
+        self.assertTrue(backup.is_dir())
+        self.assertEqual(list((slot / 'target').iterdir()), [slot / 'target' / ws_a])
+        self.assertEqual(list((slot / 'scratch').iterdir()), [slot / 'scratch' / ws_a])
+
+    def test_mixed_worktree_legacy_layout_vetoes(self):
+        # An old/new script rollout leaves target/ holding one ws-*
+        # subdir plus a legacy debug/ tree. Both vetoes must flag the
+        # mixed provenance for Operator inspection instead of scanning
+        # it as pure legacy output.
+        target = self.pool / 'slot-0' / 'target'
+        scratch = self.pool / 'slot-0' / 'scratch'
+        ws_a = cache.workspace_subdir_name(self.root / 'a')
+        (target / ws_a / 'debug').mkdir(parents=True)
+        (target / 'debug' / 'deps').mkdir(parents=True)
+        (target / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (scratch / ws_a).mkdir(parents=True)
+        (scratch / 'tmpfile').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+
+    def write_alphabet_harness(self, scratch, historical):
+        # Lifecycle fixture for the stream/API alphabet contract harness:
+        # a stable Cargo-owned scratch dir holding generated inputs plus
+        # a retained nested target. historical=True keeps the authored
+        # manifest, test source, and lockfile the harness used to leave
+        # behind; historical=False is the post-cleanup layout (lock and
+        # build outputs only).
+        scratch.mkdir(parents=True)
+        (scratch / 'harness.lock').write_bytes(b'')
+        if historical:
+            for name in ('Cargo.toml', 'alphabet.rs', 'Cargo.lock'):
+                (scratch / name).write_bytes(b'generated harness input')
+        nested = scratch / 'target'
+        (nested / 'debug' / 'deps').mkdir(parents=True)
+        (nested / 'debug' / 'deps' / 'libnntune_stream.rlib').write_bytes(b'x' * 64)
+        (nested / 'debug' / 'deps' / 'alphabet-1a2b3c4d').write_bytes(b'x' * 64)
+        (nested / 'debug' / 'build' / 'pkg' / 'out').mkdir(parents=True)
+        (nested / 'debug' / 'build' / 'pkg' / 'out' / 'codegen.rs').write_bytes(b'x' * 16)
+        (nested / '.cargo-lock').write_bytes(b'')
+        (nested / 'CACHEDIR.TAG').write_bytes(b'x' * 16)
+        (nested / '.rustc_info.json').write_bytes(b'{}')
+
+    def test_alphabet_harness_historical_layout_still_vetoes(self):
+        # Diagnosis pin: the generated manifest/test-source/lockfile the
+        # alphabet contract harness used to leave inside Cargo-owned
+        # target storage must keep failing closed on both the legacy
+        # migration and the per-worktree eviction path, so a future fix
+        # cannot come from whitelisting generated sources. Genuine
+        # protected material in the same spot still vetoes too.
+        scratch_name = 'play-ledger-alphabet-0123456789abcdef'
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        historical = slot / 'target' / 'tmp' / scratch_name
+        self.write_alphabet_harness(historical, historical=True)
+        veto = cache.preservation_veto(slot / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved file in target', veto)
+        self.assertTrue('alphabet.rs' in veto or 'Cargo.toml' in veto)
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        other = self.pool / 'slot-1'
+        self.write_alphabet_harness(
+            other / 'target' / ws_a / 'tmp' / scratch_name, historical=True)
+        (other / 'scratch' / ws_a).mkdir(parents=True)
+        veto = cache.preservation_veto(other / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved file in target', veto)
+        self.assertIn(ws_a, veto)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+                cache.acquire(self.pool, self.policy, work_b)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue((historical / 'alphabet.rs').exists())
+        control = slot / 'target' / 'tmp' / (scratch_name + '-cleaned')
+        self.write_alphabet_harness(control, historical=False)
+        (control / 'evidence').mkdir()
+        (control / 'evidence' / 'capture.json').write_bytes(b'{}')
+        veto = cache.preservation_veto(slot / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved', veto)
+
+    def test_alphabet_harness_cleaned_layout_acquires(self):
+        # The post-cleanup layout the fixed harness leaves (lock plus
+        # nested build outputs, generated inputs removed) must pass the
+        # veto and acquire on both the legacy migration and the
+        # per-worktree eviction path.
+        scratch_name = 'play-ledger-alphabet-0123456789abcdef'
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        self.write_alphabet_harness(
+            slot / 'target' / 'tmp' / scratch_name, historical=False)
+        self.assertIsNone(cache.preservation_veto(slot / 'target'))
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_c = self.root / 'work-c'
+        work_a.mkdir()
+        work_b.mkdir()
+        work_c.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        other = self.pool / 'slot-1'
+        self.write_alphabet_harness(
+            other / 'target' / ws_a / 'tmp' / scratch_name, historical=False)
+        (other / 'scratch' / ws_a).mkdir(parents=True)
+        self.assertIsNone(cache.preservation_veto(other / 'target'))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+        finally:
+            os.close(fd)
+        self.assertIn('worktree_layout_migrated', err.getvalue())
+        fd0 = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd0, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got, target, fd = cache.acquire(self.pool, self.policy, work_c)
+            try:
+                self.assertEqual(got.name, 'slot-1')
+                self.assertEqual(target, other / 'target' / cache.workspace_subdir_name(work_c))
+            finally:
+                os.close(fd)
+        finally:
+            os.close(fd0)
+
+    def test_over_budget_other_worktree_output_reuses_slot_after_eviction(self):
+        # The post-eviction re-measure restores a slot that was over
+        # budget only because of another worktree's subdirs: eviction
+        # frees the bytes, then acquire re-measures before the budget
+        # gate instead of refusing until Operator inspection.
+        work_other = self.root / 'work-other'
+        work_new = self.root / 'work-new'
+        work_other.mkdir()
+        work_new.mkdir()
+        ws_other = cache.workspace_subdir_name(work_other)
+        slot = self.pool / 'slot-0'
+        big = slot / 'target' / ws_other / 'debug' / 'libbig.rlib'
+        big.parent.mkdir(parents=True)
+        big.write_bytes(b'x' * (512 * 1024))
+        (slot / 'scratch' / ws_other).mkdir(parents=True)
+        self.assertGreaterEqual(cache.usage(slot), self.policy['slot_budget_bytes'])
+        got, target, fd = cache.acquire(self.pool, self.policy, work_new)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+            ws_new = cache.workspace_subdir_name(work_new)
+            self.assertEqual(target, slot / 'target' / ws_new)
+            self.assertEqual(list(target.iterdir()), [])
+        finally:
+            os.close(fd)
+
+    def test_eviction_io_error_skips_slot_instead_of_aborting(self):
+        # A filesystem error while evicting one slot refuses that slot
+        # so acquire tries the next one instead of aborting the pool
+        # scan with a raw OSError.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / ws_a / 'debug').mkdir(parents=True)
+        (slot / 'target' / ws_a / 'debug' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        real_rmtree = shutil.rmtree
+
+        def fail_slot0(path, *args, **kwargs):
+            if slot in Path(path).parents:
+                raise PermissionError('injected eviction failure')
+            return real_rmtree(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with patch.object(cache.shutil, 'rmtree', side_effect=fail_slot0):
+                got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
 
     def test_guard_stops_growth_and_retains_lease(self):
         self.policy['slot_budget_bytes'] = 24 * 1024
@@ -129,7 +485,7 @@ class CacheTests(unittest.TestCase):
         for slot in self.pool.glob('slot-*'):
             (slot / 'lease.json').write_text('{"wrapper_pid": 99999999}')
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def dead_pgid(self):
         terminated = subprocess.Popen(['true'])
@@ -144,7 +500,7 @@ class CacheTests(unittest.TestCase):
         (slot / 'lease.json').write_text(json.dumps(lease))
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
-            got, _, fd = cache.acquire(self.pool, self.policy)
+            got, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(got.name, 'slot-0')
         self.assertFalse((slot / 'lease.json').exists())
@@ -162,7 +518,7 @@ class CacheTests(unittest.TestCase):
         held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
         self.addCleanup(os.close, held)
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        got, _, fd = cache.acquire(self.pool, self.policy)
+        got, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(got.name, 'slot-1')
         self.assertTrue((slot / 'lease.json').exists())
@@ -176,7 +532,7 @@ class CacheTests(unittest.TestCase):
                 {'workspace': str(self.root), 'wrapper_pid': 99999999,
                  'started_at': 0, 'cargo_pgid': dead}))
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_live_recorded_group_is_still_refused(self):
@@ -197,13 +553,13 @@ class CacheTests(unittest.TestCase):
                 {'workspace': str(self.root), 'wrapper_pid': 99999999,
                  'started_at': 0, 'cargo_pgid': live.pid}))
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_over_budget_idle_slots_are_not_reused(self):
         self.policy['slot_budget_bytes'] = 1
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_absent_quota_attestation_refuses_admission(self):
         del self.policy['quota_receipt']
@@ -230,7 +586,10 @@ class CacheTests(unittest.TestCase):
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,pathlib,tempfile\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             'scratch=target.parent/"scratch"\n'
+                             'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
+                             'assert scratch.name == target.name\n'
+                             'assert scratch.parent.name == "scratch"\n'
+                             'assert target.parent.name == "target"\n'
                              'assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)\n'
                              'assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(target)\n'
                              'assert os.environ["TMPDIR"] == os.environ["TMP"] == os.environ["TEMP"]\n'
@@ -257,7 +616,10 @@ class CacheTests(unittest.TestCase):
             cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
         slot = self.pool / 'slot-0'
         self.assertTrue((slot / 'lease.json').exists())
-        self.assertEqual(list((slot / 'target').iterdir()), [])
+        targets = list((slot / 'target').iterdir())
+        self.assertEqual(len(targets), 1)
+        self.assertTrue(cache.WS_DIR_RE.fullmatch(targets[0].name))
+        self.assertEqual(list(targets[0].iterdir()), [])
         self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'] - 1)
         self.assertLessEqual(cache.usage(slot), 40 * 1024)
 
@@ -265,16 +627,20 @@ class CacheTests(unittest.TestCase):
         scratch = self.pool / 'slot-0' / 'scratch'
         scratch.rmdir()
         with self.assertRaisesRegex(cache.Refusal, 'real directory'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         scratch.symlink_to(self.root)
         with self.assertRaisesRegex(cache.Refusal, 'real directory'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_retained_scratch_prevents_reusing_over_budget_slots(self):
+        ws_name = cache.workspace_subdir_name(self.root)
         for slot in self.pool.glob('slot-*'):
-            (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+            (slot / 'target' / ws_name).mkdir()
+            work_scratch = slot / 'scratch' / ws_name
+            work_scratch.mkdir()
+            (work_scratch / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_signal_stops_build_and_leaves_crash_sentinel(self):
         child = self.start_fake()
@@ -294,8 +660,9 @@ class CacheTests(unittest.TestCase):
                              'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
                              'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
         child = self.start_fake()
         self.wait_ready(1)
         child.terminate()
@@ -324,13 +691,14 @@ class CacheTests(unittest.TestCase):
                              'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
                              'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
 
         def send_after_ready():
             deadline = time.monotonic() + 10
-            while not any((slot / 'ready').exists()
-                          for slot in self.pool.glob('slot-*/target')):
+            while not any((slot / 'debug' / 'ready').exists()
+                          for slot in self.pool.glob('slot-*/target/*')):
                 if time.monotonic() > deadline:
                     return
                 time.sleep(.01)
@@ -387,7 +755,7 @@ class CacheTests(unittest.TestCase):
 
     def assert_slots_reusable(self):
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
-        slot, _, fd = cache.acquire(self.pool, self.policy)
+        slot, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(slot.name, 'slot-0')
 
@@ -479,7 +847,7 @@ class CacheTests(unittest.TestCase):
             self.root / 'outside.par2')
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            slot, _, fd = cache.acquire(self.pool, self.policy)
+            slot, _, fd = cache.acquire(self.pool, self.policy, self.root)
         try:
             self.assertEqual(slot.name, 'slot-1')
         finally:
@@ -513,14 +881,17 @@ class CacheTests(unittest.TestCase):
                              '(scratch/"outside.par2").write_bytes(b"x"*64)\n'
                              '(scratch/"escape.par2").symlink_to(scratch/"outside.par2")\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n'
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n'
                              '(scratch/"escape.par2").unlink()\n')
         child = self.start_fake(self.root)
         self.wait_ready(1)
         time.sleep(0.3)  # symlink exists; the 20ms sampler must overlap it
-        for slot in self.pool.glob('slot-*'):
-            (slot / 'target' / 'release').touch()
+        for parent in self.pool.glob('slot-*/target/*'):
+            if parent.is_dir():
+                (parent / 'debug').mkdir(exist_ok=True)
+                (parent / 'debug' / 'release').touch()
         _, error = child.communicate(timeout=10)
         self.assertEqual(child.returncode, 0, error)
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
