@@ -464,6 +464,18 @@ jobs:
       - run: bash workers/api/tests/run_migration_tests.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: workers/api
+          key: api-postgres-acceptance
+      # The production Rust transaction and cleanup helpers, not copied SQL.
+      # Enumeration is checked first: a missing module or zero matched tests
+      # must fail this required job rather than silently report success.
+      - name: Execute atomic registration PostgreSQL acceptance
+        run: python3 workers/api/tests/run_atomic_registration_store_tests.py
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
 
   rust-mb:
     name: rust (workers/mb)
