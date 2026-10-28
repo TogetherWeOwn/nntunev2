@@ -114,6 +114,7 @@
 	let list: HTMLOListElement | null = $state(null);
 	let emptyTarget: HTMLElement | null = $state(null);
 	let filterEmptyTarget: HTMLElement | null = $state(null);
+	let revealCurrentButtonEl: HTMLButtonElement | null = $state(null);
 
 	function currentRowElement(): HTMLElement | null {
 		return (
@@ -322,7 +323,10 @@
 			trigger instanceof HTMLButtonElement && trigger.disabled && active === trigger;
 		if (!strandedOnTrigger && active !== null && active !== document.body) return;
 		if (kind === 'clear') focusEmptyTarget();
-		else currentRowElement()?.focus({ preventScroll: true });
+		else {
+			// A filtered-out current row stays hidden until explicitly revealed.
+			(currentRowElement() ?? revealCurrentButtonEl)?.focus({ preventScroll: true });
+		}
 	}
 
 	let normalizedQuery = $derived(filterQuery.trim().toLowerCase());
@@ -449,6 +453,7 @@
 <button
 	type="button"
 	data-testid="queue-reveal-current"
+	bind:this={revealCurrentButtonEl}
 	disabled={selectedIndex < 0}
 	onclick={revealCurrent}
 >
