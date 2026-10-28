@@ -363,6 +363,27 @@ for (const width of [800, 390]) {
 	});
 }
 
+/** Follow every description idref; unrelated routine live regions cannot satisfy this oracle. */
+async function describedRemovalWarning(page: Page): Promise<Locator> {
+	await expect(yes(page)).toHaveAttribute('aria-describedby', /\S/);
+	const ids = (await yes(page).getAttribute('aria-describedby'))!.trim().split(/\s+/);
+	const warning = page.locator(ids.map((id) => `p[id=${JSON.stringify(id)}]`).join(', '))
+		.filter({ hasText: /upcoming/i }).filter({ hasText: /remov|clear/i }).filter({ hasText: IRREVERSIBLE });
+	await expect(warning, 'Confirm must describe the actual removal-count and irreversibility warning').toHaveCount(1);
+	return warning;
+}
+
+async function expectPoliteWarning(warning: Locator, count: number): Promise<void> {
+	await expect(warning).toContainText(new RegExp(`\\b${count}\\b[\\s\\S]*upcoming|upcoming[\\s\\S]*\\b${count}\\b`, 'i'));
+	await expect(warning).toContainText(IRREVERSIBLE);
+	// An explicit live value overrides role=status's implicit polite semantics.
+	// In particular, neither off nor assertive becomes polite just from the role.
+	if (await warning.getAttribute('aria-live') === null) await expect(warning).toHaveAttribute('role', 'status');
+	else await expect(warning, 'the linked removal warning must be effectively polite, never explicitly off or assertive')
+		.toHaveAttribute('aria-live', 'polite');
+	await expect(warning).toHaveAttribute('aria-atomic', 'true');
+}
+
 test('QCR-06 revised upcoming scope describes Confirm and is announced politely or requires fresh consent', async ({ page }) => {
 	await nativeAudio(page);
 	const tracks = ITEMS.map((track) => ({ ...track, streamUrl: `/test-audio/${track.id}` }));
@@ -372,9 +393,8 @@ test('QCR-06 revised upcoming scope describes Confirm and is announced politely 
 	await expect(cancel(page)).toBeFocused();
 	await expect.soft(yes(page), 'Confirm needs the count, not only Cancel').toHaveAccessibleDescription(/\b2\b.*upcoming|upcoming.*\b2\b/i, { timeout: 1000 });
 	await expect.soft(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE, { timeout: 1000 });
-	const liveWarnings = page.locator('main [aria-live="polite"], main [role="status"]')
-		.filter({ hasText: /upcoming/i }).filter({ hasText: /remov|clear/i });
-	const beforeWarning = await liveWarnings.allTextContents();
+	const warning = await describedRemovalWarning(page);
+	const beforeWarning = await warning.allTextContents();
 	const oldYes = await yes(page).elementHandle();
 	await yes(page).focus();
 	// The explicit supported Next action changes the open scope, without moving
@@ -386,9 +406,10 @@ test('QCR-06 revised upcoming scope describes Confirm and is announced politely 
 		await expect(yes(page)).toBeVisible();
 		await expect.soft(yes(page)).toHaveAccessibleDescription(/\b1\b.*upcoming|upcoming.*\b1\b/i, { timeout: 1000 });
 		await expect.soft(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE, { timeout: 1000 });
-		await expect(liveWarnings.filter({ hasText: /\b1\b/ }),
-			'revised removal scope needs changed polite content, not a claim of actual screen-reader speech').not.toHaveCount(0);
-		expect(await liveWarnings.allTextContents()).not.toEqual(beforeWarning);
+		const revisedWarning = await describedRemovalWarning(page);
+		await expectPoliteWarning(revisedWarning, 1);
+		expect(await revisedWarning.allTextContents(), 'revised scope needs changed polite content, not a claim of actual screen-reader speech')
+			.not.toEqual(beforeWarning);
 		await expect(yes(page)).toBeFocused();
 	} else {
 		// A host may instead invalidate the old action and require a fresh choice.
@@ -399,6 +420,7 @@ test('QCR-06 revised upcoming scope describes Confirm and is announced politely 
 		await expect(cancel(page)).toBeFocused();
 		await expect(yes(page)).toHaveAccessibleDescription(/\b1\b.*upcoming|upcoming.*\b1\b/i);
 		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
+		await expectPoliteWarning(await describedRemovalWarning(page), 1);
 	}
 	expect(await order(page)).toEqual(['consent-first', 'consent-second', 'consent-third']);
 });
@@ -438,10 +460,17 @@ for (const hidden of [true, false]) {
 
 // Missing inbound-share invalidation must not leave an old destructive action
 // armed merely because every queued track still exists in the library.
-for (const action of ['all', 'upcoming'] as const) {
-	test(`QCR-09 unconsumed Back share without pruning invalidates ${action} consent`, async ({ page }) => {
+for (const { action, stream } of (['all', 'upcoming'] as const).flatMap((action) =>
+	(['playable', 'missing', 'blank'] as const).map((stream) => ({ action, stream }))
+)) {
+	const qualifier = stream === 'playable' ? '' : `${stream}-stream `;
+	test(`QCR-09 ${qualifier}unconsumed Back share without pruning invalidates ${action} consent`, async ({ page }) => {
 		await nativeAudio(page);
-		const tracks = ITEMS.map((track) => ({ ...track, streamUrl: `/test-audio/${track.id}` }));
+		// Valid catalogue B has no playable source in the streamless cases. A and
+		// C stay playable; selecting B must still invalidate the old queue consent.
+		const tracks = ITEMS.map((track, index): Item => index === 1 && stream !== 'playable'
+			? { ...track, ...(stream === 'blank' ? { streamUrl: '   ' } : {}) }
+			: { ...track, streamUrl: `/test-audio/${track.id}` });
 		const load = await gatedLibrary(page, tracks, tracks, '/library?track=consent-second&t=0', true);
 		try {
 			// Whole-clear sees a newly appended share; trim sees an existing shared
@@ -462,7 +491,8 @@ for (const action of ['all', 'upcoming'] as const) {
 			await expect(page).toHaveURL(/\/library\?track=consent-second&t=0$/);
 			await expect(page.locator('html')).toHaveAttribute('data-consent-document', 'original');
 			await expect(current(page)).toHaveAttribute('data-track-id', 'consent-second');
-			await audio.evaluate((element: HTMLAudioElement) => element.pause());
+			if (stream === 'playable') await audio.evaluate((element: HTMLAudioElement) => element.pause());
+			else await expect(audio, 'a valid streamless share selects B without mounting a media source').toHaveCount(0);
 			const sharedOrder = action === 'all'
 				? ['consent-first', 'consent-third', 'consent-second']
 				: ['consent-first', 'consent-second', 'consent-third'];
@@ -503,10 +533,8 @@ test('QCR-10 trusted end revises a focused upcoming warning politely during gate
 		await trim(page).click();
 		await expect(yes(page)).toHaveAccessibleDescription(/\b2\b.*upcoming|upcoming.*\b2\b/i);
 		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
-		const liveWarnings = page.locator('main [aria-live="polite"], main [role="status"]')
-			.filter({ hasText: /upcoming/i }).filter({ hasText: /remov|clear/i });
-		await expect(liveWarnings).toHaveCount(1);
-		const beforeWarning = await liveWarnings.allTextContents();
+		const warning = await describedRemovalWarning(page);
+		const beforeWarning = await warning.allTextContents();
 		await yes(page).focus();
 		await expect(yes(page)).toBeFocused();
 		await load.start({ preserveFocus: true });
@@ -536,9 +564,10 @@ test('QCR-10 trusted end revises a focused upcoming warning politely during gate
 		await expect(yes(page)).toBeFocused();
 		await expect(yes(page)).toHaveAccessibleDescription(/\b1\b.*upcoming|upcoming.*\b1\b/i);
 		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
-		await expect(liveWarnings.filter({ hasText: /\b1\b/ }),
-			'the revised warning must stay politely live before the refresh gate is released').toHaveCount(1);
-		expect(await liveWarnings.allTextContents()).not.toEqual(beforeWarning);
+		const revisedWarning = await describedRemovalWarning(page);
+		await expectPoliteWarning(revisedWarning, 1);
+		expect(await revisedWarning.allTextContents(), 'the linked warning must change politely before the refresh gate is released')
+			.not.toEqual(beforeWarning);
 		expect(await order(page)).toEqual(['consent-first', 'consent-second', 'consent-third']);
 
 		await cancel(page).evaluate((element: HTMLButtonElement) => element.click());

@@ -13,10 +13,15 @@
 	Object.freeze(queueValue.tracks);
 	Object.freeze(queueValue);
 	let calls: string[] = [];
+	let clearAll = $state(() => { calls.push('clear-all'); });
 	let clearUpcoming = $state<(() => void) | undefined>(() => { calls.push('original-trim'); });
 
 	export function supply(mode: 'original' | 'none' | 'replacement') {
 		clearUpcoming = mode === 'none' ? undefined : () => { calls.push(`${mode}-trim`); };
+	}
+
+	export function replaceClear() {
+		clearAll = () => { calls.push('replacement-all'); };
 	}
 
 	export function inspect() {
@@ -34,5 +39,5 @@
 	onmove={() => { calls.push('move'); }}
 	onplaynext={() => { calls.push('play-next'); }}
 	onremove={() => { calls.push('remove'); }}
-	onclear={() => { calls.push('clear-all'); }}
+	onclear={clearAll}
 />
