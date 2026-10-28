@@ -1,15 +1,13 @@
-//! Native-callable boundary for the ingest writers.
-//!
-//! This is the interface scaffold for the separately owned execution tests,
-//! not a second persistence model. The executors are deliberately fail-closed
-//! until those tests are delivered; no edge path calls them yet. The follow-up
-//! implementation must use this same sequence from the admission/queue adapters
-//! and inject only the database transport underneath it.
+//! Native-callable ingest writers. Edge adapters inject only the database
+//! transport; validation, ordered writes, replay probes and error policy stay
+//! here so native acceptance tests exercise the production sequence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::retry::{JobError, ERR_WRITE_FAILED};
-use crate::track_writers::TrackRow;
+use crate::ingest_jobs::{self, TransitionOutcome, MAX_ACCEPTED_AT_SECS};
+use crate::retry::{JobError, ERR_ACCOUNT_DELETING, ERR_WRITE_FAILED};
+use crate::track_writers::{self, TrackRow, TrackWriteOutcome};
+use crate::transcode::{self, PublishOutcome};
 
 /// Ordered SQL parameters and selected columns. UUIDs cross this boundary as
 /// canonical text; the edge transport owns the PostgreSQL wire representation.
@@ -51,48 +49,279 @@ pub struct MediaPublication {
     pub verified_at: i64,
 }
 
-/// Persist admission before enqueueing. The execution tests will pin replay
-/// identity and refusal handling before the edge adapter is connected.
+/// Persist admission before enqueueing. An ignored insert can be a replay or
+/// a closed fence; only the exact stored job identity makes it a replay.
 pub async fn admit_job(
-    _db: &impl WriterDb,
-    _job_id: &str,
-    _user_id: &str,
-    _idempotency_key: &str,
-    _accepted_at: i64,
+    db: &impl WriterDb,
+    job_id: &str,
+    user_id: &str,
+    idempotency_key: &str,
+    accepted_at: i64,
 ) -> Result<(), JobError> {
-    Err(unavailable())
+    ingest_jobs::validate_admit_params(job_id, user_id, idempotency_key, accepted_at)
+        .map_err(|_| invalid())?;
+    validate_owner(user_id)?;
+    let affected = db
+        .execute(
+            ingest_jobs::upsert_ingest_job_sql(),
+            &[
+                text(job_id),
+                text(user_id),
+                text(idempotency_key),
+                Value::I64(accepted_at),
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    if written(affected)? {
+        return Ok(());
+    }
+    let row = one_row(
+        db.query(
+            ingest_jobs::select_ingest_job_identity_sql(),
+            &[text(job_id)],
+        )
+        .await
+        .map_err(db_error)?,
+    )?
+    .ok_or_else(account_deleting)?;
+    if row == [text(user_id), text(idempotency_key)] {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 /// Persist terminal status before checkpoint persistence/ack, including terminal
-/// checkpoint replays. Existing terminal convergence semantics remain unchanged.
+/// checkpoint replays. Either stored terminal status is a converged replay;
+/// this does not rewrite a first terminal status to the requested opposite one.
 pub async fn settle_job(
-    _db: &impl WriterDb,
-    _job_id: &str,
-    _user_id: &str,
-    _status: &str,
+    db: &impl WriterDb,
+    job_id: &str,
+    user_id: &str,
+    status: &str,
 ) -> Result<(), JobError> {
-    Err(unavailable())
+    validate_owner(user_id)?;
+    if !crate::jobs::validate_job_id(job_id) || !ingest_jobs::validate_transition_status(status) {
+        return Err(invalid());
+    }
+    let affected = db
+        .execute(
+            ingest_jobs::transition_ingest_job_sql(),
+            &[text(job_id), text(user_id), text(status)],
+        )
+        .await
+        .map_err(db_error)?;
+    if written(affected)? {
+        return Ok(());
+    }
+    let row = one_row(
+        db.query(
+            ingest_jobs::select_ingest_job_status_sql(),
+            &[text(job_id), text(user_id)],
+        )
+        .await
+        .map_err(db_error)?,
+    )?;
+    let stored = match row.as_deref() {
+        Some([Value::Text(status)]) => Some(status.as_str()),
+        None => None,
+        _ => return Err(invalid()),
+    };
+    match ingest_jobs::classify_transition_zero_rows(stored) {
+        TransitionOutcome::Converged => Ok(()),
+        TransitionOutcome::MissingOrFenced => Err(account_deleting()),
+    }
 }
 
-/// Materialize normalized tracks and reselect their database-owned IDs, keyed
-/// by the original NZB file ordinal retained in each derived row.
+/// Materialize normalized tracks and always reselect their database-owned IDs,
+/// keyed by the original NZB file ordinal. Validate the entire batch first so
+/// a bad tail cannot commit a valid prefix under an ambiguous file identity.
 pub async fn materialize_tracks(
-    _db: &impl WriterDb,
-    _user_id: &str,
-    _rows: &[TrackRow<'_>],
+    db: &impl WriterDb,
+    user_id: &str,
+    rows: &[TrackRow<'_>],
 ) -> Result<BTreeMap<usize, String>, JobError> {
-    Err(unavailable())
+    validate_owner(user_id)?;
+    let mut ordinals = BTreeSet::new();
+    for row in rows {
+        track_writers::validate_track_row(row).map_err(|_| invalid())?;
+        if !ordinals.insert(row.file_ordinal) {
+            return Err(invalid());
+        }
+    }
+    let mut ids = BTreeMap::new();
+    for row in rows {
+        let affected = db
+            .execute(
+                track_writers::upsert_track_sql(),
+                &[
+                    text(row.mbid),
+                    text(row.release_id),
+                    text(row.title),
+                    Value::I32(row.medium_no),
+                    Value::I32(row.track_no),
+                    text(user_id),
+                ],
+            )
+            .await
+            .map_err(db_error)?;
+        let inserted = written(affected)?;
+        let selected = one_row(
+            db.query(
+                track_writers::select_track_id_by_position_sql(),
+                &[
+                    text(row.release_id),
+                    Value::I32(row.medium_no),
+                    Value::I32(row.track_no),
+                ],
+            )
+            .await
+            .map_err(db_error)?,
+        )?;
+        if !inserted
+            && track_writers::classify_track_zero_rows(selected.is_some())
+                == TrackWriteOutcome::AccountDeleting
+        {
+            return Err(account_deleting());
+        }
+        let id = match selected.as_deref() {
+            Some([Value::Text(id)]) if crate::queue::validate_mbid(id) => id.clone(),
+            _ => return Err(invalid()),
+        };
+        ids.insert(row.file_ordinal, id);
+    }
+    Ok(ids)
 }
 
 /// Execute media then grant only after verified bytes/R2/blob success. Each
-/// zero-row write must use its declared PK reselect and existing classifier.
+/// zero-row write uses its declared PK reselect and existing classifier. Probe
+/// success only disambiguates a replay; it never authorizes a new write.
 pub async fn publish_media(
-    _db: &impl WriterDb,
-    _publication: &MediaPublication,
+    db: &impl WriterDb,
+    publication: &MediaPublication,
 ) -> Result<(), JobError> {
-    Err(unavailable())
+    let p = publication;
+    validate_owner(&p.user_id)?;
+    if !crate::queue::validate_mbid(&p.track_id)
+        || !crate::queue::validate_provider_id(&p.provider_id)
+        || !crate::jobs::validate_job_id(&p.source_job_id)
+        || p.content_hash.len() != 64
+        || !p
+            .content_hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !(0..=MAX_ACCEPTED_AT_SECS).contains(&p.verified_at)
+    {
+        return Err(invalid());
+    }
+    let media_key = [
+        text(&p.user_id),
+        text(&p.track_id),
+        text(&p.source_job_id),
+        text(&p.content_hash),
+    ];
+    let mut media_params = media_key.to_vec();
+    media_params.push(Value::I64(p.verified_at));
+    let affected = db
+        .execute(transcode::upsert_track_media_sql(), &media_params)
+        .await
+        .map_err(db_error)?;
+    if !written(affected)? {
+        let row = publication_row(
+            db.query(transcode::select_track_media_by_pk_sql(), &media_key)
+                .await
+                .map_err(db_error)?,
+        )?;
+        let mut expected = media_key.to_vec();
+        expected.extend([text("opus"), Value::I32(64)]);
+        if row != expected {
+            return Err(invalid());
+        }
+    }
+    let grant_key = [text(&p.user_id), text(&p.content_hash)];
+    let affected = db
+        .execute(
+            transcode::upsert_cache_grant_sql(),
+            &[
+                text(&p.user_id),
+                text(&p.content_hash),
+                text(&p.provider_id),
+                Value::I64(p.verified_at),
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    if !written(affected)? {
+        let row = publication_row(
+            db.query(transcode::select_cache_grant_by_pk_sql(), &grant_key)
+                .await
+                .map_err(db_error)?,
+        )?;
+        // The grant's key is owner/hash, not provider. A different valid
+        // first-writer provider is still the existing proof, never rewritten.
+        match row.as_slice() {
+            [user, hash, Value::Text(provider)]
+                if user == &grant_key[0]
+                    && hash == &grant_key[1]
+                    && crate::queue::validate_provider_id(provider) => {}
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(())
 }
 
-fn unavailable() -> JobError {
-    JobError::transient(ERR_WRITE_FAILED, "writer execution not implemented")
+fn text(value: &str) -> Value {
+    Value::Text(value.to_owned())
+}
+
+fn validate_owner(user_id: &str) -> Result<(), JobError> {
+    if crate::dispatch::validate_user_id(user_id) {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
+fn written(affected: u64) -> Result<bool, JobError> {
+    match affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid()),
+    }
+}
+
+fn one_row(mut rows: Vec<Vec<Value>>) -> Result<Option<Vec<Value>>, JobError> {
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.pop()),
+        _ => Err(invalid()),
+    }
+}
+
+fn publication_row(rows: Vec<Vec<Value>>) -> Result<Vec<Value>, JobError> {
+    let row = one_row(rows)?;
+    match transcode::classify_publish_zero_rows(row.is_some()) {
+        PublishOutcome::Duplicate => row.ok_or_else(invalid),
+        _ => Err(account_deleting()),
+    }
+}
+
+fn invalid() -> JobError {
+    JobError::permanent(ERR_WRITE_FAILED, "writer identity or result invalid")
+}
+
+fn account_deleting() -> JobError {
+    JobError::permanent(
+        ERR_ACCOUNT_DELETING,
+        "account is being deleted or writer row missing",
+    )
+}
+
+fn db_error(failure: DbFailure) -> JobError {
+    if crate::library::is_deterministic_sqlstate(failure.sqlstate.as_deref()) {
+        JobError::permanent(ERR_WRITE_FAILED, "writer database schema mismatch")
+    } else {
+        JobError::transient(ERR_WRITE_FAILED, "writer database unavailable")
+    }
 }
