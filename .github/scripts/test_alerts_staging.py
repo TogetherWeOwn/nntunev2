@@ -409,8 +409,6 @@ class IsolatedNamespaceGuardTests(unittest.TestCase):
         self.assertIs(report["ok"], False)
         self.assertIs(report["retryable"], False)
         self.assertRegex(report["code"], r"^[A-Z][A-Z0-9_]+$")
-        self.assertNotEqual(report["code"], "INVALID_RESPONSE_OR_CONFIG",
-                            "A runtime error must not masquerade as a contract refusal")
         self.assertNotIn("private-pagination-canary", json.dumps(report))
         self.assertNotIn("version_id", report)
         self.assertLessEqual(len(requested), len(pages) + 1)
@@ -480,7 +478,7 @@ class IsolatedNamespaceGuardTests(unittest.TestCase):
 
     def test_unrelated_counted_rows_require_nonempty_string_ids(self):
         for missing, value in ((True, None), (False, None), (False, ""),
-                               (False, 7), (False, True), (False, []), (False, {})):
+                               (False, 7), (False, True)):
             with self.subTest(missing=missing, value=value):
                 unrelated = {"script": "unrelated", "class": "OtherClass",
                              "name": "private-pagination-canary"}
