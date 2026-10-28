@@ -1,10 +1,20 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { MAX_NZB_IMPORT_BYTES } from '#lib/library/import-validation.js';
 	import { selectImportFiles, type ImportSelection } from '#lib/library/import-selection.js';
 
 	let selection: ImportSelection = $state({ status: null, error: null });
 	let fileInput: HTMLInputElement | undefined = $state(undefined);
 	let dragging = $state(false);
+	let selectionVersion = $state(0);
+	let clearOutcome = $state('');
+
+	function setSelection(next: ImportSelection) {
+		selection = next;
+		// Refresh the text inside the same live region even for identical outcomes.
+		selectionVersion += 1;
+		clearOutcome = '';
+	}
 
 	const sizeCeilingMib = MAX_NZB_IMPORT_BYTES / 1024 / 1024;
 
@@ -12,10 +22,10 @@
 		const input = event.currentTarget as HTMLInputElement;
 		dragging = false;
 		if (!input.files?.length) {
-			onClear();
+			resetSelection();
 			return;
 		}
-		selection = selectImportFiles(Array.from(input.files));
+		setSelection(selectImportFiles(Array.from(input.files)));
 	}
 
 	function onCancel(event: Event) {
@@ -44,16 +54,26 @@
 		const hasDirectory = Array.from(transfer?.items ?? []).some(
 			(item) => item.kind === 'file' && item.webkitGetAsEntry?.()?.isDirectory
 		);
-		selection = selectImportFiles(hasDirectory ? [] : Array.from(transfer?.files ?? []));
+		setSelection(selectImportFiles(hasDirectory ? [] : Array.from(transfer?.files ?? [])));
 		if (fileInput && !hasDirectory && transfer?.files.length === 1) {
 			fileInput.files = transfer.files;
 		}
 	}
 
-	function onClear() {
+	function resetSelection() {
 		if (fileInput) fileInput.value = '';
 		dragging = false;
-		selection = { status: null, error: null };
+		if (!selection.error && !selection.status) return;
+		setSelection({ status: null, error: null });
+		clearOutcome = 'Local selection cleared.';
+	}
+
+	async function onClear() {
+		resetSelection();
+		const clearedVersion = selectionVersion;
+		await tick();
+		// Only Clear recovers focus, and never after a newer selection action.
+		if (selectionVersion === clearedVersion) fileInput?.focus({ preventScroll: true });
 	}
 </script>
 
@@ -98,20 +118,20 @@
 				data-testid="import-file"
 				type="file"
 				accept=".nzb"
+				aria-invalid={selection.error ? 'true' : undefined}
 				aria-describedby={selection.error || selection.status ? 'import-requirements import-feedback' : 'import-requirements'}
 				onchange={onFile}
 				oncancel={onCancel}
 			/>
 		</label>
 	</fieldset>
-	{#if selection.error}
-		<p id="import-feedback" data-testid="import-status" role="alert">{selection.error}</p>
-	{:else if selection.status}
-		<p id="import-feedback" data-testid="import-status" role="status">{selection.status}</p>
-	{/if}
 	{#if selection.error || selection.status}
+		<p id="import-feedback" data-testid="import-status" role={selection.error ? 'alert' : 'status'} aria-atomic="true">
+			{#key selectionVersion}{selection.error ?? selection.status}{/key}
+		</p>
 		<button class="nt-button nt-button--ghost" type="button" onclick={onClear}>Clear selection</button>
 	{/if}
+	<div aria-live="polite" aria-atomic="true">{clearOutcome}</div>
 </main>
 
 <style>
