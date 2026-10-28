@@ -277,7 +277,13 @@ jobs:
           EOF
       - name: Ensure staging schema-check client
         if: steps.config.outputs.configured == 'true'
-        run: command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null || [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client ca-certificates
+          fi
+          test -r /etc/ssl/certs/ca-certificates.crt
       - name: Verify actual staging session schema (read-only)
         id: schema
         if: steps.config.outputs.configured == 'true'

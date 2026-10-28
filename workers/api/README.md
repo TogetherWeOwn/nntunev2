@@ -178,6 +178,12 @@ The staging deployment now fails closed unless its read-only schema gate verifie
 all three nullable receipt columns and their exact types on the actual database
 identified by the deployed Hyperdrive origin. It reuses the existing staging
 migrator secret, checks private target identity, and never applies a migration.
+The direct schema connection requires `sslmode=verify-full` (also the default
+when omitted); `require` and weaker modes reject before connecting. The staging
+job installs/checks the system CA bundle, passed explicitly as `PGSSLROOTCERT`,
+so both the certificate chain and database hostname are verified. Existing
+secret URLs with `sslmode=require` need an authorized configuration update;
+this code does not read or rewrite the deployed secret.
 Missing configuration, target mismatch, query failure or absent schema prevents
 both deployment and a positive deployment marker. Applying staging migrations
 remains the authorized database executor's action, not an implicit CI operation.

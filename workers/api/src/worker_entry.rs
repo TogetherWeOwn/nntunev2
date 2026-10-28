@@ -533,8 +533,23 @@ pub async fn with_deadline<T, E>(
 }
 
 struct PgStore {
-    env: Env,
+    env: Option<Env>,
     trace_id: String,
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    test_client: std::cell::RefCell<Option<tokio_postgres::Client>>,
+}
+
+/// Inject only connection acquisition; the handler still executes the real
+/// PgStore method, deadline, digest forwarding, transaction and decoder.
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+pub fn session_retry_store_for_postgres_test(
+    client: tokio_postgres::Client,
+) -> impl Store + SingleUseStore {
+    PgStore {
+        env: None,
+        trace_id: "postgres-refresh-test".into(),
+        test_client: std::cell::RefCell::new(Some(client)),
+    }
 }
 
 impl PgStore {
@@ -554,15 +569,17 @@ impl PgStore {
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+        #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+        if let Some(client) = self.test_client.borrow_mut().take() {
+            return Ok(client);
+        }
+        let env = self.env.as_ref().ok_or(StoreError)?;
         // One overall budget encloses dial, handshake, driver spawn, and
         // statement setup: the handshake and SET consume the time left
         // after dial rather than resetting the clock.
         with_deadline(
             async {
-                let hyperdrive = self
-                    .env
-                    .hyperdrive(HYPERDRIVE_BINDING)
-                    .map_err(|_| StoreError)?;
+                let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
                 let socket = worker::Socket::builder()
                     .secure_transport(worker::SecureTransport::StartTls)
                     .connect(hyperdrive.host(), hyperdrive.port())
@@ -587,7 +604,7 @@ impl PgStore {
                 // The driver outlives the handler but still belongs to this request.
                 // Own its resolved trace and normalized build identity in the task.
                 let trace_id = self.trace_id.clone();
-                let build_sha = build_sha_from_env(&self.env);
+                let build_sha = build_sha_from_env(env);
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = Self::connection_diagnostic(connection, &trace_id, &build_sha).await;
                 });
@@ -2575,8 +2592,10 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     let ctx = handlers::Ctx {
         cfg: &config,
         store: &PgStore {
-            env: env.clone(),
+            env: Some(env.clone()),
             trace_id: trace_id.clone(),
+            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+            test_client: std::cell::RefCell::new(None),
         },
         mailer: &WebhookMailer {
             origin: config.origin.clone(),

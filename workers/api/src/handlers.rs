@@ -5394,7 +5394,12 @@ mod tests {
             let h = harness();
             seed_user(&h, "u1", "a@example.com");
             let cookie = magic_login(&h, "a@example.com");
-            let response = transported_refresh(&h, &cookie, body, Some(BOUND_REFRESH_CONTENT_TYPE));
+            let response = transported_refresh(
+                &h,
+                &cookie,
+                body,
+                Some("application/vnd.nntune.session-refresh-bound+json"),
+            );
             assert_eq!(response.status, 401);
             assert!(response.set_cookie.is_none());
             assert!(h
@@ -5418,8 +5423,18 @@ mod tests {
             assert_eq!(rejected.status, 401);
             assert!(rejected.set_cookie.is_none());
         }
-        let first = transported_refresh(&h, &cookie, &body, Some(BOUND_REFRESH_CONTENT_TYPE));
-        let retry = transported_refresh(&h, &cookie, &body, Some(BOUND_REFRESH_CONTENT_TYPE));
+        let first = transported_refresh(
+            &h,
+            &cookie,
+            &body,
+            Some("application/vnd.nntune.session-refresh-bound+json"),
+        );
+        let retry = transported_refresh(
+            &h,
+            &cookie,
+            &body,
+            Some("application/vnd.nntune.session-refresh-bound+json"),
+        );
         assert_eq!(first.status, 200);
         assert_eq!(cookie_of(&first), cookie_of(&retry));
         let legacy = transported_refresh(&h, &cookie_of(&first), "", None);
@@ -5428,6 +5443,10 @@ mod tests {
         let source = strip_line_comments(include_str!("worker_entry.rs"));
         let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
         assert!(dispatch.contains("headers_map.get(\"content-type\")"));
+        let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains(
+            "handlers::refresh_transport_rejection( &collected_request, refresh_content_type.as_deref(), )"
+        ));
         let guard = dispatch
             .find("handlers::refresh_transport_rejection")
             .unwrap();

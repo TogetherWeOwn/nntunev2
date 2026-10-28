@@ -72,9 +72,9 @@ def connection_env(env, payload):
     query = urllib.parse.parse_qs(url.query, strict_parsing=True)
     if set(query) - {"sslmode"} or len(query.get("sslmode", [])) > 1:
         raise GateError("unsupported staging connection options")
-    sslmode = query.get("sslmode", ["require"])[0]
-    if sslmode not in ("require", "verify-full"):
-        raise GateError("staging schema check requires TLS")
+    sslmode = query.get("sslmode", ["verify-full"])[0]
+    if sslmode != "verify-full":
+        raise GateError("staging schema check requires verified TLS")
     # No URL/password in argv, inherited service files, passfiles, or arbitrary
     # libpq options. Never inherit alternative credentials after a failure.
     child = {k: v for k, v in env.items()
@@ -86,6 +86,7 @@ def connection_env(env, payload):
         "PGUSER": urllib.parse.unquote(url.username),
         "PGPASSWORD": urllib.parse.unquote(url.password),
         "PGSSLMODE": sslmode,
+        "PGSSLROOTCERT": "/etc/ssl/certs/ca-certificates.crt",
         "PGCONNECT_TIMEOUT": "5",
         "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=1000 -c search_path=pg_catalog",
     })

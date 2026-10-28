@@ -19,7 +19,7 @@ class SchemaGateTests(unittest.TestCase):
             "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
             "HYPERDRIVE_ID_STAGING": "b" * 32,
             "PLANETSCALE_MIGRATOR_URL_STAGING":
-                "postgresql://migrator:synthetic-password@database.example.test:5432/nntunev2_staging?sslmode=require",
+                "postgresql://migrator:synthetic-password@database.example.test:5432/nntunev2_staging?sslmode=verify-full",
         }
         self.payload = {"success": True, "result": {"origin": {
             "scheme": "postgres", "host": "database.example.test", "port": 5432,
@@ -52,6 +52,26 @@ class SchemaGateTests(unittest.TestCase):
             self.assertIn(column, options["input"])
         for mutation in ("ALTER", "INSERT", "UPDATE", "DELETE", "DROP"):
             self.assertNotIn(mutation, options["input"])
+
+    def test_tls_verifies_hostname_with_the_system_ca_bundle(self):
+        base = self.env["PLANETSCALE_MIGRATOR_URL_STAGING"].split("?", 1)[0]
+        self.env["PGSSLROOTCERT"] = "/untrusted/ambient-ca.pem"
+        for suffix in ("", "?sslmode=verify-full"):
+            with self.subTest(suffix=suffix):
+                self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + suffix
+                self.check()
+                child = self.calls[-1][1]["env"]
+                self.assertEqual(child["PGSSLMODE"], "verify-full")
+                self.assertEqual(child["PGSSLROOTCERT"], "/etc/ssl/certs/ca-certificates.crt")
+
+    def test_unverified_tls_modes_reject_before_password_is_used(self):
+        base = self.env["PLANETSCALE_MIGRATOR_URL_STAGING"].split("?", 1)[0]
+        for mode in ("require", "verify-ca", "prefer", "allow", "disable"):
+            with self.subTest(mode=mode):
+                self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + "?sslmode=" + mode
+                with self.assertRaises(gate.GateError):
+                    self.check()
+        self.assertEqual(self.calls, [])
 
     def test_missing_provider_credentials_fail_before_network(self):
         with self.assertRaises(gate.GateError):
@@ -110,6 +130,9 @@ class SchemaGateTests(unittest.TestCase):
         self.assertIn("steps.schema.outcome == 'success'", workflow[deploy:deploy + 250])
         self.assertIn('SCHEMA_OUTCOME: ${{ steps.schema.outcome }}', workflow)
         self.assertIn('[ "${SCHEMA_OUTCOME:-}" = success ]', workflow)
+        client = workflow.split('- name: Ensure staging schema-check client', 1)[1].split('- name:', 1)[0]
+        self.assertIn('postgresql-client ca-certificates', client)
+        self.assertIn('test -r /etc/ssl/certs/ca-certificates.crt', client)
 
 
 if __name__ == "__main__":

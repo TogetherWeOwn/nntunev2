@@ -2,7 +2,8 @@
 //! Run with --features postgres-tests --test session_refresh_postgres. Missing
 //! test configuration fails; ordinary unit tests do not require a database.
 use hmac::{Hmac, KeyInit, Mac};
-use nntune_api::session::{verify_session, SessionClaims};
+use nntune_api::handlers::{self, AsyncDns, Dialer, Mailer, Request, Response, StoreError};
+use nntune_api::session::{verify_session, SessionClaims, COOKIE_NAME};
 use nntune_api::session_retry_store::rotate_with_retry;
 use sha2::Sha256;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -186,6 +187,113 @@ impl Fixture {
         .await
         .expect("cross deadline while the row remains locked");
     }
+}
+
+struct NoExternalIo;
+
+impl Mailer for NoExternalIo {
+    async fn send_magic_link(&self, _email: &str, _token: &str) -> Result<(), StoreError> {
+        panic!("refresh must not send mail")
+    }
+}
+
+impl Dialer for NoExternalIo {
+    async fn probe(&self, _target: &nntune_api::vault::ValidatedTarget, _tls: bool) -> bool {
+        panic!("refresh must not dial a provider")
+    }
+}
+
+impl AsyncDns for NoExternalIo {
+    fn resolve<'a>(
+        &'a self,
+        _host: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<std::net::IpAddr>> + 'a>> {
+        panic!("refresh must not resolve a provider")
+    }
+}
+
+async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response {
+    let store = nntune_api::worker_entry::session_retry_store_for_postgres_test(f.client().await);
+    let cfg = handlers::Config::new(
+        "app.example.test",
+        "https://app.example.test",
+        SIGNING_KEY.to_vec(),
+        [0; 32],
+        1,
+        3600,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+    let ctx = handlers::Ctx {
+        cfg: &cfg,
+        store: &store,
+        mailer: &NoExternalIo,
+        dialer: &NoExternalIo,
+        dns: &NoExternalIo,
+        now: clock(&f.db).await as u64,
+        source_ip: "127.0.0.1".into(),
+    };
+    handlers::handle(
+        &ctx,
+        &Request {
+            method: "POST".into(),
+            path: "/v1/session/refresh".into(),
+            cookie: Some(cookie.into()),
+            origin: Some(cfg.origin.clone()),
+            authorization: None,
+            body: serde_json::json!({"retry_key": retry_key})
+                .to_string()
+                .into_bytes(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn handler_through_production_store_preserves_retry_secret_isolation() {
+    use sha2::Digest;
+
+    let f = Fixture::new().await;
+    let predecessor = token(&f.old);
+    let cookie = format!("{COOKIE_NAME}={predecessor}");
+    let key_bytes = [42; 32];
+    let key = nntune_api::b64::encode(&key_bytes);
+    let other_key = nntune_api::b64::encode(&[43; 32]);
+    let first = handler_refresh(&f, &cookie, &key).await;
+    assert_eq!(first.status, 200);
+    let committed = row_state(&f.db).await;
+    let mut digest = Sha256::new();
+    digest.update(b"nntune-session-refresh-retry-v1\0");
+    digest.update(key_bytes);
+    digest.update(predecessor.as_bytes());
+    assert_eq!(
+        committed.2.as_deref(),
+        Some(nntune_api::b64::encode(&digest.finalize()).as_str())
+    );
+    assert_eq!(committed.0, 1);
+    assert!(committed.3.is_some() && committed.4.is_some());
+
+    let rejected = handler_refresh(&f, &cookie, &other_key).await;
+    assert_eq!(rejected.status, 401);
+    assert!(rejected.set_cookie.is_none());
+    assert_eq!(row_state(&f.db).await, committed);
+
+    let recovered = handler_refresh(&f, &cookie, &key).await;
+    assert_eq!(recovered.status, 200);
+    let cookie_pair = |response: &Response| {
+        response
+            .set_cookie
+            .as_deref()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(cookie_pair(&first), cookie_pair(&recovered));
+    assert_eq!(row_state(&f.db).await, committed);
 }
 
 #[tokio::test]
