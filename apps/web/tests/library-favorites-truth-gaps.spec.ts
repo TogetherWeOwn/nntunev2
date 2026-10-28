@@ -137,3 +137,18 @@ test('[FAVGAP-G03] an access-refusal refresh clears the unsaved flag before the 
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expect(notice(page), 'the next load starts with no stale unsaved flag').toHaveCount(0);
 });
+
+test('[FAVGAP-G04] a new failed save clears the previous success feedback', async ({ page }) => {
+	await openLibrary(page, { stored: ['gap-zulu'] });
+	await failFavoritesWrites(page);
+	await starButton(page, 'gap-alpha').click();
+	await expect(notice(page)).toBeVisible();
+	await restoreWrites(page);
+	await notice(page).getByRole('button', { name: 'Save again' }).click();
+	const success = section(page).getByRole('status').filter({ hasText: 'Favorites saved on this device.' });
+	await expect(success).toBeVisible();
+	await failFavoritesWrites(page);
+	await starButton(page, 'gap-mike').click();
+	await expect(notice(page)).toBeVisible();
+	await expect(success).toHaveCount(0);
+});

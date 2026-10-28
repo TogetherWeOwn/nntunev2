@@ -27,6 +27,12 @@
 		 */
 		onselect?: (index: number) => void;
 		/**
+		 * Share intent by stable track id: the host builds the link, owns the
+		 * clipboard and the polite outcome. The panel only reports and never
+		 * mutates, selects or plays. The control renders only when provided.
+		 */
+		oncopylink?: (id: string) => void;
+		/**
 		 * Trim intents, same contract: the host applies the transition and
 		 * owns the announcement; the panel reports once and never mutates.
 		 * Each control renders only when its callback is provided.
@@ -65,6 +71,7 @@
 		onremove,
 		onclear,
 		onselect,
+		oncopylink,
 		favoriteIds = new Set<string>(),
 		ontogglefavorite,
 		onkeepcurrentandupcoming,
@@ -403,6 +410,17 @@
 					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
 				</button>
 			{/if}
+			{#if oncopylink}
+				<button
+					type="button"
+					class="queue-copy-link"
+					data-testid="queue-copy-link"
+					aria-label="Copy link {displayTitle(track)}"
+					onclick={() => oncopylink?.(track.id)}
+				>
+					Copy link
+				</button>
+			{/if}
 			<button
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
@@ -544,7 +562,14 @@
 		vertical-align: middle;
 	}
 
-	.queue-star:focus-visible {
+	.queue-copy-link {
+		min-height: 2.75rem;
+		font: inherit;
+		cursor: pointer;
+	}
+
+	.queue-star:focus-visible,
+	.queue-copy-link:focus-visible {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}

@@ -35,9 +35,8 @@
 // never emits a lone surrogate, and oversized lists cap to a leading
 // prefix with a "+N more" marker; identical input always yields
 // byte-identical output.
-// This module is not wired or deployed: no consumer, schedule, delivery,
-// dashboard, or live alerting reads from it, and it carries no webhook
-// URL or secret.
+// The source-only runtime imports this pure helper; it carries no webhook
+// URL or secret and performs no delivery or deployment itself.
 
 const SCHEMA_VERSION = 1;
 const EXPECTED_SERVICE = 'api';
