@@ -222,8 +222,17 @@ def policy_budget() -> int:
             kind = os.environ.get("GITHUB_EVENT_NAME")
             if kind == "pull_request":
                 base = event["pull_request"]["base"]["sha"]
+                parents = _git(root, "rev-list", "--parents", "-n", "1", "HEAD").split()
+                if len(parents) == 3:
+                    event_base = _git(root, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
+                    head = _git(root, "rev-parse", "--verify", "--end-of-options", f"{event['pull_request']['head']['sha']}^{{commit}}")
+                    if head != parents[2] or event_base not in _git(root, "rev-list", "--first-parent", parents[1]).splitlines():
+                        raise BudgetError("pull request merge provenance mismatch")
+                    base = parents[1]
             elif kind == "merge_group":
                 base = event["merge_group"]["base_sha"]
+            elif kind == "workflow_dispatch":
+                base = _git(root, "merge-base", "HEAD", "origin/main")
             elif kind == "push":
                 base = "HEAD"  # already merged main; provenance is now authoritative
             else:
@@ -231,7 +240,7 @@ def policy_budget() -> int:
         else:
             if os.environ.get("GITHUB_ACTIONS") == "true":
                 raise BudgetError("missing admission event")
-            kind, base = "local", "origin/main"
+            kind, base = "local", _git(root, "merge-base", "HEAD", "origin/main")
         return admitted_budget(
             root, base, now=int(time.time()), merge_group=kind == "merge_group",
         )

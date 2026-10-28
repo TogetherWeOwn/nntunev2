@@ -203,7 +203,7 @@ def test_default_client_dir_suffix() -> None:
 
 
 def test_cli_defaults_match_pinned_constants() -> None:
-    """Argparse defaults must be default_client_dir() and BUDGET_CLIENT_JS_BYTES."""
+    """Argparse defaults use the client directory and effective policy budget."""
     import check_web_bundle_budget as mod
 
     seen: dict[str, object] = {}
@@ -216,10 +216,11 @@ def test_cli_defaults_match_pinned_constants() -> None:
 
     mod.check = fake_check  # type: ignore[assignment]
     try:
-        assert mod.main([]) == 0
+        with patch.object(mod, "policy_budget", return_value=BUDGET_CLIENT_JS_BYTES + 1000):
+            assert mod.main([]) == 0
     finally:
         mod.check = orig_check
-    assert seen["budget"] == BUDGET_CLIENT_JS_BYTES, seen
+    assert seen["budget"] == BUDGET_CLIENT_JS_BYTES + 1000, seen
     assert seen["client_dir"] == default_client_dir(), seen
 
 
@@ -516,12 +517,52 @@ class AdmissionTests(unittest.TestCase):
                            ("merge_group", {"merge_group": {"base_sha": self.base}})):
             event.write_text(json.dumps(data))
             with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": kind}), \
+                 patch.object(self.mod, "__file__", str(self.root / ".github/scripts/check_web_bundle_budget.py")), \
                  patch.object(self.mod, "admitted_budget", return_value=337_920) as validate:
                 self.assertEqual(self.mod.policy_budget(), 337_920)
                 self.assertEqual(validate.call_args.args[1], self.base)
                 self.assertEqual(validate.call_args.kwargs["merge_group"], kind == "merge_group")
         event.write_text("{}")
         with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": "pull_request"}):
+            with self.assertRaises(BudgetError):
+                self.mod.policy_budget()
+
+    def test_dispatch_and_local_use_merge_base_on_diverged_branch(self):
+        self.git("branch", "main")
+        self.git("checkout", "-qb", "feature")
+        (self.root / "feature").write_text("feature")
+        self.commit(self.NOW - 60)
+        self.git("checkout", "main")
+        (self.root / "main").write_text("main")
+        self.commit(self.NOW - 30)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("checkout", "feature")
+        self.decision()
+        event = self.root / "event.json"
+        event.write_text("{}")
+        script = self.root / ".github/scripts/check_web_bundle_budget.py"
+        with patch.object(self.mod, "__file__", str(script)):
+            with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": "workflow_dispatch"}):
+                self.assertEqual(self.mod.policy_budget(), 338_920)
+            with patch.dict(os.environ, {"GITHUB_EVENT_PATH": "", "GITHUB_ACTIONS": "false"}):
+                self.assertEqual(self.mod.policy_budget(), 338_920)
+
+    def test_pr_uses_actual_merge_base_parent_when_event_base_is_stale(self):
+        self.git("checkout", "-qb", "feature")
+        self.decision("feature", 1600)
+        feature = self.commit(self.NOW - 30)
+        self.git("checkout", "-qb", "main", self.base)
+        self.decision("other", 1600)
+        self.commit(self.NOW - 20)
+        self.git("merge", "--no-ff", "-qm", "synthetic merge", "feature")
+        event = self.root / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": self.base}, "head": {"sha": feature}}}))
+        script = self.root / ".github/scripts/check_web_bundle_budget.py"
+        with patch.object(self.mod, "__file__", str(script)), \
+             patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": "pull_request"}), \
+             patch.object(self.mod.time, "time", return_value=self.NOW):
+            self.assertEqual(self.mod.policy_budget(), 341_120)
+            event.write_text(json.dumps({"pull_request": {"base": {"sha": feature}, "head": {"sha": feature}}}))
             with self.assertRaises(BudgetError):
                 self.mod.policy_budget()
 
