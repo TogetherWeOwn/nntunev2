@@ -153,6 +153,8 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
+	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
@@ -425,6 +427,7 @@
 				const ids = new Set(state.items.map((track) => track.id));
 				const kept = queue.tracks.filter((track) => ids.has(track.id));
 				if (kept.length !== queue.tracks.length) {
+					queueConfirmGeneration += 1;
 					const currentId = queueCurrentTrack(queue)?.id ?? null;
 					const rebuilt = createQueue(kept);
 					const index =
@@ -2145,6 +2148,7 @@
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
 				confirmDestructive
+				confirmGeneration={queueConfirmGeneration}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
