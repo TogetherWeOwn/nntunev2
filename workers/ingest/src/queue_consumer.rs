@@ -1904,40 +1904,148 @@ fn plan_settlement(
 /// Lifecycle boundary below settlement planning and above edge effects. A
 /// separately authored native bank can observe terminal -> persist -> enqueue
 /// order without replacing the writer sequence or invoking a Workers Env.
-#[allow(dead_code)]
 trait SettlementRuntime {
     async fn settle_job(&self, msg: &QueueMsg, status: &'static str) -> Result<(), JobError>;
     async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool;
     async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool;
 }
 
-/// Fail-closed test interface, not implemented or called by the edge yet.
-/// Must eventually gate both terminal replays and newly terminal checkpoints
-/// before persistence and before exposing an Ack/Quarantine settlement.
-#[allow(dead_code)]
+struct EdgeSettlement<'a> {
+    env: &'a Env,
+    trace_id: &'a str,
+}
+
+impl SettlementRuntime for EdgeSettlement<'_> {
+    async fn settle_job(&self, msg: &QueueMsg, status: &'static str) -> Result<(), JobError> {
+        let client = crate::library_db_client(self.env, self.trace_id)
+            .await
+            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "writer database unavailable"))?;
+        let db = crate::writer_transport::PgWriterDb::new(&client, || {
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            ))
+        });
+        crate::writer_execution::settle_job(&db, &msg.job_id, &msg.user_id, status).await
+    }
+
+    async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool {
+        persist(self.env, cp, self.trace_id).await
+    }
+
+    async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool {
+        send_continuation(self.env, msg).await
+    }
+}
+
+/// Gate terminal checkpoints (including replays) on the durable job writer.
+/// A transient writer failure leaves the previous durable KV state untouched;
+/// deterministic failure is quarantined as write_failed, never phantom Done.
 async fn settle_checkpoint_with<R: SettlementRuntime>(
-    _runtime: &R,
-    _msg: &QueueMsg,
-    _cp: &mut JobCheckpoint,
-    _step: Result<(), JobError>,
-    _step_ran: bool,
+    runtime: &R,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    step: Result<(), JobError>,
+    step_ran: bool,
 ) -> Settlement {
-    Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
+    if !checkpoint_matches(msg, cp) {
+        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
+    }
+    let (must_persist, mut settlement) = plan_settlement(msg, cp, step, step_ran);
+    let status = match cp.state {
+        JobState::Done => Some("done"),
+        JobState::Failed => Some("failed"),
+        _ => None,
+    };
+    if let Some(status) = status {
+        if let Err(error) = runtime.settle_job(msg, status).await {
+            if error.transient {
+                return Settlement::RetryAfter(
+                    error
+                        .retry_after_secs
+                        .unwrap_or(UNPERSISTED_RETRY_SECS)
+                        .clamp(
+                            UNPERSISTED_RETRY_SECS,
+                            crate::retry::MAX_HINTED_RETRY_DELAY_SECS,
+                        ),
+                );
+            }
+            // Plan a separate failure, rather than allowing Done/Failed's
+            // sticky replay arms to hide a deterministic writer failure.
+            // Replays keep the original checkpoint; a new delivery may record
+            // only Failed/write_failed, never a successful terminal write.
+            let mut failure = cp.clone();
+            failure.state = JobState::Writing;
+            let (_, failed) = plan_settlement(
+                msg,
+                &mut failure,
+                Err(JobError::permanent(ERR_WRITE_FAILED, error.detail)),
+                true,
+            );
+            settlement = failed;
+            if must_persist {
+                *cp = failure;
+            }
+        }
+    }
+    if must_persist && !runtime.persist_checkpoint(cp).await {
+        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
+    }
+    match settlement {
+        Settlement::Continue => {
+            if runtime.enqueue_continuation(msg).await {
+                Settlement::Ack
+            } else {
+                Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
+            }
+        }
+        other => other,
+    }
 }
 
 /// Raw delivery operations below the same settlement tested natively. The
 /// production adapter will forward these to RawMessage and the DLQ binding.
-#[allow(dead_code)]
 trait DeliveryRuntime {
     async fn quarantine(&self, entry: &DlqEntry) -> bool;
     fn ack(&self);
     fn retry(&self, seconds: u32);
 }
 
-/// Fail-closed test interface: until implemented it performs no delivery
-/// effects, in particular no acknowledgement of unpublished terminal state.
-#[allow(dead_code)]
-async fn apply_settlement_with<R: DeliveryRuntime>(_runtime: &R, _settlement: Settlement) {}
+struct EdgeDelivery<'a> {
+    env: &'a Env,
+    raw: &'a worker::RawMessage,
+    trace_id: &'a str,
+}
+
+impl DeliveryRuntime for EdgeDelivery<'_> {
+    async fn quarantine(&self, entry: &DlqEntry) -> bool {
+        send_to_dlq(self.env, entry, self.trace_id).await
+    }
+
+    fn ack(&self) {
+        self.raw.ack();
+    }
+
+    fn retry(&self, seconds: u32) {
+        retry_raw(self.raw, seconds);
+    }
+}
+
+/// A quarantine acknowledgement requires a completed DLQ send. An unresolved
+/// continuation is defensive-retried, never acknowledged without a fresh copy.
+async fn apply_settlement_with<R: DeliveryRuntime>(runtime: &R, settlement: Settlement) {
+    match settlement {
+        Settlement::Ack => runtime.ack(),
+        Settlement::RetryAfter(seconds) => runtime.retry(seconds),
+        Settlement::Continue => runtime.retry(UNPERSISTED_RETRY_SECS),
+        Settlement::Quarantine(entry) => {
+            if runtime.quarantine(&entry).await {
+                runtime.ack();
+            } else {
+                runtime.retry(UNPERSISTED_RETRY_SECS);
+            }
+        }
+    }
+}
 
 /// In-invocation retry policy for a rejected checkpoint write: exactly one
 /// retry, after waiting out KV's 1 s same-key write window (plus margin).
@@ -2009,33 +2117,18 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
     } else {
         Ok(())
     };
-    let (must_persist, settlement) = plan_settlement(msg, &mut cp, step, step_ran);
-    if must_persist
-        && !persist(
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    settle_checkpoint_with(
+        &EdgeSettlement {
             env,
-            &cp,
-            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
-        )
-        .await
-    {
-        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
-    }
-    match settlement {
-        // The persisted tally is the continuation's payload: enqueue a
-        // fresh copy of the (identity-stable) message — a new native
-        // retry count for a delivery that spent no attempt — and ack
-        // the original. On enqueue failure fall back to a native retry,
-        // which resumes from the same persisted tally; never ack, or
-        // the job would stall mid-probe with no delivery outstanding.
-        Settlement::Continue => {
-            if send_continuation(env, msg).await {
-                Settlement::Ack
-            } else {
-                Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
-            }
-        }
-        other => other,
-    }
+            trace_id: &trace_id,
+        },
+        msg,
+        &mut cp,
+        step,
+        step_ran,
+    )
+    .await
 }
 
 /// Enqueue the fresh copy a progress continuation continues on, delayed
@@ -2141,23 +2234,16 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
         "ingest.job.consumed",
         serde_json::json!({"job_id": msg.job_id, "build_sha": build_sha}),
     );
-    match process_message(env, &msg).await {
-        Settlement::Ack => raw.ack(),
-        // `process_message` resolves a continuation into Ack (fresh copy
-        // enqueued) or a native retry, so this never reaches here; if it
-        // ever did, retry rather than ack a job with no copy outstanding.
-        Settlement::Continue => retry_raw(&raw, UNPERSISTED_RETRY_SECS),
-        Settlement::RetryAfter(seconds) => retry_raw(&raw, seconds),
-        Settlement::Quarantine(entry) => {
-            // Never ack on DLQ-send failure: the redelivery re-plans from
-            // the persisted `Failed` checkpoint and retries the send.
-            if send_to_dlq(env, &entry, &trace_id).await {
-                raw.ack()
-            } else {
-                retry_raw(&raw, UNPERSISTED_RETRY_SECS)
-            }
-        }
-    }
+    let settlement = process_message(env, &msg).await;
+    apply_settlement_with(
+        &EdgeDelivery {
+            env,
+            raw: &raw,
+            trace_id: &trace_id,
+        },
+        settlement,
+    )
+    .await;
 }
 
 #[worker::event(queue)]
