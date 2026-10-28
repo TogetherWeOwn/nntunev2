@@ -4,7 +4,7 @@ WITH eligible_accounts AS (
   SELECT DISTINCT account_id, human_key
   FROM accounts
   WHERE account_class = 'eligible' AND consent = 1
-    AND human_key IS NOT NULL AND trim(human_key) <> ''
+    AND human_key IS NOT NULL AND trim(human_key, char(32, 9, 10, 11, 12, 13)) <> ''
 ),
 humans AS (
   SELECT DISTINCT human_key FROM eligible_accounts
@@ -15,7 +15,7 @@ ranked_first AS (
            PARTITION BY a.human_key ORDER BY f.completed_at, f.journey_id, f.session_id
          ) AS position
   FROM eligible_accounts a JOIN first_journeys f ON f.account_id = a.account_id
-  WHERE f.completed_at <= :as_of AND f.session_id IS NOT NULL AND trim(f.session_id) <> ''
+  WHERE f.completed_at <= :as_of AND f.session_id IS NOT NULL AND trim(f.session_id, char(32, 9, 10, 11, 12, 13)) <> ''
     AND f.authenticated = 1 AND f.provider_setup = 1 AND f.owned_content = 1
     AND f.advancing_audio = 1 AND f.range_seek = 1
 ),
@@ -28,7 +28,7 @@ qualifying_returns AS (
   JOIN returns r ON r.account_id = a.account_id
   JOIN firsts f ON f.human_key = a.human_key
   WHERE r.completed_at > f.completed_at AND r.completed_at <= f.completed_at + 7 * 86400
-    AND r.completed_at <= :as_of AND r.session_id IS NOT NULL AND trim(r.session_id) <> ''
+    AND r.completed_at <= :as_of AND r.session_id IS NOT NULL AND trim(r.session_id, char(32, 9, 10, 11, 12, 13)) <> ''
     AND r.session_id <> f.session_id AND r.authenticated = 1
     AND r.listener_initiated = 1 AND r.advancing_audio = 1
 ),
@@ -47,10 +47,10 @@ reconciled AS (
   UNION ALL
   SELECT DISTINCT 'account:' || account_id,
     CASE WHEN account_class = 'eligible' AND consent = 1
-              AND (human_key IS NULL OR trim(human_key) = '')
+              AND (human_key IS NULL OR trim(human_key, char(32, 9, 10, 11, 12, 13)) = '')
          THEN 'uncertain_identity' ELSE 'excluded' END
   FROM accounts
   WHERE account_class IS NULL OR account_class <> 'eligible' OR consent IS NOT 1
-     OR human_key IS NULL OR trim(human_key) = ''
+     OR human_key IS NULL OR trim(human_key, char(32, 9, 10, 11, 12, 13)) = ''
 )
 SELECT subject, classification FROM reconciled ORDER BY subject;

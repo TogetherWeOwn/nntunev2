@@ -24,18 +24,23 @@ def account(db, name, human=None, kind="eligible", consent=1):
     db.execute("INSERT INTO accounts VALUES (?, ?, ?, ?)", (name, human or name, kind, consent))
 
 
-def first(db, name, when, session="first", *, seek=1):
-    db.execute("INSERT INTO first_journeys VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?)",
-               (name, "journey", when, session, seek))
+def first(db, name, when, session="first", *, journey="journey", authenticated=1,
+          provider=1, content=1, audio=1, seek=1):
+    db.execute("INSERT INTO first_journeys VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (name, journey, when, session, authenticated, provider, content, audio, seek))
 
 
-def ret(db, name, when, session="return", *, initiated=1, audio=1):
-    db.execute("INSERT INTO returns VALUES (?, ?, ?, ?, 1, ?, ?)",
-               (name, "receipt", when, session, initiated, audio))
+def ret(db, name, when, session="return", *, authenticated=1, initiated=1, audio=1):
+    db.execute("INSERT INTO returns VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (name, "receipt", when, session, authenticated, initiated, audio))
 
 
 def classifications(db):
-    return dict(db.execute(SQL.read_text(), {"as_of": AS_OF}).fetchall())
+    rows = db.execute(SQL.read_text(), {"as_of": AS_OF}).fetchall()
+    result = dict(rows)
+    if len(rows) != len(result):
+        raise AssertionError(f"duplicate subjects in query output: {rows!r}")
+    return result
 
 
 class FunnelTests(unittest.TestCase):
@@ -72,6 +77,54 @@ class FunnelTests(unittest.TestCase):
             "human:no_audio": "pending", "human:pending_edge": "pending",
             "human:expired": "non_return", "human:incomplete": "no_qualifying_first",
         })
+
+    def test_blank_identities_and_sessions(self):
+        db = database()
+        expected = {}
+        for label, value in (("empty", ""), ("space", "   "), ("tab", "\t"),
+                             ("newline", "\n"), ("mixed", " \t\n\r\v\f")):
+            identity = "identity_" + label
+            db.execute("INSERT INTO accounts VALUES (?, ?, 'eligible', 1)", (identity, value))
+            first(db, identity, AS_OF - DAY)
+            ret(db, identity, AS_OF)
+            expected["account:" + identity] = "uncertain_identity"
+            first_name = "first_" + label
+            account(db, first_name)
+            first(db, first_name, AS_OF - DAY, value)
+            ret(db, first_name, AS_OF)
+            expected["human:" + first_name] = "no_qualifying_first"
+            return_name = "return_" + label
+            account(db, return_name)
+            first(db, return_name, AS_OF - DAY)
+            ret(db, return_name, AS_OF, value)
+            expected["human:" + return_name] = "pending"
+        self.assertEqual(classifications(db), expected)
+
+    def test_each_receipt_requirement_independently(self):
+        db = database()
+        expected = {}
+        for flag in ("authenticated", "provider", "content", "audio", "seek"):
+            name = "first_" + flag
+            account(db, name)
+            first(db, name, AS_OF - DAY, **{flag: 0})
+            ret(db, name, AS_OF)
+            expected["human:" + name] = "no_qualifying_first"
+        for flag in ("authenticated", "initiated", "audio"):
+            name = "return_" + flag
+            account(db, name)
+            first(db, name, AS_OF - DAY)
+            ret(db, name, AS_OF, **{flag: 0})
+            expected["human:" + name] = "pending"
+        self.assertEqual(classifications(db), expected)
+
+    def test_earliest_qualifying_first_is_selected(self):
+        db = database()
+        account(db, "ordered")
+        first(db, "ordered", AS_OF - 8 * DAY, "early", journey="early")
+        first(db, "ordered", AS_OF - DAY, "late", journey="late")
+        ret(db, "ordered", AS_OF, "return")
+        # This return is too late for the earliest first, but valid for the later one.
+        self.assertEqual(classifications(db), {"human:ordered": "non_return"})
 
     def test_identity_dedup_exclusions_and_unknown(self):
         db = database()

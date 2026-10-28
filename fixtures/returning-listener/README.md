@@ -23,7 +23,9 @@ this is *not* a count of real people.
 ## Query and reconciliation contract
 
 An eligible, consented account with a nonblank resolved human key belongs to
-that hypothetical human. Qualifying first journeys require authenticated
+that hypothetical human. Blank means empty or composed solely of ASCII space,
+tab, line feed, vertical tab, form feed, or carriage return; the same rule
+applies to session IDs. Nonblank values are not normalized. Qualifying first journeys require authenticated
 provider setup, account-owned eligible content, advancing decoded audio and a
 successful Range seek. Choose the earliest complete journey per human as of
 `as_of`, using journey/session IDs to break timestamp ties. A qualifying return
