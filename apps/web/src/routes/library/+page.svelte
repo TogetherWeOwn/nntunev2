@@ -69,12 +69,14 @@
 		formatQueueText,
 		keepCurrentAndUpcoming,
 		moveTrack,
+		naturalEndPolicy,
 		nextTrack,
 		playNext,
 		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
 		type QueueState,
+		type RepeatMode,
 		type Track
 	} from '#lib/player/queue.js';
 
@@ -98,6 +100,29 @@
 			window.localStorage.setItem(DENSITY_KEY, value);
 		} catch {
 			// Storage refused: keep the choice in memory without a banner.
+		}
+	}
+
+	const REPEAT_KEY = 'nntune:library-repeat:v1';
+	let repeat: RepeatMode = $state('off');
+
+	function readStoredRepeat(): RepeatMode {
+		try {
+			const value = window.localStorage.getItem(REPEAT_KEY);
+			return value === 'one' || value === 'queue' ? value : 'off';
+		} catch {
+			return 'off';
+		}
+	}
+
+	function onRepeatChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== 'off' && value !== 'one' && value !== 'queue') return;
+		repeat = value;
+		try {
+			window.localStorage.setItem(REPEAT_KEY, value);
+		} catch {
+			// Storage refused: keep the choice for this visit.
 		}
 	}
 
@@ -323,6 +348,83 @@
 	}
 
 	let audioEl: HTMLAudioElement | undefined = $state();
+	// Native completion pauses before `ended`; retain intent only for that
+	// element, never for a manual pause, replaced source or account.
+	let playingElement: HTMLAudioElement | null = null;
+	let endGeneration = 0;
+
+	function currentAudioEvent(event: Event): HTMLAudioElement | null {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		const source = resolveStreamUrl(queueCurrentTrack(queue));
+		return shareAlive && element && element === audioEl && element.isConnected &&
+			source && element.getAttribute('src') === source ? element : null;
+	}
+
+	function handlePlay(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (element && !element.paused && !element.ended) playingElement = element;
+	}
+
+	function handlePause(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (!element || element.ended) return;
+		playingElement = null;
+		endGeneration += 1;
+	}
+
+	function handleMediaError(event: Event): void {
+		if (!currentAudioEvent(event)) return;
+		playingElement = null;
+		endGeneration += 1;
+	}
+
+	async function handleEnded(event: Event): Promise<void> {
+		const element = currentAudioEvent(event);
+		if (!element) return;
+		const result = naturalEndPolicy(queue, {
+			repeat,
+			radioActive: false,
+			continueRadio: false,
+			playing: playingElement === element,
+			validEnd: element.ended && element.error === null,
+			// Library has no sleep timer; any explicit pause clears intent above.
+			sleepComplete: false
+		});
+		if (result.action === 'ignore') return;
+		playingElement = null;
+		const generation = ++endGeneration;
+		queueAnnouncement = '';
+		if (result.action !== 'play') return;
+		const settings = {
+			volume: element.volume, muted: element.muted, playbackRate: element.playbackRate
+		};
+		// Replays must also retire a deferred inbound-share seek on this source.
+		clearShareFeedback();
+		pendingShareSeek = null;
+		replaceQueue(result.queue);
+		const targetQueue = queue;
+		await tick();
+		const target = audioEl;
+		const track = queueCurrentTrack(queue);
+		if (!shareAlive || generation !== endGeneration || queue !== targetQueue ||
+			!target || !target.isConnected || !track ||
+			target.getAttribute('src') !== resolveStreamUrl(track)) return;
+		try {
+			target.volume = settings.volume;
+			target.muted = settings.muted;
+			target.playbackRate = settings.playbackRate;
+			target.currentTime = 0;
+			playingElement = target;
+			await target.play();
+			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
+				queue !== targetQueue || playingElement !== target) return;
+			queueAnnouncement = `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.`;
+			queueAnnouncementVersion += 1;
+		} catch {
+			// Autoplay can be refused; native controls remain available, no success claim.
+			if (generation === endGeneration && playingElement === target) playingElement = null;
+		}
+	}
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
 	let shareInvalid = $state(false);
@@ -846,6 +948,9 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		endGeneration += 1;
+		playingElement = null;
+		if (audioEl && !audioEl.paused) audioEl.pause();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		clearQueueShareFeedback(true);
@@ -1680,6 +1785,7 @@
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
+		repeat = readStoredRepeat();
 		const session = browserStorage('session');
 		// A missing/denied storage area is optional, never a playback dependency.
 		recentStore = createRecentlyPlayedStore({
@@ -1704,6 +1810,9 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			endGeneration += 1;
+			playingElement = null;
+			if (audioEl && !audioEl.paused) audioEl.pause();
 			favoritesExportAlive = false;
 			releaseFavoritesDownload();
 			clearShareFeedback();
@@ -2203,6 +2312,17 @@
 		</p>
 	{/if}
 
+	{#if !loading && !loadError && !libraryUnavailable && items.length > 0}
+		<div class="nt-library-repeat">
+			<label for="library-repeat">Repeat</label>
+			<select id="library-repeat" data-testid="player-repeat" value={repeat} onchange={onRepeatChange}>
+				<option value="off">Off</option>
+				<option value="one">One</option>
+				<option value="queue">Queue</option>
+			</select>
+			<p data-testid="repeat-status" role="status" aria-atomic="true">Repeat: {repeat === 'off' ? 'Off' : repeat === 'one' ? 'One' : 'Queue'}</p>
+		</div>
+	{/if}
 	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
@@ -2219,6 +2339,11 @@
 						data-testid="audio-player"
 						controls
 						src={streamUrl}
+						onplay={handlePlay}
+						onplaying={handlePlay}
+						onpause={handlePause}
+						onerror={handleMediaError}
+						onended={(event) => void handleEnded(event)}
 						onloadedmetadata={(event) => {
 							applyPendingShareSeek(event.currentTarget);
 							refreshRestartAvailability(event);
@@ -2330,6 +2455,27 @@
 	}
 	main[data-density='compact'] {
 		--nt-library-row-padding: 0;
+	}
+	.nt-library-repeat {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-3);
+	}
+	.nt-library-repeat select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-repeat select:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
 	}
 	.nt-library-density {
 		display: flex;
