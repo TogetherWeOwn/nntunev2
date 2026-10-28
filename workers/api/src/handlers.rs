@@ -497,6 +497,25 @@ pub trait Store {
         &self,
         credential: &PasskeyCredential,
     ) -> impl Future<Output = Result<(), StoreError>>;
+    /// Atomically claim all registration proofs and insert the credential.
+    /// Every claim must return exactly one row using `SingleUseClaim` SQL.
+    /// Rejection, storage failure, or cancellation must never leave partial
+    /// writes. Return success only after commit; no sequential fallback.
+    fn complete_registration(
+        &self,
+        challenge: &PasskeyChallenge,
+        magic: &MagicLinkRecord,
+        invite: Option<&InviteRecord>,
+        credential: &PasskeyCredential,
+        now: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            // Stores without a transactional implementation must refuse
+            // enrollment, never fall back to separately committed claims.
+            let _ = (challenge, magic, invite, credential, now);
+            Err(StoreError)
+        }
+    }
     fn credential_by_id(
         &self,
         cred_id_b64url: &str,
@@ -1776,7 +1795,7 @@ where
     // Email-ownership proof, pre-validated BEFORE either single-use claim:
     // a mistyped emailed code must not burn the ceremony challenge, so the
     // user can simply re-enter the code (the pure snapshot check grants
-    // nothing — both atomic claims below still gate enrollment).
+    // nothing — the transactional claims below still gate enrollment).
     if body.magic_token.is_empty() || body.magic_token.len() > 256 {
         return generic_auth();
     }
@@ -1796,9 +1815,8 @@ where
     // claim: the throttle reservation, lookup and pure snapshot check run
     // here, so a mistyped invite leaves the challenge and the emailed
     // token intact for a corrected retry (the signup page stays on the
-    // code step). The atomic invite consume still runs after the claims
-    // below — single-use is enforced by that store claim, not this
-    // snapshot.
+    // code step). Single-use is enforced by the conditional store claim,
+    // not this snapshot. All claims and enrollment commit together.
     let invite_to_consume = if ctx.cfg.invites_required || body.invite_code.is_some() {
         // Atomic per-client redemption budget BEFORE the lookup: parallel
         // guesses share one reservation (no check-then-act race), and the
@@ -1834,39 +1852,21 @@ where
         if auth::consume_invite(invite.clone(), &code).is_err() {
             return generic_auth();
         }
-        Some((invite, code))
+        Some(invite)
     } else {
         None
     };
-    // Single-use claim (conditional UPDATE, exactly one row) before any
-    // signup side effect is allowed to stand.
-    if auth::consume_challenge_atomically(
+    // Preserve the RP/origin/expiry snapshot validation; the transaction
+    // below must still win every conditional claim before enrollment.
+    let challenge = match auth::verify_and_consume_challenge(
         row.challenge,
         &ctx.cfg.rp_id,
         &ctx.cfg.origin,
         ctx.now,
-        ctx.store,
-    )
-    .await
-    .is_err()
-    {
-        return generic_auth();
-    }
-    // The same proof, now consumed atomically before enrollment.
-    if auth::consume_magic_link_atomically(magic, &body.magic_token, ctx.now, ctx.store)
-        .await
-        .is_err()
-    {
-        return generic_auth();
-    }
-    if let Some((invite, code)) = invite_to_consume {
-        if auth::consume_invite_atomically(invite, &code, ctx.store)
-            .await
-            .is_err()
-        {
-            return generic_auth();
-        }
-    }
+    ) {
+        Ok(challenge) => challenge,
+        Err(_) => return generic_auth(),
+    };
     let stored = PasskeyCredential {
         cred_id_b64url: body.credential_id.clone(),
         user_id: user_id.clone(),
@@ -1874,7 +1874,19 @@ where
         sign_count: ENROLLMENT_SIGN_COUNT,
         registered_at: ctx.now,
     };
-    match ctx.store.insert_credential(&stored).await {
+    // Claims and credential insertion stand or fall together. Throttle
+    // reservations above intentionally survive failed attempts.
+    match ctx
+        .store
+        .complete_registration(
+            &challenge,
+            &magic,
+            invite_to_consume.as_ref(),
+            &stored,
+            ctx.now,
+        )
+        .await
+    {
         Ok(()) => {}
         // Duplicate credential id (replay under a fresh challenge) stays generic.
         Err(_) => return generic_auth(),
@@ -3720,6 +3732,45 @@ mod tests {
             }
             creds.insert(credential.cred_id_b64url.clone(), credential.clone());
             Ok(())
+        }
+        async fn complete_registration(
+            &self,
+            challenge: &PasskeyChallenge,
+            magic: &MagicLinkRecord,
+            invite: Option<&InviteRecord>,
+            credential: &PasskeyCredential,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            // Mirror the production transaction, including rollback when a
+            // later conditional claim loses or credential insertion fails.
+            let challenges_before = self.challenges.borrow().clone();
+            let magic_before = self.magic.borrow().clone();
+            let invites_before = self.invites.borrow().clone();
+            let result = async {
+                let mut claims = vec![
+                    auth::SingleUseClaim::Challenge {
+                        record: challenge,
+                        now,
+                    },
+                    auth::SingleUseClaim::MagicLink { record: magic, now },
+                ];
+                if let Some(record) = invite {
+                    claims.push(auth::SingleUseClaim::Invite { record });
+                }
+                for claim in claims {
+                    if self.claim(claim).await.map_err(|_| StoreError)? != 1 {
+                        return Err(StoreError);
+                    }
+                }
+                self.insert_credential(credential).await
+            }
+            .await;
+            if result.is_err() {
+                *self.challenges.borrow_mut() = challenges_before;
+                *self.magic.borrow_mut() = magic_before;
+                *self.invites.borrow_mut() = invites_before;
+            }
+            result
         }
         async fn credential_by_id(
             &self,
@@ -7214,6 +7265,98 @@ mod tests {
         let resp = h.call("POST", "/v1/auth/passkey/register/finish", finish(emailed));
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+    }
+
+    #[test]
+    fn register_finish_insert_failure_preserves_invite_and_proofs_for_retry() {
+        registration_insert_failure_retry(Some(true));
+    }
+
+    #[test]
+    fn register_finish_insert_failure_preserves_optional_invite() {
+        registration_insert_failure_retry(Some(false));
+    }
+
+    #[test]
+    fn register_finish_insert_failure_preserves_proofs_without_invite() {
+        registration_insert_failure_retry(None);
+    }
+
+    fn registration_insert_failure_retry(invite_mode: Option<bool>) {
+        let mut h = harness();
+        h.config.invites_required = invite_mode.unwrap_or(false);
+        let invite_hash = auth::hash_invite_code("retry-invite");
+        h.store.invites.borrow_mut().insert(
+            invite_hash.clone(),
+            InviteRecord {
+                code_hash: invite_hash.clone(),
+                used: false,
+                created_at: NOW,
+            },
+        );
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "retry@example.com"}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap();
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let magic_hash = auth::hash_magic_token(&emailed);
+        let cred_id = b"colliding-credential";
+        let encoded_id = b64url_encode(cred_id);
+        // Another account owns this credential id: the real INSERT's
+        // primary-key constraint fails after all three claims succeeded.
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: encoded_id.clone(),
+            user_id: "other-user".to_string(),
+            public_key: fx_es256_cose(47),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(48));
+        let finish = serde_json::json!({
+            "challenge": challenge,
+            "credential_id": encoded_id,
+            "attestation_object": b64url_encode(&att),
+            "client_data_json": b64url_encode(
+                fx_client_json("webauthn.create", challenge).as_bytes()
+            ),
+            "magic_token": emailed,
+            "invite_code": invite_mode.map(|_| "retry-invite"),
+        });
+        let resp = h.call("POST", "/v1/auth/passkey/register/finish", finish.clone());
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.invites.borrow()[&invite_hash].used,
+            "failed credential insertion must not spend the invite"
+        );
+        assert!(!h.store.challenges.borrow()[challenge].challenge.consumed);
+        assert!(!h.store.magic.borrow()[&magic_hash].used);
+        assert!(h.store.sessions.borrow().is_empty());
+        assert_eq!(
+            h.store.credentials.borrow()[&encoded_id].user_id,
+            "other-user"
+        );
+
+        // Once the insertion fault is gone, the SAME request can succeed.
+        h.store.credentials.borrow_mut().remove(&encoded_id);
+        let resp = h.call("POST", "/v1/auth/passkey/register/finish", finish.clone());
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+        assert_eq!(
+            h.store.invites.borrow()[&invite_hash].used,
+            invite_mode.is_some()
+        );
+        assert!(h.store.challenges.borrow()[challenge].challenge.consumed);
+        assert!(h.store.magic.borrow()[&magic_hash].used);
+        assert_eq!(h.store.credentials.borrow().len(), 1);
+        let replay = h.call("POST", "/v1/auth/passkey/register/finish", finish);
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
     }
 
     #[test]
