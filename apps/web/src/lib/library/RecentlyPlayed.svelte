@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import type { LibraryItem } from './cache.js';
 	import { displayArtist, displayTitle } from './order.js';
 	import { formatRecentPlayedAt, type RecentEntry } from '../player/recentlyPlayed.js';
@@ -25,6 +25,11 @@
 	} = $props();
 
 	let section: HTMLElement | undefined = $state();
+	let now = $state(Date.now());
+	onMount(() => {
+		const timer = setInterval(() => { now = Date.now(); }, 30_000);
+		return () => clearInterval(timer);
+	});
 	const rows = $derived(entries.map((entry) => ({
 		...entry,
 		track: items.find((item) => item.id === entry.trackId)
@@ -65,7 +70,7 @@
 							<span class="nt-recents-detail">{displayArtist(row.track)}</span>
 						{/if}
 						<span class="nt-recents-detail" data-testid={`library-recent-played-at-${row.trackId}`}>
-							{formatRecentPlayedAt(row.playedAt, Date.now())}
+							{formatRecentPlayedAt(row.playedAt, now)}
 						</span>
 					</div>
 					<div class="nt-recents-actions">
