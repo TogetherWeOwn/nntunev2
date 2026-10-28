@@ -287,25 +287,51 @@ mod tests {
         );
         assert_eq!(
             authenticate(&s, &creds("", "", "", "", "")),
-            Err((40, wrong_creds()))
+            Err((40, "Wrong username or password.".to_string()))
         );
-        assert!(authenticate(&s, &creds("", "u", "p", "", "")).is_ok());
-        assert_eq!(
-            authenticate(&s, &creds("", "u", "t", "", "")),
-            Err((40, wrong_creds()))
-        );
+        // Even a password accepted by the store is unsupported in this slice.
+        for password in ["p", "t"] {
+            assert_eq!(
+                authenticate(&s, &creds("", "u", password, "", "")),
+                Err((
+                    42,
+                    "Provided authentication mechanism not supported.".to_string()
+                ))
+            );
+        }
+        // Absent and empty salt both retain the missing-parameter distinction.
+        for salt in [None, Some(String::new())] {
+            let credentials = Credentials {
+                salt,
+                ..creds("", "u", "", "t", "")
+            };
+            assert_eq!(
+                authenticate(&s, &credentials),
+                Err((10, "Required parameter is missing.".to_string()))
+            );
+        }
         let salted = md5_hex(b"ps");
-        // Token without salt is 10 (v1 `RequiredParameterMissingException`).
         assert_eq!(
-            authenticate(&s, &creds("", "u", "", "t", "")),
-            Err((10, "Required parameter is missing.".to_string()))
+            authenticate(&s, &creds("", "u", "", &salted, "s")),
+            Err((40, "Wrong username or password.".to_string()))
         );
-        assert!(authenticate(&s, &creds("", "u", "", &salted, "s")).is_ok());
     }
 
     #[test]
     fn api_key_conflicts_with_legacy_params() {
         let s = Stub;
+        // The apiKey and u parameter names conflict even with empty values.
+        for (key, username) in [("k", ""), ("", "u"), ("", "")] {
+            let credentials = Credentials {
+                api_key: Some(key.into()),
+                username: Some(username.into()),
+                ..creds("", "", "", "", "")
+            };
+            assert_eq!(
+                authenticate(&s, &credentials),
+                Err((43, "Conflicting authentication parameters.".to_string()))
+            );
+        }
         // apiKey + any of u/p/t/s is 43, even when the key itself is valid.
         assert_eq!(
             authenticate(&s, &creds("k", "u", "", "", "")),
@@ -322,22 +348,16 @@ mod tests {
     }
 
     #[test]
-    fn enc_passwords_decode_like_v1() {
+    fn encoded_passwords_are_unsupported_without_decoding() {
         let s = Stub;
-        // "p" hex-encoded is accepted.
-        assert!(authenticate(&s, &creds("", "u", "enc:70", "", "")).is_ok());
-        // Malformed hex answers 40.
-        assert_eq!(
-            authenticate(&s, &creds("", "u", "enc:zz", "", "")),
-            Err((40, wrong_creds()))
-        );
-        assert_eq!(
-            authenticate(&s, &creds("", "u", "enc:7", "", "")),
-            Err((40, wrong_creds()))
-        );
-        assert_eq!(
-            authenticate(&s, &creds("", "u", "enc:", "", "")),
-            Err((40, wrong_creds()))
-        );
+        for password in ["enc:70", "enc:zz", "enc:7", "enc:"] {
+            assert_eq!(
+                authenticate(&s, &creds("", "u", password, "", "")),
+                Err((
+                    42,
+                    "Provided authentication mechanism not supported.".to_string()
+                ))
+            );
+        }
     }
 }

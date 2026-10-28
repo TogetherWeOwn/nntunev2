@@ -138,7 +138,7 @@ enum CasReply {
     Update,
     Zero,
     Error,
-    Returned(SubsonicClientRow),
+    Returned(Box<SubsonicClientRow>),
 }
 
 struct SyntheticStore {
@@ -187,7 +187,7 @@ impl SubsonicClientLookup for SyntheticStore {
         match &*self.cas.borrow() {
             CasReply::Error => return Err(StoreError),
             CasReply::Zero => return Ok(None),
-            CasReply::Returned(row) => return Ok(Some(row.clone())),
+            CasReply::Returned(row) => return Ok(Some(row.as_ref().clone())),
             CasReply::Update => {}
         }
         let mut rows = self.rows.borrow_mut();
@@ -750,7 +750,7 @@ fn cas_result_or_retry_uses_fresh_owner_projection_not_the_earlier_identity() {
             Scenario::new(vec![old_alpha()])
         };
         if !zero_rows {
-            *s.store.cas.borrow_mut() = CasReply::Returned(fresh);
+            *s.store.cas.borrow_mut() = CasReply::Returned(Box::new(fresh));
         }
         let out = s.request(Some(TRANSITION), &key_query());
         let document: serde_json::Value = serde_json::from_slice(&out.response.body).unwrap();
@@ -839,7 +839,7 @@ fn retry_and_successful_cas_rows_are_fully_revalidated_including_raced_owner_sta
                 Scenario::new(vec![old_alpha()])
             };
             if !zero_rows {
-                *s.store.cas.borrow_mut() = CasReply::Returned(candidate.clone());
+                *s.store.cas.borrow_mut() = CasReply::Returned(Box::new(candidate.clone()));
             }
             assert_invalid(&s.request(Some(TRANSITION), &key_query()));
             assert_eq!(s.cas_count(), 1);
