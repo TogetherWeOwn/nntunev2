@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
+import { previewSourceMetadata } from './nzb-preview-evidence.mjs';
 import { platform, arch, release } from 'node:os';
 import playwrightPackage from '@playwright/test/package.json' with { type: 'json' };
 
@@ -28,6 +28,7 @@ for (const engine of ['chromium', 'firefox', 'webkit'] as const) {
 	test.describe(`NZBP hostile budgets ${engine}`, () => {
 		for (const shape of shapes) {
 			test(`NZBP-R2-${shape.id} five individual fixed-budget repetitions`, async ({ playwright, baseURL }, info) => {
+				expect(info.config.workers, 'Hostile shapes must not overlap other tests').toBe(1);
 				const browser = await playwright[engine].launch();
 				try {
 				const page = await browser.newPage({ baseURL, serviceWorkers: 'block' });
@@ -70,8 +71,7 @@ for (const engine of ['chromium', 'firefox', 'webkit'] as const) {
 				}
 				const evidence = {
 					case_id: `NZBP-R2-${shape.id}`, engine, browser_version: browser.version(), playwright_version: playwrightPackage.version,
-					head_sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
-					source_tree_dirty: execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim().length > 0,
+					...previewSourceMetadata(),
 					runner: process.env['GITHUB_ACTIONS'] ? 'github-hosted-playwright-container' : 'local-test',
 					os: `${platform()} ${arch()} ${release()}`, actual_bytes: inputBytes, parse_budget_ms: 500, total_budget_ms: 1000, reps
 				};

@@ -173,3 +173,49 @@ was discarded. Shipment STOP remains for the new finding and the unverified
 engines. Guarded rejections must stay under 1,000 ms without invoking the parser;
 parser-eligible cases still require every parser step under 500 ms and every
 whole preview under 1,000 ms on all three engines.
+
+## Follow-on baseline and diagnostic contract
+
+Shipment remains stopped. The permitted next step is an uninstrumented baseline
+on the existing pinned Playwright container, followed by a separate committed
+diagnostic head if phase instrumentation is needed. Browser/Playwright versions
+and the one-worker configuration stay fixed across baseline and candidate; two
+hosted jobs are not asserted to be the same physical machine. The application
+sources remain byte-identical to `a6e613c23364839d2238619f9e60bf71535d5c51`
+while preparing this baseline. Independently authored keyboard/read-lifecycle
+acceptance corrections are integrated without altering their contents.
+
+The first hosted run's 48 hostile-budget cases all aborted while reading Git
+metadata because the container checkout has different ownership. These are
+**incomplete measurements**, not 240 passing rows or evidence that the local
+budget failures disappeared. The evidence helper now trusts only its exact
+checkout for the two read-only Git calls, without writing global configuration.
+Its regression uses Git's ownership-mismatch test mode; the original calls fail
+and the scoped calls pass. Run it without installing any package:
+
+```sh
+node --test apps/web/tests/nzb-preview-evidence.node-test.mjs
+```
+
+No hostile input, expected outcome, parser spy, external click-to-outcome timer,
+five-repetition/browser reuse rule or budget is changed. The complete browser
+suite remains enabled; one worker is explicit, and the budget checker refuses a
+multi-worker override. A branch-targeted manual CI run identifies the exact
+baseline commit rather than treating a pull-request merge-ref build as the same
+source. No same-code retry is permitted to search for favorable timings.
+
+Before an optimization, diagnostics must locate material adapter/traversal cost
+and attribute it to wrapper/iterator allocations with counts and aggregate
+CPU/GC or equivalent evidence. Time outside the parser alone is insufficient.
+Only then is one allocation-reduction approach to the adapter and necessary
+temporary traversal bookkeeping permitted. All caps, global error precedence,
+post-expansion string checks, BigInt arithmetic, read yields and cancellation
+checks remain fixed. A different cause returns for security disposition rather
+than triggering a speculative rewrite.
+
+The eventual clean committed candidate requires all **240 individual rows**:
+16 frozen shapes × five repetitions × Chromium/Firefox/WebKit, including first
+and cold runs. Each row retains source/runner identity, actual bytes, expected
+and actual outcome, parser count/duration (N/A when guarded), external total and
+verdict. Any missing engine, crash, wrong result or over-budget repetition keeps
+the STOP. Diagnostics never replace acceptance evidence or excuse a failed row.
