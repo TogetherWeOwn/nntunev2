@@ -109,7 +109,7 @@ class SchemaGateTests(unittest.TestCase):
         self.assertLess(check, deploy)
         self.assertIn("steps.schema.outcome == 'success'", workflow[deploy:deploy + 250])
         self.assertIn('SCHEMA_OUTCOME: ${{ steps.schema.outcome }}', workflow)
-        self.assertIn('[ "$SCHEMA_OUTCOME" = success ]', workflow)
+        self.assertIn('[ "${SCHEMA_OUTCOME:-}" = success ]', workflow)
 
 
 if __name__ == "__main__":

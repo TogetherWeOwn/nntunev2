@@ -319,7 +319,7 @@ jobs:
           elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
             outcome=unconfigured
           elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && \
-               [ "$HYPERDRIVE_OUTCOME" = success ] && [ "$SCHEMA_OUTCOME" = success ] && \
+               [ "$HYPERDRIVE_OUTCOME" = success ] && [ "${SCHEMA_OUTCOME:-}" = success ] && \
                [ "$DEPLOY_OUTCOME" = success ]; then
             deployed=true
             outcome=deployed
