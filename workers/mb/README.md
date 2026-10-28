@@ -91,6 +91,22 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   (Sources: success-only envelope `lib.rs:398-422`; KV degrade/no-op
   `lib.rs:772-805`; connect/query errors map to the generic 500
   `lib.rs:816-872` and `src/api_error.rs:101-103`.)
+- Cached bodies must stay compatible with the fresh DTOs or they are
+  treated as misses and fall through to the repository. Numeric optionals
+  must fit the fresh signed width (`year`/`track_no`/`medium_no` are
+  `i16`, `duration_ms` is `i32`): out-of-range, huge unsigned and
+  fractional values miss on lookups and on every release-recordings row.
+  Release search hits must carry string `artist_mbid`/`artist_name` when
+  present and non-null. There is no positivity rule: negative values,
+  zero, null, uppercase UUIDs and extra fields stay hits, and
+  artist/recording hits never require release fields. Absent optionals
+  stay hits on release-recordings rows and release-search artist fields;
+  lookups still require every always-emitted key present. Both edge Cache
+  API hits (including entries written before a deployment) and KV hits use
+  these validators. An unreadable or incompatible edge body falls through
+  to KV, then the repository; a healthy result replaces the rejected edge
+  entry without flushing caches or changing keys/TTLs. A DB miss/error
+  stays non-cacheable. Valid edge responses retain their body and headers.
 - Release responses currently preserve the stored `caa_url` unchanged, so
   lookup cache keys remain environment-independent. When public R2 hosts are
   activated and URLs become environment-specific, include the environment in

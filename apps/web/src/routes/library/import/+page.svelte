@@ -1,21 +1,87 @@
 <script lang="ts">
-	import { validateImportFile } from '#lib/library/import-validation.js';
+	import { tick } from 'svelte';
+	import { MAX_NZB_IMPORT_BYTES } from '#lib/library/import-validation.js';
+	import { selectImportFiles, type ImportSelection } from '#lib/library/import-selection.js';
 
-	let status: string | null = $state(null);
-	let error: string | null = $state(null);
+	let selection: ImportSelection = $state({ status: null, error: null });
+	let fileInput: HTMLInputElement | undefined = $state(undefined);
+	let dragging = $state(false);
+	let selectionVersion = $state(0);
+	let clearOutcome = $state('');
+
+	function setSelection(next: ImportSelection) {
+		selection = next;
+		// Refresh the text inside the same live region even for identical outcomes.
+		selectionVersion += 1;
+		clearOutcome = '';
+	}
+
+	const sizeCeilingMib = MAX_NZB_IMPORT_BYTES / 1024 / 1024;
 
 	function onFile(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
-		status = null;
-		error = null;
-		const file = input.files?.[0];
-		if (!file) return;
-		error = validateImportFile(file);
-		if (error) return;
-		status =
-			'NZB file selected locally — import is not available yet. This page does not upload or process the file or add tracks to your library.';
+		dragging = false;
+		if (!input.files?.length) {
+			resetSelection();
+			return;
+		}
+		setSelection(selectImportFiles(Array.from(input.files)));
+	}
+
+	function onCancel(event: Event) {
+		dragging = false;
+		// A native chooser also fires cancel when the same file is selected again.
+		if ((event.currentTarget as HTMLInputElement).files?.length) onFile(event);
+	}
+
+	function onDragOver(event: DragEvent) {
+		event.preventDefault();
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+		dragging = true;
+	}
+
+	function onDragLeave(event: DragEvent) {
+		const area = event.currentTarget as HTMLFieldSetElement;
+		if (event.relatedTarget instanceof Node && area.contains(event.relatedTarget)) return;
+		dragging = false;
+	}
+
+	function onDrop(event: DragEvent) {
+		event.preventDefault();
+		dragging = false;
+		if (fileInput) fileInput.value = '';
+		const transfer = event.dataTransfer;
+		const hasDirectory = Array.from(transfer?.items ?? []).some(
+			(item) => item.kind === 'file' && item.webkitGetAsEntry?.()?.isDirectory
+		);
+		setSelection(selectImportFiles(hasDirectory ? [] : Array.from(transfer?.files ?? [])));
+		if (fileInput && !hasDirectory && transfer?.files.length === 1) {
+			fileInput.files = transfer.files;
+		}
+	}
+
+	function resetSelection() {
+		if (fileInput) fileInput.value = '';
+		dragging = false;
+		if (!selection.error && !selection.status) return;
+		setSelection({ status: null, error: null });
+		clearOutcome = 'Local selection cleared.';
+	}
+
+	async function onClear() {
+		resetSelection();
+		const clearedVersion = selectionVersion;
+		await tick();
+		// Only Clear recovers focus, and never after a newer selection action.
+		if (selectionVersion === clearedVersion) fileInput?.focus({ preventScroll: true });
 	}
 </script>
+
+<svelte:window
+	ondragend={() => dragging = false}
+	onblur={() => dragging = false}
+	onkeydown={(event) => { if (event.key === 'Escape') dragging = false; }}
+/>
 
 <svelte:head>
 	<title>NNTune — local NZB selection</title>
@@ -32,19 +98,80 @@
 		selection stays local only and this page does not upload or process the file or add tracks to
 		your library.
 	</p>
-	<label>
-		NZB file
-		<input
-			data-testid="import-file"
-			type="file"
-			accept=".nzb"
-			aria-describedby={error || status ? 'import-feedback' : undefined}
-			onchange={onFile}
-		/>
-	</label>
-	{#if error}
-		<p id="import-feedback" data-testid="import-status" role="alert">{error}</p>
-	{:else if status}
-		<p id="import-feedback" data-testid="import-status" role="status">{status}</p>
+	<fieldset
+		data-testid="import-drop-area"
+		class:dragging
+		ondragenter={onDragOver}
+		ondragover={onDragOver}
+		ondragleave={onDragLeave}
+		ondrop={onDrop}
+	>
+		<legend>Drop one local NZB file</legend>
+		<p id="import-requirements">
+			Choose a file with the .nzb extension that is not empty and is {sizeCeilingMib} MiB or less.
+			Or use the file picker below.
+		</p>
+		<label>
+			NZB file
+			<input
+				bind:this={fileInput}
+				data-testid="import-file"
+				type="file"
+				accept=".nzb"
+				aria-invalid={selection.error ? 'true' : undefined}
+				aria-describedby={selection.error || selection.status ? 'import-requirements import-feedback' : 'import-requirements'}
+				onchange={onFile}
+				oncancel={onCancel}
+			/>
+		</label>
+	</fieldset>
+	{#if selection.error || selection.status}
+		<p id="import-feedback" data-testid="import-status" role={selection.error ? 'alert' : 'status'} aria-atomic="true">
+			{#key selectionVersion}{selection.error ?? selection.status}{/key}
+		</p>
+		<button class="nt-button nt-button--ghost" type="button" onclick={onClear}>Clear selection</button>
 	{/if}
+	<div aria-live="polite" aria-atomic="true">{clearOutcome}</div>
 </main>
+
+<style>
+	fieldset {
+		min-width: 0;
+		margin: var(--nt-space-4) 0;
+		padding: var(--nt-space-3) var(--nt-space-4) var(--nt-space-4);
+		border: 2px dashed var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+	}
+
+	fieldset.dragging {
+		border-color: var(--nt-accent);
+	}
+
+	legend {
+		font-weight: 600;
+		padding-inline: var(--nt-space-2);
+	}
+
+	label {
+		display: grid;
+		gap: var(--nt-space-2);
+	}
+
+	input {
+		max-width: 100%;
+	}
+
+	#import-feedback {
+		overflow-wrap: anywhere;
+	}
+
+	[role='alert'] {
+		color: var(--nt-bad);
+	}
+
+	button {
+		font: inherit;
+		cursor: pointer;
+	}
+</style>

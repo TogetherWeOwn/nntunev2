@@ -305,6 +305,114 @@ class CacheTests(unittest.TestCase):
         (scratch / 'tmpfile').write_bytes(b'x' * 64)
         self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
 
+    def write_alphabet_harness(self, scratch, historical):
+        # Lifecycle fixture for the stream/API alphabet contract harness:
+        # a stable Cargo-owned scratch dir holding generated inputs plus
+        # a retained nested target. historical=True keeps the authored
+        # manifest, test source, and lockfile the harness used to leave
+        # behind; historical=False is the post-cleanup layout (lock and
+        # build outputs only).
+        scratch.mkdir(parents=True)
+        (scratch / 'harness.lock').write_bytes(b'')
+        if historical:
+            for name in ('Cargo.toml', 'alphabet.rs', 'Cargo.lock'):
+                (scratch / name).write_bytes(b'generated harness input')
+        nested = scratch / 'target'
+        (nested / 'debug' / 'deps').mkdir(parents=True)
+        (nested / 'debug' / 'deps' / 'libnntune_stream.rlib').write_bytes(b'x' * 64)
+        (nested / 'debug' / 'deps' / 'alphabet-1a2b3c4d').write_bytes(b'x' * 64)
+        (nested / 'debug' / 'build' / 'pkg' / 'out').mkdir(parents=True)
+        (nested / 'debug' / 'build' / 'pkg' / 'out' / 'codegen.rs').write_bytes(b'x' * 16)
+        (nested / '.cargo-lock').write_bytes(b'')
+        (nested / 'CACHEDIR.TAG').write_bytes(b'x' * 16)
+        (nested / '.rustc_info.json').write_bytes(b'{}')
+
+    def test_alphabet_harness_historical_layout_still_vetoes(self):
+        # Diagnosis pin: the generated manifest/test-source/lockfile the
+        # alphabet contract harness used to leave inside Cargo-owned
+        # target storage must keep failing closed on both the legacy
+        # migration and the per-worktree eviction path, so a future fix
+        # cannot come from whitelisting generated sources. Genuine
+        # protected material in the same spot still vetoes too.
+        scratch_name = 'play-ledger-alphabet-0123456789abcdef'
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        historical = slot / 'target' / 'tmp' / scratch_name
+        self.write_alphabet_harness(historical, historical=True)
+        veto = cache.preservation_veto(slot / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved file in target', veto)
+        self.assertTrue('alphabet.rs' in veto or 'Cargo.toml' in veto)
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        other = self.pool / 'slot-1'
+        self.write_alphabet_harness(
+            other / 'target' / ws_a / 'tmp' / scratch_name, historical=True)
+        (other / 'scratch' / ws_a).mkdir(parents=True)
+        veto = cache.preservation_veto(other / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved file in target', veto)
+        self.assertIn(ws_a, veto)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaisesRegex(cache.Refusal, 'no idle'):
+                cache.acquire(self.pool, self.policy, work_b)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue((historical / 'alphabet.rs').exists())
+        control = slot / 'target' / 'tmp' / (scratch_name + '-cleaned')
+        self.write_alphabet_harness(control, historical=False)
+        (control / 'evidence').mkdir()
+        (control / 'evidence' / 'capture.json').write_bytes(b'{}')
+        veto = cache.preservation_veto(slot / 'target')
+        self.assertIsNotNone(veto)
+        self.assertIn('preserved', veto)
+
+    def test_alphabet_harness_cleaned_layout_acquires(self):
+        # The post-cleanup layout the fixed harness leaves (lock plus
+        # nested build outputs, generated inputs removed) must pass the
+        # veto and acquire on both the legacy migration and the
+        # per-worktree eviction path.
+        scratch_name = 'play-ledger-alphabet-0123456789abcdef'
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        self.write_alphabet_harness(
+            slot / 'target' / 'tmp' / scratch_name, historical=False)
+        self.assertIsNone(cache.preservation_veto(slot / 'target'))
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_c = self.root / 'work-c'
+        work_a.mkdir()
+        work_b.mkdir()
+        work_c.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        other = self.pool / 'slot-1'
+        self.write_alphabet_harness(
+            other / 'target' / ws_a / 'tmp' / scratch_name, historical=False)
+        (other / 'scratch' / ws_a).mkdir(parents=True)
+        self.assertIsNone(cache.preservation_veto(other / 'target'))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+        finally:
+            os.close(fd)
+        self.assertIn('worktree_layout_migrated', err.getvalue())
+        fd0 = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd0, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got, target, fd = cache.acquire(self.pool, self.policy, work_c)
+            try:
+                self.assertEqual(got.name, 'slot-1')
+                self.assertEqual(target, other / 'target' / cache.workspace_subdir_name(work_c))
+            finally:
+                os.close(fd)
+        finally:
+            os.close(fd0)
+
     def test_over_budget_other_worktree_output_reuses_slot_after_eviction(self):
         # The post-eviction re-measure restores a slot that was over
         # budget only because of another worktree's subdirs: eviction

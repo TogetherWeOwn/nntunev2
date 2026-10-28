@@ -49,10 +49,11 @@ test('row buttons expose the visible title and artist as their accessible name',
 	await page.goto('/library');
 	await expect(page.getByTestId('library-item')).toHaveCount(ACCOUNT_A.length);
 
-	const withArtist = page.locator('[data-testid="library-item"][data-id="row-zulu"] button');
+	// Queue controls only: each row also carries a star toggle button.
+	const withArtist = page.locator('[data-testid="library-item"][data-id="row-zulu"] button.nt-library-row');
 	await expect(withArtist).toHaveAccessibleName(/Zulu Song\s+—\s+Select Artist/);
 
-	const withoutArtist = page.locator('[data-testid="library-item"][data-id="row-alpha"] button');
+	const withoutArtist = page.locator('[data-testid="library-item"][data-id="row-alpha"] button.nt-library-row');
 	await expect(withoutArtist).toHaveAccessibleName('Alpha Song');
 });
 

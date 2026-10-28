@@ -136,10 +136,31 @@
 		if (event.clientX < bounds.left || event.clientX > bounds.right
 			|| event.clientY < bounds.top || event.clientY > bounds.bottom) close();
 	}
+
+	// Native showModal trapping stutters in Chromium: Tab from the last
+	// control lands on <body> once before wrapping back in (verified with
+	// and without the app-shell nav in the DOM). Wrap explicitly at the
+	// boundaries so keyboard focus never leaves the open dialog.
+	function wrapTab(event: KeyboardEvent) {
+		if (event.key !== 'Tab' || !dialog) return;
+		const controls = [...dialog.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)')]
+			.filter((control) => control.getClientRects().length > 0);
+		if (controls.length === 0) return;
+		const first = controls[0];
+		const last = controls[controls.length - 1];
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault();
+			last.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
 </script>
 
 <dialog
 	bind:this={dialog}
+	role="dialog"
 	class="paywall"
 	data-testid="plan-limit-notice"
 	aria-labelledby="paywall-headline"
@@ -147,6 +168,7 @@
 	onclose={() => { closing = true; announcementVersion += 1; onclose(retryAction, navigating); }}
 	oncancel={(event) => { event.preventDefault(); close(); }}
 	onclick={backdrop}
+	onkeydown={wrapTab}
 >
 	<h2 id="paywall-headline">{model.headline}</h2>
 	<p id="paywall-detail">{model.detail}</p>

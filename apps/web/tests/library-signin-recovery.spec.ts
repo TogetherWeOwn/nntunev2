@@ -91,7 +91,9 @@ function signInLink(page: Page): Locator {
 }
 
 function libraryRow(page: Page, id: string): Locator {
-	return page.locator(`[data-testid="library-item"][data-id="${id}"] button`);
+	// Queue control only: each row also carries a star toggle button, so an
+	// unfiltered query resolves to 2 elements and trips strict mode.
+	return page.locator(`[data-testid="library-item"][data-id="${id}"] button.nt-library-row`);
 }
 
 async function expectNoPrivateTracks(page: Page): Promise<void> {
