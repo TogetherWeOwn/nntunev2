@@ -48,6 +48,31 @@ impl<S: Library> SubsonicApp<S> {
         }
     }
 
+    /// Extract the exact query-first credentials the dispatcher will use.
+    /// Transports must validate their complete body before calling this.
+    pub fn request_credentials(method: &str, query: &str, body: &str) -> Credentials {
+        if method.eq_ignore_ascii_case("POST") && body.len() > MAX_BODY_BYTES {
+            return Credentials::default();
+        }
+        let params = Params::parse(&Self::merge_query(method, query, body));
+        Credentials::from_params(|key| params.get(key).map(str::to_owned))
+    }
+
+    /// Dispatch using only the prepared, request-scoped authenticator.
+    /// There is no fallback to the catalogue store's authentication.
+    pub fn handle_with_auth<A: crate::auth::AuthStore>(
+        &self,
+        auth: &A,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+    ) -> HttpResponse {
+        self.handle_using(method, path, query, body, |_, credentials| {
+            authenticate(auth, credentials)
+        })
+    }
+
     /// Handle one request. `method` is accepted as GET or POST (v1 registers
     /// both on every route); `path` is the URL path, `query` the raw query
     /// string without `?`, `body` the raw POST form body (empty for GET).
@@ -55,6 +80,17 @@ impl<S: Library> SubsonicApp<S> {
     /// with `$request->input()`, query plus form body); query wins on
     /// duplicates since `Params::get` returns the first value.
     pub fn handle(&self, method: &str, path: &str, query: &str, body: &str) -> HttpResponse {
+        self.handle_using(method, path, query, body, authenticate)
+    }
+
+    fn handle_using(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        verify: impl FnOnce(&S, &Credentials) -> Result<Identity, (i64, String)>,
+    ) -> HttpResponse {
         // v1 caps the body before routing or auth: only the query string is
         // parsed for `f`, since body parameters are untrusted past the cap.
         if method.eq_ignore_ascii_case("POST") && body.len() > MAX_BODY_BYTES {
@@ -88,7 +124,7 @@ impl<S: Library> SubsonicApp<S> {
                 let get = |key: &str| params.get(key).map(|s| s.to_string());
                 let creds = Credentials::from_params(get);
                 let mut store = self.store.borrow_mut();
-                let identity = match authenticate(&*store, &creds) {
+                let identity = match verify(&*store, &creds) {
                     Ok(identity) => identity,
                     Err((error_code, message)) => {
                         return Self::render(&params, &error_document(error_code, &message));
@@ -135,6 +171,79 @@ impl<S: Library> SubsonicApp<S> {
                 HttpResponse::document(200, content_type, body)
             }
             _ => HttpResponse::document(200, XML_CONTENT_TYPE, render_xml(doc)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_auth_builder_tests {
+    use super::*;
+    use crate::{AuthStore, MemStore};
+
+    struct RequestAuth;
+    impl AuthStore for RequestAuth {
+        fn verify_api_key(&self, key: &str) -> Option<Identity> {
+            (key == "synthetic-request-key").then(|| Identity {
+                username: "persisted-owner".into(),
+                email: "owner@example.test".into(),
+                is_admin: false,
+            })
+        }
+        fn verify_password(&self, _: &str, _: &str) -> Option<Identity> {
+            panic!("password fallback")
+        }
+        fn verify_token(&self, _: &str, _: &str, _: &str) -> Option<Identity> {
+            panic!("token fallback")
+        }
+    }
+
+    #[test]
+    fn preparation_uses_query_first_values_and_preserves_empty_username_presence() {
+        let credentials = SubsonicApp::<MemStore>::request_credentials(
+            "POST",
+            "apiKey=query-key",
+            "apiKey=body-key&u=",
+        );
+        assert_eq!(credentials.api_key.as_deref(), Some("query-key"));
+        assert_eq!(credentials.username.as_deref(), Some(""));
+        let get =
+            SubsonicApp::<MemStore>::request_credentials("GET", "apiKey=query-key", "u=body-only");
+        assert_eq!(get.api_key.as_deref(), Some("query-key"));
+        assert_eq!(get.username, None);
+        let oversized = SubsonicApp::<MemStore>::request_credentials(
+            "POST",
+            "apiKey=query-key",
+            &"x".repeat(MAX_BODY_BYTES + 1),
+        );
+        assert_eq!(oversized.api_key, None);
+    }
+
+    #[test]
+    fn request_auth_is_the_only_authority_even_with_fixture_catalogue() {
+        let app = SubsonicApp::new(MemStore::seeded());
+        let response = app.handle_with_auth(
+            &RequestAuth,
+            "GET",
+            "/rest/ping",
+            "apiKey=synthetic-request-key",
+            "",
+        );
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("status=\"ok\""));
+        let response =
+            app.handle_with_auth(&RequestAuth, "GET", "/rest/ping", "apiKey=test-key-1", "");
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("code=\"44\""));
+        for (query, code) in [
+            ("u=test&p=test-pass", "42"),
+            ("u=test&t=token&s=salt", "40"),
+        ] {
+            let response = app.handle_with_auth(&RequestAuth, "GET", "/rest/ping", query, "");
+            assert!(String::from_utf8(response.body)
+                .unwrap()
+                .contains(&format!("code=\"{code}\"")));
         }
     }
 }

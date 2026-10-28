@@ -314,6 +314,20 @@ async fn resolve<S: SubsonicClientLookup, L: SubsonicAuthLimiter>(
     Ok(Some(row))
 }
 
+/// Shared eligibility check used before resolving any runtime bindings.
+/// Unsupported/conflicting forms require neither secrets nor persistence.
+pub fn subsonic_api_key(credentials: &Credentials) -> Option<&str> {
+    let nonempty = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.is_empty());
+    if credentials.username.is_some()
+        || [&credentials.password, &credentials.token, &credentials.salt]
+            .into_iter()
+            .any(nonempty)
+    {
+        return None;
+    }
+    credentials.api_key.as_deref().filter(|key| !key.is_empty())
+}
+
 /// Protocol conflicts/unsupported forms need no persisted lookup. Operational
 /// failures stay distinct internally but expose only the dispatcher's generic 44.
 pub async fn prepare_subsonic_auth<S: SubsonicClientLookup, L: SubsonicAuthLimiter>(
@@ -323,17 +337,9 @@ pub async fn prepare_subsonic_auth<S: SubsonicClientLookup, L: SubsonicAuthLimit
     attempt: &SubsonicAuthAttempt,
     credentials: &Credentials,
 ) -> PreparedSubsonicAuth {
-    let nonempty = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.is_empty());
-    let Some(key) = credentials.api_key.as_deref().filter(|key| !key.is_empty()) else {
+    let Some(key) = subsonic_api_key(credentials) else {
         return PreparedSubsonicAuth::default();
     };
-    if credentials.username.is_some()
-        || [&credentials.password, &credentials.token, &credentials.salt]
-            .into_iter()
-            .any(nonempty)
-    {
-        return PreparedSubsonicAuth::default();
-    }
     let (Some(store), Some(limiter)) = (store, limiter) else {
         return auth_fault(SubsonicAuthFault::Configuration);
     };

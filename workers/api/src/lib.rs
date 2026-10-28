@@ -7,10 +7,10 @@
 //!
 //! The production Subsonic `Library` (PlanetScale via Hyperdrive, R2
 //! audio/artwork via the stream worker) plugs in behind the `Library`
-//! seam. Until then the Worker uses `MemStore::empty()`, which holds no
-//! credentials and rejects every auth attempt. Per-client `apiKey`
-//! credentials will resolve against `subsonic_clients`
-//! (`migrations/0023_subsonic_clients.sql`).
+//! seam. The catalogue remains `MemStore::empty()`; request-scoped API-key
+//! preparation uses the versioned `subsonic_credentials` adapter, never the
+//! inert legacy table. A source-level release fence keeps runtime credentials
+//! denied until schema, provisioning, shared limits and security gates are proved.
 
 pub mod account_deletion;
 pub mod api_error;
@@ -28,6 +28,7 @@ pub mod rate_limit;
 pub mod rotation;
 pub mod session;
 pub mod subsonic_auth;
+pub mod subsonic_runtime;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;
@@ -127,7 +128,7 @@ pub async fn main(
     #[cfg(target_arch = "wasm32")]
     if is_subsonic_request(&req) {
         let mut req = req;
-        return subsonic_response(&mut req).await;
+        return subsonic_response(&mut req, &env).await;
     }
     worker_entry::dispatch(req, env).await
 }
@@ -171,7 +172,7 @@ mod subsonic_routing_tests {
 /// Serve one Subsonic request: v1 reads params from query plus POST form
 /// body (`$request->input()`), refusing bodies over 10 MB with error 10.
 #[cfg(target_arch = "wasm32")]
-async fn subsonic_response(req: &mut Request) -> Result<Response> {
+async fn subsonic_response(req: &mut Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().to_string();
     let query = url.query().unwrap_or("").to_string();
@@ -228,9 +229,53 @@ async fn subsonic_response(req: &mut Request) -> Result<Response> {
         String::new()
     };
 
+    use crate::subsonic_auth::{
+        prepare_subsonic_auth, subsonic_api_key, PreparedSubsonicAuth, SubsonicAuthAttempt,
+    };
+    let incoming_trace = req
+        .headers()
+        .get(crate::logging::TRACE_HEADER)
+        .ok()
+        .flatten();
+    let trace_id = crate::logging::resolve_trace_id(incoming_trace.as_deref());
+    let credentials = SubsonicApp::<MemStore>::request_credentials(&method, &query, &body);
+    let auth = if matches!(
+        nntune_subsonic::routes::route(&path),
+        nntune_subsonic::routes::Route::Endpoint(_)
+    ) && subsonic_api_key(&credentials).is_some()
+    {
+        let runtime = worker_entry::subsonic_runtime_bindings(env, &trace_id);
+        let attempt = SubsonicAuthAttempt {
+            ip: crate::vault::sanitize_source_ip(
+                req.headers()
+                    .get("cf-connecting-ip")
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        };
+        let auth = prepare_subsonic_auth(
+            runtime.store.as_ref(),
+            runtime.keyring.as_deref(),
+            runtime.limiter.as_ref(),
+            &attempt,
+            &credentials,
+        )
+        .await;
+        if let Some(fault) = runtime.fault.or(auth.fault()) {
+            worker_entry::record_subsonic_auth_fault(fault, &trace_id, env);
+        }
+        auth
+    } else {
+        PreparedSubsonicAuth::default()
+    };
     let app = SubsonicApp::new(MemStore::empty());
-    let res = app.handle(&method, &path, &query, &body);
-    respond(&res)
+    let res = app.handle_with_auth(&auth, &method, &path, &query, &body);
+    let mut response = respond(&res)?;
+    response
+        .headers_mut()
+        .set(crate::logging::TRACE_HEADER, &trace_id)?;
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]

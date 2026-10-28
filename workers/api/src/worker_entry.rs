@@ -528,7 +528,8 @@ pub async fn with_deadline<T, E>(
     // Both futures are dropped here, before the caller observes the result.
 }
 
-struct PgStore {
+#[derive(Clone)]
+pub(crate) struct PgStore {
     env: Env,
     trace_id: String,
 }
@@ -621,6 +622,181 @@ impl PgStore {
         } else {
             None
         }
+    }
+}
+
+impl PgStore {
+    async fn subsonic_query(
+        &self,
+        query: crate::subsonic_auth::SubsonicSqlQuery,
+    ) -> Result<Vec<tokio_postgres::Row>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = query
+                    .params
+                    .iter()
+                    .map(|param| {
+                        use crate::subsonic_auth::SubsonicSqlParam;
+                        match param {
+                            SubsonicSqlParam::Integer(value) => {
+                                value as &(dyn tokio_postgres::types::ToSql + Sync)
+                            }
+                            SubsonicSqlParam::Text(value) => {
+                                value as &(dyn tokio_postgres::types::ToSql + Sync)
+                            }
+                        }
+                    })
+                    .collect();
+                client
+                    .query(&query.sql, &params)
+                    .await
+                    .map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+}
+
+fn subsonic_client_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::subsonic_auth::SubsonicClientRow, StoreError> {
+    use crate::subsonic_auth::{SubsonicClientRow, SubsonicOwnerRow};
+    Ok(SubsonicClientRow {
+        client_id: row.try_get("client_id").map_err(|_| StoreError)?,
+        user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+        subsonic_username: row.try_get("subsonic_username").map_err(|_| StoreError)?,
+        api_key_hmac: row.try_get("api_key_hmac").map_err(|_| StoreError)?,
+        pepper_version: u32::try_from(
+            row.try_get::<_, i32>("pepper_version")
+                .map_err(|_| StoreError)?,
+        )
+        .map_err(|_| StoreError)?,
+        auth_mode: row.try_get("auth_mode").map_err(|_| StoreError)?,
+        scope: row.try_get("scope").map_err(|_| StoreError)?,
+        revoked_at: row.try_get("revoked_at").map_err(|_| StoreError)?,
+        owner: Some(SubsonicOwnerRow {
+            user_id: row.try_get("owner_user_id").map_err(|_| StoreError)?,
+            email: row.try_get("owner_email").map_err(|_| StoreError)?,
+            deleting_at: row.try_get("deleting_at").map_err(|_| StoreError)?,
+            subsonic_disabled_at: row
+                .try_get("subsonic_disabled_at")
+                .map_err(|_| StoreError)?,
+        }),
+    })
+}
+
+impl crate::subsonic_auth::SubsonicClientLookup for PgStore {
+    async fn clients_by_candidates(
+        &self,
+        pairs: &[(u32, String)],
+    ) -> Result<Vec<crate::subsonic_auth::SubsonicClientRow>, StoreError> {
+        let query = crate::subsonic_auth::subsonic_lookup_query(pairs)?;
+        self.subsonic_query(query)
+            .await?
+            .iter()
+            .map(subsonic_client_from_row)
+            .collect()
+    }
+    async fn cas_pepper(
+        &self,
+        row: &crate::subsonic_auth::SubsonicClientRow,
+        version: u32,
+        hmac: &str,
+    ) -> Result<Option<crate::subsonic_auth::SubsonicClientRow>, StoreError> {
+        let query = crate::subsonic_auth::subsonic_rehmac_query(row, version, hmac)?;
+        let rows = self.subsonic_query(query).await?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => subsonic_client_from_row(row).map(Some),
+            _ => Err(StoreError),
+        }
+    }
+    async fn mark_last_used(
+        &self,
+        row: &crate::subsonic_auth::SubsonicClientRow,
+    ) -> Result<bool, StoreError> {
+        let query = crate::subsonic_auth::subsonic_last_used_query(row)?;
+        Ok(self.subsonic_query(query).await?.len() == 1)
+    }
+    async fn unrevoked_for_pepper(&self, version: u32) -> Result<u64, StoreError> {
+        let query = crate::subsonic_auth::subsonic_unrevoked_pepper_query(version)?;
+        let rows = self.subsonic_query(query).await?;
+        let [row] = rows.as_slice() else {
+            return Err(StoreError);
+        };
+        u64::try_from(row.try_get::<_, i64>(0).map_err(|_| StoreError)?).map_err(|_| StoreError)
+    }
+}
+
+impl crate::subsonic_runtime::SubsonicLimitStore for PgStore {
+    async fn reserve_subsonic_limit(
+        &self,
+        scope_key: &str,
+        action: &str,
+        limit: u64,
+        window_secs: u64,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        self.reserve_rate_limit(scope_key, action, limit, now, window_secs)
+            .await
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+pub(crate) struct SubsonicRuntimeBindings {
+    pub store: Option<PgStore>,
+    pub keyring: Option<String>,
+    pub limiter: Option<crate::subsonic_runtime::SharedSubsonicLimiter<PgStore>>,
+    pub fault: Option<crate::subsonic_auth::SubsonicAuthFault>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn subsonic_runtime_bindings(env: &Env, trace_id: &str) -> SubsonicRuntimeBindings {
+    let settings = crate::subsonic_runtime::load_subsonic_runtime_settings(
+        || {
+            env.secret("SUBSONIC_INDEX_PEPPER")
+                .ok()
+                .map(|value| value.to_string())
+        },
+        || {
+            env.var("SUBSONIC_RATE_LIMITS")
+                .ok()
+                .map(|value| value.to_string())
+        },
+    );
+    let settings = match settings {
+        Ok(settings) => settings,
+        Err(fault) => {
+            return SubsonicRuntimeBindings {
+                fault: Some(fault),
+                ..SubsonicRuntimeBindings::default()
+            }
+        }
+    };
+    if !hyperdrive_caching_disabled_attested(env_string(env, "HYPERDRIVE_CACHING_DISABLED")) {
+        return SubsonicRuntimeBindings {
+            fault: Some(crate::subsonic_auth::SubsonicAuthFault::Configuration),
+            ..SubsonicRuntimeBindings::default()
+        };
+    }
+    let (keyring, limits) = settings.into_parts();
+    let store = PgStore {
+        env: env.clone(),
+        trace_id: trace_id.into(),
+    };
+    let limiter = crate::subsonic_runtime::SharedSubsonicLimiter::new(
+        store.clone(),
+        limits,
+        worker::Date::now().as_millis() / 1000,
+    );
+    SubsonicRuntimeBindings {
+        store: Some(store),
+        keyring: Some(keyring),
+        limiter: Some(limiter),
+        fault: None,
     }
 }
 
@@ -2302,6 +2478,38 @@ fn emit_record(
     Some(line)
 }
 
+/// Only typed classes enter this operational event, never a driver/config
+/// error string, request path/query, key material or owner projection.
+pub fn subsonic_auth_fault_record(
+    fault: crate::subsonic_auth::SubsonicAuthFault,
+    trace_id: &str,
+    build_sha: &str,
+) -> Option<String> {
+    use crate::subsonic_auth::SubsonicAuthFault;
+    let (fault, error_class) = match fault {
+        SubsonicAuthFault::Keyring => ("keyring", "internal_error"),
+        SubsonicAuthFault::Configuration => ("configuration", "internal_error"),
+        SubsonicAuthFault::Store => ("store", "service_unavailable"),
+        SubsonicAuthFault::Limiter => ("limiter", "service_unavailable"),
+    };
+    emit_record(
+        crate::logging::Level::Error,
+        "api.subsonic.auth.failed",
+        trace_id,
+        serde_json::json!({"component":"subsonic_auth", "fault":fault, "error_class":error_class,
+            "build_sha":build_sha, "release":build_sha}),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn record_subsonic_auth_fault(
+    fault: crate::subsonic_auth::SubsonicAuthFault,
+    trace_id: &str,
+    env: &Env,
+) {
+    let _ = subsonic_auth_fault_record(fault, trace_id, &build_sha_from_env(env));
+}
+
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
 /// framework-agnostic shape. Misconfiguration (missing/invalid env)
 /// answers the same generic 500 as any store outage.
@@ -2438,6 +2646,36 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
 /// (`vault::sanitize_source_ip`). `headers` keys are lowercased.
 fn client_source_ip(headers: &HashMap<String, String>) -> String {
     crate::vault::sanitize_source_ip(headers.get("cf-connecting-ip").map(String::as_str))
+}
+
+#[cfg(test)]
+mod subsonic_logging_builder_tests {
+    use super::*;
+    use crate::subsonic_auth::SubsonicAuthFault;
+
+    #[test]
+    fn typed_subsonic_faults_reach_the_shared_error_emitter_without_diagnostics() {
+        const TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
+        for (fault, label) in [
+            (SubsonicAuthFault::Keyring, "keyring"),
+            (SubsonicAuthFault::Configuration, "configuration"),
+            (SubsonicAuthFault::Store, "store"),
+            (SubsonicAuthFault::Limiter, "limiter"),
+        ] {
+            let line = subsonic_auth_fault_record(fault, TRACE, "unknown")
+                .expect("operational fault must be emitted");
+            let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(record["event"], "api.subsonic.auth.failed");
+            assert_eq!(record["level"], "error");
+            assert_eq!(record["trace_id"], TRACE);
+            assert_eq!(record["fields"]["fault"], label);
+            assert!(record["fields"].get("cause").is_none());
+        }
+        assert!(
+            subsonic_auth_fault_record(SubsonicAuthFault::Store, "hostile-trace", "unknown")
+                .is_none()
+        );
+    }
 }
 
 #[cfg(test)]

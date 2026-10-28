@@ -1085,7 +1085,7 @@ fn fake_user_id(cfg: &Config, email: &str) -> String {
 /// budget, IPv4 keeps the full address. Audit logs keep the full `source_ip`;
 /// only budget scopes use this key, so rotation inside one prefix cannot mint
 /// fresh budgets.
-fn rate_limit_ip_key(source_ip: &str) -> String {
+pub(crate) fn rate_limit_ip_key(source_ip: &str) -> String {
     let trimmed = source_ip.trim();
     let Ok(addr) = trimmed.parse::<IpAddr>() else {
         return trimmed.to_string();
