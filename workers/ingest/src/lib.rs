@@ -53,6 +53,7 @@ pub mod retry;
 pub mod track_writers;
 pub mod transcode;
 pub mod verify;
+pub mod writer_execution;
 
 use api_error::ApiError;
 use dispatch::validate_user_id;

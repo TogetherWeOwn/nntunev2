@@ -1,4 +1,4 @@
-//! `ingest_jobs` writer: admission row + terminal transition (migration 0021).
+//! `ingest_jobs` writer: admission row + terminal transition (migration 0022).
 //!
 //! One row per pipeline job, keyed by the deterministic `job_id`
 //! (`dispatch::make_job_id`) with `UNIQUE(user_id, idempotency_key)`
@@ -100,7 +100,7 @@ pub fn validate_transition_status(raw: &str) -> bool {
 }
 
 /// Check admission values before they touch the database. Bounds mirror
-/// migration 0021 (`CHECK`s on `id`, `idempotency_key`, `accepted_at`);
+/// migration 0022 (`CHECK`s on `id`, `idempotency_key`, `accepted_at`);
 /// the key shape mirrors the ingest key (`ingest:` prefix).
 pub fn validate_admit_params(
     job_id: &str,
