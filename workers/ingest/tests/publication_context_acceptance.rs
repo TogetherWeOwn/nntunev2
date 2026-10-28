@@ -475,16 +475,16 @@ fn publication_sql_model_accepts_live_owner_join_with_aliases_and_reordered_pred
         "SELECT tracks.id, ingest_jobs.idempotency_key, providers.id, ingest_jobs.user_id, providers.user_id FROM tracks JOIN ingest_jobs ON ingest_jobs.id = $3 JOIN users ON users.id = ingest_jobs.user_id JOIN providers ON providers.user_id = users.id AND providers.id = $2 WHERE tracks.id = $1 AND users.deleting_at IS NULL FOR SHARE OF users"
     ));
     // Harmless grouping, extra projection and plain share lock stay valid.
-    assert!(live_publication_identity_query(canonical.replace(
+    assert!(live_publication_identity_query(&canonical.replace(
         "AND users.deleting_at IS NULL",
         "AND (users.deleting_at IS NULL)"
     )));
-    assert!(live_publication_identity_query(canonical.replace(
+    assert!(live_publication_identity_query(&canonical.replace(
         "SELECT providers.user_id,",
         "SELECT ingest_jobs.id, providers.user_id,"
     )));
     assert!(live_publication_identity_query(
-        canonical.replace("FOR SHARE OF users", "FOR SHARE")
+        &canonical.replace("FOR SHARE OF users", "FOR SHARE")
     ));
 }
 
