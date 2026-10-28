@@ -23,6 +23,6 @@ export function selectImportFiles(files: readonly File[]): ImportSelection {
 	if (error) return { status: null, error };
 	return {
 		error: null,
-		status: `${file.name} (${formatSize(file.size)}) selected locally — import is not available yet. This page does not upload or process the file or add tracks to your library.`
+		status: `${file.name} (${formatSize(file.size)}) selected locally — import is not available yet. Selection does not upload or process the file or add tracks to your library. Use Preview for an explicit local read of aggregate claims.`
 	};
 }

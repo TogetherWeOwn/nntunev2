@@ -42,6 +42,8 @@ test('native pointer-location drop mirrors the picker, then keyboard reselect an
 		await expect(page.getByRole('status')).toContainText('pointer-drop.nzb');
 	}
 	await page.keyboard.press('Tab');
+	await expect(page.getByRole('button', { name: 'Preview', exact: true })).toBeFocused();
+	await page.keyboard.press('Tab');
 	await expect(page.getByRole('button', { name: 'Clear selection' })).toBeFocused();
 	await page.keyboard.press('Enter');
 	await expect(input).toHaveJSProperty('value', '');
