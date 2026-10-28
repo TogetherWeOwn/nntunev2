@@ -86,7 +86,7 @@ export interface NaturalEndResult {
 
 /** Natural completion may replay/wrap; explicit navigation remains clamped. */
 export function naturalEndPolicy(state: QueueState, context: NaturalEndContext): NaturalEndResult {
-	if (!context.validEnd || !context.playing || !currentTrack(state)) {
+	if (!context.validEnd || !context.playing || (!context.radioActive && !currentTrack(state))) {
 		return { queue: state, action: 'ignore' };
 	}
 	if (context.sleepComplete) return { queue: state, action: 'stop' };

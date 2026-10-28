@@ -87,7 +87,12 @@ for (const surface of ['library', 'demo'] as const) {
 			queueMoveProbe: { play: number; pause: number; messages: string[] };
 		}).queueMoveProbe);
 		expect({ play: probe.play, pause: probe.pause }).toEqual(transportBefore);
-		expect(probe.messages).toEqual(['Third Light moved to 1 of 3', 'Demo track moved to 3 of 3']);
+		// Demo filtering now shares this region with move/remove outcomes.
+		// Assert every commit, including counts; do not discard non-move text.
+		const expectedMessages = surface === 'demo'
+			? ['1 of 3 tracks', 'Third Light moved to 1 of 3', '3 of 3 tracks', 'Demo track moved to 3 of 3']
+			: ['Third Light moved to 1 of 3', 'Demo track moved to 3 of 3'];
+		expect(probe.messages).toEqual(expectedMessages);
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 
 		await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
@@ -97,7 +102,7 @@ for (const surface of ['library', 'demo'] as const) {
 		expect(await page.evaluate(() => (window as unknown as {
 			queueMoveProbe: { messages: string[] };
 		}).queueMoveProbe.messages)).toEqual([
-			'Third Light moved to 1 of 3', 'Demo track moved to 3 of 3',
+			...expectedMessages,
 			...(surface === 'library' ? ['Queue cleared.'] : [])
 		]);
 	});

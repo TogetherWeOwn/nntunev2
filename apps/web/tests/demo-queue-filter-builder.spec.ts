@@ -115,3 +115,25 @@ test('filtered demo select marks and persists the original queue track', async (
 	await expect(page.getByTestId('queue-select-third-light')).toHaveAttribute('aria-current', 'true');
 	await expect(page.getByTestId('now-playing')).toContainText('Third Light');
 });
+
+test('filtered demo remove deletes the original queue track, not the visible position', async ({ page, baseURL }) => {
+	await open(page, baseURL!);
+	await page.getByTestId('queue-select-demo-track').click();
+	await expect.poll(() => currentId(page)).toBe('demo-track');
+	// Hide the first row so the visible target sits at visible position 0
+	// with full-queue index 1.
+	await input(page).fill('second');
+	await settle(page);
+	await expect.poll(() => order(page)).toEqual(['second-signal']);
+	await page.getByTestId('queue-remove-second-signal').click();
+	// A visible-position regression would delete demo-track (full index 0)
+	// and advance the current selection away from it.
+	await expect.poll(() => order(page)).toEqual([]);
+	await expect(input(page)).toHaveValue('second');
+	expect(await live(page)).toContain('0 of 2 tracks');
+	await clear(page).click();
+	await expect.poll(() => order(page)).toEqual(['demo-track', 'third-light']);
+	await expect.poll(() => currentId(page)).toBe('demo-track');
+	await expect(page.getByTestId('queue-select-demo-track')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('now-playing')).toContainText('Demo track');
+});

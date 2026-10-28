@@ -68,6 +68,7 @@
 		nextTrack,
 		playNext,
 		previousTrack,
+		removeTrack,
 		restoreQueue,
 		selectTrack,
 		serializeQueue,
@@ -107,8 +108,11 @@
 	let queue: QueueState = $state(createQueue(DEMO_TRACKS));
 	// A move describes one queue snapshot; other edits invalidate its position.
 	let queueMoveAnnouncement = $state.raw<{ queue: QueueState; text: string } | null>(null);
+	let queueRemovalAnnouncement = $state.raw<{ id: string; text: string } | null>(null);
 	let queueAnnouncement = $derived(
-		queueMoveAnnouncement?.queue === queue ? queueMoveAnnouncement.text : ''
+		queueMoveAnnouncement?.queue === queue
+			? queueMoveAnnouncement.text
+			: queueRemovalAnnouncement?.text ?? ''
 	);
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
@@ -144,7 +148,10 @@
 	 * playback. Matching is the shared PlayerQueue contract.
 	 */
 	let demoFilterQuery = $state('');
+	// Counts stay readable on load, but become live only after a filter action.
+	let filterAnnouncementActive = $state(false);
 	let demoFilterInput: HTMLInputElement | undefined = $state();
+	let queueEmptyFocus: HTMLHeadingElement | undefined = $state();
 	let visibleQueueEntries = $derived(
 		queue.tracks
 			.map((track, index) => ({ track, index }))
@@ -438,6 +445,8 @@
 	/** A restored or native non-preset rate renders as its own explicit option. */
 	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
+	// Removing the current track discards this node's progress, even at teardown.
+	const discardedResumeNodes = new WeakSet<HTMLAudioElement>();
 
 	// Session-local recently-played list (demo synthetic tracks only; the
 	// store itself is fail-soft, so a corrupt key renders the empty state).
@@ -625,7 +634,7 @@
 		if (!trackId || !resumeStore) return;
 		// An ended node carries the finished position: persisting it would
 		// resurrect the entry handleEnded just cleared.
-		if (element?.ended) return;
+		if (element?.ended || (element && discardedResumeNodes.has(element))) return;
 		const position = element?.currentTime;
 		if (typeof position !== 'number' || !Number.isFinite(position) || position <= 0) return;
 		resumeStore.save(trackId, position);
@@ -703,6 +712,7 @@
 		if (!deck) return;
 		let index = queue.tracks.findIndex((track) => track.id === trackId);
 		if (index < 0) {
+			if (queueRemovalAnnouncement?.id === trackId) queueRemovalAnnouncement = null;
 			queue = addTrack(queue, deck);
 			index = queue.tracks.length - 1;
 		}
@@ -726,6 +736,7 @@
 			recentFeedback = `${deck.title} is already in the queue.`;
 			return;
 		}
+		if (queueRemovalAnnouncement?.id === trackId) queueRemovalAnnouncement = null;
 		queue = addTrack(queue, deck);
 		if (status === 'empty') status = 'selected';
 		recentFeedback = `Added ${deck.title} to the queue.`;
@@ -967,6 +978,9 @@
 
 	/** Clearing restores every row and keeps focus inside the panel. */
 	function clearDemoFilter(): void {
+		filterAnnouncementActive = true;
+		queueMoveAnnouncement = null;
+		queueRemovalAnnouncement = null;
 		demoFilterQuery = '';
 		demoFilterInput?.focus();
 	}
@@ -981,6 +995,7 @@
 					? moveToBottom(queue, from)
 					: moveTrack(queue, from, to);
 		if (reordered === queue) return;
+		queueRemovalAnnouncement = null;
 		queue = reordered;
 		queueMoveAnnouncement = {
 			queue,
@@ -1014,6 +1029,8 @@
 		const reordered = playNext(queue, index);
 		// Current/already-next requests leave even the previous announcement alone.
 		if (reordered === queue || !track) return;
+		// New move feedback supersedes removal, but remains snapshot-scoped.
+		queueRemovalAnnouncement = null;
 		queue = reordered;
 		queueMoveAnnouncement = {
 			queue,
@@ -1025,8 +1042,12 @@
 	}
 
 	function addToQueue(track: (typeof DEMO_TRACKS)[number]): void {
+		const next = addTrack(queue, track);
+		if (next === queue) return;
+		// Only this track's re-add needs to reset an identical future outcome.
+		if (queueRemovalAnnouncement?.id === track.id) queueRemovalAnnouncement = null;
 		const wasEmpty = queue.tracks.length === 0;
-		queue = addTrack(queue, track);
+		queue = next;
 		// The first add to an empty queue makes it current: start it like any
 		// other track change instead of showing a track that never plays.
 		if (wasEmpty) {
@@ -1035,7 +1056,50 @@
 		}
 	}
 
+	async function removeAt(trackId: string, event: MouseEvent): Promise<void> {
+		// Resolve against live state: another activation can precede the DOM flush.
+		const index = queue.tracks.findIndex((track) => track.id === trackId);
+		const next = removeTrack(queue, index);
+		if (next === queue) return;
+		const removed = queue.tracks[index]!;
+		const button = event.currentTarget as HTMLButtonElement;
+		const heldFocus = document.activeElement === button;
+		// Snapshot visible neighbours before removal; filtered-out rows are not
+		// recovery targets. Native buttons stay the only row tab stops.
+		const list = button.closest('ol')!;
+		const buttons = Array.from(
+			list.querySelectorAll<HTMLButtonElement>('[data-testid^="queue-remove-"]')
+		);
+		const position = buttons.indexOf(button);
+		const neighbours = [...buttons.slice(position + 1), ...buttons.slice(0, position).reverse()];
+		if (!radio && index === queue.currentIndex) {
+			// Invalidate pending plays of the old source without starting the
+			// newly selected track. Non-current edits leave active audio alone.
+			if (audioEl && endedForCurrent(audioEl, removed.streamUrl)) {
+				discardedResumeNodes.add(audioEl);
+			}
+			resumeStore?.clear(removed.id);
+			playback.pause();
+			status = next.tracks.length === 0 ? 'empty' : 'selected';
+		}
+		queue = next;
+		queueMoveAnnouncement = null;
+		queueRemovalAnnouncement = { id: removed.id, text: `${removed.title} removed from the queue` };
+		if (!heldFocus) return;
+		await tick();
+		// Recover only focus lost by this removal, never a newer user choice.
+		if (!list.isConnected || !document.hasFocus() || document.activeElement !== document.body) return;
+		// Both fallback bindings are unconditional within the mounted panel. If
+		// only hidden tracks remain, let the user edit/clear the hiding filter.
+		const target = neighbours.find((candidate) => candidate.isConnected) ??
+			(queue.tracks.length > 0 ? demoFilterInput! : queueEmptyFocus!);
+		target.focus({ preventScroll: true });
+	}
+
 	function clearAll(): void {
+		queueMoveAnnouncement = null;
+		queueRemovalAnnouncement = null;
+		filterAnnouncementActive = false;
 		radio = null;
 		queue = clearQueue(queue);
 		status = 'empty';
@@ -1952,8 +2016,16 @@
 	{/if}
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
-		<h2>Queue</h2>
-		<p data-testid="queue-announcement" role="status">{queueAnnouncement}</p>
+		<h2 data-testid="queue-empty-focus" tabindex="-1" bind:this={queueEmptyFocus}>Queue</h2>
+		<p data-testid="queue-announcement" role="status">
+			{#if queueAnnouncement}
+				{queueAnnouncement}
+			{:else if filterAnnouncementActive}
+				<span class="filter-announcement">
+					{visibleQueueEntries.length} of {queue.tracks.length} tracks{#if queue.tracks.length > 0 && visibleQueueEntries.length === 0}. No matches in this queue{/if}
+				</span>
+			{/if}
+		</p>
 		<div class="queue-export">
 			<div class="queue-export-actions">
 				<button
@@ -2014,12 +2086,18 @@
 				type="search"
 				bind:value={demoFilterQuery}
 				bind:this={demoFilterInput}
+				oninput={() => {
+					filterAnnouncementActive = true;
+					queueMoveAnnouncement = null;
+					queueRemovalAnnouncement = null;
+				}}
 			/>
 			<button type="button" onclick={clearDemoFilter}>Clear queue filter</button>
 		</div>
-		<p role="status">{visibleQueueEntries.length} of {queue.tracks.length} tracks</p>
+		<!-- Readable summaries, but only queue-announcement emits live updates. -->
+		<p role="status" aria-live="off">{visibleQueueEntries.length} of {queue.tracks.length} tracks</p>
 		{#if queue.tracks.length > 0 && visibleQueueEntries.length === 0}
-			<p role="status">No matches in this queue</p>
+			<p role="status" aria-live="off">No matches in this queue</p>
 		{/if}
 		<ol>
 			{#each visibleQueueEntries as { track, index } (track.id)}
@@ -2075,6 +2153,14 @@
 						onclick={(event) => void playNextAt(index, event.currentTarget)}
 					>
 						Play next
+					</button>
+					<button
+						type="button"
+						data-testid="queue-remove-{track.id}"
+						aria-label="Remove {track.title} from queue"
+						onclick={(event) => removeAt(track.id, event)}
+					>
+						Remove
 					</button>
 				</li>
 			{/each}
@@ -2251,6 +2337,17 @@
 </main>
 
 <style>
+	.filter-announcement {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+
 	.queue-export {
 		margin-block: var(--nt-space-3);
 	}
