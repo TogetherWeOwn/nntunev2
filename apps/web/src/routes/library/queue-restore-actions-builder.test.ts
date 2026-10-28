@@ -33,7 +33,7 @@ function actions() {
 		queue, queueInitialized: true, LIBRARY_QUEUE_KEY,
 		queueAnnouncement: '', queueAnnouncementVersion: 0,
 		shareGeneration: 0, shareStatus: '', shareFallbackUrl: null, pendingShareSeek: null,
-		restartCanSeek: false, restartStatus: '',
+		restartCanSeek: false, restartStatus: '', playEpoch: 0,
 		browserStorage: () => ({
 			setItem: (key: string, value: string) => storage.set(key, value),
 			removeItem: (key: string) => storage.delete(key)

@@ -41,6 +41,11 @@ export const LIBRARY_QUEUE_KEY = 'nntune.library.queue.v1';
  * read) at the auth boundary.
  */
 export const LIBRARY_FAVORITES_KEY = 'nntune.library.favorites.v1';
+/**
+ * Base key for device-local recent find queries; same auth-context scoping
+ * and legacy-base-key handling as favorites (see `recent-finds.ts`).
+ */
+export const LIBRARY_RECENT_FINDS_KEY = 'nntune.library.recent-finds.v1';
 
 function snapshotKey(storage: SnapshotStorage | null, createContext = false): string | null {
 	if (!storage) return null;
@@ -239,8 +244,8 @@ export function broadcastAuthTransition(storage: SnapshotStorage | null): void {
 }
 
 /**
- * Drop favorites at the auth boundary: the scoped key for the outgoing
- * context plus the legacy unscoped base key. Never throws; values are
+ * Drop favorites and recent finds at the auth boundary: the scoped keys for
+ * the outgoing context plus the legacy unscoped base key. Never throws; values are
  * removed, never parsed, so a corrupt value is cleared without error.
  */
 function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | null): void {
@@ -248,6 +253,8 @@ function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | n
 	try {
 		if (context) storage.removeItem(`${LIBRARY_FAVORITES_KEY}.${context}`);
 		storage.removeItem(LIBRARY_FAVORITES_KEY);
+		if (context) storage.removeItem(`${LIBRARY_RECENT_FINDS_KEY}.${context}`);
+		storage.removeItem(LIBRARY_RECENT_FINDS_KEY);
 	} catch {
 		// Best effort; a key without its auth context is never read.
 	}

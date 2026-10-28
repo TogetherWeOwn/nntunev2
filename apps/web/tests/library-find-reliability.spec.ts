@@ -122,7 +122,13 @@ test('[LF-R-FAVORITES] find intersects Favorites only and each reset preserves t
 		.getByRole('button', { name: 'Star Beta Song', exact: true }).click();
 	await page.getByRole('checkbox', { name: 'Select Private Previous Account Text', exact: true }).check();
 	await page.getByRole('checkbox', { name: 'Select Beta Song', exact: true }).check();
-	const stored = await page.evaluate(() => Object.entries(window.localStorage));
+	const readStored = () =>
+		page.evaluate(() =>
+			Object.entries(window.localStorage).filter(
+				([key]) => !key.startsWith('nntune.library.recent-finds.v1')
+			)
+		);
+	const stored = await readStored();
 
 	const view = page.getByRole('combobox', { name: 'Show', exact: true });
 	const field = page.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
@@ -160,6 +166,6 @@ test('[LF-R-FAVORITES] find intersects Favorites only and each reset preserves t
 	await expect(page.getByRole('checkbox', { name: 'Select Private Previous Account Text', exact: true })).toBeChecked();
 	await expect(page.getByRole('checkbox', { name: 'Select Beta Song', exact: true })).toBeChecked();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
-	expect(await page.evaluate(() => Object.entries(window.localStorage))).toEqual(stored);
+	expect(await readStored()).toEqual(stored);
 	expect(requests).toBe(1);
 });

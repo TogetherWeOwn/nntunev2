@@ -1,0 +1,10 @@
+[package]
+name = "nntune-subsonic"
+version = "0.1.0"
+edition = "2021"
+description = "Subsonic-compatible API surface for NNTune v2 (ported from v1 routes/subsonic.php behaviour)"
+license = "MIT"
+
+[lib]
+name = "nntune_subsonic"
+path = "src/lib.rs"

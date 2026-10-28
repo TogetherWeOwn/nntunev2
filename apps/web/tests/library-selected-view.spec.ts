@@ -230,7 +230,12 @@ async function focusedRow(page: Page): Promise<{ rowId: string | null; actionabl
 }
 
 async function storageWriteCount(page: Page): Promise<number> {
-	return page.evaluate(() => (Reflect.get(window, '__svStorageWrites') as string[]).length);
+	return page.evaluate(
+		() =>
+			(Reflect.get(window, '__svStorageWrites') as string[]).filter(
+				(key) => !key.startsWith('nntune.library.recent-finds.v1')
+			).length
+	);
 }
 
 async function queueState(page: Page) {
