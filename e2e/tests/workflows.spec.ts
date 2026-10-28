@@ -1625,6 +1625,7 @@ staging = "dummy-hyperdrive-staging"
   for (const [name, toml] of [
     ['removed declaration', ''],
     ['wrong consumer', expectedTail.replace('nntune-alerts-staging', 'other-alerts-staging')],
+    ['unexpected consumer environment', expectedTail + 'environment = "other"\n'],
     ['duplicate consumer', expectedTail + expectedTail],
     ['root-only consumer', expectedTail.replace('env.staging.tail_consumers', 'tail_consumers')],
     ['production-only consumer', expectedTail.replace('env.staging.tail_consumers', 'env.production.tail_consumers')],
