@@ -394,6 +394,7 @@ test('QCR-06 revised upcoming scope describes Confirm and is announced politely 
 	await expect.soft(yes(page), 'Confirm needs the count, not only Cancel').toHaveAccessibleDescription(/\b2\b.*upcoming|upcoming.*\b2\b/i, { timeout: 1000 });
 	await expect.soft(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE, { timeout: 1000 });
 	const warning = await describedRemovalWarning(page);
+	await expectPoliteWarning(warning, 2);
 	const beforeWarning = await warning.allTextContents();
 	const oldYes = await yes(page).elementHandle();
 	await yes(page).focus();
@@ -534,6 +535,7 @@ test('QCR-10 trusted end revises a focused upcoming warning politely during gate
 		await expect(yes(page)).toHaveAccessibleDescription(/\b2\b.*upcoming|upcoming.*\b2\b/i);
 		await expect(yes(page)).toHaveAccessibleDescription(IRREVERSIBLE);
 		const warning = await describedRemovalWarning(page);
+		await expectPoliteWarning(warning, 2);
 		const beforeWarning = await warning.allTextContents();
 		await yes(page).focus();
 		await expect(yes(page)).toBeFocused();
