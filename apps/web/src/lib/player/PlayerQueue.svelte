@@ -325,7 +325,9 @@
 		if (kind === 'clear') focusEmptyTarget();
 		else {
 			// A filtered-out current row stays hidden until explicitly revealed.
-			(currentRowElement() ?? revealCurrentButtonEl)?.focus({ preventScroll: true });
+			const target = currentRowElement() ?? revealCurrentButtonEl;
+			target?.focus({ preventScroll: true });
+			target?.scrollIntoView({ block: 'nearest', behavior: 'instant' });
 		}
 	}
 
