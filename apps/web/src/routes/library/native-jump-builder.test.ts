@@ -41,7 +41,7 @@ function jumpFixture() {
 	const page = new Function(...Object.keys(bindings), `
 		let queue = addTrack(createQueue([coral]), ember), audioEl = element;
 		let shareGeneration = 0, shareStatus = '', shareFallbackUrl = null, pendingShareSeek = null;
-		let queueAnnouncement = '', queueAnnouncementVersion = 0;
+		let queueAnnouncement = '', queueAnnouncementVersion = 0, playEpoch = 0;
 		let queueExportAuthGeneration = 0, queueShareGeneration = 0, handledShareSearch = null;
 		let queueShareOutcome = { status: '', fallbackUrl: null, forQueue: null };
 		let shareInvalid = false;

@@ -49,6 +49,7 @@
 		hiddenSelectedCount,
 		pruneSelection,
 		selectAllDisplayed,
+		selectRange,
 		selectSelectedItems,
 		selectionCountLabel,
 		toggleSelected
@@ -190,8 +191,19 @@
 	);
 	// The last append outcome stays until the next append or a boundary purge.
 	let appendFeedback: string | null = $state(null);
+	/**
+	 * Range anchor: the most recently activated selection checkbox, or null
+	 * after Clear selection, a boundary purge or a prune that dropped it.
+	 * Plain component state, never persisted; an anchor hidden by find or
+	 * view degrades Shift+click to a plain toggle inside `selectRange`.
+	 */
+	let rangeAnchorId: string | null = null;
+	// Shift state of the checkbox click whose change event is in flight.
+	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
+	// Bumped by every queue edit; fences late play-from-top outcomes.
+	let playEpoch = 0;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -333,12 +345,15 @@
 			// there; failures without a snapshot have no rows selected.
 			if (!state.loading) {
 				if ((state.loadError && state.items.length === 0) || state.libraryUnavailable) {
-					if (selectedIds.length > 0 || appendFeedback !== null) purgeSelection();
+					if (selectedIds.length > 0 || appendFeedback !== null || rangeAnchorId !== null) {
+						purgeSelection();
+					}
 				} else if (!state.loadError) {
-					selectedIds = pruneSelection(
-						selectedIds,
-						state.items.map((track) => track.id)
-					);
+					const snapshotIds = state.items.map((track) => track.id);
+					selectedIds = pruneSelection(selectedIds, snapshotIds);
+					if (rangeAnchorId !== null && !snapshotIds.includes(rangeAnchorId)) {
+						rangeAnchorId = null;
+					}
 				}
 			}
 			// Bootstrap once after an authenticated load has minted the context.
@@ -400,6 +415,9 @@
 	const bulkAllQueued = $derived(
 		!libraryUnavailable && renderedItems.length > 0 && bulkMissing.length === 0
 	);
+	// Play-from-top stays enabled while everything is queued: selecting the
+	// first displayed track's slot is still useful.
+	const playDisplayedDisabled = $derived(libraryUnavailable || renderedItems.length === 0);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const tabTitle = $derived(libraryTabTitle(currentTrack));
 	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
@@ -443,13 +461,32 @@
 	}
 
 	function queuedTrackFor(item: LibraryItem): Track {
-		// No stream URL until the streaming slice: playback wiring is out of
-		// scope, so the queue carries library display fields only.
+		// Library display fields only: the bulk append and the favorites
+		// export snapshot never carry a stream URL.
 		return {
 			id: item.id,
 			title: displayTitle(item),
 			artist: displayArtist(item) ?? '',
 			streamUrl: ''
+		};
+	}
+
+	// The play path carries the item's stream URL like row selection does.
+	// A separate one-parameter mapper (no positional flag), so a bare
+	// `.map(...)` reference can never bind the array index to it.
+	function playableTrackFor(item: LibraryItem): Track {
+		return { ...queuedTrackFor(item), streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl }) };
+	}
+
+	/**
+	 * The append core shared by the bulk action and play-from-top: missing
+	 * tracks join the end in displayed order, the existing arrangement and
+	 * current selection survive, and an empty queue starts at its first row.
+	 */
+	function appendMissingTracks(missing: readonly Track[]): QueueState {
+		return {
+			tracks: [...queue.tracks, ...missing],
+			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
 		};
 	}
 
@@ -460,14 +497,7 @@
 		pendingShareSeek = null;
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
-		replaceQueue(
-			addTrack(queue, {
-				id: item.id,
-				title: displayTitle(item),
-				artist: displayArtist(item) ?? '',
-				streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl })
-			})
-		);
+		replaceQueue(addTrack(queue, playableTrackFor(item)));
 	}
 
 	/**
@@ -481,11 +511,56 @@
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		replaceQueue({
-			tracks: [...queue.tracks, ...missing.map(queuedTrackFor)],
-			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
-		});
+		replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)));
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
+	}
+
+	/**
+	 * Non-destructive play-from-top: append the missing displayed tracks
+	 * through the shared core, then select the first appended one (or the
+	 * first displayed track's existing slot when everything is queued).
+	 * Playback is attempted once, inside the gesture's activation window; a
+	 * rejected play() leaves the track selected but paused and is reported
+	 * as such — never retried. Any queue replacement after this activation
+	 * (another action, an auth teardown) fences the late outcome.
+	 */
+	async function playDisplayedFromTop(): Promise<void> {
+		if (playDisplayedDisabled) return;
+		const missing = bulkMissing;
+		const skipped = missingDisplayedTracks(renderedItems, new Set()).length - missing.length;
+		// Appended IDs are new and unique, so one lookup finds the first
+		// appended track, or the first displayed track's existing slot.
+		const first = missing[0] ?? renderedItems[0];
+		const base = appendMissingTracks(missing.map(playableTrackFor));
+		const index = base.tracks.findIndex((track) => track.id === first?.id);
+		const target = base.tracks[index];
+		if (!target) return;
+		// Bulk-added slots are metadata-only. This explicit play gesture
+		// hydrates only its selected slot, preserving every other queued row.
+		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
+		base.tracks[index] = { ...target, streamUrl: source };
+		replaceQueue(selectQueueIndex(base, index));
+		const epoch = playEpoch;
+		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
+		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
+		let lead = `Selected ${title}; no stream to play.`;
+		if (source) {
+			await tick();
+			if (epoch !== playEpoch) return;
+			const element = audioEl;
+			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (element) {
+				try {
+					await element.play();
+					lead = `Playing ${title}.`;
+				} catch {
+					// Selected-but-paused is the truthful fallback; no retry.
+				}
+			}
+			if (epoch !== playEpoch) return;
+		}
+		queueAnnouncement = `${lead} ${counts}`;
+		queueAnnouncementVersion += 1;
 	}
 
 	function queueFavorites(): void {
@@ -637,6 +712,11 @@
 	}
 
 	function replaceQueue(next: QueueState): void {
+		// A no-op replacement (same queue object: Next on the last track,
+		// a duplicate row tap) still clears a stale move announcement —
+		// pinned by the queue-announcement banks — but must not fence a
+		// pending play() outcome: the selection it describes is unchanged.
+		if (next !== queue) playEpoch += 1;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
@@ -1012,6 +1092,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
+		playEpoch += 1;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
@@ -1024,6 +1105,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		playEpoch += 1;
 		// Removing the current row advances the current source; the restart
 		// outcome for the removed track must not carry onto its successor.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
@@ -1037,6 +1119,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
+		playEpoch += 1;
 		queue = next;
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
@@ -1056,6 +1139,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		playEpoch += 1;
 		// Direct selection always changes the current source (reselecting
 		// the current row returned above), so restart state resets here.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
@@ -1071,6 +1155,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
@@ -1081,6 +1166,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
@@ -1330,6 +1416,25 @@
 		});
 	}
 
+	/**
+	 * Checkbox activation: Shift extends from the anchor through the
+	 * displayed rows (additive, so focus never leaves with a row); a plain
+	 * activation, or Shift without a displayed anchor, toggles exactly one
+	 * ID. Selection changes announce the count once; no-ops stay silent.
+	 */
+	function activateSelectionRow(id: string, extend: boolean, box: HTMLInputElement): void {
+		const displayedIds = renderedItems.map((track) => track.id);
+		if (extend && rangeAnchorId !== null && displayedIds.includes(rangeAnchorId)) {
+			selectedIds = selectRange(selectedIds, displayedIds, rangeAnchorId, id);
+		} else {
+			toggleSelectedId(id);
+		}
+		rangeAnchorId = id;
+		// A native toggle the selection did not follow (Shift on a selected
+		// anchor) would leave the box out of sync: re-assert the truth.
+		box.checked = selectedIds.includes(id);
+	}
+
 	function toggleSelectedId(id: string): void {
 		// Deselecting inside Selected only unmounts the row; when that row
 		// held focus, recover it to a surviving row or the Show control.
@@ -1363,6 +1468,7 @@
 		// sat inside one of them needs the Show-control fallback.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		selectedIds = clearSelection(selectedIds);
+		rangeAnchorId = null;
 		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
@@ -1374,6 +1480,7 @@
 
 	function purgeSelection(): void {
 		selectedIds = createSelection();
+		rangeAnchorId = null;
 		appendFeedback = null;
 	}
 
@@ -1699,6 +1806,18 @@
 			</button>
 			{#if bulkAllQueued}
 				<p id="bulk-queue-hint">All displayed tracks are already in the queue.</p>
+			{/if}
+			<button
+				class="nt-button nt-bulk-queue-action"
+				type="button"
+				disabled={playDisplayedDisabled}
+				aria-describedby={playDisplayedDisabled ? 'play-displayed-hint' : undefined}
+				onclick={() => void playDisplayedFromTop()}
+			>
+				Play displayed from the top
+			</button>
+			{#if playDisplayedDisabled}
+				<p id="play-displayed-hint">No displayed tracks to play.</p>
 			{/if}
 		</div>
 
@@ -2032,8 +2151,15 @@
 					type="checkbox"
 					aria-label={`Select ${displayTitle(track)}`}
 					checked={selectedIds.includes(track.id)}
-					onclick={(event) => event.stopPropagation()}
-					onchange={() => toggleSelectedId(track.id)}
+					onclick={(event) => {
+						event.stopPropagation();
+						extendSelection = event.shiftKey;
+					}}
+					onchange={(event) => {
+						const extend = extendSelection;
+						extendSelection = false;
+						activateSelectionRow(track.id, extend, event.currentTarget);
+					}}
 				/>
 				<button
 					type="button"
