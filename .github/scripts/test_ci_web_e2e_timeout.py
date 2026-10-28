@@ -26,6 +26,7 @@ WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 
 SELF_COMMAND = "python3 .github/scripts/test_ci_web_e2e_timeout.py"
 PNPM_COMMAND = "python3 .github/scripts/test_ci_pnpm_retry.py"
+RETURNING_LISTENER_COMMAND = "python3 .github/scripts/test_ci_returning_listener.py"
 
 
 class TestWebE2eTimeout(unittest.TestCase):
@@ -112,6 +113,20 @@ class TestWebE2eTimeout(unittest.TestCase):
         """The pnpm suite that backstops this suite stays required too."""
         self.assertEqual(
             check_required_step("public-text", self.jobs["public-text"], PNPM_COMMAND),
+            [],
+        )
+
+    def test_returning_listener_guard_step_is_required_in_public_text(self):
+        """The returning-listener guard's public-text step stays required.
+
+        That suite cannot catch deletion of its own run step, so this
+        independently executed suite pins it; the returning-listener
+        suite reciprocally pins this suite's step.
+        """
+        self.assertEqual(
+            check_required_step(
+                "public-text", self.jobs["public-text"], RETURNING_LISTENER_COMMAND
+            ),
             [],
         )
 

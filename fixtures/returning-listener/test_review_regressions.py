@@ -152,6 +152,52 @@ class ReviewRegressions(unittest.TestCase):
             "human:Key": "counted", "human: Key ": "counted", "human:key": "counted",
         })
 
+    def test_distinct_human_spellings_cannot_borrow_a_first_for_their_return(self):
+        # Each borrower's return is 8 days after its own first, so it is
+        # outside the 7-day limit. It must not qualify against the other
+        # spelling's first from 1 day ago under a trimmed or case-folded join.
+        account(self.db, "pad_borrower", human="Key")
+        first(self.db, "pad_borrower", AS_OF - 8 * DAY)
+        ret(self.db, "pad_borrower", AS_OF)
+        account(self.db, "pad_owner", human=" Key ")
+        first(self.db, "pad_owner", AS_OF - DAY)
+        account(self.db, "case_borrower", human="Case")
+        first(self.db, "case_borrower", AS_OF - 8 * DAY)
+        ret(self.db, "case_borrower", AS_OF)
+        account(self.db, "case_owner", human="case")
+        first(self.db, "case_owner", AS_OF - DAY)
+        self.assertEqual(classifications(self.db), {
+            "human:Key": "non_return", "human: Key ": "pending",
+            "human:Case": "non_return", "human:case": "pending",
+        })
+
+    def test_distinct_human_spellings_cannot_borrow_a_return_or_a_first(self):
+        # Return owners count on their own histories; the other spelling
+        # with a first but no return stays pending, and a spelling with no
+        # first at all must not borrow the other spelling's first presence.
+        account(self.db, "ret_owner", human="Ret")
+        first(self.db, "ret_owner", AS_OF - DAY)
+        ret(self.db, "ret_owner", AS_OF)
+        account(self.db, "ret_borrower", human=" Ret ")
+        first(self.db, "ret_borrower", AS_OF - DAY)
+        account(self.db, "retcase_owner", human="RetCase")
+        first(self.db, "retcase_owner", AS_OF - DAY)
+        ret(self.db, "retcase_owner", AS_OF)
+        account(self.db, "retcase_borrower", human="retcase")
+        first(self.db, "retcase_borrower", AS_OF - DAY)
+        account(self.db, "join_borrower", human="Join")
+        account(self.db, "join_owner", human=" Join ")
+        first(self.db, "join_owner", AS_OF - DAY)
+        account(self.db, "joincase_borrower", human="JoinCase")
+        account(self.db, "joincase_owner", human="joincase")
+        first(self.db, "joincase_owner", AS_OF - DAY)
+        self.assertEqual(classifications(self.db), {
+            "human:Ret": "counted", "human: Ret ": "pending",
+            "human:RetCase": "counted", "human:retcase": "pending",
+            "human:Join": "no_qualifying_first", "human: Join ": "pending",
+            "human:JoinCase": "no_qualifying_first", "human:joincase": "pending",
+        })
+
     def test_nonblank_sessions_are_opaque_and_case_sensitive(self):
         for name, session in (("padded", " first "), ("case", "FIRST")):
             account(self.db, name)

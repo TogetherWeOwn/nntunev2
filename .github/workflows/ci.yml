@@ -231,6 +231,8 @@ jobs:
         run: python3 .github/scripts/test_ci_pnpm_retry.py
       - name: Structural-test the web-e2e timeout budget
         run: python3 .github/scripts/test_ci_web_e2e_timeout.py
+      - name: Structural-test the returning-listener fixture wiring
+        run: python3 .github/scripts/test_ci_returning_listener.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
