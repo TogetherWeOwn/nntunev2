@@ -112,6 +112,34 @@ test.each([
 });
 
 test.each([
+	{ direction: 'back' as const, target: 10, paused: false },
+	{ direction: 'forward' as const, target: 30, paused: false },
+	{ direction: 'back' as const, target: 10, paused: true },
+	{ direction: 'forward' as const, target: 30, paused: true }
+])('$direction pending settlement preserves paused=$paused without pausing or restarting media', ({ direction, target, paused }) => {
+	const { page, media, settle } = jumpFixture();
+	media.paused = paused;
+	media.seeking = true;
+	const queue = page.read().queue;
+	page.jump(direction);
+	expect(page.read().jumpFeedback).toBe('Waiting for the player to confirm the jump.');
+	expect(media.writes).toEqual([target]);
+	expect(media.pauseCalls).toBe(0);
+	expect(media.playCalls).toBe(0);
+	expect(media.paused).toBe(paused);
+	settle();
+	expect(page.read().jumpFeedback).toBe(`${direction === 'back' ? 'Back' : 'Forward'} 10 seconds, now at 0:${target}.`);
+	expect(media.position).toBe(target);
+	expect(media.writes).toEqual([target]);
+	expect(media.pauseCalls).toBe(0);
+	expect(media.playCalls).toBe(0);
+	expect(media.paused).toBe(paused);
+	expect(media.volume).toBe(0.37);
+	expect(media.playbackRate).toBe(1.5);
+	expect(page.read().queue).toBe(queue);
+});
+
+test.each([
 	{ direction: 'back' as const, paused: false },
 	{ direction: 'forward' as const, paused: false },
 	{ direction: 'back' as const, paused: true },

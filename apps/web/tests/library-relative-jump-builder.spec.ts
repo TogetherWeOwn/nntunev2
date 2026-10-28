@@ -87,20 +87,22 @@ for (const vector of [
 	{ name: 'negative time', time: -5, duration: 120 },
 	{ name: 'past-end time', time: 121, duration: 120 }
 ]) {
-	test(`successful jump is replaced by unavailable feedback for ${vector.name}`, async ({ page }) => {
-		await openLibrary(page);
-		await mockMedia(page, 30);
-		await forward(page).click();
-		await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:40.');
-		const status = await feedback(page).elementHandle();
-		await mockMedia(page, vector.time, false, vector.duration);
-		await forward(page).click();
-		await expect(page.locator('main [data-testid="player-seek-feedback"][role="status"]')).toHaveCount(1);
-		await expect(feedback(page)).toHaveText('Cannot jump yet: this track has not reported its length.');
-		expect(await status?.evaluate((el) => el.isConnected)).toBe(true);
-		expect(await receipts(page)).toEqual({ writes: [], plays: 0, pauses: 0 });
-		await status?.dispose();
-	});
+	for (const direction of ['back', 'forward'] as const) {
+		test(`successful jump is replaced by ${direction} unavailable feedback for ${vector.name}`, async ({ page }) => {
+			await openLibrary(page);
+			await mockMedia(page, 30);
+			await forward(page).click();
+			await expect(feedback(page)).toHaveText('Forward 10 seconds, now at 0:40.');
+			const status = await feedback(page).elementHandle();
+			await mockMedia(page, vector.time, false, vector.duration);
+			await (direction === 'back' ? back(page) : forward(page)).click();
+			await expect(page.locator('main [data-testid="player-seek-feedback"][role="status"]')).toHaveCount(1);
+			await expect(feedback(page)).toHaveText('Cannot jump yet: this track has not reported its length.');
+			expect(await status?.evaluate((el) => el.isConnected)).toBe(true);
+			expect(await receipts(page)).toEqual({ writes: [], plays: 0, pauses: 0 });
+			await status?.dispose();
+		});
+	}
 }
 
 for (const colorScheme of ['light', 'dark'] as const) {

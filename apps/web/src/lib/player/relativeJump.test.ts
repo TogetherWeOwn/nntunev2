@@ -7,6 +7,7 @@ function media(currentTime: number, duration: number) {
 		attempts: [] as number[],
 		refuse: false,
 		ignore: false,
+		readbackOffset: 0,
 		seeking: false,
 		seekable: undefined as TimeRanges | undefined,
 		get currentTime() {
@@ -15,7 +16,7 @@ function media(currentTime: number, duration: number) {
 		set currentTime(next: number) {
 			this.attempts.push(next);
 			if (this.refuse) throw new DOMException('refused', 'InvalidStateError');
-			if (!this.ignore) time = next;
+			if (!this.ignore) time = next + this.readbackOffset;
 		},
 		duration
 	};
@@ -100,6 +101,32 @@ describe('jumpMedia', () => {
 		expect(m.currentTime).toBe(30);
 	});
 
+	it.each(['back', 'forward'] as const)('writes the %s target covered only by the second seekable interval', (direction) => {
+		const m = media(30, 120);
+		const ranges = [[0, 10], [20, 120]];
+		m.seekable = {
+			length: ranges.length,
+			start: (index) => ranges[index][0],
+			end: (index) => ranges[index][1]
+		};
+		const target = direction === 'back' ? 20 : 40;
+		expect(jumpMedia(m, direction)).toEqual({ kind: 'jumped', target, clamped: false });
+		expect(m.attempts).toEqual([target]);
+		expect(m.currentTime).toBe(target);
+	});
+
+	it.each([-0.1, -0.051, -0.05, -0.03, 0.03, 0.05, 0.051, 0.1])(
+		'immediate readback enforces the 50ms tolerance for offset %s', (offset) => {
+			const m = media(30, 120);
+			m.readbackOffset = offset;
+			expect(jumpMedia(m, 'forward')).toEqual(Math.abs(offset) <= 0.05
+				? { kind: 'jumped', target: 40, clamped: false }
+				: { kind: 'refused' });
+			expect(m.attempts).toEqual([40]);
+			expect(m.currentTime).toBe(40 + offset);
+		}
+	);
+
 	it('treats unreadable media as unavailable', () => {
 		const m = {
 			get currentTime(): number {
@@ -117,6 +144,9 @@ describe('watchJump', () => {
 		duration = 120;
 		seeking = false;
 		position = 30;
+		paused = true;
+		pause = vi.fn(() => { this.paused = true; });
+		play = vi.fn(() => { this.paused = false; return Promise.resolve(); });
 		attempts: number[] = [];
 		get currentTime() { return this.position; }
 		set currentTime(value: number) {
@@ -135,11 +165,12 @@ describe('watchJump', () => {
 		vi.restoreAllMocks();
 	});
 
-	function begin() {
+	function begin(direction: 'back' | 'forward' = 'forward', paused = true) {
 		vi.useFakeTimers();
 		const m = new NativeMedia();
-		const outcome = jumpMedia(m, 'forward');
-		expect(outcome).toEqual({ kind: 'pending', target: 40, clamped: false });
+		m.paused = paused;
+		const outcome = jumpMedia(m, direction);
+		expect(outcome).toEqual({ kind: 'pending', target: direction === 'back' ? 20 : 40, clamped: false });
 		if (outcome.kind !== 'pending') throw new Error('expected pending seek');
 		const publish = vi.fn();
 		const removed = vi.spyOn(m, 'removeEventListener');
@@ -159,6 +190,45 @@ describe('watchJump', () => {
 		expect(m.attempts).toEqual([40]);
 		cancel();
 	});
+
+	it.each([
+		{ direction: 'back' as const, target: 20, paused: false },
+		{ direction: 'forward' as const, target: 40, paused: false },
+		{ direction: 'back' as const, target: 20, paused: true },
+		{ direction: 'forward' as const, target: 40, paused: true }
+	])('$direction settlement preserves paused=$paused without pausing or playing', ({ direction, target, paused }) => {
+		const { m, publish, cancel } = begin(direction, paused);
+		expect(m.paused).toBe(paused);
+		expect(m.pause).not.toHaveBeenCalled();
+		expect(m.play).not.toHaveBeenCalled();
+		m.settle(target);
+		expect(publish).toHaveBeenCalledExactlyOnceWith({ kind: 'jumped', target, clamped: false });
+		expect(m.paused).toBe(paused);
+		expect(m.pause).not.toHaveBeenCalled();
+		expect(m.play).not.toHaveBeenCalled();
+		expect(m.currentTime).toBe(target);
+		expect(m.attempts).toEqual([target]);
+		vi.advanceTimersByTime(2000);
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(m.paused).toBe(paused);
+		expect(m.pause).not.toHaveBeenCalled();
+		expect(m.play).not.toHaveBeenCalled();
+		cancel();
+	});
+
+	it.each([-0.1, -0.051, -0.05, -0.03, 0.03, 0.05, 0.051, 0.1])(
+		'pending readback enforces the 50ms tolerance for offset %s', (offset) => {
+			const { m, publish, cancel } = begin();
+			m.settle(40 + offset);
+			expect(publish).toHaveBeenCalledExactlyOnceWith(Math.abs(offset) <= 0.05
+				? { kind: 'jumped', target: 40, clamped: false }
+				: { kind: 'refused' });
+			expect(m.attempts).toEqual([40]);
+			vi.advanceTimersByTime(2000);
+			expect(publish).toHaveBeenCalledTimes(1);
+			cancel();
+		}
+	);
 
 	it('reports a settled position mismatch as refused', () => {
 		const { m, publish, cancel } = begin();
