@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import alerts_staging as guard
 from test_ci_pnpm_retry import (
     check_required_step, check_step_shell, job_level_field, job_needs, non_plain_key_lines,
-    split_jobs, split_steps, step_field, step_level_field,
+    split_jobs, split_steps, step_field, step_level_field, with_defaults_shell, with_step_field,
 )
 
 ACCOUNT = "a" * 32
@@ -588,6 +588,43 @@ class IsolatedNamespaceGuardTests(unittest.TestCase):
         page["result_info"]["total_pages"] = 1
         self.assert_accepted([page])
 
+    def test_cross_page_duplicate_pure_count_only_ids_are_rejected(self):
+        # Counted inventories enumerate distinct results: repeating an ID on
+        # a later counted page must not fake completeness.
+        pages = self.pages()
+        pages[0]["result"][1]["name"] = "private-pagination-canary"
+        pages[1]["result"] = [copy.deepcopy(pages[0]["result"][1])]
+        for page in pages:
+            page["result_info"].pop("total_pages")
+            page["result_info"].update(
+                count=len(page["result"]), per_page=1000, total_count=1001
+            )
+        self.assert_rejected(pages, "NAMESPACE_DUPLICATE_ID")
+
+    def test_cross_page_duplicate_pure_explicit_only_ids_are_rejected(self):
+        # Explicit pages list distinct namespaces when IDs are present: a
+        # repeated ID on a later page must not count as a new result.
+        pages = self.pages()
+        pages[0]["result"][1]["name"] = "private-pagination-canary"
+        pages[1]["result"] = [copy.deepcopy(pages[0]["result"][1])]
+        self.assert_rejected(pages, "NAMESPACE_DUPLICATE_ID")
+
+    def test_short_middle_explicit_only_page_is_rejected(self):
+        # Numbered explicit pages are complete only when every nonterminal
+        # page is full: a short middle page must not be accepted.
+        first = self.pages()[0]["result"]
+        pages = [
+            {"result": first, "result_info": {"page": 1, "total_pages": 3}},
+            {"result": [{"script": "unrelated", "class": "OtherClass",
+                         "id": "middle-id",
+                         "name": "private-pagination-canary"}],
+             "result_info": {"page": 2, "total_pages": 3}},
+            {"result": [{"script": "unrelated", "class": "OtherClass",
+                         "id": "last-id"}],
+             "result_info": {"page": 3, "total_pages": 3}},
+        ]
+        self.assert_rejected(pages, "NAMESPACE_PAGE_SIZE")
+
     def test_exact_target_identity_is_still_required_at_the_cli(self):
         for field, value in (("script", "nntune-alerts"), ("class", "OtherClass"),
                              ("id", "other-namespace")):
@@ -625,8 +662,14 @@ class WorkflowAcceptanceTests(unittest.TestCase):
     def assert_acceptance_wiring(self, workflows):
         ci = split_jobs(workflows["ci.yml"])
         self.assertIn("tail-projection", ci)
+        self.assertIn("public-text", ci)
         self.assertIn("ci-ok", ci)
         self.assertIn("tail-projection", job_needs(ci["ci-ok"]))
+        self.assertIn("public-text", job_needs(ci["ci-ok"]))
+        self.assertEqual(check_required_step(
+            "public-text", ci["public-text"], "python3 .github/scripts/test_ci_pnpm_retry.py",
+            workflow_text=workflows["ci.yml"],
+        ), [])
         for command in self.COMMANDS:
             self.assertEqual(check_required_step(
                 "tail-projection", ci["tail-projection"], command,
@@ -677,26 +720,47 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         mutated = dict(workflows)
         text = workflows[filename]
         job_id = "tail-projection" if filename == "ci.yml" else "deploy"
+        if filename == "ci.yml":
+            checker = "python3 .github/scripts/test_ci_pnpm_retry.py"
+            public_steps = split_steps(split_jobs(text)["public-text"])
+            step = public_steps[self.required_step(public_steps, checker)]
+            text = text.replace(step, with_step_field(step, "shell", "bash"), 1)
         job = split_jobs(text)[job_id]
         steps = split_steps(job)
-        # Isolate the selected bank even when it inherits an unsafe default.
-        for other in self.COMMANDS:
-            if other == command:
-                continue
-            step = steps[self.required_step(steps, other)]
-            text = text.replace(step, step + "\n        shell: bash", 1)
-        if scope == "step":
-            step = steps[self.required_step(steps, command)]
-            text = text.replace(step, step + f"\n        shell: {shell}", 1)
-        elif scope == "job":
-            header = f"  {job_id}:\n"
-            self.assertEqual(text.count(header), 1)
-            text = text.replace(header, header + f"    defaults:\n      run:\n        shell: {shell}\n", 1)
+        # Remove more-specific overrides when testing an inherited shell; keep
+        # the other bank executable so it cannot mask the selected witness.
+        for bank in self.COMMANDS:
+            step = steps[self.required_step(steps, bank)]
+            value = "bash" if bank != command else shell if scope == "step" else None
+            text = text.replace(step, with_step_field(step, "shell", value), 1)
+        job = split_jobs(text)[job_id]
+        if scope == "job":
+            text = text.replace(job, with_defaults_shell(job, shell, 4), 1)
+        elif scope == "workflow":
+            text = text.replace(job, with_defaults_shell(job, None, 4), 1)
+            text = with_defaults_shell(text, shell, 0)
         else:
-            self.assertEqual(scope, "workflow")
-            text = f"defaults:\n  run:\n    shell: {shell}\n" + text
+            self.assertEqual(scope, "step")
         mutated[filename] = text
         return mutated
+
+    def test_shell_fixtures_replace_existing_supported_shells_and_defaults(self):
+        workflows = self.workflows()
+        for filename in workflows:
+            for command in self.COMMANDS:
+                for initial_scope in ("step", "job", "workflow"):
+                    configured = self.with_shell(workflows, filename, command, initial_scope, "bash")
+                    self.assert_acceptance_wiring(configured)
+                    for scope in ("step", "job", "workflow"):
+                        with self.subTest(filename=filename, command=command,
+                                          initial=initial_scope, replacement=scope):
+                            self.assert_acceptance_wiring(
+                                self.with_shell(configured, filename, command, scope, "bash")
+                            )
+                            with self.assertRaises(AssertionError):
+                                self.assert_acceptance_wiring(
+                                    self.with_shell(configured, filename, command, scope, "true {0}")
+                                )
 
     def test_shell_masks_are_rejected_for_each_bank_and_inheritance_scope(self):
         workflows = self.workflows()
@@ -730,11 +794,11 @@ class WorkflowAcceptanceTests(unittest.TestCase):
                         text = overridden[filename]
                         steps = split_steps(split_jobs(text)[job_id])
                         step = steps[self.required_step(steps, command)]
-                        overridden[filename] = text.replace(step, step + "\n        shell: bash", 1)
+                        overridden[filename] = text.replace(step, with_step_field(step, "shell", "bash"), 1)
                         self.assert_acceptance_wiring(overridden)
                 with self.subTest(filename=filename, command=command, job_overrides_workflow=True):
                     overridden = self.with_shell(workflows, filename, command, "job", "bash")
-                    overridden[filename] = "defaults:\n  run:\n    shell: true {0}\n" + overridden[filename]
+                    overridden[filename] = with_defaults_shell(overridden[filename], "true {0}", 0)
                     self.assert_acceptance_wiring(overridden)
 
     def test_conditional_or_failure_masked_acceptance_is_rejected_in_both_jobs(self):

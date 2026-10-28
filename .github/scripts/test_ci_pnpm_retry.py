@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
@@ -314,15 +315,92 @@ SUPPORTED_SHELLS = {
 }
 
 
+def step_env_field(step, field):
+    """Read a scalar only from the step's block-form env mapping.
+
+    Nested with/name/run content cannot supply an environment binding. Unknown,
+    duplicate or multiline mapping layouts fail closed instead of guessing YAML.
+    """
+    lines = step.splitlines()
+    envs = [index for index, line in enumerate(lines)
+            if re.match(r"^(?:      - |        )env:", line)]
+    if not envs:
+        return None
+    if len(envs) != 1 or not re.fullmatch(
+        r"(?:      - |        )env:\s*(?:#.*)?", lines[envs[0]],
+    ):
+        return ""
+    values = {}
+    for line in lines[envs[0] + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) - len(line.lstrip(" ")) <= 8:
+            break
+        match = re.fullmatch(r"          ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*", line)
+        if not match or match.group(1) in values:
+            return ""
+        values[match.group(1)] = re.sub(r"\s+#.*$", "", match.group(2))
+    return values.get(field)
+
+
+def replace_mapping_field(chunk, field, replacement, indent, *, insert_at=0):
+    """Replace/remove a plain fixture field and its block, never append a duplicate."""
+    lines = chunk.splitlines()
+    pattern = re.compile(rf"^{' ' * indent}{re.escape(field)}:\s*")
+    kept = []
+    index = 0
+    position = None
+    while index < len(lines):
+        if not pattern.match(lines[index]):
+            kept.append(lines[index])
+            index += 1
+            continue
+        if position is None:
+            position = len(kept)
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip(" ")) <= indent:
+                break
+            index += 1
+    if replacement:
+        position = insert_at if position is None else position
+        kept[position:position] = replacement.splitlines()
+    return "\n".join(kept) + ("\n" if chunk.endswith("\n") else "")
+
+
+def with_step_field(step, field, value):
+    """Set/remove a step fixture key, including when it was the dash-line key."""
+    lines = step.splitlines()
+    lines[0] = "        " + lines[0][8:]
+    replacement = "" if value is None else f"        {field}: {value}"
+    changed = replace_mapping_field("\n".join(lines), field, replacement, 8).splitlines()
+    for index, line in enumerate(changed):
+        if line.strip() and not line.lstrip().startswith("#"):
+            changed[index] = "      - " + line[8:]
+            return "\n".join(changed)
+    raise AssertionError("Step fixture cannot be empty")
+
+
+def with_defaults_shell(chunk, shell, indent):
+    """Replace/remove a fixture's entire defaults block at the selected scope."""
+    prefix = " " * indent
+    replacement = "" if shell is None else (
+        f"{prefix}defaults:\n{prefix}  run:\n{prefix}    shell: {shell}"
+    )
+    return replace_mapping_field(chunk, "defaults", replacement, indent,
+                                 insert_at=0 if indent == 0 else 1)
+
+
 def effective_shell(workflow_text, job_chunk, step):
-    """Resolve step > job > workflow > Linux default without executing text."""
+    """Resolve step > job > workflow > Linux/container default without executing text."""
     value = step_level_field(step, "shell")
     if value is None:
         value = defaults_shell(job_chunk, 4)
     if value is None:
         value = defaults_shell(workflow_text, 0)
     if value is None:
-        return "bash -e {0}"
+        return "sh -e {0}" if job_level_field(job_chunk, "container") is not None else "bash -e {0}"
     if value.startswith('"'):
         try:
             value = json.loads(value)
@@ -860,6 +938,17 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
 
 
 class TestEffectiveShell(unittest.TestCase):
+    def test_container_defaults_to_sh_unless_a_more_specific_shell_is_set(self):
+        step = timeout_step()
+        job = public_text_with(step, job_extra="    container: fixture-image\n")
+        self.assertEqual(effective_shell("", job, step), "sh -e {0}")
+        for explicit in ("bash", "sh"):
+            with self.subTest(shell=explicit):
+                overridden = timeout_step(f"        shell: {explicit}\n")
+                self.assertEqual(effective_shell("", job, overridden), SUPPORTED_SHELLS[explicit])
+        inherited = "defaults:\n  run:\n    shell: bash\n"
+        self.assertEqual(effective_shell(inherited, job, step), SUPPORTED_SHELLS["bash"])
+
     def test_every_supported_invocation_executes_the_script_and_preserves_failure(self):
         for shell in (None, *SUPPORTED_SHELLS):
             step = timeout_step("" if shell is None else f"        shell: {shell}\n")
@@ -966,23 +1055,38 @@ class TestAlertsAcceptanceWiring(unittest.TestCase):
                 break
             body.append(line[10:])
         self.assertTrue(any(line.strip() for line in body))
-        self.assertEqual(step_field(step, "NEEDS_JSON"), "${{ toJSON(needs) }}")
+        binding = step_env_field(step, "NEEDS_JSON")
+        self.assertEqual(binding, "${{ toJSON(needs) }}")
+        needs = job_needs(job)
+        self.assertTrue(needs, "Aggregate must depend on the required jobs")
+        self.assertEqual(len(needs), len(set(needs)), "Aggregate dependencies must be distinct")
+        jq = shutil.which("jq")
+        self.assertIsNotNone(jq, "Aggregate fixtures require jq installed on PATH")
         with tempfile.TemporaryDirectory(prefix="ci-aggregate-fixture-") as root:
+            # Retain only the resolved prerequisite, not the caller's PATH or secrets.
+            binaries = os.path.join(root, "bin")
+            os.mkdir(binaries)
+            os.symlink(os.path.abspath(jq), os.path.join(binaries, "jq"))
             script = os.path.join(root, "aggregate.sh")
             with open(script, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(body) + "\n")
             shell = shlex.split(effective_shell(text, job, step))
             args = [script if arg == "{0}" else arg for arg in shell]
-            for job_id in ("tail-projection", "public-text"):
-                for state in ("success", "failure", "cancelled", "skipped"):
-                    results = {name: {"result": "success"} for name in ("tail-projection", "public-text")}
+            cases = [(None, "success")] + [
+                (job_id, state) for job_id in needs for state in ("failure", "cancelled", "skipped")
+            ]
+            for job_id, state in cases:
+                results = {name: {"result": "success"} for name in needs}
+                if job_id is not None:
                     results[job_id]["result"] = state
-                    result = subprocess.run(
-                        args, cwd=root, env={"PATH": os.defpath, "NEEDS_JSON": json.dumps(results)},
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    self.assertEqual(result.returncode == 0, state == "success",
-                                     f"ci-ok must fail closed on {job_id}={state}: {result.stdout}{result.stderr}")
+                resolved = json.dumps(results) if binding == "${{ toJSON(needs) }}" else binding
+                result = subprocess.run(
+                    args, cwd=root, env={"PATH": binaries + os.pathsep + os.defpath,
+                                         "NEEDS_JSON": resolved},
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode == 0, state == "success",
+                                 f"ci-ok must fail closed on {job_id}={state}: {result.stdout}{result.stderr}")
 
     def required_alert_step(self, job, command):
         matches = [step for step in split_steps(job) if step_level_field(step, "run") == command]
@@ -1001,9 +1105,9 @@ class TestAlertsAcceptanceWiring(unittest.TestCase):
         for command in self.COMMANDS:
             step = self.required_alert_step(job, command)
             for replacement in ("", step.replace(command, ":"),
-                                step + "\n        if: always()",
-                                step + "\n        continue-on-error: true",
-                                step + "\n        shell: true {0}"):
+                                with_step_field(step, "if", "always()"),
+                                with_step_field(step, "continue-on-error", "true"),
+                                with_step_field(step, "shell", "true {0}")):
                 with self.subTest(command=command, replacement=replacement):
                     with self.assertRaises(AssertionError):
                         self.assert_wiring(text.replace(step, replacement, 1))
@@ -1019,12 +1123,92 @@ class TestAlertsAcceptanceWiring(unittest.TestCase):
         text = self.workflow()
         aggregate = split_jobs(text)["ci-ok"]
         step = next(step for step in split_steps(aggregate) if step_level_field(step, "run") is not None)
-        for replacement in (step + "\n        shell: true {0}",
-                            step + "\n        continue-on-error: true",
+        for replacement in (with_step_field(step, "shell", "true {0}"),
+                            with_step_field(step, "continue-on-error", "true"),
                             step.replace("exit 1", "exit 0"),
                             step.replace('.result == "success"', '.result != "pending"')):
             with self.subTest(replacement=replacement), self.assertRaises(AssertionError):
                 self.assert_aggregate(text.replace(step, replacement, 1))
+
+    def aggregate_step(self, text):
+        return next(step for step in split_steps(split_jobs(text)["ci-ok"])
+                    if step_level_field(step, "run") is not None)
+
+    def test_nested_needs_json_cannot_pose_as_the_step_environment_binding(self):
+        text = self.workflow()
+        step = self.aggregate_step(text)
+        binding = "${{ toJSON(needs) }}"
+        wrong = step.replace(
+            "        env:\n          NEEDS_JSON: " + binding,
+            "        with:\n          NEEDS_JSON: " + binding
+            + "\n        env:\n          NEEDS_JSON: '{}'",
+        )
+        self.assertNotEqual(wrong, step)
+        with self.assertRaises(AssertionError):
+            self.assert_aggregate(text.replace(step, wrong, 1))
+
+    def test_aggregate_cannot_accept_failure_because_another_dependency_succeeded(self):
+        text = self.workflow()
+        step = self.aggregate_step(text)
+        bypass = step.replace(
+            'all(.[]; .result == "success")',
+            'all(.[]; .result == "success") or .["rust-test"].result == "success"',
+        )
+        self.assertNotEqual(bypass, step)
+        with self.assertRaises(AssertionError):
+            self.assert_aggregate(text.replace(step, bypass, 1))
+
+    def test_caller_installed_jq_is_resolved_without_inheriting_the_caller_environment(self):
+        jq = shutil.which("jq")
+        self.assertIsNotNone(jq, "Aggregate fixtures require jq installed on PATH")
+        with tempfile.TemporaryDirectory() as root:
+            executable = os.path.join(root, "jq")
+            receipt = os.path.join(root, "jq-executed")
+            with open(executable, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    'test -z "${CI_AGGREGATE_PRIVATE_CANARY+x}" || exit 91\n'
+                    f"printf ran >> {shlex.quote(receipt)}\n"
+                    f"exec {shlex.quote(jq)} \"$@\"\n"
+                )
+            os.chmod(executable, 0o755)
+            with patch.dict(os.environ, {"PATH": root + os.pathsep + os.defpath,
+                                         "CI_AGGREGATE_PRIVATE_CANARY": "not-for-the-child"}):
+                self.assert_aggregate(self.workflow())
+            self.assertTrue(os.path.isfile(receipt), "The caller-resolved jq was discarded")
+
+    def test_missing_jq_fails_with_an_actionable_prerequisite(self):
+        which = shutil.which
+        with patch.object(shutil, "which", side_effect=lambda cmd: None if cmd == "jq" else which(cmd)):
+            with self.assertRaisesRegex(AssertionError, "require.*jq.*PATH"):
+                self.assert_aggregate(self.workflow())
+
+    def test_container_aggregate_does_not_silently_execute_a_bash_only_body_under_bash(self):
+        text = with_defaults_shell(self.workflow(), None, 0)
+        original = split_jobs(text)["ci-ok"]
+        aggregate = with_defaults_shell(original, None, 4)
+        step = next(step for step in split_steps(aggregate) if step_level_field(step, "run") is not None)
+        aggregate = aggregate.replace(step, with_step_field(step, "shell", None), 1)
+        container = replace_mapping_field(aggregate, "container", "    container: fixture-image", 4,
+                                          insert_at=1)
+        configured = text.replace(original, container, 1)
+        with self.assertRaises(AssertionError):
+            self.assert_aggregate(configured)
+        step = self.aggregate_step(configured)
+        self.assert_aggregate(configured.replace(step, with_step_field(step, "shell", "bash"), 1))
+
+    def test_existing_supported_shell_does_not_break_the_registration_or_aggregate_mutants(self):
+        text = self.workflow()
+        for job_id, commands in (("tail-projection", self.COMMANDS), ("ci-ok", (None,))):
+            for command in commands:
+                job = split_jobs(text)[job_id]
+                step = self.aggregate_step(text) if command is None else self.required_alert_step(job, command)
+                text = text.replace(step, with_step_field(step, "shell", "bash"), 1)
+        self.assert_wiring(text)
+        self.assert_aggregate(text)
+        with patch.object(self, "workflow", return_value=text):
+            self.test_registration_masks_and_missing_aggregate_dependency_are_rejected()
+            self.test_aggregate_exit_and_shell_masks_are_rejected()
 
     def test_deleted_bank_is_caught_by_the_surviving_checker_process(self):
         text = self.workflow()

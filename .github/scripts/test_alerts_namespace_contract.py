@@ -21,6 +21,10 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import alerts_staging as guard
+from test_ci_pnpm_retry import (
+    check_required_step, job_needs, split_jobs, split_steps, step_level_field,
+    with_defaults_shell, with_step_field,
+)
 
 
 FIXTURE = Path(__file__).with_name("fixtures") / "alerts-namespace-contract.json"
@@ -295,6 +299,105 @@ class NamespaceContractTests(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard.list_namespaces(get)
         self.assertLessEqual(len(requested), 100)
+
+    def test_counted_pagination_allows_the_exact_page_budget(self):
+        # The existing 100-page ceiling still permits a full 100-page
+        # counted inventory: 100000 items in exactly 100 requests.
+        requested = []
+
+        def get(path):
+            query = parse_qs(urlsplit(path).query, strict_parsing=True)
+            number = int(query["page"][0])
+            requested.append(number)
+            self.assertLessEqual(len(requested), 100, "Pagination exceeded its existing request budget")
+            page = self.single_page()
+            page["result"] = []
+            for index in range(1000):
+                if number == 100 and index == 999:
+                    page["result"].append(self.target())
+                else:
+                    item = copy.deepcopy(self.data["unrelated_namespace"])
+                    item["id"] = f"{(number - 1) * 1000 + index + 1:032x}"
+                    page["result"].append(item)
+            page["result_info"].update(count=1000, page=number, total_count=100000)
+            return page
+
+        try:
+            namespaces = guard.list_namespaces(get)
+        except guard.GuardError as error:
+            self.fail(f"Exact 100-page counted inventory was rejected: {error}")
+        self.assertEqual(requested, list(range(1, 101)))
+        self.assertEqual(len(namespaces), 100000)
+        self.assertEqual(len({namespace["id"] for namespace in namespaces}), 100000)
+        self.assertEqual(namespaces[-1], self.target())
+        self.assertEqual(self.verify(namespaces)["do_namespace_id"], "ffffffffffffffffffffffffffffffff")
+
+
+class AcceptanceCheckerWiringTests(unittest.TestCase):
+    """The tail-projection bank survives deletion/masking of the public checker."""
+
+    COMMAND = "python3 .github/scripts/test_ci_pnpm_retry.py"
+
+    def workflow(self):
+        return (Path(__file__).parents[1] / "workflows/ci.yml").read_text()
+
+    def assert_public_checker(self, text):
+        jobs = split_jobs(text)
+        for job in ("public-text", "tail-projection", "ci-ok"):
+            self.assertIn(job, jobs)
+        for job in ("public-text", "tail-projection"):
+            self.assertIn(job, job_needs(jobs["ci-ok"]))
+        self.assertEqual(check_required_step(
+            "public-text", jobs["public-text"], self.COMMAND, workflow_text=text,
+        ), [])
+
+    def test_public_checker_runs_as_a_required_independently_backstopped_step(self):
+        self.assert_public_checker(self.workflow())
+
+    def test_composed_bank_removal_and_public_checker_masks_are_rejected(self):
+        text = """jobs:
+  public-text:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python3 .github/scripts/test_ci_pnpm_retry.py
+  tail-projection:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python3 .github/scripts/test_alerts_staging.py
+      - run: python3 .github/scripts/test_alerts_namespace_contract.py
+  ci-ok:
+    needs: [public-text, tail-projection]
+"""
+        self.assert_public_checker(text)
+        jobs = split_jobs(text)
+        removed = next(step for step in split_steps(jobs["tail-projection"])
+                       if step_level_field(step, "run") == "python3 .github/scripts/test_alerts_staging.py")
+        survivor = next(step for step in split_steps(jobs["tail-projection"])
+                        if step_level_field(step, "run") == "python3 .github/scripts/test_alerts_namespace_contract.py")
+        # The namespace bank remains executable even under a masked workflow default.
+        text = text.replace(removed, "", 1).replace(survivor, with_step_field(survivor, "shell", "bash"), 1)
+        public = split_jobs(text)["public-text"]
+        checker = next(step for step in split_steps(public)
+                       if step_level_field(step, "run") == self.COMMAND)
+        for replacement in ("", checker.replace(self.COMMAND, ":"),
+                            with_step_field(checker, "if", "always()"),
+                            with_step_field(checker, "continue-on-error", "true"),
+                            with_step_field(checker, "shell", "true {0}")):
+            with self.subTest(replacement=replacement), self.assertRaises(AssertionError):
+                self.assert_public_checker(text.replace(checker, replacement, 1))
+        for scope in ("job", "workflow"):
+            masked = text.replace(checker, with_step_field(checker, "shell", None), 1)
+            job = split_jobs(masked)["public-text"]
+            masked = masked.replace(job, with_defaults_shell(job, "true {0}" if scope == "job" else None, 4), 1)
+            if scope == "workflow":
+                masked = with_defaults_shell(masked, "true {0}", 0)
+            with self.subTest(inherited=scope), self.assertRaises(AssertionError):
+                self.assert_public_checker(masked)
+            # More-specific supported overrides must still execute the checker.
+            job = split_jobs(masked)["public-text"]
+            step = next(step for step in split_steps(job)
+                        if step_level_field(step, "run") == self.COMMAND)
+            self.assert_public_checker(masked.replace(step, with_step_field(step, "shell", "bash"), 1))
 
 
 if __name__ == "__main__":
