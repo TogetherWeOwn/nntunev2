@@ -1929,7 +1929,10 @@ impl SettlementRuntime for EdgeSettlement<'_> {
     }
 
     async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool {
-        persist(self.env, cp, self.trace_id).await
+        if !persist(self.env, cp, self.trace_id).await {
+            return false;
+        }
+        true
     }
 
     async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool {
