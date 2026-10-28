@@ -147,6 +147,8 @@ def _deltas(records: dict[str, str]) -> dict[str, int]:
         if (record["delta_bytes"] == 0
                 or record["measured_after_bytes"] <= record["measured_before_bytes"]):
             raise BudgetError(f"decision must describe positive growth: {name}")
+        if record["delta_bytes"] > record["measured_after_bytes"] - record["measured_before_bytes"]:
+            raise BudgetError(f"decision delta exceeds measured growth: {name}")
         deltas[name] = record["delta_bytes"]
         measurements.append(record["measured_after_bytes"])
     ceiling = BUDGET_CLIENT_JS_BYTES + sum(deltas.values())
@@ -169,8 +171,11 @@ def admitted_budget(root: Path, base: str, *, now: int, merge_group: bool = Fals
         base = _git(root, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
         if _git(root, "rev-parse", "--is-shallow-repository") != "false":
             raise BudgetError("admission policy requires full history")
-        if base not in _git(root, "rev-list", "--first-parent", "HEAD").splitlines():
-            raise BudgetError("base is not on the first-parent integration history")
+        if merge_group:
+            if base not in _git(root, "rev-list", "--first-parent", "HEAD").splitlines():
+                raise BudgetError("base is not on the first-parent integration history")
+        elif _git(root, "merge-base", base, "HEAD") != base:
+            raise BudgetError("base is not an ancestor of HEAD")
         _frozen_base(root, base)
         previous = _ledger(root, base)
         prior = _deltas(previous)
@@ -223,10 +228,13 @@ def policy_budget() -> int:
             if kind == "pull_request":
                 base = event["pull_request"]["base"]["sha"]
                 parents = _git(root, "rev-list", "--parents", "-n", "1", "HEAD").split()
-                if len(parents) == 3:
+                head = _git(root, "rev-parse", "--verify", "--end-of-options", f"{event['pull_request']['head']['sha']}^{{commit}}")
+                # A PR head may itself merge main. Only a checkout distinct
+                # from that head is GitHub's synthetic base/head merge.
+                if parents[0] != head:
                     event_base = _git(root, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
-                    head = _git(root, "rev-parse", "--verify", "--end-of-options", f"{event['pull_request']['head']['sha']}^{{commit}}")
-                    if head != parents[2] or event_base not in _git(root, "rev-list", "--first-parent", parents[1]).splitlines():
+                    if (len(parents) != 3 or head != parents[2]
+                            or event_base not in _git(root, "rev-list", "--first-parent", parents[1]).splitlines()):
                         raise BudgetError("pull request merge provenance mismatch")
                     base = parents[1]
             elif kind == "merge_group":

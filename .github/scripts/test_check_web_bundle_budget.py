@@ -387,7 +387,7 @@ class AdmissionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.git("init", "-q")
+        self.git("init", "-q", "-b", "trunk")
         self.git("config", "user.email", "tests@example.invalid")
         self.git("config", "user.name", "Budget tests")
         script = self.root / ".github/scripts/check_web_bundle_budget.py"
@@ -418,7 +418,7 @@ class AdmissionTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         record = dict(unit="web.client.js", delta_bytes=delta,
                       measured_before_bytes=337_000,
-                      measured_after_bytes=338_000,
+                      measured_after_bytes=337_000 + delta,
                       cause="First-party feature; checked for duplicate/heavy imports")
         record.update(overrides)
         path.write_text(json.dumps(record))
@@ -473,6 +473,18 @@ class AdmissionTests(unittest.TestCase):
                 with self.assertRaises(BudgetError):
                     self.budget()
 
+    def test_delta_cannot_exceed_measured_growth(self):
+        self.decision(delta=1_000, measured_before_bytes=337_000,
+                      measured_after_bytes=338_000)
+        self.assertEqual(self.budget(), 338_920)
+        self.decision(delta=500, measured_before_bytes=337_000,
+                      measured_after_bytes=338_000)
+        self.assertEqual(self.budget(), 338_420)
+        self.decision(delta=1_001, measured_before_bytes=337_000,
+                      measured_after_bytes=338_000)
+        with self.assertRaisesRegex(BudgetError, "measured growth"):
+            self.budget()
+
     def test_whitespace_rewrites_are_still_history_edits(self):
         path = self.decision()
         self.base = self.commit(self.NOW - 60)
@@ -513,7 +525,7 @@ class AdmissionTests(unittest.TestCase):
 
     def test_cli_uses_trusted_event_base_and_fails_closed(self):
         event = self.root / "event.json"
-        for kind, data in (("pull_request", {"pull_request": {"base": {"sha": self.base}}}),
+        for kind, data in (("pull_request", {"pull_request": {"base": {"sha": self.base}, "head": {"sha": self.base}}}),
                            ("merge_group", {"merge_group": {"base_sha": self.base}})):
             event.write_text(json.dumps(data))
             with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": kind}), \
@@ -628,6 +640,78 @@ class AdmissionTests(unittest.TestCase):
             self.commit(self.NOW - (8 + i) * 86400)  # authored dates are irrelevant
         with self.assertRaisesRegex(BudgetError, "2%"):
             self.budget(merge_group=True)
+
+    def test_merge_from_main_branch_is_valid_for_pr_dispatch_and_local(self):
+        # The latest main commit is the feature merge's second parent, not
+        # part of the feature's first-parent history.
+        self.git("branch", "main")
+        self.git("checkout", "-qb", "feature")
+        self.decision("feature", 1600)
+        self.commit(self.NOW - 60)
+        self.git("checkout", "main")
+        self.decision("main", 1600)
+        main = self.commit(self.NOW - 30)
+        self.git("update-ref", "refs/remotes/origin/main", main)
+        self.git("checkout", "feature")
+        self.git("merge", "--no-ff", "-qm", "Merge main into feature", "main")
+        head = self.git("rev-parse", "HEAD")
+        self.assertNotIn(main, self.git("rev-list", "--first-parent", "HEAD").splitlines())
+        with self.assertRaisesRegex(BudgetError, "first-parent"):
+            self.budget(base=main, merge_group=True)
+        event = self.root / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": main}, "head": {"sha": head}}}))
+        script = self.root / ".github/scripts/check_web_bundle_budget.py"
+        with patch.object(self.mod, "__file__", str(script)), \
+             patch.object(self.mod.time, "time", return_value=self.NOW):
+            for kind in ("pull_request", "workflow_dispatch", "local"):
+                with self.subTest(kind=kind), patch.dict(os.environ, {
+                    "GITHUB_EVENT_PATH": "" if kind == "local" else str(event),
+                    "GITHUB_EVENT_NAME": kind, "GITHUB_ACTIONS": "false",
+                }):
+                    self.assertEqual(self.mod.policy_budget(), 341_120)
+
+    def test_pr_synthetic_merge_accepts_head_that_merged_main(self):
+        self.git("branch", "main")
+        self.git("checkout", "-qb", "feature")
+        self.decision("feature", 1600)
+        self.commit(self.NOW - 60)
+        self.git("checkout", "main")
+        (self.root / "main-change").write_text("independent main work")
+        main = self.commit(self.NOW - 30)
+        self.git("checkout", "feature")
+        self.git("merge", "--no-ff", "-qm", "Merge main into feature", "main")
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "-qm", "synthetic PR merge", "feature")
+        event = self.root / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": main}, "head": {"sha": head}}}))
+        script = self.root / ".github/scripts/check_web_bundle_budget.py"
+        with patch.object(self.mod, "__file__", str(script)), \
+             patch.object(self.mod.time, "time", return_value=self.NOW), \
+             patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": "pull_request"}):
+            self.assertEqual(self.mod.policy_budget(), 339_520)
+
+    def test_unrelated_and_nonancestor_bases_fail_closed(self):
+        self.git("checkout", "-qb", "unmerged-main")
+        (self.root / "main-change").write_text("not merged")
+        unmerged = self.commit(self.NOW - 60)
+        self.git("checkout", "--orphan", "unrelated")
+        unrelated = self.commit(self.NOW - 30)
+        self.git("checkout", "trunk")
+        for base in (unmerged, unrelated):
+            with self.subTest(base=base), self.assertRaises(BudgetError):
+                self.budget(base=base)
+
+    def test_pr_rejects_event_head_not_matching_checkout(self):
+        (self.root / "feature").write_text("feature")
+        self.commit(self.NOW - 30)
+        event = self.root / "event.json"
+        event.write_text(json.dumps({"pull_request": {"base": {"sha": self.base}, "head": {"sha": self.base}}}))
+        script = self.root / ".github/scripts/check_web_bundle_budget.py"
+        with patch.object(self.mod, "__file__", str(script)), \
+             patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event), "GITHUB_EVENT_NAME": "pull_request"}):
+            with self.assertRaises(BudgetError):
+                self.mod.policy_budget()
 
     def test_unavailable_base_fails_closed(self):
         with self.assertRaises(BudgetError):
