@@ -257,7 +257,7 @@
 
 	function currentAudioEvent(event: Event): HTMLAudioElement | null {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		const source = resolveStreamUrl(queueCurrentTrack(queue));
+		const source = resolveStreamUrl(currentAudioTrack());
 		return shareAlive && element && element === audioEl && element.isConnected &&
 			source && element.getAttribute('src') === source ? element : null;
 	}
@@ -283,7 +283,13 @@
 	async function handleEnded(event: Event): Promise<void> {
 		const element = currentAudioEvent(event);
 		if (!element) return;
-		const result = naturalEndPolicy(queue, {
+		const audible = currentAudioTrack();
+		const audibleIndex = queue.tracks.findIndex((track) => track.id === audible?.id);
+		if (audibleIndex < 0) return;
+		// Undo may restore a different selected row without changing the live
+		// source. End policy must start at the audible track's current slot.
+		const audibleQueue = audibleIndex === queue.currentIndex ? queue : selectQueueIndex(queue, audibleIndex);
+		const result = naturalEndPolicy(audibleQueue, {
 			repeat,
 			radioActive: false,
 			continueRadio: false,
@@ -296,7 +302,10 @@
 		playingElement = null;
 		const generation = ++endGeneration;
 		queueAnnouncement = '';
-		if (result.action !== 'play') return;
+		if (result.action !== 'play') {
+			if (audibleQueue !== queue) replaceQueue(result.queue);
+			return;
+		}
 		const settings = {
 			volume: element.volume, muted: element.muted, playbackRate: element.playbackRate
 		};
@@ -523,7 +532,7 @@
 		!libraryUnavailable && renderedItems.length > 0 && bulkMissing.length === 0
 	);
 	function currentAudioTrack(): Track | null {
-		return preservedAudio ? preservedAudio.track : currentTrack;
+		return preservedAudio ? preservedAudio.track : queueCurrentTrack(queue);
 	}
 	const audioTrack = $derived(currentAudioTrack());
 	const streamUrl = $derived(resolveStreamUrl(audioTrack));
@@ -608,6 +617,7 @@
 		pendingShareSeek = null;
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
+		if (preservedAudio && !preservedAudio.track && currentTrack?.id === id) preservedAudio = null;
 		replaceQueue(addTrack(queue, playableTrackFor(item)));
 	}
 
@@ -650,6 +660,12 @@
 		// hydrates only its selected slot, preserving every other queued row.
 		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
 		base.tracks[index] = { ...target, streamUrl: source };
+		// A play gesture targets the selected row even when undo kept a
+		// different source mounted and the queue selection did not change.
+		if (preservedAudio) {
+			resetRestartOnSourceChange(currentAudioTrack(), base.tracks[index]);
+			preservedAudio = null;
+		}
 		replaceQueue(selectQueueIndex(base, index));
 		const epoch = playEpoch;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
@@ -917,8 +933,9 @@
 		}
 		const title = shortTitle(queued.title?.trim() ? queued.title : queued.id);
 		const unavailable = `Link unavailable — ${title} is no longer in the queue.`;
-		const current = queueCurrentTrack(queue);
-		const position = current?.id === id && resolveStreamUrl(current) ? audioEl?.currentTime : 0;
+		const current = currentAudioTrack();
+		const position = current?.id === id && resolveStreamUrl(current) === audioEl?.getAttribute('src')
+			? audioEl?.currentTime : 0;
 		const seconds = typeof position === 'number' && Number.isFinite(position) && position >= 0 ? position : 0;
 		let url: string;
 		try {
@@ -1078,7 +1095,7 @@
 	function refreshRestartAvailability(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
 		if (!element || element !== audioEl || !shareAlive) return;
-		const current = queueCurrentTrack(queue);
+		const current = currentAudioTrack();
 		if (!current || resolveStreamUrl(current) !== element.getAttribute('src')) {
 			restartCanSeek = false;
 			return;
@@ -1115,7 +1132,7 @@
 	 */
 	function restartCurrentTrack(): void {
 		const element = audioEl;
-		const current = queueCurrentTrack(queue);
+		const current = currentAudioTrack();
 		if (!element || !current) return;
 		const source = resolveStreamUrl(current);
 		if (!source || element.getAttribute('src') !== source) return;
@@ -1214,11 +1231,17 @@
 		removalUndo = null;
 		if (!undo || restored === queue) return false;
 		const audioBefore = currentAudioTrack();
+		const canRestartBefore = restartCanSeek;
+		const restartStatusBefore = restartStatus;
 		replaceQueue(restored);
 		// Null is intentional too: undo never recreates an unloaded source.
 		preservedAudio = { track: audioBefore };
+		// The selected row changed, but the mounted source did not.
+		restartCanSeek = canRestartBefore;
+		restartStatus = restartStatusBefore;
 		const title = undo.track.title?.trim() ? undo.track.title : undo.track.id;
-		queueAnnouncement = `${title.length > 100 ? `${title.slice(0, 99)}…` : title} restored to the queue.`;
+		const points = Array.from(title);
+		queueAnnouncement = `${points.length > 100 ? `${points.slice(0, 99).join('')}…` : title} restored to the queue.`;
 		queueAnnouncementVersion += 1;
 		return true;
 	}
@@ -1237,12 +1260,17 @@
 	 * Metadata-only direct selection: apply the validated selectTrack
 	 * transition on the ORIGINAL queue coordinate, preserving every track id
 	 * and arrangement. Never transport, audio, storage, provider or stream
-	 * language. Reselecting the current row is an observable no-op that keeps
-	 * the existing feedback; stale or invalid coordinates select nothing.
+	 * language. Reselecting the current row keeps existing feedback; only a
+	 * source left unloaded by undo is reloaded. Invalid coordinates select nothing.
 	 */
 	function selectQueuedTrack(index: number): void {
 		if (!Number.isInteger(index) || index < 0 || index >= queue.tracks.length) return;
-		if (index === queue.currentIndex) return;
+		if (index === queue.currentIndex) {
+			// Undo of the last track intentionally leaves media unloaded. An
+			// explicit selection can load it again without starting playback.
+			if (preservedAudio && !preservedAudio.track) preservedAudio = null;
+			return;
+		}
 		const target = queue.tracks[index];
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);

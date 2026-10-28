@@ -16,7 +16,7 @@ function restartFixture() {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'currentAudioTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
 		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
 		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus'
 	]);
@@ -50,6 +50,7 @@ function restartFixture() {
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items), audioEl = element;
+		let preservedAudio = null, removalUndo = null, currentTrack = track;
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
