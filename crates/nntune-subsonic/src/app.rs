@@ -184,6 +184,14 @@ mod tests {
         );
     }
 
+    fn assert_auth_error(res: HttpResponse, code: u32, message: &str) {
+        assert_eq!(res.status, 200);
+        let body = String::from_utf8(res.body).unwrap();
+        assert!(body.contains("status=\"failed\""), "{body}");
+        assert!(body.contains(&format!("code=\"{code}\"")), "{body}");
+        assert!(body.contains(&format!("message=\"{message}\"")), "{body}");
+    }
+
     #[test]
     fn post_form_body_authenticates_like_query() {
         let app = SubsonicApp::new(MemStore::seeded());
@@ -193,30 +201,58 @@ mod tests {
         assert!(String::from_utf8(res.body)
             .unwrap()
             .contains("status=\"ok\""));
-        // Query wins on duplicates; body-only password auth works too.
-        let res = app.handle("POST", "/rest/ping", "v=1.16.1&c=t", "u=test&p=test-pass");
-        assert!(String::from_utf8(res.body)
-            .unwrap()
-            .contains("status=\"ok\""));
-    }
-
-    #[test]
-    fn password_and_token_auth_work() {
-        let app = SubsonicApp::new(MemStore::seeded());
-        let res = get(&app, "/rest/ping", "u=test&p=test-pass&v=1.16.1&c=t");
+        // Query wins on duplicate keys in either direction.
+        let res = app.handle(
+            "POST",
+            "/rest/ping",
+            "v=1.16.1&c=t&apiKey=test-key-1",
+            "apiKey=bad",
+        );
         assert_eq!(res.status, 200);
         assert!(String::from_utf8(res.body)
             .unwrap()
             .contains("status=\"ok\""));
+        let res = app.handle(
+            "POST",
+            "/rest/ping",
+            "v=1.16.1&c=t&apiKey=bad",
+            "apiKey=test-key-1",
+        );
+        assert_auth_error(res, 44, "Invalid API key.");
+        let res = app.handle("POST", "/rest/ping", "v=1.16.1&c=t", "u=test&p=test-pass");
+        assert_auth_error(res, 42, "Provided authentication mechanism not supported.");
+    }
+
+    #[test]
+    fn password_and_token_auth_are_refused() {
+        let app = SubsonicApp::new(MemStore::seeded());
+        for query in [
+            "u=test&p=test-pass&v=1.16.1&c=t",
+            "u=test&p=enc:746573742d70617373&v=1.16.1&c=t",
+            "u=test&p=enc:zz&v=1.16.1&c=t",
+        ] {
+            assert_auth_error(
+                get(&app, "/rest/ping", query),
+                42,
+                "Provided authentication mechanism not supported.",
+            );
+        }
         let salted = crate::auth::md5_hex(b"test-passabc");
         let res = get(
             &app,
             "/rest/ping",
             &format!("u=test&t={salted}&s=abc&v=1.16.1&c=t"),
         );
-        assert_eq!(res.status, 200);
-        assert!(String::from_utf8(res.body)
-            .unwrap()
-            .contains("status=\"ok\""));
+        assert_auth_error(res, 40, "Wrong username or password.");
+        for query in [
+            format!("u=test&t={salted}&v=1.16.1&c=t"),
+            format!("u=test&t={salted}&s=&v=1.16.1&c=t"),
+        ] {
+            assert_auth_error(
+                get(&app, "/rest/ping", &query),
+                10,
+                "Required parameter is missing.",
+            );
+        }
     }
 }
