@@ -137,6 +137,10 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
+	// One shared polite outcome for order, view and clear actions: a new
+	// outcome replaces the previous text (keyed re-announce), never queues.
+	let browseAnnouncement = $state('');
+	let browseAnnouncementVersion = $state(0);
 	/**
 	 * Explicit subset selection: page-local ordered stable IDs in checkbox
 	 * activation order. Never persisted, never fetched, never shared across
@@ -1189,8 +1193,40 @@
 		void tick().then(() => viewSelect?.focus({ preventScroll: true }));
 	}
 
+	function announceBrowse(text: string): void {
+		browseAnnouncement = text;
+		browseAnnouncementVersion += 1;
+	}
+
+	const VIEW_LABELS = {
+		all: 'All tracks',
+		favorites: 'Favorites only',
+		selected: 'Selected only'
+	} as const;
+
+	function setView(next: typeof view): void {
+		// Announce real scope changes only: reselecting the current view
+		// changes nothing and stays silent.
+		if (next === view) return;
+		view = next;
+		announceBrowse(`Showing ${VIEW_LABELS[next]}`);
+	}
+
+	function onOrderChange(event: Event): void {
+		const select = event.currentTarget as HTMLSelectElement;
+		const next = select.value as LibraryOrder;
+		if (next === order) return;
+		order = next;
+		announceBrowse(`List ordered: ${select.selectedOptions[0]?.textContent?.trim() ?? next}`);
+	}
+
+	function onViewChange(event: Event): void {
+		const next = (event.currentTarget as HTMLSelectElement).value;
+		if (next === 'all' || next === 'favorites' || next === 'selected') setView(next);
+	}
+
 	function showAllTracks(): void {
-		view = 'all';
+		setView('all');
 		focusLibraryView();
 	}
 
@@ -1323,6 +1359,8 @@
 	}
 
 	function clearFind(): void {
+		// Announce real clears only: an already-empty find stays silent.
+		if (findQuery !== '') announceBrowse('Search cleared');
 		recordFindQuery();
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -1467,8 +1505,11 @@
 		// Clearing inside Selected only unmounts every row; only focus that
 		// sat inside one of them needs the Show-control fallback.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
+		// Announce real clears only: an already-empty selection stays silent.
+		const hadSelection = selectedIds.length > 0;
 		selectedIds = clearSelection(selectedIds);
 		rangeAnchorId = null;
+		if (hadSelection) announceBrowse('Selection cleared');
 		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
@@ -1619,6 +1660,7 @@
 		</p>
 	{/if}
 	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{shareStatus}</div>
+	<p data-testid="library-browse-status" class="nt-visually-hidden" aria-live="polite" aria-atomic="true">{#key browseAnnouncementVersion}{browseAnnouncement}{/key}</p>
 	{#if shareFallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="library-share-url">Track link</label>
@@ -1911,7 +1953,7 @@
 			</section>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
-				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
+				<select id="library-order" value={order} onchange={onOrderChange} aria-describedby="library-order-hint">
 					<option value="original">Original order</option>
 					<option value="title">Title A–Z</option>
 					<option value="artist">Artist A–Z</option>
@@ -1922,7 +1964,7 @@
 			</div>
 			<div class="nt-library-view">
 				<label for="library-view">Show</label>
-				<select id="library-view" bind:this={viewSelect} bind:value={view}>
+				<select id="library-view" bind:this={viewSelect} value={view} onchange={onViewChange}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
 					<option value="selected">Selected only</option>
@@ -1937,7 +1979,7 @@
 				Group by artist
 			</button>
 			<p aria-live="polite" aria-atomic="true">{groupingAnnouncement}</p>
-			<p data-testid="library-find-count">
+			<p data-testid="library-find-count" role={loading ? undefined : 'status'}>
 				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
 					? ' (title only)'
 					: findScope === 'artist'
@@ -2203,6 +2245,17 @@
 
 
 <style>
+	.nt-visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
 	main {
 		--nt-library-row-padding: 0.25rem;
 	}
