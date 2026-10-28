@@ -19,7 +19,8 @@ import { expect, test, type Locator, type Page, type TestInfo } from '@playwrigh
  * fallback stays byte-literal (case-fold/trim only); metacharacters stay
  * literal; stored metadata, ids, the typed query text and row order are
  * never rewritten. Filtering is presentation-only: truthful counts, no
- * requests, no queue/favorites/selection/storage/media change.
+ * requests or queue/favorites/selection/media change. Typing never persists;
+ * finishing a library find may save only its scoped recent-query history.
  *
  * Fixture discipline: visible title/artist text is digit-free and avoids
  * the words "star" and "favorite". Rows canon-eclair/canon-decomposed,
@@ -173,9 +174,14 @@ async function expectNoLibraryMatches(page: Page) {
 	await expect(clearSearch(page)).toBeVisible();
 }
 
+type LibraryProbe = {
+	media: string[];
+	storage: { area: 'local' | 'session'; method: string; args: unknown[] }[];
+};
+
 async function instrument(page: Page) {
 	await page.addInitScript(() => {
-		const probe = { media: [] as string[], storage: [] as string[] };
+		const probe: LibraryProbe = { media: [], storage: [] };
 		(window as unknown as Record<string, unknown>)['canonProbe'] = probe;
 		for (const method of ['play', 'pause', 'load'] as const) {
 			Object.defineProperty(HTMLMediaElement.prototype, method, {
@@ -190,8 +196,8 @@ async function instrument(page: Page) {
 			const native = Storage.prototype[method];
 			Object.defineProperty(Storage.prototype, method, {
 				configurable: true,
-				value(...args: unknown[]) {
-					probe.storage.push(method);
+				value(this: Storage, ...args: unknown[]) {
+					probe.storage.push({ area: this === localStorage ? 'local' : 'session', method, args });
 					return Reflect.apply(native, this, args);
 				}
 			});
@@ -199,13 +205,13 @@ async function instrument(page: Page) {
 	});
 }
 
-async function probe(page: Page): Promise<{ media: string[]; storage: string[] }> {
-	return page.evaluate(() => (window as unknown as Record<string, { media: string[]; storage: string[] }>)['canonProbe']);
+async function probe(page: Page): Promise<LibraryProbe> {
+	return page.evaluate(() => (window as unknown as Record<string, LibraryProbe>)['canonProbe']);
 }
 
 async function resetProbe(page: Page) {
 	await page.evaluate(() => {
-		const current = (window as unknown as Record<string, { media: string[]; storage: string[] }>)['canonProbe'];
+		const current = (window as unknown as Record<string, LibraryProbe>)['canonProbe'];
 		current.media.length = 0;
 		current.storage.length = 0;
 	});
@@ -481,11 +487,20 @@ test('CF-B06 the untitled id fallback stays byte-literal in both directions', as
 	});
 });
 
-test('CF-B07 finding makes no request and touches no queue, selection, favorites, storage or media', async ({ page }, info) => {
+test('CF-B07 filtering is presentation-only; blur and Clear save only scoped recent history', async ({ page }, info) => {
 	await instrument(page);
 	const library = await mockLibrary(page);
 	await openLibrary(page);
-	await receipt(info, { restored: API_IDS, hidden: '1 selected track is hidden by this find.', libraryCalls: 1, requests: [], media: [], storageWrites: [], unstarred: 0 }, async () => {
+	const context = await page.evaluate(() => sessionStorage.getItem('nntune.library.auth-context.v1'));
+	expect(context, 'loaded-library history requires an auth context').toBeTruthy();
+	const historyKey = `nntune.library.recent-finds.v1.${context}`;
+	const historyValue = '["finishing"]';
+	const allowedHistoryWrite = { area: 'local', method: 'setItem', args: [historyKey, historyValue] };
+	await receipt(info, {
+		restored: API_IDS, hidden: '1 selected track is hidden by this find.', libraryCalls: 1,
+		requests: [], media: [], typingStorageWrites: [], blurHistory: ['finishing'], clearHistory: ['finishing'],
+		historyWriteShapes: [allowedHistoryWrite], unstarred: 0
+	}, async () => {
 		const callsBefore = library.requests();
 		const stored = await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }));
 		const requests: string[] = [];
@@ -498,20 +513,51 @@ test('CF-B07 finding makes no request and touches no queue, selection, favorites
 		await expectRows(page, ['canon-bare']);
 		const hidden = await page.getByTestId('selection-hidden-count').textContent();
 		await field.fill(`${E_DECOMPOSED}clair`);
+		await expectRows(page, ['canon-eclair', 'canon-decomposed']);
 		await field.fill('finishing');
-		await expect(clearSearch(page)).toBeVisible();
+		await expectNoLibraryMatches(page);
+		await settle(page);
+		// Typing/canonical filtering has no persistence boundary, even for no matches.
+		expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual(stored);
+		const typingEffects = await probe(page);
+		expect(typingEffects.storage).toEqual([]);
+
+		// Blur may add exactly this query at exactly this context's local key.
+		// All other local entries and the complete session snapshot stay exact.
+		const afterHistory = { local: { ...stored.local, [historyKey]: historyValue }, session: stored.session };
+		await field.blur();
+		await settle(page);
+		const blurred = await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }));
+		expect(blurred).toEqual(afterHistory);
+		const blurEffects = await probe(page);
+		expect(blurEffects.storage.length).toBeGreaterThan(0);
+		for (const write of blurEffects.storage) expect(write).toEqual(allowedHistoryWrite);
 		await clearSearch(page).click();
 		await expectRows(page, API_IDS);
 		await expectFindCount(page, ITEMS.length);
+		await expect(field).toHaveValue('');
 		const restored = await page.getByTestId('library-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-id')));
 		const stillChecked = await page.locator('[data-testid="library-item"][data-id="canon-plain"] input.nt-library-select').isChecked();
 		expect(stillChecked).toBe(true);
-		expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual(stored);
+		const cleared = await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }));
+		expect(cleared).toEqual(afterHistory);
 		const effects = await probe(page);
+		// Reject even transient unrelated writes (including other history contexts),
+		// while allowing idempotent saves of the same query at blur/Clear.
+		for (const write of effects.storage) expect(write).toEqual(allowedHistoryWrite);
+		await info.attach('history-storage-writes', { body: JSON.stringify(effects.storage), contentType: 'application/json' });
+		const historyWriteShapes = [...new Map(effects.storage.map((write) => [JSON.stringify(write), write])).values()];
 		await expect(page.locator('audio')).toHaveCount(0);
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		const unstarred = await page.getByRole('button', { name: /^Unstar / }).count();
-		return { restored, hidden: hidden?.replace(/\s+/g, ' ').trim(), libraryCalls: library.requests() - callsBefore + 1, requests, media: effects.media, storageWrites: effects.storage, unstarred };
+		const { local: blurLocal } = blurred;
+		const { local: clearLocal } = cleared;
+		return {
+			restored, hidden: hidden?.replace(/\s+/g, ' ').trim(), libraryCalls: library.requests() - callsBefore + 1,
+			requests, media: effects.media, typingStorageWrites: typingEffects.storage,
+			blurHistory: JSON.parse(blurLocal[historyKey]), clearHistory: JSON.parse(clearLocal[historyKey]),
+			historyWriteShapes, unstarred
+		};
 	});
 });
 
