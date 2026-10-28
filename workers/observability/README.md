@@ -1,10 +1,16 @@
-# Integrated staging Tail alert runtime (source only)
+# Integrated staging Tail alert runtime
 
 `runtime.mjs` connects the real projector, error-window reducer and verdict
 renderer through a Tail handler and the `ErrorRateAlerts` Durable Object.
-**Integrated source is not configured or live monitoring.** The only consumer
-configuration is the inactive [`wrangler.toml.example`](wrangler.toml.example):
-no account, route, cron, Tail attachment, deployment environment or secret value.
+The [staging deploy lane](../../.github/workflows/deploy-alerts-staging.yml) derives
+a temporary config from [`wrangler.toml.example`](wrangler.toml.example), which
+remains an inactive local-only example. A qualifying push to `main` deploys only
+`nntune-alerts-staging` when existing CI credentials are configured. This does not
+attach Tail or provision the webhook secret; an existing `OPS_ALERT_WEBHOOK_URL`
+is preserved and accepted only as a `secret_text` binding. Consumer logs/traces,
+workers.dev and preview URLs stay off; no routes or cron are configured.
+**Neither source nor a merged lane is proof of deployed or delivering monitoring.**
+Check the actual deploy and verify results, not a skipped credential gate.
 Existing producer deploy settings are unchanged. Health-red helpers below remain
 unconnected; this runtime is not a health probe, synthetic or auto-rollback.
 
@@ -91,12 +97,28 @@ scratch TOML and `--outdir` pointing to a scratch output directory. The local
 validation produced 42.29KiB / gzip 9.68KiB and recognized the DO and two public
 vars, without a secret or remote binding. This is not permission to deploy.
 
-A separate **staging-first activation** needs exact-head CI/review gates, an
-existing-plan/cost check, secret-bound machine contract, approved Tail attachment,
+The deployment guard is checked in at
+[`.github/scripts/alerts_staging.py`](../../.github/scripts/alerts_staging.py).
+It freezes all four runtime module bytes to
+`818e57680414c4414cc3c96e2f3f9a6ca38d80bf`, validates the complete generated config,
+pages through the DO namespace API and verifies bindings/settings without reading
+secret values. Both the deploy lane and required `tail-projection` CI gate run
+its offline fixtures; CI needs no Cloudflare credentials:
+
+```sh
+python3 .github/scripts/test_alerts_staging.py
+python3 .github/scripts/alerts_staging.py freeze
+```
+
+A separate **staging-first delivery activation** still needs exact-head CI/review,
+an existing-plan/cost check, secret-version contract, approved Tail attachment,
 health/controlled staging delivery evidence and a recorded/tested rollback.
+The [staging consumer rollback procedure](../../docs/runbook-observability.md#staging-consumer-rollback)
+uses an explicitly recorded known-good Worker version in the same DO migration
+lineage, preserves durable state and covers the no-prior-version first deployment.
+A failed Verify step does not undo the deployment. Source revert does not roll
+back the live Worker. No live delivery or rollback was tested by this slice.
 Production stays passive; no production mutations or incident injection.
-Source-only undo is a normal reviewed PR revert. No live rollback has been tested
-by this slice. See the [observability runbook](../../docs/runbook-observability.md).
 
 # Tail observation projection
 
