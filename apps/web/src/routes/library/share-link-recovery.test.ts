@@ -3,6 +3,7 @@ import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
+import { loadRecentFinds } from '#lib/library/recent-finds.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
@@ -45,7 +46,7 @@ function pageScript(search: string) {
 		createQueue: queueFunctions.createQueue,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
-		createLibraryRefresher, loadFavorites, selectFavoriteItems,
+		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		resolveStreamUrl, resolveShareTarget,
 		browserStorage: () => null,

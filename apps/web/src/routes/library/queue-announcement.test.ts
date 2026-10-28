@@ -3,6 +3,12 @@ import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
+import {
+	clearRecentFindsAtAuthBoundary,
+	loadRecentFinds,
+	recordRecentFind,
+	saveRecentFinds
+} from '#lib/library/recent-finds.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
@@ -90,6 +96,10 @@ function pageScript() {
 		loadFavorites,
 		saveFavorites,
 		clearFavoritesAtAuthBoundary,
+		clearRecentFindsAtAuthBoundary,
+		loadRecentFinds,
+		recordRecentFind,
+		saveRecentFinds,
 		selectFavoriteItems,
 		createLibraryRefresher,
 		displayArtist,

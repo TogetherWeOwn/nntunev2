@@ -28,15 +28,15 @@ system libraries Chromium links against; see `playwright.config.ts`.
 
 ## Bundle budget
 
-CI fails `web-build` when total client JS exceeds **307,200 B (300 KiB)**,
+CI fails `web-build` when total client JS exceeds **337,920 B (330 KiB)**,
 measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
 (`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
-procedure — that script is the single source of truth. Baseline was 232,233 B
-(~227 KiB, 36 files) on 2026-10-23, leaving ~32% headroom for framework
-upgrades while catching heavy additions (a charting or date library typically
-adds 50+ KiB).
+procedure — that script is the single source of truth. Baseline was 306,065 B
+(~299 KiB, 37 files) on 2026-10-27, leaving ~10% headroom for the next
+first-party features while catching heavy additions (a charting or date
+library typically adds 50+ KiB).
 
 Production builds run a build-only Terser compression pass in Vite's
 `renderChunk` hook, alongside the default Oxc minification. This happens before

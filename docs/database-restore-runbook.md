@@ -164,11 +164,13 @@ forward-only (§4).
    with the retired version inside the `CURRENT ± 8` discovery window;
    outside the window the Worker never probes that secret and the rows
    stay fail-closed unreadable.
-   The re-wrap runner and the `rotation_runs` progress table are still
-   **not implemented** (`docs/security/kek-rotation.md` §7 banner, §8
-   gate items): a restore that needs rows re-wrapped forward (rather
-   than merely read at their pinned versions) is blocked until they
-   land. Retired key material stays in the operator store until the
+   The re-wrap runner core (`run_rewrap_pass` in
+   `workers/api/src/rotation.rs`) and the `rotation_runs` record design
+   have landed fixture-proven, but no scheduled trigger, production
+   DDL, or Hyperdrive wiring exists yet
+   (`docs/security/kek-rotation.md` §7 banner, §8 gate items): a
+   restore that needs rows re-wrapped forward (rather than merely read
+   at their pinned versions) is blocked until they land. Retired key material stays in the operator store until the
    retire-after date (latest of re-wrap-complete + one window, oldest
    restorable backup/PITR horizon expiry) — a restore never justifies
    deleting key material early.
