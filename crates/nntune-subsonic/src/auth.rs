@@ -1,15 +1,10 @@
-//! Credential handling, ported from v1 `AuthenticateSubsonicRequests` +
-//! `SubsonicCredentials` (spec section 5.3 behaviour).
+//! API-key-only authentication under the accepted ADR 0002/0006 contract.
 //!
-//! Accepted, in order: per-client `apiKey`; legacy `u` with `p` (including
-//! `p=enc:<hex>`); token `u` with `t` and `s`. Raw values decide presence
-//! (v1 deliberately passes them through uncoerced so `?apiKey[]=x`-style
-//! smuggling cannot look absent). Codes match v1 exactly: 43 when `apiKey`
-//! is mixed with any of `u`/`p`/`t`/`s`, 44 for an invalid API key, 10 for
-//! token auth without `s`, 40 for any other credential failure (including
-//! malformed `enc:` hex). The `v` (client protocol version) parameter is
-//! accepted and ignored: v1 authenticates before any version gate, and
-//! clients in the wild send a spread of values.
+//! Conflicting parameter names/mechanisms answer 43 before verification.
+//! Passwords (including malformed enc: input) are unsupported 42; token
+//! forms remain deny-only with the bounded missing-salt 10 / otherwise 40.
+//! Opaque API keys are passed unchanged to the request-scoped adapter.
+//! The client protocol version `v` remains accepted and ignored.
 
 use crate::envelope::code;
 
@@ -82,94 +77,47 @@ pub trait AuthStore {
 }
 
 /// Check credentials, returning the identity or `(code, message)`.
-/// Mirrors v1 `SubsonicCredentials::make`: the apiKey/u-p-t-s conflict
-/// check runs before any authenticator.
+/// Conflicts and unsupported mechanisms precede every authenticator.
+/// The persisted API-key adapter is the sole live credential authority.
 pub fn authenticate<S: AuthStore>(
     store: &S,
     creds: &Credentials,
 ) -> Result<Identity, (i64, String)> {
     let api_key_present = Credentials::present(&creds.api_key);
-    let legacy_present = Credentials::present(&creds.username)
-        || Credentials::present(&creds.password)
+    let mixed = Credentials::present(&creds.password)
         || Credentials::present(&creds.token)
         || Credentials::present(&creds.salt);
-    if api_key_present && legacy_present {
+    if (creds.api_key.is_some() && creds.username.is_some()) || (api_key_present && mixed) {
         return Err((
             code::CONFLICTING_AUTH,
             "Conflicting authentication parameters.".to_string(),
         ));
     }
+    if Credentials::present(&creds.password) {
+        return Err((
+            42,
+            "Provided authentication mechanism not supported.".to_string(),
+        ));
+    }
     if api_key_present {
-        let key = creds.api_key.clone().unwrap_or_default();
         return store
-            .verify_api_key(&key)
+            .verify_api_key(creds.api_key.as_deref().unwrap_or_default())
             .ok_or((code::INVALID_API_KEY, "Invalid API key.".to_string()));
     }
-    if !Credentials::present(&creds.username) {
-        return Err((code::WRONG_CREDENTIALS, wrong_creds()));
+    if Credentials::present(&creds.username)
+        && Credentials::present(&creds.token)
+        && !Credentials::present(&creds.salt)
+    {
+        return Err((
+            code::REQUIRED_PARAM_MISSING,
+            "Required parameter is missing.".to_string(),
+        ));
     }
-    let username = creds.username.clone().unwrap_or_default();
-    if Credentials::present(&creds.token) {
-        if !Credentials::present(&creds.salt) {
-            return Err((
-                code::REQUIRED_PARAM_MISSING,
-                "Required parameter is missing.".to_string(),
-            ));
-        }
-        let token = creds.token.clone().unwrap_or_default();
-        let salt = creds.salt.clone().unwrap_or_default();
-        return store
-            .verify_token(&username, &token, &salt)
-            .ok_or((code::WRONG_CREDENTIALS, wrong_creds()));
-    }
-    if !Credentials::present(&creds.password) {
-        return Err((code::WRONG_CREDENTIALS, wrong_creds()));
-    }
-    let raw_password = creds.password.clone().unwrap_or_default();
-    let password = match decode_enc_password(&raw_password) {
-        Some(p) => p,
-        None => return Err((code::WRONG_CREDENTIALS, wrong_creds())),
-    };
-    store
-        .verify_password(&username, &password)
-        .ok_or((code::WRONG_CREDENTIALS, wrong_creds()))
+    Err((code::WRONG_CREDENTIALS, wrong_creds()))
 }
 
 fn wrong_creds() -> String {
     "Wrong username or password.".to_string()
-}
-
-/// Decode `p=enc:<hex>` passwords as v1 does (`SubsonicCredentials` hex
-/// handling): the remainder must be even-length hex decoding to UTF-8.
-/// Returns `None` on malformed hex (caller answers 40); a plain password
-/// is returned unchanged.
-fn decode_enc_password(raw: &str) -> Option<String> {
-    let hex = match raw.strip_prefix("enc:") {
-        Some(hex) => hex,
-        None => return Some(raw.to_string()),
-    };
-    if hex.is_empty() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let digits = hex.as_bytes();
-    let mut i = 0;
-    while i < digits.len() {
-        let hi = hex_val(digits[i])?;
-        let lo = hex_val(digits[i + 1])?;
-        bytes.push((hi << 4) | lo);
-        i += 2;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// MD5 hex digest (RFC 1321), for `t = md5(password + salt)` token auth.
