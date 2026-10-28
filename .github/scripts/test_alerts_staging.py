@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import alerts_staging as guard
 from test_ci_pnpm_retry import (
-    check_required_step, job_level_field, job_needs, non_plain_key_lines,
+    check_required_step, check_step_shell, job_level_field, job_needs, non_plain_key_lines,
     split_jobs, split_steps, step_field, step_level_field,
 )
 
@@ -402,13 +402,15 @@ class IsolatedNamespaceGuardTests(unittest.TestCase):
         self.assertIn(requested, (list(range(1, len(pages) + 1)),
                                   list(range(1, len(pages) + 2))))
 
-    def assert_rejected(self, pages):
+    def assert_rejected(self, pages, code=None):
         status, report, requested = self.run_cli(pages)
         self.assertEqual(status, 1, f"Unsafe inventory was accepted: {report}")
         self.assertLessEqual(set(report), {"ok", "code", "retryable", "next_action"})
         self.assertIs(report["ok"], False)
         self.assertIs(report["retryable"], False)
         self.assertRegex(report["code"], r"^[A-Z][A-Z0-9_]+$")
+        if code is not None:
+            self.assertEqual(report["code"], code)
         self.assertNotIn("private-pagination-canary", json.dumps(report))
         self.assertNotIn("version_id", report)
         self.assertLessEqual(len(requested), len(pages) + 1)
@@ -489,6 +491,103 @@ class IsolatedNamespaceGuardTests(unittest.TestCase):
                     "result_info": {"page": 1, "count": 2, "per_page": 1000, "total_count": 2},
                 }])
 
+    def test_short_nonempty_counted_terminal_page_is_rejected(self):
+        for explicit_pages in (False, True):
+            for target_first in (False, True):
+                with self.subTest(explicit_pages=explicit_pages, target_first=target_first):
+                    pages = self.pages()
+                    if not target_first:
+                        pages[0]["result"][0], pages[1]["result"][0] = (
+                            pages[1]["result"][0], pages[0]["result"][0]
+                        )
+                    for page in pages:
+                        if not explicit_pages:
+                            page["result_info"].pop("total_pages")
+                        page["result_info"].update(
+                            count=len(page["result"]), per_page=1000, total_count=1005
+                        )
+                        page["result"][0]["name"] = "private-pagination-canary"
+                    self.assert_rejected(pages, "NAMESPACE_COUNT_MISMATCH")
+
+    def test_explicit_only_per_page_must_match_the_request(self):
+        target = copy.deepcopy(fixtures()[1])
+        target[0]["name"] = "private-pagination-canary"
+        self.assert_rejected([{
+            "result": target,
+            "result_info": {"page": 1, "total_pages": 1, "per_page": 999},
+        }], "NAMESPACE_PAGE_SIZE")
+
+    def test_explicit_only_count_must_match_the_batch(self):
+        target = copy.deepcopy(fixtures()[1])
+        target[0]["name"] = "private-pagination-canary"
+        self.assert_rejected([{
+            "result": target,
+            "result_info": {"page": 1, "total_pages": 1, "count": 0},
+        }], "NAMESPACE_COUNT_MISMATCH")
+
+    def test_present_explicit_only_ids_must_be_nonempty_strings(self):
+        for value in (None, "", 7, True, [], {}):
+            with self.subTest(value=value):
+                self.assert_rejected([{
+                    "result": [*fixtures()[1], {
+                        "script": "unrelated", "class": "OtherClass", "id": value,
+                        "name": "private-pagination-canary",
+                    }],
+                    "result_info": {"page": 1, "total_pages": 1},
+                }], "NAMESPACE_ID_SHAPE")
+
+    def test_duplicate_present_explicit_only_ids_are_rejected(self):
+        unrelated = {"script": "unrelated", "class": "OtherClass", "id": "same-id",
+                     "name": "private-pagination-canary"}
+        self.assert_rejected([{
+            "result": [*fixtures()[1], unrelated, copy.deepcopy(unrelated)],
+            "result_info": {"page": 1, "total_pages": 1},
+        }], "NAMESPACE_DUPLICATE_ID")
+
+    def test_duplicate_counted_ids_on_the_first_page_are_rejected(self):
+        unrelated = {"script": "unrelated", "class": "OtherClass", "id": "same-id",
+                     "name": "private-pagination-canary"}
+        self.assert_rejected([{
+            "result": [*fixtures()[1], unrelated, copy.deepcopy(unrelated)],
+            "result_info": {"page": 1, "count": 3, "per_page": 1000, "total_count": 3},
+        }], "NAMESPACE_DUPLICATE_ID")
+
+    def test_oversized_explicit_only_terminal_page_is_rejected(self):
+        # Omit optional count/per_page: their own limits must not mask batch size.
+        self.assert_rejected([{
+            "result": [*fixtures()[1], *[
+                {"script": "unrelated", "class": "OtherClass", "id": f"extra-{index}",
+                 "name": "private-pagination-canary"}
+                for index in range(1000)
+            ]],
+            "result_info": {"page": 1, "total_pages": 1},
+        }], "NAMESPACE_PAGE_SIZE")
+
+    def test_exact_counted_terminal_remainder_succeeds(self):
+        pages = self.pages()
+        pages[1]["result"].extend([
+            {"script": "unrelated", "class": "OtherClass", "id": f"remainder-{index}"}
+            for index in range(4)
+        ])
+        for page in pages:
+            page["result_info"].update(
+                count=len(page["result"]), per_page=1000, total_count=1005
+            )
+        self.assert_accepted(pages)
+
+    def test_explicit_only_optional_metadata_and_absent_unrelated_id_stay_supported(self):
+        for extra in ({}, {"per_page": 1000, "count": 2}):
+            with self.subTest(extra=extra):
+                self.assert_accepted([{
+                    "result": [*fixtures()[1], {"script": "unrelated", "class": "OtherClass"}],
+                    "result_info": {"page": 1, "total_pages": 1, **extra},
+                }])
+
+    def test_full_explicit_only_terminal_page_succeeds(self):
+        page = self.pages()[0]
+        page["result_info"]["total_pages"] = 1
+        self.assert_accepted([page])
+
     def test_exact_target_identity_is_still_required_at_the_cli(self):
         for field, value in (("script", "nntune-alerts"), ("class", "OtherClass"),
                              ("id", "other-namespace")):
@@ -529,7 +628,10 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         self.assertIn("ci-ok", ci)
         self.assertIn("tail-projection", job_needs(ci["ci-ok"]))
         for command in self.COMMANDS:
-            self.assertEqual(check_required_step("tail-projection", ci["tail-projection"], command), [])
+            self.assertEqual(check_required_step(
+                "tail-projection", ci["tail-projection"], command,
+                workflow_text=workflows["ci.yml"],
+            ), [])
 
         deploy_jobs = split_jobs(workflows["deploy-alerts-staging.yml"])
         self.assertIn("deploy", deploy_jobs)
@@ -546,6 +648,9 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(deployments), 1, "Expected one staging deployment action")
         for command in self.COMMANDS:
             acceptance = self.required_step(steps, command)
+            self.assertEqual(check_step_shell(
+                "deploy", deploy, steps[acceptance], workflows["deploy-alerts-staging.yml"],
+            ), [])
             self.assertLess(acceptance, config, f"Acceptance must precede config generation: {command}")
             self.assertLess(acceptance, deployments[0], f"Acceptance must precede deployment: {command}")
 
@@ -565,6 +670,86 @@ class WorkflowAcceptanceTests(unittest.TestCase):
                     with self.subTest(workflow=filename, command=command, removed=not replacement):
                         mutated = dict(workflows)
                         mutated[filename] = workflows[filename].replace(step, replacement, 1)
+                        with self.assertRaises(AssertionError):
+                            self.assert_acceptance_wiring(mutated)
+
+    def with_shell(self, workflows, filename, command, scope, shell):
+        mutated = dict(workflows)
+        text = workflows[filename]
+        job_id = "tail-projection" if filename == "ci.yml" else "deploy"
+        job = split_jobs(text)[job_id]
+        steps = split_steps(job)
+        # Isolate the selected bank even when it inherits an unsafe default.
+        for other in self.COMMANDS:
+            if other == command:
+                continue
+            step = steps[self.required_step(steps, other)]
+            text = text.replace(step, step + "\n        shell: bash", 1)
+        if scope == "step":
+            step = steps[self.required_step(steps, command)]
+            text = text.replace(step, step + f"\n        shell: {shell}", 1)
+        elif scope == "job":
+            header = f"  {job_id}:\n"
+            self.assertEqual(text.count(header), 1)
+            text = text.replace(header, header + f"    defaults:\n      run:\n        shell: {shell}\n", 1)
+        else:
+            self.assertEqual(scope, "workflow")
+            text = f"defaults:\n  run:\n    shell: {shell}\n" + text
+        mutated[filename] = text
+        return mutated
+
+    def test_shell_masks_are_rejected_for_each_bank_and_inheritance_scope(self):
+        workflows = self.workflows()
+        for filename in workflows:
+            for command in self.COMMANDS:
+                for scope in ("step", "job", "workflow"):
+                    for shell in ("true {0}", "echo {0}", "bash -c true {0}",
+                                  "sh -c 'exit 0' {0}", "python -c pass {0}",
+                                  "'true {0}'", '"true {0}"'):
+                        with self.subTest(filename=filename, command=command, scope=scope, shell=shell):
+                            mutated = self.with_shell(workflows, filename, command, scope, shell)
+                            with self.assertRaises(AssertionError):
+                                self.assert_acceptance_wiring(mutated)
+
+    def test_supported_shells_and_more_specific_overrides_stay_executable(self):
+        workflows = self.workflows()
+        for filename in workflows:
+            job_id = "tail-projection" if filename == "ci.yml" else "deploy"
+            for command in self.COMMANDS:
+                for scope in ("step", "job", "workflow"):
+                    for shell in ("bash", "sh", "bash -e {0}", "sh -e {0}",
+                                  "bash --noprofile --norc -e -o pipefail {0}",
+                                  "'bash'", '"bash"'):
+                        with self.subTest(filename=filename, command=command, scope=scope, shell=shell):
+                            self.assert_acceptance_wiring(
+                                self.with_shell(workflows, filename, command, scope, shell)
+                            )
+                for scope in ("job", "workflow"):
+                    with self.subTest(filename=filename, command=command, overridden=scope):
+                        overridden = self.with_shell(workflows, filename, command, scope, "true {0}")
+                        text = overridden[filename]
+                        steps = split_steps(split_jobs(text)[job_id])
+                        step = steps[self.required_step(steps, command)]
+                        overridden[filename] = text.replace(step, step + "\n        shell: bash", 1)
+                        self.assert_acceptance_wiring(overridden)
+                with self.subTest(filename=filename, command=command, job_overrides_workflow=True):
+                    overridden = self.with_shell(workflows, filename, command, "job", "bash")
+                    overridden[filename] = "defaults:\n  run:\n    shell: true {0}\n" + overridden[filename]
+                    self.assert_acceptance_wiring(overridden)
+
+    def test_conditional_or_failure_masked_acceptance_is_rejected_in_both_jobs(self):
+        workflows = self.workflows()
+        for filename, job_id in (("ci.yml", "tail-projection"),
+                                 ("deploy-alerts-staging.yml", "deploy")):
+            steps = split_steps(split_jobs(workflows[filename])[job_id])
+            for command in self.COMMANDS:
+                step = steps[self.required_step(steps, command)]
+                for extra in ("if: always()", "continue-on-error: true"):
+                    with self.subTest(filename=filename, command=command, extra=extra):
+                        mutated = dict(workflows)
+                        mutated[filename] = workflows[filename].replace(
+                            step, step + "\n        " + extra, 1,
+                        )
                         with self.assertRaises(AssertionError):
                             self.assert_acceptance_wiring(mutated)
 

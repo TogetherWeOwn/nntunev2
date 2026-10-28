@@ -14,11 +14,15 @@ This module is also the shared workflow reader for the sibling
 structural suites. It therefore cross-pins the web-e2e timeout guard's
 registration in public-text: that suite cannot catch deletion of its
 own run step, but this independently executed suite can (and the
-timeout suite reciprocally pins this suite's step).
+timeout suite reciprocally pins this suite's step). It also independently
+pins both namespace/staging banks in tail-projection and checks that ci-ok
+propagates their failures; deleting a bank cannot delete its only assertion.
 """
 
+import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -255,14 +259,96 @@ def non_plain_key_lines(job_chunk):
     return bad
 
 
-def check_required_step(job_id, job_chunk, command):
+def defaults_shell(chunk, indent):
+    """Read only block-form defaults.run.shell; unknown layouts fail closed.
+
+    None means no shell default; an empty string means present but unsupported.
+    As with the job/step readers, this deliberately supports a bounded YAML
+    layout rather than approximating flow mappings, anchors or scalar folding.
+    """
+    lines = chunk.splitlines()
+    for field in ("defaults", "run", "shell"):
+        content = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        if field != "defaults" and content:
+            if min(len(line) - len(line.lstrip(" ")) for line in content) != indent:
+                return ""
+        matches = []
+        for index, line in enumerate(lines):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if len(line) - len(line.lstrip(" ")) != indent:
+                continue
+            key = re.fullmatch(r" *([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*", line)
+            if not key:
+                return ""
+            if key.group(1) == field:
+                matches.append((index, re.sub(r"\s+#.*$", "", key.group(2))))
+        if not matches:
+            return None
+        if len(matches) != 1:
+            return ""
+        index, value = matches[0]
+        end = index + 1
+        while end < len(lines):
+            following = lines[end]
+            if following.strip() and not following.lstrip().startswith("#"):
+                if len(following) - len(following.lstrip(" ")) <= indent:
+                    break
+            end += 1
+        children = lines[index + 1:end]
+        if field == "shell":
+            return "" if any(s.strip() and not s.lstrip().startswith("#") for s in children) else value
+        if value:
+            return ""
+        lines = children
+        indent += 2
+    return None
+
+
+SUPPORTED_SHELLS = {
+    "bash": "bash --noprofile --norc -e -o pipefail {0}",
+    "sh": "sh -e {0}",
+    "bash -e {0}": "bash -e {0}",
+    "sh -e {0}": "sh -e {0}",
+    "bash --noprofile --norc -e -o pipefail {0}": "bash --noprofile --norc -e -o pipefail {0}",
+}
+
+
+def effective_shell(workflow_text, job_chunk, step):
+    """Resolve step > job > workflow > Linux default without executing text."""
+    value = step_level_field(step, "shell")
+    if value is None:
+        value = defaults_shell(job_chunk, 4)
+    if value is None:
+        value = defaults_shell(workflow_text, 0)
+    if value is None:
+        return "bash -e {0}"
+    if value.startswith('"'):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return ""
+    elif value.startswith("'") and value.endswith("'"):
+        value = value[1:-1].replace("''", "'")
+    return SUPPORTED_SHELLS.get(value, "")
+
+
+def check_step_shell(job_id, job_chunk, step, workflow_text=""):
+    if effective_shell(workflow_text, job_chunk, step):
+        return []
+    return [f"{job_id}: step must use a supported effective bash/sh shell that executes {{0}}"]
+
+
+def check_required_step(job_id, job_chunk, command, *, workflow_text=""):
     """Error strings unless `command` runs as a required step of the job.
 
     Required means: a step whose `run` is exactly `command` (a trailing
     ``|| true`` or a shell wrapper would mask its failure), with no `if`
     gate and no `continue-on-error`, in a job that is itself neither
-    gated nor continue-on-error. Anything weaker lets the guarded suite
-    be silently dropped or neutralized without CI turning red.
+    gated nor continue-on-error. The effective shell must execute its
+    script and propagate failure. Pass workflow_text for workflow-level
+    defaults; callers with isolated job fixtures have no inherited default.
+    Anything weaker lets the suite be neutralized without CI turning red.
     """
     errors = [
         f"{job_id}: key line must be a plain `key:` with exactly one ASCII "
@@ -296,6 +382,7 @@ def check_required_step(job_id, job_chunk, command):
                 "not continue-on-error"
             )
         else:
+            errors.extend(check_step_shell(job_id, job_chunk, step, workflow_text))
             return errors
     return errors
 
@@ -770,6 +857,197 @@ class TestWebE2eTimeoutWiring(unittest.TestCase):
         )
         self.assertEqual(non_plain_key_lines(public_text_with(step, job_extra="    # c\n")), [])
         self.assertEqual(wiring_errors(public_text_with(step)), [])
+
+
+class TestEffectiveShell(unittest.TestCase):
+    def test_every_supported_invocation_executes_the_script_and_preserves_failure(self):
+        for shell in (None, *SUPPORTED_SHELLS):
+            step = timeout_step("" if shell is None else f"        shell: {shell}\n")
+            job = public_text_with(step)
+            invocation = effective_shell("", job, step)
+            self.assertTrue(invocation)
+            with self.subTest(shell=shell), tempfile.TemporaryDirectory() as root:
+                script = os.path.join(root, "fixture.sh")
+                marker = os.path.join(root, "executed")
+                args = [script if part == "{0}" else part for part in shlex.split(invocation)]
+                for exit_code in (0, 9):
+                    with open(script, "w", encoding="utf-8") as handle:
+                        handle.write(f"printf ran > executed\nexit {exit_code}\n")
+                    result = subprocess.run(args, cwd=root, env={"PATH": os.defpath},
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                    with open(marker, encoding="utf-8") as handle:
+                        self.assertEqual(handle.read(), "ran")
+                    os.unlink(marker)
+
+    def test_nonexecuting_shells_and_unsupported_yaml_defaults_fail_closed(self):
+        step = timeout_step()
+        for shell in ("true {0}", "bash -c true {0}", "bash -e", "sh {0}",
+                      "bash -e {0} || true", "${{ env.SHELL }}", "null", ""):
+            with self.subTest(shell=shell):
+                masked = timeout_step(f"        shell: {shell}\n")
+                self.assertTrue(check_step_shell("public-text", public_text_with(masked), masked))
+        for defaults in (
+            "defaults: {run: {shell: 'true {0}'}}\n",
+            "defaults:\n  run: {shell: 'true {0}'}\n",
+            'defaults:\n  run:\n    "shell": true {0}\n',
+            "defaults:\n  run:\n    <<: {shell: 'true {0}'}\n",
+            "defaults:\n    run:\n      shell: true {0}\n",
+            "defaults:\n run:\n  shell: true {0}\n",
+            "defaults:\n  run:\n    shell: bash\n      -c true {0}\n",
+            "defaults:\n  run:\n    shell: bash\ndefaults:\n  run:\n    shell: true {0}\n",
+        ):
+            with self.subTest(defaults=defaults):
+                self.assertTrue(check_step_shell(
+                    "public-text", public_text_with(step), step, defaults,
+                ))
+                job_defaults = "\n".join("    " + line for line in defaults.splitlines()) + "\n"
+                self.assertTrue(check_step_shell(
+                    "public-text", public_text_with(step, job_extra=job_defaults), step,
+                ))
+
+    def test_unrelated_nested_shell_data_and_working_directory_are_not_defaults(self):
+        step = timeout_step() + "        env:\n          shell: true {0}\n"
+        for defaults in (
+            "", "defaults:\n  run:\n    working-directory: .\n",
+            "env:\n  defaults:\n    run:\n      shell: true {0}\n",
+        ):
+            with self.subTest(defaults=defaults):
+                self.assertEqual(check_step_shell(
+                    "public-text", public_text_with(step), step, defaults,
+                ), [])
+
+
+class TestAlertsAcceptanceWiring(unittest.TestCase):
+    """Backstop the two banks from the separately invoked public-text suite."""
+
+    COMMANDS = (
+        "python3 .github/scripts/test_alerts_staging.py",
+        "python3 .github/scripts/test_alerts_namespace_contract.py",
+    )
+
+    def workflow(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+            return handle.read()
+
+    def assert_wiring(self, text):
+        jobs = split_jobs(text)
+        for job_id in ("tail-projection", "public-text", "ci-ok"):
+            self.assertIn(job_id, jobs)
+        for job_id in ("tail-projection", "public-text"):
+            self.assertIn(job_id, job_needs(jobs["ci-ok"]))
+        for command in self.COMMANDS:
+            self.assertEqual(check_required_step(
+                "tail-projection", jobs["tail-projection"], command, workflow_text=text,
+            ), [])
+        self.assertEqual(check_required_step(
+            "public-text", jobs["public-text"],
+            "python3 .github/scripts/test_ci_pnpm_retry.py", workflow_text=text,
+        ), [])
+
+    def assert_aggregate(self, text):
+        job = split_jobs(text)["ci-ok"]
+        self.assertEqual(non_plain_key_lines(job), [])
+        self.assertIn(job_level_field(job, "if"), ("always()", "${{ always() }}"))
+        self.assertIsNone(job_level_field(job, "continue-on-error"))
+        steps = [step for step in split_steps(job) if step_level_field(step, "run") is not None]
+        self.assertEqual(len(steps), 1, "Expected one fail-closed aggregate command")
+        step = steps[0]
+        self.assertIsNone(step_level_field(step, "if"))
+        self.assertIsNone(step_level_field(step, "continue-on-error"))
+        self.assertEqual(check_step_shell("ci-ok", job, step, text), [])
+        lines = step.splitlines()
+        blocks = [i for i, line in enumerate(lines)
+                  if re.fullmatch(r"(?:      - |        )run: \|[-]?\s*(?:#.*)?", line)]
+        self.assertEqual(len(blocks), 1, "Expected a literal aggregate run block")
+        body = []
+        for line in lines[blocks[0] + 1:]:
+            if line.strip() and not line.startswith("          "):
+                break
+            body.append(line[10:])
+        self.assertTrue(any(line.strip() for line in body))
+        self.assertEqual(step_field(step, "NEEDS_JSON"), "${{ toJSON(needs) }}")
+        with tempfile.TemporaryDirectory(prefix="ci-aggregate-fixture-") as root:
+            script = os.path.join(root, "aggregate.sh")
+            with open(script, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(body) + "\n")
+            shell = shlex.split(effective_shell(text, job, step))
+            args = [script if arg == "{0}" else arg for arg in shell]
+            for job_id in ("tail-projection", "public-text"):
+                for state in ("success", "failure", "cancelled", "skipped"):
+                    results = {name: {"result": "success"} for name in ("tail-projection", "public-text")}
+                    results[job_id]["result"] = state
+                    result = subprocess.run(
+                        args, cwd=root, env={"PATH": os.defpath, "NEEDS_JSON": json.dumps(results)},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode == 0, state == "success",
+                                     f"ci-ok must fail closed on {job_id}={state}: {result.stdout}{result.stderr}")
+
+    def required_alert_step(self, job, command):
+        matches = [step for step in split_steps(job) if step_level_field(step, "run") == command]
+        self.assertEqual(len(matches), 1, f"Expected one step running {command}")
+        return matches[0]
+
+    def test_real_alert_banks_run_in_required_job(self):
+        self.assert_wiring(self.workflow())
+
+    def test_real_aggregate_propagates_failed_cancelled_and_skipped_banks(self):
+        self.assert_aggregate(self.workflow())
+
+    def test_registration_masks_and_missing_aggregate_dependency_are_rejected(self):
+        text = self.workflow()
+        job = split_jobs(text)["tail-projection"]
+        for command in self.COMMANDS:
+            step = self.required_alert_step(job, command)
+            for replacement in ("", step.replace(command, ":"),
+                                step + "\n        if: always()",
+                                step + "\n        continue-on-error: true",
+                                step + "\n        shell: true {0}"):
+                with self.subTest(command=command, replacement=replacement):
+                    with self.assertRaises(AssertionError):
+                        self.assert_wiring(text.replace(step, replacement, 1))
+        aggregate = split_jobs(text)["ci-ok"]
+        for job_id in ("tail-projection", "public-text"):
+            needs = job_level_field(aggregate, "needs")
+            self.assertIsNotNone(needs)
+            missing = aggregate.replace(needs, needs.replace(job_id, job_id + "-shadow"), 1)
+            with self.subTest(missing=job_id), self.assertRaises(AssertionError):
+                self.assert_wiring(text.replace(aggregate, missing, 1))
+
+    def test_aggregate_exit_and_shell_masks_are_rejected(self):
+        text = self.workflow()
+        aggregate = split_jobs(text)["ci-ok"]
+        step = next(step for step in split_steps(aggregate) if step_level_field(step, "run") is not None)
+        for replacement in (step + "\n        shell: true {0}",
+                            step + "\n        continue-on-error: true",
+                            step.replace("exit 1", "exit 0"),
+                            step.replace('.result == "success"', '.result != "pending"')):
+            with self.subTest(replacement=replacement), self.assertRaises(AssertionError):
+                self.assert_aggregate(text.replace(step, replacement, 1))
+
+    def test_deleted_bank_is_caught_by_the_surviving_checker_process(self):
+        text = self.workflow()
+        job = split_jobs(text)["tail-projection"]
+        for command in self.COMMANDS:
+            step = self.required_alert_step(job, command)
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as root:
+                scripts = os.path.join(root, ".github", "scripts")
+                workflows = os.path.join(root, ".github", "workflows")
+                os.makedirs(scripts)
+                os.makedirs(workflows)
+                checker = os.path.join(scripts, "test_ci_pnpm_retry.py")
+                shutil.copyfile(__file__, checker)
+                with open(os.path.join(workflows, "ci.yml"), "w", encoding="utf-8") as handle:
+                    handle.write(text.replace(step, "", 1))
+                # No alert bank is copied or executed: only the surviving checker.
+                result = subprocess.run(
+                    [sys.executable, checker, "TestAlertsAcceptanceWiring.test_real_alert_banks_run_in_required_job"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("FAILED (failures=1)", result.stderr)
+                self.assertIn(f"no step runs {command}", result.stderr)
 
 
 if __name__ == "__main__":
