@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The workspace includes nntune-core and the stream crate; run all native
       # tests and lint every target so stream regressions stay on the gate.
       - run: cargo fmt --all -- --check
@@ -87,7 +87,7 @@ jobs:
         with:
           components: clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
       - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
@@ -168,7 +168,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Unit-test the budget check
         run: python3 .github/scripts/test_check_worker_wasm_budget.py
       - name: Unit-test the budget check build paths
@@ -199,7 +199,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Unit-test the size reporter
         run: python3 .github/scripts/test_report_worker_wasm_sizes.py
       - name: Unit-test the size reporter I/O errors
@@ -479,7 +479,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
@@ -546,7 +546,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
@@ -568,7 +568,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
@@ -625,7 +625,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
