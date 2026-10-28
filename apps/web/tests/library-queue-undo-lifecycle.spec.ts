@@ -47,13 +47,14 @@ test('metadata undo preserves the mounted media source, intent and position', as
 	});
 	await undo(page).click();
 	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	await expect(page).toHaveTitle('Selected: Coral Night — Library — NNTune');
 	await expect(audio).toHaveAttribute('data-original-source', 'yes');
 	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
 	await expect(audio).toHaveJSProperty('currentTime', 12);
 	await expect(audio).toHaveJSProperty('paused', true);
 	await expect(audio).not.toHaveAttribute('data-transport-call');
 	await expect(page.getByTestId('library-now-playing')).toContainText('Pine Morning');
-	await page.getByRole('button', { name: 'Copy link Coral Night', exact: true }).click();
+	await page.getByTestId('library-list').getByRole('button', { name: 'Copy link Coral Night', exact: true }).click();
 	await expect.poll(() => page.evaluate(() => {
 		const url = new URL(document.documentElement.dataset.copiedLink!);
 		return { track: url.searchParams.get('track'), t: url.searchParams.get('t') };
@@ -165,4 +166,49 @@ test('same-route share link after undo seeks the link target, not the preserved 
 	await expect(audio).toHaveAttribute('src', '/test-audio/coral');
 	await expect(audio).not.toHaveAttribute('data-original-source');
 	await expect(audio).toHaveAttribute('data-seek-writes', '30');
+});
+
+test('clearing upcoming releases a preserved source removed by the trim', async ({ page }) => {
+	await seed(page);
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await audio.evaluate((element: HTMLAudioElement) => element.setAttribute('data-original-source', 'yes'));
+	await undo(page).click();
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await page.getByRole('button', { name: 'Clear upcoming', exact: true }).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(audio).toHaveAttribute('src', '/test-audio/coral');
+	await expect(audio).not.toHaveAttribute('data-original-source');
+	await expect(page.getByTestId('library-now-playing')).toContainText('Coral Night');
+});
+
+test('refresh pruning the preserved source switches to the selected track', async ({ page }) => {
+	const payload = { current: ITEMS };
+	await seed(page, payload);
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await audio.evaluate((element: HTMLAudioElement) => element.setAttribute('data-original-source', 'yes'));
+	await undo(page).click();
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	payload.current = [ITEMS[0]!, ITEMS[2]!];
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(2);
+	await expect(audio).toHaveAttribute('src', '/test-audio/coral');
+	await expect(audio).not.toHaveAttribute('data-original-source');
+	await expect(page.getByTestId('library-now-playing')).toContainText('Coral Night');
+});
+
+test('changing selection after undo releases preserved audio', async ({ page }) => {
+	await seed(page);
+	await remove(page).click();
+	const audio = page.getByTestId('audio-player');
+	await undo(page).click();
+	await expect(audio).toHaveAttribute('src', '/test-audio/pine');
+	await audio.evaluate((element: HTMLAudioElement) => element.setAttribute('data-original-source', 'yes'));
+	await page.getByTestId('player-next').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
+	await page.getByTestId('player-next').click();
+	await expect(page.getByTestId('now-playing')).toContainText('Ember Line');
+	await expect(audio).toHaveAttribute('src', '/test-audio/ember');
+	await expect(audio).not.toHaveAttribute('data-original-source');
 });

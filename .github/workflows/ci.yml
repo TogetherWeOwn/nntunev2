@@ -60,6 +60,19 @@ jobs:
       # Same job, so failures fail rust-test and the ci-ok aggregate.
       - run: cargo test --locked -p nntune-core --no-default-features
 
+  # Validate fixture shape separately; byte-exact handler comparison runs
+  # in the nntune-subsonic tests in rust-test.
+  fixture-check:
+    name: fixture-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate golden fixtures
+        run: python3 scripts/check-subsonic-fixtures.py
+
   rust-wasm:
     name: rust check (wasm32)
     runs-on: ubuntu-latest
@@ -214,6 +227,8 @@ jobs:
         run: python3 .github/scripts/test_public_text_read_errors.py
       - name: Structural-test the pnpm bootstrap retry
         run: python3 .github/scripts/test_ci_pnpm_retry.py
+      - name: Structural-test the web-e2e timeout budget
+        run: python3 .github/scripts/test_ci_web_e2e_timeout.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -225,6 +240,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Fail stalled transfers so checkout's bounded fetch retry can run
+        # instead of consuming the entire job before the offline tests.
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: '1'
+          GIT_HTTP_LOW_SPEED_TIME: '60'
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -460,12 +480,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
 
   # KV config staging/prod parity: both env fixtures must validate against
   # config/schema.json with identical key sets (values may differ). Also runs
@@ -527,12 +547,12 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/ingest/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
-      - run: cargo check --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown
 
   rust-repair:
     name: rust (workers/repair)
@@ -549,13 +569,13 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --manifest-path workers/repair/Cargo.toml --all-targets
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/repair/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
       # Durable Object runtime) must check and lint on that target.
-      - run: cargo check --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
-      - run: cargo clippy --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo check --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --manifest-path workers/repair/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
   # Repair container image: the server's native tests ride the workspace
   # `rust-test` job (containers/repair is a member); this job proves the
@@ -909,7 +929,9 @@ jobs:
           env -i PATH="$tools:$PATH" jq --version
 
       - name: Browser image and preflight self-tests (offline doubles only)
-        run: python3 .github/scripts/test_ci_playwright_image.py
+        run: |
+          python3 .github/scripts/test_ci_playwright_image.py
+          python3 .github/scripts/test_ci_web_e2e_image.py
 
       - name: Smoke checker self-tests (offline fixtures only)
         run: node --test bin/test-smoke-acceptance.mjs
@@ -1071,9 +1093,16 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    # Slow Ubuntu dependency downloads can consume 17 minutes; leave room
-    # for the full browser suite (normally about five minutes) after setup.
-    timeout-minutes: 30
+    # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
+    # 18.8-20.6 minutes; container setup (image pull + pnpm install)
+    # takes under a minute on the fast path. Pre-container worst setup
+    # was 17m of apt/browser downloads; slow image pulls are unmeasured,
+    # so keep headroom. 45 = 21 suite (20.6 rounded up) + 24
+    # setup/headroom. Re-measure when the reported suite exceeds
+    # 25 minutes or the test count passes ~1,800; re-pin the container
+    # with the web lock; test_ci_web_e2e_timeout.py pins this value.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/web
@@ -1100,8 +1129,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preinstalled web Playwright chromium
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import { chromium } from '@playwright/test';
+          const browser = await chromium.launch();
+          await browser.close();
+          JS
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
       - name: Upload failure artifacts
@@ -1112,9 +1148,9 @@ jobs:
           path: apps/web/test-results/
           retention-days: 7
 
-  # Privacy-safe Tail observation projection: pure, dependency-free ESM
-  # projector with VM-isolated acceptance tests. No Cloudflare API,
-  # network, or deploy. Keep this job id in ci-ok's needs.
+  # Privacy-safe Tail helpers and integrated durable alert runtime. The Node
+  # VM acceptance harness fakes Cloudflare, storage, time and all delivery:
+  # no Cloudflare API, network, or deploy. Keep this job id in ci-ok's needs.
   tail-projection:
     name: tail-projection
     runs-on: ubuntu-latest
@@ -1123,6 +1159,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Test staging deploy guards with offline fixtures
+        run: python3 .github/scripts/test_alerts_staging.py
+      - name: Assert frozen staging alert runtime bytes
+        run: python3 .github/scripts/alerts_staging.py freeze
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -1138,6 +1179,11 @@ jobs:
           node --check workers/observability/tests/evaluate-health-window.test.mjs
           node --check workers/observability/render-health-alert.mjs
           node --check workers/observability/tests/render-health-alert.test.mjs
+          node --check workers/observability/runtime.mjs
+          node --check workers/observability/tests/runtime-harness.mjs
+          node --check workers/observability/tests/runtime.test.mjs
+      - name: Run durable Tail alert runtime acceptance tests
+        run: node --experimental-vm-modules --test workers/observability/tests/runtime.test.mjs
       - name: Run Tail projection acceptance tests
         run: node --experimental-vm-modules --test workers/observability/tests/project-tail-event.test.mjs
       - name: Run error-window acceptance tests
@@ -1153,7 +1199,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
