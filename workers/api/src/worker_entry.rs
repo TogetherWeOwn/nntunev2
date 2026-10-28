@@ -757,6 +757,54 @@ async fn insert_credential_on(
     Ok(())
 }
 
+async fn complete_registration_on(
+    client: &mut tokio_postgres::Client,
+    challenge: &PasskeyChallenge,
+    magic: &MagicLinkRecord,
+    invite: Option<&InviteRecord>,
+    credential: &PasskeyCredential,
+    now: u64,
+) -> Result<(), StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    let mut claims = vec![
+        SingleUseClaim::Challenge {
+            record: challenge,
+            now,
+        },
+        SingleUseClaim::MagicLink { record: magic, now },
+    ];
+    if let Some(record) = invite {
+        claims.push(SingleUseClaim::Invite { record });
+    }
+    for claim in claims {
+        if claim_single_use_on(&transaction, claim).await? != 1 {
+            return Err(StoreError);
+        }
+    }
+    insert_credential_on(&transaction, credential).await?;
+    // Any earlier error or deadline drops the transaction and rolls back
+    // every claim before another request can observe a partial enrollment.
+    transaction.commit().await.map_err(|_| StoreError)
+}
+
+async fn prune_expired_challenges_on(
+    client: &impl GenericClient,
+    now: u64,
+) -> Result<(), StoreError> {
+    // Enrollment may hold a challenge while waiting on a later claim. Do not
+    // stall unrelated auth starts once it expires; a later prune retries it.
+    client
+        .execute(
+            "DELETE FROM auth_challenges WHERE id IN (\
+             SELECT id FROM auth_challenges WHERE expires_at <= $1 \
+             FOR UPDATE SKIP LOCKED)",
+            &[&i64_of(now)?],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
@@ -880,27 +928,8 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                let transaction = client.transaction().await.map_err(|_| StoreError)?;
-                let mut claims = vec![
-                    SingleUseClaim::Challenge {
-                        record: challenge,
-                        now,
-                    },
-                    SingleUseClaim::MagicLink { record: magic, now },
-                ];
-                if let Some(record) = invite {
-                    claims.push(SingleUseClaim::Invite { record });
-                }
-                for claim in claims {
-                    if claim_single_use_on(&transaction, claim).await? != 1 {
-                        return Err(StoreError);
-                    }
-                }
-                insert_credential_on(&transaction, credential).await?;
-                // Any earlier error or deadline drops the transaction and
-                // rolls back ALL claims, rather than compensating flags
-                // after they were made visible to concurrent requests.
-                transaction.commit().await.map_err(|_| StoreError)
+                complete_registration_on(&mut client, challenge, magic, invite, credential, now)
+                    .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1839,14 +1868,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                client
-                    .execute(
-                        "DELETE FROM auth_challenges WHERE expires_at <= $1",
-                        &[&i64_of(now)?],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                prune_expired_challenges_on(&client, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
