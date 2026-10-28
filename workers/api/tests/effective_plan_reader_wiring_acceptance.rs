@@ -107,6 +107,10 @@ fn real_pgstore_source_connects_once_and_passes_sql_and_one_bound_identity_to_qu
         block.contains("StoreError"),
         "driver failures must become the opaque storage error"
     );
+    assert!(
+        block.contains(".query(sql,&[&params[0]]).await.map_err(|_|StoreError)?"),
+        "query driver failures must map to the opaque storage error"
+    );
     for forbidden in [
         ".execute(",
         ".batch_execute(",
