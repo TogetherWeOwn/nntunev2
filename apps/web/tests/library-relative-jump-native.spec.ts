@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { createServer, request, type Server } from 'node:http';
+import { lookup } from 'node:dns';
 import type { AddressInfo } from 'node:net';
 
 // Real Chromium media: no duration/currentTime/paused overrides. Range and
@@ -21,7 +22,13 @@ test.beforeAll(async ({}, info) => {
 	const upstream = info.project.use.baseURL!;
 	server = createServer((req, res) => {
 		if (!req.url?.startsWith('/native-audio/')) {
-			const proxy = request(upstream, { path: req.url ?? '/' }, (response) => {
+			const proxy = request(upstream, {
+				path: req.url ?? '/',
+				// Containers can have IPv6 loopback without a global IPv6 address.
+				// Node's implicit ADDRCONFIG drops ::1 there even when Vite uses it.
+				autoSelectFamily: true,
+				lookup: (hostname, options, callback) => lookup(hostname, { ...options, hints: 0 }, callback)
+			}, (response) => {
 				res.writeHead(response.statusCode ?? 500, response.headers);
 				response.pipe(res);
 			});
@@ -61,7 +68,8 @@ async function open(page: Page, progressive = false) {
 		{ id: 'native-b', title: 'Native B', streamUrl: '/native-audio/range/b.wav' }
 	];
 	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
-	await page.goto(`${origin}/library`);
+	const response = await page.goto(`${origin}/library`);
+	expect(response?.status(), 'native fixture preview proxy must reach the configured upstream').toBe(200);
 	for (const item of items) {
 		await page.getByTestId('library-item').filter({ has: page.getByRole('button', { name: item.title, exact: true }) })
 			.getByRole('button', { name: item.title, exact: true }).click();
