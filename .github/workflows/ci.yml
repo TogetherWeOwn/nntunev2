@@ -1058,6 +1058,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # admission windows use trusted main merge provenance
           persist-credentials: false
       # The pinned self-installer runs one `npm ci` with no retry, so retry
       # it once in-job. Each attempt recreates its bootstrap dir and exports
@@ -1080,7 +1081,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       # Client-JS bundle budget: fail when the built client output exceeds
-      # the budget pinned in check_web_bundle_budget.py. Runs in
+      # the base + validated decision ledger in check_web_bundle_budget.py. Runs in
       # this job so the fresh `pnpm build` output is present; the checker is
       # fail-closed when the output dir is missing. Absolute script paths
       # because this job defaults to working-directory apps/web. Keep this

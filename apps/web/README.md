@@ -28,12 +28,14 @@ system libraries Chromium links against; see `playwright.config.ts`.
 
 ## Bundle budget
 
-CI fails `web-build` when total client JS exceeds **337,920 B (330 KiB)**,
+CI fails `web-build` when total client JS exceeds its admitted ceiling,
+starting from the frozen base **337,920 B (330 KiB)**,
 measured as raw bytes over every `*.js` file under
 `.svelte-kit/output/client` after `pnpm build`. The budget is pinned in
 [`check_web_bundle_budget.py`](../../.github/scripts/check_web_bundle_budget.py)
-(`BUDGET_CLIENT_JS_BYTES`), which also documents the value and this update
-procedure — that script is the single source of truth. Baseline was 306,065 B
+(`BUDGET_CLIENT_JS_BYTES`) plus append-only decision deltas under
+`ci/budgets/web-client-js/`. The checker documents the JSON schema and
+validates the admission policy. Baseline was 306,065 B
 (~299 KiB, 37 files) on 2026-10-27, leaving ~10% headroom for the next
 first-party features while catching heavy additions (a charting or date
 library typically adds 50+ KiB).
@@ -46,11 +48,21 @@ application features and the raw-byte gate remain unchanged. Verify the result
 with `pnpm --dir apps/web build` followed by
 `python3 .github/scripts/check_web_bundle_budget.py` from the repository root.
 
-To update the budget deliberately, in its own PR: rebuild, confirm the growth
-is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
-with a comment citing the reason, and update the number in this paragraph.
-Never bump it just to make a red build green. Wasm/script size gates are out
-of scope here (tracked separately as Wasm enforcement).
+Admit explained growth in the **same feature PR**, after measuring current
+base and integrated-head builds and checking for accidental dependencies or
+duplicate imports. Add a new JSON decision with unit, positive integer delta,
+measured before/after bytes, and cause; do not edit the frozen base or previous
+decisions. CI sums every new file per PR and allows at most 0.5% of the current
+ceiling. The rolling seven-day sum is capped at 2% of the ceiling before that
+window; main merge timestamps, not file dates, determine inclusion. Queue
+squashes are attributed separately and checked together against that allowance.
+Full checkout history is required. Normal review and all other checks remain
+mandatory; larger changes need a separately reviewed policy decision.
+
+A nonblocking warning begins one block below the ceiling (0.5% rounded down
+to 256 B; byte precision below 256 B, minimum 1 B). The hard byte ceiling,
+missing/empty-output failures, and Wasm/script gates remain unchanged. Never
+raise latency, rendering, security, or required-check targets to admit bytes.
 
 ## Deploy
 
