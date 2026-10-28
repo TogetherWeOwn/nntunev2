@@ -274,6 +274,7 @@ test('LIBNOWPLAY-LN12 stream loss and clear remove previously visible identity, 
 	const noStream = await hidden(page);
 	await replace(page);
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await check(info, { before: expectedCoral, noStream: { sections: 0, readouts: 0, audio: 0 }, cleared: { sections: 0, readouts: 0, audio: 0 } }, {
 		before, noStream, cleared: await hidden(page)
 	});

@@ -943,6 +943,7 @@ test('LIBRESTART-LR15 guard: no playable current track never exposes an enabled 
 	await mountCoral(page);
 	await mockMedia(page, { time: 30, duration: 120 });
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await settle(page);
 	const cleared = {
 		audio: await audio(page).count(),
@@ -954,7 +955,7 @@ test('LIBRESTART-LR15 guard: no playable current track never exposes an enabled 
 	await settle(page);
 
 	await check(info, {
-		cleared: { audio: cleared.audio, enabled: false },
+		cleared: { audio: 0, enabled: false },
 		streamlessAudio: 0,
 		streamlessEnabled: false,
 		pageErrors: 0
