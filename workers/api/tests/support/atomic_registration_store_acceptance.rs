@@ -5,7 +5,7 @@
 //! native suite lists these as ignored; api-migrations explicitly requires and
 //! runs every test below against its migrated, throwaway PostgreSQL service.
 
-use super::{complete_registration_on, prune_expired_challenges_on};
+use super::{complete_registration_on, prune_expired_challenges_on, reap_unverified_users_on};
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
 use std::future::Future;
 use std::time::Duration;
@@ -15,6 +15,11 @@ const NOW: u64 = 1_700_000_000;
 const RP: &str = "passkey.example.com";
 const ORIGIN: &str = "https://passkey.example.com";
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+// Cleanup is called at REAP_NOW, after the aged fixtures' proofs (expiring at
+// NOW + 10) have expired, while enrollment itself claimed them at NOW.
+const REAP_NOW: u64 = NOW + 20;
+const REAP_TTL: u64 = 3600;
+const CLEANUP_BOUND: Duration = Duration::from_secs(2);
 
 fn run_test(test: impl Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
@@ -520,5 +525,388 @@ fn postgres_challenge_cleanup_skips_locked_expired_row_and_retries() {
             .expect("observe retried cleanup");
         assert_eq!(rows.len(), 1, "both expired rows are eventually removed");
         assert_eq!(rows[0].get::<_, String>(0), live.challenge.id);
+    });
+}
+
+// --- Reap-before-prune coordination with an in-flight enrollment ----------
+
+/// Make a fixture reap-eligible but for lock coordination: an old signup
+/// whose challenge and emailed proof are still claimable at NOW yet expired
+/// by REAP_NOW, when the production reaper and pruner run.
+async fn age_signup(client: &Client, fixture: &mut Fixture) {
+    fixture.challenge.expires_at = NOW + 10;
+    fixture.magic.expires_at = NOW + 10;
+    client
+        .execute(
+            "UPDATE users SET created_at = $1 WHERE id = $2",
+            &[&((NOW - 100_000) as i64), &fixture.credential.user_id],
+        )
+        .await
+        .expect("age the disposable signup past the reap cutoff");
+    client
+        .execute(
+            "UPDATE auth_challenges SET expires_at = $1 WHERE id = $2",
+            &[&((NOW + 10) as i64), &fixture.challenge.id],
+        )
+        .await
+        .expect("shorten the disposable challenge expiry");
+    client
+        .execute(
+            "UPDATE magic_link_tokens SET expires_at = $1 WHERE token_hash = $2",
+            &[&((NOW + 10) as i64), &fixture.magic.token_hash],
+        )
+        .await
+        .expect("shorten the disposable emailed-proof expiry");
+}
+
+async fn count(client: &Client, statement: &str, id: &str) -> i64 {
+    client
+        .query_one(statement, &[&id])
+        .await
+        .expect("observe disposable row counts without taking row locks")
+        .get(0)
+}
+
+async fn user_count(client: &Client, user_id: &str) -> i64 {
+    count(client, "SELECT count(*) FROM users WHERE id = $1", user_id).await
+}
+
+async fn challenge_count(client: &Client, challenge_id: &str) -> i64 {
+    count(
+        client,
+        "SELECT count(*) FROM auth_challenges WHERE id = $1",
+        challenge_id,
+    )
+    .await
+}
+
+/// Poll until the production enrollment backend reports an ungranted lock.
+/// The invite row is the only contended lock in this setup, and program
+/// order in `complete_registration_on` (parent lock, challenge claim, magic
+/// claim, invite claim) then proves the earlier statements have executed in
+/// the actual production function. This synchronizes on the lock wait
+/// itself; elapsed time alone would prove nothing.
+async fn await_enrollment_lock_wait(observer: &Client, enrollment_pid: i32) {
+    for _ in 0..500 {
+        let waiting = observer
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE pid = $1 AND NOT granted",
+                &[&enrollment_pid],
+            )
+            .await
+            .expect("observe the enrollment backend's lock wait")
+            .get::<_, i64>(0);
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("production enrollment never blocked on the contended invite claim");
+}
+
+struct BlockedEnrollment {
+    fixture: Fixture,
+    unrelated: Fixture,
+    cleanup: Client,
+    locker: Client,
+    enrollment: Option<tokio::task::JoinHandle<(Client, Result<(), ()>)>>,
+}
+
+/// Start the actual production enrollment for an aged fixture and block it
+/// on an invite row locked by an independent connection.
+async fn blocked_enrollment() -> BlockedEnrollment {
+    let cleanup = connect().await;
+    let mut fixture = Fixture::seed(&cleanup).await;
+    age_signup(&cleanup, &mut fixture).await;
+    let mut unrelated = Fixture::seed(&cleanup).await;
+    age_signup(&cleanup, &mut unrelated).await;
+
+    let locker = connect().await;
+    locker
+        .batch_execute("BEGIN")
+        .await
+        .expect("open the invite-locker transaction");
+    locker
+        .query_one(
+            "SELECT code_hash FROM invite_codes WHERE code_hash = $1 FOR UPDATE",
+            &[&fixture.invite.code_hash],
+        )
+        .await
+        .expect("hold the invite row on an independent connection");
+
+    let mut enrollment_client = connect().await;
+    // Enrollment deliberately waits on the invite while cleanup runs. Keep
+    // that wait bounded, but beyond the cleanup phase; the 15-second test
+    // bound still applies overall.
+    enrollment_client
+        .batch_execute("SET statement_timeout = '12s'; SET lock_timeout = '10s'")
+        .await
+        .expect("bound the deliberately blocked enrollment claim");
+    let enrollment_pid = enrollment_client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("identify the enrollment backend")
+        .get::<_, i32>(0);
+    let (challenge, magic, invite, credential) = (
+        fixture.challenge.clone(),
+        fixture.magic.clone(),
+        fixture.invite.clone(),
+        fixture.credential.clone(),
+    );
+    let enrollment = tokio::spawn(async move {
+        let result = complete_registration_on(
+            &mut enrollment_client,
+            &challenge,
+            &magic,
+            Some(&invite),
+            &credential,
+            NOW,
+        )
+        .await
+        .map_err(|_| ());
+        (enrollment_client, result)
+    });
+    await_enrollment_lock_wait(&cleanup, enrollment_pid).await;
+    BlockedEnrollment {
+        fixture,
+        unrelated,
+        cleanup,
+        locker,
+        enrollment: Some(enrollment),
+    }
+}
+
+/// Run the production cleanup in register-start order (reap, then prune)
+/// against the blocked enrollment. Both helpers must return promptly,
+/// preserve the in-flight signup, and still reap the unrelated old signup.
+async fn assert_reap_before_prune_defers(blocked: &mut BlockedEnrollment) {
+    let fixture_user = blocked.fixture.credential.user_id.clone();
+    let unrelated_user = blocked.unrelated.credential.user_id.clone();
+    tokio::time::timeout(
+        CLEANUP_BOUND,
+        reap_unverified_users_on(&mut blocked.cleanup, REAP_NOW, REAP_TTL, None),
+    )
+    .await
+    .expect("user reaper must not wait for the in-flight enrollment")
+    .expect("production user reaper succeeds under enrollment contention");
+    assert_eq!(
+        user_count(&blocked.cleanup, &fixture_user).await,
+        1,
+        "reaper must preserve the in-flight enrollment's user"
+    );
+    assert_eq!(
+        user_count(&blocked.cleanup, &unrelated_user).await,
+        0,
+        "reaper must still reap an unrelated eligible old signup"
+    );
+    tokio::time::timeout(
+        CLEANUP_BOUND,
+        prune_expired_challenges_on(&blocked.cleanup, REAP_NOW),
+    )
+    .await
+    .expect("challenge pruner must not wait for the in-flight enrollment")
+    .expect("production challenge pruner succeeds under enrollment contention");
+    assert_eq!(
+        challenge_count(&blocked.cleanup, &blocked.fixture.challenge.id).await,
+        1,
+        "pruner must defer the challenge claimed by the in-flight enrollment"
+    );
+    blocked
+        .fixture
+        .assert_state(&blocked.cleanup, (false, false, false, 0))
+        .await;
+}
+
+async fn finish_enrollment(blocked: &mut BlockedEnrollment) -> Result<(), ()> {
+    let enrollment = blocked
+        .enrollment
+        .take()
+        .expect("enrollment task must be joined exactly once");
+    let (_enrollment_client, result) = tokio::time::timeout(Duration::from_secs(10), enrollment)
+        .await
+        .expect("enrollment must finish once the invite lock is released")
+        .expect("enrollment task must not panic");
+    result
+}
+
+// Removing enrollment's parent lock (FOR KEY SHARE) lets the reaper select
+// this user and stall on the claimed child rows, hitting the cleanup bound.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_before_prune_preserves_in_flight_enrollment() {
+    run_test(async {
+        let mut blocked = blocked_enrollment().await;
+        assert_reap_before_prune_defers(&mut blocked).await;
+
+        blocked
+            .locker
+            .batch_execute("COMMIT")
+            .await
+            .expect("release the invite lock without spending the invite");
+        let result = finish_enrollment(&mut blocked).await;
+        assert!(
+            result.is_ok(),
+            "enrollment must commit once the invite lock is released"
+        );
+        blocked
+            .fixture
+            .assert_state(&blocked.cleanup, (true, true, true, 1))
+            .await;
+        blocked.fixture.assert_credential(&blocked.cleanup).await;
+
+        // Deferred cleanup retries after the protecting transaction ends:
+        // the reaper now spares the credentialed user, and the pruner
+        // removes the expired challenge it previously had to skip.
+        let fixture_user = blocked.fixture.credential.user_id.clone();
+        reap_unverified_users_on(&mut blocked.cleanup, REAP_NOW, REAP_TTL, None)
+            .await
+            .expect("retry production user reaper after enrollment commits");
+        assert_eq!(
+            user_count(&blocked.cleanup, &fixture_user).await,
+            1,
+            "retried reaper must spare the now-credentialed user"
+        );
+        prune_expired_challenges_on(&blocked.cleanup, REAP_NOW)
+            .await
+            .expect("retry production challenge pruner after enrollment commits");
+        assert_eq!(
+            challenge_count(&blocked.cleanup, &blocked.fixture.challenge.id).await,
+            0,
+            "retried pruner must remove the expired challenge"
+        );
+        assert_eq!(user_count(&blocked.cleanup, &fixture_user).await, 1);
+        blocked.fixture.assert_credential(&blocked.cleanup).await;
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_after_enrollment_rollback_cleans_expired_signup() {
+    run_test(async {
+        let mut blocked = blocked_enrollment().await;
+        assert_reap_before_prune_defers(&mut blocked).await;
+
+        blocked
+            .locker
+            .execute(
+                "UPDATE invite_codes SET used = TRUE WHERE code_hash = $1",
+                &[&blocked.fixture.invite.code_hash],
+            )
+            .await
+            .expect("another request spends the invite while enrollment waits");
+        blocked
+            .locker
+            .batch_execute("COMMIT")
+            .await
+            .expect("release the invite lock after spending it");
+        let result = finish_enrollment(&mut blocked).await;
+        assert!(
+            result.is_err(),
+            "enrollment must roll back when its invite claim loses"
+        );
+        blocked
+            .fixture
+            .assert_state(&blocked.cleanup, (false, false, true, 0))
+            .await;
+
+        // With the protecting transaction gone and no credential committed,
+        // retried reap-before-prune cleanup now removes the expired signup.
+        let fixture_user = blocked.fixture.credential.user_id.clone();
+        reap_unverified_users_on(&mut blocked.cleanup, REAP_NOW, REAP_TTL, None)
+            .await
+            .expect("retry production user reaper after enrollment rolls back");
+        assert_eq!(
+            user_count(&blocked.cleanup, &fixture_user).await,
+            0,
+            "retried reaper must remove the rolled-back expired signup"
+        );
+        assert_eq!(
+            challenge_count(&blocked.cleanup, &blocked.fixture.challenge.id).await,
+            0,
+            "reaping the user must cascade to its expired challenge"
+        );
+        prune_expired_challenges_on(&blocked.cleanup, REAP_NOW)
+            .await
+            .expect("retry production challenge pruner after the reap");
+    });
+}
+
+// Drive the two production reaper statements in production sequence so the
+// delete's eligibility recheck can be observed against a candidate list
+// selected before a credential existed. The credential is inserted by the
+// reaper transaction itself: a cross-transaction insert would take the
+// foreign-key parent lock and wait behind the candidate lock, so it cannot
+// be the synchronizing seam here. What this pins is that the second
+// statement reapplies the full eligibility filter to the locked ids rather
+// than deleting by id alone; the statement sequencing and READ COMMITTED
+// fresh snapshot are pinned with it in
+// atomic_registration_reap_wiring_acceptance.rs.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_delete_rechecks_locked_candidates_before_deleting() {
+    run_test(async {
+        let mut reaper = connect().await;
+        let mut enrolled = Fixture::seed(&reaper).await;
+        age_signup(&reaper, &mut enrolled).await;
+        let mut abandoned = Fixture::seed(&reaper).await;
+        age_signup(&reaper, &mut abandoned).await;
+
+        let cutoff = (REAP_NOW - REAP_TTL) as i64;
+        let now = REAP_NOW as i64;
+        let transaction = reaper
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .expect("open the reaper transaction as production does");
+        let candidates = transaction
+            .query(
+                &crate::handlers::lock_unverified_users_sql(),
+                &[&cutoff, &None::<&str>, &now],
+            )
+            .await
+            .expect("lock reap candidates with the production statement");
+        let ids: Vec<String> = candidates.iter().map(|row| row.get("id")).collect();
+        assert!(
+            ids.contains(&enrolled.credential.user_id)
+                && ids.contains(&abandoned.credential.user_id),
+            "both aged signups must be locked candidates before any credential exists"
+        );
+        transaction
+            .execute(
+                "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &enrolled.credential.cred_id_b64url,
+                    &enrolled.credential.user_id,
+                    &enrolled.credential.public_key.as_slice(),
+                    &i64::from(enrolled.credential.sign_count),
+                    &(NOW as i64),
+                ],
+            )
+            .await
+            .expect("a credential lands after candidate selection");
+        transaction
+            .execute(
+                &crate::handlers::reap_unverified_users_sql(),
+                &[&cutoff, &None::<&str>, &now, &ids],
+            )
+            .await
+            .expect("delete locked candidates with the production statement");
+        transaction
+            .commit()
+            .await
+            .expect("commit the reaper transaction");
+
+        assert_eq!(
+            user_count(&reaper, &enrolled.credential.user_id).await,
+            1,
+            "the fresh recheck must spare the candidate that gained a credential"
+        );
+        enrolled.assert_credential(&reaper).await;
+        assert_eq!(
+            user_count(&reaper, &abandoned.credential.user_id).await,
+            0,
+            "the recheck must still reap the candidate with no credential"
+        );
     });
 }

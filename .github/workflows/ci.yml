@@ -469,6 +469,10 @@ jobs:
         with:
           workspaces: workers/api
           key: api-postgres-acceptance
+      # The bank runner's own inventory guard: a missing, empty or extra
+      # compiled inventory must be rejected before any execution starts.
+      - name: Verify PostgreSQL acceptance inventory guard
+        run: python3 workers/api/tests/test_atomic_registration_store_runner.py
       # The production Rust transaction and cleanup helpers, not copied SQL.
       # Enumeration is checked first: a missing module or zero matched tests
       # must fail this required job rather than silently report success.

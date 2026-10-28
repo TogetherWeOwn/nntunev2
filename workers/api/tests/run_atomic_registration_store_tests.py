@@ -26,6 +26,9 @@ EXPECTED = {
         "postgres_registration_invite_loser_rolls_back_both_earlier_claims",
         "postgres_registration_competing_transactions_enroll_exactly_one_credential",
         "postgres_challenge_cleanup_skips_locked_expired_row_and_retries",
+        "postgres_reap_before_prune_preserves_in_flight_enrollment",
+        "postgres_reap_after_enrollment_rollback_cleans_expired_signup",
+        "postgres_reap_delete_rechecks_locked_candidates_before_deleting",
     )
 }
 

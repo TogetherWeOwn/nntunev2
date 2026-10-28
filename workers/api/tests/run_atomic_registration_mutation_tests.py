@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute two enrollment negative controls in the disposable CI checkout.
+"""Execute enrollment negative controls in the disposable CI checkout.
 
 Only GitHub-hosted CI may run this script. Each temporary mutation is scoped
 strictly to the production transaction helper, and the original bytes are
@@ -31,6 +31,13 @@ MUTATIONS = (
         "claim_single_use_on(&transaction, claim).await? > 1",
         PREFIX + "postgres_registration_zero_row_magic_claim_rolls_back_earlier_challenge",
         "a zero-row later claim must abort enrollment",
+    ),
+    (
+        "missing-enrollment-parent-lock",
+        "SELECT id FROM users WHERE id = $1 FOR KEY SHARE",
+        "SELECT id FROM users WHERE id = $1",
+        PREFIX + "postgres_reap_before_prune_preserves_in_flight_enrollment",
+        "user reaper must not wait for the in-flight enrollment",
     ),
 )
 
