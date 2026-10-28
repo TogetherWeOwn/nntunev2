@@ -390,7 +390,8 @@ pub fn rotate_session(
 
 /// Recovery is an explicitly client-bound retry, never a stale-cookie grace
 /// period. The client must create a fresh 256-bit random secret BEFORE sending
-/// a refresh and retain it only until the response is received (or 120s elapse).
+/// a refresh, serialize cookie writers across tabs, and retain it until all
+/// attempts settle after success (or recovery expires). See the API README.
 pub const REFRESH_RETRY_SECS: u64 = 120;
 
 /// Bind the separately supplied client secret to this exact predecessor token.
@@ -415,18 +416,19 @@ pub(crate) fn refresh_retry_hash(token: &str, retry_key: &str) -> Result<String,
 /// One atomic statement handles both first delivery and a bound retry. Both
 /// paths require a live, same-owner row. A retry may only recover the immediate
 /// successor, within the ORIGINAL window; it cannot rotate again or extend
-/// expiry. PostgreSQL rechecks the predicate under its UPDATE row lock, so
-/// identical concurrent attempts converge and different keys cannot both win.
+/// expiry. Execute only after locking this session row in a transaction and
+/// sampling the database clock AFTER that lock (see `session_retry_store`). A
+/// request-time snapshot is neither an expiry bound nor a serialization clock.
 /// Parameters: id, user, created_at, old counter, old expiry, next counter,
-/// next expiry, credential digest, now, now - REFRESH_RETRY_SECS.
+/// next expiry, credential digest, claim time, claim time - REFRESH_RETRY_SECS.
 pub const ROTATE_SESSION_WITH_RETRY_SQL: &str = "UPDATE sessions
 SET rotation_counter = $6,
     expires_at = CASE WHEN rotation_counter = $4 THEN $7 ELSE expires_at END,
     refresh_retry_hash = $8,
     refresh_issued_at = CASE WHEN rotation_counter = $4 THEN $9 ELSE refresh_issued_at END
 WHERE id = $1 AND user_id = $2 AND created_at = $3
-  AND revoked = FALSE AND expires_at > $9
-  AND ((rotation_counter = $4 AND expires_at = $5)
+  AND revoked = FALSE AND expires_at > $9 AND $5 > $9
+  AND ((rotation_counter = $4 AND expires_at = $5 AND $7 > $9)
        OR (rotation_counter = $6 AND refresh_retry_hash = $8
            AND refresh_issued_at <= $9 AND refresh_issued_at > $10))
 RETURNING id, user_id, created_at, expires_at, rotation_counter, refresh_issued_at";

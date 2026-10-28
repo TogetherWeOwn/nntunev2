@@ -129,14 +129,33 @@ The same exact `Origin` and signed session cookie are still required.
 - Recovery only reissues the immediate successor; it never rotates again,
   extends expiry, resets authentication age, or reopens a revoked session.
   The window is **strictly less than 120 seconds** from the original successor
-  issuance timestamp and is never extended by retry. The predecessor must also still
+  issuance timestamp and is never extended by retry. PostgreSQL locks the row
+  before sampling a fresh database clock, then rechecks both token expiries
+  and the receipt deadline in the same transaction; time spent waiting for
+  that lock counts against the window. The predecessor must also still
   pass its signed-token lifetime checks. Another rotation, logout,
   revoke-all, reauthentication, or account deletion closes recovery.
-- After success, discard the secret. After the window or either token's
-  expiry, sign in again; do not fall back to accepting a stale cookie. If
-  the browser already installed the successor cookie before reporting a
-  network failure, a retry can perform another ordinary authenticated
-  rotation; it cannot recover a different session or bypass revocation.
+- **Cross-tab single-flight is mandatory for cookie clients.** Serialize all
+  session-cookie mutations across every tab/window sharing the cookie jar,
+  including bound/unbound refresh, sign-in, logout, and reauthentication.
+  Hold one same-origin Web Lock (or equivalent shared coordinator) for the
+  entire logical operation, including delivery of response headers and all
+  retries. No hedged or overlapping live requests: a delayed duplicate's
+  `Set-Cookie` can otherwise overwrite a newer generation. This protocol
+  does not make same-name browser cookies generation-safe.
+- Retry only after the previous HTTP attempt has fully settled and cannot
+  deliver further cookie-mutating headers. A timeout or `AbortController.abort()`
+  alone is **not** proof of that boundary. If the transport cannot establish
+  settlement, do not start another cookie mutation; retain the operation's
+  recovery state and fail closed until it can. All contexts must use the
+  coordinator; one tab's in-memory mutex is not sufficient.
+- After success **and settlement of every outstanding attempt**, discard the
+  secret and release the coordinator before starting the next logical
+  operation. After the window or either token's expiry, require a new sign-in
+  under that same coordinator; never accept a stale cookie. If the browser
+  already installed the successor cookie before reporting a network failure,
+  a settled retry can perform another ordinary authenticated rotation; it
+  cannot recover a different session or bypass revocation.
 - Success stays `200 {"ok":true}` with the secure HttpOnly cookie; secrets
   and digests never appear in response bodies or audit fields. All reads
   and writes use the current server-side row. Only the digest and original
@@ -145,7 +164,9 @@ The same exact `Origin` and signed session cookie are still required.
 Apply app migration `0024_session_refresh_retry.sql` **before** deploying
 this Worker. Unsupported/unmigrated storage fails closed with 5xx, never an
 unbound recovery. No current web caller automatically opts into this
-protocol; adoption requires retaining the per-operation secret as above.
+protocol; adoption requires both the per-operation secret and the shared
+single-flight coordinator above. Do not opt in while older tabs or clients
+can still write this cookie without participating in that coordinator.
 The security decision is deliberate: no blanket previous-token allowance,
 no weakened replay tests, and no recovery from possession of a stale
 cookie alone. Stealing both the predecessor cookie and its separately

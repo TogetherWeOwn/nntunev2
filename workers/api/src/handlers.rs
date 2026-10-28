@@ -666,9 +666,12 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>>;
     /// Atomically rotate a current session OR recover its immediate successor
     /// using a digest bound to the old cookie and a separate client retry secret.
-    /// Execute `session::ROTATE_SESSION_WITH_RETRY_SQL`; a missing/revoked/stale
-    /// row or mismatched/expired recovery must return None. The default fails
-    /// closed for stores that have not implemented the new protocol.
+    /// Lock the row BEFORE sampling a fresh database claim clock, then execute
+    /// `session::ROTATE_SESSION_WITH_RETRY_SQL` in that transaction (production:
+    /// `session_retry_store::rotate_with_retry`). Recheck both expiries and the
+    /// receipt window at the claim, not at request arrival. A missing/revoked/
+    /// stale row or mismatched/expired recovery must return None. The default
+    /// fails closed for stores that have not implemented the new protocol.
     fn rotate_session_with_retry(
         &self,
         _previous: &SessionClaims,
@@ -5326,6 +5329,53 @@ mod tests {
         let mut ctx = h.ctx();
         ctx.now = now;
         block_on(handle(&ctx, &req))
+    }
+
+    #[test]
+    fn refresh_retry_delivery_contract_settles_headers_before_next_cookie_mutation() {
+        let protocol = include_str!("../README.md");
+        assert!(protocol.contains("Cross-tab single-flight is mandatory"));
+        assert!(protocol.contains("No hedged or overlapping live requests"));
+        assert!(protocol.contains("settlement of every outstanding attempt"));
+        assert!(protocol.contains("not** proof of that boundary"));
+        for settle_before_advance in [false, true] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let predecessor = magic_login(&h, "a@example.com");
+            let key = crate::b64::encode(&[42u8; 32]);
+            // Hold response A's HEADERS, not just its body. The second response
+            // can carry the same successor; the database cannot order delivery.
+            let delayed = bound_refresh(&h, &predecessor, &key, NOW, Some(ORIGIN));
+            let delivered = bound_refresh(&h, &predecessor, &key, NOW, Some(ORIGIN));
+            assert_eq!(delayed.status, 200);
+            assert_eq!(delivered.status, 200);
+            let mut cookie_jar = cookie_of(&delivered);
+            assert_eq!(cookie_of(&delayed), cookie_jar);
+            if settle_before_advance {
+                // Drain every outstanding header before releasing the shared
+                // cookie-writer lock or disposing of this operation's secret.
+                cookie_jar = cookie_of(&delayed);
+            }
+            let advanced = h.call_full(
+                "POST",
+                "/v1/session/refresh",
+                None,
+                Some(cookie_jar),
+                Some(ORIGIN),
+            );
+            assert_eq!(advanced.status, 200);
+            cookie_jar = cookie_of(&advanced);
+            if !settle_before_advance {
+                // Unsupported schedule: same-name Set-Cookie replaces C2 with
+                // C1, even though C2's response was already successfully used.
+                cookie_jar = cookie_of(&delayed);
+            }
+            let authenticated = h.call_full("GET", "/v1/vault", None, Some(cookie_jar), None);
+            assert_eq!(
+                authenticated.status,
+                if settle_before_advance { 200 } else { 401 }
+            );
+        }
     }
 
     #[test]

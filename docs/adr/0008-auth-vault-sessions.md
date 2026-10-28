@@ -51,8 +51,15 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
    client-generated 256-bit retry secret bound to the exact predecessor cookie.
    An atomic row claim may reissue only the immediate successor within 120
    seconds of its original issuance, subject to both tokens' expiry and the
-   current row's revocation/counter. There is no stale-cookie grace period:
-   ordinary authentication and empty-body refresh still reject old counters.
+   current row's revocation/counter. The transaction locks the row before
+   sampling the database claim clock; request arrival time is not the deadline
+   or serialization boundary. Cookie-client adoption additionally requires
+   cross-tab single-flight for every cookie writer: all HTTP attempts must
+   settle before another rotation or secret disposal. Abort/timeout alone is
+   not settlement; uncoordinated older tabs preclude opt-in. Duplicate response
+   headers are not generation-safe in a same-name browser cookie jar.
+   There is no stale-cookie grace period: ordinary authentication and
+   empty-body refresh still reject old counters.
    See `workers/api/README.md` for the protocol and migration ordering.
 4. **Magic links:** 256-bit random, SHA-256 at rest, 15-minute expiry,
    one generic failure message. Single-use is a database invariant, not

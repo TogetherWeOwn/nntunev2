@@ -1101,41 +1101,18 @@ impl Store for PgStore {
         previous: &crate::session::SessionClaims,
         next: &crate::session::SessionClaims,
         retry_hash: &str,
-        now: u64,
+        _now: u64,
     ) -> Result<Option<crate::session::SessionClaims>, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                let row = client
-                    .query_opt(
-                        crate::session::ROTATE_SESSION_WITH_RETRY_SQL,
-                        &[
-                            &previous.session_id,
-                            &previous.user_id,
-                            &i64_of(previous.created_at)?,
-                            &i32::try_from(previous.rotation_counter).map_err(|_| StoreError)?,
-                            &i64_of(previous.expires_at)?,
-                            &i32::try_from(next.rotation_counter).map_err(|_| StoreError)?,
-                            &i64_of(next.expires_at)?,
-                            &retry_hash,
-                            &i64_of(now)?,
-                            &i64_of(now.saturating_sub(crate::session::REFRESH_RETRY_SECS))?,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    let counter: i32 = r.try_get("rotation_counter").map_err(|_| StoreError)?;
-                    Ok(crate::session::SessionClaims {
-                        session_id: r.try_get("id").map_err(|_| StoreError)?,
-                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
-                        issued_at: u64_of(r.try_get("refresh_issued_at").map_err(|_| StoreError)?)?,
-                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                        rotation_counter: u32::try_from(counter).map_err(|_| StoreError)?,
-                    })
-                })
-                .transpose()
+                let mut client = self.connect().await?;
+                crate::session_retry_store::rotate_with_retry(
+                    &mut client,
+                    previous,
+                    next,
+                    retry_hash,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
