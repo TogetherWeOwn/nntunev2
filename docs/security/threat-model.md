@@ -341,6 +341,17 @@ Fenced writers (account-owned creates/restores, api/ingest/stream):
   the `account_deleting` probe into the typed 409. `delete_vault`
   is deliberately NOT fenced — removal cannot restore state, and the
   erasure executor deletes the row anyway.
+- **api providers mint** (`save_vault_and_mint_provider` in
+  `workers/api/src/worker_entry.rs`): the vault upsert, the
+  `providers` mint (`workers/api/src/providers.rs`, fenced
+  `INSERT ... SELECT` with the id cast `$1::text::uuid`), and the
+  rotation prune of superseded unreferenced rows run in one
+  transaction — a 0-row write on either fenced statement rolls
+  everything back, so a failed mint never leaves a committed vault
+  row the client was told failed. `delete_vault` purges the user's
+  unreferenced `providers` rows alongside the vault row (also
+  unfenced — removal cannot restore state); grant-referenced rows
+  survive under the `RESTRICT` attribution guarantee.
 - **api test-connection lease acquire** (`vault_test_leases` insert in
   `workers/api/src/worker_entry.rs`): fenced like the upsert, so a
   deleting account acquires no new lease rows; a fenced lease returns
