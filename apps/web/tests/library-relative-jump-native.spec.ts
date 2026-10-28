@@ -21,7 +21,7 @@ test.beforeAll(async ({}, info) => {
 	const upstream = info.project.use.baseURL!;
 	server = createServer((req, res) => {
 		if (!req.url?.startsWith('/native-audio/')) {
-			const proxy = request(new URL(req.url ?? '/', upstream), (response) => {
+			const proxy = request(upstream, { path: req.url ?? '/' }, (response) => {
 				res.writeHead(response.statusCode ?? 500, response.headers);
 				response.pipe(res);
 			});
