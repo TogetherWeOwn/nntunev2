@@ -91,9 +91,16 @@ fn bind_values<'a>(
                 Value::Text(value) if *ty == Type::UUID => {
                     Box::new(Uuid::parse_str(value).map_err(|_| data_error())?)
                 }
-                Value::Text(value) => Box::new(value.as_str()),
-                Value::I64(value) => Box::new(value),
-                Value::I32(value) => Box::new(value),
+                Value::Text(value)
+                    if matches!(*ty, Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME) =>
+                {
+                    Box::new(value.as_str())
+                }
+                Value::I64(value) if *ty == Type::INT8 => Box::new(value),
+                Value::I32(value) if *ty == Type::INT4 => Box::new(value),
+                // Local type mismatches have no driver SQLSTATE. Reject here
+                // as data errors instead of retrying them as transport faults.
+                _ => return Err(data_error()),
             };
             Ok(bind)
         })

@@ -48,11 +48,12 @@ pub fn upsert_ingest_job_sql() -> &'static str {
     "INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status) SELECT $1, $2, $3, $4, 'queued' FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (id) DO NOTHING"
 }
 
-/// Disambiguate an ignored admission insert using its immutable identity.
-/// Parameter: job `id` ($1). The caller compares both stored fields; the probe
-/// cannot authorize a new write or adopt another owner's job.
+/// Disambiguate an ignored admission insert using its immutable identity and
+/// the stored owner's current deletion fence. Parameter: job `id` ($1). The
+/// caller compares both stored fields; a persisted job alone cannot authorize
+/// admission after deletion starts or adopt another owner's job.
 pub fn select_ingest_job_identity_sql() -> &'static str {
-    "SELECT user_id, idempotency_key FROM ingest_jobs WHERE id = $1"
+    "SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id WHERE ingest_jobs.id = $1 AND users.deleting_at IS NULL FOR SHARE OF users"
 }
 
 /// `$n` parameter order for [`transition_ingest_job_sql`].

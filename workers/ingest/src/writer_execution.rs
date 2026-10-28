@@ -233,10 +233,17 @@ pub async fn publish_media(
                 .await
                 .map_err(db_error)?,
         )?;
-        let mut expected = media_key.to_vec();
-        expected.extend([text("opus"), Value::I32(64)]);
-        if row != expected {
-            return Err(invalid());
+        // UUID wire decoding canonicalizes case. Compare the track's parsed
+        // identity, but keep every other identity/profile field exact.
+        let track_id = uuid::Uuid::parse_str(&p.track_id).map_err(|_| invalid())?;
+        match row.as_slice() {
+            [user, Value::Text(track), job, hash, Value::Text(format), Value::I32(64)]
+                if user == &media_key[0]
+                    && uuid::Uuid::parse_str(track).ok() == Some(track_id)
+                    && job == &media_key[2]
+                    && hash == &media_key[3]
+                    && format == "opus" => {}
+            _ => return Err(invalid()),
         }
     }
     let grant_key = [text(&p.user_id), text(&p.content_hash)];
