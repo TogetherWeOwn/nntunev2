@@ -29,6 +29,10 @@ use crate::handlers::{
     self, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission,
     QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
 };
+use crate::providers::{
+    insert_provider_sql, prune_superseded_providers_sql, purge_unreferenced_providers_sql,
+    ProviderMintRow,
+};
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, VaultBlob, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -645,6 +649,21 @@ impl PgStore {
         } else {
             None
         }
+    }
+
+    /// Fenced vault-upsert statement (ADR 0002 rule 3), shared by
+    /// [`Store::upsert_vault`] and
+    /// [`Store::save_vault_and_mint_provider`] so the two call sites can
+    /// never fork. Shape pinned in the fence test below.
+    fn upsert_vault_sql() -> &'static str {
+        "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
+         payload_nonce, payload, indexer_configured, updated_at) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+         FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
+         ON CONFLICT (user_id) DO UPDATE SET kek_version = EXCLUDED.kek_version, \
+         dek_wrapped_nonce = EXCLUDED.dek_wrapped_nonce, dek_wrapped = EXCLUDED.dek_wrapped, \
+         payload_nonce = EXCLUDED.payload_nonce, payload = EXCLUDED.payload, \
+         indexer_configured = EXCLUDED.indexer_configured, updated_at = EXCLUDED.updated_at"
     }
 }
 
@@ -1426,58 +1445,208 @@ impl Store for PgStore {
     }
 
     async fn upsert_vault(&self, user_id: &str, row: &VaultRow) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let client = self.connect().await?;
-        // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
-        // while the owner's deleting_at is NULL, holding the user row
-        // FOR SHARE through the statement, so saving provider credentials
-        // cannot repopulate user-owned state behind the deletion marker.
-        // A fenced (0-row) upsert fails closed as StoreError; the
-        // handler classifies it through `account_deleting` into the
-        // typed 409. delete_vault below is deliberately not fenced:
-        // removal cannot restore state, and the executor deletes the
-        // row anyway.
-        let affected = client
-            .execute(
-                "INSERT INTO provider_vaults (user_id, kek_version, dek_wrapped_nonce, dek_wrapped, \
-                 payload_nonce, payload, indexer_configured, updated_at) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
-                 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
-                 ON CONFLICT (user_id) DO UPDATE SET kek_version = EXCLUDED.kek_version, \
-                 dek_wrapped_nonce = EXCLUDED.dek_wrapped_nonce, dek_wrapped = EXCLUDED.dek_wrapped, \
-                 payload_nonce = EXCLUDED.payload_nonce, payload = EXCLUDED.payload, \
-                 indexer_configured = EXCLUDED.indexer_configured, updated_at = EXCLUDED.updated_at",
-                &[
-                    &user_id,
-                    &i32::try_from(row.blob.kek_version).map_err(|_| StoreError)?,
-                    &row.blob.dek_wrapped_nonce_b64url,
-                    &row.blob.dek_wrapped_b64url,
-                    &row.blob.payload_nonce_b64url,
-                    &row.blob.payload_b64url,
-                    &row.indexer_configured,
-                    &i64_of(row.updated_at)?,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        if affected == 0 {
-            return Err(StoreError);
-        }
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Account-deletion fence (ADR 0002 rule 3): the upsert only lands
+                // while the owner's deleting_at is NULL, holding the user row
+                // FOR SHARE through the statement, so saving provider credentials
+                // cannot repopulate user-owned state behind the deletion marker.
+                // A fenced (0-row) upsert fails closed as StoreError; the
+                // handler classifies it through `account_deleting` into the
+                // typed 409. delete_vault below is deliberately not fenced:
+                // removal cannot restore state, and the executor deletes the
+                // row anyway.
+                let affected = client
+                    .execute(
+                        Self::upsert_vault_sql(),
+                        &[
+                            &user_id,
+                            &i32::try_from(row.blob.kek_version).map_err(|_| StoreError)?,
+                            &row.blob.dek_wrapped_nonce_b64url,
+                            &row.blob.dek_wrapped_b64url,
+                            &row.blob.payload_nonce_b64url,
+                            &row.blob.payload_b64url,
+                            &row.indexer_configured,
+                            &i64_of(row.updated_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if affected == 0 {
+                    return Err(StoreError);
+                }
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                client
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| StoreError)?;
+                // Serialize with the save's users-row FOR SHARE fence,
+                // including first saves when no vault row exists to lock.
+                // Removal remains allowed for a deleting account; a gone
+                // user makes this and the deletes harmless no-ops.
+                transaction
+                    .query_opt("SELECT id FROM users WHERE id = $1 FOR UPDATE", &[&user_id])
+                    .await
+                    .map_err(|_| StoreError)?;
+                if transaction
                     .execute(
                         "DELETE FROM provider_vaults WHERE user_id = $1",
                         &[&user_id],
                     )
                     .await
+                    .is_err()
+                {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Err(StoreError);
+                }
+                // Purge after the vault delete: a save serialized before
+                // us is visible to this READ COMMITTED statement; a later
+                // save cannot start writing until our commit releases the
+                // owner lock. Grant-referenced rows survive (RESTRICT).
+                if transaction
+                    .execute(purge_unreferenced_providers_sql(), &[&user_id])
+                    .await
+                    .is_err()
+                {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Err(StoreError);
+                }
+                transaction.commit().await.map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn insert_provider(&self, row: &ProviderMintRow) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Account-deletion fence (ADR 0002 rule 3): the mint only lands
+                // while the owner's deleting_at is NULL, holding the user row
+                // FOR SHARE through the statement, so saving provider
+                // credentials cannot mint an identity behind the deletion
+                // marker. A fenced (0-row) mint fails closed as StoreError; the
+                // handler classifies it through `account_deleting` into the
+                // typed 409. The owner binds $2 (the user_id column), never a
+                // value; the statement shape (literals, fence) is pinned in
+                // `crate::providers` and below.
+                let affected = client
+                    .execute(
+                        insert_provider_sql(),
+                        &[
+                            &row.id,
+                            &row.user_id,
+                            &row.label,
+                            &row.encrypted_creds.as_slice(),
+                            &i32::try_from(row.kek_version).map_err(|_| StoreError)?,
+                            &row.dek_wrapped_nonce.as_slice(),
+                            &row.dek_wrapped.as_slice(),
+                            &row.payload_nonce.as_slice(),
+                            &i64_of(row.created_at)?,
+                            &i64_of(row.last_verified_at)?,
+                        ],
+                    )
+                    .await
                     .map_err(|_| StoreError)?;
+                if affected == 0 {
+                    return Err(StoreError);
+                }
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn save_vault_and_mint_provider(
+        &self,
+        user_id: &str,
+        vault: &VaultRow,
+        mint: &ProviderMintRow,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| StoreError)?;
+                // One atomic save: the vault upsert and the providers
+                // mint land together or not at all, so a failed mint can
+                // never leave a committed vault row the client was told
+                // failed. Both statements carry the account-deletion
+                // fence in-statement (ADR 0002 rule 3); a 0-row write on
+                // either rolls everything back and fails closed as
+                // StoreError, which the handler classifies through
+                // `account_deleting` into the typed 409. The upsert runs
+                // first and holds the owner's users row FOR SHARE to
+                // commit, so the rotation prune below needs no fence of
+                // its own and no deletion marker can slip between the
+                // statements.
+                let upserted = transaction
+                    .execute(
+                        Self::upsert_vault_sql(),
+                        &[
+                            &user_id,
+                            &i32::try_from(vault.blob.kek_version).map_err(|_| StoreError)?,
+                            &vault.blob.dek_wrapped_nonce_b64url,
+                            &vault.blob.dek_wrapped_b64url,
+                            &vault.blob.payload_nonce_b64url,
+                            &vault.blob.payload_b64url,
+                            &vault.indexer_configured,
+                            &i64_of(vault.updated_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if upserted == 0 {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Err(StoreError);
+                }
+                // The owner binds $2 (the user_id column), like
+                // `insert_provider` above; the id binds $1 as text and
+                // casts server-side (tokio-postgres takes Rust strings
+                // for text, not uuid).
+                let minted = transaction
+                    .execute(
+                        insert_provider_sql(),
+                        &[
+                            &mint.id,
+                            &mint.user_id,
+                            &mint.label,
+                            &mint.encrypted_creds.as_slice(),
+                            &i32::try_from(mint.kek_version).map_err(|_| StoreError)?,
+                            &mint.dek_wrapped_nonce.as_slice(),
+                            &mint.dek_wrapped.as_slice(),
+                            &mint.payload_nonce.as_slice(),
+                            &i64_of(mint.created_at)?,
+                            &i64_of(mint.last_verified_at)?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if minted == 0 {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Err(StoreError);
+                }
+                // Rotation prune: superseded rows survive only while a
+                // grant references them. Zero pruned rows is success.
+                if transaction
+                    .execute(prune_superseded_providers_sql(), &[&user_id, &mint.id])
+                    .await
+                    .is_err()
+                {
+                    transaction.rollback().await.map_err(|_| StoreError)?;
+                    return Err(StoreError);
+                }
+                transaction.commit().await.map_err(|_| StoreError)?;
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
@@ -3656,19 +3825,47 @@ mod tests {
                 .to_string()
         };
         const FENCE: &str = "FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence";
-        // Vault upsert: the fence, the owner binding, and the fail-closed guard.
+        // Vault upsert: the shared statement carries the fence and the
+        // owner binding; both call sites execute it (never an inline
+        // fork) and fail closed on 0 rows. Slice the plain-fn helper to
+        // its own closing brace — the async-fn bound would overrun into
+        // unrelated items.
+        let upsert_sql = production
+            .split_once("fn upsert_vault_sql()")
+            .expect("upsert_vault_sql must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("upsert_vault_sql body must close")
+            .0;
+        assert!(
+            upsert_sql.contains(FENCE),
+            "upsert_vault_sql must select its row through the owner fence"
+        );
+        assert!(
+            !upsert_sql.contains("WHERE id = $2"),
+            "upsert_vault_sql fence binds the owner ($1), never a column value"
+        );
+        assert!(
+            upsert_sql.contains("SELECT $1, $2"),
+            "upsert_vault_sql must keep SELECT $1 bound to the owner id"
+        );
         let upsert = fn_body("async fn upsert_vault(");
         assert!(
-            upsert.contains(FENCE),
-            "upsert_vault must select its row through the owner fence"
+            upsert.contains("upsert_vault_sql()"),
+            "upsert_vault must execute the shared statement"
         );
         assert!(
-            !upsert.contains("WHERE id = $2"),
-            "upsert_vault fence binds the owner ($1), never a column value"
+            !upsert.contains("INSERT INTO provider_vaults"),
+            "upsert_vault must not inline a fork of the statement"
+        );
+        let save = fn_body("async fn save_vault_and_mint_provider(");
+        assert!(
+            save.contains("upsert_vault_sql()"),
+            "the atomic save must execute the shared upsert statement"
         );
         assert!(
-            upsert.contains("SELECT $1, $2"),
-            "upsert_vault must keep SELECT $1 bound to the owner id"
+            !save.contains("INSERT INTO provider_vaults"),
+            "the atomic save must not inline a fork of the upsert"
         );
         let guard = upsert
             .find("if affected == 0")
@@ -3742,6 +3939,243 @@ mod tests {
             mint[mint_guard..mint_guard + mint_arm_end].contains("return Err"),
             "the zero-row guard must fail closed (return Err), not Ok"
         );
+    }
+
+    #[test]
+    fn fenced_provider_mint_uses_the_pinned_statement_and_zero_row_guard() {
+        // ADR 0002 rule 3: the providers mint is a credential write behind
+        // the same deletion fence as the vault upsert. The statement shape
+        // (fence, literals, no ON CONFLICT) is pinned in
+        // `crate::providers`; this pins the production call site: it must
+        // call that statement (never an inline fork), bind the parameters
+        // in `PROVIDER_MINT_PARAM_ORDER`, and fail closed on 0 rows.
+        // Slice ONLY the fn body out of the pre-test source, so this
+        // test's own literals cannot satisfy the assertions.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let mint = production
+            .split_once("async fn insert_provider(")
+            .expect("insert_provider must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            mint.contains("insert_provider_sql()"),
+            "insert_provider must execute the pinned statement"
+        );
+        assert!(
+            !mint.contains("INSERT INTO providers"),
+            "insert_provider must not inline a fork of the statement"
+        );
+        // Bind order follows PROVIDER_MINT_PARAM_ORDER: several swaps
+        // (id/user_id/label, the two nonces, the two clocks) would still
+        // compile and silently corrupt the row, so the order is pinned
+        // positionally.
+        let binds = [
+            "&row.id",
+            "&row.user_id",
+            "&row.label",
+            "&row.encrypted_creds.as_slice()",
+            "try_from(row.kek_version)",
+            "&row.dek_wrapped_nonce.as_slice()",
+            "&row.dek_wrapped.as_slice()",
+            "&row.payload_nonce.as_slice()",
+            "i64_of(row.created_at)",
+            "i64_of(row.last_verified_at)",
+        ];
+        let mut last = 0;
+        for needle in binds {
+            let pos = mint
+                .find(needle)
+                .unwrap_or_else(|| panic!("insert_provider must bind {needle}"));
+            assert!(
+                pos > last,
+                "bind order must follow PROVIDER_MINT_PARAM_ORDER ({needle} out of order)"
+            );
+            last = pos;
+        }
+        let guard = mint
+            .find("if affected == 0")
+            .expect("insert_provider must fail closed on 0 rows");
+        let ok = mint
+            .find("Ok(())")
+            .expect("insert_provider must return Ok on the write path");
+        assert!(
+            guard < ok,
+            "the zero-row guard must precede the success return"
+        );
+        let arm_end = mint[guard..]
+            .find('}')
+            .expect("the zero-row guard arm must close");
+        assert!(
+            mint[guard..guard + arm_end].contains("return Err"),
+            "the zero-row guard must fail closed (return Err), not Ok"
+        );
+        // The atomic save reuses the pinned statement with its own bind
+        // list: the same positional pin applies there, or a swap in the
+        // save path would corrupt rows the single-writer pin cannot see.
+        let save = production
+            .split_once("async fn save_vault_and_mint_provider(")
+            .expect("save_vault_and_mint_provider must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            save.contains("insert_provider_sql()"),
+            "the atomic save must execute the pinned mint statement"
+        );
+        assert!(
+            !save.contains("INSERT INTO providers"),
+            "the atomic save must not inline a fork of the mint"
+        );
+        let save_binds = [
+            "&mint.id",
+            "&mint.user_id",
+            "&mint.label",
+            "&mint.encrypted_creds.as_slice()",
+            "try_from(mint.kek_version)",
+            "&mint.dek_wrapped_nonce.as_slice()",
+            "&mint.dek_wrapped.as_slice()",
+            "&mint.payload_nonce.as_slice()",
+            "i64_of(mint.created_at)",
+            "i64_of(mint.last_verified_at)",
+        ];
+        let mut last = 0;
+        for needle in save_binds {
+            let pos = save
+                .find(needle)
+                .unwrap_or_else(|| panic!("the atomic save must bind {needle}"));
+            assert!(
+                pos > last,
+                "save bind order must follow PROVIDER_MINT_PARAM_ORDER ({needle} out of order)"
+            );
+            last = pos;
+        }
+    }
+
+    #[test]
+    fn atomic_vault_save_runs_upsert_mint_and_prune_in_one_transaction() {
+        // The save is one unit: the fenced upsert, the fenced mint, and
+        // the rotation prune run on one transaction; any failure rolls
+        // back before the handler classifies it. Dropping the
+        // transaction, a zero-row guard, or a rollback must fail here.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let save = production
+            .split_once("async fn save_vault_and_mint_provider(")
+            .expect("save_vault_and_mint_provider must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            save.contains(".transaction()"),
+            "the save must open a transaction"
+        );
+        assert!(
+            save.contains("prune_superseded_providers_sql()"),
+            "the save must run the pinned rotation prune"
+        );
+        assert!(
+            !save.contains("DELETE FROM providers"),
+            "the save must not inline a fork of the prune"
+        );
+        // Both fenced writes guard 0 rows (fence closed → rollback, never
+        // a partial commit); the prune needs no guard (zero pruned rows
+        // is success).
+        for needle in ["if upserted == 0", "if minted == 0"] {
+            assert!(
+                save.contains(needle),
+                "the save must fail closed on a 0-row fenced write ({needle})"
+            );
+        }
+        let rollbacks = save.match_indices("rollback()").count();
+        assert_eq!(
+            rollbacks, 3,
+            "upsert guard, mint guard, and prune error each roll back ({rollbacks})"
+        );
+        let commit = save.find("commit()").expect("the save must commit");
+        let ok = save
+            .find("Ok(())")
+            .expect("the save must return Ok on the write path");
+        assert!(commit < ok, "the commit must precede the success return");
+        // Vault delete purges through the pinned statement too (never an
+        // inline fork), in the same rollback-on-error shape.
+        let delete = production
+            .split_once("async fn delete_vault(")
+            .expect("delete_vault must exist")
+            .1
+            .split_once("\n    async fn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            delete.contains("purge_unreferenced_providers_sql()"),
+            "delete_vault must execute the pinned purge statement"
+        );
+        assert!(
+            delete.contains(".transaction()"),
+            "delete_vault must purge and delete atomically"
+        );
+        let vault_delete = delete
+            .find("\"DELETE FROM provider_vaults")
+            .expect("delete_vault must remove the vault row");
+        let purge = delete
+            .find(".execute(purge_unreferenced_providers_sql()")
+            .expect("delete_vault must purge unreferenced providers");
+        assert!(
+            vault_delete < purge,
+            "delete the vault before purging, so a concurrent save cannot leave orphaned credentials"
+        );
+        let commit = delete
+            .find("transaction.commit().await.map_err(|_| StoreError)?")
+            .expect("delete_vault must commit and propagate commit failure");
+        let ok = delete.find("Ok(())").expect("delete_vault must return Ok");
+        assert!(
+            purge < commit && commit < ok,
+            "commit both deletes before reporting success"
+        );
+    }
+
+    #[test]
+    fn vault_delete_locks_the_owner_before_touching_credential_rows() {
+        // Locking only an existing vault row misses first-save races. The
+        // owner lock also conflicts with the save's in-statement FOR SHARE
+        // fence when no vault exists; lock errors must fail closed.
+        let source = include_str!("worker_entry.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let delete = production
+            .split_once("async fn delete_vault(")
+            .unwrap()
+            .1
+            .split_once("\n    async fn ")
+            .unwrap()
+            .0;
+        let lock = delete
+            .find("\"SELECT id FROM users WHERE id = $1 FOR UPDATE\"")
+            .expect("delete_vault must lock the owner even when the vault is absent");
+        let lock_call = delete[..lock]
+            .rfind("transaction")
+            .expect("the owner lock must use the delete transaction");
+        let lock_end = delete[lock..]
+            .find(".map_err(|_| StoreError)?")
+            .expect("owner-lock failure must propagate before any deletes")
+            + lock;
+        let vault_delete = delete.find("\"DELETE FROM provider_vaults").unwrap();
+        let purge = delete
+            .find(".execute(purge_unreferenced_providers_sql()")
+            .unwrap();
+        assert!(delete[lock_call..lock].contains(".query_opt("));
+        assert!(delete[lock..lock_end].contains("&[&user_id]"));
+        assert!(delete[lock..lock_end].contains(".await"));
+        assert!(lock < lock_end && lock_end < vault_delete && lock_end < purge);
     }
 
     #[test]
