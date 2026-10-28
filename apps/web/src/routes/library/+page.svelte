@@ -50,6 +50,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import LibraryTimeline from '#lib/player/LibraryTimeline.svelte';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
 	import QueueExport from '#lib/player/QueueExport.svelte';
 	import {
@@ -2197,7 +2198,7 @@
 		</div>
 	{/if}
 	{#if streamUrl}
-		<section aria-label="Player">
+		<section aria-label="Player" class="nt-player-dock">
 			<h2>Now playing</h2>
 			{#if currentTrack}
 				<p class="nt-player-identity" data-testid="library-now-playing">
@@ -2241,6 +2242,9 @@
 					Restart current track
 				</button>
 			</div>
+			{#key `${currentTrack?.id}:${streamUrl}`}
+				<LibraryTimeline element={audioEl} getCurrent={() => audioEl} source={streamUrl} />
+			{/key}
 			{#if !restartCanSeek}
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
@@ -2408,6 +2412,26 @@
 	}
 	.nt-player-identity {
 		overflow-wrap: anywhere;
+	}
+	/* The player with its timeline stays reachable while the long queue and
+	   library lists scroll; skipped on narrow or short viewports where it would cover
+	   too much of the page. */
+	@media (min-width: 40rem) and (min-height: 36rem) {
+		.nt-player-dock {
+			position: sticky;
+			bottom: 0;
+			z-index: 1;
+			padding: var(--nt-space-2) var(--nt-space-3);
+			background: var(--nt-bg);
+			border-top: 1px solid var(--nt-border);
+		}
+		/* The dock's height varies with wrapping, identity and status text.
+		   Keep focused controls elsewhere unobscured, including during a
+		   keyboard-to-pointer transition; never reappear over a click target
+		   between pointerdown (focus changes) and pointerup. */
+		:global(html:has(:focus)) .nt-player-dock:not(:focus-within) {
+			position: static;
+		}
 	}
 	audio {
 		max-width: 100%;
