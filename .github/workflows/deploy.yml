@@ -263,6 +263,12 @@ jobs:
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
           SESSION_TTL_SECS = "86400"
           HYPERDRIVE_CACHING_DISABLED = "1"
+          DEPLOYMENT_ENV = "staging"
+          # A normal deploy never starts or continues a key ceremony.
+          VAULT_REWRAP_ENABLED = "0"
+
+          [env.staging.triggers]
+          crons = ["7 * * * *"]
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the

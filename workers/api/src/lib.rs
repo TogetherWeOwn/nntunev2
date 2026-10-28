@@ -105,6 +105,19 @@ mod logging_tests {
     }
 }
 
+#[worker::event(scheduled)]
+pub async fn scheduled(
+    _event: worker::ScheduledEvent,
+    env: worker::Env,
+    _ctx: worker::ScheduleContext,
+) {
+    // worker-rs scheduled handlers return unit. Record the opaque failure
+    // explicitly rather than silently discarding the handler Result.
+    if worker_entry::scheduled_rewrap(env.clone()).await.is_err() {
+        worker_entry::scheduled_rewrap_failed(&env);
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]

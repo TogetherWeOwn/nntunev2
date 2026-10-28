@@ -19,13 +19,13 @@
 //!   in-memory state;
 //! - dry-run mode: claims and re-wraps compute, nothing mutates.
 //!
-//! Deliberately NOT here (see the runbook §7 banner): the Cloudflare
-//! Workflow/Queue trigger, the production `rotation_runs` DDL migration,
-//! and the Hyperdrive [`RewrapStore`] implementation. [`ROTATION_RUNS_DDL`]
-//! is fixture-validated (it executes verbatim on the sqlite stand-in, which
-//! is why it sticks to the Postgres/sqlite overlap); the production DDL
-//! and store wiring land with the trigger card, which orchestrates
-//! `load_open_run` → `open_run` → [`run_rewrap_pass`] → `close_run`.
+//! [`run_scheduled_rewrap`] orchestrates load/open/pass/close. The Worker
+//! scheduled handler and fenced Hyperdrive [`RewrapStore`] live in
+//! `worker_entry`; migration `0024_rotation_runs.sql` carries this ledger
+//! plus the database-scoped invocation fence. The normative CAS retains
+//! named placeholders; [`CAS_REWRAP_POSTGRES_SQL`] is its positional
+//! rendering for the production driver. Source/native/SQL proof is not a
+//! live ceremony: see the runbook §7 for deployment and drill limitations.
 //!
 //! Redaction: claims and envelopes carry wrap ciphertext, so their `Debug`
 //! impls are manual and redacted; [`RunRecord`] and [`PassReport`] are
@@ -66,6 +66,17 @@ pub const CAS_REWRAP_SQL: &str = "UPDATE provider_vaults
       AND dek_wrapped = $captured_wrapped
       AND dek_wrapped_nonce = $captured_wrapped_nonce;";
 
+/// PostgreSQL rendering of the normative named-parameter CAS above.
+/// Bind order: new version, wrap, nonce, timestamp, user, captured version,
+/// captured wrap, captured nonce. The normative statement stays unchanged.
+pub const CAS_REWRAP_POSTGRES_SQL: &str = "UPDATE provider_vaults
+      SET kek_version = $1, dek_wrapped = $2,
+          dek_wrapped_nonce = $3, updated_at = $4,
+          rewrapped_at = $4
+    WHERE user_id = $5 AND kek_version = $6
+      AND dek_wrapped = $7
+      AND dek_wrapped_nonce = $8;";
+
 /// Designed `rotation_runs` progress record (runbook §6: id, env,
 /// from/to versions, cursor, counts, started/finished), reconciled with two
 /// drill counts the design implies but does not name — `rows_deferred`
@@ -76,9 +87,9 @@ pub const CAS_REWRAP_SQL: &str = "UPDATE provider_vaults
 /// fail, and the store maps that conflict to
 /// [`JobError::PassAlreadyRunning`].
 ///
-/// Fixture-validated only: this DDL executes verbatim on the sqlite
-/// stand-in. There is deliberately no production migration for it yet (see
-/// the module docs); the trigger card carries the production DDL.
+/// This DDL executes verbatim on the SQLite stand-in and is mirrored by
+/// root migration `0024_rotation_runs.sql`. The migration adds a separate
+/// `rotation_state` fence; the progress-record columns stay unchanged.
 pub const ROTATION_RUNS_DDL: &str = "CREATE TABLE IF NOT EXISTS rotation_runs (
   id             TEXT PRIMARY KEY,
   env            TEXT NOT NULL,
@@ -387,6 +398,181 @@ pub trait RewrapStore {
         run_id: &str,
         now_secs: u64,
     ) -> impl Future<Output = Result<(), StoreError>>;
+}
+
+/// An explicitly armed ceremony; cron never derives or changes a key version.
+#[derive(Debug, Clone)]
+pub struct ScheduledRewrapConfig {
+    pub env: String,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub batch_limit: u32,
+    pub max_batches: u32,
+    pub dry_run: bool,
+    pub now_secs: u64,
+}
+
+impl ScheduledRewrapConfig {
+    pub fn params(&self) -> RewrapParams {
+        RewrapParams {
+            to_version: self.to_version,
+            batch_limit: self.batch_limit,
+            max_batches: self.max_batches,
+            dry_run: self.dry_run,
+            now_secs: self.now_secs,
+        }
+    }
+
+    /// Shared preflight, also used before production acquires its lease.
+    pub fn validate(&self, keks: &impl KekSource) -> Result<(), JobError> {
+        if self
+            .env
+            .chars()
+            .any(|c| c.is_whitespace() || c == ',' || c == ';')
+        {
+            return Err(JobError::InvalidParams("run env must name one environment"));
+        }
+        let transient =
+            RunRecord::transient(&self.env, self.from_version, self.to_version, self.now_secs);
+        // A live pass requires persistence, but preflight must precede that
+        // very mutation. Validate the remaining shape as a transient rehearsal.
+        let mut params = self.params();
+        params.dry_run = true;
+        params.validate(&transient)?;
+        keks.kek(self.to_version)
+            .ok_or(JobError::UnknownKekVersion(self.to_version))?;
+        Ok(())
+    }
+}
+
+/// Safe to emit: counts and flags only, never run IDs or resume cursors.
+#[derive(Debug)]
+pub struct ScheduledRewrapReport {
+    pub pass: PassReport,
+    pub resumed: bool,
+    pub closed: bool,
+}
+
+pub enum ScheduledRewrapArming {
+    Disabled,
+    Armed(ScheduledRewrapConfig),
+}
+
+fn rewrap_flag(raw: Option<String>) -> Result<bool, JobError> {
+    match raw.as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("FALSE") => Ok(false),
+        Some("1") | Some("true") | Some("TRUE") => Ok(true),
+        _ => Err(JobError::InvalidParams("invalid rewrap flag")),
+    }
+}
+
+/// Presence-preserving parsing; bad or partial arming is never a silent no-op.
+pub fn scheduled_rewrap_arming_from_lookup(
+    get: impl Fn(&str) -> Option<String>,
+    now_secs: u64,
+) -> Result<ScheduledRewrapArming, JobError> {
+    if !rewrap_flag(get("VAULT_REWRAP_ENABLED"))? {
+        return Ok(ScheduledRewrapArming::Disabled);
+    }
+    let number = |name: &str, default: Option<u32>| -> Result<u32, JobError> {
+        match get(name) {
+            Some(raw) => raw
+                .parse()
+                .map_err(|_| JobError::InvalidParams("invalid rewrap bound or version")),
+            None => default.ok_or(JobError::InvalidParams("missing rewrap version")),
+        }
+    };
+    let config = ScheduledRewrapConfig {
+        env: get("VAULT_REWRAP_ENV").ok_or(JobError::InvalidParams("missing rewrap env"))?,
+        from_version: number("VAULT_REWRAP_FROM_VERSION", None)?,
+        to_version: number("VAULT_REWRAP_TO_VERSION", None)?,
+        batch_limit: number("VAULT_REWRAP_BATCH_LIMIT", Some(20))?,
+        max_batches: number("VAULT_REWRAP_MAX_BATCHES", Some(1))?,
+        dry_run: rewrap_flag(get("VAULT_REWRAP_DRY_RUN"))?,
+        now_secs,
+    };
+    if config
+        .env
+        .chars()
+        .any(|c| c.is_whitespace() || c == ',' || c == ';')
+    {
+        return Err(JobError::InvalidParams("run env must name one environment"));
+    }
+    let mut params = config.params();
+    params.dry_run = true;
+    params.validate(&RunRecord::transient(
+        &config.env,
+        config.from_version,
+        config.to_version,
+        now_secs,
+    ))?;
+    Ok(ScheduledRewrapArming::Armed(config))
+}
+
+/// One invocation, one bounded pass. Production must fence overlapping
+/// invocations for the entire ceremony; the partial-unique ledger index
+/// prevents duplicate open records, not concurrent writes to one cursor.
+/// The Hyperdrive implementation additionally fences every transaction.
+pub async fn run_scheduled_rewrap(
+    store: &impl RewrapStore,
+    keks: &impl KekSource,
+    config: &ScheduledRewrapConfig,
+) -> Result<ScheduledRewrapReport, JobError> {
+    config.validate(keks)?;
+    let mut run = RunRecord::transient(
+        &config.env,
+        config.from_version,
+        config.to_version,
+        config.now_secs,
+    );
+    let mut resumed = false;
+    if !config.dry_run {
+        let existing = store.load_open_run(&config.env, config.to_version).await?;
+        run = match existing {
+            Some(existing) => {
+                resumed = true;
+                existing
+            }
+            None => match store
+                .open_run(
+                    &config.env,
+                    config.from_version,
+                    config.to_version,
+                    config.now_secs,
+                )
+                .await
+            {
+                Ok(opened) => opened,
+                Err(JobError::PassAlreadyRunning) => {
+                    resumed = true;
+                    store
+                        .load_open_run(&config.env, config.to_version)
+                        .await?
+                        .ok_or(JobError::PassAlreadyRunning)?
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        if run.env != config.env
+            || run.from_version != config.from_version
+            || run.to_version != config.to_version
+            || run.finished_at.is_some()
+        {
+            return Err(JobError::InvalidParams(
+                "persisted run differs from ceremony",
+            ));
+        }
+    }
+    let pass = run_rewrap_pass(store, keks, &mut run, &config.params()).await?;
+    let closed = pass.complete && !config.dry_run;
+    if closed {
+        store.close_run(&run.id, config.now_secs).await?;
+    }
+    Ok(ScheduledRewrapReport {
+        pass,
+        resumed,
+        closed,
+    })
 }
 
 /// Outcome of one row's bounded attempts.
