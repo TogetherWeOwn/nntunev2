@@ -420,17 +420,20 @@ pub(crate) fn refresh_retry_hash(token: &str, retry_key: &str) -> Result<String,
 /// sampling the database clock AFTER that lock (see `session_retry_store`). A
 /// request-time snapshot is neither an expiry bound nor a serialization clock.
 /// Parameters: id, user, created_at, old counter, old expiry, next counter,
-/// next expiry, credential digest, claim time, claim time - REFRESH_RETRY_SECS.
+/// next expiry, credential digest, validated token issuance, database claim
+/// time, database claim time - REFRESH_RETRY_SECS. The two clocks are NOT
+/// interchangeable: receipt age must never create an invalid signed token.
 pub const ROTATE_SESSION_WITH_RETRY_SQL: &str = "UPDATE sessions
 SET rotation_counter = $6,
     expires_at = CASE WHEN rotation_counter = $4 THEN $7 ELSE expires_at END,
     refresh_retry_hash = $8,
-    refresh_issued_at = CASE WHEN rotation_counter = $4 THEN $9 ELSE refresh_issued_at END
+    refresh_issued_at = CASE WHEN rotation_counter = $4 THEN $9 ELSE refresh_issued_at END,
+    refresh_claimed_at = CASE WHEN rotation_counter = $4 THEN $10 ELSE refresh_claimed_at END
 WHERE id = $1 AND user_id = $2 AND created_at = $3
-  AND revoked = FALSE AND expires_at > $9 AND $5 > $9
-  AND ((rotation_counter = $4 AND expires_at = $5 AND $7 > $9)
+  AND revoked = FALSE AND expires_at > $10 AND $5 > $10
+  AND ((rotation_counter = $4 AND expires_at = $5 AND $7 > $10)
        OR (rotation_counter = $6 AND refresh_retry_hash = $8
-           AND refresh_issued_at <= $9 AND refresh_issued_at > $10))
+           AND refresh_claimed_at <= $10 AND refresh_claimed_at > $11))
 RETURNING id, user_id, created_at, expires_at, rotation_counter, refresh_issued_at";
 
 /// Reconstruct the already-committed successor using metadata returned by the

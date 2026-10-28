@@ -15,6 +15,11 @@ fn fixture() -> (Connection, SessionClaims) {
             .replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"),
     )
     .unwrap();
+    db.execute_batch(
+        &include_str!("../../../migrations/0025_session_refresh_claim_clock.sql")
+            .replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"),
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO users (id,email,created_at) VALUES ('u1','synthetic@example.test',?1)",
         [NOW as i64],
@@ -53,7 +58,8 @@ fn rotate(db: &Connection, old: &SessionClaims, hash: &str, now: u64) -> Option<
             "$7": (now + 3600) as i64,
             "$8": hash,
             "$9": now as i64,
-            "$10": now.saturating_sub(REFRESH_RETRY_SECS) as i64,
+            "$10": now as i64,
+            "$11": now.saturating_sub(REFRESH_RETRY_SECS) as i64,
         },
         |r| {
             Ok(SessionClaims {

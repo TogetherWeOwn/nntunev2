@@ -113,9 +113,14 @@ lane skips until they are.
 An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:
 commit the conditional counter advance, then send `Set-Cookie`. A stale
 cookie is never accepted for ordinary authentication or unbound refresh.
-Clients needing lost-response recovery can instead send JSON
+Clients needing lost-response recovery must send the body-independent header
+`Content-Type: application/vnd.nntune.session-refresh-bound+json` and JSON
 `{"retry_key":"<unpadded base64url of 32 cryptographically random bytes>"}`.
-The same exact `Origin` and signed session cookie are still required.
+The same exact `Origin` and signed session cookie are still required. The HTTP
+transport rejects a retry key without this marker, and rejects marked requests
+with missing, empty, truncated or malformed JSON before any session mutation.
+Thus a lengthless upload abort hidden by the runtime as empty EOF cannot
+silently downgrade a marked operation to an unbound empty-body refresh.
 
 - Generate a **new 256-bit random secret before each logical refresh** and
   retain it privately for that operation. Never derive it from the cookie,
@@ -128,11 +133,15 @@ The same exact `Origin` and signed session cookie are still required.
   Ordinary endpoints still reject the old cookie immediately.
 - Recovery only reissues the immediate successor; it never rotates again,
   extends expiry, resets authentication age, or reopens a revoked session.
-  The window is **strictly less than 120 seconds** from the original successor
-  issuance timestamp and is never extended by retry. PostgreSQL locks the row
-  before sampling a fresh database clock, then rechecks both token expiries
-  and the receipt deadline in the same transaction; time spent waiting for
-  that lock counts against the window. The predecessor must also still
+  The window is **strictly less than 120 seconds** from the first serialized
+  PostgreSQL receipt claim (`refresh_claimed_at`) and is never renewed by retry.
+  Signed-token issuance (`refresh_issued_at`) retains the validated Worker
+  candidate's clock; it is not replaced by the database clock. This separates
+  receipt age from token structure under cross-system clock skew. The adapter
+  validates candidate and returned token structure before committing.
+  PostgreSQL locks the row before sampling its fresh claim clock, then rechecks
+  both token expiries and the receipt deadline in that transaction; time spent
+  waiting for that lock counts against the existing recovery window. The predecessor must also still
   pass its signed-token lifetime checks. Another rotation, logout,
   revoke-all, reauthentication, or account deletion closes recovery.
 - **Cross-tab single-flight is mandatory for cookie clients.** Serialize all
@@ -158,11 +167,21 @@ The same exact `Origin` and signed session cookie are still required.
   cannot recover a different session or bypass revocation.
 - Success stays `200 {"ok":true}` with the secure HttpOnly cookie; secrets
   and digests never appear in response bodies or audit fields. All reads
-  and writes use the current server-side row. Only the digest and original
-  issuance timestamp are stored, with one bounded slot per session.
+  and writes use the current server-side row. Only the digest, original token
+  issuance and original database claim timestamp are stored, in one bounded
+  receipt slot per session.
 
-Apply app migration `0024_session_refresh_retry.sql` **before** deploying
-this Worker. Unsupported/unmigrated storage fails closed with 5xx, never an
+Apply app migrations `0024_session_refresh_retry.sql` and
+`0025_session_refresh_claim_clock.sql` **before** deploying this Worker.
+Existing receipts without a claim clock cannot recover; no history is backfilled.
+The staging deployment now fails closed unless its read-only schema gate verifies
+all three nullable receipt columns and their exact types on the actual database
+identified by the deployed Hyperdrive origin. It reuses the existing staging
+migrator secret, checks private target identity, and never applies a migration.
+Missing configuration, target mismatch, query failure or absent schema prevents
+both deployment and a positive deployment marker. Applying staging migrations
+remains the authorized database executor's action, not an implicit CI operation.
+Unsupported/unmigrated runtime storage fails closed with 5xx, never an
 unbound recovery. No current web caller automatically opts into this
 protocol; adoption requires both the per-operation secret and the shared
 single-flight coordinator above. Do not opt in while older tabs or clients

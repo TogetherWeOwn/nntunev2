@@ -2411,6 +2411,32 @@ struct SessionRefreshBody {
     retry_key: Option<String>,
 }
 
+/// Body-independent opt-in marker. A lengthless upload hidden as EOF must not
+/// downgrade a bound refresh to the ordinary empty-body rotation protocol.
+pub const BOUND_REFRESH_CONTENT_TYPE: &str = "application/vnd.nntune.session-refresh-bound+json";
+
+/// Runtime-only transport guard, before `handle` and all session mutations.
+/// Keep metadata outside Request so existing transport-free callers retain the
+/// core API while HTTP clients must explicitly mark the bound protocol.
+pub fn refresh_transport_rejection(req: &Request, content_type: Option<&str>) -> Option<Response> {
+    if req.method != "POST" || req.path != "/v1/session/refresh" {
+        return None;
+    }
+    let marked = content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case(BOUND_REFRESH_CONTENT_TYPE)
+        });
+    let has_key =
+        parse_body::<SessionRefreshBody>(req).is_some_and(|body| body.retry_key.is_some());
+    if marked != has_key {
+        return Some(generic_auth());
+    }
+    None
+}
+
 /// Optional lost-response recovery protocol. This is NOT ordinary request
 /// authentication: the stale cookie plus the separately retained client secret
 /// can ONLY retrieve the already committed successor via the atomic DB claim.
@@ -5329,6 +5355,87 @@ mod tests {
         let mut ctx = h.ctx();
         ctx.now = now;
         block_on(handle(&ctx, &req))
+    }
+
+    fn transported_refresh(
+        h: &Harness,
+        cookie: &str,
+        body: &str,
+        media_type: Option<&str>,
+    ) -> Response {
+        let ctx = h.ctx();
+        let request = Request {
+            method: "POST".into(),
+            path: "/v1/session/refresh".into(),
+            cookie: Some(cookie.into()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            body: Vec::new(),
+        };
+        block_on(crate::worker_entry::dispatch_collected(
+            crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
+            request,
+            |collected_request| async move {
+                if let Some(rejection) = refresh_transport_rejection(&collected_request, media_type)
+                {
+                    return rejection;
+                }
+                handle(&ctx, &collected_request).await
+            },
+        ))
+    }
+
+    #[test]
+    fn refresh_transport_marker_prevents_empty_upload_downgrade() {
+        // A lengthless aborted upload may be surfaced by the runtime as clean
+        // empty EOF. Preserve the header opt-in through that exact Complete
+        // decision; no auth, rotation or Set-Cookie may happen on missing JSON.
+        for body in ["", "{", "{}", "{\"retry_key\":null}"] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let response = transported_refresh(&h, &cookie, body, Some(BOUND_REFRESH_CONTENT_TYPE));
+            assert_eq!(response.status, 401);
+            assert!(response.set_cookie.is_none());
+            assert!(h
+                .store
+                .sessions
+                .borrow()
+                .values()
+                .all(|row| row.rotation_counter == 0));
+            assert!(h.store.refresh_retries.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn refresh_transport_requires_marked_recovery_but_preserves_legacy_empty_refresh() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let body = serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+        for media_type in [None, Some("application/json")] {
+            let rejected = transported_refresh(&h, &cookie, &body, media_type);
+            assert_eq!(rejected.status, 401);
+            assert!(rejected.set_cookie.is_none());
+        }
+        let first = transported_refresh(&h, &cookie, &body, Some(BOUND_REFRESH_CONTENT_TYPE));
+        let retry = transported_refresh(&h, &cookie, &body, Some(BOUND_REFRESH_CONTENT_TYPE));
+        assert_eq!(first.status, 200);
+        assert_eq!(cookie_of(&first), cookie_of(&retry));
+        let legacy = transported_refresh(&h, &cookie_of(&first), "", None);
+        assert_eq!(legacy.status, 200);
+        assert!(h.store.refresh_retries.borrow().is_empty());
+        let source = strip_line_comments(include_str!("worker_entry.rs"));
+        let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
+        assert!(dispatch.contains("headers_map.get(\"content-type\")"));
+        let guard = dispatch
+            .find("handlers::refresh_transport_rejection")
+            .unwrap();
+        let handle = dispatch.find("handlers::handle(&ctx").unwrap();
+        assert!(
+            guard < handle,
+            "runtime must reject downgrade before calling handlers"
+        );
     }
 
     #[test]

@@ -1078,7 +1078,7 @@ impl Store for PgStore {
                 let rows = client
                     .query(
                         "UPDATE sessions SET rotation_counter = $3, expires_at = $4, \
-                 refresh_retry_hash = NULL, refresh_issued_at = NULL \
+                 refresh_retry_hash = NULL, refresh_issued_at = NULL, refresh_claimed_at = NULL \
                  WHERE id = $1 AND rotation_counter = $2 AND revoked = FALSE RETURNING id",
                         &[
                             &id,
@@ -2590,7 +2590,15 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
+    // Preserve the header marker independently of any truncated upload bytes.
+    let refresh_content_type = headers_map.get("content-type").cloned();
     let response = dispatch_collected(collected, request, |collected_request| async move {
+        if let Some(rejection) = handlers::refresh_transport_rejection(
+            &collected_request,
+            refresh_content_type.as_deref(),
+        ) {
+            return rejection;
+        }
         handlers::handle(&ctx, &collected_request).await
     })
     .await;

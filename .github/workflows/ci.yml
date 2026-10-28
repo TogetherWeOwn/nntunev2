@@ -389,6 +389,8 @@ jobs:
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
+      - name: Test fail-closed staging schema gate (mocked; no credentials)
+        run: python3 .github/scripts/test_staging_api_schema_gate.py
 
   mb-import-etl:
     name: mb-import-etl

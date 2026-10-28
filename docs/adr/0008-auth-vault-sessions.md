@@ -50,10 +50,16 @@ Hyperdrive. The STRIDE threat model (§3–§4) is the binding security spec.
    Lost-response recovery is opt-in and requires a separately retained,
    client-generated 256-bit retry secret bound to the exact predecessor cookie.
    An atomic row claim may reissue only the immediate successor within 120
-   seconds of its original issuance, subject to both tokens' expiry and the
-   current row's revocation/counter. The transaction locks the row before
-   sampling the database claim clock; request arrival time is not the deadline
-   or serialization boundary. Cookie-client adoption additionally requires
+   seconds of its first serialized database receipt claim, subject to both
+   tokens' expiry and the current row's revocation/counter. Token issuance
+   retains the already-validated Worker candidate timestamp, separately from
+   the database receipt clock; returned token structure is checked before
+   commit. The transaction locks the row before sampling the database claim
+   clock; request arrival time is not the deadline or serialization boundary.
+   HTTP opt-in also requires the bound-refresh Content-Type marker outside
+   the body, so an aborted upload surfaced as empty EOF cannot downgrade the
+   operation. Staging deployment verifies the actual binding's required
+   receipt schema read-only before deploying; it never applies migrations. Cookie-client adoption additionally requires
    cross-tab single-flight for every cookie writer: all HTTP attempts must
    settle before another rotation or secret disposal. Abort/timeout alone is
    not settlement; uncoordinated older tabs preclude opt-in. Duplicate response

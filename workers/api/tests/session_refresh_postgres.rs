@@ -1,13 +1,18 @@
 //! Real production transaction/bindings, on CI's disposable PostgreSQL service.
 //! Run with --features postgres-tests --test session_refresh_postgres. Missing
 //! test configuration fails; ordinary unit tests do not require a database.
-use nntune_api::session::SessionClaims;
+use hmac::{Hmac, KeyInit, Mac};
+use nntune_api::session::{verify_session, SessionClaims};
 use nntune_api::session_retry_store::rotate_with_retry;
+use sha2::Sha256;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio_postgres::{Client, Config, NoTls};
 
 static SCHEMA: AtomicUsize = AtomicUsize::new(0);
+const SIGNING_KEY: &[u8] = b"synthetic-test-key-0123456789abcdef";
+const ATTEMPTS: usize = 3;
 
 struct Fixture {
     config: Config,
@@ -40,6 +45,37 @@ async fn clock(db: &Client) -> i64 {
     .await
     .unwrap()
     .get(0)
+}
+
+fn token(claims: &SessionClaims) -> String {
+    let payload = nntune_api::b64::encode(&serde_json::to_vec(claims).unwrap());
+    let mut mac = Hmac::<Sha256>::new_from_slice(SIGNING_KEY).unwrap();
+    mac.update(payload.as_bytes());
+    format!(
+        "{}.{}",
+        payload,
+        nntune_api::b64::encode(&mac.finalize().into_bytes())
+    )
+}
+
+async fn joined<T>(mut task: JoinHandle<T>) -> T {
+    match tokio::time::timeout(Duration::from_secs(12), &mut task).await {
+        Ok(result) => result.expect("contender task"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            panic!("contender did not finish after lock release")
+        }
+    }
+}
+
+// Counter, expiry and the complete receipt, including nullable columns.
+async fn row_state(db: &Client) -> (i32, i64, Option<String>, Option<i64>, Option<i64>) {
+    let row = db.query_one(
+        "SELECT rotation_counter, expires_at, refresh_retry_hash, refresh_issued_at, refresh_claimed_at FROM sessions WHERE id='s1'",
+        &[],
+    ).await.unwrap();
+    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
 }
 
 impl Fixture {
@@ -76,6 +112,11 @@ impl Fixture {
             .unwrap();
         db.batch_execute(include_str!(
             "../../../migrations/0024_session_refresh_retry.sql"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute(include_str!(
+            "../../../migrations/0025_session_refresh_claim_clock.sql"
         ))
         .await
         .unwrap();
@@ -117,8 +158,8 @@ impl Fixture {
         connect(&self.config, &self.schema).await
     }
 
-    async fn wait_for_lock(&self, pid: i32) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+    async fn wait_for_lock(&self, pid: i32) -> bool {
+        tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 let waiting: bool = self
                     .db
@@ -133,17 +174,17 @@ impl Fixture {
             }
         })
         .await
-        .expect("contender must actually wait on another PostgreSQL connection");
+        .is_ok()
     }
 
     async fn wait_until(&self, deadline: i64) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(12), async {
             while clock(&self.db).await < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("cross the claim deadline while the row remains locked");
+        .expect("cross deadline while the row remains locked");
     }
 }
 
@@ -171,12 +212,12 @@ async fn real_adapter_same_key_contenders_converge_and_different_keys_lose() {
                 .unwrap()
                 .unwrap()
         }));
-        f.wait_for_lock(pid).await;
+        assert!(f.wait_for_lock(pid).await);
     }
     lock.commit().await.unwrap();
-    let first = tasks.remove(0).await.unwrap();
+    let first = joined(tasks.remove(0)).await;
     for task in tasks {
-        assert_eq!(task.await.unwrap(), first);
+        assert_eq!(joined(task).await, first);
     }
     assert_eq!(first.rotation_counter, 1);
     assert_eq!(first.expires_at, f.next.expires_at);
@@ -207,11 +248,118 @@ async fn real_adapter_same_key_contenders_converge_and_different_keys_lose() {
                     .unwrap()
             }),
         ));
-        f.wait_for_lock(pid).await;
+        assert!(f.wait_for_lock(pid).await);
     }
     lock.commit().await.unwrap();
     for (same_key, task) in tasks {
-        assert_eq!(task.await.unwrap(), same_key.then(|| first.clone()));
+        assert_eq!(joined(task).await, same_key.then(|| first.clone()));
+    }
+}
+
+#[tokio::test]
+async fn real_adapter_mixed_keys_compete_for_first_rotation() {
+    let f = Fixture::new().await;
+    let mut locker = f.client().await;
+    let lock = locker.transaction().await.unwrap();
+    lock.query_one("SELECT id FROM sessions WHERE id='s1' FOR UPDATE", &[])
+        .await
+        .unwrap();
+    let mut tasks = Vec::new();
+    for digest in ["digest-a", "digest-b", "digest-a", "digest-b"] {
+        let mut client = f.client().await;
+        let pid = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let old = f.old.clone();
+        let next = f.next.clone();
+        tasks.push((
+            digest,
+            tokio::spawn(async move {
+                rotate_with_retry(&mut client, &old, &next, digest)
+                    .await
+                    .unwrap()
+            }),
+        ));
+        assert!(
+            f.wait_for_lock(pid).await,
+            "each independent client must block before the first rotation"
+        );
+    }
+    lock.commit().await.unwrap();
+    let mut results = Vec::new();
+    for (digest, task) in tasks {
+        results.push((digest, joined(task).await));
+    }
+    let winner = results
+        .iter()
+        .find_map(|(digest, result)| result.as_ref().map(|claims| (*digest, claims.clone())))
+        .expect("one group must rotate");
+    for (digest, result) in results {
+        assert_eq!(result, (digest == winner.0).then(|| winner.1.clone()));
+    }
+    let state = row_state(&f.db).await;
+    assert_eq!(state.0, 1);
+    assert_eq!(state.2.as_deref(), Some(winner.0));
+}
+
+#[tokio::test]
+async fn real_adapter_preserves_worker_issued_at_across_split_clocks() {
+    for skew in [1_i64, 30, -61] {
+        let f = Fixture::new().await;
+        let db_now = clock(&f.db).await;
+        let worker_now = db_now + skew;
+        let mut old = f.old.clone();
+        old.created_at = worker_now as u64;
+        old.issued_at = worker_now as u64;
+        old.expires_at = (worker_now + 3600) as u64;
+        let next = SessionClaims {
+            rotation_counter: 1,
+            ..old.clone()
+        };
+        f.db.execute(
+            "UPDATE sessions SET created_at=$1, expires_at=$2 WHERE id='s1'",
+            &[&worker_now, &(worker_now + 3600)],
+        )
+        .await
+        .unwrap();
+        let mut client = f.client().await;
+        let before = clock(&f.db).await;
+        let first = rotate_with_retry(&mut client, &old, &next, "bound-digest")
+            .await
+            .unwrap()
+            .expect("first rotation");
+        let after = clock(&f.db).await;
+        let state = row_state(&f.db).await;
+        assert_eq!(first.issued_at, next.issued_at);
+        assert_eq!(state.3, Some(next.issued_at as i64));
+        let claimed_at = state.4.expect("DB receipt clock");
+        assert!((before..=after).contains(&claimed_at));
+        if skew == -61 {
+            assert_ne!(claimed_at, next.issued_at as i64);
+        }
+        if skew == 30 {
+            // Retain an unambiguous split-clock oracle even if setup for the
+            // one-second case crossed a clock tick on a busy runner.
+            assert!(claimed_at < next.created_at as i64);
+        }
+        let signed = token(&first);
+        assert_eq!(
+            verify_session(SIGNING_KEY, &signed, worker_now as u64).unwrap(),
+            first
+        );
+        let recovered = rotate_with_retry(&mut client, &old, &next, "bound-digest")
+            .await
+            .unwrap()
+            .expect("bound retry");
+        assert_eq!(recovered, first);
+        assert_eq!(token(&recovered), signed);
+        assert_eq!(
+            row_state(&f.db).await,
+            state,
+            "retry must not strand or advance the counter"
+        );
     }
 }
 
@@ -219,8 +367,6 @@ async fn real_adapter_same_key_contenders_converge_and_different_keys_lose() {
 async fn real_adapter_uses_claim_order_not_request_timestamp_order() {
     let f = Fixture::new().await;
     let mut client = f.client().await;
-    // The earlier-sampled request is already prepared but delayed before DB
-    // admission. The later-sampled request commits first across a clock tick.
     let earlier = f.next.clone();
     f.wait_until(earlier.issued_at as i64 + 1).await;
     let later = SessionClaims {
@@ -240,72 +386,24 @@ async fn real_adapter_uses_claim_order_not_request_timestamp_order() {
 
 #[tokio::test]
 async fn real_adapter_rejects_receipt_that_expires_during_unchanged_row_lock_wait() {
-    let f = Fixture::new().await;
-    let mut client = f.client().await;
-    rotate_with_retry(&mut client, &f.old, &f.next, "bound-digest")
-        .await
-        .unwrap()
-        .unwrap();
-    let issued_at = clock(&f.db).await - 119;
-    f.db.execute("UPDATE sessions SET refresh_issued_at=$1", &[&issued_at])
-        .await
-        .unwrap();
-    let mut locker = f.client().await;
-    let lock = locker.transaction().await.unwrap();
-    // The holder makes NO change: a volatile predicate in a waiting UPDATE
-    // must not be mistaken for a clock sampled after serialization.
-    lock.query_one("SELECT id FROM sessions WHERE id='s1' FOR UPDATE", &[])
-        .await
-        .unwrap();
-    let pid = client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    let old = f.old.clone();
-    let next = f.next.clone();
-    let task = tokio::spawn(async move {
-        rotate_with_retry(&mut client, &old, &next, "bound-digest")
-            .await
-            .unwrap()
-    });
-    f.wait_for_lock(pid).await;
-    f.wait_until(issued_at + 120).await;
-    lock.commit().await.unwrap();
-    assert!(task.await.unwrap().is_none());
-    let receipt: i64 =
-        f.db.query_one("SELECT refresh_issued_at FROM sessions", &[])
-            .await
-            .unwrap()
-            .get(0);
-    assert_eq!(receipt, issued_at, "rejection cannot renew the receipt");
-}
-
-#[tokio::test]
-async fn real_adapter_rechecks_predecessor_and_successor_expiry_after_lock_wait() {
-    for predecessor_expires in [true, false] {
+    for _ in 0..ATTEMPTS {
         let f = Fixture::new().await;
         let mut client = f.client().await;
-        let expires = clock(&f.db).await + 2;
-        let mut old = f.old.clone();
-        let mut next = f.next.clone();
-        if predecessor_expires {
-            old.expires_at = expires as u64;
-        } else {
-            next.expires_at = expires as u64;
-        }
-        f.db.execute(
-            "UPDATE sessions SET expires_at=$1",
-            &[&(old.expires_at as i64)],
-        )
-        .await
-        .unwrap();
-        rotate_with_retry(&mut client, &old, &next, "bound-digest")
+        rotate_with_retry(&mut client, &f.old, &f.next, "bound-digest")
             .await
             .unwrap()
             .unwrap();
+        let claimed_at = clock(&f.db).await - 114;
+        f.db.execute(
+            "UPDATE sessions SET refresh_claimed_at=$1 WHERE id='s1'",
+            &[&claimed_at],
+        )
+        .await
+        .unwrap();
+        let before = row_state(&f.db).await;
         let mut locker = f.client().await;
         let lock = locker.transaction().await.unwrap();
+        // The holder makes no change; clock sampling must happen after the lock.
         lock.query_one("SELECT id FROM sessions WHERE id='s1' FOR UPDATE", &[])
             .await
             .unwrap();
@@ -314,14 +412,119 @@ async fn real_adapter_rechecks_predecessor_and_successor_expiry_after_lock_wait(
             .await
             .unwrap()
             .get(0);
+        let old = f.old.clone();
+        let next = f.next.clone();
         let task = tokio::spawn(async move {
             rotate_with_retry(&mut client, &old, &next, "bound-digest")
                 .await
                 .unwrap()
         });
-        f.wait_for_lock(pid).await;
-        f.wait_until(expires).await;
+        let blocked = f.wait_for_lock(pid).await;
+        let observed = clock(&f.db).await;
+        if !blocked || observed >= claimed_at + 120 {
+            lock.commit().await.unwrap();
+            let _ = joined(task).await;
+            continue;
+        }
+        assert!(
+            observed < claimed_at + 120,
+            "waiter must block while receipt is eligible"
+        );
+        f.wait_until(claimed_at + 120).await;
         lock.commit().await.unwrap();
-        assert!(task.await.unwrap().is_none());
+        assert!(joined(task).await.is_none());
+        assert_eq!(
+            row_state(&f.db).await,
+            before,
+            "rejection cannot renew or change the receipt"
+        );
+        return;
+    }
+    panic!("could not establish a blocked waiter before the receipt deadline");
+}
+
+#[tokio::test]
+async fn real_adapter_rechecks_expiry_after_lock_wait() {
+    // Recovery of either expired predecessor or successor, plus a first
+    // rotation whose candidate expires while its predecessor remains live.
+    for scenario in 0..3 {
+        let mut completed = false;
+        for _ in 0..ATTEMPTS {
+            let f = Fixture::new().await;
+            let mut client = f.client().await;
+            let expires = clock(&f.db).await + 8;
+            let mut old = f.old.clone();
+            let mut next = f.next.clone();
+            if scenario == 0 {
+                old.expires_at = expires as u64;
+            } else {
+                next.expires_at = expires as u64;
+            }
+            f.db.execute(
+                "UPDATE sessions SET expires_at=$1 WHERE id='s1'",
+                &[&(old.expires_at as i64)],
+            )
+            .await
+            .unwrap();
+            if scenario != 2 {
+                let initial = rotate_with_retry(&mut client, &old, &next, "bound-digest")
+                    .await
+                    .unwrap();
+                if initial.is_none() {
+                    assert!(
+                        clock(&f.db).await >= expires,
+                        "eligible initial rotation unexpectedly rejected"
+                    );
+                    continue;
+                }
+            }
+            let before = row_state(&f.db).await;
+            if clock(&f.db).await + 2 >= expires {
+                continue;
+            }
+            let mut locker = f.client().await;
+            let lock = locker.transaction().await.unwrap();
+            lock.query_one("SELECT id FROM sessions WHERE id='s1' FOR UPDATE", &[])
+                .await
+                .unwrap();
+            let pid = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let task = tokio::spawn(async move {
+                rotate_with_retry(&mut client, &old, &next, "bound-digest")
+                    .await
+                    .unwrap()
+            });
+            let blocked = f.wait_for_lock(pid).await;
+            let observed = clock(&f.db).await;
+            if !blocked || observed + 2 >= expires {
+                lock.commit().await.unwrap();
+                let _ = joined(task).await;
+                continue;
+            }
+            assert!(
+                observed + 2 < expires,
+                "waiter must block with more than two seconds of eligibility"
+            );
+            f.wait_until(expires).await;
+            lock.commit().await.unwrap();
+            assert!(
+                joined(task).await.is_none(),
+                "scenario {scenario} must reject after expiry"
+            );
+            assert_eq!(
+                row_state(&f.db).await,
+                before,
+                "scenario {scenario} must not change counter, expiry or receipt"
+            );
+            completed = true;
+            break;
+        }
+        assert!(
+            completed,
+            "could not establish eligible blocked waiter for scenario {scenario}"
+        );
     }
 }
