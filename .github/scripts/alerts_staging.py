@@ -165,7 +165,7 @@ def list_namespaces(get):
             total_pages = counted_pages
             require(len(batch) == min(per_page, max(0, total_count - len(namespaces))),
                     "NAMESPACE_COUNT_MISMATCH")
-        elif page < total_pages and ("per_page" in info or "count" in info):
+        elif page < total_pages:
             require(len(batch) == per_page, "NAMESPACE_PAGE_SIZE")
         require(page <= total_pages, "NAMESPACE_PAGE_MISMATCH")
         require(bool(batch) or page == total_pages == 1, "NAMESPACE_EMPTY_PAGE")
