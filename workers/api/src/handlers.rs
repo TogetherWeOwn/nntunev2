@@ -3677,6 +3677,8 @@ mod tests {
         rate_limit_pair_calls: RefCell<usize>,
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
+        lose_magic_claim: RefCell<bool>,
+        magic_redemptions: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
         /// Bearer-gate store-error pin: when set, the HMAC lookup fails
@@ -4035,6 +4037,10 @@ mod tests {
             now: u64,
             session: &SessionRecord,
         ) -> Result<bool, StoreError> {
+            *self.magic_redemptions.borrow_mut() += 1;
+            if *self.lose_magic_claim.borrow() {
+                return Ok(false);
+            }
             let mut magic = self.magic.borrow_mut();
             let Some(row) = magic.get_mut(&record.token_hash) else {
                 return Ok(false);
@@ -4876,6 +4882,46 @@ mod tests {
         );
         assert_eq!(bad.status, 401);
         assert_eq!(bad.body, replay.body);
+    }
+
+    #[test]
+    fn magic_finish_lost_claim_never_authenticates() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        assert_eq!(
+            h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            )
+            .status,
+            200
+        );
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let hash = auth::hash_magic_token(&token);
+        assert!(!h.store.magic.borrow()[&hash].used);
+        *h.store.lose_magic_claim.borrow_mut() = true;
+        let audits_before = h.store.audits.borrow().len();
+
+        let lost = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+
+        assert_eq!(*h.store.magic_redemptions.borrow(), 1);
+        assert_eq!(lost.status, 401);
+        assert_eq!(lost.body, r#"{"error":"check your email and try again"}"#);
+        assert!(lost.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+        assert!(!h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+        assert!(!h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .any(|event| event.action == "auth.magic"));
     }
 
     #[test]

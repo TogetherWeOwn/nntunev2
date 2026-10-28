@@ -21,6 +21,8 @@ pub mod handlers;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
+#[cfg(any(test, target_arch = "wasm32"))]
+mod magic_redemption;
 pub mod native_rest;
 pub mod plan_limits;
 pub mod providers;
