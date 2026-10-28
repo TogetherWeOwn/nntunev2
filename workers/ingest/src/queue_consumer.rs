@@ -2560,8 +2560,37 @@ mod tests {
         assert_eq!(settlement, Settlement::Ack);
     }
 
+    /// Future track association read through JSON so this helper compiles
+    /// both before and after the checkpoint gains the field: missing now
+    /// reads as null (legacy), then as the stored map or empty object.
+    fn association(cp: &JobCheckpoint) -> serde_json::Value {
+        serde_json::to_value(cp)
+            .unwrap()
+            .get("track_ids")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Writing checkpoint with a completed-empty association (`{}`), built
+    /// through JSON so the future field compiles now (ignored) and lands
+    /// then without further test edits. Provider is the current test owner.
+    fn writing_checkpoint_completed_empty(msg: &QueueMsg) -> JobCheckpoint {
+        let mut cp = crate::checkpoint::initial(msg);
+        cp.state = JobState::Writing;
+        cp.provider_id = Some("33000000-0000-4000-8000-000000000003".to_string());
+        let mut value = serde_json::to_value(&cp).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("track_ids".to_string(), serde_json::json!({}));
+        serde_json::from_value(value).unwrap()
+    }
+
     /// Fake [`MatchWriteRuntime`] recording every effect in call order, so
     /// the meter-before-advance sequencing is asserted, not just prose.
+    /// Normalized hooks return an unmatched detailed match plus an empty
+    /// map (completed-empty); legacy resolve/upsert stay to expose any
+    /// obsolete call as a sequencing failure.
     struct FakeMatchWrite {
         calls: std::cell::RefCell<Vec<&'static str>>,
         fail_meter_stage: Option<&'static str>,
@@ -2601,45 +2630,71 @@ mod tests {
             self.calls.borrow_mut().push("upsert");
             Ok(())
         }
+
+        async fn resolve_tracks(&self, _msg: &QueueMsg) -> Result<DetailedTrackMatch, JobError> {
+            self.calls.borrow_mut().push("resolve:tracks");
+            Ok(DetailedTrackMatch {
+                release_mbid: None,
+                files: Vec::new(),
+                recordings: Vec::new(),
+            })
+        }
+
+        async fn materialize_tracks(
+            &self,
+            _user_id: &str,
+            _rows: &[crate::track_writers::TrackRow<'_>],
+        ) -> Result<std::collections::BTreeMap<usize, String>, JobError> {
+            self.calls.borrow_mut().push("materialize:tracks");
+            Ok(std::collections::BTreeMap::new())
+        }
     }
 
     #[tokio::test]
-    async fn matching_entry_meters_match_then_yields_to_transcoding() {
+    async fn matching_entry_records_completed_derivation_then_meters_match() {
         let msg = search_message();
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
-        // Matching no longer writes in the same delivery: the checkpoint
-        // advances to Transcoding and settles as progress (no attempt
-        // spent), so the artifact step runs next and the write waits
-        // for a post-transcode checkpoint.
+        // Normalized: resolve detailed tracks, materialize DB IDs, meter
+        // match, then yield to transcoding as progress. The unmatched
+        // fixture completes empty (no inputs) but still advances.
         let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect_err("matching delivery yields to transcoding");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(err.transient);
         assert!(err.made_progress);
-        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        // Empty derivations may avoid a no-op materializer call; either
+        // path must record completion before the meter and never use library.
+        assert!(matches!(
+            runtime.calls().as_slice(),
+            ["resolve:tracks", "materialize:tracks", "meter:match"]
+                | ["resolve:tracks", "meter:match"]
+        ));
+        assert_eq!(association(&cp), serde_json::json!({}));
+        assert!(cp.transcode_inputs.is_empty());
         assert_eq!(cp.state, JobState::Transcoding);
     }
 
     #[tokio::test]
-    async fn writing_entry_re_resolves_without_re_emitting_match() {
+    async fn writing_entry_uses_completed_empty_without_legacy_resolution() {
         let msg = search_message();
-        let mut cp = crate::checkpoint::initial(&msg);
-        cp.state = JobState::Writing;
+        let mut cp = writing_checkpoint_completed_empty(&msg);
         let runtime = FakeMatchWrite::new(None);
         run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect("writing delivery succeeds");
-        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(runtime.calls(), ["meter:write"]);
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Done);
     }
 
     #[tokio::test]
-    async fn meter_failures_stop_before_the_advance_they_guard() {
+    async fn normalized_meter_failures_stop_before_the_advance_they_guard() {
         let msg = search_message();
-        // `match` meter down: no advance out of Matching, no upsert spent.
+        // `match` meter down: no advance out of Matching; the completed-
+        // empty association is already recorded before the meter gate.
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(Some("match"));
@@ -2648,28 +2703,35 @@ mod tests {
             .expect_err("match meter failure must fail the step");
         assert_eq!(err.code, ERR_MATCH_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        // Empty derivations may avoid a no-op materializer call; either
+        // path must record completion before the meter and never use library.
+        assert!(matches!(
+            runtime.calls().as_slice(),
+            ["resolve:tracks", "materialize:tracks", "meter:match"]
+                | ["resolve:tracks", "meter:match"]
+        ));
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Matching);
 
-        // `write` meter down after the upsert: the checkpoint stays in
-        // Writing, so redelivery replays the converged upsert and retries
-        // the meter instead of acking a Done that was never metered.
-        let mut cp = crate::checkpoint::initial(&msg);
-        cp.state = JobState::Writing;
+        // `write` meter down on a completed-empty checkpoint: the state
+        // stays in Writing, so redelivery retries the meter instead of
+        // acking a Done that was never metered.
+        let mut cp = writing_checkpoint_completed_empty(&msg);
         let runtime = FakeMatchWrite::new(Some("write"));
         let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect_err("write meter failure must fail the step");
         assert_eq!(err.code, ERR_WRITE_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(runtime.calls(), ["meter:write"]);
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Writing);
     }
 
     /// Fake [`TranscodeRuntime`] with scripted outcomes, recording
     /// every effect in call order so the
-    /// front-fetch-put-publish-meter sequencing is asserted, not just
-    /// prose.
+    /// context-front-fetch-put-publish-media-meter sequencing is asserted,
+    /// not just prose.
     struct FakeTranscode {
         calls: std::cell::RefCell<Vec<&'static str>>,
         front: crate::transcode::TranscodeCall,
@@ -2699,6 +2761,19 @@ mod tests {
     }
 
     impl TranscodeRuntime for FakeTranscode {
+        async fn validate_context(
+            &self,
+            _msg: &QueueMsg,
+            cp: &JobCheckpoint,
+            input: &crate::transcode::TranscodeInput,
+        ) -> Result<crate::writer_execution::PublicationContext, JobError> {
+            self.calls.borrow_mut().push("context");
+            Ok(crate::writer_execution::PublicationContext {
+                track_id: format!("88000000-0000-4000-8000-{:012}", input.file_index),
+                provider_id: cp.provider_id.clone().expect("test checkpoint provider"),
+            })
+        }
+
         async fn call_front(
             &self,
             _req: &crate::transcode::TranscodeRequest,
@@ -2730,6 +2805,14 @@ mod tests {
         ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError> {
             self.calls.borrow_mut().push("publish");
             self.publish
+        }
+
+        async fn publish_media(
+            &self,
+            _publication: &crate::writer_execution::MediaPublication,
+        ) -> Result<(), JobError> {
+            self.calls.borrow_mut().push("media");
+            Ok(())
         }
 
         async fn meter_transcode(&self, _msg: &QueueMsg) -> Result<(), ()> {
@@ -2764,10 +2847,34 @@ mod tests {
     fn transcoding_checkpoint(msg: &QueueMsg, inputs: usize) -> JobCheckpoint {
         let mut cp = crate::checkpoint::initial(msg);
         cp.state = JobState::Transcoding;
+        // Current provider (not the stale message copy): the context
+        // validation reads it from here.
+        cp.provider_id = Some("33000000-0000-4000-8000-000000000003".to_string());
         cp.transcode_inputs = (0..inputs)
             .map(|index| transcode_input(msg, index))
             .collect();
-        cp
+        // Future sparse map via serde: ignored now, populated when the
+        // field lands, so no test edits are needed then. Legacy empty
+        // (0 inputs) stays null (refusal); any inputs get a dense map
+        // keyed by file_index for the context hook.
+        let mut value = serde_json::to_value(&cp).unwrap();
+        let track_ids = if inputs == 0 {
+            serde_json::Value::Null
+        } else {
+            let mut map = serde_json::Map::new();
+            for index in 0..inputs {
+                map.insert(
+                    index.to_string(),
+                    serde_json::Value::String(format!("88000000-0000-4000-8000-{:012}", index)),
+                );
+            }
+            serde_json::Value::Object(map)
+        };
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("track_ids".to_string(), track_ids);
+        serde_json::from_value(value).unwrap()
     }
 
     fn completed_call_for(bytes: &[u8]) -> crate::transcode::TranscodeCall {
@@ -2791,7 +2898,7 @@ mod tests {
         assert!(err.made_progress);
         assert_eq!(
             runtime.calls(),
-            ["front", "fetch", "put", "publish", "meter"]
+            ["context", "front", "fetch", "put", "publish", "media", "meter"]
         );
         assert_eq!(cp.transcode_next, 1);
         assert_eq!(cp.state, JobState::Transcoding);
@@ -2895,7 +3002,7 @@ mod tests {
             .expect_err("hash mismatch is terminal");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(!err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch"]);
     }
 
     #[tokio::test]
@@ -2914,7 +3021,7 @@ mod tests {
             .expect_err("missing bucket config is transient");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch"]);
         // R2 put failure: transient.
         let mut cp = transcoding_checkpoint(&msg, 1);
         let mut runtime =
@@ -2924,7 +3031,7 @@ mod tests {
             .await
             .expect_err("put failure is transient");
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch", "put"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch", "put"]);
         // Deterministic publication rejection quarantines at once.
         let mut cp = transcoding_checkpoint(&msg, 1);
         let mut runtime =
@@ -2961,7 +3068,7 @@ mod tests {
         assert_eq!(cp.transcode_next, 0);
         assert_eq!(
             runtime.calls(),
-            ["front", "fetch", "put", "publish", "meter"]
+            ["context", "front", "fetch", "put", "publish", "media", "meter"]
         );
     }
 
