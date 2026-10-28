@@ -28,7 +28,9 @@ nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-fe
 # Hyperdrive Postgres client for the metered-admission ledger (same pattern
 # as workers/mb): `connect_raw` over the Worker socket with the generated
 # connection string.
-tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js", "with-uuid-1"] }
+# Typed UUID binds/results; no random generation or platform entropy required.
+uuid = { version = "1", default-features = false }
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
