@@ -405,7 +405,7 @@ form announcements separately from the application's existing route announcer.
 
 | Threat | Required containment / case |
 | --- | --- |
-| Stolen session changes email for persistence | Begin AND finish purpose-bound passkey proof; fresh cookie is not sufficient; exact Origin; transaction rechecks current session. EML-02/03/09. |
+| Stolen session changes email for persistence | Begin AND finish purpose-bound passkey proof; fresh cookie is not sufficient; exact Origin; transaction rechecks current session. EML-02/03/09/20. |
 | Attacker supplies their own inbox or link; login-CSRF | New code never authenticates, GET inert, explicit owner confirmation, owner/version/purpose binding; no auto-redemption or cross-account swap. EML-04/05. |
 | Old inbox compromised after change | No alias, no automatic revert or login authority; passkey plus old-inbox proof for narrow revert. EML-13/14. |
 | Session fixation / pre-change proof races sweep | Revoke all; fence every issuance commit by identity version/serialization; preserve passkeys but invalidate old challenges. EML-07/08/10. |
@@ -436,7 +436,7 @@ present in this PR. The Test Author owns the future acceptance banks.
 | EML-06 | Free/occupied candidate pair, unknown/malformed token pair; identical admitted status/body and bounded lookup path. | `pending / null / check_inbox` at begin; `denied / cannot_complete / start_again` on invalid finish; no occupancy hint. |
 | EML-07 | Two finishes, finish vs cancel/resend/superseding begin/deletion, concurrent distinct begins, two users racing same candidate, same idempotency key/different body. | Serialized winner and generation/version checks; no promotion on deletion; input_conflict only for body mismatch; uniqueness and all-or-none revocation. |
 | EML-08 | Old magic/register/passkey finish/session-refresh/native-key issuance paused before commit; promotion commits first. | `denied / cannot_complete / start_again`; no post-sweep session/credential from an old version. |
-| EML-09 | Session revoked or freshness/auth proof absent while finish is paused; bearer key substituted. | `pending / unauthenticated / sign_in`; old primary stays; bearer never authorizes. |
+| EML-09 | Session revoked or absent while finish is paused; bearer key substituted. | `pending / unauthenticated / sign_in`; old primary stays; bearer never authorizes. |
 | EML-10 | Two other sessions and outstanding magic/challenges/native keys at promotion. | `verified / null / sign_in`; ALL invalid on next use; a new passkey sign-in works; no replacement cookie. |
 | EML-11 | 60-second cooldown boundary, fourth issuance in 900 s, rotated IPs within IPv6 /64, target/global exhaustion, store/entropy failure. | `pending / rate_limited / wait` for user-known throttle; admitted generic otherwise; no excess send/row; rotated token dead; deadline not extended. |
 | EML-12 | Inject rollback at claim/proof/counter/revoke/audit/outbox/commit boundaries. | `pending / not_changed / retry_explicitly` only for proven rollback; old primary/proofs/sessions/counter/vault unchanged together. |
@@ -447,6 +447,7 @@ present in this PR. The Test Author owns the future acceptance banks.
 | EML-17 | Notice provider rejects/times out/duplicates; notice outbox insert fails. | Verified result stays verified after delivery failure; bounded retry/alert; failed enqueue rolls back transaction; no raw proof/mail address in telemetry. |
 | EML-18 | Code at now=expiry−1, expiry, future-issued; cancelled/superseded token; fourth change inside revert window. | Strict expiry; stale generations rejected; new forward change denied during hold, unchanged primary and bounded claims. |
 | EML-19 | Keyboard-only, screen reader, 320 px/200% zoom, light/dark, passkey dismiss, expiry and transport failure. | §7 focus, announcement, contrast and copy contract; no trap, horizontal scroll, auto-send or false outcome. |
+| EML-20 | Live session lacking freshness or operation proof while finish is paused. | `pending / reauth_required / use_passkey`; old primary stays; no new-address magic fallback. |
 
 Proposed executable checks **after admission**, with test filenames to be
 created by the Test Author (these commands are not claimed runnable today):
@@ -510,7 +511,7 @@ above dispositions explicitly admit them; do not create these cards now:
 
 | Slice | Deliverable / bound | Depends on |
 | --- | --- | --- |
-| A | Test Author freezes EML-01–19 offline acceptance banks and failure barriers; no product activation. | Dispositions |
+| A | Test Author freezes EML-01–20 offline acceptance banks and failure barriers; no product activation. | Dispositions |
 | B | Inert transition/unique-claim/outbox schema and transactional adapter with rollback/uniqueness proofs. No live route. | A, host alignment |
 | C | Identity-version issuance fence at every auth/session/native-key commit point; regression/race evidence. | B |
 | D | Purpose-bound passkey begin + bounded candidate proof issuance/resend/cancel, held inactive. | B, C |
