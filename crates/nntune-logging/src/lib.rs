@@ -287,6 +287,7 @@ const BANNED_KEY_PARTS: &[&str] = &[
     "password",
     "passwd",
     "secret",
+    "pepper",
     "api_key",
     "apikey",
     "token",
@@ -352,7 +353,8 @@ pub fn is_banned_field_key(key: &str) -> bool {
         || lower.starts_with("name_")
         || lower.contains("_name")
         || BANNED_NAME_PARTS.iter().any(|part| lower.contains(part));
-    has_ip_component
+    matches!(lower.as_str(), "u" | "p" | "t" | "s")
+        || has_ip_component
         || has_name_component
         || BANNED_KEY_PARTS.iter().any(|part| lower.contains(part))
 }
@@ -369,6 +371,24 @@ const SECRET_VALUE_MARKERS: &[&str] = &[
     "secret:",
     "apikey=",
     "api_key=",
+    "api_key_hmac=",
+    "subsonic_index_pepper=",
+    "?u=",
+    "&u=",
+    "?p=",
+    "&p=",
+    "?t=",
+    "&t=",
+    "?s=",
+    "&s=",
+    "\"apikey\"",
+    "\"api_key\"",
+    "\"api_key_hmac\"",
+    "\"subsonic_index_pepper\"",
+    "\"u\"",
+    "\"p\"",
+    "\"t\"",
+    "\"s\"",
 ];
 
 /// A string value is rejected when it opens with a known credential prefix

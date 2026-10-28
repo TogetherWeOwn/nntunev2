@@ -14,9 +14,19 @@ use crate::library::{
 use crate::value::Value;
 
 /// Parsed query string: first value wins for `get`, all values for `get_all`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Params {
     pairs: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for Params {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Even parameter names are caller-controlled: expose neither names
+        // nor values, including under alternate/pretty formatting.
+        f.debug_struct("Params")
+            .field("pair_count", &self.pairs.len())
+            .finish()
+    }
 }
 
 impl Params {
