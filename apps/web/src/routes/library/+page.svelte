@@ -981,6 +981,8 @@
 			shareInvalid = true;
 			return;
 		}
+		// A newly consumed navigation must not inherit consent for the old arrangement.
+		queueConfirmGeneration += 1;
 		selectTrack(target.trackId);
 		replaceQueue(
 			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))

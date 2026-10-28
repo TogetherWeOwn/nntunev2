@@ -54,8 +54,9 @@
 		 * Whether the panel's polite regions are exposed as live statuses.
 		 * The library host suspends them while a library refresh is in
 		 * flight so the loading transient keeps a single page-level
-		 * status; content, controls and focus are untouched. Defaults to
-		 * exposed; component harnesses leave it on.
+		 * status; content, controls and focus are untouched. The open consent
+		 * warning stays live so a changed destructive scope is never silent.
+		 * Defaults to exposed; component harnesses leave it on.
 		 */
 		liveRegions?: boolean;
 		/**
@@ -654,7 +655,7 @@
 		the rest of the page stays reachable and nothing is modal. -->
 	<fieldset class="queue-confirm" data-testid="queue-clear-confirm" bind:this={confirmEl}>
 		<legend>{pending === 'clear' ? 'Clear queue?' : 'Clear upcoming?'}</legend>
-		<p id="{confirmId}-message" aria-live={liveRegions ? 'polite' : undefined} aria-atomic="true">
+		<p id="{confirmId}-message" aria-live="polite" aria-atomic="true">
 			{#if pending === 'clear'}
 				Remove all {trackCount} {trackCount === 1 ? 'track' : 'tracks'} from the queue? This cannot be undone.
 			{:else}
