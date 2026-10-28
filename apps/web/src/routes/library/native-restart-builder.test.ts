@@ -16,7 +16,7 @@ function restartFixture() {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
+		'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
 		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
 		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus'
 	]);
@@ -55,7 +55,6 @@ function restartFixture() {
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		const restartSupersededSources = new Set();
-		let playEpoch = 0;
 		${compiled}
 		return {
 			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek,
