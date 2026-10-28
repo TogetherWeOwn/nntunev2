@@ -22,9 +22,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * - The existing `Show` combobox gains a third option labeled exactly
  *   `Selected only`, beside the existing `All tracks` and `Favorites only`.
  *   Its value is the build's choice; these tests select by label. No second
- *   selection store, persistence key, control, or route is introduced, and
- *   there is still no Select all / Select displayed affordance: membership
- *   comes only from the existing per-row checkboxes.
+ *   selection store, persistence key, control, or route is introduced. At
+ *   this slice membership came only from the existing per-row checkboxes;
+ *   a later slice added the one-action Select all for the displayed set,
+ *   pinned by `tests/library-select-all-displayed.spec.ts`, and this file
+ *   no longer asserts its absence.
  * - Selected only renders the ONE canonical projection
  *   (`selectSelectedItems`, pure half) of the loaded snapshot through the
  *   existing selected-ID set, composed with the existing find field and
@@ -66,7 +68,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  * SV-B-10 account teardown, SV-B-11 320px light/dark. SV-U-* live in the
  * pure sibling file.
  *
- * Out of scope (not pinned): select-all/invert/range selection, selection
+ * Out of scope (not pinned here): invert/range selection (select-all is
+ * pinned by `tests/library-select-all-displayed.spec.ts`), selection
  * persistence, saved lists, queue-row removal, changing append order,
  * deployed streaming. Queue/media evidence is state invariance in the
  * mocked page, not a claim of audible playback.
@@ -227,7 +230,12 @@ async function focusedRow(page: Page): Promise<{ rowId: string | null; actionabl
 }
 
 async function storageWriteCount(page: Page): Promise<number> {
-	return page.evaluate(() => (Reflect.get(window, '__svStorageWrites') as string[]).length);
+	return page.evaluate(
+		() =>
+			(Reflect.get(window, '__svStorageWrites') as string[]).filter(
+				(key) => !key.startsWith('nntune.library.recent-finds.v1')
+			).length
+	);
 }
 
 async function queueState(page: Page) {
@@ -302,9 +310,9 @@ test('[SV-B-01] Selected only shows a noncontiguous selection in loaded order; v
 
 	// Exactly three Show choices: the new option joins, nothing else appears.
 	await expect(showControl(page).locator('option')).toHaveCount(3);
-	// Membership is individual-only: no bulk-select escape hatch.
-	await expect(page.getByRole('button', { name: /select all|select displayed/i })).toHaveCount(0);
-	await expect(page.getByRole('checkbox', { name: /select all|select displayed/i })).toHaveCount(0);
+	// Membership here is built per-row. (The former no-bulk-select
+	// absence pins were retired when the displayed-set Select all action
+	// landed under its own acceptance spec; see the header.)
 
 	// Activation order opposes loaded order at every step.
 	await selectTracks(page, ['sv-delta', 'sv-zulu', 'sv-mike']);

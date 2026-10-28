@@ -805,6 +805,7 @@ dependencies = [
  "hmac",
  "nntune-logging",
  "nntune-ssrf-guard",
+ "nntune-subsonic",
  "p256",
  "rand 0.8.8",
  "rusqlite",
@@ -830,6 +831,10 @@ dependencies = [
 
 [[package]]
 name = "nntune-ssrf-guard"
+version = "0.1.0"
+
+[[package]]
+name = "nntune-subsonic"
 version = "0.1.0"
 
 [[package]]

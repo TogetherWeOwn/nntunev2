@@ -41,6 +41,63 @@ export function toggleSelected(selection: readonly string[], id: unknown): strin
 	return [...selection, id];
 }
 
+/**
+ * Shift+click / Shift+Space: additively select the contiguous run of
+ * `displayedIds` between `anchorId` and `focusId` (either direction).
+ * Existing entries stay untouched and in place; each run ID not already
+ * selected appends in displayed-ascending order. Anchor and focus resolve
+ * by first displayed occurrence; non-string/empty displayed entries are
+ * ignored. An unusable focus (invalid or not displayed) is a no-op, so
+ * hidden rows are never touched. A missing anchor (null, invalid, or not
+ * displayed) degrades to `toggleSelected(selection, focusId)`: the honest
+ * reset after Clear, purge or an anchor prune. A run that adds nothing
+ * returns the same reference. Inputs are never mutated.
+ */
+export function selectRange(
+	selection: readonly string[],
+	displayedIds: readonly string[],
+	anchorId: string | null,
+	focusId: unknown
+): string[] {
+	if (!isValidId(focusId)) return selection as string[];
+	const displayed = displayedIds as readonly unknown[];
+	const focusIndex = displayed.indexOf(focusId);
+	if (focusIndex < 0) return selection as string[];
+	const anchorIndex = isValidId(anchorId) ? displayed.indexOf(anchorId) : -1;
+	if (anchorIndex < 0) return toggleSelected(selection, focusId);
+	const selected = new Set<unknown>(selection);
+	const added: string[] = [];
+	const from = Math.min(anchorIndex, focusIndex);
+	const to = Math.max(anchorIndex, focusIndex);
+	for (let index = from; index <= to; index += 1) {
+		const id = displayed[index];
+		if (!isValidId(id) || selected.has(id)) continue;
+		selected.add(id);
+		added.push(id);
+	}
+	if (added.length === 0) return selection as string[];
+	return [...selection, ...added];
+}
+
+/**
+ * Select displayed IDs without dropping hidden selections: existing valid
+ * IDs keep activation order, new IDs append in displayed order. Exact
+ * membership, first occurrence wins; invalid entries in either input are
+ * ignored. Inputs are never mutated, and no undisplayed ID is added.
+ */
+export function selectAllDisplayed(
+	selection: readonly string[],
+	displayedIds: readonly string[]
+): string[] {
+	const selected = new Set<string>();
+	for (const ids of [selection, displayedIds]) {
+		for (const id of ids) {
+			if (isValidId(id)) selected.add(id);
+		}
+	}
+	return [...selected];
+}
+
 /** Empty the selection; the input is never mutated. */
 export function clearSelection(selection: readonly string[]): string[] {
 	void selection;
