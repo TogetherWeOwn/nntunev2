@@ -1901,6 +1901,44 @@ fn plan_settlement(
     }
 }
 
+/// Lifecycle boundary below settlement planning and above edge effects. A
+/// separately authored native bank can observe terminal -> persist -> enqueue
+/// order without replacing the writer sequence or invoking a Workers Env.
+#[allow(dead_code)]
+trait SettlementRuntime {
+    async fn settle_job(&self, msg: &QueueMsg, status: &'static str) -> Result<(), JobError>;
+    async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool;
+    async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool;
+}
+
+/// Fail-closed test interface, not implemented or called by the edge yet.
+/// Must eventually gate both terminal replays and newly terminal checkpoints
+/// before persistence and before exposing an Ack/Quarantine settlement.
+#[allow(dead_code)]
+async fn settle_checkpoint_with<R: SettlementRuntime>(
+    _runtime: &R,
+    _msg: &QueueMsg,
+    _cp: &mut JobCheckpoint,
+    _step: Result<(), JobError>,
+    _step_ran: bool,
+) -> Settlement {
+    Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
+}
+
+/// Raw delivery operations below the same settlement tested natively. The
+/// production adapter will forward these to RawMessage and the DLQ binding.
+#[allow(dead_code)]
+trait DeliveryRuntime {
+    async fn quarantine(&self, entry: &DlqEntry) -> bool;
+    fn ack(&self);
+    fn retry(&self, seconds: u32);
+}
+
+/// Fail-closed test interface: until implemented it performs no delivery
+/// effects, in particular no acknowledgement of unpublished terminal state.
+#[allow(dead_code)]
+async fn apply_settlement_with<R: DeliveryRuntime>(_runtime: &R, _settlement: Settlement) {}
+
 /// In-invocation retry policy for a rejected checkpoint write: exactly one
 /// retry, after waiting out KV's 1 s same-key write window (plus margin).
 /// The colliding write is the admission route's initial/reset checkpoint

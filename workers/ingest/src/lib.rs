@@ -725,6 +725,17 @@ enum AdmissionMark {
 /// state. Tests drive the same seam with in-memory and file-backed
 /// doubles (see `mod tests`).
 trait AdmissionLedger {
+    /// Durable fenced job admission. Fail-closed default preserves compiling
+    /// existing doubles until the lifecycle acceptance bank supplies this hook.
+    /// Not called by the edge until the tested sequencer is implemented.
+    #[allow(dead_code)]
+    async fn admit_job(&mut self, _msg: &QueueMsg) -> core::result::Result<(), retry::JobError> {
+        Err(retry::JobError::transient(
+            retry::ERR_WRITE_FAILED,
+            "durable admission unavailable",
+        ))
+    }
+
     /// Atomically claim (`job_id`, `stage`) before reading or creating the
     /// durable mark. A competing request returns `Busy` without side effects.
     async fn record_stage_once(
@@ -1086,6 +1097,31 @@ where
         return AdmissionDecision::MeterUnavailable(e);
     }
     AdmissionDecision::Admitted
+}
+
+/// Compiling boundary for independent lifecycle acceptance. The implementation
+/// will validate the stage, prove durable job admission (including queued
+/// replays), then drive the existing ledger/queue/meter protocol. Until that
+/// bank lands this is deliberately fail-closed and has no edge caller.
+#[allow(dead_code)]
+async fn drive_metered_admission_with_writer<L, Q, QF, M, MF>(
+    _ledger: &mut L,
+    _msg: &QueueMsg,
+    _stage: &str,
+    _queue_send: Q,
+    _meter_emit: M,
+) -> core::result::Result<AdmissionDecision, retry::JobError>
+where
+    L: AdmissionLedger,
+    Q: FnMut() -> QF,
+    QF: core::future::Future<Output = bool>,
+    M: FnMut(MeterOutcome) -> MF,
+    MF: core::future::Future<Output = core::result::Result<(), MeterWriteError>>,
+{
+    Err(retry::JobError::transient(
+        retry::ERR_WRITE_FAILED,
+        "durable admission unavailable",
+    ))
 }
 
 /// Write the checkpoint for a real (non-replay) admission, per
