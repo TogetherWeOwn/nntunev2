@@ -3156,3 +3156,7 @@ mod build_sha_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/admission_lifecycle_acceptance.rs"]
+mod admission_lifecycle_acceptance;

@@ -3346,3 +3346,7 @@ mod tests {
         assert_eq!(adopted.sha256, "abc123");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/terminal_lifecycle_acceptance.rs"]
+mod terminal_lifecycle_acceptance;
