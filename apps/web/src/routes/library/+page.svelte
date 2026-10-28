@@ -5,6 +5,7 @@
 	import {
 		describeJump,
 		jumpMedia,
+		watchJump,
 		type JumpDirection,
 		type JumpOutcome
 	} from '#lib/player/relativeJump.js';
@@ -253,6 +254,10 @@
 	// One-shot readout for the Back/Forward 10 seconds buttons; cleared when
 	// the source changes or the auth boundary resets the player.
 	let jumpFeedback = $state('');
+	let cancelJump: (() => void) | undefined;
+	// Seeking explicitly to the end is not natural track completion. Keep this
+	// fence through native pause/ended, retiring it only on new playback/seek.
+	let jumpEndElement: HTMLAudioElement | null = null;
 	// Native completion pauses before `ended`; retain intent only for that
 	// element, never for a manual pause, replaced source or account.
 	let playingElement: HTMLAudioElement | null = null;
@@ -267,7 +272,10 @@
 
 	function handlePlay(event: Event): void {
 		const element = currentAudioEvent(event);
-		if (element && !element.paused && !element.ended) playingElement = element;
+		if (element && !element.paused && !element.ended) {
+			jumpEndElement = null;
+			playingElement = element;
+		}
 	}
 
 	function handlePause(event: Event): void {
@@ -286,6 +294,11 @@
 	async function handleEnded(event: Event): Promise<void> {
 		const element = currentAudioEvent(event);
 		if (!element) return;
+		if (jumpEndElement === element) {
+			playingElement = null;
+			endGeneration += 1;
+			return;
+		}
 		const result = naturalEndPolicy(queue, {
 			repeat,
 			radioActive: false,
@@ -814,6 +827,9 @@
 			restartStatus = '';
 			// The Back/Forward readout describes the previous source too.
 			jumpFeedback = '';
+			cancelJump?.();
+			cancelJump = undefined;
+			jumpEndElement = null;
 		}
 	}
 
@@ -863,6 +879,9 @@
 		clearQueueShareFeedback(true);
 		pendingShareSeek = null;
 		jumpFeedback = '';
+		cancelJump?.();
+		cancelJump = undefined;
+		jumpEndElement = null;
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
@@ -1029,6 +1048,7 @@
 	}
 
 	function handleSeeking(): void {
+		if (audioEl && audioEl.currentTime < audioEl.duration) jumpEndElement = null;
 		// A listener's own seek wins over a pending late-duration adjustment.
 		if (
 			pendingShareSeek?.appliedSeconds != null &&
@@ -1173,16 +1193,33 @@
 	 * seek so later metadata events cannot undo it.
 	 */
 	function jumpRelative(direction: JumpDirection): void {
+		cancelJump?.();
+		cancelJump = undefined;
 		const element = audioEl;
+		const source = streamUrl;
 		let outcome: JumpOutcome = { kind: 'unavailable' };
 		if (
 			element &&
 			element.isConnected &&
-			streamUrl &&
-			element.getAttribute('src') === streamUrl
+			source &&
+			element.getAttribute('src') === source
 		) {
 			outcome = jumpMedia(element, direction);
-			if (outcome.kind === 'jumped' || outcome.kind === 'boundary') pendingShareSeek = null;
+			if (outcome.kind === 'jumped' || outcome.kind === 'pending' || outcome.kind === 'boundary') {
+				pendingShareSeek = null;
+				if ('target' in outcome && outcome.target === element.duration) jumpEndElement = element;
+			}
+			if (outcome.kind === 'pending') {
+				cancelJump = watchJump(element, outcome, (settled) => {
+					cancelJump = undefined;
+					if (!shareAlive || audioEl !== element || !element.isConnected ||
+						streamUrl !== source || element.getAttribute('src') !== source) return;
+					if (settled.kind === 'refused' && !element.seeking && element.currentTime < element.duration &&
+						jumpEndElement === element) jumpEndElement = null;
+					jumpFeedback = describeJump(direction, settled);
+					jumpStatusVersion += 1;
+				});
+			}
 		}
 		jumpFeedback = describeJump(direction, outcome);
 		// A repeated identical outcome changes no text; the version re-renders
@@ -1729,6 +1766,9 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			cancelJump?.();
+			cancelJump = undefined;
+			jumpEndElement = null;
 			endGeneration += 1;
 			playingElement = null;
 			if (audioEl && !audioEl.paused) audioEl.pause();
