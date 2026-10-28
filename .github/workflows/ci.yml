@@ -72,6 +72,8 @@ jobs:
           persist-credentials: false
       - name: Validate golden fixtures
         run: python3 scripts/check-subsonic-fixtures.py
+      - name: Reconcile synthetic returning-listener fixtures
+        run: python3 -m unittest discover -s fixtures/returning-listener -p 'test_*.py' -v
 
   rust-wasm:
     name: rust check (wasm32)
