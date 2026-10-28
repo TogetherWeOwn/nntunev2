@@ -206,6 +206,7 @@ export function appendSelection(
 		next = addTrack(next, {
 			id: item.id,
 			title: displayTitle(item),
+			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
 			artist: displayArtist(item) ?? '',
 			streamUrl: ''
 		});

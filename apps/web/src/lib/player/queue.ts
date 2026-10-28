@@ -8,6 +8,8 @@
 export interface Track {
 	id: string;
 	title: string;
+	/** Display title was synthesized from the id, not supplied as metadata. */
+	titleIsFallback?: boolean;
 	artist: string;
 	album?: string;
 	streamUrl: string;
