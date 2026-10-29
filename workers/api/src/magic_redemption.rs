@@ -101,7 +101,7 @@ fn pg_params<'a>(params: &'a [Param<'a>]) -> Vec<&'a (dyn tokio_postgres::types:
     params
         .iter()
         .map(|param| match param {
-            Param::Text(value) => &*value as &(dyn tokio_postgres::types::ToSql + Sync),
+            Param::Text(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
             Param::Int64(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
             Param::Int32(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
             Param::Bool(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
