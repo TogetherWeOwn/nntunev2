@@ -5376,11 +5376,12 @@ mod tests {
             crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
             request,
             |collected_request| async move {
-                if let Some(rejection) = refresh_transport_rejection(&collected_request, media_type)
-                {
-                    return rejection;
-                }
-                handle(&ctx, &collected_request).await
+                crate::worker_entry::handle_with_refresh_transport_guard(
+                    collected_request,
+                    media_type,
+                    |guarded_request| async move { handle(&ctx, &guarded_request).await },
+                )
+                .await
             },
         ))
     }
@@ -5401,6 +5402,29 @@ mod tests {
                 Some("application/vnd.nntune.session-refresh-bound+json"),
             );
             assert_eq!(response.status, 401);
+            assert!(response.set_cookie.is_none());
+            assert!(h
+                .store
+                .sessions
+                .borrow()
+                .values()
+                .all(|row| row.rotation_counter == 0));
+            assert!(h.store.refresh_retries.borrow().is_empty());
+        }
+        // Every accepted marker spelling must also reject a marked empty
+        // upload: media types are case-insensitive and may carry parameters
+        // or surrounding whitespace. An exact comparison, or dropping the
+        // parameter split or trim, must turn one of these red.
+        for media_type in [
+            "Application/Vnd.Nntune.Session-Refresh-Bound+Json",
+            "application/vnd.nntune.session-refresh-bound+json; charset=utf-8",
+            "  application/vnd.nntune.session-refresh-bound+json ",
+        ] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let response = transported_refresh(&h, &cookie, "", Some(media_type));
+            assert_eq!(response.status, 401, "media type {media_type:?}");
             assert!(response.set_cookie.is_none());
             assert!(h
                 .store
@@ -5445,16 +5469,40 @@ mod tests {
         assert!(dispatch.contains("headers_map.get(\"content-type\")"));
         let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains(
-            "handlers::refresh_transport_rejection( &collected_request, refresh_content_type.as_deref(), )"
+            "handle_with_refresh_transport_guard( collected_request, refresh_content_type.as_deref(),"
         ));
         let guard = dispatch
-            .find("handlers::refresh_transport_rejection")
+            .find("handle_with_refresh_transport_guard")
             .unwrap();
         let handle = dispatch.find("handlers::handle(&ctx").unwrap();
         assert!(
             guard < handle,
             "runtime must reject downgrade before calling handlers"
         );
+    }
+
+    #[test]
+    fn refresh_transport_accepts_each_marker_spelling_for_recovery() {
+        // Positive counterpart to the marked-empty vectors: each accepted
+        // spelling must also let a keyed request commit and recover the
+        // same successor. A fresh harness per spelling keeps each first
+        // commit and its recovery claim independent.
+        for media_type in [
+            "Application/Vnd.Nntune.Session-Refresh-Bound+Json",
+            "application/vnd.nntune.session-refresh-bound+json; charset=utf-8",
+            "  application/vnd.nntune.session-refresh-bound+json ",
+        ] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let body =
+                serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+            let first = transported_refresh(&h, &cookie, &body, Some(media_type));
+            assert_eq!(first.status, 200, "media type {media_type:?}");
+            let retry = transported_refresh(&h, &cookie, &body, Some(media_type));
+            assert_eq!(retry.status, 200, "media type {media_type:?}");
+            assert_eq!(cookie_of(&first), cookie_of(&retry));
+        }
     }
 
     #[test]

@@ -2411,6 +2411,27 @@ where
     }
 }
 
+/// Shared runtime composition for the collected request: the bound-refresh
+/// transport guard runs before `handler`, so a marked request whose keyed
+/// body was lost in transport is rejected instead of downgrading to the
+/// ordinary empty-body rotation. Production dispatch and the transport
+/// tests both call this seam, so disabling the guard fails those tests
+/// behaviorally rather than only a source-shape pin.
+pub async fn handle_with_refresh_transport_guard<F, Fut>(
+    request: handlers::Request,
+    refresh_content_type: Option<&str>,
+    handler: F,
+) -> handlers::Response
+where
+    F: FnOnce(handlers::Request) -> Fut,
+    Fut: std::future::Future<Output = handlers::Response>,
+{
+    if let Some(rejection) = handlers::refresh_transport_rejection(&request, refresh_content_type) {
+        return rejection;
+    }
+    handler(request).await
+}
+
 /// Registry code for an error response: the envelope `code` when the body
 /// carries one, else the status-implied code for statuses this worker owns
 /// unambiguously (429 is only ever `rate_limited`, 404 only `not_found`,
@@ -2612,13 +2633,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Preserve the header marker independently of any truncated upload bytes.
     let refresh_content_type = headers_map.get("content-type").cloned();
     let response = dispatch_collected(collected, request, |collected_request| async move {
-        if let Some(rejection) = handlers::refresh_transport_rejection(
-            &collected_request,
+        handle_with_refresh_transport_guard(
+            collected_request,
             refresh_content_type.as_deref(),
-        ) {
-            return rejection;
-        }
-        handlers::handle(&ctx, &collected_request).await
+            |guarded_request| async move { handlers::handle(&ctx, &guarded_request).await },
+        )
+        .await
     })
     .await;
     // One structured line per served request: route, status, latency, and

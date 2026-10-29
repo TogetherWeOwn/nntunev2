@@ -31,12 +31,53 @@ CASES = (
         "refresh_transport_marker_prevents_empty_upload_downgrade",
     ),
     (
+        "media type case folding",
+        HANDLERS,
+        ".eq_ignore_ascii_case(BOUND_REFRESH_CONTENT_TYPE)",
+        "== BOUND_REFRESH_CONTENT_TYPE",
+        ("--lib", "refresh_transport_"),
+        (
+            "refresh_transport_marker_prevents_empty_upload_downgrade",
+            "refresh_transport_accepts_each_marker_spelling_for_recovery",
+        ),
+    ),
+    (
+        "media type parameter split",
+        HANDLERS,
+        "value.split(';').next()",
+        "Some(value)",
+        ("--lib", "refresh_transport_"),
+        (
+            "refresh_transport_marker_prevents_empty_upload_downgrade",
+            "refresh_transport_accepts_each_marker_spelling_for_recovery",
+        ),
+    ),
+    (
+        "media type whitespace trim",
+        HANDLERS,
+        "            media_type\n                .trim()\n                .eq_ignore_ascii_case(BOUND_REFRESH_CONTENT_TYPE)",
+        "            media_type.eq_ignore_ascii_case(BOUND_REFRESH_CONTENT_TYPE)",
+        ("--lib", "refresh_transport_"),
+        (
+            "refresh_transport_marker_prevents_empty_upload_downgrade",
+            "refresh_transport_accepts_each_marker_spelling_for_recovery",
+        ),
+    ),
+    (
         "runtime header forwarding",
         WORKER,
         "            refresh_content_type.as_deref(),\n",
         "            refresh_content_type.as_deref().filter(|_| false),\n",
         ("--lib", "refresh_transport_"),
         "refresh_transport_requires_marked_recovery_but_preserves_legacy_empty_refresh",
+    ),
+    (
+        "block-commented transport guard",
+        WORKER,
+        "    if let Some(rejection) = handlers::refresh_transport_rejection(&request, refresh_content_type) {\n        return rejection;\n    }\n",
+        "    /*\n    if let Some(rejection) = handlers::refresh_transport_rejection(&request, refresh_content_type) {\n        return rejection;\n    }\n    */\n",
+        ("--lib", "refresh_transport_"),
+        "refresh_transport_marker_prevents_empty_upload_downgrade",
     ),
 )
 
@@ -54,18 +95,21 @@ def run(args):
 
 def main():
     for label, path, old, new, args, expected in CASES:
+        expected_names = (expected,) if isinstance(expected, str) else expected
         original = path.read_text()
         if original.count(old) != 1:
             raise RuntimeError(f"{label}: mutation anchor must occur exactly once")
         baseline = run(args)
-        if (baseline.returncode != 0 or expected not in baseline.stdout
+        if (baseline.returncode != 0
+                or any(name not in baseline.stdout for name in expected_names)
                 or "test result: ok." not in baseline.stdout):
             raise RuntimeError(f"{label}: baseline did not pass\n{baseline.stdout[-6000:]}")
         try:
             path.write_text(original.replace(old, new, 1))
             mutant = run(args)
             if (mutant.returncode != 101 or "test result: FAILED." not in mutant.stdout
-                    or f"{expected} ... FAILED" not in mutant.stdout):
+                    or any(f"{name} ... FAILED" not in mutant.stdout
+                           for name in expected_names)):
                 raise RuntimeError(f"{label}: expected assertion did not kill mutant\n{mutant.stdout[-6000:]}")
         finally:
             path.write_text(original)
