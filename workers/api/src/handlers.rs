@@ -653,6 +653,11 @@ pub trait Store {
     /// Both writes must commit together or neither may commit; never emulate
     /// this with autocommitted writes or a compensating reset of `used`. The default
     /// fails closed for stores without transactional redemption support.
+    /// `_now` is the request-admission timestamp: database implementations
+    /// MUST re-evaluate expiry against their own clock when the claim
+    /// executes (the production store does, inside the claim statement), so a
+    /// request admitted just before expiry cannot commit after it. In-memory
+    /// test stores have no second clock and use `_now`.
     fn redeem_magic_link(
         &self,
         _magic: &MagicLinkRecord,
@@ -660,6 +665,30 @@ pub trait Store {
         _session: &SessionRecord,
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async { Err(StoreError) }
+    }
+    /// Redemption plus its success audit, for handlers whose response
+    /// carries the freshly committed credential: no store operation may run
+    /// between the redemption commit and that response, or a slow audit
+    /// insert could eat the client's remaining deadline after the link is
+    /// already spent. The production store writes the audit inside the
+    /// redemption transaction, so all three writes commit together and an
+    /// audit failure leaves the link unspent and retryable. The default
+    /// keeps stores without that seam on the sequential shape (redeem, then
+    /// best-effort audit on success), preserving observable test behavior.
+    fn redeem_magic_link_and_audit(
+        &self,
+        magic: &MagicLinkRecord,
+        now: u64,
+        session: &SessionRecord,
+        audit: &AuditEvent,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let redeemed = self.redeem_magic_link(magic, now, session).await?;
+            if redeemed {
+                let _ = self.insert_audit(audit).await;
+            }
+            Ok(redeemed)
+        }
     }
     fn session_by_id(
         &self,
@@ -2382,10 +2411,16 @@ where
     // no auto-redeem, an explicit confirm, and the signed-in identity shown
     // before any credential is typed.
     if session_cookie_value(req).is_some() {
-        if let Ok((claims, _)) = ctx.authenticate(req, false).await {
-            if claims.user_id != record.user_id {
-                return generic_auth();
-            }
+        match ctx.authenticate(req, false).await {
+            Ok((claims, _)) if claims.user_id != record.user_id => return generic_auth(),
+            Ok(_) => {}
+            // A storage failure inside `authenticate` (its 5xx results, e.g.
+            // the `session_by_id` lookup) is NOT an absent or invalid
+            // cookie: the existing session's owner is unproven, so fail
+            // closed without consuming the token instead of letting a
+            // transient lookup error silently replace that session.
+            Err(resp) if resp.status >= 500 => return resp,
+            Err(_) => {}
         }
     }
     // Pure validation is not authentication: prepare everything that can fail
@@ -2399,16 +2434,29 @@ where
         Ok(prepared) => prepared,
         Err(resp) => return resp,
     };
+    // `ctx.now` is the request-admission timestamp; the production store
+    // re-evaluates expiry against the database clock when its claim
+    // executes (documented on the trait), so time spent in admission and
+    // lookup cannot push a redemption past the link's stated expiry. The
+    // success audit rides the same call (inside the production
+    // transaction), so nothing but response construction follows the
+    // commit that spends the link.
+    let audit = vault::audit_event(
+        &prepared.user_id,
+        "auth.magic",
+        true,
+        &ctx.source_ip,
+        ctx.now,
+    );
     match ctx
         .store
-        .redeem_magic_link(&prepared.used_record, ctx.now, &session)
+        .redeem_magic_link_and_audit(&prepared.used_record, ctx.now, &session, &audit)
         .await
     {
         Ok(true) => {}
         Ok(false) => return generic_auth(),
         Err(_) => return internal(),
     }
-    ctx.audit(&prepared.user_id, "auth.magic", true).await;
     // The token holder is now signed in as this account; echo only its email.
     let mut resp = json_response(
         200,
@@ -3677,6 +3725,9 @@ mod tests {
         rate_limit_pair_calls: RefCell<usize>,
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
+        /// Session-row lookup outage pin: `session_by_id` fails like a
+        /// production query error, which `authenticate` maps to a 500.
+        fail_session_lookup: RefCell<bool>,
         lose_magic_claim: RefCell<bool>,
         magic_redemptions: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
@@ -4065,6 +4116,9 @@ mod tests {
             Ok(true)
         }
         async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
+            if *self.fail_session_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.sessions.borrow().get(id).cloned())
         }
         async fn rotate_session_row(
@@ -5035,6 +5089,47 @@ mod tests {
             "signed-in identity must be in the body: {}",
             resp.body
         );
+    }
+
+    #[test]
+    fn magic_finish_fails_closed_when_the_session_lookup_errors() {
+        // The account-swap guard must distinguish a storage failure from an
+        // absent/invalid cookie: if looking up the existing session's row
+        // errors, its owner is unproven, so the other account's link must
+        // not be redeemed (and must not be spent) on the strength of the
+        // failed lookup.
+        let h = harness();
+        seed_user(&h, "victim", "victim@example.com");
+        seed_user(&h, "other", "other@example.com");
+        let victim_cookie = magic_login(&h, "victim@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "other@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let other_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let sessions_before = h.store.sessions.borrow().len();
+        *h.store.fail_session_lookup.borrow_mut() = true;
+        let resp = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": other_token}).to_string()),
+            Some(victim_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(resp.set_cookie.is_none(), "no swapped-session cookie");
+        assert_eq!(h.store.sessions.borrow().len(), sessions_before);
+        assert!(!h.store.magic.borrow()[&auth::hash_magic_token(&other_token)].used);
+        // Once the lookup recovers the token is still redeemable by its owner.
+        *h.store.fail_session_lookup.borrow_mut() = false;
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": other_token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
     }
 
     #[test]

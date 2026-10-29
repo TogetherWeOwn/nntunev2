@@ -1038,14 +1038,36 @@ impl Store for PgStore {
     async fn redeem_magic_link(
         &self,
         magic: &MagicLinkRecord,
-        now: u64,
+        // Admission time is intentionally unused here: the claim statement
+        // re-evaluates expiry against the database clock when it executes
+        // (see `crate::magic_redemption`), so a slow admission/lookup path
+        // cannot redeem a link after its stated expiry.
+        _now: u64,
         session: &SessionRecord,
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
                 let transaction = client.transaction().await.map_err(|_| StoreError)?;
-                crate::magic_redemption::redeem(transaction, magic, now, session).await
+                crate::magic_redemption::redeem(transaction, magic, session, None).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn redeem_magic_link_and_audit(
+        &self,
+        magic: &MagicLinkRecord,
+        _now: u64,
+        session: &SessionRecord,
+        audit: &AuditEvent,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| StoreError)?;
+                crate::magic_redemption::redeem(transaction, magic, session, Some(audit)).await
             },
             TOTAL_TIMEOUT_MS,
         )
