@@ -27,7 +27,7 @@ SELECT current_database() = 'nntunev2_staging'
    AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                WHERE n.nspname='public' AND c.relname='sessions' AND c.relkind='r')
    AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-               WHERE c.relname='sessions' AND c.relkind IN ('r','p','v','m','f','S')
+               WHERE c.relname='sessions'
                  AND n.nspname NOT IN ('public','pg_catalog','information_schema')
                  AND n.nspname NOT LIKE 'pg\\_temp\\_%'
                  AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%')

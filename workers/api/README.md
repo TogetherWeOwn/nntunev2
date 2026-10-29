@@ -179,8 +179,12 @@ all three nullable receipt columns and their exact types on the actual database
 identified by the deployed Hyperdrive origin. It reuses the existing staging
 migrator secret, checks private target identity, and never applies a migration.
 Because the Worker resolves unqualified `sessions` through its runtime role,
-the gate also requires that no other non-system `sessions` relation exists, so
-any role search path that resolves the name resolves the checked public table.
+the gate also requires that no other non-system `sessions` relation exists
+(including indexes, partitioned indexes and composite relations), so any role
+search path that resolves the name resolves the checked public table. Disposable
+PostgreSQL CI executes this exact catalog query against positive, shadow and
+system/temp-exception fixtures; inverted-exclusion and omitted-kind mutants
+must fail verdict assertions, not just SQL-source checks.
 The direct schema connection requires `sslmode=verify-full` (also the default
 when omitted); `require` and weaker modes reject before connecting. The staging
 job installs/checks the system CA bundle, passed explicitly as `PGSSLROOTCERT`,
