@@ -50,6 +50,10 @@ class SchemaGateTests(unittest.TestCase):
         self.assertTrue(options["input"].startswith("BEGIN READ ONLY;"))
         for column in ("refresh_retry_hash", "refresh_issued_at", "refresh_claimed_at"):
             self.assertIn(column, options["input"])
+        # No other schema may shadow the Worker's unqualified `sessions`
+        # resolution away from the checked public table.
+        self.assertIn("n.nspname NOT IN ('public','pg_catalog','information_schema')",
+                      options["input"])
         for mutation in ("ALTER", "INSERT", "UPDATE", "DELETE", "DROP"):
             self.assertNotIn(mutation, options["input"])
 
