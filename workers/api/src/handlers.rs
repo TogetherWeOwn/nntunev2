@@ -3725,6 +3725,7 @@ mod tests {
         rate_limit_pair_calls: RefCell<usize>,
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
+        fail_magic_audit: RefCell<bool>,
         /// Session-row lookup outage pin: `session_by_id` fails like a
         /// production query error, which `authenticate` maps to a 500.
         fail_session_lookup: RefCell<bool>,
@@ -4114,6 +4115,25 @@ mod tests {
             sessions.insert(session.id.clone(), session.clone());
             row.used = true;
             Ok(true)
+        }
+        async fn redeem_magic_link_and_audit(
+            &self,
+            magic: &MagicLinkRecord,
+            now: u64,
+            session: &SessionRecord,
+            audit: &AuditEvent,
+        ) -> Result<bool, StoreError> {
+            // The database fixtures separately prove rollback after both
+            // writes. Here the store's error pins the handler's no-cookie
+            // response to that failed transaction, without faking SQL.
+            if *self.fail_magic_audit.borrow() {
+                return Err(StoreError);
+            }
+            let redeemed = self.redeem_magic_link(magic, now, session).await?;
+            if redeemed {
+                let _ = self.insert_audit(audit).await;
+            }
+            Ok(redeemed)
         }
         async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
             if *self.fail_session_lookup.borrow() {
@@ -5032,6 +5052,56 @@ mod tests {
         assert_eq!(replay.status, 401);
         assert!(replay.set_cookie.is_none());
         assert_eq!(h.store.sessions.borrow().len(), 1);
+    }
+
+    #[test]
+    fn magic_finish_audit_transaction_error_never_sets_a_cookie() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        assert_eq!(
+            h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            )
+            .status,
+            200
+        );
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let hash = auth::hash_magic_token(&token);
+        let audits_before = h.store.audits.borrow().len();
+        *h.store.fail_magic_audit.borrow_mut() = true;
+        let failed = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(failed.status, 500);
+        assert!(failed.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+        assert!(!h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        *h.store.fail_magic_audit.borrow_mut() = false;
+        let retry = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert!(retry.set_cookie.is_some());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before + 1);
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert_eq!(h.store.audits.borrow().len(), audits_before + 1);
     }
 
     #[test]

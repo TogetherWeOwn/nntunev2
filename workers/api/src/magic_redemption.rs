@@ -207,6 +207,9 @@ pub(crate) async fn redeem(
     Ok(true)
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod postgres_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +302,11 @@ mod tests {
 
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
             self.events.borrow_mut().push("audit");
+            let sessions: i64 = self
+                .transaction
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sessions, 1, "audit insertion must follow session insertion");
             let params = audit_params(event)?;
             self.transaction
                 .execute(INSERT_AUDIT, params_from_iter(sqlite_values(&params)))
@@ -439,6 +447,57 @@ mod tests {
         ));
         assert!(matches!(replay, Ok(false)));
         assert_eq!(*events.borrow(), ["bound", "claim", "rollback"]);
+        assert_eq!(persisted(&db), (true, 1, 1));
+    }
+
+    #[test]
+    fn audit_failure_rolls_back_claim_and_session_then_allows_one_retry() {
+        let (mut db, magic, session) = fixture();
+        let events = RefCell::new(Vec::new());
+        db.execute_batch(
+            "CREATE TRIGGER fail_audit_insert BEFORE INSERT ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'injected audit insertion failure'); END;",
+        )
+        .unwrap();
+        let failed = ready(redeem(
+            SqliteTransaction {
+                transaction: db.transaction().unwrap(),
+                events: &events,
+            },
+            &magic,
+            &session,
+            Some(&success_audit(&magic)),
+        ));
+        assert!(failed.is_err());
+        assert_eq!(
+            *events.borrow(),
+            ["bound", "claim", "insert", "audit", "rollback"]
+        );
+        assert_eq!(persisted(&db), (false, 0, 0));
+
+        db.execute_batch("DROP TRIGGER fail_audit_insert").unwrap();
+        events.borrow_mut().clear();
+        let retry = ready(redeem(
+            SqliteTransaction {
+                transaction: db.transaction().unwrap(),
+                events: &events,
+            },
+            &magic,
+            &session,
+            Some(&success_audit(&magic)),
+        ));
+        assert!(matches!(retry, Ok(true)));
+        assert_eq!(persisted(&db), (true, 1, 1));
+        let replay = ready(redeem(
+            SqliteTransaction {
+                transaction: db.transaction().unwrap(),
+                events: &events,
+            },
+            &magic,
+            &session,
+            Some(&success_audit(&magic)),
+        ));
+        assert!(matches!(replay, Ok(false)));
         assert_eq!(persisted(&db), (true, 1, 1));
     }
 
