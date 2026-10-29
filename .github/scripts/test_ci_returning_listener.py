@@ -18,7 +18,13 @@ import os
 import re
 import unittest
 
-from test_ci_pnpm_retry import check_required_step, job_needs, split_jobs
+from test_ci_pnpm_retry import (
+    check_required_step,
+    job_needs,
+    split_jobs,
+    split_steps,
+    step_level_field,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
@@ -30,23 +36,22 @@ FIXTURE_COMMAND = (
 SELF_COMMAND = "python3 .github/scripts/test_ci_returning_listener.py"
 TIMEOUT_COMMAND = "python3 .github/scripts/test_ci_web_e2e_timeout.py"
 
-# The only top-level keys this workflow may carry above `jobs:`. A
+# The only top-level keys this workflow may carry, in any order. A
 # top-level `defaults` block would set `defaults.run.shell` for every
-# job, including fixture-check and the public-text job running this
-# guard, so no new top-level key is allowed to appear unreviewed here.
+# job, including fixture-check. The guard's explicit shell keeps it
+# running so it can reject those defaults.
 WORKFLOW_TOP_KEYS = ("name", "on", "permissions", "concurrency", "env", "jobs")
 
 
 def workflow_shell_default_errors(text):
-    """Error strings unless the workflow head stays shell-default free.
+    """Error strings unless the entire workflow stays shell-default free.
 
-    Only the known top-level keys above `jobs:` are accepted; anything
-    else at column zero (plain, quoted, or otherwise spelled) fails
-    closed instead of being parsed as a possible `defaults` block.
+    Root mapping-key order is not semantic: defaults can follow jobs.
+    Only known top-level keys are accepted anywhere; anything else at
+    column zero (plain, quoted, or otherwise spelled) fails closed.
     """
-    head = re.split(r"^jobs\s*:", text, flags=re.MULTILINE, maxsplit=1)[0]
     errors = []
-    for line in head.splitlines():
+    for line in text.splitlines():
         if not line.strip() or line[0] in " \t" or line.startswith("#"):
             continue
         match = re.match(r"^([^\s#:][^:]*?)\s*:(?:\s|$)", line)
@@ -187,18 +192,40 @@ class TestReturningListenerWiring(unittest.TestCase):
         self.assertEqual(workflow_shell_default_errors(self.workflow_text), [])
 
     def test_workflow_level_defaults_fail(self):
-        """A top-level `defaults` block turns this suite red, any spelling."""
+        """Root defaults fail before or after jobs, in any key spelling."""
         for key_line in ("defaults:\n", '"defaults":\n', "'defaults':\n"):
-            with self.subTest(key_line=key_line):
-                text = (
-                    "name: ci\n"
-                    f"{key_line}"
-                    "  run:\n"
-                    "    shell: bash --noprofile --norc -c true {0}\n"
-                    "jobs:\n"
-                )
-                errors = workflow_shell_default_errors(text)
-                self.assertTrue(any("defaults" in e for e in errors), errors)
+            block = (
+                f"{key_line}"
+                "  run:\n"
+                "    shell: bash --noprofile --norc -c true {0}\n"
+            )
+            for placement in ("before", "after"):
+                with self.subTest(key_line=key_line, placement=placement):
+                    if placement == "before":
+                        text = self.workflow_text.replace("jobs:\n", block + "jobs:\n", 1)
+                    else:
+                        text = self.workflow_text + "\n" + block
+                    errors = workflow_shell_default_errors(text)
+                    self.assertTrue(any("defaults" in e for e in errors), errors)
+
+    def test_allowed_root_keys_after_jobs_stay_clean(self):
+        """Root key order alone is not an error; only unsafe keys fail."""
+        text = (
+            "jobs:\n"
+            + fixture_check_with(fixture_step())
+            + "\n# A known root key may follow the jobs mapping.\n"
+            + "name: ci\n"
+        )
+        self.assertEqual(workflow_shell_default_errors(text), [])
+
+    def test_guard_step_uses_explicit_safe_shell(self):
+        """Inherited defaults cannot silence the guard that rejects them."""
+        steps = [
+            step for step in split_steps(self.jobs["public-text"])
+            if step_level_field(step, "run") == SELF_COMMAND
+        ]
+        self.assertEqual(len(steps), 1)
+        self.assertIn(step_level_field(steps[0], "shell"), ("bash", "sh"))
 
     def test_masking_shell_on_fixture_step_fails(self):
         """A shell that ignores or replaces the script turns this red.
