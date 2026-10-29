@@ -255,14 +255,25 @@ def non_plain_key_lines(job_chunk):
     return bad
 
 
+SAFE_STEP_SHELLS = ("bash", "sh")
+
+
 def check_required_step(job_id, job_chunk, command):
     """Error strings unless `command` runs as a required step of the job.
 
     Required means: a step whose `run` is exactly `command` (a trailing
     ``|| true`` or a shell wrapper would mask its failure), with no `if`
     gate and no `continue-on-error`, in a job that is itself neither
-    gated nor continue-on-error. Anything weaker lets the guarded suite
-    be silently dropped or neutralized without CI turning red.
+    gated nor continue-on-error. The step must also run under the
+    default shell or a safe named shell (``bash``/``sh``, which GitHub
+    executes with ``-e``): a custom shell template receives the
+    generated script path as ``{0}`` and can ignore it entirely, so an
+    arbitrary `shell` override masks the command just as surely as
+    ``|| true``. A job-level `defaults` block is rejected for the same
+    reason: ``defaults.run`` can set that shell (or redirect the
+    working directory) for every step in the job. Anything weaker lets
+    the guarded suite be silently dropped or neutralized without CI
+    turning red.
     """
     errors = [
         f"{job_id}: key line must be a plain `key:` with exactly one ASCII "
@@ -276,6 +287,11 @@ def check_required_step(job_id, job_chunk, command):
         errors.append(f"{job_id}: job must be unconditional (no job-level if)")
     if job_level_field(job_chunk, "continue-on-error") is not None:
         errors.append(f"{job_id}: job must fail on a failed step, not continue-on-error")
+    if job_level_field(job_chunk, "defaults") is not None:
+        errors.append(
+            f"{job_id}: job must not set defaults "
+            "(defaults.run can override the required step's shell)"
+        )
     script = command.rsplit("/", 1)[-1]
     candidates = [
         step
@@ -286,6 +302,7 @@ def check_required_step(job_id, job_chunk, command):
         errors.append(f"{job_id}: no step runs {command}")
         return errors
     for step in candidates:
+        shell = step_level_field(step, "shell")
         if step_level_field(step, "run") != command:
             errors.append(f"{job_id}: step running {script} must be exactly `{command}`")
         elif step_level_field(step, "if") is not None:
@@ -294,6 +311,12 @@ def check_required_step(job_id, job_chunk, command):
             errors.append(
                 f"{job_id}: step running {script} must fail the job, "
                 "not continue-on-error"
+            )
+        elif shell not in (None, *SAFE_STEP_SHELLS):
+            errors.append(
+                f"{job_id}: step running {script} must use the default "
+                f"shell or a safe named shell {SAFE_STEP_SHELLS}, "
+                f"not a shell override {shell!r}"
             )
         else:
             return errors
