@@ -128,19 +128,16 @@ mod tests {
         async fn claim(&self, magic: &MagicLinkRecord, now: u64) -> Result<usize, StoreError> {
             self.events.borrow_mut().push("claim");
             let claim = SingleUseClaim::MagicLink { record: magic, now };
+            // rusqlite has no u64 binding; convert like the PostgreSQL impl.
+            let expires = i64::try_from(magic.expires_at).map_err(|_| StoreError)?;
+            let now = i64::try_from(now).map_err(|_| StoreError)?;
             let mut statement = self
                 .transaction
                 .prepare(claim.statement())
                 .map_err(|_| StoreError)?;
             let rows = statement
                 .query_map(
-                    params![
-                        magic.token_hash,
-                        magic.user_id,
-                        magic.email,
-                        magic.expires_at,
-                        now
-                    ],
+                    params![magic.token_hash, magic.user_id, magic.email, expires, now],
                     |_| Ok(()),
                 )
                 .map_err(|_| StoreError)?
@@ -158,16 +155,13 @@ mod tests {
                 .query_row("SELECT used FROM magic_link_tokens", [], |row| row.get(0))
                 .unwrap();
             assert!(used, "session insertion must follow a successful claim");
+            let created_at = i64::try_from(session.created_at).map_err(|_| StoreError)?;
+            let expires_at = i64::try_from(session.expires_at).map_err(|_| StoreError)?;
+            let counter = i64::from(session.rotation_counter);
             self.transaction
                 .execute(
                     INSERT_SESSION,
-                    params![
-                        session.id,
-                        session.user_id,
-                        session.created_at,
-                        session.expires_at,
-                        session.rotation_counter,
-                    ],
+                    params![session.id, session.user_id, created_at, expires_at, counter,],
                 )
                 .map(|_| ())
                 .map_err(|_| StoreError)
@@ -219,10 +213,10 @@ mod tests {
         let used = db
             .query_row("SELECT used FROM magic_link_tokens", [], |row| row.get(0))
             .unwrap();
-        let sessions = db
+        let sessions: i64 = db
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .unwrap();
-        (used, sessions)
+        (used, usize::try_from(sessions).unwrap())
     }
 
     #[test]
