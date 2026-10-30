@@ -1,0 +1,62 @@
+{
+  "provenance": {
+    "kind": "Synthetic offline contract fixture, not a captured account response",
+    "retrieved_on": "2026-10-28",
+    "api_version": "client/v4",
+    "api_reference": "https://developers.cloudflare.com/api/resources/durable_objects/subresources/namespaces/methods/list/",
+    "sdk_commit": "6992be906720834c83357ba99f4704c9f0ad7bd1",
+    "sdk_sources_sha256": {
+      "src/cloudflare/resources/durable_objects/namespaces/namespaces.py": "d4a2b131db86971e252da346f65c1ee5b715be6debd9bbf7f42034420032ef7c",
+      "src/cloudflare/pagination.py": "3f54e95a2eb8f4c5da4931e3690a6bb3ae661fc11e92d5678c604034748984e9",
+      "src/cloudflare/_base_client.py": "858c5f0527a90b32485056807b3131251c142acb397805463c27ff64322e9b0b"
+    },
+    "contract": "The reference documents page/per_page and optional result_info fields, including total_count and total_pages. The SDK uses numbered pages and does not require total_pages. These positive fixtures omit only total_pages and retain explicit count-based completion evidence; missing or contradictory evidence is not an implicit single-page success."
+  },
+  "settings": {
+    "observability": {
+      "enabled": false,
+      "logs": {"enabled": false, "invocation_logs": false},
+      "traces": {"enabled": false}
+    },
+    "compatibility_date": "2026-10-01",
+    "tail_consumers": [],
+    "bindings": [
+      {"name": "PRODUCER_SCRIPT_NAME", "type": "plain_text", "text": "nntune-api-staging"},
+      {
+        "name": "LOGS_URL",
+        "type": "plain_text",
+        "text": "https://dash.cloudflare.com/00000000000000000000000000000000/workers/services/view/nntune-api-staging/observability/logs"
+      },
+      {
+        "name": "ALERT_WINDOWS",
+        "type": "durable_object_namespace",
+        "class_name": "ErrorRateAlerts",
+        "namespace_id": "ffffffffffffffffffffffffffffffff"
+      }
+    ]
+  },
+  "subdomain": {"enabled": false},
+  "versions": {"items": [{"id": "00000000-0000-4000-8000-000000000001"}]},
+  "unrelated_namespace": {
+    "id": "00000000000000000000000000000001",
+    "class": "FixtureUnrelatedClass",
+    "name": "fixture-unrelated-namespace",
+    "script": "fixture-unrelated-worker",
+    "use_sqlite": true
+  },
+  "single_page_without_total_pages": {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": [
+      {
+        "id": "ffffffffffffffffffffffffffffffff",
+        "class": "ErrorRateAlerts",
+        "name": "fixture-alert-namespace",
+        "script": "nntune-alerts-staging",
+        "use_sqlite": true
+      }
+    ],
+    "result_info": {"count": 1, "page": 1, "per_page": 1000, "total_count": 1}
+  }
+}
