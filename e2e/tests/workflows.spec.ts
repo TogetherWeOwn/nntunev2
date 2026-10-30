@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import './calver-web-release.acceptance.js';
 import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -969,12 +970,12 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     }
   });
 
-  test('deploy concurrency is job-level so the E2E tail never holds the deploy group', () => {
-    // A workflow-level group is held until every job in the run finishes —
-    // now including up to ~40 min of post-deploy E2E — so queued main
-    // pushes would be cancelled before ever deploying. Job-level groups
-    // release when the deploy finishes; E2E serializes on e2e-staging.
-    expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
+  test('the outer web transaction lock spans E2E while nested lane locks remain distinct', () => {
+    // The complete plan/build/deploy/E2E/publish transaction must hold an
+    // outer main-writer lock. GitHub may supersede pending runs; this is
+    // deliberately not a FIFO claim. The imported CalVer bank evaluates
+    // that boundary across two main pushes and checks nested groups.
+    expect(deployWorkflow.split('\njobs:\n')[0]!).toMatch(/^concurrency:/m);
     for (const job of ['staging-web', 'staging-api', 'preview-web']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
@@ -1670,7 +1671,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'publish-web-canary', 'staging-api', 'staging-web']);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
@@ -1681,12 +1682,14 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   const assertDeployBody = (body: string) => {
     expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
     expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
-    // Exact command pin: staging-web deploys to staging, staging-api
-    // deploys the api Worker to staging with the public BUILD_SHA var, and
-    // preview-web runs `preview`. A bare `command: deploy` (no --env)
-    // deploys the top-level worker name, which equals the production env
-    // name — count checks alone miss it, so pin every wrangler-action
-    // command value exactly.
+    // Only web gains a saved-output config and no-bundle flag. API and
+    // preview commands stay exact; arbitrary flags/CLI vars or a bare
+    // deploy still fail. --no-bundle keeps the retained modules unchanged.
+    const webCommand = jobSection(body, 'staging-web')
+      .match(/^\s+command: (.+)$/m)?.[1]?.trim();
+    expect(webCommand).toMatch(
+      /^deploy --env staging --config (?:[^\s;&|`#]+|"[^"\n;&|`#]+") --no-bundle$/,
+    );
     const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
       .map((m) => m[1]!.trim())
       .sort();
@@ -1694,10 +1697,10 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       commands,
       `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
     ).toEqual([
-      'deploy --env staging',
+      webCommand!,
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
       'preview',
-    ]);
+    ].sort());
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
     // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
