@@ -3,9 +3,9 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-// Imported by the already-required workflows.spec.ts. Keeping this support
-// bank outside *.spec.ts avoids adding an unrelated browser journey/matrix
-// row: every offline assertion still runs through test:unit -> e2e-lint -> ci-ok.
+// workflows.spec.ts registers these callbacks so Playwright's list output
+// attributes them to the required spec and its existing traceability row.
+// Every offline assertion still runs through test:unit -> e2e-lint -> ci-ok.
 // The Python file's header is the executable CLI/fixture contract for the two
 // stdlib-only seams. No product implementation is replaced by a test double.
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -87,33 +87,33 @@ const mainContext = {
   'github.run_id': 4242,
 };
 
-test.describe('complete immutable web artifact and honest executed acceptance', () => {
-  test('offline package, inventory, safe extraction and metadata-only rendering', () => {
+export const calverAcceptanceCases: Record<string, () => void> = {
+  'offline package, inventory, safe extraction and metadata-only rendering': () => {
     test.setTimeout(150_000);
     runOfflineClass('ArtifactTests');
-  });
+  },
 
-  test('offline exact-run/attempt jobs, steps, pagination and artifact certification', () => {
+  'offline exact-run/attempt jobs, steps, pagination and artifact certification': () => {
     test.setTimeout(150_000);
     runOfflineClass('EvidenceTests');
-  });
+  },
 
-  test('producer bundles retain the complete sibling-server closure without a consumer build', () => {
+  'producer bundles retain the complete sibling-server closure without a consumer build': () => {
     test.setTimeout(150_000);
     runOfflineClass('ProducerModuleClosureTests', 'ci/test-web-release-boundaries.py');
-  });
+  },
 
-  test('malformed nested inventory and evidence refuse structurally without usable output', () => {
+  'malformed nested inventory and evidence refuse structurally without usable output': () => {
     test.setTimeout(150_000);
     runOfflineClass('MalformedBoundaryTests', 'ci/test-web-release-boundaries.py');
-  });
+  },
 
-  test('GitHub fetch and canary resolve enforce exact immutable selection at the fake HTTP boundary', () => {
+  'GitHub fetch and canary resolve enforce exact immutable selection at the fake HTTP boundary': () => {
     test.setTimeout(150_000);
     runOfflineClass('GitHubTransportTests', 'ci/test-web-release-boundaries.py');
-  });
+  },
 
-  test('main writer lock spans build, deploy, reusable E2E and publication without a nested same-group deadlock', () => {
+  'main writer lock spans build, deploy, reusable E2E and publication without a nested same-group deadlock': () => {
     const outer = concurrency(deploy.split('\njobs:\n')[0]!, 0);
     const first = groupValue(outer.group, mainContext);
     expect(groupValue(outer.group, { ...mainContext, 'github.run_id': 4243 })).toBe(first);
@@ -130,9 +130,9 @@ test.describe('complete immutable web artifact and honest executed acceptance', 
         expect(groupValue(concurrency(body, 4).group, mainContext), `nested lock ${name}`).not.toBe(first);
       }
     }
-  });
+  },
 
-  test('the staging build uses a single deferred-source plan and retains that exact plan with the full tree', () => {
+  'the staging build uses a single deferred-source plan and retains that exact plan with the full tree': () => {
     const staging = job(deploy, 'staging-web');
     const planner = calver(staging);
     expect(planner).toHaveLength(1);
@@ -159,9 +159,9 @@ test.describe('complete immutable web artifact and honest executed acceptance', 
     expect(staging).toContain('artifact-id');
     expect(staging).toContain('artifact-digest');
     expect(staging, 'current same-origin API/CSP policy stays portable').not.toMatch(/PUBLIC_API_BASE_URL:\s*https?:/);
-  });
+  },
 
-  test('canary publication needs real deployment and E2E, then the stronger certificate, with frozen plan and upload identity', () => {
+  'canary publication needs real deployment and E2E, then the stronger certificate, with frozen plan and upload identity': () => {
     const publisher = job(deploy, 'publish-web-canary');
     const needs = publisher.match(/^    needs: \[([^\]]+)\]/m)?.[1]?.split(',').map(value => value.trim()).sort();
     expect(needs).toEqual(['post-deploy-e2e', 'staging-web']);
@@ -180,9 +180,9 @@ test.describe('complete immutable web artifact and honest executed acceptance', 
     expect(publisher).toContain('actions: read');
     expect(publisher).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(publisher).toContain('needs.staging-web.outputs.plan');
-  });
+  },
 
-  test('production is still explicit-SHA manual web-only and never rebuilds or substitutes source output', () => {
+  'production is still explicit-SHA manual web-only and never rebuilds or substitutes source output': () => {
     const triggers = production.split('\npermissions:\n')[0]!;
     expect(triggers).toContain('workflow_dispatch:');
     expect(triggers).not.toMatch(/^  (push|schedule|workflow_run|workflow_call|pull_request):/m);
@@ -233,5 +233,5 @@ test.describe('complete immutable web artifact and honest executed acceptance', 
       expect(action).toContain(sharedAction);
       expect(action).toContain('runs-on-json:');
     }
-  });
-});
+  },
+};

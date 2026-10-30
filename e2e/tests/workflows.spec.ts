@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import './calver-web-release.acceptance.js';
+import { calverAcceptanceCases } from './calver-web-release.acceptance.js';
 import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -3019,4 +3019,10 @@ test.describe('burst probe bounds (static + executed pin)', () => {
     expect(readme).toContain('never point this script at');
     expect(readme).toContain('production');
   });
+});
+
+test.describe('complete immutable web artifact and honest executed acceptance', () => {
+  for (const [name, run] of Object.entries(calverAcceptanceCases)) {
+    test(name, run);
+  }
 });
