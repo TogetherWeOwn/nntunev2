@@ -30,15 +30,46 @@ fn function_body(source: &str, signature: &str) -> String {
     normalize(&rest[..end])
 }
 
+// Separate only top-level clauses: a subquery's LIMIT/ORDER BY belongs to
+// the eligibility filter and must still match the delete's filter exactly.
+fn candidate_filter_and_clauses(sql: &str) -> (&str, &str) {
+    let predicate = sql
+        .strip_prefix("SELECT users.id FROM users WHERE ")
+        .expect("candidate selection must use the production user eligibility filter");
+    let mut depth = 0;
+    for (offset, character) in predicate.char_indices() {
+        if depth == 0
+            && [
+                " LIMIT ",
+                " ORDER BY ",
+                " FOR UPDATE ",
+                " FETCH ",
+                " OFFSET ",
+            ]
+            .iter()
+            .any(|clause| predicate[offset..].starts_with(clause))
+        {
+            return (&predicate[..offset], &predicate[offset..]);
+        }
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    panic!("candidate selection must retain its locking clause");
+}
+
 #[test]
 fn reap_candidate_lock_and_delete_share_one_filter_and_locked_ids() {
     let lock_sql = normalize(&nntune_api::handlers::lock_unverified_users_sql());
     let delete_sql = normalize(&nntune_api::handlers::reap_unverified_users_sql());
 
-    let filter = lock_sql
-        .strip_prefix("SELECT users.id FROM users WHERE ")
-        .and_then(|rest| rest.strip_suffix(" FOR UPDATE SKIP LOCKED"))
-        .expect("candidate lock must skip parents held by enrollment, never wait on them");
+    let (filter, clauses) = candidate_filter_and_clauses(&lock_sql);
+    assert!(
+        clauses.contains("FOR UPDATE SKIP LOCKED"),
+        "candidate lock must skip parents held by enrollment, never wait on them"
+    );
     assert_eq!(
         delete_sql,
         format!("DELETE FROM users WHERE {filter} AND users.id = ANY($4)"),
@@ -49,6 +80,36 @@ fn reap_candidate_lock_and_delete_share_one_filter_and_locked_ids() {
         filter.contains("NOT EXISTS (SELECT 1 FROM webauthn_credentials"),
         "a credential committed after candidate selection must exempt its user at delete time"
     );
+}
+
+#[test]
+fn reap_candidate_selection_is_bounded_in_sql_before_buffering() {
+    let lock_sql = normalize(&nntune_api::handlers::lock_unverified_users_sql());
+    let (_, clauses) = candidate_filter_and_clauses(&lock_sql);
+    let words: Vec<_> = clauses.split_whitespace().collect();
+    let limit = words
+        .windows(2)
+        .find(|pair| pair[0] == "LIMIT")
+        .and_then(|pair| pair[1].parse::<usize>().ok())
+        .expect("candidate selection must be bounded in SQL before buffering any ids");
+    assert!(
+        (1..=1000).contains(&limit),
+        "candidate SQL must cap each reaper call at a finite batch of 1..=1000 users"
+    );
+}
+
+#[test]
+fn candidate_filter_keeps_subquery_clauses_but_not_top_level_batching() {
+    let filter = "NOT EXISTS (SELECT 1 FROM sessions WHERE user_id = users.id ORDER BY id LIMIT 1)";
+    for clauses in [
+        " FOR UPDATE SKIP LOCKED",
+        " LIMIT 128 FOR UPDATE SKIP LOCKED",
+        " FOR UPDATE SKIP LOCKED LIMIT 128",
+        " ORDER BY users.id LIMIT 128 FOR UPDATE SKIP LOCKED",
+    ] {
+        let sql = format!("SELECT users.id FROM users WHERE {filter}{clauses}");
+        assert_eq!(candidate_filter_and_clauses(&sql), (filter, clauses));
+    }
 }
 
 #[test]

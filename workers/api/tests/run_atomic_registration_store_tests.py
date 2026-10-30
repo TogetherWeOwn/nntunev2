@@ -29,6 +29,8 @@ EXPECTED = {
         "postgres_reap_before_prune_preserves_in_flight_enrollment",
         "postgres_reap_after_enrollment_rollback_cleans_expired_signup",
         "postgres_reap_delete_rechecks_locked_candidates_before_deleting",
+        "postgres_reap_bounded_batch_drains_cap_plus_one",
+        "postgres_reap_preserves_explicit_protected_user_and_dependents",
     )
 }
 
@@ -58,10 +60,24 @@ def main():
         extra = ", ".join(sorted(actual - EXPECTED)) or "none"
         sys.exit(f"PostgreSQL acceptance module mismatch; missing: {missing}; extra: {extra}")
     print(f"PostgreSQL acceptance: executing {len(actual)} production-seam tests", flush=True)
-    subprocess.run(
-        command + ["--", "--ignored", "--nocapture", "--test-threads=1"],
-        cwd=ROOT, check=True,
-    )
+    try:
+        subprocess.run(
+            command + ["--", "--ignored", "--nocapture", "--test-threads=1"],
+            cwd=ROOT, check=True,
+        )
+    except subprocess.CalledProcessError:
+        # Blind batching tests intentionally start RED. Prove the independent
+        # protected-id mutant in the same disposable job, without skipping or
+        # converting the original bank failure into a successful check.
+        if (
+            os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        ):
+            subprocess.run(
+                [sys.executable, "workers/api/tests/run_atomic_registration_mutation_tests.py", "--protected-only"],
+                cwd=ROOT, check=True,
+            )
+        raise
 
 
 if __name__ == "__main__":

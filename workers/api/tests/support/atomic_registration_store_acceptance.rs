@@ -831,6 +831,208 @@ fn postgres_reap_after_enrollment_rollback_cleans_expired_signup() {
     });
 }
 
+// Removing the SQL cap (or draining several batches inside one helper call)
+// must leave no overflow row and fail here. A post-buffer truncate can leave
+// the overflow but still fails the independently observed candidate row count.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_bounded_batch_drains_cap_plus_one() {
+    run_test(async {
+        let mut cleanup = connect().await;
+        // Other cases deliberately retain rows. Hold their parents on another
+        // connection so only this case's new backlog can consume the batch.
+        let mut other_rows = connect().await;
+        let isolation = other_rows
+            .transaction()
+            .await
+            .expect("isolate prior fixtures");
+        isolation
+            .query("SELECT id FROM users FOR UPDATE SKIP LOCKED", &[])
+            .await
+            .expect("protect prior disposable fixtures from this batch");
+
+        let candidate_sql = crate::handlers::lock_unverified_users_sql();
+        let words: Vec<_> = candidate_sql.split_whitespace().collect();
+        // The ceiling is independent of the chosen production batch size;
+        // changing a safe cap within 1..=1000 does not require changing this
+        // fixture. With no SQL cap, still run the real helper against 1001
+        // rows so baseline RED reports its unbounded cleanup behavior.
+        let cap = words
+            .windows(2)
+            .rev()
+            .find(|pair| pair[0] == "LIMIT")
+            .and_then(|pair| pair[1].parse::<usize>().ok())
+            .unwrap_or(1000);
+        assert!(
+            (1..=1000).contains(&cap),
+            "candidate SQL must cap each reaper call at a finite batch of 1..=1000 users"
+        );
+        let prefix = format!("reap-batch-{:016x}", rand::random::<u64>());
+        let ids: Vec<String> = (0..=cap).map(|index| format!("{prefix}-{index}")).collect();
+        cleanup
+            .execute(
+                "INSERT INTO users (id, email, created_at) SELECT id, id || '@example.com', $2 FROM unnest($1::TEXT[]) AS seed(id)",
+                &[&ids, &((NOW - 100_000) as i64)],
+            )
+            .await
+            .expect("seed exactly cap plus one eligible disposable signups");
+
+        let cutoff = (REAP_NOW - REAP_TTL) as i64;
+        let now = REAP_NOW as i64;
+        let selection = cleanup
+            .transaction()
+            .await
+            .expect("observe candidate query");
+        let selected = selection
+            .query(&candidate_sql, &[&cutoff, &None::<&str>, &now])
+            .await
+            .expect("execute the real candidate SQL before any client-side truncation")
+            .len();
+        selection
+            .rollback()
+            .await
+            .expect("release observed candidate locks");
+
+        tokio::time::timeout(
+            CLEANUP_BOUND,
+            reap_unverified_users_on(&mut cleanup, REAP_NOW, REAP_TTL, None),
+        )
+        .await
+        .expect("one bounded reaper batch must return promptly")
+        .expect("run the production reaper on the cap-plus-one backlog");
+        let remaining = cleanup
+            .query_one("SELECT count(*) FROM users WHERE id = ANY($1)", &[&ids])
+            .await
+            .expect("observe overflow after one production reaper call")
+            .get::<_, i64>(0);
+        assert_eq!(
+            remaining, 1,
+            "one reaper call must leave exactly the cap-plus-one overflow row"
+        );
+        assert_eq!(
+            selected, cap,
+            "candidate selection must enforce the batch cap in SQL before ids are buffered"
+        );
+        tokio::time::timeout(
+            CLEANUP_BOUND,
+            reap_unverified_users_on(&mut cleanup, REAP_NOW, REAP_TTL, None),
+        )
+        .await
+        .expect("the deferred reaper batch must return promptly")
+        .expect("a later call drains the overflow");
+        assert_eq!(
+            cleanup
+                .query_one("SELECT count(*) FROM users WHERE id = ANY($1)", &[&ids])
+                .await
+                .expect("observe eventual cleanup")
+                .get::<_, i64>(0),
+            0,
+            "a later reaper call must drain the overflow rather than strand it"
+        );
+        isolation
+            .rollback()
+            .await
+            .expect("release prior fixture locks");
+    });
+}
+
+// Dropping/corrupting the Some(id) binding must reap this otherwise eligible
+// signup and its expired dependents. The final None call proves that no
+// credential, live proof, age boundary or fixture lock was sparing it.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_preserves_explicit_protected_user_and_dependents() {
+    run_test(async {
+        let mut cleanup = connect().await;
+        let mut other_rows = connect().await;
+        let isolation = other_rows
+            .transaction()
+            .await
+            .expect("isolate prior fixtures");
+        isolation
+            .query("SELECT id FROM users FOR UPDATE SKIP LOCKED", &[])
+            .await
+            .expect("protect prior disposable fixtures from this case");
+        let mut protected = Fixture::seed(&cleanup).await;
+        age_signup(&cleanup, &mut protected).await;
+        let mut control = Fixture::seed(&cleanup).await;
+        age_signup(&cleanup, &mut control).await;
+        let protected_id = protected.credential.user_id.as_str();
+
+        for _ in 0..2 {
+            tokio::time::timeout(
+                CLEANUP_BOUND,
+                reap_unverified_users_on(&mut cleanup, REAP_NOW, REAP_TTL, Some(protected_id)),
+            )
+            .await
+            .expect("protected-user cleanup must return promptly")
+            .expect("run the real reaper with Some(protected_id)");
+            assert_eq!(
+                user_count(&cleanup, protected_id).await,
+                1,
+                "protected signup must survive the production reaper"
+            );
+            assert_eq!(
+                challenge_count(&cleanup, &protected.challenge.id).await,
+                1,
+                "the protected signup's expired challenge must survive"
+            );
+            assert_eq!(
+                count(
+                    &cleanup,
+                    "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                    &protected.magic.token_hash
+                )
+                .await,
+                1,
+                "the protected signup's expired emailed proof must survive"
+            );
+            protected
+                .assert_state(&cleanup, (false, false, false, 0))
+                .await;
+            assert_eq!(
+                user_count(&cleanup, &control.credential.user_id).await,
+                0,
+                "an unprotected eligible signup must still be reaped"
+            );
+            assert_eq!(challenge_count(&cleanup, &control.challenge.id).await, 0);
+            assert_eq!(
+                count(
+                    &cleanup,
+                    "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                    &control.magic.token_hash
+                )
+                .await,
+                0,
+                "reaping the unprotected control must cascade to its emailed proof"
+            );
+        }
+
+        reap_unverified_users_on(&mut cleanup, REAP_NOW, REAP_TTL, None)
+            .await
+            .expect("remove only the explicit protection on a later call");
+        assert_eq!(
+            user_count(&cleanup, protected_id).await,
+            0,
+            "the protected signup must otherwise be reap-eligible"
+        );
+        assert_eq!(challenge_count(&cleanup, &protected.challenge.id).await, 0);
+        assert_eq!(
+            count(
+                &cleanup,
+                "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                &protected.magic.token_hash
+            )
+            .await,
+            0
+        );
+        isolation
+            .rollback()
+            .await
+            .expect("release prior fixture locks");
+    });
+}
+
 // Drive the two production reaper statements in production sequence so the
 // delete's eligibility recheck can be observed against a candidate list
 // selected before a credential existed. The credential is inserted by the

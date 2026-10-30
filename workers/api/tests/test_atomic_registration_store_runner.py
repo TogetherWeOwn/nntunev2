@@ -84,6 +84,32 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
         self.assertNotIn("--list", calls[1])
         self.assertIn(runner.PREFIX, calls[1])
 
+    def test_failed_bank_keeps_its_failure_after_hosted_protected_control(self):
+        for runner_environment, expected_calls in (("github-hosted", 3), ("self-hosted", 2), ("", 2)):
+            with self.subTest(runner_environment=runner_environment):
+                calls = []
+                bank_failure = subprocess.CalledProcessError(101, ["cargo", "test"])
+
+                def fake_run(command, **kwargs):
+                    calls.append(command)
+                    if "--list" in command:
+                        return subprocess.CompletedProcess(command, 0, stdout=listing(runner.EXPECTED))
+                    if "--protected-only" in command:
+                        return subprocess.CompletedProcess(command, 0)
+                    raise bank_failure
+
+                environment = dict(ENVIRONMENT, RUNNER_ENVIRONMENT=runner_environment)
+                with patch.dict(os.environ, environment, clear=True):
+                    with patch.object(runner.subprocess, "run", fake_run):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                                runner.main()
+                self.assertIs(failure.exception, bank_failure, "diagnostics must never turn a red bank green")
+                self.assertEqual(len(calls), expected_calls)
+                if runner_environment == "github-hosted":
+                    self.assertIn("--protected-only", calls[-1])
+                    self.assertIn("workers/api/tests/run_atomic_registration_mutation_tests.py", calls[-1])
+
     def test_missing_database_url_starts_no_command(self):
         calls = []
         environment = dict(ENVIRONMENT)

@@ -35,8 +35,110 @@ async fn complete_registration_on(
 async fn cleanup() {}
 """
 
+REAPER_SOURCE_FIXTURE = b"""async fn complete_registration_on(
+) {
+    let protected_user_id = None;
+}
+async fn reap_unverified_users_on(
+    protected_user_id: Option<&str>,
+) -> Result<(), Error> {
+    let cutoff = 0;
+    if cutoff == 0 {
+        use_binding(protected_user_id);
+    }
+}
+async fn cleanup() {}
+"""
+
 
 class MutationRunnerTests(unittest.TestCase):
+    def test_protected_user_mutation_targets_only_the_real_reaper_binding(self):
+        mutations = [mutation for mutation in runner.MUTATIONS if mutation[0] == "ignored-protected-user-binding"]
+        self.assertEqual(len(mutations), 1, "the protected-user negative control must not be silently absent")
+        _, old, new, target, reason, signature = mutations[0]
+        self.assertEqual(target, runner.PREFIX + "postgres_reap_preserves_explicit_protected_user_and_dependents")
+        self.assertEqual(reason, "protected signup must survive the production reaper")
+        changed = runner.mutated_source(REAPER_SOURCE_FIXTURE, old, new, signature)
+        self.assertEqual(changed, b"""async fn complete_registration_on(
+) {
+    let protected_user_id = None;
+}
+async fn reap_unverified_users_on(
+    protected_user_id: Option<&str>,
+) -> Result<(), Error> {
+    let protected_user_id = protected_user_id.map(|_| "");
+    let cutoff = 0;
+    if cutoff == 0 {
+        use_binding(protected_user_id);
+    }
+}
+async fn cleanup() {}
+""")
+
+    def test_protected_user_mutation_restores_bytes_after_unrelated_failure(self):
+        mutations = [mutation for mutation in runner.MUTATIONS if mutation[0] == "ignored-protected-user-binding"]
+        self.assertEqual(len(mutations), 1, "the protected-user negative control must not be silently absent")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / runner.SOURCE
+            source.parent.mkdir(parents=True)
+            source.write_bytes(REAPER_SOURCE_FIXTURE)
+            environment = {
+                "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                "NNTUNE_TEST_DATABASE_URL": "postgresql://localhost/nntune_ci",
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.object(runner, "ROOT", root):
+                with patch.object(runner, "MUTATIONS", mutations), patch.object(
+                    runner.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 101, stdout="connection refused"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "did not reach its expected assertion"):
+                        runner.main()
+            self.assertEqual(source.read_bytes(), REAPER_SOURCE_FIXTURE)
+
+    def test_protected_only_control_requires_a_named_red_then_restored_green(self):
+        target = runner.PREFIX + "postgres_reap_preserves_explicit_protected_user_and_dependents"
+        reason = "protected signup must survive the production reaper"
+        red = FAILURE.replace(TARGET, target).replace(REASON, reason)
+        green = f"running 1 test\ntest {target} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;"
+        for code, output, succeeds in (
+            (0, green, True),
+            (0, "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored;", False),
+            (0, green.replace(target, "another_case"), False),
+            (101, "error[E0425]: compilation failed", False),
+        ):
+            with self.subTest(code=code, output=output), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / runner.SOURCE
+                source.parent.mkdir(parents=True)
+                source.write_bytes(REAPER_SOURCE_FIXTURE)
+                calls = []
+
+                def fake_run(command, **kwargs):
+                    calls.append(command)
+                    self.assertIn(target, command)
+                    self.assertIn("--exact", command)
+                    if len(calls) == 1:
+                        self.assertIn(b'protected_user_id.map(|_| "")', source.read_bytes())
+                        return subprocess.CompletedProcess(command, 101, stdout=red)
+                    self.assertEqual(len(calls), 2, "a protected-only control must not recurse into the RED bank")
+                    self.assertEqual(source.read_bytes(), REAPER_SOURCE_FIXTURE)
+                    return subprocess.CompletedProcess(command, code, stdout=output)
+
+                environment = {
+                    "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                    "NNTUNE_TEST_DATABASE_URL": "postgresql://localhost/nntune_ci",
+                }
+                with patch.dict(os.environ, environment, clear=True), patch.object(runner, "ROOT", root):
+                    with patch.object(runner.subprocess, "run", fake_run):
+                        if succeeds:
+                            runner.main(protected_only=True)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "did not execute exactly once and pass"):
+                                runner.main(protected_only=True)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(source.read_bytes(), REAPER_SOURCE_FIXTURE)
+
     def test_accepts_only_the_named_runtime_assertion_failure(self):
         result = subprocess.CompletedProcess([], 101, stdout=FAILURE)
         self.assertIn("1 failed", runner.require_assertion_failure(result, TARGET, REASON))
