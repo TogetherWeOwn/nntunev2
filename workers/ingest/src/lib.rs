@@ -53,6 +53,8 @@ pub mod retry;
 pub mod track_writers;
 pub mod transcode;
 pub mod verify;
+pub mod writer_execution;
+pub mod writer_transport;
 
 use api_error::ApiError;
 use dispatch::validate_user_id;
@@ -723,6 +725,15 @@ enum AdmissionMark {
 /// state. Tests drive the same seam with in-memory and file-backed
 /// doubles (see `mod tests`).
 trait AdmissionLedger {
+    /// Durable fenced job admission. Existing meter-only doubles fail closed
+    /// unless they explicitly implement this separate writer boundary.
+    async fn admit_job(&mut self, _msg: &QueueMsg) -> core::result::Result<(), retry::JobError> {
+        Err(retry::JobError::transient(
+            retry::ERR_WRITE_FAILED,
+            "durable admission unavailable",
+        ))
+    }
+
     /// Atomically claim (`job_id`, `stage`) before reading or creating the
     /// durable mark. A competing request returns `Busy` without side effects.
     async fn record_stage_once(
@@ -887,6 +898,27 @@ impl PgAdmissionLedger {
 }
 
 impl AdmissionLedger for PgAdmissionLedger {
+    async fn admit_job(&mut self, msg: &QueueMsg) -> core::result::Result<(), retry::JobError> {
+        let client = library_db_client(&self.env, &self.trace_id)
+            .await
+            .map_err(|()| {
+                retry::JobError::transient(retry::ERR_WRITE_FAILED, "writer database unavailable")
+            })?;
+        let db = writer_transport::PgWriterDb::new(&client, || {
+            worker::Delay::from(std::time::Duration::from_millis(
+                library::LIBRARY_DB_DEADLINE_MS,
+            ))
+        });
+        writer_execution::admit_job(
+            &db,
+            &msg.job_id,
+            &msg.user_id,
+            &msg.idempotency_key,
+            (worker::Date::now().as_millis() / 1_000) as i64,
+        )
+        .await
+    }
+
     async fn record_stage_once(
         &mut self,
         job_id: &str,
@@ -1086,6 +1118,32 @@ where
     AdmissionDecision::Admitted
 }
 
+/// Prove durable job admission before the metered enqueue protocol, including
+/// queued replays. Writer errors retain their permanent/transient policy; an
+/// invalid stage causes no database, ledger, queue or meter effects.
+async fn drive_metered_admission_with_writer<L, Q, QF, M, MF>(
+    ledger: &mut L,
+    msg: &QueueMsg,
+    stage: &str,
+    queue_send: Q,
+    meter_emit: M,
+) -> core::result::Result<AdmissionDecision, retry::JobError>
+where
+    L: AdmissionLedger,
+    Q: FnMut() -> QF,
+    QF: core::future::Future<Output = bool>,
+    M: FnMut(MeterOutcome) -> MF,
+    MF: core::future::Future<Output = core::result::Result<(), MeterWriteError>>,
+{
+    if !crate::queue::WORKFLOW_STEPS.contains(&stage) {
+        return Ok(AdmissionDecision::MeterUnavailable(
+            MeterWriteError::UnknownStage("stage must be a pipeline workflow step"),
+        ));
+    }
+    ledger.admit_job(msg).await?;
+    Ok(drive_metered_admission(ledger, msg, stage, queue_send, meter_emit).await)
+}
+
 /// Write the checkpoint for a real (non-replay) admission, per
 /// [`checkpoint::admission_plan`]: a fresh job becomes queryable via
 /// `GET /v1/ingest/jobs/:id` immediately, and a re-admitted job's stale
@@ -1149,7 +1207,7 @@ async fn admit_metered_job(
     source: &str,
     extra: serde_json::Value,
 ) -> Result<Response> {
-    match drive_metered_admission(
+    let decision = match drive_metered_admission_with_writer(
         ledger,
         msg,
         stage,
@@ -1158,6 +1216,13 @@ async fn admit_metered_job(
     )
     .await
     {
+        Ok(decision) => decision,
+        Err(error) if error.transient => {
+            return service_unavailable("durable admission unavailable; retry shortly");
+        }
+        Err(_) => return json_error(ApiError::conflict("job cannot be admitted")),
+    };
+    match decision {
         AdmissionDecision::Admitted => {
             ensure_admission_checkpoint(env, msg).await;
             queued_envelope(msg, source, true, extra)
@@ -3118,3 +3183,7 @@ mod build_sha_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/admission_lifecycle_acceptance.rs"]
+mod admission_lifecycle_acceptance;
