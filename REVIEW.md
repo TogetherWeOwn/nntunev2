@@ -85,8 +85,10 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 - **Provider credentials (highest stakes):** users bring their own Usenet
   provider accounts. Credentials must never be logged, cached in plaintext
-  beyond their designed store, echoed in errors, or sent anywhere except
-  that user's provider connection. Partial redaction is exposure.
+  beyond their designed store, echoed in errors, or sent to unauthorized
+  destinations. Protected submission to the authenticated first-party vault
+  and test API, trusted vault processing, and the user's provider connection
+  are part of the supported flow. Partial redaction is exposure.
 - **Untrusted protocol data** (`crates/nntune-core`: NNTP, yEnc, NZB,
   decrypt, par2): size/count bounds before allocation, integer overflow on
   segment math, decompression/decrypt output caps, and malformed-input
@@ -97,9 +99,10 @@ A missing test alone is not a runtime bug. These are blocking findings:
 - **Auth and account flows** (`workers/api`, `apps/web`): magic-link/token
   redemption is single-use via one conditional write (not
   read-check-write), passkey (WebAuthn) input stays size-capped, throttles
-  fail the documented way, and re-authentication cannot be
-  cancelled or replayed into another session. Provider-auth expiry must not
-  be conflated with account-auth expiry.
+  fail the documented way, and cancelled or stale re-authentication cannot
+  authorize or continue a protected operation; its proof cannot be replayed
+  into another session. Provider-auth expiry must not be conflated with
+  account-auth expiry.
 - **Metering and concurrency** (Postgres flow ledger, Durable Object pool
   leases): counters and grants are claimed atomically, leases release on
   enqueue/workflow failure, and retries cannot double-charge the ledger.
