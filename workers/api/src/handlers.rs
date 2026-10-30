@@ -156,10 +156,10 @@ fn unverified_user_filter() -> String {
     )
 }
 
-/// Lock eligible parents without waiting on enrollment's parent-row lock.
+/// Lock at most 128 eligible parents without waiting on enrollment's lock.
 pub fn lock_unverified_users_sql() -> String {
     format!(
-        "SELECT users.id FROM users WHERE {} FOR UPDATE SKIP LOCKED",
+        "SELECT users.id FROM users WHERE {} LIMIT 128 FOR UPDATE SKIP LOCKED",
         unverified_user_filter()
     )
 }
