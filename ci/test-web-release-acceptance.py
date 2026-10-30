@@ -52,6 +52,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +173,11 @@ def archive_fixture(path, manifest=None, members=None):
                 archive.addfile(info, io.BytesIO(data))
 
 
+def interpreter_loader_env():
+    """Keep shared-library Python runnable without inheriting the parent environment."""
+    return {key: os.environ[key] for key in ("LD_LIBRARY_PATH",) if os.environ.get(key)}
+
+
 class OfflineCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="web-release-acceptance-")
@@ -197,7 +203,7 @@ class OfflineCase(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-I", "-c", OFFLINE_RUNNER, str(script), *map(str, args)],
             cwd=self.tmp,
-            env={"PATH": "", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"},
+            env={"PATH": "", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8", **interpreter_loader_env()},
             text=True, capture_output=True, timeout=15,
         )
         return result
@@ -246,6 +252,24 @@ class OfflineCase(unittest.TestCase):
 
 
 class ArtifactTests(OfflineCase):
+    def test_isolated_interpreter_starts_with_only_its_loader_path_preserved(self):
+        loader_path = os.pathsep.join(filter(None, [
+            os.environ.get("LD_LIBRARY_PATH"), str(self.tmp / "python-loader"),
+        ]))
+        with mock.patch.dict(os.environ, {
+            "LD_LIBRARY_PATH": loader_path, "PATH": "parent-path-must-not-leak",
+            "GITHUB_TOKEN": "parent-token-must-not-leak", "GH_TOKEN": "parent-token-must-not-leak",
+            "PYTHONPATH": "parent-modules-must-not-leak", "PYTHONHOME": "parent-home-must-not-leak",
+        }, clear=True), mock.patch("subprocess.run", wraps=subprocess.run) as spawn:
+            result = self.tool("web-release-artifact.py", "--help")
+        self.assertEqual(spawn.call_args.kwargs["env"], {
+            "PATH": "", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8",
+            "LD_LIBRARY_PATH": loader_path,
+        })
+        self.assertEqual(spawn.call_args.args[0][:3], [sys.executable, "-I", "-c"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("usage:", result.stdout)
+
     def test_package_keeps_all_nested_static_hidden_and_wasm_bytes_and_the_exact_plan(self):
         self.success(self.package())
         with tarfile.open(self.archive) as archive:

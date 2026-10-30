@@ -34,12 +34,14 @@ import subprocess
 import sys
 import tarfile
 import unittest
+from unittest import mock
 import urllib.parse
 import zipfile
 
 
 fixtures = runpy.run_path(str(Path(__file__).with_name("test-web-release-acceptance.py")))
 OfflineCase = fixtures["OfflineCase"]
+interpreter_loader_env = fixtures["interpreter_loader_env"]
 REPO_ROOT = fixtures["REPO_ROOT"]
 REPOSITORY = fixtures["REPOSITORY"]
 SHA = fixtures["SHA"]
@@ -348,7 +350,8 @@ class GitHubTransportTests(OfflineCase):
         return subprocess.run(
             [sys.executable, "-I", "-c", FAKE_HTTP_RUNNER, str(scenario), str(self.audit_path),
              str(REPO_ROOT / "ci/web-release-evidence.py"), *map(str, args)],
-            cwd=self.tmp, env={"PATH": "", "GITHUB_TOKEN": "offline-fixture-token", "PYTHONDONTWRITEBYTECODE": "1"},
+            cwd=self.tmp,
+            env={"PATH": "", "GITHUB_TOKEN": "offline-fixture-token", "PYTHONDONTWRITEBYTECODE": "1", **interpreter_loader_env()},
             text=True, capture_output=True, timeout=15,
         )
 
@@ -418,6 +421,25 @@ class GitHubTransportTests(OfflineCase):
             "resolve", "--repository", REPOSITORY, "--canary", self.canary_tag,
             "--sha", SHA, "--output", self.resolve_output,
         ], self.resolve_rows() if rows is None else rows)
+
+    def test_fake_http_interpreter_starts_without_inheriting_parent_credentials(self):
+        loader_path = os.pathsep.join(filter(None, [
+            os.environ.get("LD_LIBRARY_PATH"), str(self.tmp / "python-loader"),
+        ]))
+        with mock.patch.dict(os.environ, {
+            "LD_LIBRARY_PATH": loader_path, "PATH": "parent-path-must-not-leak",
+            "GITHUB_TOKEN": "parent-token-must-not-leak", "GH_TOKEN": "parent-token-must-not-leak",
+            "PYTHONPATH": "parent-modules-must-not-leak", "PYTHONHOME": "parent-home-must-not-leak",
+        }, clear=True), mock.patch("subprocess.run", wraps=subprocess.run) as spawn:
+            result = self.http_tool(["--help"], [])
+        self.assertEqual(spawn.call_args.kwargs["env"], {
+            "PATH": "", "GITHUB_TOKEN": "offline-fixture-token", "PYTHONDONTWRITEBYTECODE": "1",
+            "LD_LIBRARY_PATH": loader_path,
+        })
+        self.assertEqual(spawn.call_args.args[0][:3], [sys.executable, "-I", "-c"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertEqual(self.requests(), [])
 
     def test_fetch_reads_only_the_exact_attempt_and_returns_the_exact_retained_payload(self):
         self.success(self.fetch())
