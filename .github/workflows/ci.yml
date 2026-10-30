@@ -394,10 +394,12 @@ jobs:
       # `--locked`: the committed workers/api/Cargo.lock is the audited
       # dependency set for the auth/vault crypto crates. A missing or stale
       # lockfile fails the build instead of silently re-resolving.
-      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
-      - name: Exercise production redemption against disposable PostgreSQL
-        run: |
-          cargo test --locked --manifest-path workers/api/Cargo.toml --lib magic_redemption::postgres_tests:: -- --ignored
+      # `--include-ignored` also runs the redemption tests against the
+      # disposable PostgreSQL service above. It stays one `- run:` line:
+      # the locked-dependency static pin requires this job's test step to
+      # be a single removable invocation, and needs no database for the
+      # ordinary unlocked/`--all-targets` failure it mutates.
+      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets --include-ignored
         env:
           NNTUNE_REDEMPTION_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
