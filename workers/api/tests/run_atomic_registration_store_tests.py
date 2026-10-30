@@ -10,6 +10,7 @@ must use the repository's bounded Cargo pool.
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -31,8 +32,45 @@ EXPECTED = {
         "postgres_reap_delete_rechecks_locked_candidates_before_deleting",
         "postgres_reap_bounded_batch_drains_cap_plus_one",
         "postgres_reap_preserves_explicit_protected_user_and_dependents",
+        "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
+        "postgres_reap_holds_selected_parent_lock_through_delete",
     )
 }
+EXPECTED_CONFIG = {
+    PREFIX + name
+    for name in (
+        "disposable_database_config_accepts_standard_loopback_service",
+        "disposable_database_config_rejects_hostaddr_overrides",
+        "disposable_database_config_rejects_wrong_or_missing_database",
+        "disposable_database_config_rejects_nonloopback_and_multiple_hosts",
+    )
+}
+
+
+def _parse_listing(output):
+    return {
+        line.removesuffix(": test")
+        for line in output.splitlines()
+        if line.startswith(PREFIX) and line.endswith(": test")
+    }
+
+
+def _require_config_bank_green(result, expected):
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
+    if result.returncode != 0:
+        raise RuntimeError(
+            "disposable config bank did not pass\n" + output
+        )
+    if "test result: ok. 4 passed; 0 failed; 0 ignored;" not in output:
+        raise RuntimeError(
+            "disposable config bank did not report exactly 4 passing\n" + output
+        )
+    for target in sorted(expected):
+        if not re.search(r"(?m)^test " + re.escape(target) + r" \.\.\. ok$", output):
+            raise RuntimeError(
+                f"disposable config case did not execute exactly once and pass: {target}\n" + output
+            )
+    return output
 
 
 def main():
@@ -44,21 +82,39 @@ def main():
         else [sys.executable, "scripts/cargo_cache.py", "run", "--"]
     )
     command = cargo + [
-        "test", "--locked", "--manifest-path", "workers/api/Cargo.toml", "--lib", PREFIX,
+        "test", "--locked", "--features", "postgres-tests",
+        "--manifest-path", "workers/api/Cargo.toml", "--lib", PREFIX,
     ]
+    # Normal listing may return every compiled test matching the prefix or only
+    # the non-ignored subset, depending on the libtest version. Subtracting the
+    # ignored inventory yields the native config subset in either case.
+    listed_normal = subprocess.run(
+        command + ["--", "--list"],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True,
+    ).stdout
+    actual_config = _parse_listing(listed_normal) - EXPECTED
+    if actual_config != EXPECTED_CONFIG:
+        missing = ", ".join(sorted(EXPECTED_CONFIG - actual_config)) or "none"
+        extra = ", ".join(sorted(actual_config - EXPECTED_CONFIG)) or "none"
+        sys.exit(f"PostgreSQL config module mismatch; missing: {missing}; extra: {extra}")
     listed = subprocess.run(
         command + ["--", "--list", "--ignored"],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True,
     ).stdout
-    actual = {
-        line.removesuffix(": test")
-        for line in listed.splitlines()
-        if line.startswith(PREFIX) and line.endswith(": test")
-    }
+    actual = _parse_listing(listed)
     if actual != EXPECTED:
         missing = ", ".join(sorted(EXPECTED - actual)) or "none"
         extra = ", ".join(sorted(actual - EXPECTED)) or "none"
         sys.exit(f"PostgreSQL acceptance module mismatch; missing: {missing}; extra: {extra}")
+    print(f"PostgreSQL config: executing {len(actual_config)} native guard tests", flush=True)
+    config_command = command[:-1] + [PREFIX + "disposable_database_config_"]
+    config_result = subprocess.run(
+        config_command + ["--", "--nocapture", "--test-threads=1"],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        check=False,
+    )
+    config_output = _require_config_bank_green(config_result, EXPECTED_CONFIG)
+    print(config_output, flush=True)
     print(f"PostgreSQL acceptance: executing {len(actual)} production-seam tests", flush=True)
     try:
         subprocess.run(

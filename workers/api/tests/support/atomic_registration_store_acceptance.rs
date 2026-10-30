@@ -33,23 +33,112 @@ fn run_test(test: impl Future<Output = ()>) {
         });
 }
 
+// A hostaddr overrides host resolution in tokio-postgres. Reject all such
+// overrides, including loopback ones, before this destructive bank can connect.
+// Configuration-only tests below never open a socket or read credentials.
+fn validate_disposable_database_config(
+    config: &tokio_postgres::Config,
+) -> Result<(), &'static str> {
+    if config.get_dbname() != Some("nntune_ci") {
+        return Err("only the explicitly named disposable nntune_ci database is permitted");
+    }
+    if !config.get_hostaddrs().is_empty() {
+        return Err("hostaddr overrides are not permitted for the disposable test service");
+    }
+    if config.get_hosts().len() != 1 {
+        return Err("one disposable test host only");
+    }
+    match &config.get_hosts()[0] {
+        tokio_postgres::config::Host::Tcp(host)
+            if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") =>
+        {
+            Ok(())
+        }
+        _ => Err("only the loopback disposable TCP test service is permitted"),
+    }
+}
+
+#[test]
+fn disposable_database_config_accepts_standard_loopback_service() {
+    for input in [
+        "postgresql://localhost/nntune_ci",
+        "host=127.0.0.1 dbname=nntune_ci",
+        "host=::1 dbname=nntune_ci",
+    ] {
+        let config = input
+            .parse()
+            .expect("parse credential-free loopback config");
+        assert_eq!(validate_disposable_database_config(&config), Ok(()));
+    }
+}
+
+// Removing the hostaddr guard must fail here without ever attempting a
+// connection, even when the advertised hostname and database are permitted.
+#[test]
+fn disposable_database_config_rejects_hostaddr_overrides() {
+    for input in [
+        "host=localhost hostaddr=192.0.2.10 dbname=nntune_ci",
+        "host=127.0.0.1 hostaddr=2001:db8::10 dbname=nntune_ci",
+        "host=localhost hostaddr=127.0.0.1 dbname=nntune_ci",
+        "host=localhost hostaddr=::1 dbname=nntune_ci",
+        "host=localhost hostaddr=127.0.0.1,192.0.2.10 dbname=nntune_ci",
+        "host=localhost hostaddr=::1,2001:db8::10 dbname=nntune_ci",
+        "host=localhost hostaddr=127.0.0.1,::1 dbname=nntune_ci",
+        "hostaddr=192.0.2.10 dbname=nntune_ci",
+    ] {
+        let config = input
+            .parse()
+            .expect("parse credential-free address override");
+        assert_eq!(
+            validate_disposable_database_config(&config),
+            Err("hostaddr overrides are not permitted for the disposable test service"),
+            "hostaddr override must be rejected before connecting"
+        );
+    }
+}
+
+#[test]
+fn disposable_database_config_rejects_wrong_or_missing_database() {
+    for input in [
+        "host=localhost dbname=postgres",
+        "host=localhost dbname=nntune_ci_backup",
+        "host=localhost",
+    ] {
+        let config = input
+            .parse()
+            .expect("parse credential-free database config");
+        assert_eq!(
+            validate_disposable_database_config(&config),
+            Err("only the explicitly named disposable nntune_ci database is permitted")
+        );
+    }
+}
+
+#[test]
+fn disposable_database_config_rejects_nonloopback_and_multiple_hosts() {
+    for input in [
+        "host=db.example.com dbname=nntune_ci",
+        "host=192.0.2.10 dbname=nntune_ci",
+        "host=2001:db8::10 dbname=nntune_ci",
+        "host=localhost,127.0.0.1 dbname=nntune_ci",
+        "host=localhost,db.example.com dbname=nntune_ci",
+        "host=/tmp dbname=nntune_ci",
+        "dbname=nntune_ci",
+    ] {
+        let config = input.parse().expect("parse credential-free host config");
+        assert!(
+            validate_disposable_database_config(&config).is_err(),
+            "a nonloopback, ambiguous or missing host must be rejected before connecting"
+        );
+    }
+}
+
 async fn connect() -> Client {
     let url = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("NNTUNE_TEST_DATABASE_URL is required; database tests never silently skip");
     let config: tokio_postgres::Config = url.parse().expect("parse disposable database URL");
-    assert_eq!(
-        config.get_dbname(),
-        Some("nntune_ci"),
-        "only the explicitly named disposable nntune_ci database is permitted"
-    );
-    assert_eq!(config.get_hosts().len(), 1, "one disposable test host only");
-    match &config.get_hosts()[0] {
-        tokio_postgres::config::Host::Tcp(host) => assert!(
-            matches!(host.as_str(), "localhost" | "127.0.0.1"),
-            "only the loopback disposable CI test service is permitted"
-        ),
-        _ => panic!("a disposable TCP test service is required"),
-    }
+    validate_disposable_database_config(&config)
+        .expect("validate disposable database configuration before connecting");
     let (client, connection) = config
         .connect(NoTls)
         .await
@@ -718,14 +807,19 @@ async fn assert_reap_before_prune_defers(blocked: &mut BlockedEnrollment) {
 }
 
 async fn finish_enrollment(blocked: &mut BlockedEnrollment) -> Result<(), ()> {
-    let enrollment = blocked
+    let mut enrollment = blocked
         .enrollment
         .take()
         .expect("enrollment task must be joined exactly once");
-    let (_enrollment_client, result) = tokio::time::timeout(Duration::from_secs(10), enrollment)
-        .await
-        .expect("enrollment must finish once the invite lock is released")
-        .expect("enrollment task must not panic");
+    let joined = tokio::time::timeout(Duration::from_secs(10), &mut enrollment).await;
+    let (_enrollment_client, result) = match joined {
+        Ok(joined) => joined.expect("enrollment task must not panic"),
+        Err(_) => {
+            enrollment.abort();
+            let _ = enrollment.await;
+            panic!("enrollment must finish once the invite lock is released");
+        }
+    };
     result
 }
 
@@ -1109,6 +1203,257 @@ fn postgres_reap_delete_rechecks_locked_candidates_before_deleting() {
             user_count(&reaper, &abandoned.credential.user_id).await,
             0,
             "the recheck must still reap the candidate with no credential"
+        );
+    });
+}
+
+// Removing SKIP LOCKED from the real PgStore issuance cleanup must hit the
+// named contention assertion, not merely change a SQL-source pin. The old
+// proof expires after enrollment claims it but before replacement issuance.
+#[cfg(feature = "postgres-tests")]
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_magic_issuance_skips_locked_expired_proof_and_retries() {
+    use crate::handlers::Store;
+
+    run_test(async {
+        let mut blocked = blocked_enrollment().await;
+        let mut expired = blocked.fixture.magic.clone();
+        expired.token_hash.push_str("-unlocked-expired");
+        expired.expires_at = REAP_NOW;
+        let mut valid = blocked.fixture.magic.clone();
+        valid.token_hash.push_str("-valid-at-issuance");
+        valid.expires_at = REAP_NOW + 1;
+        for record in [&expired, &valid] {
+            blocked
+                .cleanup
+                .execute(
+                    "INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) VALUES ($1, $2, $3, $4, $5, FALSE)",
+                    &[&record.token_hash, &record.user_id, &record.email, &(record.issued_at as i64), &(record.expires_at as i64)],
+                )
+                .await
+                .expect("seed same-user expiry-boundary controls");
+        }
+        let mut replacement = blocked.fixture.magic.clone();
+        replacement.token_hash.push_str("-replacement");
+        replacement.issued_at = REAP_NOW;
+        replacement.expires_at = REAP_NOW + 300;
+        let observed_ids = vec![
+            blocked.fixture.magic.token_hash.clone(),
+            replacement.token_hash.clone(),
+            expired.token_hash.clone(),
+            valid.token_hash.clone(),
+            blocked.unrelated.magic.token_hash.clone(),
+        ];
+        // This seam replaces connection acquisition only. SQL, binds,
+        // deadlines and execution are the actual production adapter's.
+        let store = super::session_retry_store_for_postgres_test(connect().await);
+        let issuance = tokio::time::timeout(CLEANUP_BOUND, store.insert_magic(&replacement)).await;
+        let issued_promptly = matches!(issuance, Ok(Ok(())));
+        // Observe committed state while enrollment still owns the old proof
+        // and still waits on the locked invite. Save results, not assertions,
+        // until both enrollment and the invite-locker have settled.
+        let before_release = blocked
+            .cleanup
+            .query(
+                "SELECT token_hash FROM magic_link_tokens WHERE token_hash = ANY($1)",
+                &[&observed_ids],
+            )
+            .await;
+        let released = blocked.locker.batch_execute("COMMIT").await;
+        let enrollment = finish_enrollment(&mut blocked).await;
+        released.expect("release invite after replacement issuance attempt");
+        assert!(
+            issued_promptly,
+            "magic issuance must not wait for locked expired cleanup"
+        );
+        assert!(
+            enrollment.is_ok(),
+            "settle enrollment after releasing its invite"
+        );
+        let before_release: Vec<String> = before_release
+            .expect("observe token state before releasing the invite")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(
+            before_release.contains(&replacement.token_hash),
+            "replacement must be committed before the invite is released"
+        );
+        assert!(
+            before_release.contains(&blocked.fixture.magic.token_hash),
+            "the enrollment-locked expired proof must survive issuance"
+        );
+        assert!(
+            !before_release.contains(&expired.token_hash),
+            "unlocked same-user proof expiring exactly at issued_at must be removed"
+        );
+        assert!(
+            before_release.contains(&valid.token_hash),
+            "same-user proof valid at issued_at must survive, regardless of wall clock"
+        );
+        assert!(
+            before_release.contains(&blocked.unrelated.magic.token_hash),
+            "expired proof for another user must survive issuance"
+        );
+        blocked.fixture.assert_credential(&blocked.cleanup).await;
+        assert_eq!(
+            count(
+                &blocked.cleanup,
+                "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                &blocked.fixture.magic.token_hash,
+            )
+            .await,
+            1,
+            "settling enrollment alone must not clean the deferred expired proof"
+        );
+
+        let mut retry = replacement.clone();
+        retry.token_hash.push_str("-retry");
+        let store = super::session_retry_store_for_postgres_test(connect().await);
+        tokio::time::timeout(CLEANUP_BOUND, store.insert_magic(&retry))
+            .await
+            .expect("unlocked issuance cleanup retry must return promptly")
+            .expect("retry the actual issuance adapter after enrollment commits");
+        let after_retry: Vec<String> = blocked
+            .cleanup
+            .query(
+                "SELECT token_hash FROM magic_link_tokens WHERE token_hash = ANY($1)",
+                &[&observed_ids],
+            )
+            .await
+            .expect("observe deferred cleanup retry")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(
+            !after_retry.contains(&blocked.fixture.magic.token_hash),
+            "later issuance must remove the now-unlocked expired old proof"
+        );
+        assert!(!after_retry.contains(&expired.token_hash));
+        for retained in [
+            &replacement.token_hash,
+            &valid.token_hash,
+            &blocked.unrelated.magic.token_hash,
+        ] {
+            assert!(
+                after_retry.contains(retained),
+                "valid and other-user controls survive retry"
+            );
+        }
+        assert_eq!(
+            count(
+                &blocked.cleanup,
+                "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                &retry.token_hash,
+            )
+            .await,
+            1,
+            "retry issuance commits its new token"
+        );
+    });
+}
+
+// Committing after selection and using a fresh transaction for deletion
+// preserves the copied-SQL recheck case above, but must fail this real-helper
+// test: its selected parent must remain locked while the reaper is paused.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_holds_selected_parent_lock_through_delete() {
+    run_test(async {
+        let mut reaper = connect().await;
+        let mut other_rows = connect().await;
+        let isolation = other_rows
+            .transaction()
+            .await
+            .expect("isolate prior fixtures from selection");
+        isolation
+            .query("SELECT id FROM users FOR UPDATE SKIP LOCKED", &[])
+            .await
+            .expect("hold prior fixture parents outside the tested reaper");
+        let mut fixture = Fixture::seed(&reaper).await;
+        age_signup(&reaper, &mut fixture).await;
+        let observer = connect().await;
+        observer
+            .batch_execute("BEGIN")
+            .await
+            .expect("open independent lock observer");
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let resumed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_resumed = resumed.clone();
+        super::REAPER_SELECTION_PAUSE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "the one-shot reaper pause must start empty"
+            );
+            *slot.borrow_mut() = Some(Box::pin(async move {
+                let _ = selected_tx.send(());
+                hook_resumed.set(matches!(
+                    tokio::time::timeout(CLEANUP_BOUND, resume_rx).await,
+                    Ok(Ok(()))
+                ));
+            }));
+        });
+        let observe_then_resume = async {
+            let selected = tokio::time::timeout(CLEANUP_BOUND, selected_rx).await;
+            let lock = observer
+                .query_one(
+                    "SELECT id FROM users WHERE id = $1 FOR KEY SHARE NOWAIT",
+                    &[&fixture.credential.user_id],
+                )
+                .await;
+            // NOWAIT errors abort this observer transaction; success means the
+            // mutant acquired a lock. Roll back either way BEFORE the reaper
+            // resumes, then join both futures before asserting the outcome.
+            let released = observer.batch_execute("ROLLBACK").await;
+            let _ = resume_tx.send(());
+            (selected, lock, released)
+        };
+        let (reaped, (selected, lock, released)) = futures_util::future::join(
+            tokio::time::timeout(
+                TEST_TIMEOUT,
+                reap_unverified_users_on(&mut reaper, REAP_NOW, REAP_TTL, None),
+            ),
+            observe_then_resume,
+        )
+        .await;
+        super::REAPER_SELECTION_PAUSE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        isolation
+            .rollback()
+            .await
+            .expect("release prior fixture locks");
+        released.expect("release every observer lock before resuming deletion");
+        assert!(
+            matches!(selected, Ok(Ok(()))),
+            "real reaper must reach the selection pause"
+        );
+        assert!(
+            resumed.get(),
+            "reaper must resume from the observer, not a pause timeout"
+        );
+        assert!(
+            lock.as_ref().is_err_and(|error| {
+                error.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+            }),
+            "reaper must retain selected parent lock through delete"
+        );
+        reaped
+            .expect("real paused reaper must settle within the test bound")
+            .expect("real reaper must commit after the observer releases its locks");
+        assert_eq!(user_count(&observer, &fixture.credential.user_id).await, 0);
+        assert_eq!(challenge_count(&observer, &fixture.challenge.id).await, 0);
+        assert_eq!(
+            count(
+                &observer,
+                "SELECT count(*) FROM magic_link_tokens WHERE token_hash = $1",
+                &fixture.magic.token_hash,
+            )
+            .await,
+            0,
+            "the real reaper must finish deletion and cascading cleanup after resume"
         );
     });
 }
