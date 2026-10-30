@@ -529,20 +529,23 @@ Notes, all referencing (not changing) owning-lane state:
 
 ## Staging promotion checklist
 
-Promotion is `main` HEAD → staging; production promotion is a later gated
-lane. Complete every box on the exact head being promoted.
+Promotion is `main` HEAD → staging; production promotion is an existing,
+manual, disabled-by-default web-only lane. Complete every box on the exact
+head being promoted. [Web release identity and retained artifacts](web-releases.md)
+describes the component-scoped canary, executed-step certificate and no-rebuild
+consumer. Its wiring does not enable production or certify skipped journeys.
 
 ### Production seed precondition (one-time)
 
 The production lane (`.github/workflows/deploy-production.yml`) promotes
 through the shared gradual-promote action, whose automatic-rollback target is
 the latest production deployment and which refuses unless that deployment is
-a single Worker version at 100%. There is currently no active production
-NNTune Worker deployment, so the very first promotion cannot satisfy that
-precondition on its own. Before the first promotion, an authorized executor
-must seed production once: make one full deploy of the web frontend to
-production (for example `wrangler deploy --env production` from the launch
-SHA, run from `apps/web`) with the `nntune.com` apex custom domain (repo
+a single Worker version at 100%. This change does not establish the current
+live production state. If no such deployment exists, the first promotion cannot
+satisfy that precondition on its own. Under the separate launch authority, an
+authorized executor must seed production once from the accepted saved web
+artifact and reviewed configuration, without rebuilding, with the `nntune.com`
+apex custom domain (repo
 variable `PRODUCTION_DOMAIN`) attached and `www` redirecting to the apex,
 leaving a single 100% deployment. The lane enforces this before
 uploading anything: its seed step lists production deployments and refuses
@@ -552,36 +555,36 @@ the promotion action. Re-dispatch the lane after seeding.
 
 ### Production Worker secret-shape gate
 
-The production lane refuses any production vars beyond `name` in
-`[env.production]` before uploading a version. The gate step
-(`.github/workflows/deploy-production.yml:226-234`) runs
-`node ci/check-production-secrets-shape.mjs`, which enforces the offline
-policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
-no bindings and needs no secrets, so its production env table must carry
-only `name` (current state: `apps/web/wrangler.toml:35-36`). It runs in the
-`deploy-production` job after that job checks out the validated promotion
-SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
-(preflight checks out the dispatch tip,
-`.github/workflows/deploy-production.yml:77-79`). It is an offline
-shape check — no credentials, no network — that reads key names only and
-never reads or prints values
-(`ci/check-production-secrets-shape.mjs:6-7`).
+The production lane admits only its Worker name plus a canonical stable
+`DEPLOYED_RELEASE_VERSION` string in the conventional `[env.production.vars]`
+table. The committed config remains name-only. After exact-artifact verification
+and runtime-metadata rendering, `Require production Worker secret shape before
+upload` runs `node ci/check-production-secrets-shape.mjs --config
+"$WEB_RELEASE_CONFIG"`. This checks both the source config and the actual
+saved-output config used by upload, before production credentials or mutation.
+
+The checker retains JSON-shadow and alternate-TOML refusal coverage. Extra vars,
+secret/binding/routes tables, duplicate/alternate metadata declarations, canaries,
+invalid dates and unsafe counters still refuse. This is an offline check: no
+credential or network access. Only the public release string is inspected and no
+values are printed. The exact acceptance bank is
+`ci/test-check-production-secrets-shape.mjs`.
 
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA, plus Paperclip Review 5/5 on that head (merge policy in
   `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
   a flake/quarantine decision with a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
-  secret shape before upload` step passed on the promotion SHA
-  (`.github/workflows/deploy-production.yml:226-234` runs
-  `ci/check-production-secrets-shape.mjs`, which refuses any
-  `[env.production]` table beyond `name`). Same-checker CI coverage
-  (`.github/workflows/ci.yml:607-621`) is not promotion evidence on its
-  own; require the deploy-production job's pass on the exact head being
-  promoted.
-- [ ] Staging deploy evidence: record the successful push-triggered
-  `deploy.yml` run for the promotion SHA, and require its `staging-web` job
-  conclusion to be `success` (not `skipped`); verify staging health. This
+  secret shape before upload` passed on both the source and rendered
+  saved-artifact config. Only the reviewed stable runtime-release var is
+  permitted beyond the Worker name. Same-checker CI coverage is not promotion
+  evidence on its own; require the deploy-production job's pass on the exact
+  head being promoted.
+- [ ] Staging deploy evidence: record the canary's exact push-triggered
+  `deploy.yml` run, attempt and immutable artifact for the promotion SHA. Require
+  the web-only certificate's actual deployment/synthetic/journey/enforcement
+  steps to have succeeded; green job labels with skipped steps do not count.
+  Verify staging health. This
   workflow deploys `apps/web` (`staging-web`) plus the api Worker staging
   lane (`staging-api`, staging only); it does not deploy stream, MB, ingest
   or repair Workers. `/api/health` returns exactly `{ok, version}` — the public
