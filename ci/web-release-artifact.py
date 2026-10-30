@@ -85,7 +85,15 @@ def package(args):
         bundle = tree(args.bundle_root)
         require("_worker.js" in bundle, "producer-entrypoint")
         payload = {name: data for name, data in payload.items() if name != "_worker.js" and not name.startswith("_worker.js/")}
-        payload.update({"_worker.js/" + ("index.js" if name == "_worker.js" else name): data for name, data in bundle.items()})
+        emitted = {}
+        for name, data in sorted(bundle.items()):
+            # The emitted main is renamed to index.js. A bundle that also ships
+            # its own index.js would land on the same destination, and a plain
+            # dict update would silently replace the real main with it.
+            target = "_worker.js/" + ("index.js" if name == "_worker.js" else name)
+            require(target not in emitted, "bundle-destination-collision")
+            emitted[target] = data
+        payload.update(emitted)
     require("_worker.js" not in payload or b"cloudflare-tmp" not in payload["_worker.js"], "producer-bundle-required")
     manifest = {
         "schema": "nntune-web-release-v1", "components": ["web"], "source": source,
