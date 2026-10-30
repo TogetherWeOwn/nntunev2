@@ -21,6 +21,7 @@ pub mod handlers;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
+mod magic_redemption;
 pub mod native_rest;
 pub mod plan_limits;
 pub mod providers;
