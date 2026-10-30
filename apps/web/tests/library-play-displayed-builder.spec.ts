@@ -410,12 +410,22 @@ const DIRECT_EDITS: QueueEdit[] = [
 	},
 	{
 		name: 'clear-upcoming',
-		click: (page) => page.getByRole('button', { name: 'Clear upcoming', exact: true }).click(),
+		click: async (page) => {
+			await page.getByRole('button', { name: 'Clear upcoming', exact: true }).click();
+			const prompt = page.getByTestId('queue-clear-confirm');
+			await expect(prompt).toContainText('Remove 2 upcoming tracks');
+			await prompt.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).click();
+		},
 		outcome: /Removed 2 upcoming tracks\./
 	},
 	{
 		name: 'clear',
-		click: (page) => page.getByRole('button', { name: 'Clear queue', exact: true }).click(),
+		click: async (page) => {
+			await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+			const prompt = page.getByTestId('queue-clear-confirm');
+			await expect(prompt).toContainText('Remove all 3 tracks');
+			await prompt.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+		},
 		outcome: /Queue cleared\./
 	}
 ];

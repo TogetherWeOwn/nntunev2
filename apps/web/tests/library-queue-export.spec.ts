@@ -305,6 +305,7 @@ for (const emptyAt of ['initial', 'after clear'] as const) {
 			// Guard the new feature first: pre-feature main is RED, not a vacuous pass.
 			await actions(page);
 			await clearQueue(page).click();
+			await main(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 		}
 		await expect(main(page).getByTestId('queue-item')).toHaveCount(0);
 		for (const name of [COPY_NAME, DOWNLOAD_NAME]) {
@@ -396,6 +397,7 @@ for (const edit of ['reorder', 'clear', 'away and back', 'remove', 'append', 'se
 			let expectedIds: string[] = INITIAL_IDS;
 			if (edit === 'clear') {
 				await clearQueue(page).click();
+				await main(page).getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 				expectedIds = ['export-alpha']; // Added again only after the stale completion.
 			} else if (edit === 'append') {
 				await addTrack(page, 'export-alpha');

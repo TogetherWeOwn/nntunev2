@@ -28,6 +28,7 @@ pub mod random;
 pub mod rate_limit;
 pub mod rotation;
 pub mod session;
+pub mod session_retry_store;
 pub mod vault;
 pub mod webauthn;
 pub mod worker_entry;

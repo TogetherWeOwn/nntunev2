@@ -56,7 +56,7 @@ const dummyVars = {
 };
 const reporter = step('Record API deployment outcome');
 const positive = {
-  CONFIGURED: 'true', HYPERDRIVE_OUTCOME: 'success', DEPLOY_OUTCOME: 'success',
+  CONFIGURED: 'true', HYPERDRIVE_OUTCOME: 'success', SCHEMA_OUTCOME: 'success', DEPLOY_OUTCOME: 'success',
   JOB_STATUS: 'success', SOURCE_SHA: sourceSha,
 };
 
@@ -73,20 +73,27 @@ function assertWiring(source: string) {
   for (const [name, expression] of [
     ['CONFIGURED', 'steps.config.outputs.configured'],
     ['HYPERDRIVE_OUTCOME', 'steps.hyperdrive.outcome'],
+    ['SCHEMA_OUTCOME', 'steps.schema.outcome'],
     ['DEPLOY_OUTCOME', 'steps.deploy.outcome'],
     ['JOB_STATUS', 'job.status'],
     ['SOURCE_SHA', 'github.sha'],
   ]) {
     expect(report).toContain(`          ${name}: \${{ ${expression} }}`);
   }
-  for (const [name, id] of [
-    ['Hyperdrive cache-disabled gate', 'hyperdrive'], ['Deploy api to staging', 'deploy'],
+  for (const [name, id, condition] of [
+    ['Hyperdrive cache-disabled gate', 'hyperdrive', "steps.config.outputs.configured == 'true'"],
+    ['Verify actual staging session schema (read-only)', 'schema', "steps.config.outputs.configured == 'true'"],
+    ['Deploy api to staging', 'deploy', "steps.config.outputs.configured == 'true' && steps.schema.outcome == 'success'"],
   ]) {
     const section = step(name!, source);
     expect(section).toContain(`        id: ${id}\n`);
-    expect(section).toContain("        if: steps.config.outputs.configured == 'true'\n");
+    expect(section).toContain(`        if: ${condition}\n`);
     expect(section).not.toMatch(/always\(\)|failure\(\)|cancelled\(\)/);
   }
+  expect(step('Verify actual staging session schema (read-only)', source))
+    .toContain('run: python3 .github/scripts/staging_api_schema_gate.py');
+  expect(source.indexOf('- name: Verify actual staging session schema (read-only)'))
+    .toBeLessThan(source.indexOf('- name: Deploy api to staging'));
   expect(step('Generate staging wrangler.toml', source)).toContain("        if: steps.config.outputs.configured == 'true'\n");
   expect(source).not.toContain('continue-on-error:');
   expect(step('Hyperdrive cache-disabled gate', source)).toContain('working-directory: workers/api');
@@ -102,6 +109,9 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     for (const [from, to] of [
       ['if: always()', "if: steps.config.outputs.configured == 'true'"],
       ['steps.deploy.outcome', 'steps.deploy.conclusion'],
+      ['steps.schema.outcome', 'steps.schema.conclusion'],
+      [" && steps.schema.outcome == 'success'", ''],
+      ['id: schema\n', 'id: renamed\n'],
       ['steps.deployment.outputs.deployed', 'steps.config.outputs.configured'],
       ["if: steps.config.outputs.configured == 'true'", 'if: always()'],
       ['id: deploy\n', 'id: renamed\n'],
@@ -136,6 +146,11 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
   for (const [name, overrides, outcome] of [
     ['setup failure', { CONFIGURED: '', HYPERDRIVE_OUTCOME: 'skipped', DEPLOY_OUTCOME: 'skipped', JOB_STATUS: 'failure' }, 'failed'],
     ['Hyperdrive failure', { HYPERDRIVE_OUTCOME: 'failure', DEPLOY_OUTCOME: 'skipped', JOB_STATUS: 'failure' }, 'failed'],
+    ['schema failure', { SCHEMA_OUTCOME: 'failure', DEPLOY_OUTCOME: 'skipped', JOB_STATUS: 'failure' }, 'failed'],
+    ['failed schema with green job and deploy', { SCHEMA_OUTCOME: 'failure' }, 'failed'],
+    ['skipped schema with green job and deploy', { SCHEMA_OUTCOME: 'skipped' }, 'failed'],
+    ['cancelled schema with green job and deploy', { SCHEMA_OUTCOME: 'cancelled' }, 'failed'],
+    ['missing schema outcome with green job and deploy', { SCHEMA_OUTCOME: '' }, 'failed'],
     ['config generation failure', { DEPLOY_OUTCOME: 'skipped', JOB_STATUS: 'failure' }, 'failed'],
     ['deploy failure', { DEPLOY_OUTCOME: 'failure', JOB_STATUS: 'failure' }, 'failed'],
     ['skipped deploy with green job', { DEPLOY_OUTCOME: 'skipped' }, 'failed'],
@@ -155,6 +170,14 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     });
   }
 
+  test('absent schema environment fails closed without losing the summary', () => {
+    const { SCHEMA_OUTCOME: _schemaOutcome, ...env } = positive;
+    const result = runShell(shell(reporter), env);
+    expect(result.output).toBe('deployed=false\noutcome=failed\nsource_sha=\n');
+    expect(result.summary).toContain('Read-only session schema gate: not-run');
+    expect(result.summary).not.toContain(sourceSha);
+  });
+
   test('complete vars and successful executed steps report the deployed source only', () => {
     const config = runShell(shell(step('Check api staging configuration')), dummyVars);
     expect(config.output).toBe('configured=true\n');
@@ -162,6 +185,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     expect(result.output).toBe(`deployed=true\noutcome=deployed\nsource_sha=${sourceSha}\n`);
     expect(result.summary).toContain('deployment outcome: deployed');
     expect(result.summary).toContain('Hyperdrive cache-disabled gate: success');
+    expect(result.summary).toContain('Read-only session schema gate: success');
     expect(result.summary).toContain('Deploy api to staging: success');
     expect(result.summary).toContain(`Source SHA: ${sourceSha}`);
     expect(result.summary).toContain(`BUILD_SHA var: ${sourceSha}`);
