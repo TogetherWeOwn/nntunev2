@@ -839,6 +839,8 @@ async fn reap_unverified_users_on(
         .iter()
         .map(|row| row.try_get::<_, String>("id").map_err(|_| StoreError))
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    reaper_selection_pause().await;
     if !ids.is_empty() {
         // Enrollment may commit between the selection snapshot and its parent
         // lock. A second READ COMMITTED statement sees that credential before
@@ -1069,13 +1071,15 @@ impl Store for PgStore {
         .await
     }
 
-    // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
+    // Per-user prune avoids a global scan; enrollment-held tokens retry on a later issuance.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
-                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4) \
+                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4 \
+                 AND token_hash IN (SELECT token_hash FROM magic_link_tokens \
+                 WHERE user_id = $2 AND expires_at <= $4 FOR UPDATE SKIP LOCKED)) \
                  INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
@@ -4434,6 +4438,25 @@ mod tests {
             !compensated.get(),
             "expiry drops the future: in-future compensation never runs"
         );
+    }
+}
+
+// Native acceptance can pause the real reaper between selection and deletion.
+// Each single-threaded test runtime owns its hook; production has no hook.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+type ReaperSelectionPause = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+std::thread_local! {
+    static REAPER_SELECTION_PAUSE: std::cell::RefCell<Option<ReaperSelectionPause>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+async fn reaper_selection_pause() {
+    let pause = REAPER_SELECTION_PAUSE.with(|slot| slot.borrow_mut().take());
+    if let Some(pause) = pause {
+        pause.await;
     }
 }
 
