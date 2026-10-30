@@ -30,8 +30,12 @@ Severity is impact times confidence, after the disproof pass below:
 - **Investigate/flag, not a bug:** the mechanism depends on an unverified
   assumption about a dependency, action, or platform contract.
 - **Security exception:** never drop or downgrade a plausible security issue
-  for lack of full verification. Report it as a security Warning and state
-  the unverified step; reserve Critical for a traced, verified path.
+  for lack of full verification; reserve Critical for a traced, verified path.
+  If the vulnerable code is new in this unmerged PR, post a security Warning
+  with the class, location and unverified step, but no exploit steps or
+  payloads. If it affects code already on `main` or deployed, do not describe
+  it publicly: post only a non-sensitive notice that a private report under
+  `SECURITY.md` is required.
 
 ## Disproof pass (before posting any finding)
 
@@ -132,7 +136,8 @@ review the behavior/dependency change, not cosmetic diff noise.
 
 ## Finding format and coverage
 
-One concise inline finding per root cause, anchored to the smallest changed
+Except for deployed-code vulnerability details (see Security exception), one
+concise inline finding per root cause, anchored to the smallest changed
 range: title, severity with its reason, triggering scenario, evidence
 (file/symbol), smallest corrective direction. State the commit you reviewed
 and anything material you did not cover; "no issues" must not claim coverage
