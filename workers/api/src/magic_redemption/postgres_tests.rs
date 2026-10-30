@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{config::Host, Client, Config, NoTls};
 
 fn runtime() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -17,16 +17,72 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
+fn disposable_config(database_url: &str) -> Result<Config, &'static str> {
+    let config: Config = database_url
+        .parse()
+        .map_err(|_| "invalid test database URL")?;
+    // Validate the driver's effective settings, including URL query overrides,
+    // and connect with this same configuration before issuing any fixture DDL.
+    if !matches!(config.get_dbname(), Some("nntune_ci" | "agent-testdb")) {
+        return Err("test database must be disposable");
+    }
+    if config.get_hosts().is_empty()
+        || !config.get_hosts().iter().all(|host| match host {
+            Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "agent-testdb"),
+            _ => false,
+        })
+        || !config.get_hostaddrs().iter().all(|addr| addr.is_loopback())
+    {
+        return Err("test database hosts and addresses must be local");
+    }
+    Ok(config)
+}
+
+#[test]
+fn disposable_config_checks_effective_driver_settings() {
+    let base = "postgresql://postgres:throwaway@localhost:5432/nntune_ci";
+    for url in [
+        base.to_owned(),
+        "postgresql://postgres@agent-testdb/agent-testdb".to_owned(),
+        format!("{base}?hostaddr=127.0.0.1"),
+        format!("{base}?dbname=agent-testdb"),
+    ] {
+        assert!(
+            disposable_config(&url).is_ok(),
+            "allowed disposable configuration"
+        );
+    }
+    for url in [
+        format!("{base}?dbname=application"),
+        format!("{base}?dbname=nntune_ci&dbname=application"),
+        format!("{base}?host=remote.example.com"),
+        format!("{base}?host=localhost,remote.example.com"),
+        format!("{base}?host=%2Fvar%2Frun%2Fpostgresql"),
+        format!("{base}?hostaddr=203.0.113.10"),
+        format!("{base}?hostaddr=127.0.0.1,203.0.113.10"),
+        "postgresql://postgres@remote.example.com/nntune_ci".to_owned(),
+        "postgresql://postgres@localhost/application".to_owned(),
+    ] {
+        assert!(
+            disposable_config(&url).is_err(),
+            "unsafe configuration must fail before connecting"
+        );
+    }
+    let config = disposable_config(&format!("{base}?dbname=agent-testdb&hostaddr=127.0.0.1"))
+        .expect("checked effective configuration");
+    assert_eq!(config.get_dbname(), Some("agent-testdb"));
+    assert_eq!(
+        config.get_hostaddrs(),
+        &[std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
+    );
+}
+
 async fn connect() -> (Client, JoinHandle<()>) {
     let database_url = std::env::var("NNTUNE_REDEMPTION_TEST_DATABASE_URL")
         .expect("set the dedicated disposable redemption-test database URL");
-    let url = url::Url::parse(&database_url).expect("invalid test database URL");
-    assert!(matches!(url.path(), "/nntune_ci" | "/agent-testdb"));
-    assert!(matches!(
-        url.host_str(),
-        Some("localhost" | "127.0.0.1" | "agent-testdb")
-    ));
-    let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
+    let config = disposable_config(&database_url).expect("unsafe test database configuration");
+    let (client, connection) = config
+        .connect(NoTls)
         .await
         .expect("connect to disposable PostgreSQL");
     let driver = tokio::spawn(async move {
@@ -163,6 +219,53 @@ fn postgres_claim_uses_database_time() {
             .unwrap();
         let audit = fixture.audit();
         let transaction = fixture.client.transaction().await.unwrap();
+        assert!(matches!(
+            redeem(transaction, &fixture.magic, &fixture.session, Some(&audit)).await,
+            Ok(false)
+        ));
+        assert_eq!(fixture.persisted().await, (false, 0, 0));
+        fixture.close().await;
+    });
+}
+
+#[test]
+#[ignore = "requires the disposable PostgreSQL service; enforced explicitly in CI"]
+fn postgres_claim_rejects_link_expiring_after_transaction_start() {
+    runtime().block_on(async {
+        let mut fixture = Fixture::new().await;
+        let audit = fixture.audit();
+        let transaction = fixture.client.transaction().await.unwrap();
+        transaction.apply_statement_timeout().await.unwrap();
+        let expires_at: i64 = transaction
+            .query_one(
+                "UPDATE magic_link_tokens
+                 SET expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + 2
+                 RETURNING expires_at",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        fixture.magic.expires_at = u64::try_from(expires_at).unwrap();
+        // Cross the expiry using database time while keeping this transaction
+        // open. A frozen transaction_timestamp() claim would now accept it.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            transaction.batch_execute("SELECT pg_sleep(2)"),
+        )
+        .await
+        .expect("database-time expiry wait must be bounded")
+        .unwrap();
+        let clocks = transaction
+            .query_one(
+                "SELECT FLOOR(EXTRACT(EPOCH FROM transaction_timestamp()))::BIGINT < $1,
+                        FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT >= $1",
+                &[&expires_at],
+            )
+            .await
+            .unwrap();
+        assert!(clocks.get::<_, bool>(0), "link valid at transaction start");
+        assert!(clocks.get::<_, bool>(1), "link expired before claim");
         assert!(matches!(
             redeem(transaction, &fixture.magic, &fixture.session, Some(&audit)).await,
             Ok(false)
