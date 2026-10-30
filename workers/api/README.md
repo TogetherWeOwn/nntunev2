@@ -108,6 +108,103 @@ public repo variables, worker-build plumbing, `--var BUILD_SHA` wiring);
 Worker secrets and the staging variable values are Operator-wired, and the
 lane skips until they are.
 
+### Session refresh retries without a stale-cookie grace period
+
+An empty body or `{}` on `POST /v1/session/refresh` keeps the strict one-shot contract:
+commit the conditional counter advance, then send `Set-Cookie`. A stale
+cookie is never accepted for ordinary authentication or unbound refresh.
+Clients needing lost-response recovery must send the body-independent header
+`Content-Type: application/vnd.nntune.session-refresh-bound+json` and JSON
+`{"retry_key":"<unpadded base64url of 32 cryptographically random bytes>"}`.
+The same exact `Origin` and signed session cookie are still required. The HTTP
+transport rejects a retry key without this marker, and rejects marked requests
+with missing, empty, truncated or malformed JSON before any session mutation.
+Thus a lengthless upload abort hidden by the runtime as empty EOF cannot
+silently downgrade a marked operation to an unbound empty-body refresh.
+
+- Generate a **new 256-bit random secret before each logical refresh** and
+  retain it privately for that operation. Never derive it from the cookie,
+  user id, timestamps, or a public request id. Never log it, put it in URLs,
+  or persist it to localStorage. The server checks encoding/length, not
+  randomness: clients must use a CSPRNG (e.g. `crypto.getRandomValues`).
+- On a lost response or retryable 5xx, retry with the **same** secret and
+  predecessor cookie. The server atomically binds a digest of both to the
+  rotation. The original cookie alone, or a different secret, cannot recover.
+  Ordinary endpoints still reject the old cookie immediately.
+- Recovery only reissues the immediate successor; it never rotates again,
+  extends expiry, resets authentication age, or reopens a revoked session.
+  The window is **strictly less than 120 seconds** from the first serialized
+  PostgreSQL receipt claim (`refresh_claimed_at`) and is never renewed by retry.
+  Signed-token issuance (`refresh_issued_at`) retains the validated Worker
+  candidate's clock; it is not replaced by the database clock. This separates
+  receipt age from token structure under cross-system clock skew. The adapter
+  validates candidate and returned token structure before committing.
+  PostgreSQL locks the row before sampling its fresh claim clock, then rechecks
+  both token expiries and the receipt deadline in that transaction; time spent
+  waiting for that lock counts against the existing recovery window. The predecessor must also still
+  pass its signed-token lifetime checks. Another rotation, logout,
+  revoke-all, reauthentication, or account deletion closes recovery.
+- **Cross-tab single-flight is mandatory for cookie clients.** Serialize all
+  session-cookie mutations across every tab/window sharing the cookie jar,
+  including bound/unbound refresh, sign-in, logout, and reauthentication.
+  Hold one same-origin Web Lock (or equivalent shared coordinator) for the
+  entire logical operation, including delivery of response headers and all
+  retries. No hedged or overlapping live requests: a delayed duplicate's
+  `Set-Cookie` can otherwise overwrite a newer generation. This protocol
+  does not make same-name browser cookies generation-safe.
+- Retry only after the previous HTTP attempt has fully settled and cannot
+  deliver further cookie-mutating headers. A timeout or `AbortController.abort()`
+  alone is **not** proof of that boundary. If the transport cannot establish
+  settlement, do not start another cookie mutation; retain the operation's
+  recovery state and fail closed until it can. All contexts must use the
+  coordinator; one tab's in-memory mutex is not sufficient.
+- After success **and settlement of every outstanding attempt**, discard the
+  secret and release the coordinator before starting the next logical
+  operation. After the window or either token's expiry, require a new sign-in
+  under that same coordinator; never accept a stale cookie. If the browser
+  already installed the successor cookie before reporting a network failure,
+  a settled retry can perform another ordinary authenticated rotation; it
+  cannot recover a different session or bypass revocation.
+- Success stays `200 {"ok":true}` with the secure HttpOnly cookie; secrets
+  and digests never appear in response bodies or audit fields. All reads
+  and writes use the current server-side row. Only the digest, original token
+  issuance and original database claim timestamp are stored, in one bounded
+  receipt slot per session.
+
+Apply app migrations `0024_session_refresh_retry.sql` and
+`0025_session_refresh_claim_clock.sql` **before** deploying this Worker.
+Existing receipts without a claim clock cannot recover; no history is backfilled.
+The staging deployment now fails closed unless its read-only schema gate verifies
+all three nullable receipt columns and their exact types on the actual database
+identified by the deployed Hyperdrive origin. It reuses the existing staging
+migrator secret, checks private target identity, and never applies a migration.
+Because the Worker resolves unqualified `sessions` through its runtime role,
+the gate also requires that no other non-system `sessions` relation exists
+(including indexes, partitioned indexes and composite relations), so any role
+search path that resolves the name resolves the checked public table. Disposable
+PostgreSQL CI executes this exact catalog query against positive, shadow and
+system/temp-exception fixtures; inverted-exclusion and omitted-kind mutants
+must fail verdict assertions, not just SQL-source checks.
+The direct schema connection requires `sslmode=verify-full` (also the default
+when omitted); `require` and weaker modes reject before connecting. The staging
+job installs/checks the system CA bundle, passed explicitly as `PGSSLROOTCERT`,
+so both the certificate chain and database hostname are verified. Existing
+secret URLs with `sslmode=require` need an authorized configuration update;
+this code does not read or rewrite the deployed secret.
+Missing configuration, target mismatch, query failure or absent schema prevents
+both deployment and a positive deployment marker. Applying staging migrations
+remains the authorized database executor's action, not an implicit CI operation.
+Unsupported/unmigrated runtime storage fails closed with 5xx, never an
+unbound recovery. No current web caller automatically opts into this
+protocol; adoption requires both the per-operation secret and the shared
+single-flight coordinator above. Do not opt in while older tabs or clients
+can still write this cookie without participating in that coordinator.
+The security decision is deliberate: no blanket previous-token allowance,
+no weakened replay tests, and no recovery from possession of a stale
+cookie alone. Stealing both the predecessor cookie and its separately
+retained retry secret allows recovery inside the bounded window; protect
+both as credentials.
+
 ### Test-connection routing boundary
 
 - The current path is a direct dial from the api Worker:

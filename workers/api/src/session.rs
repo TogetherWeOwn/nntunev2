@@ -388,6 +388,67 @@ pub fn rotate_session(
     Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
 }
 
+/// Recovery is an explicitly client-bound retry, never a stale-cookie grace
+/// period. The client must create a fresh 256-bit random secret BEFORE sending
+/// a refresh, serialize cookie writers across tabs, and retain it until all
+/// attempts settle after success (or recovery expires). See the API README.
+pub const REFRESH_RETRY_SECS: u64 = 120;
+
+/// Bind the separately supplied client secret to this exact predecessor token.
+/// Only this digest is stored; neither credential is persisted or logged.
+/// A canonical unpadded base64url encoding of 32 random bytes is required.
+pub(crate) fn refresh_retry_hash(token: &str, retry_key: &str) -> Result<String, SessionError> {
+    use sha2::Digest;
+    if retry_key.len() != 43 {
+        return Err(SessionError::Invalid);
+    }
+    let key = crate::b64::decode(retry_key).map_err(|_| SessionError::Invalid)?;
+    if key.len() != 32 || crate::b64::encode(&key) != retry_key {
+        return Err(SessionError::Invalid);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"nntune-session-refresh-retry-v1\0");
+    hash.update(&key); // Fixed length, so concatenation is unambiguous.
+    hash.update(token.as_bytes());
+    Ok(crate::b64::encode(&hash.finalize()))
+}
+
+/// One atomic statement handles both first delivery and a bound retry. Both
+/// paths require a live, same-owner row. A retry may only recover the immediate
+/// successor, within the ORIGINAL window; it cannot rotate again or extend
+/// expiry. Execute only after locking this session row in a transaction and
+/// sampling the database clock AFTER that lock (see `session_retry_store`). A
+/// request-time snapshot is neither an expiry bound nor a serialization clock.
+/// Parameters: id, user, created_at, old counter, old expiry, next counter,
+/// next expiry, credential digest, validated token issuance, database claim
+/// time, database claim time - REFRESH_RETRY_SECS. The two clocks are NOT
+/// interchangeable: receipt age must never create an invalid signed token.
+pub const ROTATE_SESSION_WITH_RETRY_SQL: &str = "UPDATE sessions
+SET rotation_counter = $6,
+    expires_at = CASE WHEN rotation_counter = $4 THEN $7 ELSE expires_at END,
+    refresh_retry_hash = $8,
+    refresh_issued_at = CASE WHEN rotation_counter = $4 THEN $9 ELSE refresh_issued_at END,
+    refresh_claimed_at = CASE WHEN rotation_counter = $4 THEN $10 ELSE refresh_claimed_at END
+WHERE id = $1 AND user_id = $2 AND created_at = $3
+  AND revoked = FALSE AND expires_at > $10 AND $5 > $10
+  AND ((rotation_counter = $4 AND expires_at = $5 AND $7 > $10)
+       OR (rotation_counter = $6 AND refresh_retry_hash = $8
+           AND refresh_claimed_at <= $10 AND refresh_claimed_at > $11))
+RETURNING id, user_id, created_at, expires_at, rotation_counter, refresh_issued_at";
+
+/// Reconstruct the already-committed successor using metadata returned by the
+/// atomic retry claim, never by relaxing `verify_stored_session`. Signing always
+/// uses the primary key (including during an explicit secret-rotation window).
+pub(crate) fn sign_refreshed_claims(
+    secret: &[u8],
+    claims: &SessionClaims,
+) -> Result<String, SessionError> {
+    let payload = serde_json::to_vec(claims).expect("claims serialize");
+    let payload_b64 = crate::b64::encode(&payload);
+    let sig = sign(secret, &payload_b64)?;
+    Ok(format!("{}.{}", payload_b64, crate::b64::encode(&sig)))
+}
+
 /// Privilege gate: like [`verify_stored_session`], plus a freshness check
 /// on the immutable authentication time.
 ///

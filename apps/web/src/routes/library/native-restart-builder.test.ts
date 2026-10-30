@@ -53,6 +53,7 @@ function restartFixture() {
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null, pendingShareSeek = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
+		let queueConfirmGeneration = 0;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
 		const restartSupersededSources = new Set();
 		let playEpoch = 0;

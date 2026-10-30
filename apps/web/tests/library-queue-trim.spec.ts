@@ -262,6 +262,22 @@ test('TRIM-C05 background prop replacements never autofocus and refresh boundary
 	}
 });
 
+test('TRIM-C06 panel without the confirm opt-in reports clear-all once in one step, with no prompt', async ({ componentPage: page }) => {
+	const value = { ...createQueue(TRACKS), currentIndex: 1 };
+	await replace(page, value);
+	const clearAll = button(page, 'Clear queue');
+	await expect(clearAll).toBeVisible();
+	await expect(clearAll).toHaveAttribute('type', 'button');
+	await clearAll.focus();
+	await page.keyboard.press('Space');
+	await settle(page);
+	expect(await page.evaluate(() => window.queueTrim.inspect())).toEqual({ state: value, calls: ['clear-all'] });
+	await expect(button(page, 'Yes, clear queue')).toHaveCount(0);
+	await expect(button(page, 'Cancel')).toHaveCount(0);
+	await expect(page.getByTestId('queue-clear-confirm')).toHaveCount(0);
+	expect(await page.evaluate(() => window.trimProbe)).toEqual({ media: [], positions: [], sources: [] });
+});
+
 const EXAMPLES = [
 	{ id: 'TRIM-B01', index: 0, name: KEEP, want: ['trim-zulu', 'trim-apple', 'trim-mango', 'trim-kiwi'], position: 'Track 1 of 4', removed: 0, key: 'Enter' },
 	{ id: 'TRIM-B02', index: 2, name: KEEP, want: ['trim-mango', 'trim-kiwi'], position: 'Track 1 of 2', removed: 2, key: 'Enter' },
@@ -283,6 +299,7 @@ for (const example of EXAMPLES) {
 			await expect(action).toBeEnabled();
 			await tabTo(page, action);
 			await page.keyboard.press(example.key);
+			if (example.name === CLEAR) await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).click();
 			await expect(currentRow(page)).toBeFocused();
 			await expect(announcement).toHaveAttribute('role', 'status');
 			await expect(announcement).not.toHaveAttribute('aria-live', 'assertive');
@@ -327,12 +344,14 @@ test('TRIM-B07 touch at narrow dark viewport trims the middle and keeps whole-cl
 		await button(page, KEEP).tap();
 		await expect.poll(() => order(page)).toEqual(['trim-apple', 'trim-mango', 'trim-kiwi']);
 		await button(page, CLEAR).tap();
+		await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).tap();
 		await expect.poll(() => order(page)).toEqual(['trim-apple']);
 		await expect(currentRow(page)).toHaveAttribute('data-track-id', 'trim-apple');
 		await expect(button(page, KEEP)).toBeDisabled();
 		await expect(button(page, CLEAR)).toBeDisabled();
 		await noPlayback(page, calls);
 		await button(page, 'Clear queue').tap();
+		await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).tap();
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		await expect(page.getByTestId('now-playing')).toContainText('Queue is empty');
 		await expect(button(page, 'Clear queue')).toBeDisabled();
@@ -364,6 +383,7 @@ test('TRIM-B09 auth purge discards the trimmed queue before another account retr
 	const { payload } = await seedLibrary(page, baseURL!, 1);
 	await requireControls(page);
 	await button(page, CLEAR).click();
+	await page.getByRole('button', { name: 'Yes, clear upcoming', exact: true }).click();
 	await expect.poll(() => order(page)).toEqual(['trim-zulu', 'trim-apple']);
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');
