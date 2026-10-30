@@ -77,14 +77,27 @@ fn disposable_config_checks_effective_driver_settings() {
     );
 }
 
-async fn connect() -> (Client, JoinHandle<()>) {
-    let database_url = std::env::var("NNTUNE_REDEMPTION_TEST_DATABASE_URL")
-        .expect("set the dedicated disposable redemption-test database URL");
-    let config = disposable_config(&database_url).expect("unsafe test database configuration");
+fn test_database_url() -> String {
+    std::env::var("NNTUNE_REDEMPTION_TEST_DATABASE_URL")
+        .expect("set the dedicated disposable redemption-test database URL")
+}
+
+async fn connect<F>(
+    database_url: &str,
+    connector: impl FnOnce(Config) -> F,
+) -> Result<(Client, JoinHandle<()>), &'static str>
+where
+    F: std::future::Future<Output = Result<(Client, JoinHandle<()>), &'static str>>,
+{
+    let config = disposable_config(database_url)?;
+    connector(config).await
+}
+
+async fn open_postgres(config: Config) -> Result<(Client, JoinHandle<()>), &'static str> {
     let (client, connection) = config
         .connect(NoTls)
         .await
-        .expect("connect to disposable PostgreSQL");
+        .map_err(|_| "connect to disposable PostgreSQL")?;
     let driver = tokio::spawn(async move {
         connection.await.expect("PostgreSQL connection driver");
     });
@@ -94,7 +107,50 @@ async fn connect() -> (Client, JoinHandle<()>) {
         .batch_execute("SET statement_timeout = 0")
         .await
         .unwrap();
-    (client, driver)
+    Ok((client, driver))
+}
+
+#[test]
+fn fixture_connection_rejects_unsafe_config_before_connector_or_ddl() {
+    runtime().block_on(async {
+        for (url, expected) in [
+            (
+                "postgresql://postgres@localhost/nntune_ci?dbname=application",
+                "test database must be disposable",
+            ),
+            (
+                "postgresql://postgres@localhost/nntune_ci?host=remote.example.com",
+                "test database hosts and addresses must be local",
+            ),
+            (
+                "postgresql://postgres@localhost/nntune_ci?hostaddr=203.0.113.10",
+                "test database hosts and addresses must be local",
+            ),
+        ] {
+            let connector_calls = std::cell::Cell::new(0);
+            let result = connect(url, |_| {
+                connector_calls.set(connector_calls.get() + 1);
+                std::future::ready(Err("connector must not run"))
+            })
+            .await;
+            assert_eq!(result.err(), Some(expected), "require the guard's failure");
+            assert_eq!(connector_calls.get(), 0);
+            // No connection or Client exists: Fixture::new cannot issue DDL.
+        }
+
+        let connector_calls = std::cell::Cell::new(0);
+        let result = connect(
+            "postgresql://postgres@localhost/nntune_ci?dbname=agent-testdb",
+            |config| {
+                connector_calls.set(connector_calls.get() + 1);
+                assert_eq!(config.get_dbname(), Some("agent-testdb"));
+                std::future::ready(Err("connector sentinel"))
+            },
+        )
+        .await;
+        assert_eq!(connector_calls.get(), 1);
+        assert_eq!(result.err(), Some("connector sentinel"));
+    });
 }
 
 struct Fixture {
@@ -108,7 +164,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
-        let (client, driver) = connect().await;
+        let (client, driver) = connect(&test_database_url(), open_postgres)
+            .await
+            .expect("safe disposable PostgreSQL connection");
         let schema = format!(
             "redemption_{}_{}",
             std::process::id(),
@@ -280,7 +338,9 @@ fn postgres_claim_rejects_link_expiring_after_transaction_start() {
 fn postgres_claim_locks_user_before_token() {
     runtime().block_on(async {
         let mut fixture = Fixture::new().await;
-        let (blocker, driver) = connect().await;
+        let (blocker, driver) = connect(&test_database_url(), open_postgres)
+            .await
+            .expect("safe disposable PostgreSQL connection");
         blocker
             .batch_execute(&format!("SET search_path TO {}; BEGIN", fixture.schema))
             .await
