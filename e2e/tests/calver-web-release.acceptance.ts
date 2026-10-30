@@ -33,8 +33,8 @@ function calver(body: string): string[] {
   return steps(body).filter(step => /uses: TogetherWeOwn\/\.github\/actions\/calver@/.test(step));
 }
 
-function runOfflineClass(name: string) {
-  const result = spawnSync('python3', ['ci/test-web-release-acceptance.py', name, '-v'], {
+function runOfflineClass(name: string, file = 'ci/test-web-release-acceptance.py') {
+  const result = spawnSync('python3', [file, name, '-v'], {
     cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
     env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1', PYTHONIOENCODING: 'utf-8' },
   });
@@ -96,6 +96,21 @@ test.describe('complete immutable web artifact and honest executed acceptance', 
   test('offline exact-run/attempt jobs, steps, pagination and artifact certification', () => {
     test.setTimeout(150_000);
     runOfflineClass('EvidenceTests');
+  });
+
+  test('producer bundles retain the complete sibling-server closure without a consumer build', () => {
+    test.setTimeout(150_000);
+    runOfflineClass('ProducerModuleClosureTests', 'ci/test-web-release-boundaries.py');
+  });
+
+  test('malformed nested inventory and evidence refuse structurally without usable output', () => {
+    test.setTimeout(150_000);
+    runOfflineClass('MalformedBoundaryTests', 'ci/test-web-release-boundaries.py');
+  });
+
+  test('GitHub fetch and canary resolve enforce exact immutable selection at the fake HTTP boundary', () => {
+    test.setTimeout(150_000);
+    runOfflineClass('GitHubTransportTests', 'ci/test-web-release-boundaries.py');
   });
 
   test('main writer lock spans build, deploy, reusable E2E and publication without a nested same-group deadlock', () => {
