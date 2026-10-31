@@ -20,8 +20,10 @@ import { apiGet, apiOptions, apiPost } from '../helpers/accounts.js';
 // when STAGING_BASE_URL is unset and fails closed once it is configured:
 // the pair is required before any request (`accessHeaders` throws on a
 // half-set pair), every status is exact, and no probe has a fallback accept.
-// Diagnostics name only the gate (fixed context + status): never a URL,
-// header, or body value.
+// Diagnostics name only the gate (fixed context + status) and cookie names:
+// never a URL, header, or body value. Access admits the pair by issuing its
+// own `CF_Authorization` cookie on every response, so the no-cookie checks
+// exempt exactly that edge cookie (see ACCESS_EDGE_COOKIE).
 
 /** Liveness probe: unauthenticated at the Worker, Access pair only at the edge. */
 const HEALTHZ_PATH = '/healthz';
@@ -51,12 +53,33 @@ export interface DenialProbe {
   context: string;
 }
 
-/** Absence check for response cookies (presence only — values are never read). */
+/**
+ * Cookie the Cloudflare Access edge issues on every response to a request
+ * it admitted with the QA service-token pair (exact, case-sensitive name).
+ * It is set by the edge in front of staging, not by the Worker, and carries
+ * no app session, so it is the only cookie a denial may carry here.
+ */
+const ACCESS_EDGE_COOKIE = 'CF_Authorization';
+
+/**
+ * Absence check for app cookies on a denial. Only cookie NAMES are read (the
+ * text before the first `=` of each Set-Cookie line Playwright joins with
+ * newlines); values are never read or logged. Any cookie other than the
+ * Access edge cookie fails, named in the error.
+ */
 function assertNoSetCookie(headers: Record<string, string>, context: string): void {
-  const names = Object.keys(headers).map((name) => name.toLowerCase());
-  if (names.includes('set-cookie')) {
+  const appCookies: string[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'set-cookie') continue;
+    for (const line of value.split('\n')) {
+      const cookieName = line.split('=', 1)[0]!.trim();
+      if (cookieName !== ACCESS_EDGE_COOKIE) appCookies.push(cookieName || '(unnamed)');
+    }
+  }
+  if (appCookies.length > 0) {
     throw new Error(
-      `[${context}] denial must not set a cookie (names only — no values logged).`,
+      `[${context}] denial must not set a cookie, got: ${appCookies.join(', ')} ` +
+        '(names only — no values logged).',
     );
   }
 }
@@ -266,6 +289,29 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     }
     expect(cookie, 'denials must not set cookies').toMatch(/must not set a cookie/);
     expect(cookie).not.toContain('SENTINEL');
+    // The Access edge cookie alone passes (issued by Cloudflare Access for the
+    // service-token pair, never by the Worker) ...
+    assertGenericAnonymous401({
+      ...ok,
+      headers: { 'set-cookie': 'CF_Authorization=SENTINEL; Path=/; Secure; HttpOnly' },
+    });
+    // ... but never covers an app cookie on another Set-Cookie line, nor a
+    // look-alike name.
+    for (const setCookie of [
+      'CF_Authorization=SENTINEL; Path=/\n__Host-nntune-session=SENTINEL; Path=/',
+      'cf_authorization=SENTINEL; Path=/',
+      'CF_Authorization_x=SENTINEL',
+      '=SENTINEL',
+    ]) {
+      let mixed = '';
+      try {
+        assertGenericAnonymous401({ ...ok, headers: { 'set-cookie': setCookie } });
+      } catch (error) {
+        mixed = (error as Error).message;
+      }
+      expect(mixed, 'non-Access cookies must fail').toMatch(/must not set a cookie, got: /);
+      expect(mixed).not.toContain('SENTINEL');
+    }
   });
 
   test('not_found verdict accepts the envelope and rejects the rest', () => {

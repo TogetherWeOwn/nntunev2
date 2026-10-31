@@ -67,6 +67,14 @@
 		return () => media.removeEventListener('change', onChange);
 	});
 
+	// Hydration marker for browser tests ($effect never runs during SSR, and
+	// effects flush only after the whole tree has attached its handlers).
+	// Without it a test can click a server-rendered form before hydration and
+	// trigger a native GET submit instead of the client handler. Carries no state.
+	$effect(() => {
+		document.documentElement.setAttribute('data-hydrated', '');
+	});
+
 	// Any 402/429 limit response from an API client lands here as a paywall
 	// modal (upgrade CTA, not a dead-end toast). See planLimit.ts.
 	let paywall = $state<PaywallModel | null>(null);

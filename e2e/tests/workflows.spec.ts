@@ -846,9 +846,9 @@ test.describe('fail-closed artifact publication gate', () => {
 });
 
 // Post-deploy sequencing contract: the full journey is promotion evidence,
-// so it may run only after the same run's staging-web deploy succeeds.
-// e2e-staging.yml must not race deploy.yml on push; instead deploy.yml
-// calls it as a reusable workflow from a job that `needs` staging-web,
+// so it may run only after the same run's staging-web and staging-api jobs
+// succeed. e2e-staging.yml must not race deploy.yml on push; instead
+// deploy.yml calls it as a reusable workflow from a job that `needs` both,
 // and the journey job additionally requires the caller-only
 // `inputs.post_deploy`. Scheduled/manual runs stay synthetic monitoring.
 const deployWorkflow = readFileSync(new URL('deploy.yml', workflowDir), 'utf8');
@@ -922,14 +922,17 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(jobIf(stagingWorkflow, 'synthetic')).toBeUndefined();
   });
 
-  test('deploy calls e2e-staging only after a successful push staging-web (evaluated)', () => {
+  test('deploy calls e2e-staging only after successful push staging-web and staging-api (evaluated)', () => {
     // The deploy being sequenced after is itself push-only and gated on
     // the Cloudflare token; when it skips, dependents must skip too.
     expect(jobIf(deployWorkflow, 'staging-web')).toContain("github.event_name == 'push'");
     expect(jobIf(deployWorkflow, 'staging-web')).toContain("needs.gate.outputs.enabled == 'true'");
 
     const section = jobSection(deployWorkflow, 'post-deploy-e2e');
-    expect(section).toContain('needs: [staging-web]');
+    // Both lanes: needing only staging-web let the journey run against the
+    // previous api while the new one was still deploying.
+    expect(section).toContain('needs: [staging-web, staging-api]');
+    expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
     expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
@@ -937,12 +940,17 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     expect(condition, 'post-deploy-e2e must carry a job-level if').toBeDefined();
     // No status-check function in the condition: GitHub then applies the
     // implicit success() over `needs`, which is the whole contract — a
-    // skipped/failed/cancelled staging-web can never run this job.
+    // skipped/failed/cancelled staging-web or staging-api can never run
+    // this job.
     for (const statusFn of ['always()', '!cancelled()', 'success()', 'failure()', 'cancelled()']) {
       expect(condition, `post-deploy-e2e if must not use ${statusFn}`).not.toContain(statusFn);
     }
 
-    const evaluate = (stagingWebResult: string, eventName: string): boolean => {
+    const evaluate = (
+      stagingWebResult: string,
+      eventName: string,
+      stagingApiResult = 'success',
+    ): boolean => {
       const inner = condition!
         .replace(/^\$\{\{\s*/, '')
         .replace(/\s*\}\}$/, '');
@@ -955,13 +963,17 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       );
       const conditionHolds = Function(`"use strict"; return (${expr});`)() as boolean;
       // Implicit success() over needs.
-      return stagingWebResult === 'success' && conditionHolds;
+      return stagingWebResult === 'success' && stagingApiResult === 'success' && conditionHolds;
     };
     expect(evaluate('success', 'push')).toBe(true);
     for (const result of ['skipped', 'failure', 'cancelled']) {
       expect(
         evaluate(result, 'push'),
         `staging-web ${result} must not produce a full-journey run`,
+      ).toBe(false);
+      expect(
+        evaluate('success', 'push', result),
+        `staging-api ${result} must not produce a full-journey run`,
       ).toBe(false);
     }
     for (const event of ['pull_request', 'workflow_dispatch', 'schedule']) {

@@ -199,9 +199,10 @@ How the suite uses them:
 
 - `.github/workflows/e2e-staging.yml` — no `push` trigger. The full
   journey runs only as a reusable-workflow call from `deploy.yml`'s
-  `post-deploy-e2e` job, which `needs` the same run's `staging-web`
-  deploy, so a skipped/failed deploy cannot produce a full-journey PASS
-  and no run can start without its own deploy. A later main push can
+  `post-deploy-e2e` job, which `needs` the same run's `staging-web` and
+  `staging-api` jobs, so a skipped/failed deploy cannot produce a
+  full-journey PASS, no run can start without its own deploy, and the
+  journey never runs against the previous api mid-deploy. A later main push can
   still deploy staging mid-journey (deploy releases its job-level group
   when the deploy finishes while E2E serializes separately) — that
   timing fails the closing build-identity re-read instead of passing

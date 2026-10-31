@@ -320,11 +320,18 @@ export async function applyAccountToPage(
       // on the browser's automatic redirect follow to another origin. Fetching
       // with maxRedirects: 0 and fulfilling hands the 3xx to the browser as-is
       // so the next request re-enters this handler and goes out clean.
-      const response = await route.fetch({
-        headers: { ...route.request().headers(), ...stagingHeaders },
-        maxRedirects: 0,
-      });
-      await route.fulfill({ response });
+      // A fetch still in flight when the test ends rejects with "Test ended"
+      // and fails an otherwise green test. Abort instead: the page sees a
+      // failed request, so a mid-test transport failure still fails closed.
+      try {
+        const response = await route.fetch({
+          headers: { ...route.request().headers(), ...stagingHeaders },
+          maxRedirects: 0,
+        });
+        await route.fulfill({ response });
+      } catch {
+        await route.abort().catch(() => {});
+      }
     } else {
       await route.continue();
     }
@@ -422,6 +429,22 @@ export async function tryMintTestAccount(
 }
 
 /**
+ * Wait until the SvelteKit client has hydrated the current page (the root
+ * layout sets `data-hydrated` on <html> from an effect, which never runs
+ * during SSR). The server-rendered form is visible before its client
+ * handler is attached: clicking then triggers a native GET submit
+ * (`?email=...`) instead of the API call. Staging assets also load through
+ * the origin-scoped route proxy, so the gap is wide enough to hit every run.
+ * Call after each navigation, before the first interaction.
+ */
+export async function waitForHydration(page: Page, context: string): Promise<void> {
+  await expect(
+    page.locator('html[data-hydrated]'),
+    `[${context}] page never hydrated (client bundle not started)`,
+  ).toBeAttached({ timeout: 30_000 });
+}
+
+/**
  * Complete the BYOP wizard for the current page identity: point it at the
  * synthetic NNTP endpoint and save. Every identity that ingests runs this
  * first — the ingest worker probes through the user's authenticated provider
@@ -442,6 +465,7 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
     waitUntil: 'domcontentloaded',
     timeout: 30_000,
   });
+  await waitForHydration(page, 'byop');
   await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
   await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
@@ -514,6 +538,7 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
 export async function submitPublicUiSignup(page: Page, baseURL: string): Promise<TestAccount> {
   const email = uniqueTestEmail('e2e-ui');
   await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await waitForHydration(page, 'signup');
   await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.signupEmail).fill(email);
   await page.getByTestId(TESTIDS.signupSubmit).click();
@@ -665,6 +690,7 @@ export async function submitPublicUiSignupToByopWizard(
 ): Promise<TestAccount> {
   const email = uniqueTestEmail('e2e-wizard');
   await page.goto(`${baseURL}/signup`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await waitForHydration(page, 'signup');
   await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.signupEmail).fill(email);
   await page.getByTestId(TESTIDS.signupSubmit).click();
