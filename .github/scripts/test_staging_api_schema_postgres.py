@@ -109,7 +109,7 @@ def assert_verdict(env, name):
     try:
         gate.check(synthetic, fetch=lambda _: payload, run=run)
         actual = True
-    except gate.GateError:
+    except gate.CategorizedFailure:
         actual = False
     assert actual == expected, f"{name}: expected verdict {expected}, got {actual}"
 
