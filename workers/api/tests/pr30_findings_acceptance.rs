@@ -208,6 +208,49 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
+    async fn complete_registration(
+        &self,
+        challenge: &auth::PasskeyChallenge,
+        magic: &auth::MagicLinkRecord,
+        invite: Option<&auth::InviteRecord>,
+        credential: &auth::PasskeyCredential,
+        now: u64,
+    ) -> Result<(), handlers::StoreError> {
+        // Mirror the production transaction, including rollback when a
+        // later conditional claim loses or credential insertion fails.
+        let challenges_before = self.challenges.borrow().clone();
+        let magic_before = self.magic.borrow().clone();
+        let invites_before = self.invites.borrow().clone();
+        let result = async {
+            let mut claims = vec![
+                auth::SingleUseClaim::Challenge {
+                    record: challenge,
+                    now,
+                },
+                auth::SingleUseClaim::MagicLink { record: magic, now },
+            ];
+            if let Some(record) = invite {
+                claims.push(auth::SingleUseClaim::Invite { record });
+            }
+            for claim in claims {
+                if auth::SingleUseStore::claim(self, claim)
+                    .await
+                    .map_err(|_| handlers::StoreError)?
+                    != 1
+                {
+                    return Err(handlers::StoreError);
+                }
+            }
+            self.insert_credential(credential).await
+        }
+        .await;
+        if result.is_err() {
+            *self.challenges.borrow_mut() = challenges_before;
+            *self.magic.borrow_mut() = magic_before;
+            *self.invites.borrow_mut() = invites_before;
+        }
+        result
+    }
     async fn credential_by_id(
         &self,
         cred_id_b64url: &str,
@@ -2380,4 +2423,231 @@ fn purpose_guard_migration_keeps_the_constraint_creation_strategy_pinned() {
         "create trigger auth_challenges_purpose_immutable before update of purpose on auth_challenges"
     ));
     assert!(normalized.contains("execute function auth_challenges_purpose_immutable()"));
+}
+
+// Stored ceremony bindings are independent of the current attestation's
+// RP/origin. Removing either snapshot guard must admit an otherwise valid
+// ceremony here; invalid client data would hide that regression.
+mod registration_snapshot_acceptance {
+    use super::*;
+
+    struct Attempt {
+        harness: Harness,
+        challenge: String,
+        magic_hash: String,
+        invite_hash: String,
+        body: serde_json::Value,
+    }
+
+    fn attempt() -> Attempt {
+        let mut harness = harness();
+        harness.config = test_config(true, None);
+        let email = "snapshot-register@example.com";
+        let invite = "snapshot-registration-invite";
+        harness.store.seed_invite(invite);
+        let start = harness.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": email}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
+        let challenge = start["challenge"].as_str().expect("challenge").to_string();
+        let magic_token = harness.mailer.sent.borrow()[0].1.clone();
+        let magic_hash = harness
+            .store
+            .magic
+            .borrow()
+            .keys()
+            .next()
+            .expect("start stored the emailed proof")
+            .clone();
+        let key = test_signing_key(67);
+        let credential_id = b"snapshot-registration-credential";
+        let auth_data = authenticator_data(RP, 0x45, 0, Some((credential_id, &es256_cose(&key))));
+        let attestation = none_attestation(&auth_data);
+        let client_data = client_json("webauthn.create", &challenge, ORIGIN);
+        webauthn::verify_attestation(&attestation, &client_data, &ceremony_expect(&challenge))
+            .expect("attestation is valid for the CURRENT RP and origin");
+        let body = serde_json::json!({
+            "challenge": challenge,
+            "credential_id": b64::encode(credential_id),
+            "attestation_object": b64::encode(&attestation),
+            "client_data_json": b64::encode(&client_data),
+            "magic_token": magic_token,
+            "invite_code": invite,
+        });
+        Attempt {
+            harness,
+            challenge,
+            magic_hash,
+            invite_hash: auth::hash_invite_code(invite),
+            body,
+        }
+    }
+
+    impl Attempt {
+        fn finish(&self) -> handlers::Response {
+            self.harness.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                self.body.clone(),
+            )
+        }
+
+        fn assert_unspent(&self) {
+            assert!(
+                !self.harness.store.challenges.borrow()[&self.challenge]
+                    .challenge
+                    .consumed,
+                "rejected registration must not spend the stored challenge"
+            );
+            assert!(
+                !self.harness.store.magic.borrow()[&self.magic_hash].used,
+                "rejected registration must not spend the valid inbox proof"
+            );
+            assert!(
+                !self.harness.store.invites.borrow()[&self.invite_hash].used,
+                "rejected registration must not spend the invite"
+            );
+            assert!(self.harness.store.credentials.borrow().is_empty());
+            assert!(self.harness.store.sessions.borrow().is_empty());
+        }
+
+        fn assert_accepted(&self, response: &handlers::Response) {
+            assert_eq!(response.status, 200, "{}", response.body);
+            assert!(
+                response.set_cookie.is_some(),
+                "successful registration sets a cookie"
+            );
+            assert!(
+                self.harness.store.challenges.borrow()[&self.challenge]
+                    .challenge
+                    .consumed
+            );
+            assert!(self.harness.store.magic.borrow()[&self.magic_hash].used);
+            assert!(self.harness.store.invites.borrow()[&self.invite_hash].used);
+            assert_eq!(self.harness.store.credentials.borrow().len(), 1);
+            assert_eq!(self.harness.store.sessions.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn registration_finish_accepts_matching_stored_rp_and_origin() {
+        let attempt = attempt();
+        attempt.assert_unspent();
+        attempt.assert_accepted(&attempt.finish());
+    }
+
+    #[test]
+    fn registration_finish_rejects_stale_stored_rp_with_current_valid_attestation() {
+        let attempt = attempt();
+        {
+            let mut rows = attempt.harness.store.challenges.borrow_mut();
+            let stored = &mut rows
+                .get_mut(&attempt.challenge)
+                .expect("stored challenge")
+                .challenge;
+            assert_eq!(stored.origin, ORIGIN);
+            stored.rp_id = "old.passkey.example.com".to_string();
+        }
+        let response = attempt.finish();
+        assert_eq!(
+            response.status, 401,
+            "stale stored RP must fail generically"
+        );
+        assert_eq!(response.body, GENERIC_AUTH_BODY);
+        assert!(response.set_cookie.is_none());
+        attempt.assert_unspent();
+
+        attempt
+            .harness
+            .store
+            .challenges
+            .borrow_mut()
+            .get_mut(&attempt.challenge)
+            .expect("stored challenge")
+            .challenge
+            .rp_id = RP.to_string();
+        attempt.assert_accepted(&attempt.finish());
+    }
+
+    #[test]
+    fn registration_finish_rejects_stale_stored_origin_with_current_valid_attestation() {
+        let attempt = attempt();
+        {
+            let mut rows = attempt.harness.store.challenges.borrow_mut();
+            let stored = &mut rows
+                .get_mut(&attempt.challenge)
+                .expect("stored challenge")
+                .challenge;
+            assert_eq!(stored.rp_id, RP);
+            stored.origin = "https://old.passkey.example.com".to_string();
+        }
+        let response = attempt.finish();
+        assert_eq!(
+            response.status, 401,
+            "stale stored origin must fail generically"
+        );
+        assert_eq!(response.body, GENERIC_AUTH_BODY);
+        assert!(response.set_cookie.is_none());
+        attempt.assert_unspent();
+
+        attempt
+            .harness
+            .store
+            .challenges
+            .borrow_mut()
+            .get_mut(&attempt.challenge)
+            .expect("stored challenge")
+            .challenge
+            .origin = ORIGIN.to_string();
+        attempt.assert_accepted(&attempt.finish());
+    }
+
+    #[test]
+    fn registration_finish_zero_row_magic_claim_returns_no_cookie_or_partial_enrollment() {
+        let attempt = attempt();
+        attempt
+            .harness
+            .store
+            .magic
+            .borrow_mut()
+            .get_mut(&attempt.magic_hash)
+            .expect("stored magic proof")
+            .expires_at = NOW;
+        let magic = attempt.harness.store.magic.borrow()[&attempt.magic_hash].clone();
+        assert_eq!(
+            block_on(auth::SingleUseStore::claim(
+                &attempt.harness.store,
+                auth::SingleUseClaim::MagicLink {
+                    record: &magic,
+                    now: NOW
+                },
+            ))
+            .expect("conditional claim"),
+            0,
+            "snapshot expiry equality must lose the later strict SQL-style claim"
+        );
+        let response = attempt.finish();
+        assert_eq!(
+            response.status, 401,
+            "zero-row transaction must fail generically"
+        );
+        assert_eq!(response.body, GENERIC_AUTH_BODY);
+        assert!(response.set_cookie.is_none());
+        attempt.assert_unspent();
+
+        // The challenge was claimed first, but the losing magic claim must
+        // roll it back. The same emailed token and attestation remain usable.
+        attempt
+            .harness
+            .store
+            .magic
+            .borrow_mut()
+            .get_mut(&attempt.magic_hash)
+            .expect("stored magic proof")
+            .expires_at = NOW + 60;
+        attempt.assert_accepted(&attempt.finish());
+    }
 }
