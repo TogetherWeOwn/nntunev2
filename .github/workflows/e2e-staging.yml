@@ -38,6 +38,15 @@ on:
         description: Promotion commit SHA the staging deploy was built from
         type: string
         required: false
+      api_deploy_outcome:
+        # Same-run staging-api outcome (deployed / skipped / unconfigured /
+        # failed / cancelled). The build-identity spec holds the API
+        # /healthz build_sha to expected_sha when deployed (or when unset),
+        # and states explicitly that web=API=head is not claimed when
+        # skipped/unconfigured.
+        description: Outcome of the same-run staging-api deploy
+        type: string
+        required: false
     secrets:
       STAGING_BASE_URL:
         required: false
@@ -336,6 +345,7 @@ jobs:
           # set by deploy.yml from github.sha) — never a source checkout. The
           # build-identity spec fails closed when it is absent or malformed.
           EXPECTED_BUILD_SHA: ${{ inputs.expected_sha }}
+          API_DEPLOY_OUTCOME: ${{ inputs.api_deploy_outcome }}
         run: npm run e2e:staging
 
       - name: Enforce journey evidence gate (all-skipped must fail)

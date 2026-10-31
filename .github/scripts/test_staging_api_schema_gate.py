@@ -171,10 +171,18 @@ class SchemaGateTests(unittest.TestCase):
                 with patch.object(gate, "check", side_effect=failure):
                     with contextlib.redirect_stderr(output):
                         self.assertEqual(gate.main(), 1)
+                hint = ("staging schema behind repo migrations — see docs/ops.md staging migrations"
+                        if category == "schema"
+                        else "configuration, target or schema not verified")
                 self.assertEqual(
                     output.getvalue(),
-                    f"staging-api-schema: FAIL category={category} "
-                    "(configuration, target or schema not verified)\n")
+                    f"staging-api-schema: FAIL category={category} ({hint})\n")
+                self.assertNotIn("synthetic-private-password", output.getvalue())
+
+    def test_schema_hint_points_to_an_existing_ops_section(self):
+        ops = (pathlib.Path(__file__).parents[2] / "docs/ops.md").read_text()
+        self.assertIn("\n### Staging migrations\n", ops)
+        self.assertEqual(set(gate.HINTS), {"schema"})
 
     def test_staging_workflow_requires_executed_schema_success(self):
         workflow = (pathlib.Path(__file__).parents[1] / "workflows/deploy.yml").read_text()

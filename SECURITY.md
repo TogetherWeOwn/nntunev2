@@ -20,7 +20,8 @@ acknowledge within 5 business days and keep you updated until resolution.
 - `gitleaks` full-history scan is a required check on every PR
   (`.github/workflows/gitleaks.yml` clones with `fetch-depth: 0` and scans
   `HEAD` history; `gitleaks` is required on the default branch by the
-  `protect-main` ruleset alongside `ci-ok`, `pr-lint`, and Paperclip Review).
+  `protect-main` ruleset alongside `ci-ok`, `pr-lint`, `CodeRabbit` and
+  `Devin Review`).
 - Dependabot alerts enabled; version-update automation is configured in
   `.github/dependabot.yml` (weekly minor-and-patch groups for Actions,
   cargo, docker, and npm).

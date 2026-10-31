@@ -33,9 +33,9 @@
 # lockfile changes.
 #
 # First Dependabot PR: confirm the required checks (`ci-ok`, `gitleaks`,
-# `pr-lint`, Paperclip Review) all appear on it before relying on them —
-# automated authorship may not trigger every check. If the review check
-# is missing, a maintainer mentions the reviewer on the PR.
+# `pr-lint`, `CodeRabbit`, `Devin Review`) all appear on it before relying
+# on them — automated authorship may not trigger every check. If a review
+# check is missing, a maintainer requests that bot's review on the PR.
 
 version: 2
 
