@@ -128,6 +128,26 @@ test.describe('production preflight (exact checked-in block, offline)', () => {
     expect(result.output).toContain('Production lane disabled');
   });
 
+  test('every disabled spelling exits before any network, build, upload, tag or promotion command', () => {
+    const doubles = ['git', 'gh', 'curl', 'wget', 'npm', 'pnpm', 'npx', 'node', 'python3', 'wrangler']
+      .map(command => `${command}() { printf 'MUTATING_DOUBLE_CALLED:%s\\n' '${command}'; return 94; }`)
+      .join('\n');
+    // Verify the observation boundary once: an actual invocation is visible.
+    const control = runShell(`${doubles}\nnpx versions upload`);
+    expect(control.status).toBe(94);
+    expect(control.output).toContain('MUTATING_DOUBLE_CALLED:npx');
+    for (const flag of ['', 'false', 'TRUE', 'True', '1', 'true ']) {
+      const result = runShell(`${doubles}\n${script!}`, {
+        ...STEP_ENV, INPUT_SHA: 'invalid', PRODUCTION_DOMAIN: 'invalid/path',
+        PRODUCTION_DEPLOY_ENABLED: flag,
+      });
+      expect(result.status, `disabled spelling ${JSON.stringify(flag)}`).not.toBe(0);
+      expect(result.output).toContain('Production lane disabled');
+      expect(result.output).not.toContain('MUTATING_DOUBLE_CALLED:');
+      expect(result.output).not.toContain('sha=');
+    }
+  });
+
   test('refuses a non-40-hex sha', () => {
     const result = runShell(script!, {
       ...STEP_ENV,
@@ -173,219 +193,19 @@ test.describe('production preflight (exact checked-in block, offline)', () => {
   });
 });
 
-type RunRow = {
-  id: number;
-  head_sha: string;
-  status: string;
-  conclusion: string;
-  event: string;
-};
-
-type JobRow = { name: string; conclusion: string };
-
-// Stubbed GitHub API for the staging-evidence script. The exact checked-in
-// Python block runs unmodified except for the API base URL, which points at
-// this stub instead of api.github.com (test-only substitution). The stub
-// emulates GitHub's server-side event filter: when the script requests
-// event=push, dispatch runs are withheld, mirroring production behavior.
-const evidenceStub = {
-  runs: [] as RunRow[],
-  jobsByRun: new Map<number, JobRow[]>(),
-  ignoreEventFilter: false,
-  lastRunsUrl: '',
-};
-
-function startEvidenceStub(): Promise<{ server: Server; base: string }> {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? '/', 'http://stub');
-    if (url.pathname.endsWith('/actions/workflows/deploy.yml/runs')) {
-      evidenceStub.lastRunsUrl = req.url ?? '';
-      const event = url.searchParams.get('event');
-      const rows =
-        event === 'push' && !evidenceStub.ignoreEventFilter
-          ? evidenceStub.runs.filter((r) => r.event === 'push')
-          : [...evidenceStub.runs];
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ workflow_runs: rows }));
-      return;
-    }
-    const jobsMatch = url.pathname.match(/\/actions\/runs\/(\d+)\/jobs/);
-    if (jobsMatch) {
-      const jobs = evidenceStub.jobsByRun.get(Number(jobsMatch[1])) ?? [];
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ jobs }));
-      return;
-    }
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ message: 'not found' }));
-  });
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      const port =
-        typeof address === 'object' && address ? address.port : 0;
-      resolve({ server, base: `http://127.0.0.1:${port}` });
-    });
-  });
-}
-
-async function runEvidence(base: string) {
-  const match = productionWorkflow.match(
-    /python3 - <<'PY'\n([\s\S]*?)\n          PY/,
-  );
-  expect(match?.[1], 'evidence python block missing').toBeDefined();
-  // Test-only substitution: the exact block text runs, with only the API
-  // host redirected at the local stub (no ambient network).
-  const script = match![1]!
-    .replace(/^ {10}/gm, '')
-    .split('https://api.github.com')
-    .join(base);
-  const scratch = mkdtempSync(
-    join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'evidence-'),
-  );
-  try {
-    const file = join(scratch, 'evidence.py');
-    writeFileSync(file, script);
-    return await runChild(
-      'python3',
-      [file],
-      {
-        REPO: 'o/r',
-        DEPLOY_SHA: VALID_SHA,
-        GITHUB_TOKEN: 'dummy-token',
-      },
-      60_000,
-    );
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
-}
-
-const PUSH_RUN: RunRow = {
-  id: 100,
-  head_sha: VALID_SHA,
-  status: 'completed',
-  conclusion: 'success',
-  event: 'push',
-};
-
-// A later manual dispatch on the same SHA: staging jobs skip on dispatch, so
-// it carries no evidence and must never shadow the push run above.
-const DISPATCH_RUN: RunRow = {
-  id: 101,
-  head_sha: VALID_SHA,
-  status: 'completed',
-  conclusion: 'success',
-  event: 'workflow_dispatch',
-};
-
-const HEALTHY_JOBS: JobRow[] = [
-  { name: 'staging-web', conclusion: 'success' },
-  { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
-  {
-    name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
-    conclusion: 'success',
-  },
-];
-
-test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
-  let server: Server;
-  let base: string;
-
-  test.beforeAll(async () => {
-    ({ server, base } = await startEvidenceStub());
-  });
-
-  test.afterAll(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  });
-
-  test.beforeEach(() => {
-    evidenceStub.runs = [];
-    evidenceStub.jobsByRun = new Map();
-    evidenceStub.ignoreEventFilter = false;
-    evidenceStub.lastRunsUrl = '';
-  });
-
-  test('accepts prefixed called-workflow e2e job names on a push run', async () => {
-    evidenceStub.runs = [PUSH_RUN];
-    evidenceStub.jobsByRun.set(100, HEALTHY_JOBS);
-    const result = await runEvidence(base);
-    expect(result.status).toBe(0);
-    expect(result.output).toContain('staging evidence ok');
-    expect(result.output).toContain('deploy run 100');
-  });
-
-  test('accepts the bare post-deploy-e2e name', async () => {
-    evidenceStub.runs = [PUSH_RUN];
-    evidenceStub.jobsByRun.set(100, [
-      { name: 'staging-web', conclusion: 'success' },
-      { name: 'post-deploy-e2e', conclusion: 'success' },
-    ]);
-    expect((await runEvidence(base)).status).toBe(0);
-  });
-
-  test('requests only push-triggered deploy runs', async () => {
-    evidenceStub.runs = [PUSH_RUN];
-    evidenceStub.jobsByRun.set(100, HEALTHY_JOBS);
-    expect((await runEvidence(base)).status).toBe(0);
-    expect(evidenceStub.lastRunsUrl).toContain('event=push');
-  });
-
-  test('a later manual dispatch never shadows push evidence', async () => {
-    // Without the event=push filter the script would select run 101 (the
-    // newest id) and refuse on its skipped staging jobs. The filter keeps
-    // run 100 selectable however many dispatches follow it.
-    evidenceStub.runs = [PUSH_RUN, DISPATCH_RUN];
-    evidenceStub.jobsByRun.set(100, HEALTHY_JOBS);
-    evidenceStub.jobsByRun.set(101, [
-      { name: 'staging-web', conclusion: 'skipped' },
-    ]);
-    const result = await runEvidence(base);
-    expect(result.status).toBe(0);
-    expect(result.output).toContain('deploy run 100');
-  });
-
-  test('refuses when no e2e job matches', async () => {
-    evidenceStub.runs = [PUSH_RUN];
-    evidenceStub.jobsByRun.set(100, [
-      { name: 'staging-web', conclusion: 'success' },
-    ]);
-    const result = await runEvidence(base);
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('post-deploy-e2e');
-  });
-
-  test('refuses when a prefixed e2e job is not success', async () => {
-    evidenceStub.runs = [PUSH_RUN];
-    evidenceStub.jobsByRun.set(100, [
-      { name: 'staging-web', conclusion: 'success' },
-      {
-        name: 'post-deploy-e2e / synthetic smoke (health)',
-        conclusion: 'success',
-      },
-      {
-        name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
-        conclusion: 'failure',
-      },
-    ]);
-    const result = await runEvidence(base);
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('not all success');
-  });
-
-  test('refuses a non-push run even if the listing returns one', async () => {
-    // Defense in depth for the server-side filter: a listing that hands
-    // back a dispatch run must still never count as evidence.
-    evidenceStub.ignoreEventFilter = true;
-    evidenceStub.runs = [DISPATCH_RUN];
-    evidenceStub.jobsByRun.set(101, [
-      { name: 'staging-web', conclusion: 'success' },
-      { name: 'post-deploy-e2e', conclusion: 'success' },
-    ]);
-    const result = await runEvidence(base);
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('not push-triggered');
+// Job-only/latest-run evidence tests were replaced by the stronger exact
+// run-attempt/step/artifact fixtures in calver-web-release.acceptance.ts.
+// A bare post-deploy-e2e job is deliberately no longer positive evidence.
+test.describe('production consumes certified staging evidence', () => {
+  test('the workflow invokes the exact-attempt validator and requires a fully completed source', () => {
+    const code = productionWorkflow.split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
+    expect(code).toMatch(/web-release-evidence\.py[\s\S]*?certify/);
+    expect(code).toContain('--require-completed');
+    expect(code).not.toMatch(/latest\s*=\s*max\(same/);
+    expect(code).toContain('--run-id');
+    expect(code).toContain('--attempt');
+    expect(code).toContain('--artifact-id');
+    expect(code).toContain('--artifact-digest');
   });
 });
 
@@ -558,23 +378,21 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
 });
 
 test.describe('production secret-shape gate (workflow wiring pin)', () => {
-  test('the secret-shape step runs after the dry-run and before the version upload', () => {
+  test('the secret-shape step checks the rendered saved-artifact config before the version upload', () => {
     // The checker itself is covered by ci/test-check-production-secrets-shape.mjs
-    // (ci-ok job); this pins the wiring: offline shape proof on the validated
-    // SHA after wrangler accepts the config, before any version upload.
+    // (ci-ok job); keep it blocking after artifact config rendering, without
+    // requiring the former production rebuild/dry-run.
     const stepAt = productionWorkflow.indexOf(
       'node ci/check-production-secrets-shape.mjs',
     );
     expect(stepAt).toBeGreaterThan(-1);
-    const dryRunAt = productionWorkflow.indexOf(
-      'Build production target without deploying',
-    );
+    const renderAt = productionWorkflow.indexOf('render-config');
     const uploadAt = productionWorkflow.indexOf(
       'Upload reviewed production version',
     );
-    expect(dryRunAt).toBeGreaterThan(-1);
+    expect(renderAt).toBeGreaterThan(-1);
     expect(uploadAt).toBeGreaterThan(-1);
-    expect(stepAt).toBeGreaterThan(dryRunAt);
+    expect(stepAt).toBeGreaterThan(renderAt);
     expect(stepAt).toBeLessThan(uploadAt);
     // A position check alone cannot prove the step blocks the job (`|| true`,
     // continue-on-error, if: false, or the command demoted to a comment all
@@ -585,7 +403,9 @@ test.describe('production secret-shape gate (workflow wiring pin)', () => {
     )?.[1];
     expect(stepBlock, 'secret-shape step block missing').toBeDefined();
     const runLine = stepBlock!.match(/^\s*run:\s*(.+?)\s*$/m)?.[1];
-    expect(runLine).toBe('node ci/check-production-secrets-shape.mjs');
+    expect(runLine).toMatch(
+      /^node ci\/check-production-secrets-shape\.mjs --config (?:[^\s;&|`#]+|"[^"\n;&|`#]+")$/,
+    );
     const codeLines = stepBlock!.split('\n').filter(
       (line) => !/^\s*#/.test(line),
     );

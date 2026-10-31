@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { calverAcceptanceCases } from './calver-web-release.acceptance.js';
 import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -969,12 +970,12 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     }
   });
 
-  test('deploy concurrency is job-level so the E2E tail never holds the deploy group', () => {
-    // A workflow-level group is held until every job in the run finishes —
-    // now including up to ~40 min of post-deploy E2E — so queued main
-    // pushes would be cancelled before ever deploying. Job-level groups
-    // release when the deploy finishes; E2E serializes on e2e-staging.
-    expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
+  test('the outer web transaction lock spans E2E while nested lane locks remain distinct', () => {
+    // The complete plan/build/deploy/E2E/publish transaction must hold an
+    // outer main-writer lock. GitHub may supersede pending runs; this is
+    // deliberately not a FIFO claim. The imported CalVer bank evaluates
+    // that boundary across two main pushes and checks nested groups.
+    expect(deployWorkflow.split('\njobs:\n')[0]!).toMatch(/^concurrency:/m);
     for (const job of ['staging-web', 'staging-api', 'preview-web']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
@@ -1670,7 +1671,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'publish-web-canary', 'staging-api', 'staging-web']);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
@@ -1678,15 +1679,45 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     }
   };
 
+  // One producer-only, credential-free bundle command closes the adapter's
+  // sibling server graph BEFORE retention. This is not an added deploy lane.
+  // Keep the raw-deploy refusal below, with only this whole-line exception.
+  const producerBundleCommand =
+    'WRANGLER_SEND_METRICS=false npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env staging --outdir "$RUNNER_TEMP/web-bundle"';
+  const assertProducerBundle = (body: string) => {
+    const flat = body.replace(/\\\r?\n\s*/g, ' ');
+    const rawDeploy = /\bwrangler\b(?!-action)[^\n]*\bdeploy\b/;
+    const rawLines = flat.split('\n').filter(line => rawDeploy.test(line)).map(line => line.trim());
+    expect(rawLines, 'exactly one pinned staging producer dry-run, no other raw deploy').toEqual([producerBundleCommand]);
+    // Remove only a verified whole line: suffixes, arbitrary flags or another
+    // invocation cannot hide behind stripping an allowed command substring.
+    const remainder = flat.split('\n').filter(line => line.trim() !== producerBundleCommand).join('\n');
+    expect(remainder).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
+    const web = jobSection(flat, 'staging-web');
+    expect(web.split('\n').filter(line => rawDeploy.test(line)).map(line => line.trim())).toEqual([producerBundleCommand]);
+    const packageMatch = /web-release-artifact\.py\s+package\b[^\n]*/.exec(web);
+    expect(packageMatch, 'the producer must package the emitted module closure').not.toBeNull();
+    expect(packageMatch![0]).toContain('--bundle-root "$RUNNER_TEMP/web-bundle"');
+    expect(web.indexOf(producerBundleCommand)).toBeGreaterThan(web.indexOf('pnpm build'));
+    expect(web.indexOf(producerBundleCommand)).toBeLessThan(packageMatch!.index);
+    const producerStep = web.split(/^      - /m).find(step => step.includes(producerBundleCommand));
+    expect(producerStep).toBeDefined();
+    const credential = /secrets\.|CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID|CF_API_TOKEN/;
+    expect(producerStep).not.toMatch(credential);
+    expect(web.split('    steps:')[0]).not.toMatch(credential);
+  };
+
   const assertDeployBody = (body: string) => {
     expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
     expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
-    // Exact command pin: staging-web deploys to staging, staging-api
-    // deploys the api Worker to staging with the public BUILD_SHA var, and
-    // preview-web runs `preview`. A bare `command: deploy` (no --env)
-    // deploys the top-level worker name, which equals the production env
-    // name — count checks alone miss it, so pin every wrangler-action
-    // command value exactly.
+    // Only web gains a saved-output config and no-bundle flag. API and
+    // preview commands stay exact; arbitrary flags/CLI vars or a bare
+    // deploy still fail. --no-bundle keeps the retained modules unchanged.
+    const webCommand = jobSection(body, 'staging-web')
+      .match(/^\s+command: (.+)$/m)?.[1]?.trim();
+    expect(webCommand).toMatch(
+      /^deploy --env staging --config (?:[^\s;&|`#]+|"[^"\n;&|`#]+") --no-bundle$/,
+    );
     const commands = [...body.matchAll(/^\s+command: (.+)$/gm)]
       .map((m) => m[1]!.trim())
       .sort();
@@ -1694,18 +1725,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       commands,
       `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
     ).toEqual([
-      'deploy --env staging',
+      webCommand!,
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
       'preview',
-    ]);
-    // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
-    // across lines (`wrangler \` + newline + `deploy`), version-pinned
-    // (`wrangler@<ver> deploy`), or flag-first (`wrangler --config x
-    // deploy`). Join continuations, then match `wrangler` (excluding
-    // `wrangler-action` and `wranglerVersion`) followed anywhere on the
-    // same logical line by `deploy`.
-    const flat = body.replace(/\\\r?\n\s*/g, ' ');
-    expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
+    ].sort());
+    assertProducerBundle(body);
     // Working directories: apps/web everywhere except the api lane, which
     // is the only job allowed to touch workers/api.
     for (const line of bodyWithoutJob(body, 'staging-api').split('\n')) {
@@ -1937,6 +1961,39 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       'v2-staging.nntune.com',
     );
   });
+
+  const producerMutants: Array<[string, (body: string) => string]> = [
+    ['missing dry-run', body => body.replace(producerBundleCommand, producerBundleCommand.replace(' --dry-run', ''))],
+    ['production target', body => body.replace(producerBundleCommand, producerBundleCommand.replace('--env staging', '--env production'))],
+    ['different staging target', body => body.replace(producerBundleCommand, producerBundleCommand.replace('--env staging', '--env preview'))],
+    ['unpinned version', body => body.replace(producerBundleCommand, producerBundleCommand.replace('wrangler@${{ env.WRANGLER_VERSION }}', 'wrangler@latest'))],
+    ['CLI variable bypass', body => body.replace(producerBundleCommand, producerBundleCommand + ' --var EXTRA:bad')],
+    ['custom config bypass', body => body.replace(producerBundleCommand, producerBundleCommand + ' --config other.toml')],
+    ['extra shell action', body => body.replace(producerBundleCommand, producerBundleCommand + ' && curl https://example.test')],
+    ['different output directory', body => body.replace(producerBundleCommand, producerBundleCommand.replace('/web-bundle', '/other-bundle'))],
+    ['duplicate approved dry-run', body => body.replace(producerBundleCommand, producerBundleCommand + '\n          ' + producerBundleCommand)],
+    ['extra real raw deploy', body => body + '\n      - run: npx wrangler deploy --env staging\n'],
+    ['missing producer', body => body.replace(producerBundleCommand, ': no producer bundle')],
+    ['packaging ignores bundle root', body => body.replace(' --bundle-root "$RUNNER_TEMP/web-bundle"', '')],
+    ['producer runs after packaging', body => body.replace(producerBundleCommand, ': moved below package')
+      .replace('          plan_id=', '          ' + producerBundleCommand + '\n          plan_id=')],
+    ['producer moved to consumer job', body => {
+      const withoutProducer = body.replace(producerBundleCommand, ': not a producer');
+      const consumer = jobSection(withoutProducer, 'publish-web-canary');
+      return withoutProducer.replace(consumer, consumer.replace('    steps:\n',
+        '    steps:\n      - name: Unexpected consumer build\n        run: |\n          ' + producerBundleCommand + '\n'));
+    }],
+    ['producer receives cloud credentials', body => body.replace('          PLAN_JSON:',
+      '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n          PLAN_JSON:')],
+  ];
+  for (const [name, mutate] of producerMutants) {
+    test(`producer bundle admission refuses ${name}`, () => {
+      assertProducerBundle(jobsBody);
+      const mutant = mutate(jobsBody);
+      expect(mutant, 'mutant must change the actual producer boundary').not.toBe(jobsBody);
+      expect(() => assertProducerBundle(mutant)).toThrow();
+    });
+  }
 
   test('synthetic backend-deploy mutants trip the pins above', () => {
     // Regression proof for the shared guard: each mutant models an
@@ -2962,4 +3019,10 @@ test.describe('burst probe bounds (static + executed pin)', () => {
     expect(readme).toContain('never point this script at');
     expect(readme).toContain('production');
   });
+});
+
+test.describe('complete immutable web artifact and honest executed acceptance', () => {
+  for (const [name, run] of Object.entries(calverAcceptanceCases)) {
+    test(name, run);
+  }
 });

@@ -48,11 +48,13 @@ on:
 permissions:
   contents: read
 
-# No workflow-level concurrency here: it would hold the deploy group for
-# the whole run, now including up to ~40 min of post-deploy E2E, so queued
-# main pushes would be cancelled before ever deploying. The deploy jobs
-# serialize on their own job-level groups below and release them when the
-# deploy finishes; E2E serializes separately on the e2e-staging group.
+# Hold the source environment through plan/build/deploy/E2E/publication. The
+# distinct job/reusable locks below must not reuse this writer key. GitHub may
+# replace pending entries (not FIFO); only builds that actually deploy and pass
+# acceptance receive a canary. Previews do not hold the main writer key.
+concurrency:
+  group: calver-web-${{ github.event_name == 'push' && 'main' || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   NODE_VERSION: "24"
@@ -80,6 +82,14 @@ jobs:
 
   staging-web:
     name: staging-web
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      plan: ${{ steps.calver.outputs.plan }}
+      artifact-id: ${{ steps.retained.outputs.artifact-id }}
+      artifact-digest: ${{ steps.retained.outputs.artifact-digest }}
+      artifact-name: certified-web-${{ github.run_id }}-${{ github.run_attempt }}
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
     # Job-level (not workflow-level) so the group releases when the deploy
@@ -104,8 +114,46 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: Plan the web canary before building
+        id: calver
+        uses: TogetherWeOwn/.github/actions/calver@1508f2c10cb83bc0677e8e559ff796a55c66e737
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: |
+            {"phase":"plan","input":{"channel":"canary","sha":"${{ github.sha }}","operation":"staging/${{ github.run_id }}/${{ github.run_attempt }}","policy":"staged-promotion","source":{"runId":${{ github.run_id }},"attempt":${{ github.run_attempt }},"workflow":".github/workflows/deploy.yml","jobs":["staging-web","post-deploy-e2e / synthetic smoke (health)","post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)"]}}}
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+        env:
+          BUILD_SHA: ${{ github.sha }}
+          PUBLIC_API_BASE_URL: ''
+      - name: Retain and verify the complete adapter output
+        env:
+          PLAN_JSON: ${{ steps.calver.outputs.plan }}
+          RELEASE_VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PLAN_JSON" > "$RUNNER_TEMP/web-plan.json"
+          # Bundle the adapter's sibling server graph once, before retention.
+          # All later uploads consume these modules with --no-bundle.
+          WRANGLER_SEND_METRICS=false npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env staging --outdir "$RUNNER_TEMP/web-bundle"
+          python3 ../../ci/web-release-artifact.py package --root .svelte-kit/cloudflare --bundle-root "$RUNNER_TEMP/web-bundle" \
+            --config wrangler.toml --plan "$RUNNER_TEMP/web-plan.json" \
+            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --public-api-base-url '' --output "$RUNNER_TEMP/web-release.tar.gz"
+          plan_id=$(jq -r '.id' "$RUNNER_TEMP/web-plan.json")
+          python3 ../../ci/web-release-artifact.py verify --archive "$RUNNER_TEMP/web-release.tar.gz" \
+            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --plan-id "$plan_id" --destination "$RUNNER_TEMP/web-retained" --require-portable
+          python3 ../../ci/web-release-artifact.py render-config --verified-root "$RUNNER_TEMP/web-retained" \
+            --source-config wrangler.toml --environment staging --release-version "$RELEASE_VERSION" --output "$RUNNER_TEMP/web-staging.toml"
+      - name: Save the immutable web payload
+        id: retained
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: certified-web-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/web-release.tar.gz
+          if-no-files-found: error
+          retention-days: 7
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
@@ -114,7 +162,7 @@ jobs:
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           packageManager: pnpm
           workingDirectory: apps/web
-          command: deploy --env staging
+          command: deploy --env staging --config "${{ runner.temp }}/web-staging.toml" --no-bundle
 
   # Api Worker staging lane (staging only; ingest/mb/stream/repair are
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
@@ -381,6 +429,59 @@ jobs:
       SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
       SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
       SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+
+  publish-web-canary:
+    name: publish-web-canary
+    needs: [staging-web, post-deploy-e2e]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      ARTIFACT_ID: ${{ needs.staging-web.outputs.artifact-id }}
+      ARTIFACT_NAME: ${{ needs.staging-web.outputs.artifact-name }}
+      ARTIFACT_DIGEST: sha256:${{ needs.staging-web.outputs.artifact-digest }}
+      PLAN_JSON: ${{ needs.staging-web.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the exact source archive and executed acceptance
+        id: certificate
+        run: |
+          set -euo pipefail
+          python3 ci/web-release-evidence.py fetch --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --artifact-id "$ARTIFACT_ID" --artifact-name "$ARTIFACT_NAME" --artifact-digest "$ARTIFACT_DIGEST" \
+            --output "$RUNNER_TEMP/web-evidence.json" --archive-output "$RUNNER_TEMP/web-release.tar.gz"
+          plan_id=$(printf '%s' "$PLAN_JSON" | jq -r '.id')
+          python3 ci/web-release-artifact.py verify --archive "$RUNNER_TEMP/web-release.tar.gz" \
+            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --plan-id "$plan_id" --destination "$RUNNER_TEMP/web-certified" --require-portable
+          if python3 ci/web-release-evidence.py certify --input "$RUNNER_TEMP/web-evidence.json" \
+            --manifest "$RUNNER_TEMP/web-certified/manifest.json" --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --workflow .github/workflows/deploy.yml \
+            --artifact-id "$ARTIFACT_ID" --artifact-name "$ARTIFACT_NAME" --artifact-digest "$ARTIFACT_DIGEST" \
+            --output "$RUNNER_TEMP/web-certificate.json" > "$RUNNER_TEMP/web-certification-result.json"; then
+            echo 'eligible=true' >> "$GITHUB_OUTPUT"
+            echo "evidence=$(jq -c '.evidence' "$RUNNER_TEMP/web-certificate.json")" >> "$GITHUB_OUTPUT"
+          else
+            # Unconfigured staging is not acceptance. Keep its existing no-op
+            # posture but mint no certificate/tag; all other refusals are red.
+            jq -e '.ok == false and .code == "acceptance-skipped"' "$RUNNER_TEMP/web-certification-result.json"
+            echo 'eligible=false' >> "$GITHUB_OUTPUT"
+            echo 'Web was not certified: acceptance skipped; no canary published.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish only the certified web canary
+        if: steps.certificate.outputs.eligible == 'true'
+        uses: TogetherWeOwn/.github/actions/calver@1508f2c10cb83bc0677e8e559ff796a55c66e737
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: |
+            {"phase":"publish","plan":${{ needs.staging-web.outputs.plan }},"evidence":${{ steps.certificate.outputs.evidence }}}
 
   preview-web:
     name: preview-web

@@ -19,6 +19,12 @@ import { defineEnvVars } from '@sveltejs/kit/env';
  * vars ship to the browser.
  */
 export const variables = defineEnvVars({
+	DEPLOYED_RELEASE_VERSION: {
+		public: false,
+		static: false,
+		description: 'Deployment release metadata; independent of the baked source SHA.',
+		schema: (value) => value
+	},
 	PUBLIC_API_BASE_URL: {
 		public: true,
 		description: 'Base URL of the workers/api worker. Empty means same-origin.',

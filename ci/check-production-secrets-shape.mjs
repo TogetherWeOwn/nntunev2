@@ -1,15 +1,14 @@
 // Production Worker secret-shape check for the web frontend's wrangler config.
 //
-// Offline policy gate (no credentials, no network): the web Worker ships no
-// bindings and needs no secrets, so [env.production] must carry only `name`.
-// Anything beyond refuses with a pointer to this file, so a config that grows
-// a production vars/secrets table is reviewed here first. Names only; values
-// are never read or printed.
+// Offline policy gate (no credentials, no network). Production admits only its
+// Worker name and one canonical stable DEPLOYED_RELEASE_VERSION string in the
+// conventional [env.production.vars] table. All other production vars/bindings
+// still refuse. Only public release metadata is inspected; values are never
+// printed and no Worker secret is read.
 //
-// Usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>]
-// (exit 0 ok, 1 refuse). --root exists for the CLI-level suite, which
-// spawns the checker against temp trees; the deploy step passes no args
-// and the checker resolves its own repo root. Refuses when a
+// Usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>] [--config <rendered.toml>]
+// (exit 0 ok, 1 refuse). --root supports temp-tree tests. --config checks
+// the exact rendered config in addition to the committed source. Refuses when a
 // wrangler.json/jsonc shadows apps/web/wrangler.toml (wrangler prefers
 // JSON over TOML, searching parent directories), so an unreviewed JSON
 // production config can never slip past the TOML shape check.
@@ -309,10 +308,54 @@ function refuseProductionTable(label) {
   );
 }
 
+function canonicalStable(value) {
+  const match = /^([1-9][0-9]{3})\.([1-9][0-9]{2,3})\.(0|[1-9][0-9]*)$/.exec(value);
+  if (!match || !Number.isSafeInteger(Number(match[3]))) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2].slice(0, -2));
+  const day = Number(match[2].slice(-2));
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month &&
+    date.getUTCDate() === day && `${month}${String(day).padStart(2, "0")}` === match[2];
+}
+
+// Remove just the reviewed conventional metadata table before applying the
+// existing structural refusal parser. Alternate spellings still hit that parser;
+// no general production vars/bindings exemption is introduced.
+function reviewedStatements(text) {
+  const statements = [];
+  let metadata = false;
+  let seenTable = false;
+  let seenValue = false;
+  const finish = () => {
+    if (metadata && !seenValue) refuseProductionTable("env.production.vars");
+    metadata = false;
+  };
+  for (const statement of joinTomlStatements(text)) {
+    const trimmed = statement.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("[")) {
+      finish();
+      if (trimmed === "[env.production.vars]") {
+        if (seenTable) refuseProductionTable("env.production.vars");
+        seenTable = metadata = true;
+        continue;
+      }
+    }
+    if (metadata) {
+      const match = /^DEPLOYED_RELEASE_VERSION\s*=\s*(["'])([^"'\\\r\n]*)\1$/.exec(trimmed);
+      if (seenValue || !match || !canonicalStable(match[2])) refuseProductionTable("env.production.vars");
+      seenValue = true;
+    } else statements.push(statement);
+  }
+  finish();
+  return statements;
+}
+
 export function assertProductionSecretsShape(configText) {
   const root = {};
   let current = [];
-  for (const statement of joinTomlStatements(configText)) {
+  for (const statement of reviewedStatements(configText)) {
     const trimmed = statement.trim();
     if (!trimmed) continue;
     const header = /^\s*\[{1,2}\s*(.+?)\s*\]{1,2}\s*$/.exec(trimmed);
@@ -372,24 +415,23 @@ export function findShadowWranglerConfig(appDir, stopDir) {
   return null;
 }
 
-function resolveCliRoot(argv) {
-  let root = null;
+function resolveCliOptions(argv) {
+  const options = {};
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] === "--root" && i + 1 < argv.length) {
-      root = argv[i + 1];
-      i += 1;
-    } else {
-      throw new Error(
-        `unknown argument "${argv[i]}": usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>]`,
-      );
+    const key = argv[i] === "--root" ? "root" : argv[i] === "--config" ? "config" : null;
+    if (!key || options[key] !== undefined || i + 1 >= argv.length) {
+      throw new Error("usage: node ci/check-production-secrets-shape.mjs [--root <repo-root>] [--config <rendered.toml>]");
     }
+    options[key] = resolve(argv[++i]);
   }
-  return root === null ? fileURLToPath(new URL("..", import.meta.url)) : resolve(root);
+  options.root ??= fileURLToPath(new URL("..", import.meta.url));
+  if (options.config && !options.config.endsWith(".toml")) throw new Error("only reviewed TOML configs are supported");
+  return options;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    const repoRoot = resolveCliRoot(process.argv.slice(2));
+    const { root: repoRoot, config } = resolveCliOptions(process.argv.slice(2));
     const appDir = join(repoRoot, "apps", "web");
     const shadow = findShadowWranglerConfig(appDir, repoRoot);
     if (shadow) {
@@ -398,7 +440,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       );
     }
     assertProductionSecretsShape(readFileSync(join(appDir, "wrangler.toml"), "utf8"));
-    console.log("Production Worker secret shape ok: no production vars or secret tables");
+    if (config) assertProductionSecretsShape(readFileSync(config, "utf8"));
+    console.log("Production Worker secret shape ok: only reviewed release metadata, no secret tables");
   } catch (error) {
     // Names only: never print values or file bodies on a failed check.
     console.error(`::error::${error.message}`);

@@ -5,8 +5,8 @@ name: deploy-production
 # Cutover only. Never runs on push, PR, release, or another workflow.
 # Disabled by default: the preflight job refuses unless the repo variable
 # PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
-# decided at launch; until then the workflow builds against the placeholder
-# domain below and refuses to promote to it. Backend Workers (api, ingest,
+# decided at launch; until then the workflow refuses the placeholder domain
+# below without building or promoting anything. Backend Workers (api, ingest,
 # mb, stream, repair) each add their own lane as follow-ups; the reserved
 # production data-plane bindings stay untouched by this lane (see docs/ops.md
 # environments matrix: the clean launch database is deferred, so no
@@ -16,13 +16,13 @@ name: deploy-production
 # - workflow_dispatch with an explicit full 40-hex main SHA.
 # - preflight resolves and validates the SHA, the enabled flag, and the
 #   production hostname variable.
-# - staging-evidence requires a real post-deploy staging run on the exact
-#   SHA: the push-triggered deploy run (event=push; manual dispatches never
-#   count and can never shadow evidence) must have staging-web success (never
-#   skipped) and its post-deploy full-journey job success. The called
-#   workflow reports its jobs under the "post-deploy-e2e / ..." prefix, so
-#   every matching job must conclude success. Scheduled or manual monitoring
-#   runs never count (see docs/ops.md staging checklist).
+# - staging-evidence resolves the explicit canary's exact immutable artifact,
+#   source push/main SHA, run and attempt. Required deploy/synthetic/journey
+#   jobs AND execution/enforcement steps must actually succeed. A green job
+#   with skipped acceptance, or a newer manual run, is never a certificate.
+# - deploy-production verifies the complete retained modules/assets, plans a
+#   frozen stable identity and renders narrowly admitted runtime metadata.
+#   No build command or source-entrypoint fallback runs in this consumer.
 # - deploy-production uploads one Worker version without mutating routes,
 #   custom domains or triggers, then calls the shared central
 #   gradual-promote action (pinned below): 5% -> 50% -> 100% with per-stage
@@ -45,6 +45,10 @@ on:
         required: false
         type: string
         default: ""
+      source_canary:
+        description: "Exact certified canary/v... tag selecting the saved web artifact"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -110,78 +114,51 @@ jobs:
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      selection: ${{ steps.source.outputs.selection }}
+      evidence: ${{ steps.source.outputs.evidence }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Require real post-deploy staging evidence on the exact SHA
+        id: source
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          SOURCE_CANARY: ${{ inputs.source_canary }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os, sys, urllib.request
-
-          repo = os.environ["REPO"]
-          sha = os.environ["DEPLOY_SHA"]
-          token = os.environ["GITHUB_TOKEN"]
-
-          def api(path):
-              req = urllib.request.Request(
-                  f"https://api.github.com/repos/{repo}{path}",
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                  },
-              )
-              with urllib.request.urlopen(req, timeout=15) as res:
-                  return json.load(res)
-
-          # Only push-triggered deploy runs carry staging evidence: staging-web
-          # and post-deploy-e2e run on push alone, so a later manual dispatch
-          # on the same SHA must neither create nor shadow evidence.
-          runs = api(f"/actions/workflows/deploy.yml/runs?branch=main&event=push&per_page=100")["workflow_runs"]
-          same = [r for r in runs if r.get("head_sha") == sha]
-          if not same:
-              print(f"::error::No push-triggered deploy run on main for {sha}; promote what staging verified, never an unverified SHA")
-              sys.exit(1)
-          latest = max(same, key=lambda r: r["id"])
-          if latest.get("event") != "push":
-              print(f"::error::Deploy run {latest['id']} on {sha} is not push-triggered "
-                    f"(got event {latest.get('event')}); manual dispatches are never evidence")
-              sys.exit(1)
-          if latest.get("status") != "completed" or latest.get("conclusion") != "success":
-              print(f"::error::Latest push-triggered deploy run {latest['id']} on {sha} is not successful "
-                    f"({latest.get('status')}/{latest.get('conclusion')})")
-              sys.exit(1)
-          jobs = api(f"/actions/runs/{latest['id']}/jobs?per_page=100")["jobs"]
-          by_name = {j["name"]: j.get("conclusion") for j in jobs}
-          if by_name.get("staging-web") != "success":
-              print(f"::error::Deploy run {latest['id']} has no staging-web success "
-                    f"(got {by_name.get('staging-web')}); a skipped deploy is not evidence")
-              sys.exit(1)
-          # The post-deploy-e2e job calls e2e-staging.yml as a reusable
-          # workflow, so the jobs API reports each called job under the
-          # "post-deploy-e2e / <called job name>" prefix instead of a bare
-          # "post-deploy-e2e" entry. Require at least one such job and require
-          # every one of them to conclude success.
-          e2e = [(name, conclusion) for name, conclusion in by_name.items()
-                 if name == "post-deploy-e2e" or name.startswith("post-deploy-e2e / ")]
-          if not e2e:
-              print(f"::error::Deploy run {latest['id']} has no post-deploy-e2e success "
-                    f"(got {by_name.get('post-deploy-e2e')}); scheduled/manual monitoring never counts")
-              sys.exit(1)
-          bad = sorted(name for name, conclusion in e2e if conclusion != "success")
-          if bad:
-              print(f"::error::Deploy run {latest['id']} post-deploy-e2e jobs are not all success "
-                    f"(not success: {', '.join(bad)}); scheduled/manual monitoring never counts")
-              sys.exit(1)
-          print(f"staging evidence ok: deploy run {latest['id']} staging-web + post-deploy-e2e success on {sha}")
-          PY
+          python3 ci/web-release-evidence.py resolve --repository "$GITHUB_REPOSITORY" \
+            --sha "$DEPLOY_SHA" --canary "$SOURCE_CANARY" --output "$RUNNER_TEMP/selection.json"
+          run_id=$(jq -er '.evidence.runId' "$RUNNER_TEMP/selection.json")
+          attempt=$(jq -er '.evidence.attempt' "$RUNNER_TEMP/selection.json")
+          artifact_id=$(jq -er '.evidence.artifactId' "$RUNNER_TEMP/selection.json")
+          artifact_name=$(jq -er '.evidence.artifactName' "$RUNNER_TEMP/selection.json")
+          artifact_digest=$(jq -er '.evidence.artifactDigest' "$RUNNER_TEMP/selection.json")
+          plan_id=$(jq -er '.plan.id' "$RUNNER_TEMP/selection.json")
+          python3 ci/web-release-evidence.py fetch --repository "$GITHUB_REPOSITORY" \
+            --run-id "$run_id" --attempt "$attempt" --artifact-id "$artifact_id" --artifact-name "$artifact_name" --artifact-digest "$artifact_digest" \
+            --output "$RUNNER_TEMP/source-evidence.json" --archive-output "$RUNNER_TEMP/web-release.tar.gz"
+          python3 ci/web-release-artifact.py verify --archive "$RUNNER_TEMP/web-release.tar.gz" \
+            --repository "$GITHUB_REPOSITORY" --sha "$DEPLOY_SHA" --run-id "$run_id" --attempt "$attempt" \
+            --plan-id "$plan_id" --destination "$RUNNER_TEMP/verified-web" --require-portable
+          python3 ci/web-release-evidence.py certify --input "$RUNNER_TEMP/source-evidence.json" \
+            --manifest "$RUNNER_TEMP/verified-web/manifest.json" --repository "$GITHUB_REPOSITORY" --sha "$DEPLOY_SHA" \
+            --run-id "$run_id" --attempt "$attempt" --workflow .github/workflows/deploy.yml \
+            --artifact-id "$artifact_id" --artifact-name "$artifact_name" --artifact-digest "$artifact_digest" \
+            --require-completed --output "$RUNNER_TEMP/certificate.json"
+          echo "selection=$(jq -c '.' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+          echo "evidence=$(jq -c '.evidence' "$RUNNER_TEMP/certificate.json")" >> "$GITHUB_OUTPUT"
 
   deploy-production:
     name: deploy-production
     needs: [preflight, staging-evidence]
+    permissions:
+      contents: write
+      actions: read
+    env:
+      WEB_RELEASE_CONFIG: ${{ github.workspace }}/.web-production-release.toml
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # One static non-cancelling group serializes production Worker
@@ -205,33 +182,49 @@ jobs:
           # Deploy the validated dispatch SHA, never a newer main head.
           ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: apps/web/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-        working-directory: apps/web
-      - name: Build the promotion SHA
-        working-directory: apps/web
+      - name: Reverify the selected immutable web payload before credentials
         env:
-          BUILD_SHA: ${{ needs.preflight.outputs.sha }}
-        run: pnpm build
-      - name: Build production target without deploying
-        working-directory: apps/web
-        run: npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env production --outdir dist-production
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          SELECTION_JSON: ${{ needs.staging-evidence.outputs.selection }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SELECTION_JSON" > "$RUNNER_TEMP/selection.json"
+          run_id=$(jq -er '.evidence.runId' "$RUNNER_TEMP/selection.json")
+          attempt=$(jq -er '.evidence.attempt' "$RUNNER_TEMP/selection.json")
+          artifact_id=$(jq -er '.evidence.artifactId' "$RUNNER_TEMP/selection.json")
+          artifact_name=$(jq -er '.evidence.artifactName' "$RUNNER_TEMP/selection.json")
+          artifact_digest=$(jq -er '.evidence.artifactDigest' "$RUNNER_TEMP/selection.json")
+          plan_id=$(jq -er '.plan.id' "$RUNNER_TEMP/selection.json")
+          python3 ci/web-release-evidence.py fetch --repository "$GITHUB_REPOSITORY" \
+            --run-id "$run_id" --attempt "$attempt" --artifact-id "$artifact_id" --artifact-name "$artifact_name" --artifact-digest "$artifact_digest" \
+            --output "$RUNNER_TEMP/source-evidence.json" --archive-output "$RUNNER_TEMP/web-release.tar.gz"
+          python3 ci/web-release-artifact.py verify --archive "$RUNNER_TEMP/web-release.tar.gz" \
+            --repository "$GITHUB_REPOSITORY" --sha "$DEPLOY_SHA" --run-id "$run_id" --attempt "$attempt" \
+            --plan-id "$plan_id" --destination "$RUNNER_TEMP/verified-web" --require-portable
+          python3 ci/web-release-evidence.py certify --input "$RUNNER_TEMP/source-evidence.json" \
+            --manifest "$RUNNER_TEMP/verified-web/manifest.json" --repository "$GITHUB_REPOSITORY" --sha "$DEPLOY_SHA" \
+            --run-id "$run_id" --attempt "$attempt" --workflow .github/workflows/deploy.yml \
+            --artifact-id "$artifact_id" --artifact-name "$artifact_name" --artifact-digest "$artifact_digest" \
+            --require-completed --output "$RUNNER_TEMP/certificate.json"
+      - name: Freeze the stable identity for this promotion
+        id: release
+        uses: TogetherWeOwn/.github/actions/calver@1508f2c10cb83bc0677e8e559ff796a55c66e737
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: |
+            {"phase":"plan","input":{"channel":"stable","sha":"${{ needs.preflight.outputs.sha }}","operation":"production/${{ github.run_id }}/${{ github.run_attempt }}","policy":"staged-promotion","sourceCanary":${{ toJSON(inputs.source_canary) }},"evidence":${{ needs.staging-evidence.outputs.evidence }}}}
+      - name: Render runtime metadata over the retained executable bytes
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python3 ci/web-release-artifact.py render-config --verified-root "$RUNNER_TEMP/verified-web" \
+            --source-config apps/web/wrangler.toml --environment production --release-version "$RELEASE_VERSION" --output "$WEB_RELEASE_CONFIG"
       - name: Require production Worker secret shape before upload
-        # Offline shape check, not a secret read: the web Worker ships no
-        # bindings and needs no secrets, so any production vars table in
-        # its wrangler config must be reviewed in
-        # ci/check-production-secrets-shape.mjs first. Values are never
-        # read or printed. Runs here, not in preflight: preflight checks
-        # out the dispatch tip, while this job checked out the validated
-        # promotion SHA above.
-        run: node ci/check-production-secrets-shape.mjs
+        run: node ci/check-production-secrets-shape.mjs --config "$WEB_RELEASE_CONFIG"
       - name: Require production-only Cloudflare credentials
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
@@ -304,7 +297,7 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          npx --yes wrangler@${{ env.WRANGLER_VERSION }} versions upload --env production \
+          npx --yes wrangler@${{ env.WRANGLER_VERSION }} versions upload --config "$WEB_RELEASE_CONFIG" --no-bundle --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
@@ -347,3 +340,9 @@ jobs:
           done
           echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
           exit 1
+      - name: Publish the successfully promoted stable
+        uses: TogetherWeOwn/.github/actions/calver@1508f2c10cb83bc0677e8e559ff796a55c66e737
+        with:
+          runs-on-json: '"ubuntu-latest"'
+          request: |
+            {"phase":"publish","plan":${{ steps.release.outputs.plan }}}
