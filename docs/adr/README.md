@@ -19,7 +19,7 @@
 
 The merged core ADR retains **0001**. The architecture branch's former
 `0001-stack.md` is now **0009**; data/cache/plan/billing/API retain 0002–0006.
-This avoids colliding with the already-merged mirror (0007) and auth (0008)
+This avoids colliding with the already-merged core, mirror (0007) and auth (0008)
 records while preserving existing data/cache references. The Subsonic API port
 record also carries **0001**, so that number is not unique. Historical stack
 references to “ADR 0001” (including the stack/database context in ADR 0007)
