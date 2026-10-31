@@ -267,6 +267,11 @@ jobs:
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
           SESSION_TTL_SECS = "86400"
           HYPERDRIVE_CACHING_DISABLED = "1"
+          # Arms the staging-only QA seams (POST /api/test-codes and
+          # POST /api/test-accounts). They still answer 404 unless the
+          # Worker also holds the QA_AUTH_TOKEN secret. Never set in
+          # deploy-production.yml.
+          QA_CODE_SEAM = "1"
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the
