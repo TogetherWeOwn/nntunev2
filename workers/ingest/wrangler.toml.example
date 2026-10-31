@@ -4,6 +4,11 @@
 name = "nntune-ingest"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
+# Never public on *.workers.dev: the routes still trust a self-asserted
+# `user_id` (no caller authentication yet), so the only reachable surface
+# must be one an authenticated caller fronts. Pinned by
+# tests/wrangler_workers_dev_off.rs.
+workers_dev = false
 
 [vars]
 # Search rate-limit tunables (src/rate_limit.rs). Unset/invalid values
