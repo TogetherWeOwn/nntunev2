@@ -324,7 +324,7 @@ fn handler_gate_still_passes_exactly_at_cap() {
         "an exactly-at-cap body must pass the in-handler size gate: {}",
         response.body
     );
-    assert_eq!(response.body, r#"{"ok":true}"#);
+    assert_eq!(response.body, r#"{"build_sha":"unknown","ok":true}"#);
 }
 
 // --- Worker-entry dispatch gate (`dispatch_collected`) -------------------------
