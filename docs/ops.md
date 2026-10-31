@@ -568,9 +568,12 @@ never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA, plus the `CodeRabbit` and `Devin Review` checks and human (board)
-  approval on that head (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code or recorded as
-  a flake/quarantine decision with a card link, never dismissed.
+  SHA. `CodeRabbit`, `Devin Review` and human (board) approval report on
+  pull requests, not on `main`: record the PR whose squash commit is the
+  promotion SHA, and that they were green/given on that PR's final head
+  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
+  or recorded as a flake/quarantine decision with a card link, never
+  dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:226-234` runs
