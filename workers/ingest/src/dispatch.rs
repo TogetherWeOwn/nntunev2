@@ -5,9 +5,8 @@
 //! builders are pure so the idempotency story — same user + same content +
 //! same source ref converges on one job — is unit-tested, not mocked.
 //!
-//! `user_id` is self-asserted until the accounts card authenticates callers;
-//! the key format already binds the user so today's keys stay valid when
-//! auth lands.
+//! `user_id` is the authenticated caller from `crate::caller_auth`, never a
+//! request-body claim; the key format binds that user.
 
 use sha2::{Digest, Sha256};
 
@@ -67,9 +66,9 @@ pub fn payload_retry_delay_ms(attempt: u32) -> u64 {
     }
 }
 
-/// Self-asserted user handles are 1..=128 chars without `:` (the idempotency
-/// key delimiter); the accounts card replaces this with the authenticated
-/// subject without changing the key format.
+/// User handles are 1..=128 chars without `:` (the idempotency key
+/// delimiter). Callers' grants are checked against this too
+/// (`crate::caller_auth::verify`), so a signed id always forms a valid key.
 pub fn validate_user_id(raw: &str) -> bool {
     !raw.is_empty() && raw.len() <= 128 && !raw.contains(':') && !raw.contains('\0')
 }

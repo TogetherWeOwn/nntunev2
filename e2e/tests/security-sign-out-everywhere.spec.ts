@@ -123,7 +123,9 @@ function anonymousMutationHeaders(webBase: string): Record<string, string> {
  * failure, never the value).
  */
 function sessionValueFromSetCookie(setCookie: string, context: string): string {
-  const value = /(?:^|;\s*)__Host-nntune-session=([^;]*)/.exec(setCookie)?.[1]?.trim();
+  // Playwright joins Set-Cookie lines with '\n', and the Access edge adds
+  // its own CF_Authorization line, so the session cookie may start any line.
+  const value = /(?:^|[;\n]\s*)__Host-nntune-session=([^;\n]*)/.exec(setCookie)?.[1]?.trim();
   if (!value) {
     throw new Error(
       `[${context}] no session cookie issued (names only — no values logged).`,

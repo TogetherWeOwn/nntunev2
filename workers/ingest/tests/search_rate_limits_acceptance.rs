@@ -52,7 +52,8 @@
 //! for i in $(seq 1 11); do
 //!   curl -s -o /dev/null -w "%{http_code}\n" \
 //!     -H "Content-Type: application/json" \
-//!     -d '{"user_id":"u","query":"x","indexer_ref":"vault_idx_01-ab","categories":[],"limit":25,"page":0}' \
+//!     -H "Authorization: Bearer $INGEST_GRANT" \
+//!     -d '{"query":"x","indexer_ref":"vault_idx_01-ab","categories":[],"limit":25,"page":0}' \
 //!     "$INGEST/v1/ingest/search"
 //! done
 //! # expected: ten non-429s, then 429 with `Retry-After: <secs>`; a single

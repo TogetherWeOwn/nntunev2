@@ -6,8 +6,8 @@ name: e2e-staging
 #
 # Sequencing: this workflow no longer triggers on push. The full journey
 # (`e2e` job) runs only when deploy.yml calls this workflow with
-# `post_deploy: true` from a job that `needs` a successful `staging-web`
-# deploy of the same run/revision — a skipped or failed deploy therefore
+# `post_deploy: true` from a job that `needs` successful `staging-web` and
+# `staging-api` jobs of the same run/revision — a skipped or failed deploy therefore
 # cannot produce a full-journey PASS. Scheduled and manually dispatched
 # runs are monitoring only: they run the synthetic smoke and never the
 # full journey, so they cannot be cited as post-deploy promotion
@@ -23,7 +23,7 @@ on:
   workflow_call:
     inputs:
       post_deploy:
-        # Set only by deploy.yml, from a job that needs staging-web.
+        # Set only by deploy.yml, from a job that needs staging-web and staging-api.
         # workflow_dispatch defines no such input, so a manual run cannot
         # mint post-deploy evidence.
         description: Run the full journey as post-deploy evidence

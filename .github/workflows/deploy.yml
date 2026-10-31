@@ -5,8 +5,10 @@ name: deploy
 # - Push to `main` deploys apps/web to its `staging` env, then the
 #   `post-deploy-e2e` job calls e2e-staging.yml in the same run/revision.
 #   That call is the only path to the full-journey staging E2E: it
-#   `needs` `staging-web` with no always()/!cancelled(), so a skipped or
-#   failed deploy cannot produce a full-journey PASS.
+#   `needs` `staging-web` and `staging-api` with no always()/!cancelled(),
+#   so a skipped or failed deploy cannot produce a full-journey PASS, and
+#   the journey never runs against the previous api while the new one is
+#   still deploying.
 # - Pull requests get a live preview of apps/web (`wrangler preview`).
 # - Both paths need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
@@ -362,17 +364,21 @@ jobs:
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Post-deploy staging E2E (same run, same revision as the deploy above).
+  # Post-deploy staging E2E (same run, same revision as the deploys above).
   # No always()/!cancelled(): with the implicit success() gate, this job is
-  # skipped whenever `staging-web` is skipped (gate disabled / non-push) or
-  # fails, so it can never report a full-journey PASS without a successful
-  # deploy first. Secrets are passed explicitly (never `inherit`) and match
+  # skipped whenever `staging-web` or `staging-api` is skipped (gate
+  # disabled / non-push), fails or is cancelled, so it can never report a
+  # full-journey PASS without both deploys finishing first. A failed api
+  # deploy already turns the run red; running the journey against the
+  # previous api would only add misleading evidence. An unconfigured api
+  # lane still succeeds (outcome=unconfigured), so the journey runs.
+  # Secrets are passed explicitly (never `inherit`) and match
   # exactly the names e2e-staging.yml reads. The promotion SHA (github.sha)
   # is passed as expected_sha so the build-identity spec can prove the
   # serving build is the promoted one — never a source checkout.
   post-deploy-e2e:
     name: post-deploy-e2e
-    needs: [staging-web]
+    needs: [staging-web, staging-api]
     if: ${{ github.event_name == 'push' }}
     permissions:
       contents: read
@@ -380,6 +386,10 @@ jobs:
     with:
       post_deploy: true
       expected_sha: ${{ github.sha }}
+      # Same-run staging-api outcome, so build identity holds the API to
+      # expected_sha only when it deployed this run and says web=API=head
+      # is not claimed when it was unconfigured.
+      api_deploy_outcome: ${{ needs.staging-api.outputs.outcome }}
     secrets:
       STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}

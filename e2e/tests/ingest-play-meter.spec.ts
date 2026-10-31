@@ -31,6 +31,7 @@ import {
   submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
+  waitForHydration,
 } from '../helpers/accounts.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -131,6 +132,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
     });
+    await waitForHydration(page, 'ingest');
     const fileInput = page.getByTestId(TESTIDS.importFile);
     await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
     await fileInput.setInputFiles(FIXTURE_NZB);
@@ -305,6 +307,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // assertion mechanism.
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'meter');
     const player = page.getByTestId(TESTIDS.audioPlayer);
     const playerVisible = await player
       .waitFor({ state: 'visible', timeout: 10_000 })
@@ -348,6 +351,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
 
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'ingest');
     const item = page.getByTestId(TESTIDS.libraryItem).first();
     await expect(item, 'synthetic staged track missing from library — ingest spec must run first').toBeVisible({
       timeout: 60_000,
@@ -549,6 +553,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
 
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'ingest');
     const firstTrack = page.getByTestId(TESTIDS.libraryItem).first();
     await expect(
       firstTrack,
@@ -789,6 +794,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
 
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'ingest');
     const item = page.getByTestId(TESTIDS.libraryItem).first();
     await expect(
       item,

@@ -488,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn ypart_begin_zero_or_end_past_file_size_is_bad_part() {
+        let spec = |file_size| PartSpec {
+            file_size,
+            part: 1,
+            total: 1,
+            offset: 0,
+            file_crc: None,
+        };
+        // `begin` is 1-based: 0 would underflow the placement offset.
+        let good = String::from_utf8(part(b"77", spec(2))).unwrap();
+        assert!(good.contains("begin=1 end=2"));
+        let zero = good.replace("begin=1 end=2", "begin=0 end=1");
+        assert_eq!(decode_part(zero.as_bytes()), Err(YencError::BadPart));
+        // The part claims bytes beyond the declared file size.
+        assert_eq!(decode_part(&part(b"77", spec(1))), Err(YencError::BadPart));
+        assert!(decode_part(good.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn latin1_filename_does_not_break_decode() {
         // Legacy posters encode names in Latin-1/CP1252; the tags precede
         // `name=` and are pure ASCII, so decode must not care.

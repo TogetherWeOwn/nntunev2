@@ -13,6 +13,7 @@ import {
   requireApiAccount,
   submitPublicUiSignup,
   tryMintTestAccount,
+  waitForHydration,
 } from '../helpers/accounts.js';
 import {
   SECOND_SINGLE_TRACK_FIXTURE_FILE,
@@ -153,6 +154,7 @@ test.describe.serial('two-track fixture stages library tracks (staging)', () => 
         waitUntil: 'domcontentloaded',
         timeout: 30_000,
       });
+      await waitForHydration(page, 'two-track-fixture');
       const fileInput = page.getByTestId(TESTIDS.importFile);
       await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
       await fileInput.setInputFiles(nzb);

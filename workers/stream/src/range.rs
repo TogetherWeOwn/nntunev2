@@ -174,11 +174,22 @@ mod tests {
             RangeOutcome::Unsatisfiable
         );
         assert_eq!(parse(Some("bytes=90-10"), 100), RangeOutcome::Full);
+        // Closed range starting exactly at the length: still unsatisfiable,
+        // never `Partial { start: 100, end: 99 }`.
+        assert_eq!(
+            parse(Some("bytes=100-150"), 100),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            parse(Some("bytes=99-150"), 100),
+            RangeOutcome::Partial(ByteRange { start: 99, end: 99 })
+        );
     }
 
     #[test]
     fn empty_body_has_no_satisfiable_range() {
         assert_eq!(parse(Some("bytes=0-"), 0), RangeOutcome::Unsatisfiable);
+        assert_eq!(parse(Some("bytes=0-0"), 0), RangeOutcome::Unsatisfiable);
         assert_eq!(parse(None, 0), RangeOutcome::Full);
     }
 

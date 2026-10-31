@@ -30,6 +30,13 @@ compatibility_date = "2026-10-01"
 # means the Transcoding step fails transiently (a redeploy heals it).
 # AUDIO_BUCKET_NAME = "<AUDIO_BUCKET>"
 
+# Caller auth (code: src/caller_auth.rs): every /v1/ingest/* route needs an
+# `Authorization: Bearer` grant scoped `ingest:write`, minted by the api
+# Worker and HMAC-signed with the shared INGEST_CALLER_SECRET (>= 32 bytes).
+# It is a Worker secret, never a [vars] entry:
+#   wrangler secret put INGEST_CALLER_SECRET
+# Unset or short, every route fails closed with 503.
+
 # Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
 # produce; the consumer below stays disabled, so every accepted enqueue
 # waits in the queue until it is enabled.

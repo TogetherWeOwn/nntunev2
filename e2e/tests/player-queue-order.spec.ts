@@ -14,6 +14,7 @@ import {
   submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
+  waitForHydration,
 } from '../helpers/accounts.js';
 import { queueOrderFailure } from '../helpers/queue-order.js';
 import {
@@ -97,6 +98,7 @@ test.describe.serial('player queue follows library-selection order', () => {
         waitUntil: 'domcontentloaded',
         timeout: 30_000,
       });
+      await waitForHydration(page, 'player-queue-order');
       const fileInput = page.getByTestId(TESTIDS.importFile);
       await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
       await fileInput.setInputFiles(nzb);
@@ -150,6 +152,7 @@ test.describe.serial('player queue follows library-selection order', () => {
 
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'player-queue-order');
     const rows = page.getByTestId(TESTIDS.libraryItem);
     await expect(
       rows.first(),

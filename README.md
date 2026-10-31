@@ -132,7 +132,8 @@ Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
 
 - Pushing to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
   `staging-web` deploys `apps/web`, then `post-deploy-e2e` sequences the full
-  Playwright journey after that web deploy succeeds. Pull requests use
+  Playwright journey after both that web deploy and the `staging-api` job
+  succeed. Pull requests use
   `preview-web` for web previews. The `gate` job checks for
   `CLOUDFLARE_API_TOKEN`; deploys also require `CLOUDFLARE_ACCOUNT_ID`.
   Without the token, deploy/preview jobs skip, so fork PRs get neither a
@@ -149,8 +150,10 @@ Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
   even a successful `staging-api` job can have skipped deploy steps. Require
   a non-skipped API deploy plus exact-build health, activation and rollback
   evidence under the [per-Worker evidence contract](docs/ops.md#future-worker-deploy-lanes-required-rollback-evidence).
-  `post-deploy-e2e` depends on `staging-web`, not `staging-api`, and does not
-  prove API deploy or rollback. Operator-owned staging configuration and
+  `post-deploy-e2e` waits for both `staging-web` and `staging-api` (so it
+  never runs against the previous API mid-deploy), but a green `staging-api`
+  job can be an unconfigured skip, so the journey does not prove API deploy
+  or rollback. Operator-owned staging configuration and
   Worker-secret wiring, authorized Access credential injection, and the
   separate `ingest`, `stream`, `mb` and `repair` deploy lanes remain prerequisites
   or deferred work; no backend runtime acceptance is claimed here.

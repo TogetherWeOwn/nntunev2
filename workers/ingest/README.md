@@ -64,7 +64,7 @@ NZB upload ───────────────┘                     
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-44`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:34`). No ingest route
+  `src/lib.rs:35`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -76,7 +76,7 @@ NZB upload ───────────────┘                     
 
 `src/indexer_fetch.rs` is a **library-only policy guard and buffered
 model**, not delivered outbound fetching. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:34`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:35`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:497-649`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:394`) or
@@ -188,7 +188,7 @@ be wired to a live transport as if it were approved policy.
 
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**,
 not a live SSRF boundary (module at `src/nzb_fetch.rs:1-68`, exported as
-`pub mod nzb_fetch` in `src/lib.rs:40`). No ingest route calls it
+`pub mod nzb_fetch` in `src/lib.rs:42`). No ingest route calls it
 (`fetch_nzb` at `src/nzb_fetch.rs:408` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`
@@ -311,9 +311,17 @@ stub whose NZB references fixture message-ids.
   not wired (enabling the consumer would burn search jobs' retry budget
   against an unavailable boundary and quarantine them), the library schema
   is missing, and the repair re-verify loop is still open (both below).
-- Request bodies carry self-asserted `user_id` (1..=128 chars) until the
-  accounts card authenticates callers; the key format already binds the
-  user, so keys stay valid when auth lands.
+- Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
+  `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
+  scoped `ingest:write` that the `api` Worker mints for the session user,
+  signed with the `INGEST_CALLER_SECRET` Worker secret (≥32 bytes). Auth
+  runs before the body is read, so a refused caller gets the generic 401
+  `unauthorized` with no queue, KV, throttle, ledger or meter side effect.
+  A missing or short secret fails closed with 503. The job's `user_id` is
+  the grant's. A body `user_id` is optional, and one that disagrees is
+  refused with 400. `GET /v1/ingest/jobs/:id` answers 404 for another
+  user's job, the same as an unknown id. The idempotency key format is
+  unchanged.
 - Hyperdrive library upsert (`src/library.rs`): one row per idempotency
   key, `ON CONFLICT DO UPDATE` so replays converge on the latest MB match.
 - Repair dispatch (`src/repair.rs`): missing blocks + par2 set → Container
@@ -535,7 +543,9 @@ invocation is claimed here.
 `scripts/search_rate_limit_burst.sh` sends 11 identical Newznab search requests
 and prints HTTP status codes and `Retry-After` headers to inspect the default
 ten-request throttle (the last request should return 429). Set `INGEST_URL`
-to a local or isolated staging ingest worker; **never point this script at
+to a local or isolated staging ingest worker and `INGEST_GRANT` to an
+`ingest:write` caller grant (without one every request stops at 401 before
+the throttle); **never point this script at
 production**. Each request has a 10-second connect timeout and a 30-second total
 timeout. Requests are not retried: replaying 429/503 responses would change the
 burst count and hide the observed throttle result. Transport failures stop the
