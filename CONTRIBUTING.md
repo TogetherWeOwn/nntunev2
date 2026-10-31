@@ -85,7 +85,10 @@ labels are the durable record behind it.
   in the PR body (what it catches that tests cannot).
 - Staging migrations: a PR that adds or changes `migrations/*.sql` needs a
   `Staging migration:` line in its body (`migrations-staging` enforces it);
-  see "Staging migrations" in `docs/ops.md`.
+  see "Staging migrations" in `docs/ops.md`. Green checks are not enough for
+  such a PR: the DDL needs board approval before it is applied to staging, and
+  the PR merges only once its line says `applied`. `migrations-staging` passes
+  a `pending` line with only a warning, so do not merge on it.
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection
   enabled) enforce this.
