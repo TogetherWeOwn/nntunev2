@@ -4,7 +4,7 @@
 
 # Pinned par2cmdline-turbo, built from the release tarball and verified
 # by sha256. Re-pin deliberately; the digest is the release asset digest.
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS par2
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS par2
 ARG PAR2_VERSION=1.5.0
 ARG PAR2_SHA256=035584144d3ac3b08fb5d7d4b844f60cf97404b6469f6aed7d9b9430a25bef0e
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +30,7 @@ COPY . .
 RUN cargo build --locked --release -p nntune-repair-server \
  && install -m0755 target/release/nntune-repair-server /usr/local/bin/nntune-repair-server
 
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 # util-linux provides /usr/bin/prlimit, the kernel resource limiter the
 # bounded repair runner always wraps the binary in (fail-closed without).
 RUN apt-get update && apt-get install -y --no-install-recommends util-linux \
