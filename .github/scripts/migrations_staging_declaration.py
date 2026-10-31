@@ -15,6 +15,7 @@ No secrets and no network: the workflow passes the PR body and the changed
 file list as files. Exit 0 = satisfied or no migrations, 1 = missing, 2 = usage.
 """
 import argparse
+import datetime
 import re
 import sys
 
@@ -26,6 +27,20 @@ APPLIED_RE = re.compile(
     re.I,
 )
 PENDING_RE = re.compile(r"^pending\s*\(\s*blocked on\s+(?P<ticket>[^)\s][^)]*)\)$", re.I)
+PENDING_PREFIX = "staging migration pending"
+
+
+def is_filled(value):
+    """Reject unfilled template placeholders such as ``<who>``."""
+    return not value.strip().startswith("<")
+
+
+def is_date(value):
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def changed_migrations(paths):
@@ -36,9 +51,9 @@ def parse_declarations(body):
     """Return (pending_tickets, applied_files) from the PR body."""
     pending, applied = [], set()
     for value in LINE_RE.findall(COMMENT_RE.sub("", body or "")):
-        if m := PENDING_RE.match(value):
+        if (m := PENDING_RE.match(value)) and is_filled(m["ticket"]):
             pending.append(m["ticket"].strip())
-        elif m := APPLIED_RE.match(value):
+        elif (m := APPLIED_RE.match(value)) and is_date(m["date"]) and is_filled(m["who"]):
             for token in re.split(r"[\s,]+", m["files"]):
                 token = token.strip("`'\"")
                 if token:
@@ -54,7 +69,7 @@ def check(body, paths):
         return True, "no migrations/*.sql changes; nothing to declare"
     pending, applied = parse_declarations(body)
     if pending:
-        return True, f"staging migration pending (blocked on {', '.join(pending)}): {', '.join(migrations)}"
+        return True, f"{PENDING_PREFIX} (blocked on {', '.join(pending)}): {', '.join(migrations)}"
     missing = [m for m in migrations if m not in applied and m.rsplit("/", 1)[-1] not in applied]
     if not missing:
         return True, f"staging migration applied: {', '.join(migrations)}"
@@ -80,7 +95,9 @@ def main(argv=None):
         print(f"migrations-staging: cannot read input: {err.strerror}", file=sys.stderr)
         return 2
     ok, message = check(body, paths)
-    print(f"migrations-staging: {message}" if ok else f"::error::migrations-staging: {message}")
+    # Pending passes but stays visible: docs/ops.md forbids merging it as-is.
+    level = "::error::" if not ok else "::warning::" if message.startswith(PENDING_PREFIX) else ""
+    print(f"{level}migrations-staging: {message}")
     return 0 if ok else 1
 
 

@@ -63,6 +63,8 @@ class CheckTestCase(unittest.TestCase):
             "0024_session_refresh_retry.sql, 0025_session_refresh_claim_clock.sql — applied by a",
             "0024_session_refresh_retry.sql, 0025_session_refresh_claim_clock.sql — applied 30/10/2026 by a",
             "0024_session_refresh_retry.sql, 0025_session_refresh_claim_clock.sql — applied 2026-10-30",
+            "0024_session_refresh_retry.sql, 0025_session_refresh_claim_clock.sql — applied 2026-02-31 by a",
+            "0024_session_refresh_retry.sql, 0025_session_refresh_claim_clock.sql — applied 2026-10-30 by <who>",
             "<files> — applied <date> by <who>",
         ):
             with self.subTest(value=value):
@@ -73,7 +75,7 @@ class CheckTestCase(unittest.TestCase):
         self.assertIn("#900", message)
 
     def test_pending_needs_ticket(self):
-        for value in ("pending", "pending ()", "pending (blocked on )", "pending (#900)"):
+        for value in ("pending", "pending ()", "pending (blocked on )", "pending (#900)", "pending (blocked on <ticket>)"):
             with self.subTest(value=value):
                 self.assertFails(f"Staging migration: {value}\n")
 
@@ -110,7 +112,12 @@ class CliTestCase(unittest.TestCase):
         failed = self.run_cli("", FILES)
         self.assertEqual(failed.returncode, 1)
         self.assertIn("::error::migrations-staging:", failed.stdout)
-        self.assertEqual(self.run_cli("Staging migration: pending (blocked on #900)", FILES).returncode, 0)
+        pending = self.run_cli("Staging migration: pending (blocked on #900)", FILES)
+        self.assertEqual(pending.returncode, 0)
+        self.assertIn("::warning::migrations-staging:", pending.stdout)
+        applied = self.run_cli("Staging migration: " + ", ".join(FILES[:2]) + " — applied 2026-10-30 by a", FILES)
+        self.assertEqual(applied.returncode, 0)
+        self.assertNotIn("::", applied.stdout)
 
     def test_unreadable_input_exits_2(self):
         result = subprocess.run(
