@@ -3669,6 +3669,16 @@ where
     let Ok(user_id) = random_id::<16>() else {
         return unavailable();
     };
+    // Everything that can fail without touching the store runs first, so
+    // only a failed session write can leave a user row behind; that row
+    // holds no session, credential or vault and is removed by the
+    // unverified-signup reaper (`unverified_user_filter`), and the E2E
+    // never retries the same mailbox. The stored session row is also what
+    // exempts a minted account from that reaper.
+    let (token, record) = match ctx.prepare_session(&user_id) {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
     let user = UserRecord {
         id: user_id,
         email: email.clone(),
@@ -3678,12 +3688,6 @@ where
     if ctx.store.insert_user(&user).await.is_err() {
         return internal();
     }
-    // The stored session row also exempts the account from the
-    // unverified-signup reaper (`unverified_user_filter`).
-    let (token, record) = match ctx.prepare_session(&user.id) {
-        Ok(prepared) => prepared,
-        Err(resp) => return resp,
-    };
     if ctx.store.insert_session(&record).await.is_err() {
         return internal();
     }
