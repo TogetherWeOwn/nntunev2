@@ -866,7 +866,10 @@ mod tests {
         assert_eq!(cbor_parse(&[0xf5]), Ok(Cbor::Simple(21)));
         let cases: [(&str, &[u8]); 6] = [
             ("duplicate int key", &[0xa2, 0x01, 0x01, 0x01, 0x02]),
-            ("duplicate text key", &[0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02]),
+            (
+                "duplicate text key",
+                &[0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02],
+            ),
             ("trailing byte", &[0x01, 0x00]),
             // +0.0: would otherwise fit the simple-value branch.
             ("half float", &[0xf9, 0x00, 0x00]),
