@@ -1076,7 +1076,7 @@ fn e2e_bodyless_get_healthz_still_dispatches() {
     let harness = harness();
     let response = harness.dispatch("GET", "/healthz", None, None, BodySource::Bodyless);
     assert_eq!(response.status, 200);
-    assert_eq!(response.body, r#"{"ok":true}"#);
+    assert_eq!(response.body, r#"{"build_sha":"unknown","ok":true}"#);
 }
 
 #[test]
