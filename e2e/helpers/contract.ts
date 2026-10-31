@@ -39,6 +39,9 @@ export const API = {
   // baked SHA from `src/lib/build.ts`). A renamed path fails the
   // build-identity spec with this key named.
   build: '/api/build',
+  // API Worker liveness + build identity (`workers/api/src/handlers.rs`):
+  // exactly `{ ok: true, build_sha }`, served on the same staging origin.
+  healthz: '/healthz',
   testAccounts: '/api/test-accounts',
   // Staging-only emailed-code retrieval seam (paired staging-seam build slice):
   // returns the issued signup code for an `example.test` mailbox without

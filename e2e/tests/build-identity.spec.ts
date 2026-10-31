@@ -2,9 +2,12 @@ import { test, expect } from '@playwright/test';
 import { stagingBaseUrl } from '../helpers/access.js';
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import {
+  assertApiBuildMatchesPromotion,
   assertDeployedBuildMatchesPromotion,
   expectedPromotionSha,
+  extractApiBuildSha,
   extractDeployedSha,
+  resolveApiIdentity,
 } from '../helpers/build-identity.js';
 
 // Same-build assertion for exact-head staging evidence (row 7 remainder):
@@ -145,6 +148,107 @@ test.describe('build identity assertion (offline fixtures)', () => {
   });
 });
 
+test.describe('API build identity assertion (offline fixtures)', () => {
+  const HEAD = 'a'.repeat(40);
+  const OLD = 'b'.repeat(40);
+
+  test('healthz body with build_sha extracts it', () => {
+    expect(extractApiBuildSha(`{"ok":true,"build_sha":"${HEAD}"}`, 'api')).toBe(HEAD);
+  });
+
+  test('pre-identity healthz body {ok:true} extracts null', () => {
+    expect(extractApiBuildSha('{"ok":true}', 'api')).toBeNull();
+  });
+
+  test('healthz body with extra keys or without ok:true fails', () => {
+    expect(() => extractApiBuildSha(`{"ok":true,"build_sha":"${HEAD}","x":1}`, 'api')).toThrow(
+      /exactly \{ ok, build_sha \}/,
+    );
+    expect(() => extractApiBuildSha(`{"ok":false,"build_sha":"${HEAD}"}`, 'api')).toThrow(/ok:true/);
+    expect(() => extractApiBuildSha('nope', 'api')).toThrow(/not JSON/);
+  });
+
+  for (const outcome of ['deployed', '']) {
+    test(`staging-api "${outcome}": equal SHA is web = API = head`, () => {
+      expect(assertApiBuildMatchesPromotion(HEAD, HEAD, outcome, 'api').sameBuild).toBe(true);
+    });
+
+    test(`staging-api "${outcome}": mismatch, unknown and absent fail by name`, () => {
+      expect(() => assertApiBuildMatchesPromotion(OLD, HEAD, outcome, 'api')).toThrow(
+        /\[api\] API build identity mismatch/,
+      );
+      expect(() => assertApiBuildMatchesPromotion('unknown', HEAD, outcome, 'api')).toThrow(
+        /API build identity is unknown/,
+      );
+      expect(() => assertApiBuildMatchesPromotion(null, HEAD, outcome, 'api')).toThrow(
+        /API build identity is absent/,
+      );
+      expect(() => assertApiBuildMatchesPromotion('nope', HEAD, outcome, 'api')).toThrow(
+        /API build identity is malformed/,
+      );
+    });
+  }
+
+  test('unwired outcome names API_DEPLOY_OUTCOME on mismatch', () => {
+    expect(() => assertApiBuildMatchesPromotion(OLD, HEAD, '', 'api')).toThrow(/API_DEPLOY_OUTCOME/);
+  });
+
+  for (const outcome of ['skipped', 'unconfigured']) {
+    test(`staging-api "${outcome}": differing API SHA is stated, not claimed`, () => {
+      const verdict = assertApiBuildMatchesPromotion(OLD, HEAD, outcome, 'api');
+      expect(verdict.sameBuild).toBe(false);
+      expect(verdict.note).toContain(`staging-api ${outcome}`);
+      expect(verdict.note).toContain(OLD);
+      expect(verdict.note).toContain(HEAD);
+      expect(verdict.note).toContain('NOT claimed');
+    });
+
+    test(`staging-api "${outcome}": an equal API SHA is still not same-run evidence`, () => {
+      const verdict = assertApiBuildMatchesPromotion(HEAD, HEAD, outcome, 'api');
+      expect(verdict.sameBuild).toBe(false);
+      expect(verdict.note).toContain('NOT claimed');
+    });
+  }
+
+  for (const outcome of ['skipped', 'unconfigured']) {
+    test(`staging-api "${outcome}": a non-200 /healthz records no API identity`, () => {
+      const verdict = resolveApiIdentity(404, 'Not Found', HEAD, outcome, 'api');
+      expect(verdict.apiSha).toBeNull();
+      expect(verdict.sameBuild).toBe(false);
+      expect(verdict.note).toContain('HTTP 404');
+      expect(verdict.note).toContain('NOT claimed');
+    });
+  }
+
+  for (const outcome of ['deployed', '']) {
+    test(`staging-api "${outcome}": a non-200 /healthz fails`, () => {
+      expect(() => resolveApiIdentity(404, 'Not Found', HEAD, outcome, 'api')).toThrow(
+        /\[api\] API build identity request failed.*HTTP 404/,
+      );
+    });
+  }
+
+  test('a 200 /healthz flows through the strict verdict', () => {
+    const body = `{"ok":true,"build_sha":"${HEAD}"}`;
+    expect(resolveApiIdentity(200, body, HEAD, 'deployed', 'api')).toEqual({
+      apiSha: HEAD,
+      sameBuild: true,
+      note: '',
+    });
+    expect(() =>
+      resolveApiIdentity(200, `{"ok":true,"build_sha":"${OLD}"}`, HEAD, 'deployed', 'api'),
+    ).toThrow(/API build identity mismatch/);
+  });
+
+  test('failed or cancelled staging-api never passes', () => {
+    for (const outcome of ['failed', 'cancelled', 'surprise']) {
+      expect(() => assertApiBuildMatchesPromotion(HEAD, HEAD, outcome, 'api')).toThrow(
+        /staging-api outcome/,
+      );
+    }
+  });
+});
+
 test('deployed build matches the promotion SHA (exact-head staging evidence)', async ({
   request,
 }) => {
@@ -153,8 +257,8 @@ test('deployed build matches the promotion SHA (exact-head staging evidence)', a
     test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
     return;
   }
-  // Opening read: proves the deploy delivered the promoted build before the
-  // journey. The closing spec re-reads at the end through the same helper —
+  // Opening read: proves the deploy delivered the promoted build (web and
+  // API, logged as web=… api=… head=…) before the journey. The closing spec re-reads at the end through the same helper —
   // a mid-journey deploy reds the run instead of passing green.
   await assertServingBuildMatchesPromotion(request, baseURL, 'build-identity');
 });
