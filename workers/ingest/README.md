@@ -555,9 +555,10 @@ probe; rerun it explicitly after checking the local/staging worker.
 
 ```sh
 python3 scripts/cargo_cache.py run -- test --manifest-path workers/ingest/Cargo.toml
-# without the bounded Cargo pool:
-cargo test --locked --manifest-path workers/ingest/Cargo.toml
 ```
+
+Exit 75 means the pool refused the run: retry later. Checkouts with no pool
+follow the root [README](../../README.md#test).
 
 Pure modules carry inline unit tests; handlers stay thin so the contract
 is reviewed, not mocked.
