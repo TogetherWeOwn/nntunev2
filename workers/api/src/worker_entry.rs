@@ -719,6 +719,161 @@ fn native_credential_from_row(
     })
 }
 
+/// Shared by standalone claims and registration's transaction: keep every
+/// single-use predicate and its bind order identical across both paths.
+async fn claim_single_use_on(
+    client: &impl GenericClient,
+    candidate: SingleUseClaim<'_>,
+) -> Result<u64, StoreError> {
+    let statement = candidate.statement();
+    type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
+    let rows = match &candidate {
+        SingleUseClaim::MagicLink { record, now } => {
+            let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
+            let now = i64_of(*now).map_err(|_| StoreError)?;
+            let params: [Param<'_>; 5] = [
+                &record.token_hash,
+                &record.user_id,
+                &record.email,
+                &expires,
+                &now,
+            ];
+            client.query(statement, &params[..]).await
+        }
+        SingleUseClaim::Challenge { record, now } => {
+            let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
+            let now = i64_of(*now).map_err(|_| StoreError)?;
+            let params: [Param<'_>; 5] =
+                [&record.id, &record.rp_id, &record.origin, &expires, &now];
+            client.query(statement, &params[..]).await
+        }
+        SingleUseClaim::Invite { record } => {
+            let params: [Param<'_>; 1] = [&record.code_hash];
+            client.query(statement, &params[..]).await
+        }
+    }
+    .map_err(|_| StoreError)?;
+    Ok(rows.len() as u64)
+}
+
+async fn insert_credential_on(
+    client: &impl GenericClient,
+    credential: &PasskeyCredential,
+) -> Result<(), StoreError> {
+    client.execute(
+        "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+        &[
+            &credential.cred_id_b64url,
+            &credential.user_id,
+            &credential.public_key.as_slice(),
+            &i64::from(credential.sign_count),
+            &i64_of(credential.registered_at)?,
+        ],
+    ).await.map_err(|_| StoreError)?;
+    Ok(())
+}
+
+async fn complete_registration_on(
+    client: &mut tokio_postgres::Client,
+    challenge: &PasskeyChallenge,
+    magic: &MagicLinkRecord,
+    invite: Option<&InviteRecord>,
+    credential: &PasskeyCredential,
+    now: u64,
+) -> Result<(), StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    // Reaping locks parents before cascading to proofs. Take the compatible
+    // enrollment lock first, so a reaper skips us even after our proofs expire.
+    transaction
+        .query_opt(
+            "SELECT id FROM users WHERE id = $1 FOR KEY SHARE",
+            &[&credential.user_id],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .ok_or(StoreError)?;
+    let mut claims = vec![
+        SingleUseClaim::Challenge {
+            record: challenge,
+            now,
+        },
+        SingleUseClaim::MagicLink { record: magic, now },
+    ];
+    if let Some(record) = invite {
+        claims.push(SingleUseClaim::Invite { record });
+    }
+    for claim in claims {
+        if claim_single_use_on(&transaction, claim).await? != 1 {
+            return Err(StoreError);
+        }
+    }
+    insert_credential_on(&transaction, credential).await?;
+    // Any earlier error or deadline drops the transaction and rolls back
+    // every claim before another request can observe a partial enrollment.
+    transaction.commit().await.map_err(|_| StoreError)
+}
+
+async fn reap_unverified_users_on(
+    client: &mut tokio_postgres::Client,
+    now: u64,
+    ttl_secs: u64,
+    protected_user_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
+    let now = i64_of(now)?;
+    let transaction = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(|_| StoreError)?;
+    let candidates = transaction
+        .query(
+            &handlers::lock_unverified_users_sql(),
+            &[&cutoff, &protected_user_id, &now],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let ids = candidates
+        .iter()
+        .map(|row| row.try_get::<_, String>("id").map_err(|_| StoreError))
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    reaper_selection_pause().await;
+    if !ids.is_empty() {
+        // Enrollment may commit between the selection snapshot and its parent
+        // lock. A second READ COMMITTED statement sees that credential before
+        // deleting; holding the parent locks prevents a new enrollment racing it.
+        transaction
+            .execute(
+                &handlers::reap_unverified_users_sql(),
+                &[&cutoff, &protected_user_id, &now, &ids],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
+    transaction.commit().await.map_err(|_| StoreError)
+}
+
+async fn prune_expired_challenges_on(
+    client: &impl GenericClient,
+    now: u64,
+) -> Result<(), StoreError> {
+    // Enrollment may hold a challenge while waiting on a later claim. Do not
+    // stall unrelated auth starts once it expires; a later prune retries it.
+    client
+        .execute(
+            "DELETE FROM auth_challenges WHERE id IN (\
+             SELECT id FROM auth_challenges WHERE expires_at <= $1 \
+             FOR UPDATE SKIP LOCKED)",
+            &[&i64_of(now)?],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(())
+}
+
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
@@ -821,24 +976,33 @@ impl Store for PgStore {
     }
 
     async fn insert_credential(&self, credential: &PasskeyCredential) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let client = self.connect().await?;
-        client
-            .execute(
-                "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) \
-                 VALUES ($1, $2, $3, $4, $5)",
-                &[
-                    &credential.cred_id_b64url,
-                    &credential.user_id,
-                    &credential.public_key.as_slice(),
-                    &i64::from(credential.sign_count),
-                    &i64_of(credential.registered_at)?,
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                insert_credential_on(&client, credential).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn complete_registration(
+        &self,
+        challenge: &PasskeyChallenge,
+        magic: &MagicLinkRecord,
+        invite: Option<&InviteRecord>,
+        credential: &PasskeyCredential,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                complete_registration_on(&mut client, challenge, magic, invite, credential, now)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn credential_by_id(
@@ -907,13 +1071,15 @@ impl Store for PgStore {
         .await
     }
 
-    // Per-user prune: magic_link_tokens has no expires_at index, so a global sweep would scan.
+    // Per-user prune avoids a global scan; enrollment-held tokens retry on a later issuance.
     async fn insert_magic(&self, record: &MagicLinkRecord) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
-                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4) \
+                "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4 \
+                 AND token_hash IN (SELECT token_hash FROM magic_link_tokens \
+                 WHERE user_id = $2 AND expires_at <= $4 FOR UPDATE SKIP LOCKED)) \
                  INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
@@ -1836,14 +2002,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                client
-                    .execute(
-                        "DELETE FROM auth_challenges WHERE expires_at <= $1",
-                        &[&i64_of(now)?],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                prune_expired_challenges_on(&client, now).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1858,21 +2017,8 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         Self::bounded(
             async {
-                // Single source of truth lives in `handlers` (statement-shape test
-                // pins the purpose literal and the vault/session/magic exemptions):
-                // magic-only accounts and vault owners are never reaped, so a vault
-                // saved under a magic session cannot cascade-delete 24h later.
-                let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
-                let now = i64_of(now)?;
-                let client = self.connect().await?;
-                client
-                    .execute(
-                        &handlers::reap_unverified_users_sql(),
-                        &[&cutoff, &protected_user_id, &now],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                Ok(())
+                let mut client = self.connect().await?;
+                reap_unverified_users_on(&mut client, now, ttl_secs, protected_user_id).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1956,36 +2102,8 @@ impl SingleUseStore for PgStore {
     async fn claim(&self, candidate: SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
         Self::bounded(
             async {
-                let statement = candidate.statement();
                 let client = self.connect().await?;
-                type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
-                let rows = match &candidate {
-                    SingleUseClaim::MagicLink { record, now } => {
-                        let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
-                        let now = i64_of(*now).map_err(|_| StoreError)?;
-                        let params: [Param<'_>; 5] = [
-                            &record.token_hash,
-                            &record.user_id,
-                            &record.email,
-                            &expires,
-                            &now,
-                        ];
-                        client.query(statement, &params[..]).await
-                    }
-                    SingleUseClaim::Challenge { record, now } => {
-                        let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
-                        let now = i64_of(*now).map_err(|_| StoreError)?;
-                        let params: [Param<'_>; 5] =
-                            [&record.id, &record.rp_id, &record.origin, &expires, &now];
-                        client.query(statement, &params[..]).await
-                    }
-                    SingleUseClaim::Invite { record } => {
-                        let params: [Param<'_>; 1] = [&record.code_hash];
-                        client.query(statement, &params[..]).await
-                    }
-                }
-                .map_err(|_| StoreError)?;
-                Ok(rows.len() as u64)
+                claim_single_use_on(&client, candidate).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4361,3 +4479,26 @@ mod tests {
         );
     }
 }
+
+// Native acceptance can pause the real reaper between selection and deletion.
+// Each single-threaded test runtime owns its hook; production has no hook.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+type ReaperSelectionPause = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+std::thread_local! {
+    static REAPER_SELECTION_PAUSE: std::cell::RefCell<Option<ReaperSelectionPause>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+async fn reaper_selection_pause() {
+    let pause = REAPER_SELECTION_PAUSE.with(|slot| slot.borrow_mut().take());
+    if let Some(pause) = pause {
+        pause.await;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../tests/support/atomic_registration_store_acceptance.rs"]
+mod atomic_registration_store_acceptance;

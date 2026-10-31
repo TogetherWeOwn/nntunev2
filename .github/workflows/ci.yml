@@ -399,8 +399,14 @@ jobs:
       # above. It stays one `- run:` line: the locked-dependency static pin
       # requires this job's test step to be a single removable invocation,
       # and needs no database for the ordinary unlocked/`--all-targets`
-      # failure it mutates.
-      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets -- --include-ignored
+      # failure it mutates. Registration's PostgreSQL cases run in the
+      # required api-migrations job after migrations, serialized by its
+      # inventory-checked runner; do not also run them on this empty schema.
+      # Keep their configuration-only guards and all redemption cases here.
+      # The skip filter stays single-quoted: the pin's echo-sibling mutant
+      # only tolerates trailing libtest args that still read as literal
+      # echo words, and an unquoted `::` module path breaks that charset.
+      - run: cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets -- --include-ignored --skip 'worker_entry::atomic_registration_store_acceptance::postgres_'
         env:
           NNTUNE_REDEMPTION_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - run: cargo clippy --locked --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
@@ -493,10 +499,31 @@ jobs:
         env:
           SCHEMA_GATE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: workers/api
+          key: api-postgres-acceptance
       - name: Exercise production session retry adapter under PostgreSQL contention
         run: |
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test session_refresh_postgres
           python3 .github/scripts/check_refresh_retry_mutants.py
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      # The bank runner's own inventory guard: a missing, empty or extra
+      # compiled inventory must be rejected before any execution starts.
+      - name: Verify PostgreSQL acceptance inventory guard
+        run: python3 workers/api/tests/test_atomic_registration_store_runner.py
+      # The production Rust transaction and cleanup helpers, not copied SQL.
+      # Enumeration is checked first: a missing module or zero matched tests
+      # must fail this required job rather than silently report success.
+      - name: Execute atomic registration PostgreSQL acceptance
+        run: python3 workers/api/tests/run_atomic_registration_store_tests.py
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Verify fail-closed mutation harness and source restoration
+        run: python3 workers/api/tests/test_atomic_registration_mutation_runner.py
+      - name: Prove transaction mutations fail, restore source, and rerun GREEN
+        run: python3 workers/api/tests/run_atomic_registration_mutation_tests.py
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
 
