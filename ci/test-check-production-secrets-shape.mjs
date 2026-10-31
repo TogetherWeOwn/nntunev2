@@ -34,8 +34,10 @@ function withTempRoot(files, fn) {
   }
 }
 
-function runChecker(root) {
-  const result = spawnSync(process.execPath, [checkerCli, "--root", root], { encoding: "utf8" });
+function runChecker(root, config = null) {
+  const args = [checkerCli, "--root", root];
+  if (config !== null) args.push("--config", config);
+  const result = spawnSync(process.execPath, args, { encoding: "utf8" });
   assert.equal(result.error, undefined);
   assert.equal(result.signal, null);
   return result;
@@ -52,7 +54,65 @@ describe("assertProductionSecretsShape", () => {
     assertProductionSecretsShape('[env.staging.vars]\nFOO = "x"\n');
   });
 
-  it("refuses production vars in every valid TOML spelling", () => {
+  it("admits only canonical stable DEPLOYED_RELEASE_VERSION metadata, not general production vars", () => {
+    for (const version of ["2026.1028.0", "2026.105.12", "2024.229.0", "2026.1231.12"]) {
+      const config = `${CLEAN_TOML}[env.production.vars]\nDEPLOYED_RELEASE_VERSION = "${version}"\n`;
+      assert.doesNotThrow(() => assertProductionSecretsShape(config), version);
+      withTempRoot({ "apps/web/wrangler.toml": config }, (root) => {
+        const result = runChecker(root);
+        assert.equal(result.status, 0, result.stderr);
+      });
+    }
+  });
+
+  it("refuses noncanonical, canary, invalid-calendar and nonstring production release metadata", () => {
+    const invalid = [
+      '"2026.1028.0-canary.3"', '"v2026.1028.0"', '"2026.0105.0"',
+      '"2026.105.00"', '"2026.105.-1"', '"2026.229.0"', '"2026.431.0"',
+      '"2026.1301.0"', '"2026.100.0"', '"2026.1028.9007199254740992"',
+      '"2026.1028.0+build"', '" 2026.1028.0"', '"2026.1028.0 "',
+      '"2026.1028.0\\nFOO=sentinel-value"', '""', 'true', '1',
+      '["2026.1028.0"]', '{ value = "2026.1028.0" }',
+    ];
+    for (const value of invalid) {
+      const config = `${CLEAN_TOML}[env.production.vars]\nDEPLOYED_RELEASE_VERSION = ${value}\n`;
+      assert.throws(() => assertProductionSecretsShape(config), undefined, value);
+      withTempRoot({ "apps/web/wrangler.toml": config }, (root) => {
+        const result = runChecker(root);
+        assert.equal(result.status, 1, value);
+        assert.doesNotMatch(result.stdout + result.stderr, /sentinel-value/);
+      });
+    }
+  });
+
+  it("a valid release value never whitewashes extra vars, bindings, routes or duplicate declarations", () => {
+    const release = `${CLEAN_TOML}[env.production.vars]\nDEPLOYED_RELEASE_VERSION = "2026.1028.0"\n`;
+    const additions = [
+      'FOO = "x"\n', 'CLOUDFLARE_API_TOKEN = "sentinel-value"\n',
+      'DEPLOYED_RELEASE_VERSION = "2026.1028.1"\n',
+      '[env.production.bindings]\nFOO = "x"\n',
+      '[[env.production.d1_databases]]\nbinding = "DB"\n',
+      '[[env.production.routes]]\npattern = "example.test/*"\n',
+      '[env.production]\nname = "nntune-web"\nroute = "example.test/*"\n',
+      '["env"."production"."vars"]\nFOO = "x"\n',
+      '[env]\nproduction.vars.FOO = "x"\n',
+    ];
+    for (const addition of additions) {
+      assert.throws(() => assertProductionSecretsShape(release + addition), undefined, addition);
+    }
+    // The admission is deliberately the reviewed conventional table/key form.
+    // Equivalent-looking inline/dotted/escaped forms must not create a new
+    // unchecked metadata path through the defensive TOML reader.
+    const alternatives = [
+      'env = { production = { vars = { DEPLOYED_RELEASE_VERSION = "2026.1028.0" } } }\n',
+      '[env.production]\nvars.DEPLOYED_RELEASE_VERSION = "2026.1028.0"\n',
+      '["env"."production"."vars"]\nDEPLOYED_RELEASE_VERSION = "2026.1028.0"\n',
+      '["env"."\\u0070roduction"."vars"]\nDEPLOYED_RELEASE_VERSION = "2026.1028.0"\n',
+    ];
+    for (const config of alternatives) assert.throws(() => assertProductionSecretsShape(config));
+  });
+
+  it("refuses unapproved production vars in every valid TOML spelling", () => {
     const bypasses = {
       plain: "[env.production.vars]\nFOO = \"x\"\n",
       quoted: '["env"."production"."vars"]\nFOO = "x"\n',
@@ -152,6 +212,27 @@ describe("assertProductionSecretsShape", () => {
       const result = runChecker(root);
       assert.equal(result.status, 0);
       assert.match(result.stdout, /secret shape ok/);
+    });
+  });
+
+  it("CLI --config validates the actual rendered TOML rather than only a clean source default", () => {
+    const candidate = `${CLEAN_TOML}[env.production.vars]\nDEPLOYED_RELEASE_VERSION = "2026.1028.0"\n`;
+    withTempRoot({ "apps/web/wrangler.toml": CLEAN_TOML, "release/production.toml": candidate }, (root) => {
+      assert.equal(runChecker(root, join(root, "release/production.toml")).status, 0);
+      writeFileSync(join(root, "release/production.toml"), BAD_TOML);
+      assert.equal(runChecker(root, join(root, "release/production.toml")).status, 1);
+    });
+  });
+
+  it("an explicit rendered config cannot bypass the existing shadow-config refusal", () => {
+    withTempRoot({
+      "apps/web/wrangler.toml": CLEAN_TOML,
+      "apps/web/wrangler.json": '{}\n',
+      "release/production.toml": CLEAN_TOML,
+    }, (root) => {
+      const result = runChecker(root, join(root, "release/production.toml"));
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /shadows apps\/web\/wrangler\.toml/);
     });
   });
 
