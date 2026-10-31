@@ -1410,11 +1410,12 @@ mod tests {
                     ..good.clone()
                 },
             ),
+            // Within clock skew, so only the ordering check can reject it.
             (
                 "expires_at equal to issued_at",
                 SessionClaims {
-                    issued_at: now + 3600,
-                    expires_at: now + 3600,
+                    issued_at: now + 30,
+                    expires_at: now + 30,
                     ..good.clone()
                 },
             ),
