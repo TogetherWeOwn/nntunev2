@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Report-only summary: a newer push to main supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   coverage:
     name: Rust line coverage
