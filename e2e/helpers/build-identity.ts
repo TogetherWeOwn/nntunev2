@@ -149,7 +149,7 @@ export function apiDeployOutcome(): string {
  * wired. The serving API is then an earlier build and may legitimately
  * differ from head; the verdict says so instead of claiming web=API=head.
  */
-export const API_NOT_REDEPLOYED: ReadonlySet<string> = new Set(['skipped', 'unconfigured']);
+const API_NOT_REDEPLOYED: ReadonlySet<string> = new Set(['skipped', 'unconfigured']);
 
 /**
  * Pull the API Worker build SHA out of a `GET /healthz` body.
@@ -265,4 +265,41 @@ export function assertApiBuildMatchesPromotion(
     );
   }
   return { sameBuild: true, note: '' };
+}
+
+/**
+ * Turn one `GET /healthz` response into the API identity verdict.
+ *
+ * When `staging-api` did not redeploy (skipped/unconfigured), a non-200
+ * answer (no API Worker route, so the web catch-all answers) records "no
+ * API identity" without claiming web=API=head. Every other outcome needs
+ * HTTP 200 with the exact `{ ok, build_sha }` shape, judged by
+ * `assertApiBuildMatchesPromotion`.
+ */
+export function resolveApiIdentity(
+  status: number,
+  bodyText: string,
+  expectedSha: string,
+  outcome: string,
+  context: string,
+): { apiSha: string | null; sameBuild: boolean; note: string } {
+  if (status !== 200 && API_NOT_REDEPLOYED.has(outcome)) {
+    return {
+      apiSha: null,
+      sameBuild: false,
+      note:
+        `staging-api ${outcome} this run: API GET /healthz answered HTTP ${status}, ` +
+        `so no API identity is available (promotion SHA ${expectedSha}). ` +
+        'web=API=head is NOT claimed for this run.',
+    };
+  }
+  if (status !== 200) {
+    throw new Error(
+      `[${context}] API build identity request failed: expected HTTP 200 from GET /healthz, ` +
+        `got HTTP ${status} (body ${bodyText.length} chars, promotion SHA ${expectedSha}). ` +
+        'See e2e/README.md.',
+    );
+  }
+  const apiSha = extractApiBuildSha(bodyText, context);
+  return { apiSha, ...assertApiBuildMatchesPromotion(apiSha, expectedSha, outcome, context) };
 }

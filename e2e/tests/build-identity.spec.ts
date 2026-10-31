@@ -7,6 +7,7 @@ import {
   expectedPromotionSha,
   extractApiBuildSha,
   extractDeployedSha,
+  resolveApiIdentity,
 } from '../helpers/build-identity.js';
 
 // Same-build assertion for exact-head staging evidence (row 7 remainder):
@@ -208,6 +209,36 @@ test.describe('API build identity assertion (offline fixtures)', () => {
       expect(verdict.note).toContain('NOT claimed');
     });
   }
+
+  for (const outcome of ['skipped', 'unconfigured']) {
+    test(`staging-api "${outcome}": a non-200 /healthz records no API identity`, () => {
+      const verdict = resolveApiIdentity(404, 'Not Found', HEAD, outcome, 'api');
+      expect(verdict.apiSha).toBeNull();
+      expect(verdict.sameBuild).toBe(false);
+      expect(verdict.note).toContain('HTTP 404');
+      expect(verdict.note).toContain('NOT claimed');
+    });
+  }
+
+  for (const outcome of ['deployed', '']) {
+    test(`staging-api "${outcome}": a non-200 /healthz fails`, () => {
+      expect(() => resolveApiIdentity(404, 'Not Found', HEAD, outcome, 'api')).toThrow(
+        /\[api\] API build identity request failed.*HTTP 404/,
+      );
+    });
+  }
+
+  test('a 200 /healthz flows through the strict verdict', () => {
+    const body = `{"ok":true,"build_sha":"${HEAD}"}`;
+    expect(resolveApiIdentity(200, body, HEAD, 'deployed', 'api')).toEqual({
+      apiSha: HEAD,
+      sameBuild: true,
+      note: '',
+    });
+    expect(() =>
+      resolveApiIdentity(200, `{"ok":true,"build_sha":"${OLD}"}`, HEAD, 'deployed', 'api'),
+    ).toThrow(/API build identity mismatch/);
+  });
 
   test('failed or cancelled staging-api never passes', () => {
     for (const outcome of ['failed', 'cancelled', 'surprise']) {

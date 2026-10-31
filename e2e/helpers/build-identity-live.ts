@@ -3,13 +3,11 @@ import { API } from './contract.js';
 import { accessHeaders, assertNoAccessWall } from './access.js';
 import { apiGet } from './accounts.js';
 import {
-  API_NOT_REDEPLOYED,
   apiDeployOutcome,
-  assertApiBuildMatchesPromotion,
   assertDeployedBuildMatchesPromotion,
   expectedPromotionSha,
-  extractApiBuildSha,
   extractDeployedSha,
+  resolveApiIdentity,
 } from './build-identity.js';
 
 /**
@@ -64,38 +62,17 @@ export async function assertServingBuildMatchesPromotion(
     context,
   );
   const outcome = apiDeployOutcome();
-  // Logged before the strict verdict so a failing run still shows both values.
-  const logIdentity = (sha: string | null) =>
-    console.log(
-      `[${context}] build identity: web=${deployed} api=${sha ?? '(absent)'} ` +
-        `head=${expected} staging-api=${outcome || '(not provided)'}`,
-    );
-  let apiSha: string | null;
-  let verdict: { sameBuild: boolean; note: string };
-  if (apiRes.status() !== 200 && API_NOT_REDEPLOYED.has(outcome)) {
-    // An unprovisioned API (no Worker route) answers from the web catch-all;
-    // record it as unavailable instead of blocking the web-only evidence.
-    apiSha = null;
-    logIdentity(apiSha);
-    verdict = {
-      sameBuild: false,
-      note:
-        `staging-api ${outcome} this run: API GET /healthz answered HTTP ${apiRes.status()}, ` +
-        `so no API identity is available (promotion SHA ${expected}). ` +
-        'web=API=head is NOT claimed for this run.',
-    };
-  } else {
-    if (apiRes.status() !== 200) {
-      throw new Error(
-        `[${context}] API build identity request failed: expected HTTP 200 from GET /healthz, ` +
-          `got HTTP ${apiRes.status()} (body ${apiBody.length} chars, ` +
-          `promotion SHA ${expected}). See e2e/README.md.`,
-      );
-    }
-    apiSha = extractApiBuildSha(apiBody, context);
-    logIdentity(apiSha);
-    verdict = assertApiBuildMatchesPromotion(apiSha, expected, outcome, context);
-  }
+  // Logged before the API verdict so a failing run still shows the web and
+  // head values; the API value follows on the next line (or in the error).
+  console.log(
+    `[${context}] build identity: web=${deployed} head=${expected} ` +
+      `staging-api=${outcome || '(not provided)'}`,
+  );
+  const verdict = resolveApiIdentity(apiRes.status(), apiBody, expected, outcome, context);
+  console.log(
+    `[${context}] build identity: web=${deployed} api=${verdict.apiSha ?? '(absent)'} ` +
+      `head=${expected}`,
+  );
   if (verdict.sameBuild) {
     console.log(`[${context}] build identity: web = API = head = ${expected}`);
   } else {
