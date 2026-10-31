@@ -34,6 +34,11 @@ class SchemaGateTests(unittest.TestCase):
     def check(self, **kwargs):
         gate.check(self.env, fetch=lambda env: self.payload, run=kwargs.get("run", self.run_psql))
 
+    def assertCategory(self, category, **kwargs):
+        with self.assertRaises(gate.CategorizedFailure) as caught:
+            self.check(**kwargs)
+        self.assertEqual(caught.exception.category, category)
+
     def test_success_is_catalog_only_bounded_and_secretless_argv(self):
         self.check()
         args, options = self.calls[0]
@@ -74,8 +79,7 @@ class SchemaGateTests(unittest.TestCase):
         for mode in ("require", "verify-ca", "prefer", "allow", "disable"):
             with self.subTest(mode=mode):
                 self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + "?sslmode=" + mode
-                with self.assertRaises(gate.GateError):
-                    self.check()
+                self.assertCategory("config")
         self.assertEqual(self.calls, [])
 
     def test_only_the_system_root_cert_option_is_accepted(self):
@@ -85,8 +89,7 @@ class SchemaGateTests(unittest.TestCase):
                       "&sslcert=/tmp/client.pem", "&options=-csearch_path%3Devil"):
             with self.subTest(extra=extra):
                 self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + extra
-                with self.assertRaises(gate.GateError):
-                    self.check()
+                self.assertCategory("config")
         self.assertEqual(self.calls, [])
 
     def test_missing_provider_credentials_fail_before_network(self):
@@ -99,8 +102,7 @@ class SchemaGateTests(unittest.TestCase):
             with self.subTest(key=key):
                 saved = copy.deepcopy(self.payload)
                 self.payload["result"]["origin"][key] = value
-                with self.assertRaises(gate.GateError):
-                    self.check()
+                self.assertCategory("binding")
                 self.payload = saved
         self.assertEqual(self.calls, [])
 
@@ -108,27 +110,49 @@ class SchemaGateTests(unittest.TestCase):
         for value in ("", "postgresql://u:p@database.example.test/production",
                       "postgresql://u:p@database.example.test/nntunev2_staging?sslmode=disable"):
             self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = value
-            with self.assertRaises(gate.GateError):
-                self.check()
+            self.assertCategory("config")
         self.assertEqual(self.calls, [])
 
     def test_provider_failure_prevents_database_connection(self):
         self.payload["success"] = False
-        with self.assertRaises(gate.GateError):
-            self.check()
+        self.assertCategory("binding")
+        self.assertEqual(self.calls, [])
+
+    def test_fetch_exception_is_binding_and_skips_database(self):
+        def boom(env):
+            raise OSError("synthetic-private-provider-error")
+        with self.assertRaises(gate.CategorizedFailure) as caught:
+            gate.check(self.env, fetch=boom, run=self.run_psql)
+        self.assertEqual(caught.exception.category, "binding")
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_provider_inputs_are_config_before_network(self):
+        fetched = []
+        for key in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "HYPERDRIVE_ID_STAGING"):
+            with self.subTest(key=key):
+                env = dict(self.env, **{key: ""})
+                with self.assertRaises(gate.CategorizedFailure) as caught:
+                    gate.check(env, fetch=fetched.append, run=self.run_psql)
+                self.assertEqual(caught.exception.category, "config")
+        self.assertEqual(fetched, [])
         self.assertEqual(self.calls, [])
 
     def test_empty_false_extra_and_error_results_never_pass(self):
-        for code, output in ((0, ""), (0, "f\n"), (0, "t\nt\n"), (1, "t\n")):
+        for code, output, category in ((0, "", "schema"), (0, "f\n", "schema"),
+                                       (0, "t\nt\n", "schema"), (1, "t\n", "query"),
+                                       (3, "t\n", "query"), (2, "t\n", "connect")):
             with self.subTest(code=code, output=output):
-                with self.assertRaises(gate.GateError):
-                    self.check(run=lambda args, **kw: subprocess.CompletedProcess(args, code, output, "private"))
+                self.assertCategory(
+                    category,
+                    run=lambda args, **kw: subprocess.CompletedProcess(args, code, output, "private"))
 
-    def test_timeouts_propagate_as_failure(self):
+    def test_timeouts_and_missing_client_fail_as_connect(self):
         def timeout(args, **kwargs):
             raise subprocess.TimeoutExpired(args, 15)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            self.check(run=timeout)
+        def missing(args, **kwargs):
+            raise FileNotFoundError("psql")
+        for run in (timeout, missing):
+            self.assertCategory("connect", run=run)
 
     def test_main_never_renders_private_exception_details(self):
         output = io.StringIO()
@@ -136,7 +160,21 @@ class SchemaGateTests(unittest.TestCase):
             with contextlib.redirect_stderr(output):
                 self.assertEqual(gate.main(), 1)
         self.assertNotIn("synthetic-private-password", output.getvalue())
-        self.assertIn("staging-api-schema: FAIL", output.getvalue())
+        self.assertIn("staging-api-schema: FAIL category=unknown", output.getvalue())
+
+    def test_main_prints_only_the_fixed_category(self):
+        for category in gate.CATEGORIES:
+            with self.subTest(category=category):
+                output = io.StringIO()
+                failure = gate.CategorizedFailure(category)
+                failure.__cause__ = RuntimeError("synthetic-private-password")
+                with patch.object(gate, "check", side_effect=failure):
+                    with contextlib.redirect_stderr(output):
+                        self.assertEqual(gate.main(), 1)
+                self.assertEqual(
+                    output.getvalue(),
+                    f"staging-api-schema: FAIL category={category} "
+                    "(configuration, target or schema not verified)\n")
 
     def test_staging_workflow_requires_executed_schema_success(self):
         workflow = (pathlib.Path(__file__).parents[1] / "workflows/deploy.yml").read_text()
