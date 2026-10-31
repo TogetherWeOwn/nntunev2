@@ -2718,6 +2718,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         );
         return internal_render(&trace_id);
     };
+    // `GET /healthz` reports the same normalized identity the log lines carry.
+    let config = config.with_build_sha(Some(build_sha.as_str()));
     // Classify the body source from the actual runtime request, then
     // collect through the tested seam: a legitimate bodyless request
     // (`inner().body()` is `None`; `stream()` would error for it too) is

@@ -238,6 +238,11 @@ How the suite uses them:
   with the promotion SHA `deploy.yml` passes as `expected_sha` from
   `github.sha` — never a source checkout — through one shared helper, so
   a green run proves the whole journey ran against the promoted build.
+  The same helper reads the API Worker's `GET /healthz` `build_sha`
+  and logs `web=… api=… head=…`. When `staging-api` deployed this run
+  (`API_DEPLOY_OUTCOME=deployed`, or unset), the API must equal the
+  promotion SHA too. When it was `skipped`/`unconfigured`, the log and a
+  `api-not-redeployed` annotation state that web=API=head is not claimed.
   Blocking a later production promotion on that result, and live
   enforcement, are still acceptance prerequisites of that later lane.
 

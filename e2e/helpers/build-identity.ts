@@ -133,3 +133,135 @@ export function assertDeployedBuildMatchesPromotion(
     );
   }
 }
+
+/**
+ * Outcome of the same-run `staging-api` job, as `API_DEPLOY_OUTCOME`
+ * (`deploy.yml` → `e2e-staging.yml` `inputs.api_deploy_outcome`). Empty when
+ * the caller does not wire it; the API verdict then stays strict.
+ */
+export function apiDeployOutcome(): string {
+  return (process.env.API_DEPLOY_OUTCOME || '').trim();
+}
+
+/**
+ * `staging-api` outcomes meaning this run did not redeploy the API on
+ * purpose: the job was skipped (no api changes / gate) or staging is not
+ * wired. The serving API is then an earlier build and may legitimately
+ * differ from head; the verdict says so instead of claiming web=API=head.
+ */
+const API_NOT_REDEPLOYED = new Set(['skipped', 'unconfigured']);
+
+/**
+ * Pull the API Worker build SHA out of a `GET /healthz` body.
+ *
+ * The Worker returns exactly `{ ok: true, build_sha }`, where `build_sha` is
+ * a 40-char lowercase hex SHA or `"unknown"`. A body of exactly `{ ok: true }`
+ * is an API build that predates identity reporting and returns `null`
+ * (the verdict decides whether that is acceptable). Anything else throws.
+ */
+export function extractApiBuildSha(bodyText: string, context: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText) as unknown;
+  } catch {
+    throw new Error(
+      `[${context}] API build identity body is not JSON (${bodyText.length} chars received): ` +
+        'expected exactly { ok, build_sha } from GET /healthz. See e2e/README.md.',
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(
+      `[${context}] API build identity body is not a JSON object: expected exactly ` +
+        '{ ok, build_sha } from GET /healthz. See e2e/README.md.',
+    );
+  }
+  const body = parsed as Record<string, unknown>;
+  const keys = Object.keys(body).sort();
+  if (body.ok !== true) {
+    throw new Error(`[${context}] API GET /healthz did not confirm ok:true. See e2e/README.md.`);
+  }
+  if (keys.length === 1) return null;
+  if (keys.length !== 2 || keys[1] !== 'ok' || keys[0] !== 'build_sha') {
+    throw new Error(
+      `[${context}] API build identity body must carry exactly { ok, build_sha } from ` +
+        `GET /healthz, got keys: ${keys.join(', ')}. See e2e/README.md.`,
+    );
+  }
+  if (typeof body.build_sha !== 'string' || body.build_sha.length === 0) {
+    throw new Error(
+      `[${context}] API build identity build_sha is missing: expected a 40-hex SHA or ` +
+        '"unknown" from GET /healthz. See e2e/README.md.',
+    );
+  }
+  return body.build_sha;
+}
+
+/**
+ * Verdict for the API Worker identity against the promotion SHA.
+ *
+ * - `staging-api` deployed this run (or the outcome is not wired): strict.
+ *   The API must report exactly the promotion SHA; absent, `"unknown"`,
+ *   malformed or different throws by name.
+ * - `staging-api` skipped/unconfigured: the API was not redeployed, so a
+ *   different SHA is legitimate. Returns `sameBuild: false` with a note the
+ *   caller logs and annotates — never a silent pass, never a web=API claim.
+ * - Any other outcome (failed, cancelled, unexpected): throws.
+ */
+export function assertApiBuildMatchesPromotion(
+  apiSha: string | null,
+  expectedSha: string,
+  outcome: string,
+  context: string,
+): { sameBuild: boolean; note: string } {
+  const shown = apiSha ?? '(absent)';
+  if (API_NOT_REDEPLOYED.has(outcome)) {
+    const sameBuild = apiSha === expectedSha;
+    return {
+      sameBuild,
+      note: sameBuild
+        ? `staging-api ${outcome} this run, yet the API already serves the promotion SHA ${expectedSha}.`
+        : `staging-api ${outcome} this run: the API was not redeployed and serves ${shown}, ` +
+          `which legitimately differs from the promotion SHA ${expectedSha}. ` +
+          'web=API=head is NOT claimed for this run.',
+    };
+  }
+  if (outcome !== '' && outcome !== 'deployed') {
+    throw new Error(
+      `[${context}] API build identity cannot be claimed: staging-api outcome is ` +
+        `"${outcome}" (expected deployed, skipped or unconfigured). See e2e/README.md.`,
+    );
+  }
+  const unwired =
+    outcome === ''
+      ? ' API_DEPLOY_OUTCOME is not set, so the API is held to the promotion SHA; if ' +
+        'staging-api did not deploy this run, wire inputs.api_deploy_outcome from deploy.yml.'
+      : '';
+  if (apiSha === null) {
+    throw new Error(
+      `[${context}] API build identity is absent: GET /healthz carries no build_sha ` +
+        `(an API build that predates identity reporting), promotion SHA ${expectedSha}.` +
+        `${unwired} See e2e/README.md.`,
+    );
+  }
+  if (apiSha === 'unknown') {
+    throw new Error(
+      `[${context}] API build identity is unknown: GET /healthz reported "unknown" instead ` +
+        `of the promotion SHA ${expectedSha} (BUILD_SHA var not set on the Worker).` +
+        `${unwired} See e2e/README.md.`,
+    );
+  }
+  if (!SHA40.test(apiSha)) {
+    throw new Error(
+      `[${context}] API build identity is malformed: GET /healthz reported a build_sha that ` +
+        `is neither 40-hex nor "unknown". Promotion SHA ${expectedSha}.${unwired} See e2e/README.md.`,
+    );
+  }
+  if (apiSha !== expectedSha) {
+    throw new Error(
+      `[${context}] API build identity mismatch: API build ${apiSha} does not match the ` +
+        `promotion SHA ${expectedSha} from the push-triggered deploy run.${unwired} ` +
+        'See e2e/README.md.',
+    );
+  }
+  return { sameBuild: true, note: '' };
+}

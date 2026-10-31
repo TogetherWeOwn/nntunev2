@@ -243,6 +243,12 @@ pub struct Config {
     /// the flag is on: with no expected value there is nothing to compare
     /// against, so every seam request 404s.
     pub qa_auth_token: Option<String>,
+    /// Deployed build identity reported by `GET /healthz`: a 40-char
+    /// lowercase hex commit or the explicit `"unknown"` marker. The
+    /// constructor defaults to `"unknown"`; the Worker entry stages the
+    /// public `BUILD_SHA` var via [`Config::with_build_sha`], which
+    /// normalizes through the shared validator so nothing else can leak.
+    pub build_sha: String,
 }
 
 impl Config {
@@ -290,6 +296,7 @@ impl Config {
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
+            build_sha: crate::logging::BUILD_SHA_UNKNOWN.to_string(),
         })
     }
 
@@ -375,6 +382,14 @@ impl Config {
     /// value to compare against, so every seam request 404s.
     pub fn with_qa_auth_token(mut self, token: &str) -> Self {
         self.qa_auth_token = Some(token.to_string());
+        self
+    }
+
+    /// Stage the deployed build identity for `GET /healthz`. Anything
+    /// that is not a 40-char lowercase hex commit becomes `"unknown"`, so
+    /// the health body never echoes an arbitrary var value.
+    pub fn with_build_sha(mut self, raw: Option<&str>) -> Self {
+        self.build_sha = crate::logging::parse_build_sha(raw);
         self
     }
 
@@ -3708,7 +3723,10 @@ where
         }
     }
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/healthz") => json_response(200, serde_json::json!({"ok": true})),
+        ("GET", "/healthz") => json_response(
+            200,
+            serde_json::json!({"ok": true, "build_sha": ctx.cfg.build_sha}),
+        ),
         ("POST", "/v1/auth/passkey/register/start") => register_start(ctx, req).await,
         ("POST", "/v1/auth/passkey/register/finish") => register_finish(ctx, req).await,
         ("POST", "/v1/auth/passkey/login/start") => login_start(ctx, req).await,
@@ -10381,6 +10399,32 @@ mod tests {
         );
         assert_eq!(resp.status, 401);
         assert!(resp.set_cookie.is_none());
+    }
+
+    #[test]
+    fn healthz_reports_only_ok_and_build_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        // Unset var: explicit marker, never a missing key.
+        let h = harness();
+        let resp = h.call_full("GET", "/healthz", None, None, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body, serde_json::json!({"ok": true, "build_sha": "unknown"}));
+        // Valid SHA passes through; the body carries exactly two keys.
+        let mut h = harness();
+        h.config = h.config.with_build_sha(Some(sha));
+        let resp = h.call_full("GET", "/healthz", None, None, None);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body, serde_json::json!({"ok": true, "build_sha": sha}));
+        // Anything else is dropped, never echoed.
+        let upper = sha.to_uppercase();
+        for raw in ["", "abc123", upper.as_str(), "<script>", "secret-value"] {
+            let mut h = harness();
+            h.config = h.config.with_build_sha(Some(raw));
+            let resp = h.call_full("GET", "/healthz", None, None, None);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body, serde_json::json!({"ok": true, "build_sha": "unknown"}), "{raw}");
+        }
     }
 
     #[test]

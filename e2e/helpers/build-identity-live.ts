@@ -1,10 +1,13 @@
-import type { APIRequestContext } from '@playwright/test';
+import { test, type APIRequestContext } from '@playwright/test';
 import { API } from './contract.js';
 import { accessHeaders, assertNoAccessWall } from './access.js';
 import { apiGet } from './accounts.js';
 import {
+  apiDeployOutcome,
+  assertApiBuildMatchesPromotion,
   assertDeployedBuildMatchesPromotion,
   expectedPromotionSha,
+  extractApiBuildSha,
   extractDeployedSha,
 } from './build-identity.js';
 
@@ -17,9 +20,13 @@ import {
  * `apiGet` wrapper, clears the Access-wall check, requires HTTP 200 with
  * exactly `{ sha }` from `GET /api/build`, and requires strict equality
  * with the promotion SHA (`EXPECTED_BUILD_SHA` from the push-triggered
- * deploy run — never a source checkout). Every gap throws by name;
- * callers skip only while `STAGING_BASE_URL` is unset. Returns the
- * deployed SHA so the closing leg can name it.
+ * deploy run — never a source checkout). Then reads the API Worker's
+ * `GET /healthz` `build_sha` through the same Access pair and holds it to
+ * the same SHA unless `staging-api` did not redeploy this run
+ * (`API_DEPLOY_OUTCOME` skipped/unconfigured), which is logged and
+ * annotated explicitly. Logs one plain `web=… api=… head=…` line for QA.
+ * Every gap throws by name; callers skip only while `STAGING_BASE_URL` is
+ * unset. Returns the web SHA so the closing leg can name it.
  */
 export async function assertServingBuildMatchesPromotion(
   request: APIRequestContext,
@@ -47,5 +54,34 @@ export async function assertServingBuildMatchesPromotion(
   }
   const deployed = extractDeployedSha(bodyText, context);
   assertDeployedBuildMatchesPromotion(deployed, expected, context);
+
+  const apiUrl = `${baseURL}${API.healthz}`;
+  const apiRes = await apiGet(request, apiUrl, accessHeaders(), context);
+  const apiBody = await apiRes.text().catch(() => '');
+  assertNoAccessWall(
+    { status: apiRes.status(), headers: apiRes.headers(), bodyText: apiBody, url: apiUrl },
+    context,
+  );
+  if (apiRes.status() !== 200) {
+    throw new Error(
+      `[${context}] API build identity request failed: expected HTTP 200 from GET /healthz, ` +
+        `got HTTP ${apiRes.status()} (body ${apiBody.length} chars, ` +
+        `promotion SHA ${expected}). See e2e/README.md.`,
+    );
+  }
+  const apiSha = extractApiBuildSha(apiBody, context);
+  const outcome = apiDeployOutcome();
+  // Log before the verdict so a failing run still shows both values.
+  console.log(
+    `[${context}] build identity: web=${deployed} api=${apiSha ?? '(absent)'} ` +
+      `head=${expected} staging-api=${outcome || '(not provided)'}`,
+  );
+  const verdict = assertApiBuildMatchesPromotion(apiSha, expected, outcome, context);
+  if (verdict.sameBuild) {
+    console.log(`[${context}] build identity: web = API = head = ${expected}`);
+  } else {
+    console.log(`[${context}] build identity: ${verdict.note}`);
+    test.info().annotations.push({ type: 'api-not-redeployed', description: verdict.note });
+  }
   return deployed;
 }
