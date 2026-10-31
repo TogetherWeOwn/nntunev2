@@ -57,7 +57,7 @@ concurrency:
 env:
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
-  WRANGLER_VERSION: 4.150.0
+  WRANGLER_VERSION: 4.153.0
   # Placeholder production hostname until the launch decision lands in the
   # repo variable PRODUCTION_DOMAIN. ".invalid" never resolves, so a
   # misconfigured run cannot send traffic anywhere real; the preflight job

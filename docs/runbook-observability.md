@@ -70,7 +70,7 @@ attachment state in the private deployment record. Never record secret values.
    authorized executor restores/removes only that attachment under its own
    recorded rollback contract; this lane does not manage producer settings.
 2. For an existing known-good version with the same DO migration lineage, use
-   pinned Wrangler 4.150.0:
+   pinned Wrangler 4.153.0:
    `wrangler rollback "$LAST_KNOWN_GOOD_VERSION" --name nntune-alerts-staging`.
    Select the recorded version explicitly; never rely on implicit "previous".
    [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
