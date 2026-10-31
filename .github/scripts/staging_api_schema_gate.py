@@ -27,6 +27,13 @@ class GateError(Exception):
 #   schema   - query ran; required sessions columns absent or shadowed
 CATEGORIES = ("config", "binding", "connect", "query", "schema")
 
+# Fixed, non-secret operator hints. Like the category word, these are constants
+# and never derived from exception text, so redaction is unaffected.
+HINTS = {
+    "schema": "staging schema behind repo migrations — see docs/ops.md staging migrations",
+}
+DEFAULT_HINT = "configuration, target or schema not verified"
+
 
 class CategorizedFailure(Exception):
     def __init__(self, category):
@@ -175,8 +182,8 @@ def main():
         # payloads, or stderr; each can contain credentials or private targets.
         # Only a fixed category word from CATEGORIES is printed.
         category = exc.category if isinstance(exc, CategorizedFailure) else "unknown"
-        print(f"staging-api-schema: FAIL category={category} "
-              "(configuration, target or schema not verified)", file=sys.stderr)
+        hint = HINTS.get(category, DEFAULT_HINT)
+        print(f"staging-api-schema: FAIL category={category} ({hint})", file=sys.stderr)
         return 1
     print("staging-api-schema: PASS (actual staging binding; read-only schema check)")
     return 0
