@@ -419,8 +419,10 @@ mod tests {
     fn non_canonical_signature_spelling_is_malformed() {
         // A 32-byte HMAC is 43 chars; the last carries 2 zero pad bits.
         // Setting one yields the same bytes under a second spelling.
+        // Verify just inside the TTL cap so only the spelling decides.
+        let now = 1_700_000_000 - MAX_GRANT_TTL;
         let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
-        assert!(verify(&token, SECRET, 1).is_ok());
+        assert!(verify(&token, SECRET, now).is_ok());
         let mut forged = token.into_bytes();
         let last = forged.last_mut().unwrap();
         let tail = *last;
@@ -428,6 +430,6 @@ mod tests {
         assert_eq!(idx & 0b11, 0, "canonical tail has zero pad bits");
         *last = B64URL[idx | 0b01];
         let forged = String::from_utf8(forged).unwrap();
-        assert_eq!(verify(&forged, SECRET, 1), Err(GrantError::Malformed));
+        assert_eq!(verify(&forged, SECRET, now), Err(GrantError::Malformed));
     }
 }
