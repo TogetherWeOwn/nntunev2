@@ -568,32 +568,6 @@ impl PgStore {
         with_deadline(operation, timeout_ms, StoreError).await
     }
 
-    /// [`Self::bounded`] for the mint-seam methods. When the shared
-    /// deadline drops `operation` before it settles, the connect and
-    /// statement failure records inside it never run, so record `event`
-    /// (an `api.db.deadline_exceeded.<operation>` name) instead.
-    async fn bounded_logged<T>(
-        &self,
-        operation: impl Future<Output = Result<T, StoreError>>,
-        timeout_ms: u64,
-        event: &str,
-    ) -> Result<T, StoreError> {
-        let settled = std::cell::Cell::new(false);
-        let outcome = Self::bounded(
-            async {
-                let outcome = operation.await;
-                settled.set(true);
-                outcome
-            },
-            timeout_ms,
-        )
-        .await;
-        if outcome.is_err() && !settled.get() {
-            return Err(self.statement_failed(event));
-        }
-        outcome
-    }
-
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
@@ -662,8 +636,7 @@ impl PgStore {
     }
 
     /// Opaque `StoreError` for a failed statement, after an
-    /// `api.db.statement_failed.<operation>` (or deadline) record named
-    /// by `event`.
+    /// `api.db.statement_failed.<operation>` record (`event` names it).
     fn statement_failed(&self, event: &str) -> StoreError {
         let build_sha = self
             .env
@@ -933,7 +906,7 @@ async fn prune_expired_challenges_on(
 
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
-        self.bounded_logged(
+        Self::bounded(
             async {
                 let client = self.connect().await?;
                 let row = client
@@ -946,13 +919,12 @@ impl Store for PgStore {
                 row.map(|r| user_from_row(&r)).transpose()
             },
             TOTAL_TIMEOUT_MS,
-            "api.db.deadline_exceeded.user_by_email",
         )
         .await
     }
 
     async fn insert_user(&self, user: &UserRecord) -> Result<(), StoreError> {
-        self.bounded_logged(
+        Self::bounded(
             async {
                 let client = self.connect().await?;
                 client
@@ -965,7 +937,6 @@ impl Store for PgStore {
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
-            "api.db.deadline_exceeded.insert_user",
         )
         .await
     }
@@ -1257,7 +1228,7 @@ impl Store for PgStore {
     }
 
     async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
-        self.bounded_logged(async {
+        Self::bounded(async {
         let client = self.connect().await?;
         client
             .execute(
@@ -1274,7 +1245,7 @@ impl Store for PgStore {
             .await
             .map_err(|_| self.statement_failed("api.db.statement_failed.insert_session"))?;
         Ok(())
-        }, TOTAL_TIMEOUT_MS, "api.db.deadline_exceeded.insert_session").await
+        }, TOTAL_TIMEOUT_MS).await
     }
 
     async fn redeem_magic_link(
@@ -2906,7 +2877,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 11] = [
+    const DB_FAILURE_EVENTS: [&str; 8] = [
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -2915,9 +2886,6 @@ mod tests {
         "api.db.statement_failed.user_by_email",
         "api.db.statement_failed.insert_user",
         "api.db.statement_failed.insert_session",
-        "api.db.deadline_exceeded.user_by_email",
-        "api.db.deadline_exceeded.insert_user",
-        "api.db.deadline_exceeded.insert_session",
     ];
 
     #[test]
@@ -3066,41 +3034,10 @@ mod tests {
                 .split_once("\n    async fn ")
                 .expect("a following method must bound it")
                 .0;
-            let site = match kind {
-                "statement_failed" => format!("self.statement_failed(\"{event}\")"),
-                "deadline_exceeded" => format!("\"{event}\""),
-                other => panic!("unexpected db failure kind {other}"),
-            };
+            assert_eq!(kind, "statement_failed", "unexpected db failure kind");
+            let site = format!("self.statement_failed(\"{event}\")");
             assert!(method.contains(&site), "{operation} must emit {event}");
-            if kind == "deadline_exceeded" {
-                assert!(
-                    method.contains("self.bounded_logged("),
-                    "{operation} must race through bounded_logged"
-                );
-            }
         }
-    }
-
-    #[test]
-    fn bounded_logged_keeps_the_outcome_and_expires_a_stalled_operation() {
-        let store = PgStore {
-            env: None,
-            trace_id: REQUEST_TRACE.to_string(),
-            #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
-            test_client: std::cell::RefCell::new(None),
-        };
-        let mut stalled = Box::pin(store.bounded_logged(
-            std::future::pending::<Result<u8, StoreError>>(),
-            25,
-            "api.db.deadline_exceeded.user_by_email",
-        ));
-        assert!(poll_bounded_to_ready(stalled.as_mut()).is_err());
-        let mut ready = Box::pin(store.bounded_logged(
-            std::future::ready(Ok::<u8, StoreError>(7)),
-            25,
-            "api.db.deadline_exceeded.user_by_email",
-        ));
-        assert_eq!(poll_bounded_to_ready(ready.as_mut()).unwrap(), 7);
     }
 
     #[test]
