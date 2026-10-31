@@ -29,6 +29,20 @@ id-free branch names; squash-merge keeps branch names off main).
 
 Follow `.github/pull_request_template.md`: what changed, why, how tested.
 
+## Pull-request size
+
+Keep each PR to about **400 counted lines** or fewer, counted as the
+`pr-size` labels below count them (additions + deletions, excluding
+lockfiles, generated files and fixtures). Split larger work into a series of
+reviewable PRs. A PR that cannot be split adds one line to its body:
+
+```text
+Size justification: <why this change cannot land in smaller pieces>
+```
+
+The limit is a working agreement, not a gate: the `pr-size` workflow stays
+advisory and no required check enforces it.
+
 ## Pull-request size labels (advisory)
 
 `.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
@@ -53,9 +67,19 @@ labels are the durable record behind it.
   only `squash`, merge queue merges with `SQUASH`); the squash commit title
   is the PR title.
 - Delete the branch on merge (automatic repo setting).
-- Every PR must pass **`ci-ok` + `gitleaks` + `pr-lint` + Paperclip Review 5/5**
-  before merge. These are required status checks on `main` (the
-  `protect-main` ruleset).
+- Every PR must pass the required status checks on `main` (the
+  `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit`
+  and `Devin Review`**.
+- **Human (board) approval is required to merge.** Agents and bots open,
+  update and mark PRs ready for review; they do not merge.
+- Bot review findings (CodeRabbit, Devin Review) are advisory. Fix real
+  defects or answer them in the thread with evidence; do not chase a score
+  or rework a PR only to silence a bot.
+- Tests prove behaviour. Do not add bespoke oracle or proof scripts just to
+  satisfy a reviewer; a new guard or gate script needs its own justification
+  in the PR body (what it catches that tests cannot).
+- Staging migrations: TODO — link the migration staging-apply checklist once
+  the recurrence-guard change lands.
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection
   enabled) enforce this.
