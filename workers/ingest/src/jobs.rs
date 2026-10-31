@@ -332,23 +332,30 @@ mod tests {
     }
 
     fn checkpoint_at(state: JobState) -> JobCheckpoint {
-        JobCheckpoint {
-            job_id: "job_0123456789abcdef".to_string(),
-            user_id: "user_01".to_string(),
-            idempotency_key: format!("ingest:user_01:{}:upload", "a".repeat(64)),
-            source: JobSource::NzbUpload,
-            state,
-            attempt: 1,
-            repair_rounds: 0,
-            probe_tally: None,
-            par2_set_id: None,
-            missing_blocks: 0,
-            failure_code: None,
-            failure_reason: None,
-            provider_id: None,
-            transcode_inputs: Vec::new(),
-            transcode_next: 0,
-        }
+        // Serde-built so a future defaulted checkpoint field compiles
+        // without touching this helper: unknown fields are ignored now
+        // and defaulted then. Values mirror the previous literal exactly.
+        serde_json::from_value(serde_json::json!({
+            "job_id": "job_0123456789abcdef",
+            "user_id": "user_01",
+            "idempotency_key": format!("ingest:user_01:{}:upload", "a".repeat(64)),
+            "source": JobSource::NzbUpload,
+            "state": state,
+            "attempt": 1,
+            "repair_rounds": 0,
+            "probe_tally": null,
+            "par2_set_id": null,
+            "missing_blocks": 0,
+            "failure_code": null,
+            "failure_reason": null,
+            "provider_id": null,
+            "transcode_inputs": [],
+            "transcode_next": 0,
+            // Future track-identity map: ignored until the field lands,
+            // then deserializes to its empty default.
+            "track_ids": null,
+        }))
+        .expect("test checkpoint shape must deserialize")
     }
 
     #[test]

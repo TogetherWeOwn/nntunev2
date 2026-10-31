@@ -1,4 +1,4 @@
-//! `ingest_jobs` writer: admission row + terminal transition (migration 0021).
+//! `ingest_jobs` writer: admission row + terminal transition (migration 0022).
 //!
 //! One row per pipeline job, keyed by the deterministic `job_id`
 //! (`dispatch::make_job_id`) with `UNIQUE(user_id, idempotency_key)`
@@ -46,6 +46,14 @@ pub const INGEST_JOB_ADMIT_PARAM_ORDER: [&str; 4] =
 /// is BIGINT unix seconds bound by the caller.
 pub fn upsert_ingest_job_sql() -> &'static str {
     "INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status) SELECT $1, $2, $3, $4, 'queued' FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (id) DO NOTHING"
+}
+
+/// Disambiguate an ignored admission insert using its immutable identity and
+/// the stored owner's current deletion fence. Parameter: job `id` ($1). The
+/// caller compares both stored fields; a persisted job alone cannot authorize
+/// admission after deletion starts or adopt another owner's job.
+pub fn select_ingest_job_identity_sql() -> &'static str {
+    "SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id WHERE ingest_jobs.id = $1 AND users.deleting_at IS NULL FOR SHARE OF users"
 }
 
 /// `$n` parameter order for [`transition_ingest_job_sql`].
@@ -100,7 +108,7 @@ pub fn validate_transition_status(raw: &str) -> bool {
 }
 
 /// Check admission values before they touch the database. Bounds mirror
-/// migration 0021 (`CHECK`s on `id`, `idempotency_key`, `accepted_at`);
+/// migration 0022 (`CHECK`s on `id`, `idempotency_key`, `accepted_at`);
 /// the key shape mirrors the ingest key (`ingest:` prefix).
 pub fn validate_admit_params(
     job_id: &str,

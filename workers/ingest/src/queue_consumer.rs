@@ -1356,15 +1356,42 @@ async fn resolve_library_write(
     ))
 }
 
-/// The side effects [`run_match_write_with`] sequences, behind a trait so
-/// the meter-before-advance ordering is regression-tested with a fake
-/// instead of resting on prose (the edge impl needs an `Env`). `meter`
-/// failures are unit errors: the sequencer maps them to the failing
-/// stage's error code, so a fake cannot accidentally bless the wrong code.
-trait MatchWriteRuntime {
+/// Detailed match input for normalized tracks. File ordinals come from the
+/// original NZB; recording metadata must not be reduced to an ID-only list.
+#[derive(Debug, Clone)]
+pub struct DetailedTrackMatch {
+    pub release_mbid: Option<String>,
+    pub files: Vec<nntune_core::nzb::File>,
+    pub recordings: Vec<crate::matching::MbRecording>,
+}
+
+/// The real matching/writing sequencer's effects. The new normalized-track
+/// hooks are fail-closed test boundaries until their independent acceptance
+/// bank lands; the legacy path below does not call them yet. `meter` failures
+/// are unit errors so the sequencer, not the adapter, owns their stage code.
+#[allow(async_fn_in_trait)]
+pub trait MatchWriteRuntime {
     async fn resolve(&self, msg: &QueueMsg) -> Result<crate::queue::LibraryWrite, JobError>;
     async fn meter(&self, msg: &QueueMsg, stage: &'static str) -> Result<(), ()>;
     async fn upsert(&self, write: &crate::queue::LibraryWrite) -> Result<(), JobError>;
+
+    async fn resolve_tracks(&self, _msg: &QueueMsg) -> Result<DetailedTrackMatch, JobError> {
+        Err(JobError::transient(
+            ERR_MATCH_FAILED,
+            "track match unavailable",
+        ))
+    }
+
+    async fn materialize_tracks(
+        &self,
+        _user_id: &str,
+        _rows: &[crate::track_writers::TrackRow<'_>],
+    ) -> Result<std::collections::BTreeMap<usize, String>, JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "track writer unavailable",
+        ))
+    }
 }
 
 /// Edge [`MatchWriteRuntime`]: MB resolution, Analytics Engine meter, and
@@ -1486,7 +1513,7 @@ async fn execute_write_with<R: MatchWriteRuntime>(
 /// next. A delivery that enters in `Writing` (checkpoint persisted
 /// after the transcode transition) re-resolves and writes without
 /// re-emitting `match`.
-async fn run_match_write_with<R: MatchWriteRuntime>(
+pub async fn run_match_write_with<R: MatchWriteRuntime>(
     runtime: &R,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
@@ -1524,12 +1551,12 @@ async fn run_match_write(
     .await
 }
 
-/// `Transcoding` edge dependencies, split for tests: the front call,
-/// scratch artifact fetch, audio-bucket put, blob-row publication,
-/// meter, config and clock. Every method is neutral (no job codes);
-/// the step owns all error mapping so it is unit-tested through the
-/// fake below.
-trait TranscodeRuntime {
+/// `Transcoding` edge dependencies, exposed for native tests of the real
+/// sequencer. Artifact methods use neutral errors; owned publication methods
+/// retain the writer's permanent/transient verdict. The new context/media
+/// hooks fail closed and remain uncalled until their integration is tested.
+#[allow(async_fn_in_trait)]
+pub trait TranscodeRuntime {
     async fn call_front(
         &self,
         req: &crate::transcode::TranscodeRequest,
@@ -1544,8 +1571,33 @@ trait TranscodeRuntime {
         publication: &crate::transcode::TranscodePublication,
     ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError>;
     async fn meter_transcode(&self, msg: &QueueMsg) -> Result<(), ()>;
+    // Preserve the existing neutral config-error contract; the sequencer maps
+    // it to the stage's JobError, just like the async artifact methods above.
+    #[allow(clippy::result_unit_err)]
     fn audio_bucket(&self) -> Result<String, ()>;
     fn now_unix_secs(&self) -> i64;
+
+    async fn validate_context(
+        &self,
+        _msg: &QueueMsg,
+        _cp: &JobCheckpoint,
+        _input: &crate::transcode::TranscodeInput,
+    ) -> Result<crate::writer_execution::PublicationContext, JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "publication context unavailable",
+        ))
+    }
+
+    async fn publish_media(
+        &self,
+        _publication: &crate::writer_execution::MediaPublication,
+    ) -> Result<(), JobError> {
+        Err(JobError::transient(
+            ERR_WRITE_FAILED,
+            "media publication unavailable",
+        ))
+    }
 }
 
 /// Edge [`TranscodeRuntime`]: transcode service binding, scratch and
@@ -1697,7 +1749,7 @@ impl TranscodeRuntime for EdgeTranscode<'_> {
 /// the R2 put overwrites identical bytes, the blob upsert converges).
 /// Per-user rows stay unwired (see the transcode module docs): this
 /// step publishes bytes plus `cache_objects` only.
-async fn run_transcode_step_with<R: TranscodeRuntime>(
+pub async fn run_transcode_step_with<R: TranscodeRuntime>(
     runtime: &R,
     msg: &QueueMsg,
     cp: &mut JobCheckpoint,
@@ -1901,6 +1953,155 @@ fn plan_settlement(
     }
 }
 
+/// Lifecycle boundary below settlement planning and above edge effects. A
+/// separately authored native bank can observe terminal -> persist -> enqueue
+/// order without replacing the writer sequence or invoking a Workers Env.
+trait SettlementRuntime {
+    async fn settle_job(&self, msg: &QueueMsg, status: &'static str) -> Result<(), JobError>;
+    async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool;
+    async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool;
+}
+
+struct EdgeSettlement<'a> {
+    env: &'a Env,
+    trace_id: &'a str,
+}
+
+impl SettlementRuntime for EdgeSettlement<'_> {
+    async fn settle_job(&self, msg: &QueueMsg, status: &'static str) -> Result<(), JobError> {
+        let client = crate::library_db_client(self.env, self.trace_id)
+            .await
+            .map_err(|()| JobError::transient(ERR_WRITE_FAILED, "writer database unavailable"))?;
+        let db = crate::writer_transport::PgWriterDb::new(&client, || {
+            worker::Delay::from(std::time::Duration::from_millis(
+                crate::library::LIBRARY_DB_DEADLINE_MS,
+            ))
+        });
+        crate::writer_execution::settle_job(&db, &msg.job_id, &msg.user_id, status).await
+    }
+
+    async fn persist_checkpoint(&self, cp: &JobCheckpoint) -> bool {
+        if !persist(self.env, cp, self.trace_id).await {
+            return false;
+        }
+        true
+    }
+
+    async fn enqueue_continuation(&self, msg: &QueueMsg) -> bool {
+        send_continuation(self.env, msg).await
+    }
+}
+
+/// Gate terminal checkpoints (including replays) on the durable job writer.
+/// A transient writer failure leaves the previous durable KV state untouched;
+/// deterministic failure is quarantined as write_failed, never phantom Done.
+async fn settle_checkpoint_with<R: SettlementRuntime>(
+    runtime: &R,
+    msg: &QueueMsg,
+    cp: &mut JobCheckpoint,
+    step: Result<(), JobError>,
+    step_ran: bool,
+) -> Settlement {
+    if !checkpoint_matches(msg, cp) {
+        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
+    }
+    let (must_persist, mut settlement) = plan_settlement(msg, cp, step, step_ran);
+    let status = match cp.state {
+        JobState::Done => Some("done"),
+        JobState::Failed => Some("failed"),
+        _ => None,
+    };
+    if let Some(status) = status {
+        if let Err(error) = runtime.settle_job(msg, status).await {
+            if error.transient {
+                return Settlement::RetryAfter(
+                    error
+                        .retry_after_secs
+                        .unwrap_or(UNPERSISTED_RETRY_SECS)
+                        .clamp(
+                            UNPERSISTED_RETRY_SECS,
+                            crate::retry::MAX_HINTED_RETRY_DELAY_SECS,
+                        ),
+                );
+            }
+            // Plan a separate failure, rather than allowing Done/Failed's
+            // sticky replay arms to hide a deterministic writer failure.
+            // Replays keep the original checkpoint; a new delivery may record
+            // only Failed/write_failed, never a successful terminal write.
+            let mut failure = cp.clone();
+            failure.state = JobState::Writing;
+            let (_, failed) = plan_settlement(
+                msg,
+                &mut failure,
+                Err(JobError::permanent(ERR_WRITE_FAILED, error.detail)),
+                true,
+            );
+            settlement = failed;
+            if must_persist {
+                *cp = failure;
+            }
+        }
+    }
+    if must_persist && !runtime.persist_checkpoint(cp).await {
+        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
+    }
+    match settlement {
+        Settlement::Continue => {
+            if runtime.enqueue_continuation(msg).await {
+                Settlement::Ack
+            } else {
+                Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
+            }
+        }
+        other => other,
+    }
+}
+
+/// Raw delivery operations below the same settlement tested natively. The
+/// production adapter will forward these to RawMessage and the DLQ binding.
+trait DeliveryRuntime {
+    async fn quarantine(&self, entry: &DlqEntry) -> bool;
+    fn ack(&self);
+    fn retry(&self, seconds: u32);
+}
+
+struct EdgeDelivery<'a> {
+    env: &'a Env,
+    raw: &'a worker::RawMessage,
+    trace_id: &'a str,
+}
+
+impl DeliveryRuntime for EdgeDelivery<'_> {
+    async fn quarantine(&self, entry: &DlqEntry) -> bool {
+        send_to_dlq(self.env, entry, self.trace_id).await
+    }
+
+    fn ack(&self) {
+        self.raw.ack();
+    }
+
+    fn retry(&self, seconds: u32) {
+        retry_raw(self.raw, seconds);
+    }
+}
+
+/// A quarantine acknowledgement requires a completed DLQ send. An unresolved
+/// continuation is defensive-retried, never acknowledged without a fresh copy.
+async fn apply_settlement_with<R: DeliveryRuntime>(runtime: &R, settlement: Settlement) {
+    match settlement {
+        Settlement::Ack => runtime.ack(),
+        Settlement::RetryAfter(seconds) => runtime.retry(seconds),
+        Settlement::Continue => runtime.retry(UNPERSISTED_RETRY_SECS),
+        Settlement::Quarantine(entry) => {
+            if runtime.quarantine(&entry).await {
+                runtime.ack();
+            } else {
+                runtime.retry(UNPERSISTED_RETRY_SECS);
+            }
+        }
+    }
+}
+
 /// In-invocation retry policy for a rejected checkpoint write: exactly one
 /// retry, after waiting out KV's 1 s same-key write window (plus margin).
 /// The colliding write is the admission route's initial/reset checkpoint
@@ -1971,33 +2172,18 @@ async fn process_message(env: &Env, msg: &QueueMsg) -> Settlement {
     } else {
         Ok(())
     };
-    let (must_persist, settlement) = plan_settlement(msg, &mut cp, step, step_ran);
-    if must_persist
-        && !persist(
+    let trace_id = nntune_logging::resolve_trace_id(msg.trace_id.as_deref());
+    settle_checkpoint_with(
+        &EdgeSettlement {
             env,
-            &cp,
-            &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
-        )
-        .await
-    {
-        return Settlement::RetryAfter(UNPERSISTED_RETRY_SECS);
-    }
-    match settlement {
-        // The persisted tally is the continuation's payload: enqueue a
-        // fresh copy of the (identity-stable) message — a new native
-        // retry count for a delivery that spent no attempt — and ack
-        // the original. On enqueue failure fall back to a native retry,
-        // which resumes from the same persisted tally; never ack, or
-        // the job would stall mid-probe with no delivery outstanding.
-        Settlement::Continue => {
-            if send_continuation(env, msg).await {
-                Settlement::Ack
-            } else {
-                Settlement::RetryAfter(UNPERSISTED_RETRY_SECS)
-            }
-        }
-        other => other,
-    }
+            trace_id: &trace_id,
+        },
+        msg,
+        &mut cp,
+        step,
+        step_ran,
+    )
+    .await
 }
 
 /// Enqueue the fresh copy a progress continuation continues on, delayed
@@ -2103,23 +2289,16 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
         "ingest.job.consumed",
         serde_json::json!({"job_id": msg.job_id, "build_sha": build_sha}),
     );
-    match process_message(env, &msg).await {
-        Settlement::Ack => raw.ack(),
-        // `process_message` resolves a continuation into Ack (fresh copy
-        // enqueued) or a native retry, so this never reaches here; if it
-        // ever did, retry rather than ack a job with no copy outstanding.
-        Settlement::Continue => retry_raw(&raw, UNPERSISTED_RETRY_SECS),
-        Settlement::RetryAfter(seconds) => retry_raw(&raw, seconds),
-        Settlement::Quarantine(entry) => {
-            // Never ack on DLQ-send failure: the redelivery re-plans from
-            // the persisted `Failed` checkpoint and retries the send.
-            if send_to_dlq(env, &entry, &trace_id).await {
-                raw.ack()
-            } else {
-                retry_raw(&raw, UNPERSISTED_RETRY_SECS)
-            }
-        }
-    }
+    let settlement = process_message(env, &msg).await;
+    apply_settlement_with(
+        &EdgeDelivery {
+            env,
+            raw: &raw,
+            trace_id: &trace_id,
+        },
+        settlement,
+    )
+    .await;
 }
 
 #[worker::event(queue)]
@@ -2381,8 +2560,37 @@ mod tests {
         assert_eq!(settlement, Settlement::Ack);
     }
 
+    /// Future track association read through JSON so this helper compiles
+    /// both before and after the checkpoint gains the field: missing now
+    /// reads as null (legacy), then as the stored map or empty object.
+    fn association(cp: &JobCheckpoint) -> serde_json::Value {
+        serde_json::to_value(cp)
+            .unwrap()
+            .get("track_ids")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Writing checkpoint with a completed-empty association (`{}`), built
+    /// through JSON so the future field compiles now (ignored) and lands
+    /// then without further test edits. Provider is the current test owner.
+    fn writing_checkpoint_completed_empty(msg: &QueueMsg) -> JobCheckpoint {
+        let mut cp = crate::checkpoint::initial(msg);
+        cp.state = JobState::Writing;
+        cp.provider_id = Some("33000000-0000-4000-8000-000000000003".to_string());
+        let mut value = serde_json::to_value(&cp).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("track_ids".to_string(), serde_json::json!({}));
+        serde_json::from_value(value).unwrap()
+    }
+
     /// Fake [`MatchWriteRuntime`] recording every effect in call order, so
     /// the meter-before-advance sequencing is asserted, not just prose.
+    /// Normalized hooks return an unmatched detailed match plus an empty
+    /// map (completed-empty); legacy resolve/upsert stay to expose any
+    /// obsolete call as a sequencing failure.
     struct FakeMatchWrite {
         calls: std::cell::RefCell<Vec<&'static str>>,
         fail_meter_stage: Option<&'static str>,
@@ -2422,45 +2630,71 @@ mod tests {
             self.calls.borrow_mut().push("upsert");
             Ok(())
         }
+
+        async fn resolve_tracks(&self, _msg: &QueueMsg) -> Result<DetailedTrackMatch, JobError> {
+            self.calls.borrow_mut().push("resolve:tracks");
+            Ok(DetailedTrackMatch {
+                release_mbid: None,
+                files: Vec::new(),
+                recordings: Vec::new(),
+            })
+        }
+
+        async fn materialize_tracks(
+            &self,
+            _user_id: &str,
+            _rows: &[crate::track_writers::TrackRow<'_>],
+        ) -> Result<std::collections::BTreeMap<usize, String>, JobError> {
+            self.calls.borrow_mut().push("materialize:tracks");
+            Ok(std::collections::BTreeMap::new())
+        }
     }
 
     #[tokio::test]
-    async fn matching_entry_meters_match_then_yields_to_transcoding() {
+    async fn matching_entry_records_completed_derivation_then_meters_match() {
         let msg = search_message();
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(None);
-        // Matching no longer writes in the same delivery: the checkpoint
-        // advances to Transcoding and settles as progress (no attempt
-        // spent), so the artifact step runs next and the write waits
-        // for a post-transcode checkpoint.
+        // Normalized: resolve detailed tracks, materialize DB IDs, meter
+        // match, then yield to transcoding as progress. The unmatched
+        // fixture completes empty (no inputs) but still advances.
         let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect_err("matching delivery yields to transcoding");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(err.transient);
         assert!(err.made_progress);
-        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        // Empty derivations may avoid a no-op materializer call; either
+        // path must record completion before the meter and never use library.
+        assert!(matches!(
+            runtime.calls().as_slice(),
+            ["resolve:tracks", "materialize:tracks", "meter:match"]
+                | ["resolve:tracks", "meter:match"]
+        ));
+        assert_eq!(association(&cp), serde_json::json!({}));
+        assert!(cp.transcode_inputs.is_empty());
         assert_eq!(cp.state, JobState::Transcoding);
     }
 
     #[tokio::test]
-    async fn writing_entry_re_resolves_without_re_emitting_match() {
+    async fn writing_entry_uses_completed_empty_without_legacy_resolution() {
         let msg = search_message();
-        let mut cp = crate::checkpoint::initial(&msg);
-        cp.state = JobState::Writing;
+        let mut cp = writing_checkpoint_completed_empty(&msg);
         let runtime = FakeMatchWrite::new(None);
         run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect("writing delivery succeeds");
-        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(runtime.calls(), ["meter:write"]);
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Done);
     }
 
     #[tokio::test]
-    async fn meter_failures_stop_before_the_advance_they_guard() {
+    async fn normalized_meter_failures_stop_before_the_advance_they_guard() {
         let msg = search_message();
-        // `match` meter down: no advance out of Matching, no upsert spent.
+        // `match` meter down: no advance out of Matching; the completed-
+        // empty association is already recorded before the meter gate.
         let mut cp = crate::checkpoint::initial(&msg);
         cp.state = JobState::Matching;
         let runtime = FakeMatchWrite::new(Some("match"));
@@ -2469,28 +2703,35 @@ mod tests {
             .expect_err("match meter failure must fail the step");
         assert_eq!(err.code, ERR_MATCH_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["resolve", "meter:match"]);
+        // Empty derivations may avoid a no-op materializer call; either
+        // path must record completion before the meter and never use library.
+        assert!(matches!(
+            runtime.calls().as_slice(),
+            ["resolve:tracks", "materialize:tracks", "meter:match"]
+                | ["resolve:tracks", "meter:match"]
+        ));
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Matching);
 
-        // `write` meter down after the upsert: the checkpoint stays in
-        // Writing, so redelivery replays the converged upsert and retries
-        // the meter instead of acking a Done that was never metered.
-        let mut cp = crate::checkpoint::initial(&msg);
-        cp.state = JobState::Writing;
+        // `write` meter down on a completed-empty checkpoint: the state
+        // stays in Writing, so redelivery retries the meter instead of
+        // acking a Done that was never metered.
+        let mut cp = writing_checkpoint_completed_empty(&msg);
         let runtime = FakeMatchWrite::new(Some("write"));
         let err = run_match_write_with(&runtime, &msg, &mut cp)
             .await
             .expect_err("write meter failure must fail the step");
         assert_eq!(err.code, ERR_WRITE_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["resolve", "upsert", "meter:write"]);
+        assert_eq!(runtime.calls(), ["meter:write"]);
+        assert_eq!(association(&cp), serde_json::json!({}));
         assert_eq!(cp.state, JobState::Writing);
     }
 
     /// Fake [`TranscodeRuntime`] with scripted outcomes, recording
     /// every effect in call order so the
-    /// front-fetch-put-publish-meter sequencing is asserted, not just
-    /// prose.
+    /// context-front-fetch-put-publish-media-meter sequencing is asserted,
+    /// not just prose.
     struct FakeTranscode {
         calls: std::cell::RefCell<Vec<&'static str>>,
         front: crate::transcode::TranscodeCall,
@@ -2520,6 +2761,19 @@ mod tests {
     }
 
     impl TranscodeRuntime for FakeTranscode {
+        async fn validate_context(
+            &self,
+            _msg: &QueueMsg,
+            cp: &JobCheckpoint,
+            input: &crate::transcode::TranscodeInput,
+        ) -> Result<crate::writer_execution::PublicationContext, JobError> {
+            self.calls.borrow_mut().push("context");
+            Ok(crate::writer_execution::PublicationContext {
+                track_id: format!("88000000-0000-4000-8000-{:012}", input.file_index),
+                provider_id: cp.provider_id.clone().expect("test checkpoint provider"),
+            })
+        }
+
         async fn call_front(
             &self,
             _req: &crate::transcode::TranscodeRequest,
@@ -2551,6 +2805,14 @@ mod tests {
         ) -> Result<crate::transcode::PublishOutcome, crate::transcode::PublishError> {
             self.calls.borrow_mut().push("publish");
             self.publish
+        }
+
+        async fn publish_media(
+            &self,
+            _publication: &crate::writer_execution::MediaPublication,
+        ) -> Result<(), JobError> {
+            self.calls.borrow_mut().push("media");
+            Ok(())
         }
 
         async fn meter_transcode(&self, _msg: &QueueMsg) -> Result<(), ()> {
@@ -2585,10 +2847,34 @@ mod tests {
     fn transcoding_checkpoint(msg: &QueueMsg, inputs: usize) -> JobCheckpoint {
         let mut cp = crate::checkpoint::initial(msg);
         cp.state = JobState::Transcoding;
+        // Current provider (not the stale message copy): the context
+        // validation reads it from here.
+        cp.provider_id = Some("33000000-0000-4000-8000-000000000003".to_string());
         cp.transcode_inputs = (0..inputs)
             .map(|index| transcode_input(msg, index))
             .collect();
-        cp
+        // Future sparse map via serde: ignored now, populated when the
+        // field lands, so no test edits are needed then. Legacy empty
+        // (0 inputs) stays null (refusal); any inputs get a dense map
+        // keyed by file_index for the context hook.
+        let mut value = serde_json::to_value(&cp).unwrap();
+        let track_ids = if inputs == 0 {
+            serde_json::Value::Null
+        } else {
+            let mut map = serde_json::Map::new();
+            for index in 0..inputs {
+                map.insert(
+                    index.to_string(),
+                    serde_json::Value::String(format!("88000000-0000-4000-8000-{:012}", index)),
+                );
+            }
+            serde_json::Value::Object(map)
+        };
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("track_ids".to_string(), track_ids);
+        serde_json::from_value(value).unwrap()
     }
 
     fn completed_call_for(bytes: &[u8]) -> crate::transcode::TranscodeCall {
@@ -2612,7 +2898,7 @@ mod tests {
         assert!(err.made_progress);
         assert_eq!(
             runtime.calls(),
-            ["front", "fetch", "put", "publish", "meter"]
+            ["context", "front", "fetch", "put", "publish", "media", "meter"]
         );
         assert_eq!(cp.transcode_next, 1);
         assert_eq!(cp.state, JobState::Transcoding);
@@ -2716,7 +3002,7 @@ mod tests {
             .expect_err("hash mismatch is terminal");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(!err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch"]);
     }
 
     #[tokio::test]
@@ -2735,7 +3021,7 @@ mod tests {
             .expect_err("missing bucket config is transient");
         assert_eq!(err.code, ERR_TRANSCODE_FAILED);
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch"]);
         // R2 put failure: transient.
         let mut cp = transcoding_checkpoint(&msg, 1);
         let mut runtime =
@@ -2745,7 +3031,7 @@ mod tests {
             .await
             .expect_err("put failure is transient");
         assert!(err.transient);
-        assert_eq!(runtime.calls(), ["front", "fetch", "put"]);
+        assert_eq!(runtime.calls(), ["context", "front", "fetch", "put"]);
         // Deterministic publication rejection quarantines at once.
         let mut cp = transcoding_checkpoint(&msg, 1);
         let mut runtime =
@@ -2782,7 +3068,7 @@ mod tests {
         assert_eq!(cp.transcode_next, 0);
         assert_eq!(
             runtime.calls(),
-            ["front", "fetch", "put", "publish", "meter"]
+            ["context", "front", "fetch", "put", "publish", "media", "meter"]
         );
     }
 
@@ -3308,3 +3594,7 @@ mod tests {
         assert_eq!(adopted.sha256, "abc123");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/terminal_lifecycle_acceptance.rs"]
+mod terminal_lifecycle_acceptance;

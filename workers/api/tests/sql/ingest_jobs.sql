@@ -1,15 +1,16 @@
 -- Regression test for the ingest_jobs writer
--- (workers/ingest/src/ingest_jobs.rs against migration 0021). Run after
+-- (workers/ingest/src/ingest_jobs.rs against migration 0022). Run after
 -- ALL migrations are applied (see ../run_migration_tests.sh). Everything
 -- happens inside one transaction that is rolled back, so it leaves no rows;
 -- any broken expectation RAISEs and (with ON_ERROR_STOP) fails the run.
 --
--- This test executes the admission upsert and the terminal transition in
--- their exact shapes (literals stand in for the $n parameters): the fenced
--- queued insert with ON CONFLICT (id) DO NOTHING, the fenced
--- queued/running-to-done/failed update, and the status re-select the
--- consumer uses to separate a converged replay from a missing-or-fenced
--- row.
+-- This test executes the admission upsert, the terminal transition, and
+-- both re-selects in their exact shapes (literals stand in for the $n
+-- parameters): the fenced queued insert with ON CONFLICT (id) DO NOTHING,
+-- the fenced queued/running-to-done/failed update, the live-owner identity
+-- re-select the admission path uses to separate a converged duplicate from
+-- a deleting/missing-owner replay, and the status re-select the consumer
+-- uses to separate a converged replay from a missing-or-fenced row.
 
 BEGIN;
 
@@ -18,6 +19,8 @@ DECLARE
     updated_count INTEGER;
     row_count_var INTEGER;
     job_status TEXT;
+    job_owner TEXT;
+    job_key TEXT;
 BEGIN
     INSERT INTO users (id, email, created_at)
     VALUES ('user-ij-1', 'ij-1@example.com', 1700000000),
@@ -176,6 +179,62 @@ BEGIN
     IF (SELECT count(*) FROM ingest_jobs WHERE id = 'job_01ingestjobs0005') <> 0 THEN
         RAISE EXCEPTION 'admission for a missing user produced a row';
     END IF;
+
+    -- Statement 3: admission identity re-select. A live duplicate replay
+    -- returns the stored owner + key through the live-owner join, while a
+    -- deleting owner or an unknown job id returns zero rows, so the caller
+    -- separates a converged duplicate from a fenced replay without adopting
+    -- another owner's job. The join + deleting_at predicate + FOR SHARE OF
+    -- users are all load-bearing: the lock pins the live owner row while
+    -- the caller compares identity. A true missing-owner row (job present,
+    -- owner absent) cannot persist under the RESTRICT FK (proven below),
+    -- so the deleting-owner + unknown-id cases cover every representable
+    -- replay; the orphan SELECT shape is unrepresentable by construction.
+    SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key INTO job_owner, job_key
+    FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id
+    WHERE ingest_jobs.id = 'job_01ingestjobs0001' AND users.deleting_at IS NULL FOR SHARE OF users;
+    IF NOT FOUND OR job_owner <> 'user-ij-1' OR job_key <> 'ingest:user-ij-1:9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734:upload' THEN
+        RAISE EXCEPTION 'identity re-select missed the live duplicate';
+    END IF;
+
+    -- Deleting-owner replay: job_01ingestjobs0004 exists and stays queued,
+    -- but its owner carries the deletion marker, so the live-owner join
+    -- returns zero rows instead of the stored identity.
+    SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key INTO job_owner, job_key
+    FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id
+    WHERE ingest_jobs.id = 'job_01ingestjobs0004' AND users.deleting_at IS NULL FOR SHARE OF users;
+    IF FOUND THEN
+        RAISE EXCEPTION 'identity re-select adopted a deleting owner';
+    END IF;
+
+    -- Missing-job replay (unknown id): job_01ingestjobs0005 never landed
+    -- (fenced admission above), so the same statement returns zero rows
+    -- for the unknown id rather than a stale identity. This is distinct
+    -- from a missing-owner row, which the FK guard below proves cannot
+    -- persist.
+    SELECT ingest_jobs.user_id, ingest_jobs.idempotency_key INTO job_owner, job_key
+    FROM ingest_jobs JOIN users ON users.id = ingest_jobs.user_id
+    WHERE ingest_jobs.id = 'job_01ingestjobs0005' AND users.deleting_at IS NULL FOR SHARE OF users;
+    IF FOUND THEN
+        RAISE EXCEPTION 'identity re-select found a missing job';
+    END IF;
+
+    -- True missing-owner gap: a job row whose owner row is gone would also
+    -- return zero rows through the inner join, but the RESTRICT FK rejects
+    -- the orphan insert, and the fence rejects admission without a live
+    -- owner, so no persistent orphan exists to re-select. The FK is not
+    -- deferrable (migration 0022 declares no DEFERRABLE), so even a
+    -- deferred-constraint probe cannot stage one; constraints stay enabled.
+    -- Prove the guard still holds.
+    BEGIN
+        INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status)
+        VALUES ('job_01ingestjobs0007', 'user-ij-gone',
+                'ingest:user-ij-gone:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:upload',
+                1700000000, 'queued');
+        RAISE EXCEPTION 'orphan job row escaped the owner FK';
+    EXCEPTION WHEN foreign_key_violation THEN
+        NULL;
+    END;
 END $$;
 
 ROLLBACK;

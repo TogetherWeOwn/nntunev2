@@ -468,23 +468,14 @@ mod tests {
     }
 
     fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
-        JobCheckpoint {
-            job_id: msg.job_id.clone(),
-            user_id: msg.user_id.clone(),
-            idempotency_key: msg.idempotency_key.clone(),
-            source: msg.source,
-            state: msg.state,
-            attempt: msg.attempt,
-            repair_rounds: msg.repair_rounds,
-            probe_tally: None,
-            par2_set_id: None,
-            missing_blocks: 0,
-            failure_code: None,
-            failure_reason: None,
-            provider_id: msg.provider_id.clone(),
-            transcode_inputs: Vec::new(),
-            transcode_next: 0,
-        }
+        // Shared constructor keeps this helper compiling across defaulted
+        // checkpoint fields; overrides preserve the previous literal's
+        // per-message projections exactly.
+        let mut cp = crate::checkpoint::initial(msg);
+        cp.state = msg.state;
+        cp.attempt = msg.attempt;
+        cp.repair_rounds = msg.repair_rounds;
+        cp
     }
 
     fn boom() -> Result<(), JobError> {

@@ -1296,23 +1296,30 @@ mod tests {
                 512,
             ),
         )]);
-        let mut cp = JobCheckpoint {
-            job_id: JOB.to_string(),
-            user_id: USER.to_string(),
-            idempotency_key: KEY.to_string(),
-            source: JobSource::NzbUpload,
-            state: JobState::Verifying,
-            attempt: 1,
-            repair_rounds: 1,
-            probe_tally: None,
-            par2_set_id: None,
-            missing_blocks: 0,
-            failure_code: None,
-            failure_reason: None,
-            provider_id: None,
-            transcode_inputs: Vec::new(),
-            transcode_next: 7,
-        };
+        // Serde-built so a future defaulted checkpoint field compiles
+        // without touching this fake: unknown fields are ignored now and
+        // defaulted then. Values mirror the previous literal exactly.
+        let mut cp: JobCheckpoint = serde_json::from_value(serde_json::json!({
+            "job_id": JOB,
+            "user_id": USER,
+            "idempotency_key": KEY,
+            "source": JobSource::NzbUpload,
+            "state": JobState::Verifying,
+            "attempt": 1,
+            "repair_rounds": 1,
+            "probe_tally": null,
+            "par2_set_id": null,
+            "missing_blocks": 0,
+            "failure_code": null,
+            "failure_reason": null,
+            "provider_id": null,
+            "transcode_inputs": [],
+            "transcode_next": 7,
+            // Future track-identity map: ignored until the field lands,
+            // then deserializes to its empty default.
+            "track_ids": null,
+        }))
+        .expect("test checkpoint shape must deserialize");
         record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
         assert_eq!(cp.transcode_inputs.len(), 1);
         assert_eq!(cp.transcode_next, 0);

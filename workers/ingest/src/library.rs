@@ -193,13 +193,14 @@ pub fn upsert_params(write: &LibraryWrite) -> UpsertParams<'_> {
 /// only burns the delivery budget. Covers class 42 (syntax / access rule
 /// violation — including 42P01 undefined table and 42P10 invalid
 /// `ON CONFLICT` target, i.e. the missing-`library`-table case), class 22
-/// (data exception) and class 23 (integrity constraint violation).
+/// (data exception), class 23 (integrity constraint violation), and class
+/// 3F (invalid schema name).
 /// Anything else (connection class 08, operator intervention 57, no
 /// SQLSTATE at all, …) may succeed on redelivery and stays transient.
 pub fn is_deterministic_sqlstate(sqlstate: Option<&str>) -> bool {
     matches!(
         sqlstate.and_then(|code| code.get(..2)),
-        Some("42" | "22" | "23")
+        Some("42" | "22" | "23" | "3F")
     )
 }
 
