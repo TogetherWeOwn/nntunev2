@@ -14,6 +14,7 @@ import {
 import { assertPlanLimitHeaders, assertPlanLimitRefusal, extractLibraryItems, extractLimitCode, extractPlanMeta, extractRecordingMbids, extractUpgradeCta, extractUsageBytes, isMbid, secretLeak } from '../helpers/contract.js';
 import {
   anonymousApiGet,
+  anonymousApiOptions,
   anonymousGet,
   annotateSignupPath,
   apiGet,
@@ -447,6 +448,67 @@ test.describe('anonymousApiGet (isolated, credential-free, no-follow)', () => {
   });
 });
 
+
+test.describe('anonymousApiOptions (isolated, CORS headers only, no-follow)', () => {
+  test('sends only the CORS request headers and refuses credential headers', async () => {
+    const listen = (server: Server): Promise<number> =>
+      new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port));
+      });
+    const close = (server: Server): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve()));
+    const hits: Array<{ method?: string; headers: Record<string, string | string[] | undefined> }> =
+      [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      hits.push({ method: req.method, headers: { ...req.headers } });
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<title>403 Forbidden</title><center>cloudflare</center>');
+    });
+    const port = await listen(staging);
+    const origin = `http://127.0.0.1:${port}`;
+    const cors = {
+      Origin: origin,
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Headers': 'content-type',
+    };
+
+    try {
+      await withEnvAsync(
+        { ...dummyAccessPair, QA_AUTH_TOKEN: 'dummy-qa-token-anon-probe' },
+        async () => {
+          const probe = await anonymousApiOptions(`${origin}/healthz`, cors, 'preflight');
+          expect(probe.status).toBe(403);
+          expect(probe.bodyText).toContain('cloudflare');
+
+          for (const name of ['CF-Access-Client-Id', 'Authorization', 'Cookie']) {
+            await expect(
+              anonymousApiOptions(`${origin}/healthz`, { ...cors, [name]: 'x' }, 'preflight'),
+              `${name} must be refused`,
+            ).rejects.toThrow(/accepts only CORS request headers/);
+          }
+        },
+      );
+
+      expect(hits).toHaveLength(1);
+      const [hit] = hits;
+      if (!hit) throw new Error('anonymous OPTIONS never reached the fixture');
+      expect(hit.method).toBe('OPTIONS');
+      const headers = hit.headers;
+      expect(headers.origin).toBe(origin);
+      expect(headers['access-control-request-method']).toBe('GET');
+      expect(headers['cf-access-client-id']).toBeUndefined();
+      expect(headers['cf-access-client-secret']).toBeUndefined();
+      expect(headers.authorization).toBeUndefined();
+      expect(headers.cookie).toBeUndefined();
+      const dumped = JSON.stringify(hits);
+      expect(dumped).not.toContain('dummy-client-id');
+      expect(dumped).not.toContain('dummy-qa-token-anon-probe');
+    } finally {
+      await close(staging).catch(() => {});
+    }
+  });
+});
 
 test.describe('anonymousGet (no credentials, no follow)', () => {
   // The anonymous probe must send NO header material even when the QA Access
