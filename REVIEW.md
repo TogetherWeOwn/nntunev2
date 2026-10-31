@@ -4,7 +4,7 @@
 
 First-pass review in English. Find defects this PR introduces or makes
 reachable. Your check is one of the required checks in `CONTRIBUTING.md`;
-together with human (board) approval they are the merge gate. Do not approve,
+together with fixed or answered findings they are the merge gate. Do not approve,
 merge, enable auto-merge, edit code, or start fix sessions. This file guides
 analysis only; it is not a permission boundary.
 

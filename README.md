@@ -194,8 +194,8 @@ review for personal data or the policy keeping the full account ID private.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every PR must pass `ci-ok`,
-`gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review`, and needs human
-(board) approval to merge.
+`gitleaks`, `pr-lint`, `migrations-staging`, `CodeRabbit` and `Devin Review`,
+with review findings fixed or answered, before its author merges it.
 
 ## Security
 

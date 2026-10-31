@@ -69,20 +69,23 @@ labels are the durable record behind it.
   is the PR title.
 - Delete the branch on merge (automatic repo setting).
 - Every PR must pass the required status checks on `main` (the
-  `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit`
-  and `Devin Review`**.
-- **Human (board) approval is required to merge.** This is company
-  process, not a GitHub setting (the ruleset requires 0 approving reviews).
-  Agents and bots open, update and mark PRs ready for review; they do not
-  merge.
+  `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`,
+  `migrations-staging`, `CodeRabbit` and `Devin Review`**.
+- A PR merges without owner approval once every required check is green and
+  every review finding is fixed or answered with evidence. The author (the
+  agent or person who did the work) merges it. `main` deploys staging, not
+  production, so no owner approval applies to merging here. Promoting to
+  production (the gated `deploy-production` lane) still needs the owner's
+  approval.
 - Bot review (CodeRabbit, Devin Review) is part of the gate. Fix each
   finding, or answer it in the thread with evidence from the code. Check a
   suggested fix before applying it (the disproof pass in `REVIEW.md`).
 - Tests prove behaviour. Do not add bespoke oracle or proof scripts just to
   satisfy a reviewer; a new guard or gate script needs its own justification
   in the PR body (what it catches that tests cannot).
-- Staging migrations: TODO — link the migration staging-apply checklist once
-  the recurrence-guard change lands.
+- Staging migrations: a PR that adds or changes `migrations/*.sql` needs a
+  `Staging migration:` line in its body (`migrations-staging` enforces it);
+  see "Staging migrations" in `docs/ops.md`.
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection
   enabled) enforce this.
