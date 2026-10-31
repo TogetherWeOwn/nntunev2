@@ -613,7 +613,7 @@ never reads or prints values
   it routes the hostname to the edge and is not replaced.
 - [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
-  `staging-web` job succeeds (`needs`, no `always()`), so a skipped/failed
+  `staging-web` and `staging-api` jobs succeed (`needs`, no `always()`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
   needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
   synthetic monitoring only (the full-journey job is skipped there).
