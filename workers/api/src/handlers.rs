@@ -10409,7 +10409,10 @@ mod tests {
         let resp = h.call_full("GET", "/healthz", None, None, None);
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-        assert_eq!(body, serde_json::json!({"ok": true, "build_sha": "unknown"}));
+        assert_eq!(
+            body,
+            serde_json::json!({"ok": true, "build_sha": "unknown"})
+        );
         // Valid SHA passes through; the body carries exactly two keys.
         let mut h = harness();
         h.config = h.config.with_build_sha(Some(sha));
@@ -10423,7 +10426,11 @@ mod tests {
             h.config = h.config.with_build_sha(Some(raw));
             let resp = h.call_full("GET", "/healthz", None, None, None);
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-            assert_eq!(body, serde_json::json!({"ok": true, "build_sha": "unknown"}), "{raw}");
+            assert_eq!(
+                body,
+                serde_json::json!({"ok": true, "build_sha": "unknown"}),
+                "{raw}"
+            );
         }
     }
 
