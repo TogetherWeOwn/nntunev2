@@ -330,6 +330,44 @@ this documentation update, nor evidence of separate compute/failure domains.
   login identities; do not alter grants or roles. Update this evidence only from
   that direct result, keeping host-reported statements clearly distinguished.
 
+#### Staging migration apply declaration
+
+Nothing in CI applies migrations. `deploy.yml`'s `staging-api` job runs only a
+read-only schema gate (`.github/scripts/staging_api_schema_gate.py`) and fails
+when an `app` migration was never applied to `nntunev2_staging`. That is how
+#815's `0024`/`0025` left `staging-api` red for six `main` pushes. To make the
+out-of-band apply explicit:
+
+- **Rule (enforced in the required `pr-lint` check):** a PR that adds or
+  modifies a numbered `migrations/NNNN_*.sql` file must fill in the PR body's
+  `## Staging migration apply` section
+  (`.github/pull_request_template.md`): migration files (each touched file
+  named), target (`app`/`mirror`, matching `migrations/manifest.toml`), role,
+  who applies, rollback. When any touched migration is `app`, it must also tick
+  `- [x] Applied to nntunev2_staging and verified (preflight/verify output linked)`.
+  Empty, `TBD`/`n/a` or `<placeholder>` values fail, and the error names
+  the missing fields. Editing the PR body re-runs the check. PRs that touch no
+  numbered migration pass silently. Check:
+  `.github/scripts/migration_apply_declaration.py`; it reads the body from
+  the event JSON, never from the shell.
+- **Apply before merge.** The Operator (or whoever the declaration names)
+  applies the file to `nntunev2_staging` with the staging migrator role, links
+  the preflight/verify output in the PR, and only then ticks the box.
+  Production is unaffected. Its migrator stays unset and gated (see above).
+- **`mirror` migrations** need the declaration fields but not the
+  `nntunev2_staging` checkbox. Mirror tables live on the separate `nntunev2-mb`
+  cluster that staging and production share (`HYPERDRIVE_ID_MB`, see Hyperdrive
+  bindings below), not in `nntunev2_staging`. No staging lane reads them yet,
+  so applying one is a change to the shared mirror and is gated like a
+  production change. The declaration records who will apply it and how to roll
+  it back. Unknown or unlisted files count as `app`.
+- **Red staging-api is noticed:** the `staging-api-alert` job in `deploy.yml`
+  opens a `staging-api deploy is red on main` issue on the first red `main`
+  push and comments on it for each later red push. The next successful deploy
+  closes it (`.github/scripts/staging_api_alert.py`).
+  `deploy-alerts-staging.yml` does not cover this. Its Tail consumer only
+  watches the serving Worker, and a failed deploy leaves the old Worker serving.
+
 ### Hyperdrive bindings
 
 | Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |

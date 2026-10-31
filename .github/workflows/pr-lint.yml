@@ -6,6 +6,11 @@ name: pr-lint
 #   Types: feat fix perf refactor test docs build ci chore revert style security.
 # No tracker IDs (TOG-*) are required — this is a public repo.
 # Keep the JOB name `pr-lint`.
+# On pull_request the same job also enforces the staging migration apply
+# declaration (.github/scripts/migration_apply_declaration.py, docs/ops.md):
+# a PR adding/modifying a numbered migrations/*.sql must carry the filled-in
+# `## Staging migration apply` section. Living in this required job is what
+# makes it blocking; `edited` re-runs it when the body changes.
 
 on:
   pull_request:
@@ -90,3 +95,16 @@ jobs:
             echo "::error::PR title must be 'type(scope): summary' (types: feat fix perf refactor test docs build ci chore revert style security), <=100 chars, no trailing period."
             exit 1
           fi
+      # Untrusted PR body: the script reads it from the event JSON file
+      # (GITHUB_EVENT_PATH); it is never expanded into a shell command.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check staging migration apply declaration
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/migration_apply_declaration.py --root . --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"
