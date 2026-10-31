@@ -1670,7 +1670,16 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    // staging-api-alert deploys nothing (red-deploy tracking issue only);
+    // the wrangler/workers/production pins below still cover its body.
+    expect(names).toEqual([
+      'gate',
+      'post-deploy-e2e',
+      'preview-web',
+      'staging-api',
+      'staging-api-alert',
+      'staging-web',
+    ]);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
