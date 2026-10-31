@@ -120,21 +120,52 @@ def api_get(path, account_id, token):
     return payload
 
 
+NAMESPACE_PAGE_SIZE = 1000
+NAMESPACE_MAX_PAGES = 100
+
+
+def is_count(value, maximum):
+    return type(value) is int and 0 <= value <= maximum
+
+
 def list_namespaces(get):
+    # The live list response carries page/per_page/count/total_count and omits
+    # the optional total_pages, so completeness is proven from the counts.
     namespaces = []
-    page = 1
-    while True:
-        payload = get(f"durable_objects/namespaces?per_page=1000&page={page}")
+    seen_ids = set()
+    total_count = None
+    for page in range(1, NAMESPACE_MAX_PAGES + 1):
+        payload = get(f"durable_objects/namespaces?per_page={NAMESPACE_PAGE_SIZE}&page={page}")
         batch = payload["result"]
         require(isinstance(batch, list), "NAMESPACE_LIST_SHAPE")
+        info = payload.get("result_info")
+        require(isinstance(info, dict), "NAMESPACE_PAGES_SHAPE")
+        require(type(info.get("page")) is int and info["page"] == page, "NAMESPACE_PAGE_MISMATCH")
+        require(type(info.get("per_page")) is int and info["per_page"] == NAMESPACE_PAGE_SIZE,
+                "NAMESPACE_PAGES_SHAPE")
+        require(is_count(info.get("count"), NAMESPACE_PAGE_SIZE) and info["count"] == len(batch),
+                "NAMESPACE_PAGES_SHAPE")
+        require(is_count(info.get("total_count"), NAMESPACE_PAGE_SIZE * NAMESPACE_MAX_PAGES),
+                "NAMESPACE_PAGES_SHAPE")
+        if total_count is None:
+            total_count = info["total_count"]
+        require(info["total_count"] == total_count, "NAMESPACE_COUNT_MISMATCH")
+        total_pages = max(1, -(-total_count // NAMESPACE_PAGE_SIZE))
+        if "total_pages" in info:
+            require(type(info["total_pages"]) is int and info["total_pages"] == total_pages,
+                    "NAMESPACE_PAGES_SHAPE")
+        require(len(batch) == min(NAMESPACE_PAGE_SIZE, total_count - len(namespaces)),
+                "NAMESPACE_COUNT_MISMATCH")
+        for namespace in batch:
+            require(isinstance(namespace, dict), "NAMESPACE_ITEM_SHAPE")
+            namespace_id = namespace.get("id")
+            require(isinstance(namespace_id, str) and bool(namespace_id), "NAMESPACE_ITEM_SHAPE")
+            require(namespace_id not in seen_ids, "NAMESPACE_DUPLICATE_ID")
+            seen_ids.add(namespace_id)
         namespaces.extend(batch)
-        info = payload.get("result_info") or {}
-        total_pages = info.get("total_pages")
-        require(type(total_pages) is int and 1 <= total_pages <= 100, "NAMESPACE_PAGES_SHAPE")
-        require(info.get("page") == page, "NAMESPACE_PAGE_MISMATCH")
-        if page >= total_pages:
+        if page == total_pages:
             return namespaces
-        page += 1
+    raise GuardError("NAMESPACE_PAGES_SHAPE")
 
 
 def verify(settings, namespaces, subdomain, versions, expected_logs):
