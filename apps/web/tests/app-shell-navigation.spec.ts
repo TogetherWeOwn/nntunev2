@@ -189,7 +189,7 @@ async function paywallFocusState(page: Page): Promise<{
 	onLast: boolean;
 }> {
 	return page.evaluate(() => {
-		const open = document.querySelector('[role="dialog"]');
+		const open = document.querySelector('dialog[open]');
 		const controls = [
 			...(open?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)') ?? [])
 		].filter((control) => control.getClientRects().length > 0);
@@ -781,7 +781,7 @@ test('[NAV-13] paywall close keeps focus restoration and modal isolation with na
 	for (let tab = 0; tab < 6; tab += 1) {
 		await page.keyboard.press('Tab');
 		const inside = await page.evaluate(() => {
-			const open = document.querySelector('[role="dialog"]');
+			const open = document.querySelector('dialog[open]');
 			return !!open?.contains(document.activeElement);
 		});
 		expect(
@@ -799,7 +799,7 @@ test('[NAV-13] paywall close keeps focus restoration and modal isolation with na
 			'Builder: keep the upgrade link and dismiss actions rendered together.'
 	).toBeGreaterThan(1);
 	await page.evaluate(() => {
-		const open = document.querySelector('[role="dialog"]');
+		const open = document.querySelector('dialog[open]');
 		const controls = [
 			...(open?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)') ?? [])
 		].filter((control) => control.getClientRects().length > 0);
