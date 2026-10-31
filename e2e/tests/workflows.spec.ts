@@ -375,6 +375,7 @@ test.describe('public UI signup coverage (static pin)', () => {
     // The contract carries the seam path so a rename fails by name.
     const contract = readFileSync(new URL('../helpers/contract.ts', import.meta.url), 'utf8');
     expect(contract).toContain("testCodes: '/api/test-codes'");
+    expect(contract).toContain("testAccounts: '/api/test-accounts'");
   });
 });
 
@@ -1575,6 +1576,7 @@ staging = "dummy-hyperdrive-staging"
           routes: [
             { pattern: 'staging.nntune.com/v1/*', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
           ],
           vars: {
@@ -1784,8 +1786,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n/m,
     );
     // Same-host routes: the generated staging config must serve /v1/*,
-    // /healthz, plus the staging-only /api/test-codes seam on the
-    // staging host, with route hosts derived from the RP repo var
+    // /healthz, plus the staging-only /api/test-codes and
+    // /api/test-accounts seams on the staging host, with route hosts derived from the RP repo var
     // (asserted the exact staging host in the validation block above)
     // so the RP pair and the serving host cannot drift. The web Worker
     // owns the catch-all; the most specific route wins.
@@ -1806,7 +1808,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       'API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)',
     );
     expect(section).toMatch(
-      /^[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n/m,
+      /^[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n/m,
     );
   };
 
@@ -1880,6 +1882,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     assertWebStagingCatchAll(webWrangler, rpId!);
     expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/v1/*"');
     expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/api/test-codes"');
+    expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/api/test-accounts"');
     expect(jobsBody).toContain('pattern = "${API_RP_ID_STAGING}/healthz"');
     // The deploy-time exact-host literal must equal the canonical host:
     // config/staging.json stays the single source even though the
@@ -2064,6 +2067,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '          pattern = "${API_RP_ID_STAGING}/api/test-codes"\n',
       '',
     );
+    // Same for the mint seam: POST /api/test-accounts would fall through
+    // to web and every minted-account journey spec would 404.
+    const droppedMintSeamRouteMutant = jobsBody.replace(
+      '          pattern = "${API_RP_ID_STAGING}/api/test-accounts"\n',
+      '',
+    );
     // Api lane whose generated config comments out a routes header: the
     // TOML then defines no routes table at all (the keys fall into
     // env.staging.vars), and an unanchored pin would keep matching the
@@ -2128,6 +2137,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       commentedVarsHeaderMutant,
       droppedV1RouteMutant,
       droppedSeamRouteMutant,
+      droppedMintSeamRouteMutant,
       commentedRoutesHeaderMutant,
       routeHostSwappedMutant,
       droppedHealthzRouteMutant,
@@ -2168,6 +2178,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(commentedVarsHeaderMutant)).toThrow();
     expect(() => assertStagingApi(droppedV1RouteMutant)).toThrow();
     expect(() => assertStagingApi(droppedSeamRouteMutant)).toThrow();
+    expect(() => assertStagingApi(droppedMintSeamRouteMutant)).toThrow();
     expect(() => assertStagingApi(commentedRoutesHeaderMutant)).toThrow();
     expect(() => assertStagingApi(routeHostSwappedMutant)).toThrow();
     expect(() => assertStagingApi(droppedHealthzRouteMutant)).toThrow();

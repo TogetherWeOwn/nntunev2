@@ -1126,6 +1126,11 @@ pub(crate) fn invalid_request() -> Response {
 /// change both sides together.
 pub const QA_TEST_CODES_PATH: &str = "/api/test-codes";
 
+/// Staging-only test-account mint seam, armed by the same flag + bearer as
+/// [`QA_TEST_CODES_PATH`]. The E2E contract pins the same path
+/// (`testAccounts` in `e2e/helpers/contract.ts`).
+pub const QA_TEST_ACCOUNTS_PATH: &str = "/api/test-accounts";
+
 /// True iff the address is a synthetic test mailbox: exactly one `@` and
 /// the reserved `example.test` domain (RFC 2606, never routable), matched
 /// case-insensitively. Subdomains and suffix lookalikes
@@ -3609,6 +3614,102 @@ where
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QaTestAccountBody {
+    email: String,
+    plan: Option<String>,
+}
+
+/// Staging-only test-account mint seam (`POST /api/test-accounts`).
+/// Creates a fresh `example.test` account and returns its email plus a
+/// stored session (the `__Host-nntune-session` cookie value) so the
+/// staging E2E can act as that account without the passkey ceremony.
+/// Same gates as [`qa_test_codes`] and in the same order: flag armed plus
+/// bearer staged (else the unknown-route 404), constant-time bearer (else
+/// a names-only 401), then a well-formed synthetic mailbox (else 404).
+/// Only the default plan is minted: `plan` absent or `"free"`. Any other
+/// plan is a fixed 422 — no route enforces plan caps yet, so a capped
+/// account cannot be honestly provisioned and is never faked. An address
+/// that already has an account is a fixed 422 too, never handed a new
+/// session (mint, not sign-in). Nothing here echoes the mailbox or token.
+async fn qa_test_accounts<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let error_response = |error: crate::api_error::ApiError| Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+    };
+    let not_found = || error_response(crate::api_error::ApiError::not_found("not found"));
+    let refused =
+        |message: &str| error_response(crate::api_error::ApiError::validation_failed(message));
+    let Some(expected) = ctx
+        .cfg
+        .qa_auth_token
+        .as_deref()
+        .filter(|_| ctx.cfg.qa_code_seam)
+    else {
+        return not_found();
+    };
+    let presented = req
+        .authorization
+        .as_deref()
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !qa_bearer_ok(presented, expected) {
+        return json_response(401, serde_json::json!({"error": "unauthorized"}));
+    }
+    let Some(body) = parse_body::<QaTestAccountBody>(req) else {
+        return not_found();
+    };
+    let Some(email) = normalize_email(&body.email) else {
+        return not_found();
+    };
+    if !is_example_test_mailbox(&email) {
+        return not_found();
+    }
+    if !matches!(body.plan.as_deref(), None | Some("free")) {
+        return refused("unsupported plan");
+    }
+    match ctx.store.user_by_email(&email).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return refused("account exists"),
+        Err(_) => return internal(),
+    }
+    let Ok(user_id) = random_id::<16>() else {
+        return unavailable();
+    };
+    // Everything that can fail without touching the store runs first, so
+    // only a failed session write can leave a user row behind; that row
+    // holds no session, credential or vault and is removed by the
+    // unverified-signup reaper (`unverified_user_filter`), and the E2E
+    // never retries the same mailbox. The stored session row is also what
+    // exempts a minted account from that reaper.
+    let (token, record) = match ctx.prepare_session(&user_id) {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
+    let user = UserRecord {
+        id: user_id,
+        email: email.clone(),
+        created_at: ctx.now,
+    };
+    // Unique-email race with a concurrent mint: the loser simply fails.
+    if ctx.store.insert_user(&user).await.is_err() {
+        return internal();
+    }
+    if ctx.store.insert_session(&record).await.is_err() {
+        return internal();
+    }
+    ctx.audit(&user.id, "qa.test_account_mint", true).await;
+    json_response(201, serde_json::json!({"email": email, "session": token}))
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
@@ -3616,10 +3717,11 @@ where
 /// scope-map-served native paths (see `options_preflight_served`) — with
 /// an empty 204 (the entry renders credentialed CORS headers only for an
 /// exact `Origin` match); anything else 404s, so a preflight never maps
-/// the API surface. The staging-only `POST /api/test-codes` seam is
-/// deliberately absent: its POST arm matches independently, and listing
-/// it here would answer `OPTIONS` with 204 in every posture — making the
-/// seam enumerable from production.
+/// the API surface. The staging-only `POST /api/test-codes` and
+/// `POST /api/test-accounts` seams are
+/// deliberately absent: their POST arms match independently, and listing
+/// them here would answer `OPTIONS` with 204 in every posture — making the
+/// seams enumerable from production.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -3745,6 +3847,7 @@ where
             vault_test_connection(ctx, req).await
         }
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
+        ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Single-segment credential ids only; deeper shapes 404 inside
@@ -5165,6 +5268,137 @@ mod tests {
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(!h.mailer.sent.borrow().is_empty());
         assert!(h.store.qa_codes.borrow().is_empty());
+    }
+
+    impl Harness {
+        fn call_mint_seam(&self, body: serde_json::Value, bearer: Option<&str>) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: QA_TEST_ACCOUNTS_PATH.to_string(),
+                cookie: None,
+                origin: None,
+                authorization: bearer.map(|token| format!("Bearer {token}")),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    const NOT_FOUND_BODY: &str = r#"{"code":"not_found","message":"not found","retryable":false}"#;
+
+    #[test]
+    fn qa_mint_seam_absent_outside_the_staging_posture() {
+        // Production posture (flag off) and flag-without-bearer both serve
+        // the plain unknown-route 404 and mint nothing.
+        let mut unarmed = harness();
+        unarmed.config = cfg().with_qa_code_seam(true);
+        for h in [harness(), unarmed] {
+            let resp = h.call_mint_seam(
+                serde_json::json!({"email": "a@example.test"}),
+                Some(QA_TOKEN),
+            );
+            assert_eq!(resp.status, 404);
+            assert_eq!(resp.body, NOT_FOUND_BODY);
+            assert!(h.store.users.borrow().is_empty());
+            assert!(h.store.sessions.borrow().is_empty());
+            // Not enumerable through a preflight either.
+            let pre = h.call_full("OPTIONS", QA_TEST_ACCOUNTS_PATH, None, None, Some(ORIGIN));
+            assert_eq!(pre.status, 404);
+            assert_eq!(pre.body, NOT_FOUND_BODY);
+        }
+    }
+
+    #[test]
+    fn qa_mint_seam_rejects_a_bad_bearer_without_detail() {
+        let h = qa_harness();
+        for bearer in [None, Some(""), Some("wrong-token")] {
+            let resp = h.call_mint_seam(serde_json::json!({"email": "a@example.test"}), bearer);
+            assert_eq!(resp.status, 401);
+            assert_eq!(resp.body, r#"{"error":"unauthorized"}"#);
+        }
+        assert!(h.store.users.borrow().is_empty());
+    }
+
+    #[test]
+    fn qa_mint_seam_refuses_real_mailboxes_and_malformed_bodies() {
+        let h = qa_harness();
+        for body in [
+            serde_json::json!({"email": "a@example.com"}),
+            serde_json::json!({"email": "a@example.test.evil.com"}),
+            serde_json::json!({}),
+            serde_json::json!({"email": 1}),
+            serde_json::json!({"email": "a@example.test", "extra": true}),
+        ] {
+            let resp = h.call_mint_seam(body, Some(QA_TOKEN));
+            assert_eq!(resp.status, 404);
+            assert_eq!(resp.body, NOT_FOUND_BODY);
+        }
+        assert!(h.store.users.borrow().is_empty());
+        assert!(h.store.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn qa_mint_seam_mints_an_account_with_a_live_session() {
+        let h = qa_harness();
+        for (email, plan) in [
+            ("e2e+1@example.test", None),
+            ("e2e+2@example.test", Some("free")),
+        ] {
+            let mut body = serde_json::json!({"email": email});
+            if let Some(plan) = plan {
+                body["plan"] = serde_json::json!(plan);
+            }
+            let resp = h.call_mint_seam(body, Some(QA_TOKEN));
+            assert_eq!(resp.status, 201, "{}", resp.body);
+            assert!(resp.set_cookie.is_none());
+            let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(minted["email"], email);
+            let session = minted["session"].as_str().expect("session").to_string();
+            let user = block_on(h.store.user_by_email(email))
+                .unwrap()
+                .expect("user");
+            // The session is the real cookie credential for this account:
+            // ordinary request authentication accepts it as that user.
+            let req = Request {
+                method: "GET".to_string(),
+                path: "/v1/vault".to_string(),
+                cookie: Some(format!("{}={session}", session::COOKIE_NAME)),
+                origin: None,
+                authorization: None,
+                body: Vec::new(),
+            };
+            let (claims, _) = block_on(h.ctx().authenticate(&req, false)).expect("authenticated");
+            assert_eq!(claims.user_id, user.id);
+        }
+        let audits = h.store.audits.borrow();
+        let actions: Vec<&str> = audits.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(actions, ["qa.test_account_mint", "qa.test_account_mint"]);
+    }
+
+    #[test]
+    fn qa_mint_seam_refuses_unsupported_plans_and_existing_accounts() {
+        let h = qa_harness();
+        // No route enforces plan caps yet: a capped account is refused by
+        // name instead of being minted as an ordinary one.
+        for plan in ["overlimit", "plus", ""] {
+            let resp = h.call_mint_seam(
+                serde_json::json!({"email": "capped@example.test", "plan": plan}),
+                Some(QA_TOKEN),
+            );
+            assert_eq!(resp.status, 422, "{}", resp.body);
+            assert!(resp.body.contains("unsupported plan"));
+            assert!(!resp.body.contains("capped@"));
+        }
+        assert!(h.store.users.borrow().is_empty());
+        // Mint, never sign-in: an existing account gets no new session.
+        seed_user(&h, "u-existing", "taken@example.test");
+        let resp = h.call_mint_seam(
+            serde_json::json!({"email": "taken@example.test"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 422, "{}", resp.body);
+        assert!(!resp.body.contains("taken@"));
+        assert!(h.store.sessions.borrow().is_empty());
     }
 
     #[test]
