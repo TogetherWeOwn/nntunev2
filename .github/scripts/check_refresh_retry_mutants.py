@@ -93,6 +93,33 @@ def run(args):
     )
 
 
+def failed_tests(stdout):
+    """Names in libtest's closing `failures:` list.
+
+    Under --nocapture a test's panic text lands between `test <name> ... ` and
+    `FAILED` (from its own thread, or a parallel one), so the per-test result
+    line is unreliable. The closing list is printed after every test finished.
+    """
+    lines = stdout.splitlines()
+    starts = [i for i, line in enumerate(lines) if line == "failures:"]
+    if not starts:
+        return set()
+    names = set()
+    for line in lines[starts[-1] + 1:]:
+        if not line.strip():
+            if names:
+                break
+            continue
+        if not line.startswith("    "):
+            break
+        names.add(line.strip())
+    return names
+
+
+def killed_by(name, failed):
+    return any(test == name or test.endswith(f"::{name}") for test in failed)
+
+
 def main():
     for label, path, old, new, args, expected in CASES:
         expected_names = (expected,) if isinstance(expected, str) else expected
@@ -107,9 +134,9 @@ def main():
         try:
             path.write_text(original.replace(old, new, 1))
             mutant = run(args)
+            failed = failed_tests(mutant.stdout)
             if (mutant.returncode != 101 or "test result: FAILED." not in mutant.stdout
-                    or any(f"{name} ... FAILED" not in mutant.stdout
-                           for name in expected_names)):
+                    or not all(killed_by(name, failed) for name in expected_names)):
                 raise RuntimeError(f"{label}: expected assertion did not kill mutant\n{mutant.stdout[-6000:]}")
         finally:
             path.write_text(original)
