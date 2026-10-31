@@ -26,6 +26,7 @@ WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 
 SELF_COMMAND = "python3 .github/scripts/test_ci_web_e2e_timeout.py"
 PNPM_COMMAND = "python3 .github/scripts/test_ci_pnpm_retry.py"
+RUST_CACHE_COMMAND = "python3 .github/scripts/test_ci_rust_cache.py"
 
 
 class TestWebE2eTimeout(unittest.TestCase):
@@ -113,6 +114,29 @@ class TestWebE2eTimeout(unittest.TestCase):
         self.assertEqual(
             check_required_step("public-text", self.jobs["public-text"], PNPM_COMMAND),
             [],
+        )
+
+    def test_rust_cache_guard_step_is_required_in_public_text(self):
+        """The Rust cache suite's step stays required.
+
+        That suite pins its own step too, but it cannot fail once the
+        step is gone, so this suite backstops it.
+        """
+        self.assertEqual(
+            check_required_step("public-text", self.jobs["public-text"], RUST_CACHE_COMMAND),
+            [],
+        )
+
+    def test_removed_rust_cache_step_fails(self):
+        """Deleting the Rust cache suite's step is caught here."""
+        job = self.jobs["public-text"]
+        step = (
+            "      - name: Structural-test the Rust cache and coverage concurrency\n"
+            "        run: " + RUST_CACHE_COMMAND + "\n"
+        )
+        self.assertIn(step, job)
+        self.assertTrue(
+            check_required_step("public-text", job.replace(step, ""), RUST_CACHE_COMMAND)
         )
 
 
