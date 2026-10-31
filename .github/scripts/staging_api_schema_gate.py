@@ -18,6 +18,32 @@ class GateError(Exception):
     pass
 
 
+# Fixed, non-secret failure categories. Only one of these words ever reaches
+# CI output, never exception text, so the redaction contract is unchanged:
+#   config   - repo secret/variable missing or malformed (no network yet)
+#   binding  - Hyperdrive config fetch failed or does not match the migrator
+#   connect  - psql could not connect/authenticate (TLS, auth, network, timeout)
+#   query    - connected, but the read-only catalog query errored
+#   schema   - query ran; required sessions columns absent or shadowed
+CATEGORIES = ("config", "binding", "connect", "query", "schema")
+
+
+class CategorizedFailure(Exception):
+    def __init__(self, category):
+        assert category in CATEGORIES
+        super().__init__(category)
+        self.category = category
+
+
+def _stage(category, fn, *args):
+    try:
+        return fn(*args)
+    except CategorizedFailure:
+        raise
+    except Exception as exc:
+        raise CategorizedFailure(category) from exc
+
+
 # The Worker resolves unqualified `sessions` through its runtime role's
 # search path, while this gate connects as the migrator. Requiring that no
 # other non-system `sessions` relation exists means any search path that
@@ -71,6 +97,15 @@ def connection_env(env, payload):
             or not url.username or not url.password or url.fragment
             or database != "nntunev2_staging"):
         raise GateError("missing or invalid staging database configuration")
+    query = urllib.parse.parse_qs(url.query, strict_parsing=True)
+    if set(query) - {"sslmode"} or len(query.get("sslmode", [])) > 1:
+        raise GateError("unsupported staging connection options")
+    sslmode = query.get("sslmode", ["verify-full"])[0]
+    if sslmode != "verify-full":
+        raise GateError("staging schema check requires verified TLS")
+    if payload is None:
+        url.port  # raises on a malformed port
+        return None
     origin = payload.get("result", {}).get("origin", {})
     if (payload.get("success") is not True or origin.get("scheme") not in ("postgres", "postgresql")
             or origin.get("database") != database
@@ -78,12 +113,6 @@ def connection_env(env, payload):
             or origin["host"].lower().rstrip(".") != url.hostname.lower().rstrip(".")
             or origin.get("port") != (url.port or 5432)):
         raise GateError("staging database does not match the selected binding")
-    query = urllib.parse.parse_qs(url.query, strict_parsing=True)
-    if set(query) - {"sslmode"} or len(query.get("sslmode", [])) > 1:
-        raise GateError("unsupported staging connection options")
-    sslmode = query.get("sslmode", ["verify-full"])[0]
-    if sslmode != "verify-full":
-        raise GateError("staging schema check requires verified TLS")
     # No URL/password in argv, inherited service files, passfiles, or arbitrary
     # libpq options. Never inherit alternative credentials after a failure.
     child = {k: v for k, v in env.items()
@@ -102,24 +131,48 @@ def connection_env(env, payload):
     return child
 
 
+def validate_inputs(env):
+    """Shape-check every input before any network call (category: config)."""
+    if not env.get("CLOUDFLARE_API_TOKEN") or not all(
+            re.fullmatch(r"[a-fA-F0-9-]{32,36}", env.get(k, ""))
+            for k in ("CLOUDFLARE_ACCOUNT_ID", "HYPERDRIVE_ID_STAGING")):
+        raise GateError("missing or invalid staging binding configuration")
+    # connection_env validates the migrator URL before reading the payload.
+    connection_env(env, None)
+
+
 def check(env, fetch=fetch_config, run=subprocess.run):
-    child = connection_env(env, fetch(env))
-    result = run(
-        ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
-         "--no-align", "--set", "ON_ERROR_STOP=1"],
-        input=SCHEMA_SQL, text=True, capture_output=True, timeout=15, env=child,
-    )
-    if result.returncode != 0 or result.stdout.strip() != "t":
-        raise GateError("staging session schema prerequisite not verified")
+    _stage("config", validate_inputs, env)
+    payload = _stage("binding", fetch, env)
+    child = _stage("binding", connection_env, env, payload)
+    try:
+        result = run(
+            ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
+             "--no-align", "--set", "ON_ERROR_STOP=1"],
+            input=SCHEMA_SQL, text=True, capture_output=True, timeout=15, env=child,
+        )
+    except Exception as exc:
+        raise CategorizedFailure("connect") from exc
+    # psql exit codes: 2 = connection to the server went bad, 3 = an error
+    # occurred in the script (ON_ERROR_STOP), 1 = other fatal client error.
+    if result.returncode == 2:
+        raise CategorizedFailure("connect")
+    if result.returncode != 0:
+        raise CategorizedFailure("query")
+    if result.stdout.strip() != "t":
+        raise CategorizedFailure("schema")
 
 
 def main():
     try:
         check(dict(os.environ))
-    except Exception:
+    except Exception as exc:
         # Deliberately do not render exceptions, SQL output, URLs, provider
         # payloads, or stderr; each can contain credentials or private targets.
-        print("staging-api-schema: FAIL (configuration, target or schema not verified)", file=sys.stderr)
+        # Only a fixed category word from CATEGORIES is printed.
+        category = exc.category if isinstance(exc, CategorizedFailure) else "unknown"
+        print(f"staging-api-schema: FAIL category={category} "
+              "(configuration, target or schema not verified)", file=sys.stderr)
         return 1
     print("staging-api-schema: PASS (actual staging binding; read-only schema check)")
     return 0
