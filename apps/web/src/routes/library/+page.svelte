@@ -3,6 +3,13 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import {
+		describeJump,
+		jumpMedia,
+		watchJump,
+		type JumpDirection,
+		type JumpOutcome
+	} from '#lib/player/relativeJump.js';
+	import {
 		browserStorage,
 		clearSnapshot,
 		invalidateLibraryCache,
@@ -246,6 +253,13 @@
 	 */
 	let restoreFilterFocus = false;
 	let audioEl: HTMLAudioElement | undefined = $state();
+	// One-shot readout for the Back/Forward 10 seconds buttons; cleared when
+	// the source changes or the auth boundary resets the player.
+	let jumpFeedback = $state('');
+	let cancelJump: (() => void) | undefined;
+	// Seeking explicitly to the end is not natural track completion. Keep this
+	// fence through native pause/ended, retiring it only on new playback/seek.
+	let jumpEndElement: HTMLAudioElement | null = null;
 	// Native completion pauses before `ended`; retain intent only for that
 	// element, never for a manual pause, replaced source or account.
 	let playingElement: HTMLAudioElement | null = null;
@@ -260,7 +274,10 @@
 
 	function handlePlay(event: Event): void {
 		const element = currentAudioEvent(event);
-		if (element && !element.paused && !element.ended) playingElement = element;
+		if (element && !element.paused && !element.ended) {
+			jumpEndElement = null;
+			playingElement = element;
+		}
 	}
 
 	function handlePause(event: Event): void {
@@ -279,6 +296,11 @@
 	async function handleEnded(event: Event): Promise<void> {
 		const element = currentAudioEvent(event);
 		if (!element) return;
+		if (jumpEndElement === element) {
+			playingElement = null;
+			endGeneration += 1;
+			return;
+		}
 		const result = naturalEndPolicy(queue, {
 			repeat,
 			radioActive: false,
@@ -373,6 +395,7 @@
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
 	let restartStatusVersion = $state(0);
+	let jumpStatusVersion = $state(0);
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -806,6 +829,11 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			restartCanSeek = false;
 			restartStatus = '';
+			// The Back/Forward readout describes the previous source too.
+			jumpFeedback = '';
+			cancelJump?.();
+			cancelJump = undefined;
+			jumpEndElement = null;
 		}
 	}
 
@@ -854,6 +882,10 @@
 		clearShareFeedback();
 		clearQueueShareFeedback(true);
 		pendingShareSeek = null;
+		jumpFeedback = '';
+		cancelJump?.();
+		cancelJump = undefined;
+		jumpEndElement = null;
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
@@ -1022,6 +1054,7 @@
 	}
 
 	function handleSeeking(): void {
+		if (audioEl && audioEl.currentTime < audioEl.duration) jumpEndElement = null;
 		// A listener's own seek wins over a pending late-duration adjustment.
 		if (
 			pendingShareSeek?.appliedSeconds != null &&
@@ -1157,6 +1190,47 @@
 				? withTitle('Restarted')
 				: withTitle('Could not restart')
 		);
+	}
+
+	/**
+	 * Back/Forward 10 seconds act on the live, mounted audio element for the
+	 * current source only (never a cached one, never catalogue duration).
+	 * A gesture that reaches usable media supersedes a pending inbound-share
+	 * seek so later metadata events cannot undo it.
+	 */
+	function jumpRelative(direction: JumpDirection): void {
+		cancelJump?.();
+		cancelJump = undefined;
+		const element = audioEl;
+		const source = streamUrl;
+		let outcome: JumpOutcome = { kind: 'unavailable' };
+		if (
+			element &&
+			element.isConnected &&
+			source &&
+			element.getAttribute('src') === source
+		) {
+			outcome = jumpMedia(element, direction);
+			if (outcome.kind === 'jumped' || outcome.kind === 'pending' || outcome.kind === 'boundary') {
+				pendingShareSeek = null;
+				if ('target' in outcome && outcome.target === element.duration) jumpEndElement = element;
+			}
+			if (outcome.kind === 'pending') {
+				cancelJump = watchJump(element, outcome, (settled) => {
+					cancelJump = undefined;
+					if (!shareAlive || audioEl !== element || !element.isConnected ||
+						streamUrl !== source || element.getAttribute('src') !== source) return;
+					if (settled.kind === 'refused' && !element.seeking && element.currentTime < element.duration &&
+						jumpEndElement === element) jumpEndElement = null;
+					jumpFeedback = describeJump(direction, settled);
+					jumpStatusVersion += 1;
+				});
+			}
+		}
+		jumpFeedback = describeJump(direction, outcome);
+		// A repeated identical outcome changes no text; the version re-renders
+		// the live-region content so it is announced again.
+		jumpStatusVersion += 1;
 	}
 
 	if (typeof window !== 'undefined') {
@@ -1698,6 +1772,9 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			cancelJump?.();
+			cancelJump = undefined;
+			jumpEndElement = null;
 			endGeneration += 1;
 			playingElement = null;
 			if (audioEl && !audioEl.paused) audioEl.pause();
@@ -2252,6 +2329,29 @@
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
 			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
+			<div class="nt-player-jump">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-back"
+					aria-label="Back 10 seconds"
+					onclick={() => jumpRelative('back')}
+				>
+					Back 10 s
+				</button>
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-forward"
+					aria-label="Forward 10 seconds"
+					onclick={() => jumpRelative('forward')}
+				>
+					Forward 10 s
+				</button>
+			</div>
+			<p class="nt-player-jump-status" data-testid="player-seek-feedback" role="status">
+				{#key jumpStatusVersion}{jumpFeedback}{/key}
+			</p>
 		</section>
 	{/if}
 </main>
@@ -2439,6 +2539,24 @@
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;
+	}
+	.nt-player-jump {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-player-jump button {
+		min-height: 2.75rem;
+		min-width: 2.75rem;
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.nt-player-jump-status {
+		margin: 0;
+		color: var(--nt-fg-muted);
+		overflow-wrap: anywhere;
 	}
 	.nt-library-order {
 		display: flex;
