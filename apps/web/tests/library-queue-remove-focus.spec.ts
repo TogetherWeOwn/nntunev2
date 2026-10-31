@@ -354,6 +354,8 @@ test('QF-B07 focused Clear empties the queue onto the empty target', async ({ pa
 	await expect(clear).toBeEnabled();
 	await clear.focus();
 	await page.keyboard.press('Enter');
+	await page.keyboard.press('Tab');
+	await page.keyboard.press('Enter');
 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	expect(await queueOrder(page)).toEqual([]);
@@ -398,6 +400,8 @@ test('QF-B09 the empty target is inert: activating it plays, seeks and repopulat
 	const clear = page.getByRole('button', { name: 'Clear queue', exact: true });
 	await expect(clear).toBeVisible();
 	await clear.focus();
+	await page.keyboard.press('Enter');
+	await page.keyboard.press('Tab');
 	await page.keyboard.press('Enter');
 	await expectEmptyRecovery(page);
 
@@ -571,6 +575,8 @@ for (const scheme of ['light', 'dark'] as const) {
 		const clear = page.getByRole('button', { name: 'Clear queue', exact: true });
 		await clear.focus();
 		await page.keyboard.press('Enter');
+		await page.keyboard.press('Tab');
+		await page.keyboard.press('Enter');
 		await expect(page.getByTestId('queue-item')).toHaveCount(0);
 		await expectEmptyRecovery(page);
 	});
@@ -603,6 +609,8 @@ test('QF-B18 remove and clear announce exactly once without replaying moves', as
 	const clear = page.getByRole('button', { name: 'Clear queue', exact: true });
 	await watchAnnouncements(page);
 	await clear.focus();
+	await page.keyboard.press('Enter');
+	await page.keyboard.press('Tab');
 	await page.keyboard.press('Enter');
 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);

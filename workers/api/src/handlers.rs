@@ -14,6 +14,9 @@
 //!   [`session::verify_stored_session`] against the current server row
 //!   (revoked/missing/stale-counter/mismatched rows reject), and cookie-
 //!   authenticated mutations require an exact `Origin` match (CSRF).
+//!   The only stale-cookie operation is opt-in refresh recovery: it requires
+//!   a separate client secret and an atomic current-row claim, and can only
+//!   reissue the immediate successor, never authorize an application action.
 //!   `POST /v1/auth/magic/finish` mints a cookie from a pure bearer token,
 //!   so it requires the same exact `Origin` match even when unauthenticated
 //!   (login-CSRF session planting): browsers always send `Origin` on this
@@ -648,6 +651,48 @@ pub trait Store {
         &self,
         record: &SessionRecord,
     ) -> impl Future<Output = Result<(), StoreError>>;
+    /// Claim a validated magic link and insert its session in one transaction.
+    /// `Ok(false)` means the conditional single-use claim lost (replay/expiry).
+    /// Both writes must commit together or neither may commit; never emulate
+    /// this with autocommitted writes or a compensating reset of `used`. The default
+    /// fails closed for stores without transactional redemption support.
+    /// `_now` is the request-admission timestamp: database implementations
+    /// MUST re-evaluate expiry against their own clock when the claim
+    /// executes (the production store does, inside the claim statement), so a
+    /// request admitted just before expiry cannot commit after it. In-memory
+    /// test stores have no second clock and use `_now`.
+    fn redeem_magic_link(
+        &self,
+        _magic: &MagicLinkRecord,
+        _now: u64,
+        _session: &SessionRecord,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Redemption plus its success audit, for handlers whose response
+    /// carries the freshly committed credential: no store operation may run
+    /// between the redemption commit and that response, or a slow audit
+    /// insert could eat the client's remaining deadline after the link is
+    /// already spent. The production store writes the audit inside the
+    /// redemption transaction, so all three writes commit together and an
+    /// audit failure leaves the link unspent and retryable. The default
+    /// keeps stores without that seam on the sequential shape (redeem, then
+    /// best-effort audit on success), preserving observable test behavior.
+    fn redeem_magic_link_and_audit(
+        &self,
+        magic: &MagicLinkRecord,
+        now: u64,
+        session: &SessionRecord,
+        audit: &AuditEvent,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let redeemed = self.redeem_magic_link(magic, now, session).await?;
+            if redeemed {
+                let _ = self.insert_audit(audit).await;
+            }
+            Ok(redeemed)
+        }
+    }
     fn session_by_id(
         &self,
         id: &str,
@@ -661,6 +706,23 @@ pub trait Store {
         new_counter: u32,
         new_expires_at: u64,
     ) -> impl Future<Output = Result<bool, StoreError>>;
+    /// Atomically rotate a current session OR recover its immediate successor
+    /// using a digest bound to the old cookie and a separate client retry secret.
+    /// Lock the row BEFORE sampling a fresh database claim clock, then execute
+    /// `session::ROTATE_SESSION_WITH_RETRY_SQL` in that transaction (production:
+    /// `session_retry_store::rotate_with_retry`). Recheck both expiries and the
+    /// receipt window at the claim, not at request arrival. A missing/revoked/
+    /// stale row or mismatched/expired recovery must return None. The default
+    /// fails closed for stores that have not implemented the new protocol.
+    fn rotate_session_with_retry(
+        &self,
+        _previous: &SessionClaims,
+        _next: &SessionClaims,
+        _retry_hash: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Option<SessionClaims>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Atomically claim the old session for reauthentication and insert its
     /// replacement. A false result means the conditional revoke lost a race;
     /// errors must leave both rows unchanged.
@@ -1224,9 +1286,8 @@ where
             .await;
     }
 
-    /// Issue + persist a new session row; the cookie is only returned
-    /// after the row insert succeeds.
-    async fn start_session(&self, user_id: &str) -> Result<Response, Response> {
+    /// Prepare a signed token and its row without committing any auth state.
+    fn prepare_session(&self, user_id: &str) -> Result<(String, SessionRecord), Response> {
         let token = session::issue_session(
             &self.cfg.session_secret,
             user_id,
@@ -1239,21 +1300,31 @@ where
         })?;
         let claims = session::verify_session(&self.cfg.session_secret, &token, self.now)
             .map_err(|_| internal())?;
-        self.store
-            .insert_session(&SessionRecord {
-                id: claims.session_id.clone(),
-                user_id: claims.user_id.clone(),
+        Ok((
+            token,
+            SessionRecord {
+                id: claims.session_id,
+                user_id: claims.user_id,
                 created_at: claims.created_at,
                 expires_at: claims.expires_at,
                 rotation_counter: claims.rotation_counter,
                 revoked: false,
-            })
+            },
+        ))
+    }
+
+    /// Issue + persist a new session row; the cookie is only returned
+    /// after the row insert succeeds.
+    async fn start_session(&self, user_id: &str) -> Result<Response, Response> {
+        let (token, record) = self.prepare_session(user_id)?;
+        self.store
+            .insert_session(&record)
             .await
             .map_err(|_| internal())?;
         let mut resp = json_response(200, serde_json::json!({"ok": true}));
         resp.set_cookie = Some(session::set_cookie_header(
             &token,
-            claims.expires_at.saturating_sub(self.now),
+            record.expires_at.saturating_sub(self.now),
         ));
         Ok(resp)
     }
@@ -2360,29 +2431,161 @@ where
     // no auto-redeem, an explicit confirm, and the signed-in identity shown
     // before any credential is typed.
     if session_cookie_value(req).is_some() {
-        if let Ok((claims, _)) = ctx.authenticate(req, false).await {
-            if claims.user_id != record.user_id {
-                return generic_auth();
-            }
+        match ctx.authenticate(req, false).await {
+            Ok((claims, _)) if claims.user_id != record.user_id => return generic_auth(),
+            Ok(_) => {}
+            // A storage failure inside `authenticate` (its 5xx results, e.g.
+            // the `session_by_id` lookup) is NOT an absent or invalid
+            // cookie: the existing session's owner is unproven, so fail
+            // closed without consuming the token instead of letting a
+            // transient lookup error silently replace that session.
+            Err(resp) if resp.status >= 500 => return resp,
+            Err(_) => {}
         }
     }
-    let email = record.email.clone();
-    let consumed =
-        match auth::consume_magic_link_atomically(record, &body.token, ctx.now, ctx.store).await {
-            Ok(consumed) => consumed,
-            Err(_) => return generic_auth(),
-        };
-    ctx.audit(&consumed.user_id, "auth.magic", true).await;
-    match ctx.start_session(&consumed.user_id).await {
-        Ok(mut resp) => {
-            // The token holder is now signed in as this account; echoing
-            // its own email back lets the web app show "Signed in as …"
-            // before any provider credential is entered.
-            resp.body = serde_json::json!({"ok": true, "email": email}).to_string();
-            resp
-        }
-        Err(resp) => resp,
+    // Pure validation is not authentication: prepare everything that can fail
+    // before the database claim, then commit the claim AND session together.
+    // No cookie or success audit may escape before that transaction commits.
+    let prepared = match auth::consume_magic_link(record, &body.token, ctx.now) {
+        Ok(prepared) => prepared,
+        Err(_) => return generic_auth(),
+    };
+    let (token, session) = match ctx.prepare_session(&prepared.user_id) {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
+    // `ctx.now` is the request-admission timestamp; the production store
+    // re-evaluates expiry against the database clock when its claim
+    // executes (documented on the trait), so time spent in admission and
+    // lookup cannot push a redemption past the link's stated expiry. The
+    // success audit rides the same call (inside the production
+    // transaction), so nothing but response construction follows the
+    // commit that spends the link.
+    let audit = vault::audit_event(
+        &prepared.user_id,
+        "auth.magic",
+        true,
+        &ctx.source_ip,
+        ctx.now,
+    );
+    match ctx
+        .store
+        .redeem_magic_link_and_audit(&prepared.used_record, ctx.now, &session, &audit)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return generic_auth(),
+        Err(_) => return internal(),
     }
+    // The token holder is now signed in as this account; echo only its email.
+    let mut resp = json_response(
+        200,
+        serde_json::json!({"ok": true, "email": prepared.used_record.email}),
+    );
+    resp.set_cookie = Some(session::set_cookie_header(
+        &token,
+        session.expires_at.saturating_sub(ctx.now),
+    ));
+    resp
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRefreshBody {
+    retry_key: Option<String>,
+}
+
+/// Body-independent opt-in marker. A lengthless upload hidden as EOF must not
+/// downgrade a bound refresh to the ordinary empty-body rotation protocol.
+pub const BOUND_REFRESH_CONTENT_TYPE: &str = "application/vnd.nntune.session-refresh-bound+json";
+
+/// Runtime-only transport guard, before `handle` and all session mutations.
+/// Keep metadata outside Request so existing transport-free callers retain the
+/// core API while HTTP clients must explicitly mark the bound protocol.
+pub fn refresh_transport_rejection(req: &Request, content_type: Option<&str>) -> Option<Response> {
+    if req.method != "POST" || req.path != "/v1/session/refresh" {
+        return None;
+    }
+    let marked = content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case(BOUND_REFRESH_CONTENT_TYPE)
+        });
+    let has_key =
+        parse_body::<SessionRefreshBody>(req).is_some_and(|body| body.retry_key.is_some());
+    if marked != has_key {
+        return Some(generic_auth());
+    }
+    None
+}
+
+/// Optional lost-response recovery protocol. This is NOT ordinary request
+/// authentication: the stale cookie plus the separately retained client secret
+/// can ONLY retrieve the already committed successor via the atomic DB claim.
+async fn session_refresh_with_retry<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    retry_key: String,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.origin.as_deref() != Some(ctx.cfg.origin.as_str()) {
+        return generic_auth();
+    }
+    let Some(token) = session_cookie_value(req) else {
+        return generic_auth();
+    };
+    let keys = ctx.cfg.session_keys();
+    let previous = match session::verify_session_dual(&keys, &token, ctx.now) {
+        Ok(claims) => claims,
+        Err(error) => return session_error_response(error),
+    };
+    let retry_hash = match session::refresh_retry_hash(&token, &retry_key) {
+        Ok(hash) => hash,
+        Err(_) => return generic_auth(),
+    };
+    let candidate = match session::rotate_session(&keys, &token, ctx.now, ctx.cfg.session_ttl_secs)
+        .and_then(|next| session::verify_session(&ctx.cfg.session_secret, &next, ctx.now))
+    {
+        Ok(claims) => claims,
+        Err(error) => return session_error_response(error),
+    };
+    let committed = match ctx
+        .store
+        .rotate_session_with_retry(&previous, &candidate, &retry_hash, ctx.now)
+        .await
+    {
+        Ok(Some(claims)) => claims,
+        Ok(None) => return generic_auth(),
+        Err(_) => return internal(), // Keep the original cookie and retry key.
+    };
+    // Defense in depth against an adapter returning unrelated row metadata.
+    if committed.session_id != previous.session_id
+        || committed.user_id != previous.user_id
+        || committed.created_at != previous.created_at
+        || committed.rotation_counter != candidate.rotation_counter
+    {
+        return internal();
+    }
+    let new_token = match session::sign_refreshed_claims(&ctx.cfg.session_secret, &committed) {
+        Ok(token) => token,
+        Err(error) => return session_error_response(error),
+    };
+    if session::verify_session(&ctx.cfg.session_secret, &new_token, ctx.now).is_err() {
+        return internal();
+    }
+    let mut response = json_response(200, serde_json::json!({"ok": true}));
+    response.set_cookie = Some(session::set_cookie_header(
+        &new_token,
+        committed.expires_at.saturating_sub(ctx.now),
+    ));
+    response
 }
 
 async fn session_refresh<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -2392,6 +2595,16 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Empty bodies and `{}` preserve the strict one-shot rotation protocol.
+    // Recovery requires an explicit, separately bound retry secret.
+    if !req.body.is_empty() {
+        let Some(body) = parse_body::<SessionRefreshBody>(req) else {
+            return generic_auth();
+        };
+        if let Some(retry_key) = body.retry_key {
+            return session_refresh_with_retry(ctx, req, retry_key).await;
+        }
+    }
     let (claims, token) = match ctx.authenticate(req, true).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
@@ -3614,6 +3827,8 @@ mod tests {
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
+        refresh_retries: RefCell<HashMap<String, (String, u64)>>,
+        lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
         vaults: RefCell<HashMap<String, VaultRow>>,
         providers: RefCell<Vec<ProviderMintRow>>,
@@ -3640,6 +3855,13 @@ mod tests {
         /// zero while a well-formed unknown key increments both.
         rate_limit_pair_calls: RefCell<usize>,
         native_credential_lookups: RefCell<usize>,
+        fail_session_insert: RefCell<bool>,
+        fail_magic_audit: RefCell<bool>,
+        /// Session-row lookup outage pin: `session_by_id` fails like a
+        /// production query error, which `authenticate` maps to a 500.
+        fail_session_lookup: RefCell<bool>,
+        lose_magic_claim: RefCell<bool>,
+        magic_redemptions: RefCell<usize>,
         fail_reauth_revocation: RefCell<bool>,
         fail_reauth_insert: RefCell<bool>,
         /// Bearer-gate store-error pin: when set, the HMAC lookup fails
@@ -3984,12 +4206,70 @@ mod tests {
             Ok(self.invites.borrow().get(code_hash).cloned())
         }
         async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
+            if *self.fail_session_insert.borrow() {
+                return Err(StoreError);
+            }
             self.sessions
                 .borrow_mut()
                 .insert(record.id.clone(), record.clone());
             Ok(())
         }
+        async fn redeem_magic_link(
+            &self,
+            record: &MagicLinkRecord,
+            now: u64,
+            session: &SessionRecord,
+        ) -> Result<bool, StoreError> {
+            *self.magic_redemptions.borrow_mut() += 1;
+            if *self.lose_magic_claim.borrow() {
+                return Ok(false);
+            }
+            let mut magic = self.magic.borrow_mut();
+            let Some(row) = magic.get_mut(&record.token_hash) else {
+                return Ok(false);
+            };
+            if row.user_id != record.user_id
+                || row.email != record.email
+                || row.expires_at != record.expires_at
+                || row.expires_at <= now
+                || row.used
+            {
+                return Ok(false);
+            }
+            if session.user_id != record.user_id || *self.fail_session_insert.borrow() {
+                return Err(StoreError);
+            }
+            let mut sessions = self.sessions.borrow_mut();
+            if sessions.contains_key(&session.id) {
+                return Err(StoreError);
+            }
+            sessions.insert(session.id.clone(), session.clone());
+            row.used = true;
+            Ok(true)
+        }
+        async fn redeem_magic_link_and_audit(
+            &self,
+            magic: &MagicLinkRecord,
+            now: u64,
+            session: &SessionRecord,
+            audit: &AuditEvent,
+        ) -> Result<bool, StoreError> {
+            // The database fixtures separately prove rollback after both
+            // writes. Here the store's error pins the handler's no-cookie
+            // response to that failed transaction, without faking SQL.
+            if *self.fail_magic_audit.borrow() {
+                return Err(StoreError);
+            }
+            let redeemed = self.redeem_magic_link(magic, now, session).await?;
+            if redeemed {
+                let _ = self.insert_audit(audit).await;
+            }
+            Ok(redeemed)
+        }
         async fn session_by_id(&self, id: &str) -> Result<Option<SessionRecord>, StoreError> {
+            if *self.fail_session_lookup.borrow() {
+                return Err(StoreError);
+            }
             Ok(self.sessions.borrow().get(id).cloned())
         }
         async fn rotate_session_row(
@@ -4004,10 +4284,63 @@ mod tests {
                 Some(row) if row.rotation_counter == expected_counter && !row.revoked => {
                     row.rotation_counter = new_counter;
                     row.expires_at = new_expires_at;
+                    self.refresh_retries.borrow_mut().remove(id);
                     Ok(true)
                 }
                 _ => Ok(false),
             }
+        }
+        async fn rotate_session_with_retry(
+            &self,
+            previous: &SessionClaims,
+            next: &SessionClaims,
+            retry_hash: &str,
+            now: u64,
+        ) -> Result<Option<SessionClaims>, StoreError> {
+            let mut sessions = self.sessions.borrow_mut();
+            let Some(row) = sessions.get_mut(&previous.session_id) else {
+                return Ok(None);
+            };
+            if row.revoked
+                || row.user_id != previous.user_id
+                || row.created_at != previous.created_at
+                || now >= row.expires_at
+            {
+                return Ok(None);
+            }
+            let mut retries = self.refresh_retries.borrow_mut();
+            let issued_at = if row.rotation_counter == previous.rotation_counter
+                && row.expires_at == previous.expires_at
+            {
+                row.rotation_counter = next.rotation_counter;
+                row.expires_at = next.expires_at;
+                retries.insert(row.id.clone(), (retry_hash.to_string(), now));
+                now
+            } else {
+                match retries.get(&row.id) {
+                    Some((hash, at))
+                        if row.rotation_counter == next.rotation_counter
+                            && hash == retry_hash
+                            && *at <= now
+                            && now.saturating_sub(*at) < session::REFRESH_RETRY_SECS =>
+                    {
+                        *at
+                    }
+                    _ => return Ok(None),
+                }
+            };
+            // Simulate a committed UPDATE whose acknowledgement is lost.
+            if self.lose_next_refresh_ack.replace(false) {
+                return Err(StoreError);
+            }
+            Ok(Some(SessionClaims {
+                session_id: row.id.clone(),
+                user_id: row.user_id.clone(),
+                created_at: row.created_at,
+                issued_at,
+                expires_at: row.expires_at,
+                rotation_counter: row.rotation_counter,
+            }))
         }
         async fn replace_session_after_reauthentication(
             &self,
@@ -4810,6 +5143,152 @@ mod tests {
     }
 
     #[test]
+    fn magic_finish_lost_claim_never_authenticates() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        assert_eq!(
+            h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            )
+            .status,
+            200
+        );
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let hash = auth::hash_magic_token(&token);
+        assert!(!h.store.magic.borrow()[&hash].used);
+        *h.store.lose_magic_claim.borrow_mut() = true;
+        let audits_before = h.store.audits.borrow().len();
+
+        let lost = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+
+        assert_eq!(*h.store.magic_redemptions.borrow(), 1);
+        assert_eq!(lost.status, 401);
+        assert_eq!(lost.body, r#"{"error":"check your email and try again"}"#);
+        assert!(lost.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+        assert!(!h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+        assert!(!h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .any(|event| event.action == "auth.magic"));
+    }
+
+    #[test]
+    fn magic_finish_can_retry_after_session_insert_failure() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let started = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "a@example.com"}),
+        );
+        assert_eq!(started.status, 200);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        *h.store.fail_session_insert.borrow_mut() = true;
+        let failed = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(failed.status, 500);
+        assert!(failed.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+        assert!(!h.store.magic.borrow()[&auth::hash_magic_token(&token)].used);
+        assert!(!h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .any(|event| event.action == "auth.magic"));
+        *h.store.fail_session_insert.borrow_mut() = false;
+        let retry = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert!(retry.set_cookie.is_some());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h.store.magic.borrow()[&auth::hash_magic_token(&token)].used);
+        assert_eq!(
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|event| event.action == "auth.magic")
+                .count(),
+            1
+        );
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+    }
+
+    #[test]
+    fn magic_finish_audit_transaction_error_never_sets_a_cookie() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        assert_eq!(
+            h.call(
+                "POST",
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": "a@example.com"}),
+            )
+            .status,
+            200
+        );
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let hash = auth::hash_magic_token(&token);
+        let audits_before = h.store.audits.borrow().len();
+        *h.store.fail_magic_audit.borrow_mut() = true;
+        let failed = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(failed.status, 500);
+        assert!(failed.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+        assert!(!h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        *h.store.fail_magic_audit.borrow_mut() = false;
+        let retry = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert!(retry.set_cookie.is_some());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h.store.magic.borrow()[&hash].used);
+        assert_eq!(h.store.audits.borrow().len(), audits_before + 1);
+        let replay = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert_eq!(h.store.audits.borrow().len(), audits_before + 1);
+    }
+
+    #[test]
     fn magic_finish_never_swaps_an_existing_session_for_another_account() {
         // Login CSRF: a signed-in victim lured into redeeming someone
         // else's emailed link must keep their own session, and the
@@ -4864,6 +5343,47 @@ mod tests {
             "signed-in identity must be in the body: {}",
             resp.body
         );
+    }
+
+    #[test]
+    fn magic_finish_fails_closed_when_the_session_lookup_errors() {
+        // The account-swap guard must distinguish a storage failure from an
+        // absent/invalid cookie: if looking up the existing session's row
+        // errors, its owner is unproven, so the other account's link must
+        // not be redeemed (and must not be spent) on the strength of the
+        // failed lookup.
+        let h = harness();
+        seed_user(&h, "victim", "victim@example.com");
+        seed_user(&h, "other", "other@example.com");
+        let victim_cookie = magic_login(&h, "victim@example.com");
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "other@example.com"}),
+        );
+        assert_eq!(resp.status, 200);
+        let other_token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let sessions_before = h.store.sessions.borrow().len();
+        *h.store.fail_session_lookup.borrow_mut() = true;
+        let resp = h.call_full(
+            "POST",
+            "/v1/auth/magic/finish",
+            Some(serde_json::json!({"token": other_token}).to_string()),
+            Some(victim_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(resp.set_cookie.is_none(), "no swapped-session cookie");
+        assert_eq!(h.store.sessions.borrow().len(), sessions_before);
+        assert!(!h.store.magic.borrow()[&auth::hash_magic_token(&other_token)].used);
+        // Once the lookup recovers the token is still redeemable by its owner.
+        *h.store.fail_session_lookup.borrow_mut() = false;
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": other_token}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
     }
 
     #[test]
@@ -5104,6 +5624,453 @@ mod tests {
             .filter(|won| *won)
             .count();
         assert_eq!(wins, 1);
+    }
+
+    #[test]
+    fn refresh_retry_recovers_lost_response_only_with_original_client_secret() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let body = serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+        let refresh = |body: Option<String>, cookie: String| {
+            h.call_full(
+                "POST",
+                "/v1/session/refresh",
+                body,
+                Some(cookie),
+                Some(ORIGIN),
+            )
+        };
+        // Commit the rotation but deliberately do not install its Set-Cookie.
+        let lost = refresh(Some(body.clone()), cookie.clone());
+        assert_eq!(lost.status, 200);
+        let successor = cookie_of(&lost);
+        assert_ne!(cookie, successor);
+        assert_eq!(refresh(None, cookie.clone()).status, 401);
+        let wrong_key =
+            serde_json::json!({"retry_key": crate::b64::encode(&[43u8; 32])}).to_string();
+        assert_eq!(refresh(Some(wrong_key), cookie.clone()).status, 401);
+        let retried = refresh(Some(body.clone()), cookie.clone());
+        assert_eq!(
+            retried.status, 200,
+            "a bound retry must recover the committed cookie"
+        );
+        assert_eq!(cookie_of(&retried), successor);
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+                .status,
+            401
+        );
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(successor.clone()), None)
+                .status,
+            200
+        );
+        // A later rotation permanently closes the recovery slot.
+        assert_eq!(refresh(None, successor).status, 200);
+        assert_eq!(refresh(Some(body), cookie).status, 401);
+    }
+
+    fn bound_refresh(
+        h: &Harness,
+        cookie: &str,
+        key: &str,
+        now: u64,
+        origin: Option<&str>,
+    ) -> Response {
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1/session/refresh".into(),
+            cookie: Some(cookie.into()),
+            origin: origin.map(str::to_string),
+            authorization: None,
+            body: serde_json::json!({"retry_key": key})
+                .to_string()
+                .into_bytes(),
+        };
+        let mut ctx = h.ctx();
+        ctx.now = now;
+        block_on(handle(&ctx, &req))
+    }
+
+    fn transported_refresh(
+        h: &Harness,
+        cookie: &str,
+        body: &str,
+        media_type: Option<&str>,
+    ) -> Response {
+        let ctx = h.ctx();
+        let request = Request {
+            method: "POST".into(),
+            path: "/v1/session/refresh".into(),
+            cookie: Some(cookie.into()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            body: Vec::new(),
+        };
+        block_on(crate::worker_entry::dispatch_collected(
+            crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
+            request,
+            |collected_request| async move {
+                crate::worker_entry::handle_with_refresh_transport_guard(
+                    collected_request,
+                    media_type,
+                    |guarded_request| async move { handle(&ctx, &guarded_request).await },
+                )
+                .await
+            },
+        ))
+    }
+
+    #[test]
+    fn refresh_transport_marker_prevents_empty_upload_downgrade() {
+        // A lengthless aborted upload may be surfaced by the runtime as clean
+        // empty EOF. Preserve the header opt-in through that exact Complete
+        // decision; no auth, rotation or Set-Cookie may happen on missing JSON.
+        for body in ["", "{", "{}", "{\"retry_key\":null}"] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let response = transported_refresh(
+                &h,
+                &cookie,
+                body,
+                Some("application/vnd.nntune.session-refresh-bound+json"),
+            );
+            assert_eq!(response.status, 401);
+            assert!(response.set_cookie.is_none());
+            assert!(h
+                .store
+                .sessions
+                .borrow()
+                .values()
+                .all(|row| row.rotation_counter == 0));
+            assert!(h.store.refresh_retries.borrow().is_empty());
+        }
+        // Every accepted marker spelling must also reject a marked empty
+        // upload: media types are case-insensitive and may carry parameters
+        // or surrounding whitespace. An exact comparison, or dropping the
+        // parameter split or trim, must turn one of these red.
+        for media_type in [
+            "Application/Vnd.Nntune.Session-Refresh-Bound+Json",
+            "application/vnd.nntune.session-refresh-bound+json; charset=utf-8",
+            "  application/vnd.nntune.session-refresh-bound+json ",
+        ] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let response = transported_refresh(&h, &cookie, "", Some(media_type));
+            assert_eq!(response.status, 401, "media type {media_type:?}");
+            assert!(response.set_cookie.is_none());
+            assert!(h
+                .store
+                .sessions
+                .borrow()
+                .values()
+                .all(|row| row.rotation_counter == 0));
+            assert!(h.store.refresh_retries.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn refresh_transport_requires_marked_recovery_but_preserves_legacy_empty_refresh() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let body = serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+        for media_type in [None, Some("application/json")] {
+            let rejected = transported_refresh(&h, &cookie, &body, media_type);
+            assert_eq!(rejected.status, 401);
+            assert!(rejected.set_cookie.is_none());
+        }
+        let first = transported_refresh(
+            &h,
+            &cookie,
+            &body,
+            Some("application/vnd.nntune.session-refresh-bound+json"),
+        );
+        let retry = transported_refresh(
+            &h,
+            &cookie,
+            &body,
+            Some("application/vnd.nntune.session-refresh-bound+json"),
+        );
+        assert_eq!(first.status, 200);
+        assert_eq!(cookie_of(&first), cookie_of(&retry));
+        let legacy = transported_refresh(&h, &cookie_of(&first), "", None);
+        assert_eq!(legacy.status, 200);
+        assert!(h.store.refresh_retries.borrow().is_empty());
+        let source = strip_line_comments(include_str!("worker_entry.rs"));
+        let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
+        assert!(dispatch.contains("headers_map.get(\"content-type\")"));
+        let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains(
+            "handle_with_refresh_transport_guard( collected_request, refresh_content_type.as_deref(),"
+        ));
+        let guard = dispatch
+            .find("handle_with_refresh_transport_guard")
+            .unwrap();
+        let handle = dispatch.find("handlers::handle(&ctx").unwrap();
+        assert!(
+            guard < handle,
+            "runtime must reject downgrade before calling handlers"
+        );
+    }
+
+    #[test]
+    fn refresh_transport_accepts_each_marker_spelling_for_recovery() {
+        // Positive counterpart to the marked-empty vectors: each accepted
+        // spelling must also let a keyed request commit and recover the
+        // same successor. A fresh harness per spelling keeps each first
+        // commit and its recovery claim independent.
+        for media_type in [
+            "Application/Vnd.Nntune.Session-Refresh-Bound+Json",
+            "application/vnd.nntune.session-refresh-bound+json; charset=utf-8",
+            "  application/vnd.nntune.session-refresh-bound+json ",
+        ] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let cookie = magic_login(&h, "a@example.com");
+            let body =
+                serde_json::json!({"retry_key": crate::b64::encode(&[42u8; 32])}).to_string();
+            let first = transported_refresh(&h, &cookie, &body, Some(media_type));
+            assert_eq!(first.status, 200, "media type {media_type:?}");
+            let retry = transported_refresh(&h, &cookie, &body, Some(media_type));
+            assert_eq!(retry.status, 200, "media type {media_type:?}");
+            assert_eq!(cookie_of(&first), cookie_of(&retry));
+        }
+    }
+
+    #[test]
+    fn refresh_retry_delivery_contract_settles_headers_before_next_cookie_mutation() {
+        let protocol = include_str!("../README.md");
+        assert!(protocol.contains("Cross-tab single-flight is mandatory"));
+        assert!(protocol.contains("No hedged or overlapping live requests"));
+        assert!(protocol.contains("settlement of every outstanding attempt"));
+        assert!(protocol.contains("not** proof of that boundary"));
+        for settle_before_advance in [false, true] {
+            let h = harness();
+            seed_user(&h, "u1", "a@example.com");
+            let predecessor = magic_login(&h, "a@example.com");
+            let key = crate::b64::encode(&[42u8; 32]);
+            // Hold response A's HEADERS, not just its body. The second response
+            // can carry the same successor; the database cannot order delivery.
+            let delayed = bound_refresh(&h, &predecessor, &key, NOW, Some(ORIGIN));
+            let delivered = bound_refresh(&h, &predecessor, &key, NOW, Some(ORIGIN));
+            assert_eq!(delayed.status, 200);
+            assert_eq!(delivered.status, 200);
+            let mut cookie_jar = cookie_of(&delivered);
+            assert_eq!(cookie_of(&delayed), cookie_jar);
+            if settle_before_advance {
+                // Drain every outstanding header before releasing the shared
+                // cookie-writer lock or disposing of this operation's secret.
+                cookie_jar = cookie_of(&delayed);
+            }
+            let advanced = h.call_full(
+                "POST",
+                "/v1/session/refresh",
+                None,
+                Some(cookie_jar),
+                Some(ORIGIN),
+            );
+            assert_eq!(advanced.status, 200);
+            cookie_jar = cookie_of(&advanced);
+            if !settle_before_advance {
+                // Unsupported schedule: same-name Set-Cookie replaces C2 with
+                // C1, even though C2's response was already successfully used.
+                cookie_jar = cookie_of(&delayed);
+            }
+            let authenticated = h.call_full("GET", "/v1/vault", None, Some(cookie_jar), None);
+            assert_eq!(
+                authenticated.status,
+                if settle_before_advance { 200 } else { 401 }
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_retry_is_bounded_and_does_not_extend_lifetime() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        let first = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        let before = h.store.sessions.borrow().clone();
+        let recovered = bound_refresh(&h, &cookie, &key, NOW + 119, Some(ORIGIN));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(cookie_of(&recovered), cookie_of(&first));
+        assert!(recovered.set_cookie.unwrap().contains("Max-Age=3481"));
+        for (id, row) in h.store.sessions.borrow().iter() {
+            assert_eq!(row.rotation_counter, before[id].rotation_counter);
+            assert_eq!(row.expires_at, before[id].expires_at);
+            assert_eq!(row.created_at, before[id].created_at);
+        }
+        let expired = bound_refresh(&h, &cookie, &key, NOW + 120, Some(ORIGIN));
+        assert_eq!(expired.status, 401);
+        assert!(expired.set_cookie.is_none());
+    }
+
+    #[test]
+    fn refresh_retry_rejects_revoked_and_cross_origin_requests() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        for origin in [None, Some("https://attacker.example")] {
+            assert_eq!(bound_refresh(&h, &cookie, &key, NOW, origin).status, 401);
+        }
+        let first = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        let successor = cookie_of(&first);
+        for origin in [None, Some("https://attacker.example")] {
+            assert_eq!(bound_refresh(&h, &cookie, &key, NOW, origin).status, 401);
+        }
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(successor),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+    }
+
+    #[test]
+    fn refresh_retry_recovers_a_committed_rotation_after_storage_ack_loss() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        *h.store.lose_next_refresh_ack.borrow_mut() = true;
+        let uncertain = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+        assert_eq!(uncertain.status, 500);
+        assert!(uncertain.set_cookie.is_none());
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie.clone()), None)
+                .status,
+            401
+        );
+        let recovered = bound_refresh(&h, &cookie, &key, NOW + 1, Some(ORIGIN));
+        assert_eq!(recovered.status, 200);
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&recovered)), None)
+                .status,
+            200
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 1));
+    }
+
+    #[test]
+    fn refresh_retry_cannot_retrofit_recovery_onto_an_unbound_rotation() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let first = h.call_full(
+            "POST",
+            "/v1/session/refresh",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(first.status, 200);
+        let key = crate::b64::encode(&[42u8; 32]);
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie_of(&first)), None)
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn refresh_retry_cannot_bypass_signed_token_or_current_row_checks() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let key = crate::b64::encode(&[42u8; 32]);
+        let token = cookie.split_once('=').unwrap().1;
+        let claims = session::verify_session(&h.config.session_secret, token, NOW).unwrap();
+        let mut wrong_owner = claims.clone();
+        wrong_owner.user_id = "other-user".into();
+        let mut wrong_created = claims.clone();
+        wrong_created.created_at -= 1;
+        let mut wrong_expiry = claims.clone();
+        wrong_expiry.expires_at += 1;
+        for altered in [wrong_owner, wrong_created, wrong_expiry] {
+            let signed =
+                session::sign_refreshed_claims(&h.config.session_secret, &altered).unwrap();
+            let cookie = format!("{}={signed}", session::COOKIE_NAME);
+            assert_eq!(
+                bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+                401
+            );
+        }
+        assert_eq!(
+            bound_refresh(&h, &format!("{cookie}tampered"), &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 0));
+        let first = bound_refresh(&h, &cookie, &key, NOW + 3599, Some(ORIGIN));
+        assert_eq!(first.status, 200);
+        // A still-open recovery window cannot revive an expired predecessor.
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW + 3600, Some(ORIGIN)).status,
+            401
+        );
+        h.store.sessions.borrow_mut().clear();
+        assert_eq!(
+            bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN)).status,
+            401
+        );
+    }
+
+    #[test]
+    fn refresh_retry_rejects_malformed_keys_without_rotating() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for key in [
+            "".to_string(),
+            "not-base64!".into(),
+            crate::b64::encode(&[1u8; 31]),
+            crate::b64::encode(&[1u8; 33]),
+        ] {
+            let response = bound_refresh(&h, &cookie, &key, NOW, Some(ORIGIN));
+            assert_eq!(response.status, 401);
+            assert!(response.set_cookie.is_none());
+        }
+        assert_eq!(
+            h.call_full("GET", "/v1/vault", None, Some(cookie), None)
+                .status,
+            200
+        );
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|r| r.rotation_counter == 0));
     }
 
     #[test]

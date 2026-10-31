@@ -194,6 +194,7 @@ test('LIBTITLE-09 removal changes selected title and last removal/clear restore 
 	await add(page, 'title-coral');
 	await settle(page); titles.push(await page.title());
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await settle(page); titles.push(await page.title());
 	await check(info, [PINE_TITLE, BASELINE, CORAL_TITLE, BASELINE], titles);
 });

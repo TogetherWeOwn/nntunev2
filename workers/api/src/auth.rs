@@ -80,8 +80,9 @@ pub struct MagicLinkRecord {
 }
 
 /// SHA-256 hex of a presented magic-link token, for record lookup by hash.
-/// The HTTP layer looks the record up with this, then still requires
-/// [`consume_magic_link_atomically`] — a hash lookup is not authentication.
+/// The HTTP layer looks the record up with this, then still requires a
+/// committed conditional claim (optionally with session insertion in the same
+/// transaction) — a hash lookup is not authentication.
 pub fn hash_magic_token(token: &str) -> String {
     sha256_hex(token)
 }
@@ -111,9 +112,10 @@ pub fn issue_magic_link(
 }
 
 /// Pure record validation/preparation, NOT authentication or a database claim.
-/// Independent snapshots may both pass. HTTP callers must instead use
-/// [`consume_magic_link_atomically`], which requires a committed conditional
-/// database update before returning an authenticated result.
+/// Independent snapshots may both pass. HTTP callers must also commit the
+/// conditional database claim, using [`consume_magic_link_atomically`] or
+/// [`crate::handlers::Store::redeem_magic_link`] to include session insertion
+/// in the same transaction, before returning an authenticated result.
 pub fn consume_magic_link(
     mut record: MagicLinkRecord,
     presented_token: &str,
@@ -142,8 +144,9 @@ pub fn consume_magic_link(
 }
 
 /// Validated candidate and prepared spent record. It becomes an authenticated
-/// result ONLY when returned by [`consume_magic_link_atomically`] after the
-/// database claim commits; the pure preparation helper grants no session.
+/// result ONLY after the conditional database claim commits (via
+/// [`consume_magic_link_atomically`] or transactional session redemption);
+/// the pure preparation helper grants no session.
 #[derive(Debug, Clone)]
 pub struct ConsumedMagicLink {
     pub user_id: String,

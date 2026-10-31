@@ -351,6 +351,33 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
+    async fn redeem_magic_link(
+        &self,
+        record: &auth::MagicLinkRecord,
+        now: u64,
+        session: &session::SessionRecord,
+    ) -> Result<bool, handlers::StoreError> {
+        let mut magic = self.magic.borrow_mut();
+        let Some(row) = magic.get_mut(&record.token_hash) else {
+            return Ok(false);
+        };
+        if row.user_id != record.user_id
+            || row.email != record.email
+            || row.expires_at != record.expires_at
+            || row.expires_at <= now
+            || row.used
+        {
+            return Ok(false);
+        }
+        let mut sessions = self.sessions.borrow_mut();
+        if session.user_id != record.user_id || sessions.contains_key(&session.id) {
+            return Err(handlers::StoreError);
+        }
+        sessions.insert(session.id.clone(), session.clone());
+        row.used = true;
+        Ok(true)
+    }
+
     async fn session_by_id(
         &self,
         id: &str,
