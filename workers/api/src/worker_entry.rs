@@ -574,12 +574,17 @@ impl PgStore {
             return Ok(client);
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
+        // The phase in progress when the connect fails (or the deadline
+        // fires) names the `api.db.connect_failed.*` record below; the
+        // caller still sees only the opaque `StoreError`.
+        let reached = std::cell::Cell::new("api.db.connect_failed.binding");
         // One overall budget encloses dial, handshake, driver spawn, and
         // statement setup: the handshake and SET consume the time left
         // after dial rather than resetting the clock.
-        with_deadline(
+        let connected = with_deadline(
             async {
                 let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+                reached.set("api.db.connect_failed.socket");
                 let socket = worker::Socket::builder()
                     .secure_transport(worker::SecureTransport::StartTls)
                     .connect(hyperdrive.host(), hyperdrive.port())
@@ -587,12 +592,14 @@ impl PgStore {
                 // The builder connect is synchronous; the actual dial
                 // completes when the socket opens, bounded by the vault
                 // dial budget shared with the test-connection probe.
+                reached.set("api.db.connect_failed.dial");
                 with_deadline(
                     async { socket.opened().await.map(|_| ()).map_err(|_| StoreError) },
                     DIAL_TIMEOUT_MS,
                     StoreError,
                 )
                 .await?;
+                reached.set("api.db.connect_failed.handshake");
                 let config: tokio_postgres::Config = hyperdrive
                     .connection_string()
                     .parse()
@@ -611,6 +618,7 @@ impl PgStore {
                 // Connect-time SET of the total budget; Hyperdrive RESETs
                 // pooled backends, so each Store method additionally races
                 // its statements through Self::bounded.
+                reached.set("api.db.connect_failed.set_timeout");
                 client
                     .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
                     .await
@@ -620,7 +628,23 @@ impl PgStore {
             TOTAL_TIMEOUT_MS,
             StoreError,
         )
-        .await
+        .await;
+        if connected.is_err() {
+            let _ = Self::db_failure(reached.get(), &self.trace_id, &build_sha_from_env(env));
+        }
+        connected
+    }
+
+    /// Opaque `StoreError` for a failed statement, after an
+    /// `api.db.statement_failed.<operation>` record (`event` names it).
+    fn statement_failed(&self, event: &str) -> StoreError {
+        let build_sha = self
+            .env
+            .as_ref()
+            .map(build_sha_from_env)
+            .unwrap_or_else(|| crate::logging::BUILD_SHA_UNKNOWN.to_string());
+        let _ = Self::db_failure(event, &self.trace_id, &build_sha);
+        StoreError
     }
 
     async fn connection_diagnostic<F, E>(
@@ -631,17 +655,23 @@ impl PgStore {
     where
         F: std::future::Future<Output = Result<(), E>>,
     {
-        // No detail in logs: driver errors can carry host/role strings.
         if connection.await.is_err() {
-            emit_record(
-                crate::logging::Level::Error,
-                "api.db.connection_error",
-                trace_id,
-                serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
-            )
+            Self::db_failure("api.db.connection_error", trace_id, build_sha)
         } else {
             None
         }
+    }
+
+    /// The one database-failure record shape. No detail in logs: driver
+    /// errors can carry host/role strings, so only the fixed event name
+    /// says where it failed.
+    fn db_failure(event: &str, trace_id: &str, build_sha: &str) -> Option<String> {
+        emit_record(
+            crate::logging::Level::Error,
+            event,
+            trace_id,
+            serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
+        )
     }
 
     /// Fenced vault-upsert statement (ADR 0002 rule 3), shared by
@@ -885,7 +915,7 @@ impl Store for PgStore {
                         &[&email],
                     )
                     .await
-                    .map_err(|_| StoreError)?;
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.user_by_email"))?;
                 row.map(|r| user_from_row(&r)).transpose()
             },
             TOTAL_TIMEOUT_MS,
@@ -903,7 +933,7 @@ impl Store for PgStore {
                         &[&user.id, &user.email, &i64_of(user.created_at)?],
                     )
                     .await
-                    .map_err(|_| StoreError)?;
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.insert_user"))?;
                 Ok(())
             },
             TOTAL_TIMEOUT_MS,
@@ -1213,7 +1243,7 @@ impl Store for PgStore {
                 ],
             )
             .await
-            .map_err(|_| StoreError)?;
+            .map_err(|_| self.statement_failed("api.db.statement_failed.insert_session"))?;
         Ok(())
         }, TOTAL_TIMEOUT_MS).await
     }
@@ -2845,6 +2875,19 @@ mod tests {
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
+    /// Every names-only database failure event PgStore can emit beyond
+    /// `api.db.connection_error`.
+    const DB_FAILURE_EVENTS: [&str; 8] = [
+        "api.db.connect_failed.binding",
+        "api.db.connect_failed.socket",
+        "api.db.connect_failed.dial",
+        "api.db.connect_failed.handshake",
+        "api.db.connect_failed.set_timeout",
+        "api.db.statement_failed.user_by_email",
+        "api.db.statement_failed.insert_user",
+        "api.db.statement_failed.insert_session",
+    ];
+
     #[test]
     fn resolved_trace_reaches_response_mail_and_driver_diagnostics() {
         use futures_util::FutureExt;
@@ -2936,6 +2979,64 @@ mod tests {
             .now_or_never()
             .unwrap()
             .is_none());
+            for event in DB_FAILURE_EVENTS {
+                let line = PgStore::db_failure(event, &trace_id, "unknown")
+                    .expect("every db failure event must pass the event validator");
+                let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(record["event"], event);
+                assert_eq!(
+                    record["fields"],
+                    serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown", "release": "unknown"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_db_failure_event_is_emitted_from_its_store_path() {
+        // The renderer test above calls `db_failure` directly; pin that the
+        // production store paths actually name each event, so dropping an
+        // emission site fails here. Slice the pre-test source so this
+        // test's own literals cannot satisfy it.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let connect_body = production
+            .split_once("async fn connect(&self)")
+            .expect("PgStore::connect must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("a closing brace must bound connect")
+            .0;
+        assert!(
+            connect_body.contains("Self::db_failure(reached.get()"),
+            "a failed connect must emit the phase it reached"
+        );
+        for event in DB_FAILURE_EVENTS {
+            if let Some(phase) = event.strip_prefix("api.db.connect_failed.") {
+                let literal = format!("\"api.db.connect_failed.{phase}\"");
+                assert!(
+                    connect_body.contains(&literal),
+                    "connect must reach {event}"
+                );
+                continue;
+            }
+            let (kind, operation) = event
+                .strip_prefix("api.db.")
+                .and_then(|rest| rest.split_once('.'))
+                .expect("db failure events are api.db.<kind>.<operation>");
+            let method = production
+                .split_once(&format!("async fn {operation}(&self"))
+                .unwrap_or_else(|| panic!("store method {operation} must exist"))
+                .1
+                .split_once("\n    async fn ")
+                .expect("a following method must bound it")
+                .0;
+            assert_eq!(kind, "statement_failed", "unexpected db failure kind");
+            let site = format!("self.statement_failed(\"{event}\")");
+            assert!(method.contains(&site), "{operation} must emit {event}");
         }
     }
 
