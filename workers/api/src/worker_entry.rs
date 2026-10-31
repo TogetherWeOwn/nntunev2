@@ -14,6 +14,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use tokio_postgres::types::Type;
 use tokio_postgres::GenericClient;
 use worker::{
     Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
@@ -909,14 +910,22 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                // The mint-path statements (here, insert_user,
+                // insert_session) run unnamed via `query_typed`: one
+                // Parse/Bind/Execute/Sync round-trip, so no `sN` prepared
+                // statement name can collide on, or go missing from, a
+                // Hyperdrive-pooled backend between round-trips.
+                let rows = client
+                    .query_typed(
                         "SELECT id, email, created_at FROM users WHERE email = $1",
-                        &[&email],
+                        &[(&email, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| self.statement_failed("api.db.statement_failed.user_by_email"))?;
-                row.map(|r| user_from_row(&r)).transpose()
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(user_from_row).transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -928,9 +937,13 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 client
-                    .execute(
+                    .query_typed(
                         "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
-                        &[&user.id, &user.email, &i64_of(user.created_at)?],
+                        &[
+                            (&user.id, Type::TEXT),
+                            (&user.email, Type::TEXT),
+                            (&i64_of(user.created_at)?, Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| self.statement_failed("api.db.statement_failed.insert_user"))?;
@@ -1231,15 +1244,18 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
-                    &record.id,
-                    &record.user_id,
-                    &i64_of(record.created_at)?,
-                    &i64_of(record.expires_at)?,
-                    &i32::try_from(record.rotation_counter).map_err(|_| StoreError)?,
+                    (&record.id, Type::TEXT),
+                    (&record.user_id, Type::TEXT),
+                    (&i64_of(record.created_at)?, Type::INT8),
+                    (&i64_of(record.expires_at)?, Type::INT8),
+                    (
+                        &i32::try_from(record.rotation_counter).map_err(|_| StoreError)?,
+                        Type::INT4,
+                    ),
                 ],
             )
             .await
