@@ -65,9 +65,10 @@ the core and require exactly one row before any response.
 | `GET /v1/credentials` | list the caller's native REST credentials (session-only, ordinary session; ids and metadata only, no secrets) |
 | `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
 | `POST /api/test-codes` (staging-only seam, no `OPTIONS` arm — see below) | returns the issued signup code for an `example.test` mailbox without minting; fail-closed 404/401 outside the staging posture |
+| `POST /api/test-accounts` (staging-only seam, no `OPTIONS` arm — see below) | mints a fresh `example.test` account and returns `{"email", "session"}` (the session cookie value) in a 201; same gates and fail-closed 404/401 as `/api/test-codes` |
 
 `OPTIONS` on any listed route (and the scope-map-served native paths, never
-the staging-only `POST /api/test-codes` seam) answers an empty 204. Credentialed CORS
+the staging-only `POST /api/test-codes` and `POST /api/test-accounts` seams) answers an empty 204. Credentialed CORS
 headers (`Access-Control-Allow-Origin`, never `*`) are emitted only when
 the request `Origin` exactly equals the configured origin; any other
 origin gets none, so cross-origin JSON posts die at preflight. The web
@@ -302,6 +303,17 @@ behavior changes here.
   gate test (`src/handlers.rs`). The E2E returns null without
   `QA_AUTH_TOKEN` and treats the seam as required infrastructure once it
   is set (`e2e/helpers/accounts.ts`).
+- **Mint seam:** `POST /api/test-accounts` (`QA_TEST_ACCOUNTS_PATH`,
+  served by `qa_test_accounts` in `src/handlers.rs`; read by
+  `tryMintTestAccount` in `e2e/helpers/accounts.ts`) runs the same flag,
+  bearer and `example.test` gates in the same order, then creates a new
+  user plus a stored session row and returns `{"email", "session"}` with
+  201. `session` is the `__Host-nntune-session` cookie value; the API
+  authenticates sessions by cookie only. No passkey, vault or magic row is
+  created. Only the default plan is minted (`plan` absent or `"free"`);
+  any other plan, and an address that already has an account, is a fixed
+  422 `validation_failed` (no route enforces plan caps yet, so a capped
+  account is never faked). Every mint is audited as `qa.test_account_mint`.
 
 The Subsonic-compatible `/rest/*` surface (wasm32 only) is routed in
 `src/lib.rs` and delegates to `crates/nntune-subsonic`. Its

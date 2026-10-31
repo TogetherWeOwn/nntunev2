@@ -111,10 +111,10 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   needed). The error case forces the backend failure with a local route stub and
   requires the generic alert (no seam needed). The live case skips pre-deploy
   and fails closed on CI without `QA_AUTH_TOKEN`. **Remaining gap:** the mint seam
-  has no server implementation yet and the code seam still awaits API Worker
-  staging deployment and activation — with the token set the live leg fails with
-  the documented `[seam] POST /api/test-accounts failed` or
-  `[code-seam] POST /api/test-codes failed` signature instead of passing.
+  (`qa_test_accounts`, `workers/api/src/handlers.rs`) and the code seam need the
+  API Worker staging deployment and activation — until then, with the token set,
+  the live leg fails with the documented `[seam] POST /api/test-accounts failed`
+  or `[code-seam] POST /api/test-codes failed` signature instead of passing.
 
 - `e2e/tests/helpers.spec.ts` and `e2e/tests/workflows.spec.ts` are
   offline self-tests (wall detection, credential scope, workflow
