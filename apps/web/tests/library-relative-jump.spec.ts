@@ -816,6 +816,10 @@ test('LIBJUMP10-12 source change and auth teardown invalidate pending share stat
 test('LIBJUMP10-GUARD-13 an empty queue hides the Player instead of stranding jump buttons', async ({ libraryPage: page }, info) => {
 	await replace(page);
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	const confirmation = page.getByRole('group', { name: 'Clear queue?', exact: true });
+	if (await confirmation.isVisible()) {
+		await confirmation.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+	}
 	await check(info, {
 		sections: 0, backs: 0, forwards: 0, audio: 0
 	}, {
