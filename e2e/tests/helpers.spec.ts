@@ -23,6 +23,7 @@ import {
   requireApiAccount,
   signupPathLabel,
   tryMintTestAccount,
+  awaitSignupOutcome,
 } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
@@ -1441,5 +1442,57 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
         context: 'plan-limit-stream',
       }),
     ).toThrow(/retryable flag disagrees/);
+  });
+});
+
+// Signup outcome diagnostics (offline, static pages): when neither the code
+// step nor the inline error appears, the failure must name the page state
+// and the registerStart status — never a field value.
+test.describe('awaitSignupOutcome names the signup page state', () => {
+  const page_ = (body: string) =>
+    `<!doctype html><html><body><input data-testid="signup-email" value="SENTINEL@example.test" />${body}</body></html>`;
+  const failure = async (
+    page: import('@playwright/test').Page,
+    body: string,
+    status: number | null,
+  ): Promise<string> => {
+    await page.setContent(page_(body));
+    try {
+      await awaitSignupOutcome(
+        page,
+        page.locator('input[name="magic_code"]'),
+        page.getByTestId('signup-error'),
+        { status },
+        200,
+      );
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return '';
+  };
+
+  test('code step or inline error settles without throwing', async ({ page }) => {
+    expect(await failure(page, '<input name="magic_code" />', 200)).toBe('');
+    expect(await failure(page, '<p data-testid="signup-error">x</p>', 500)).toBe('');
+  });
+
+  test('plan-limit notice names a paywall/limit answer and its status', async ({ page }) => {
+    const message = await failure(page, '<dialog open data-testid="plan-limit-notice">limit</dialog>', 429);
+    expect(message).toContain('plan-limit notice open');
+    expect(message).toContain('registerStart HTTP 429');
+    expect(message).not.toContain('SENTINEL');
+  });
+
+  test('pending request names the sending state', async ({ page }) => {
+    const message = await failure(page, '<p role="status">Sending your email code…</p>', null);
+    expect(message).toContain('still sending');
+    expect(message).toContain('registerStart HTTP not observed');
+  });
+
+  test('unsupported passkeys and a bare email step are named', async ({ page }) => {
+    expect(
+      await failure(page, '<p role="status">This browser does not support passkeys.</p>', null),
+    ).toContain('passkeys unsupported');
+    expect(await failure(page, '', 201)).toContain('back at the email step with no status');
   });
 });

@@ -545,18 +545,19 @@ function recordRegisterStartStatus(page: Page): { status: number | null } {
  * request, or a browser without passkeys is distinguishable from a
  * missing form. Never logs field values or response bodies.
  */
-async function awaitSignupOutcome(
+export async function awaitSignupOutcome(
   page: Page,
   codeField: Locator,
   error: Locator,
   registerStatus: { status: number | null },
+  timeout = 30_000,
 ): Promise<void> {
   try {
     await expect(async () => {
       const onCodeStep = await codeField.isVisible().catch(() => false);
       const onError = await error.isVisible().catch(() => false);
       expect(onCodeStep || onError).toBe(true);
-    }).toPass({ timeout: 30_000 });
+    }).toPass({ timeout });
   } catch {
     const visible = async (locator: Locator) => locator.isVisible().catch(() => false);
     const state = (await visible(page.getByTestId('plan-limit-notice')))
