@@ -3632,9 +3632,8 @@ where
         retry_after: None,
     };
     let not_found = || error_response(crate::api_error::ApiError::not_found("not found"));
-    let refused = |message: &str| {
-        error_response(crate::api_error::ApiError::validation_failed(message))
-    };
+    let refused =
+        |message: &str| error_response(crate::api_error::ApiError::validation_failed(message));
     let Some(expected) = ctx
         .cfg
         .qa_auth_token
@@ -5333,7 +5332,9 @@ mod tests {
             let minted: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
             assert_eq!(minted["email"], email);
             let session = minted["session"].as_str().expect("session").to_string();
-            let user = block_on(h.store.user_by_email(email)).unwrap().expect("user");
+            let user = block_on(h.store.user_by_email(email))
+                .unwrap()
+                .expect("user");
             // The session is the real cookie credential for this account:
             // ordinary request authentication accepts it as that user.
             let req = Request {
