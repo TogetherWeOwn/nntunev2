@@ -15,9 +15,10 @@ name: e2e-staging
 # full journey: it compares GET /api/build (baked at build time) with the
 # promotion SHA the caller passes as inputs.expected_sha (see docs/ops.md).
 #
-# Pre-deploy there is no staging yet: jobs skip at step level with a notice
-# when secrets.STAGING_BASE_URL is unset. Once staging is configured the
-# same file fails closed — no workflow change needed for activation.
+# Pre-deploy there is no staging yet: the synthetic smoke skips at step
+# level with a notice when secrets.STAGING_BASE_URL is unset. The full
+# journey never skips that way: it runs only after a staging deploy, so an
+# unset STAGING_BASE_URL fails it rather than minting green evidence.
 
 on:
   workflow_call:
@@ -291,8 +292,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${STAGING_BASE_URL:-}" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — full journey skips."
+            # This job runs only on the post-deploy call, after staging-web
+            # deployed. A skipped journey here would be a green run that
+            # staging-evidence accepts as promotion evidence, so fail closed.
+            echo "::error::Post-deploy full journey requires STAGING_BASE_URL; refusing to pass without running."
+            exit 1
           else
             if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
               echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
@@ -341,8 +345,8 @@ jobs:
       - name: Enforce journey evidence gate (all-skipped must fail)
         id: journey-gate
         # always(): publishes ran/skipped/failed counts even when the journey
-        # failed, and turns an all-skipped green run red. Skipped pre-deploy
-        # (unconfigured staging produces no evidence by design). The skip
+        # failed, and turns an all-skipped green run red. Unconfigured
+        # staging never reaches here: the preflight fails the job. The skip
         # budget covers only the remaining recording_mbids test.fixme;
         # every other skip (including queue order) fails the job.
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
