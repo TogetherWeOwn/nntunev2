@@ -99,7 +99,7 @@ No `lifecycle` field appears in the checked-in Worker/app Wrangler manifests
 Cloudflare-side, not a Wrangler field, per the audio bucket sources in
 `docs/cache-policy.md` — and the only `lifecycle` string in those manifests is
 the scratch-prefix cleanup comment at
-`workers/ingest/wrangler.toml.example:129`. "None reported" records the
+`workers/ingest/wrangler.toml.example:136`. "None reported" records the
 verified absence of any reported rule for these two audio buckets
 (`workers/stream/wrangler.toml:47-49,59-61`); it does not assert the live
 Cloudflare-side state, which remains unverified for the audio buckets.
@@ -114,13 +114,13 @@ for `CACHE_FRESH_TTL_SECS = 300` (`workers/stream/src/cache.rs:33`), then
 stale for `CACHE_SWR_WINDOW_SECS = 3_600` (`workers/stream/src/cache.rs:38`)
 while owing background revalidation, then hard-miss past 3,900 s of age
 (`get_track_at` returns `None` past fresh + SWR at
-`workers/stream/src/cache.rs:250-258`, within
-`workers/stream/src/cache.rs:229-261`; `workers/stream/src/play.rs:502-527`
+`workers/stream/src/cache.rs:312-316`, within
+`workers/stream/src/cache.rs:287-319`; `workers/stream/src/play.rs:528`
 falls through to the miss path and re-fetches upstream;
 `workers/stream/README.md:157-168` documents HIT, STALE, and MISS). Untimed
-`put_track` entries never go stale (`workers/stream/src/cache.rs:127-147`
+`put_track` entries never go stale (`workers/stream/src/cache.rs:175-199`
 writes `stored_at_secs: None`, served fresh at
-`workers/stream/src/cache.rs:246-247`).
+`workers/stream/src/cache.rs:305`).
 
 ### Queues (metadata GET-verified 2026-10-17)
 
@@ -499,14 +499,14 @@ worker and the exact config source for each row.
 | Binding | Type | Owning worker | staging | prod | Committed config source |
 |---|---|---|---|---|---|
 | `NNTP_POOL` (class declaration) | Durable Object | `stream` | class `NntpPool` | class `NntpPool` | `workers/stream/wrangler.toml:22-24` (top-level), `:44-46` (staging), `:56-58` (production); migration tag `v1` `:26-28`; code `workers/stream/src/runtime.rs:44`, `workers/stream/src/routes.rs:14` |
-| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:105-112` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
+| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:128-131` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
 | `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
-| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:124-127`; code `workers/ingest/src/metering.rs:16-18` |
-| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:157-161` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:19` |
+| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:152-155`; code `workers/ingest/src/metering.rs:16-18` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:157-161` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:24` |
 | `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | `workers/ingest/wrangler.toml.example:163-168` (pins the prod service name); target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
-| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:170-175` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:28-39` (staging) or `:41-52` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:27` |
-| `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:122` |
-| `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:128` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:170-175` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:41-52` (staging) or `:54-65` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:30` |
+| `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:33` |
+| `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:34` |
 
 Notes, all referencing (not changing) owning-lane state:
 
@@ -517,7 +517,7 @@ Notes, all referencing (not changing) owning-lane state:
   have explicit per-env `name` overrides committed in their configs, so
   their per-environment resolution follows the target workers' committed
   names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
-  only, none in `:28-39` or `:41-52`), so its per-environment values above
+  only, none in `:41-52` or `:54-65`), so its per-environment values above
   are the Wrangler default-suffixed names and ingest's single
   `service = "nntune-mb"` needs the same env split. Wiring the env split is
   owned by the integration lane, like the ingest queue-name drift recorded
@@ -591,7 +591,7 @@ never reads or prints values
   (`.github/workflows/deploy-production.yml:226-234` runs
   `ci/check-production-secrets-shape.mjs`, which refuses any
   `[env.production]` table beyond `name`). Same-checker CI coverage
-  (`.github/workflows/ci.yml:607-621`) is not promotion evidence on its
+  (`.github/workflows/ci.yml:824-842`) is not promotion evidence on its
   own; require the deploy-production job's pass on the exact head being
   promoted.
 - [ ] Staging deploy evidence: record the successful push-triggered
@@ -643,8 +643,10 @@ never reads or prints values
   insufficient. To roll back `apps/web`, open that Actions run and choose
   **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
   `staging-web` is push-only and will be skipped. Verify the rerun's
-  `staging-web` success and staging health. This workflow does not
-  deploy Workers, which need their own rollback evidence. Staging rollback is
+  `staging-web` success and staging health. The rerun also redeploys the api
+  Worker through `staging-api` when that lane is configured; that is not
+  verified api rollback, and each Worker needs its own rollback evidence.
+  Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
 
@@ -655,9 +657,11 @@ This section defines evidence only. It does not create a lane.
 **Current claim boundary.** `.github/workflows/deploy.yml` deploys
 `apps/web` (`staging-web` on push, `preview-web` on pull requests) plus the
 api Worker staging lane (`staging-api` on push, staging only, skipped until
-the Operator wires the staging variables). No other tracked workflow
-deploys the backend Workers under `workers/` (`ingest`, `stream`, `mb`,
-`repair`), and
+the Operator wires the staging variables).
+`.github/workflows/deploy-alerts-staging.yml` deploys only the
+`nntune-alerts-staging` consumer from `workers/observability`. No other
+tracked workflow deploys the backend Workers under `workers/` (`ingest`,
+`stream`, `mb`, `repair`, `transcode`), and
 `.github/workflows/e2e-staging.yml` exercises the staging web URL, not a
 Worker deploy or rollback. Worker source and Wrangler configs existing in
 the repo are not deployment. Therefore **no backend-Worker deploy,
@@ -665,7 +669,8 @@ rollback, activation, or staging acceptance is currently claimed**, for any
 Worker in any environment, until that Worker's lane exists and its gates
 pass on the exact head being promoted — for the api Worker that requires a
 `staging-api` job conclusion `success`, successful **executed** `Hyperdrive
-cache-disabled gate` and `Deploy api to staging` steps, and the job output
+cache-disabled gate`, `Verify actual staging session schema (read-only)` and
+`Deploy api to staging` steps, and the job output
 `deployed=true` (`outcome=deployed`) on the promotion run. Its `source_sha`
 output must match the promotion SHA and the deploy's `BUILD_SHA` argument.
 A missing-config job can conclude `success` while reporting
@@ -689,7 +694,7 @@ be called accepted:
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
-| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2; a config-skipped `success` does not qualify. Record gate results by name and outcome only. |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging session schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2; a config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |

@@ -3,9 +3,8 @@
 //! Billing truth lives with the metering card; these events are the ingest
 //! pipeline's usage signal (stage entered, outcome, attempt). The worker
 //! writes them through the `INGEST_METER` dataset binding (see
-//! `wrangler.toml.example`); workers-rs 0.3 has no Analytics Engine API, so
-//! the runtime write goes through the binding's HTTP API at the edge while
-//! this module owns the event shape.
+//! `wrangler.toml.example`; the runtime write is `EdgeMeterSink` in
+//! `lib.rs`) while this module owns the event shape.
 
 use serde::{Deserialize, Serialize};
 

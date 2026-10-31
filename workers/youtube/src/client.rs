@@ -13,8 +13,9 @@
 //! gitleaks gate fails the build on them.
 //!
 //! Client-table maintenance is expected monthly (see the spike spec in
-//! `docs/youtube-backend-spike.md`): the Worker reads its ordered client
-//! list from KV config, and [`CLIENT_ORDER`] is the compiled-in default.
+//! `docs/youtube-backend-spike.md`): [`CLIENT_ORDER`] is the compiled-in
+//! default; reading an ordered client list from KV config arrives with the
+//! extraction wiring.
 
 /// An Innertube client identity for `/player` requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

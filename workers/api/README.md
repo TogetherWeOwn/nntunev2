@@ -32,10 +32,12 @@ deletion), `0007` (registration-challenge user foreign key), `0008`
 fencing, queued replay window), `0013` (session-bound reauth purpose),
 `0015_kek_rotation` (vault `rewrapped_at` marker + `kek_version`
 index, see `docs/security/kek-rotation.md` §2), `0018`
-(staging-only `qa_issued_codes` outbox for the test-code seam below), and
+(staging-only `qa_issued_codes` outbox for the test-code seam below), `0019`
+(native REST credentials),
 `0020_stream_play_ledger.sql` (per-play stream ledger: validated row intents,
-monthly folds, replay-safe parameterized SQL; NOT the ADR daily `usage_ledger`)
-define the app-target Postgres schema (PlanetScale via Hyperdrive;
+monthly folds, replay-safe parameterized SQL; NOT the ADR daily `usage_ledger`),
+and `0021`–`0025` (billing, library artifacts, Subsonic clients, session
+refresh retry and claim clock) define the app-target Postgres schema (PlanetScale via Hyperdrive;
 targets per `migrations/manifest.toml`). The mirror-target `0001`
 (MusicBrainz mirror base), `0014` (import resume cursors + dead-letter
 queue), `0016` (release-to-track membership) and `0017` (replication
@@ -545,7 +547,8 @@ This crate remains standalone (excluded from the root workspace), so use
   validation, the unchanged socket budgets dial at most four addresses with a
   5-second per-address timeout and stop the socket attempts at 15 seconds.
   (Sources:
-  `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden`,
+  `workers/api/src/vault.rs` — `host_shape_ok`, `ip_is_forbidden` (from
+  `crates/nntune-ssrf-guard`),
   `resolve_public_target`, `ProviderConfig::validate`,
   `authorize_pool_dial`, `ALLOWED_NNTP_PORTS`, `MAX_DIAL_ADDRESSES`,
   `RESOLUTION_TIMEOUT_MS`, `DIAL_TIMEOUT_MS`/`TOTAL_TIMEOUT_MS`, `MAX_TEST_CONCURRENCY`,

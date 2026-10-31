@@ -9,9 +9,10 @@ the provider pages linked in each section; re-check before relying on any
 number, because list prices change.
 
 This worksheet covers only the services listed below. It is **not** an
-all-in bill: Durable Objects (the `stream` Worker's `NntpPool` pool and the
-repair Worker's `RepairContainer` class; see the non-storage bindings
-inventory in `docs/ops.md`), Containers (repair path),
+all-in bill: Durable Objects (the `stream` Worker's `NntpPool` pool, the
+repair Worker's `RepairContainer` and transcode Worker's `TranscodeContainer`
+classes, and the alerts consumer's `ErrorRateAlerts`; see the non-storage
+bindings inventory in `docs/ops.md`), Containers (repair and transcode),
 Cloudflare Access (staging gate), domain/DNS and any non-Cloudflare,
 non-PlanetScale services are out of scope here and must be added before
 any total is quoted as complete. Workers Logs is priced prospectively in
@@ -47,7 +48,8 @@ workers = 5.00
 
 Volume sources at staging time: per-Worker request and CPU metrics in the
 Cloudflare dashboard / GraphQL Analytics API, summed over every deployed
-Worker (`web`, `api`, `stream`, `mb`, `ingest`, `repair`).
+Worker (`web`, `api`, `stream`, `mb`, `ingest`, `repair`, `transcode`,
+`alerts`).
 
 ## 2. Cloudflare R2
 
@@ -164,7 +166,8 @@ analytics_engine_prospective = max(0, W/1e6 - 10) * 0.25
 ```
 
 The `stream` Worker writes metering points to the `nntune_meter` dataset
-(`workers/stream/wrangler.toml`). Adaptive sampling can reduce stored
+(`workers/stream/wrangler.toml`) and the `ingest` Worker to
+`nntune_ingest_meter` (`workers/ingest/wrangler.toml.example`). Adaptive sampling can reduce stored
 points at volume, so use the billed data-point count from account usage,
 not the raw event count in the Worker.
 

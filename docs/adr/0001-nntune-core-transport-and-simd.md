@@ -43,5 +43,5 @@ in parallel and need a stable contract now.
 - Worker builds must set `RUSTFLAGS="-C target-feature=+simd128"` to get
   the vectorised yEnc path; without it the scalar fallback is used
   (correct, slower). CI checks both wasm builds plus the simd128 build.
-- `workers/bench` (sibling card) still owes the wasm-on-Workers ms/MB
-  measurement to fully close the bench gate.
+- A wasm-on-Workers ms/MB measurement (no harness in this repo yet) is
+  still owed to fully close the bench gate.

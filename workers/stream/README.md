@@ -246,7 +246,7 @@ the seek position. Integration tests pin both costs (one
 are owned by Analytics Engine monitoring (`PlayStart` → first-byte events)
 once deployed.
 
-CI (`.github/workflows/ci.yml`, job `rust`, required through `ci-ok`) runs
+CI (`.github/workflows/ci.yml`, jobs `rust-test` and `rust-wasm`, required through `ci-ok`) runs
 fmt, clippy `-D warnings` and every test; the integration test asserts the
 local hit budget (< 100 ms), so a regression turns `ci-ok` red.
 

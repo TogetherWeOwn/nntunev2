@@ -44,7 +44,7 @@ Three distinct operations. They are not interchangeable:
 
 | Operation | What it does | Governing rule |
 |---|---|---|
-| **Redeploy rollback** | Re-serves a prior known-good build (web rerun; Worker redeploy/activation). Touches code only. | `docs/ops.md:504`: staging rollback is a redeploy, **never a data restore**. `docs/ops.md:540-545`: a Worker rollback restores Worker code only; **rollback is never a data restore**. |
+| **Redeploy rollback** | Re-serves a prior known-good build (web rerun; Worker redeploy/activation). Touches code only. | `docs/ops.md:649-650`: staging rollback is a redeploy, **never a data restore**. `docs/ops.md:702-707`: a Worker rollback restores Worker code only; **rollback is never a data restore**. |
 | **Forward fix** | Repairs schema or data with a NEW migration / NEW write on top of current state. History is append-only. | `migrations/README.md:9`: migrations are forward-only — correct a deployed schema with a new migration, never by editing history. Enforced by `migrations_gate.py` `check_drift` (`applied-edited`, `applied-removed`). |
 | **Data restore** | Replaces or re-seeds database contents from a backup, point-in-time (PITR) snapshot, or branch **[UNVERIFIED — confirm in console: exact PlanetScale Postgres restore primitive names and whether restore is in-place, branch-clone, or dump-reload]**. | This runbook only. A restore never rewrites migration history (§4). |
 
@@ -54,7 +54,7 @@ redeploy rollback of the code). A data restore is reserved for
 data-loss or data-corruption cases where forward repair cannot
 reconstruct the data (see decision table). A restore never substitutes
 for a redeploy rollback, and a redeploy rollback never substitutes for a
-restore — `docs/ops.md:504` and `:540-545` forbid conflating them in
+restore — `docs/ops.md:649-650` and `:702-707` forbid conflating them in
 either direction. After any restore, schema convergence is still
 forward-only (§4).
 
@@ -269,7 +269,7 @@ table's operational fields above (names, dates, query expressions,
 migration numbers, counts, cutover mechanism/time, version identifiers,
 commit SHAs, run URLs) — never account IDs, tokens, credentials,
 database URLs, environment values, or personal login identities (same
-prohibited set as `docs/ops.md:547-549`).
+prohibited set as `docs/ops.md:709-711`).
 
 ## 7. Unverifiable platform facts (must confirm per incident)
 
@@ -288,7 +288,7 @@ and records the answers in the §6 record:
    readings; $10 compute receipt excludes metered terms).
 5. Connection/compute headroom on the shared PS-5 single-node app cluster
    during a restore (app staging/prod pools plus migrator/admin share one
-   allowance per `docs/ops.md:279-285`; single-node is not HA).
+   allowance per `docs/ops.md:368-370`; single-node is not HA).
 6. MB mirror restore-vs-rebuild cost break-even at the incident's data
    size (restore may still lose to source rebuild for the ~100 GB import
    target).

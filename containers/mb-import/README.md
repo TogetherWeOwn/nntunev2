@@ -156,13 +156,16 @@ same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and
 dupe/cursor-ahead refusals, track repoint/prune, interrupted multi-chunk
 resume) against a scratch database: (Sources: `test-import.sh:1-8`
 (contract), `:82-136,221-260,264-323,324-377,379-525` (suites 1-12);
-`.github/workflows/ci.yml:483-516`.)
+`.github/workflows/ci.yml:746-790`.)
+
+Run it in the shipped image, as CI does (the image carries `mb-validate`):
 
 ```sh
-cargo build -p mb-import-validate
-DATABASE_URL=<scratch-url> ALLOW_TEST_TRUNCATE=1 \
-  MB_VALIDATE_BIN=$PWD/target/debug/mb-validate \
-  bash containers/mb-import/test-import.sh
+docker build -f containers/mb-import/Dockerfile -t mb-import:ci .
+docker run --rm --network host \
+  -e DATABASE_URL=<scratch-url> -e ALLOW_TEST_TRUNCATE=1 \
+  -v "$PWD/containers/mb-import/test-import.sh:/job/test-import.sh:ro" \
+  mb-import:ci bash /job/test-import.sh
 ```
 
 The suite truncates the mirror tables, so `ALLOW_TEST_TRUNCATE=1` is

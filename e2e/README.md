@@ -104,7 +104,7 @@ dependencies this harness needs.
 Toolchain: CI runs Node 26 for this harness (both jobs in
 `.github/workflows/e2e-staging.yml` and the `e2e-lint` job in `ci.yml`,
 kept in sync with the `@types/node` major in `e2e/package.json`;
-Playwright `1.64.0` there too). The app itself uses Node 24 + pnpm
+same Playwright pin there too). The app itself uses Node 24 + pnpm
 (`NODE_VERSION`/`PNPM_VERSION` in `ci.yml`) and is unrelated to this
 npm-based harness (`e2e/package-lock.json`).
 
@@ -249,7 +249,7 @@ headers/bodies and screenshots can expose account/provider information. CI
 uses the junit reporter only — the html reporter embeds step fill values
 (including the BYOP password) as a base64 zip in
 `playwright-report/index.html`, so it is never published. Sanitization is
-still required with traces off: Playwright (`1.64.0` in
+still required with traces off: Playwright (as pinned in
 `e2e/package.json`) writes
 `test-results/**/error-context.md` (an ARIA snapshot rendering filled input
 values, including the BYOP password) — the workflow deletes
