@@ -119,9 +119,9 @@ jobs:
   # Api Worker staging lane (staging only; ingest/mb/stream/repair are
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
   # on the same token gate as staging-web. Serves the staging host on
-  # /v1/* and /healthz plus the staging-only /api/test-codes seam
-  # (routes derived from API_RP_ID_STAGING); the web Worker owns the
-  # catch-all. Passes the
+  # /v1/* and /healthz plus the staging-only /api/test-codes and
+  # /api/test-accounts seams (routes derived from API_RP_ID_STAGING);
+  # the web Worker owns the catch-all. Passes the
   # public BUILD_SHA var so worker log records carry the deploy SHA (never
   # a secret); secrets live only in Cloudflare and are never written here.
   # Fails closed on the Hyperdrive cache-disabled gate (no --allow-skip);
@@ -243,7 +243,8 @@ jobs:
           name = "nntune-api-staging"
 
           # Same-host split: this Worker serves /v1/*, /healthz, plus the
-          # staging-only /api/test-codes seam on the staging host, while
+          # staging-only /api/test-codes and /api/test-accounts seams on
+          # the staging host, while
           # the web Worker owns the catch-all (see apps/web/wrangler.toml);
           # the most specific route wins. Route hosts derive from
           # API_RP_ID_STAGING (asserted the exact staging host above), so
@@ -253,6 +254,9 @@ jobs:
           zone_name = "nntune.com"
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/api/test-codes"
+          zone_name = "nntune.com"
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/api/test-accounts"
           zone_name = "nntune.com"
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/healthz"
