@@ -399,4 +399,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn truncated_signature_is_rejected() {
+        // `constant_time_eq` only compares the common prefix, so the length
+        // check is what stops a cut-down (guessable) signature.
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        let (head, sig) = token.rsplit_once('.').unwrap();
+        for keep in [4, 8, 40] {
+            assert_eq!(
+                verify(&format!("{head}.{}", &sig[..keep]), SECRET, 1),
+                Err(GrantError::BadSignature),
+                "signature cut to {keep} chars"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_signature_spelling_is_malformed() {
+        // A 32-byte HMAC is 43 chars; the last carries 2 zero pad bits.
+        // Setting one yields the same bytes under a second spelling.
+        let token = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        assert!(verify(&token, SECRET, 1).is_ok());
+        let mut forged = token.into_bytes();
+        let last = forged.last_mut().unwrap();
+        let tail = *last;
+        let idx = B64URL.iter().position(|&c| c == tail).unwrap();
+        assert_eq!(idx & 0b11, 0, "canonical tail has zero pad bits");
+        *last = B64URL[idx | 0b01];
+        let forged = String::from_utf8(forged).unwrap();
+        assert_eq!(verify(&forged, SECRET, 1), Err(GrantError::Malformed));
+    }
 }

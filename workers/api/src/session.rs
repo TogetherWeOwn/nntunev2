@@ -1362,4 +1362,96 @@ mod tests {
             }
         }
     }
+
+    /// Sign arbitrary claims with the production signer, bypassing the
+    /// issuer's own clamps, so each consistency check is hit in isolation.
+    fn forge(secret: &[u8], claims: &SessionClaims) -> String {
+        let payload_b64 = crate::b64::encode(&serde_json::to_vec(claims).unwrap());
+        let sig = sign(secret, &payload_b64).unwrap();
+        format!("{payload_b64}.{}", crate::b64::encode(&sig))
+    }
+
+    #[test]
+    fn verify_session_rejects_internally_inconsistent_claims() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let now = 1_700_000_000u64;
+        let good = SessionClaims {
+            session_id: "s-1".into(),
+            user_id: "user-1".into(),
+            created_at: now,
+            issued_at: now + 10,
+            expires_at: now + 3600,
+            rotation_counter: 0,
+        };
+        // Control: the forger produces tokens the verifier accepts.
+        assert_eq!(
+            verify_session(secret, &forge(secret, &good), now + 20),
+            Ok(good.clone())
+        );
+        for (why, bad) in [
+            (
+                "empty user_id",
+                SessionClaims {
+                    user_id: String::new(),
+                    ..good.clone()
+                },
+            ),
+            (
+                "empty session_id",
+                SessionClaims {
+                    session_id: String::new(),
+                    ..good.clone()
+                },
+            ),
+            (
+                "created_at after issued_at",
+                SessionClaims {
+                    created_at: now + 11,
+                    ..good.clone()
+                },
+            ),
+            (
+                "expires_at equal to issued_at",
+                SessionClaims {
+                    issued_at: now + 3600,
+                    expires_at: now + 3600,
+                    ..good.clone()
+                },
+            ),
+        ] {
+            assert_eq!(
+                verify_session(secret, &forge(secret, &bad), now + 20),
+                Err(SessionError::Invalid),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_retry_hash_requires_a_canonical_32_byte_key() {
+        let key = crate::b64::encode(&[7u8; 32]);
+        assert_eq!((key.len(), key.chars().last()), (43, Some('c')));
+        let hash = refresh_retry_hash("token-a", &key).expect("canonical key");
+        assert_eq!(refresh_retry_hash("token-a", &key).unwrap(), hash);
+        // Bound to both the predecessor token and the client key.
+        assert_ne!(refresh_retry_hash("token-b", &key).unwrap(), hash);
+        let other_key = crate::b64::encode(&[8u8; 32]);
+        assert_ne!(refresh_retry_hash("token-a", &other_key).unwrap(), hash);
+        let head = &key[..42];
+        for bad in [
+            String::new(),
+            head.to_string(),
+            format!("{key}A"),
+            format!("{head}!"),
+            format!("{head}="),
+            // `c` -> `d` sets a trailing pad bit: non-canonical spelling.
+            format!("{head}d"),
+        ] {
+            assert_eq!(
+                refresh_retry_hash("token-a", &bad),
+                Err(SessionError::Invalid),
+                "{bad:?}"
+            );
+        }
+    }
 }

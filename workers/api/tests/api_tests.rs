@@ -187,6 +187,38 @@ fn passkey_challenge_origin_rp_expiry_single_use_enforced() {
 }
 
 #[test]
+fn passkey_challenge_rejects_wrong_rp_with_matching_origin() {
+    let now = 1_700_000_000u64;
+    let c =
+        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now)
+            .expect("valid config");
+    let origin = "https://nntune.example.com";
+    for rp in ["evil.example.com", "example.com", "", "nntune.example.co"] {
+        let got = auth::verify_and_consume_challenge(c.clone(), rp, origin, now + 60);
+        assert_eq!(got.unwrap_err(), auth::AuthError::Invalid, "rp {rp:?}");
+    }
+}
+
+#[test]
+fn auth_ttls_are_inclusive_of_the_expiry_second() {
+    let now = 1_700_000_000u64;
+    // Magic link: valid through now + 900, invalid at now + 901.
+    let (plaintext, record) =
+        auth::issue_magic_link("user-1", "alice@example.com", now).expect("issue");
+    assert!(auth::consume_magic_link(record.clone(), &plaintext, now + 900).is_ok());
+    assert!(auth::consume_magic_link(record, &plaintext, now + 901).is_err());
+    // Passkey challenge: valid through now + 300, invalid at now + 301.
+    let c =
+        auth::new_registration_challenge("nntune.example.com", "https://nntune.example.com", now)
+            .expect("valid config");
+    let (rp, origin) = ("nntune.example.com", "https://nntune.example.com");
+    for (at, ok) in [(now + 300, true), (now + 301, false)] {
+        let got = auth::verify_and_consume_challenge(c.clone(), rp, origin, at);
+        assert_eq!(got.is_ok(), ok, "challenge at +{}", at - now);
+    }
+}
+
+#[test]
 fn passkey_challenge_misconfiguration_rejected_without_panic() {
     let now = 1_700_000_000u64;
     // Empty RP id and non-https origins are generic rejections, never panics.
