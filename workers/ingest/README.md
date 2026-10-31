@@ -64,7 +64,7 @@ NZB upload ───────────────┘                     
 - Outbound indexer fetch: `src/indexer_fetch.rs` is a **policy/model
   library, not a live SSRF boundary** (see next section; module at
   `src/indexer_fetch.rs:1-44`, exported as `pub mod indexer_fetch` in
-  `src/lib.rs:34`). No ingest route
+  `src/lib.rs:35`). No ingest route
   or queue step calls it, no live resolver or HTTPS transport implements
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
@@ -76,7 +76,7 @@ NZB upload ───────────────┘                     
 
 `src/indexer_fetch.rs` is a **library-only policy guard and buffered
 model**, not delivered outbound fetching. It is exported as
-`pub mod indexer_fetch` (`src/lib.rs:34`), but nothing outside its unit tests
+`pub mod indexer_fetch` (`src/lib.rs:35`), but nothing outside its unit tests
 (`src/indexer_fetch.rs:497-649`) and
 `tests/indexer_fetch_ssrf_guard.rs` calls `fetch_indexer`
 (`src/indexer_fetch.rs:394`) or
@@ -188,7 +188,7 @@ be wired to a live transport as if it were approved policy.
 
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**,
 not a live SSRF boundary (module at `src/nzb_fetch.rs:1-68`, exported as
-`pub mod nzb_fetch` in `src/lib.rs:40`). No ingest route calls it
+`pub mod nzb_fetch` in `src/lib.rs:42`). No ingest route calls it
 (`fetch_nzb` at `src/nzb_fetch.rs:408` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

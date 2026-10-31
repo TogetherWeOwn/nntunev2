@@ -3297,6 +3297,7 @@ mod build_sha_tests {
             "ingest.payload.store_failed",
             "ingest.upload.received",
             "ingest.job.status_checked",
+            "ingest.auth.not_configured",
         ] {
             assert!(production.contains(event), "fetch entry must emit {event}");
         }
@@ -3304,12 +3305,12 @@ mod build_sha_tests {
         // substring: `let build_sha = …` alone must never satisfy this.
         // The four fetch lines plus the migrated operational emits carry
         // the key, so a dropped key at any one of them drops the count
-        // below seventeen. The detached library-db failure line owns its
+        // below eighteen. The detached library-db failure line owns its
         // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            17,
-            "all seventeen keyed lines must carry the build_sha key"
+            18,
+            "all eighteen keyed lines must carry the build_sha key"
         );
         assert_eq!(
             production
