@@ -79,16 +79,17 @@ async fn row_state(db: &Client) -> (i32, i64, Option<String>, Option<i64>, Optio
     (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
 }
 
-impl Fixture {
-    async fn new() -> Self {
-        let url = std::env::var("NNTUNE_TEST_DATABASE_URL")
-            .expect("NNTUNE_TEST_DATABASE_URL must name CI's disposable database");
-        let config: Config = url.parse().expect("scratch database configuration");
-        // No arbitrary database URLs: this regression is wired only to a local
-        // throwaway service, never an application or production credential.
-        assert_eq!(config.get_dbname(), Some("nntune_ci"));
-        assert!(!config.get_hosts().is_empty());
-        assert!(config.get_hosts().iter().all(|host| match host {
+// No arbitrary database URLs: this regression is wired only to a local
+// throwaway service, never an application or production credential. Checks
+// the driver's effective settings, including `hostaddr`, which the driver
+// dials instead of `host` when set.
+fn disposable_config(url: &str) -> Result<Config, &'static str> {
+    let config: Config = url.parse().map_err(|_| "invalid test database URL")?;
+    if config.get_dbname() != Some("nntune_ci") {
+        return Err("test database must be disposable");
+    }
+    if config.get_hosts().is_empty()
+        || !config.get_hosts().iter().all(|host| match host {
             tokio_postgres::config::Host::Tcp(host) => {
                 host == "localhost"
                     || host
@@ -96,7 +97,40 @@ impl Fixture {
                         .is_ok_and(|ip| ip.is_loopback())
             }
             _ => false,
-        }));
+        })
+    {
+        return Err("test database hosts and addresses must be local");
+    }
+    Ok(config)
+}
+
+#[test]
+fn disposable_config_rejects_non_local_targets() {
+    let base = "postgresql://postgres:throwaway@localhost:5432/nntune_ci";
+    for url in [
+        base.to_owned(),
+        "postgresql://postgres@127.0.0.1/nntune_ci".to_owned(),
+        format!("{base}?hostaddr=127.0.0.1"),
+    ] {
+        assert!(disposable_config(&url).is_ok(), "allowed: {url}");
+    }
+    for url in [
+        format!("{base}?hostaddr=203.0.113.10"),
+        format!("{base}?hostaddr=127.0.0.1,203.0.113.10"),
+        format!("{base}?host=remote.example.com"),
+        format!("{base}?host=%2Fvar%2Frun%2Fpostgresql"),
+        format!("{base}?dbname=application"),
+        "postgresql://postgres@remote.example.com/nntune_ci".to_owned(),
+    ] {
+        assert!(disposable_config(&url).is_err(), "must refuse: {url}");
+    }
+}
+
+impl Fixture {
+    async fn new() -> Self {
+        let url = std::env::var("NNTUNE_TEST_DATABASE_URL")
+            .expect("NNTUNE_TEST_DATABASE_URL must name CI's disposable database");
+        let config = disposable_config(&url).expect("scratch database configuration");
         let schema = format!(
             "retry_test_{}_{}",
             std::process::id(),
