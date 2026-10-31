@@ -857,4 +857,71 @@ mod tests {
         }
         assert!(verify_assertion(b"\xa0", 0, &[0u8; 37], b"not json", b"sig", &expect()).is_err());
     }
+
+    #[test]
+    fn cbor_rejects_duplicate_keys_trailing_bytes_and_floats() {
+        // Controls: the same shapes without the defect parse.
+        assert!(cbor_parse(&[0xa2, 0x01, 0x01, 0x02, 0x02]).is_ok());
+        assert_eq!(cbor_parse(&[0x01]), Ok(Cbor::Int(1)));
+        assert_eq!(cbor_parse(&[0xf5]), Ok(Cbor::Simple(21)));
+        let cases: [(&str, &[u8]); 6] = [
+            ("duplicate int key", &[0xa2, 0x01, 0x01, 0x01, 0x02]),
+            (
+                "duplicate text key",
+                &[0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02],
+            ),
+            ("trailing byte", &[0x01, 0x00]),
+            // +0.0: would otherwise fit the simple-value branch.
+            ("half float", &[0xf9, 0x00, 0x00]),
+            ("single float", &[0xfa, 0x3f, 0x80, 0x00, 0x00]),
+            ("double float", &[0xfb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0]),
+        ];
+        for (why, bytes) in cases {
+            assert_eq!(cbor_parse(bytes), Err(WebAuthnError::Invalid), "{why}");
+        }
+    }
+
+    #[test]
+    fn auth_data_rejects_bad_credential_id_lengths_and_flag_mismatch() {
+        let (_sk, cose) = es256_keypair();
+        let cd = client_data("webauthn.create", CHALLENGE, ORIGIN);
+        let register = |auth: &[u8]| {
+            verify_attestation(&attestation("none", auth, empty_map()), &cd, &expect())
+                .map(|c| c.cred_id)
+        };
+        // Largest permitted id registers.
+        let max_id = vec![0x11u8; 1024];
+        assert_eq!(
+            register(&auth_data(0x45, 0, Some((&max_id, &cose)))),
+            Ok(max_id)
+        );
+        // Zero-length and over-cap ids.
+        for id in [Vec::new(), vec![0x11u8; 1025]] {
+            assert_eq!(
+                register(&auth_data(0x45, 0, Some((&id, &cose)))),
+                Err(WebAuthnError::Invalid),
+                "cred id len {}",
+                id.len()
+            );
+        }
+        // Id runs to the end of authData: no room for the COSE key.
+        assert_eq!(
+            register(&auth_data(0x45, 0, Some((b"cred-x", &[])))),
+            Err(WebAuthnError::Invalid)
+        );
+        // Registration without the attested-credential (AT) flag.
+        assert_eq!(
+            register(&auth_data(0x05, 0, None)),
+            Err(WebAuthnError::Invalid)
+        );
+        // Assertion carrying the AT flag, otherwise validly signed.
+        let (sk, cose) = es256_keypair();
+        let cd = client_data("webauthn.get", CHALLENGE, ORIGIN);
+        let auth = auth_data(0x45, 41, None);
+        let sig: EsSignature = sk.sign(&signed_message(&auth, &cd));
+        assert_eq!(
+            verify_assertion(&cose, 40, &auth, &cd, sig.to_der().as_bytes(), &expect()),
+            Err(WebAuthnError::Invalid)
+        );
+    }
 }
