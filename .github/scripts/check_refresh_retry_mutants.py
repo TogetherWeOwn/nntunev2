@@ -83,17 +83,41 @@ CASES = (
 
 
 def run(args):
-    # One test thread: with --nocapture, parallel tests interleave their panic
-    # text between `test <name> ... ` and `FAILED`, which breaks the per-name
-    # kill check in main() when a case lists several expected tests.
     prefix = (["cargo"] if os.environ.get("GITHUB_ACTIONS") == "true" else
               ["python3", "scripts/cargo_cache.py", "run", "--"])
     return subprocess.run(
         prefix + ["test", "--locked", "--manifest-path", "workers/api/Cargo.toml",
-                  "--features", "postgres-tests", *args, "--", "--nocapture", "--test-threads=1"],
+                  "--features", "postgres-tests", *args, "--", "--nocapture"],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=180,
     )
+
+
+def failed_tests(stdout):
+    """Names in libtest's closing `failures:` list.
+
+    Under --nocapture a test's panic text lands between `test <name> ... ` and
+    `FAILED` (from its own thread, or a parallel one), so the per-test result
+    line is unreliable. The closing list is printed after every test finished.
+    """
+    lines = stdout.splitlines()
+    starts = [i for i, line in enumerate(lines) if line == "failures:"]
+    if not starts:
+        return set()
+    names = set()
+    for line in lines[starts[-1] + 1:]:
+        if not line.strip():
+            if names:
+                break
+            continue
+        if not line.startswith("    "):
+            break
+        names.add(line.strip())
+    return names
+
+
+def killed_by(name, failed):
+    return any(test == name or test.endswith(f"::{name}") for test in failed)
 
 
 def main():
@@ -110,9 +134,9 @@ def main():
         try:
             path.write_text(original.replace(old, new, 1))
             mutant = run(args)
+            failed = failed_tests(mutant.stdout)
             if (mutant.returncode != 101 or "test result: FAILED." not in mutant.stdout
-                    or any(f"{name} ... FAILED" not in mutant.stdout
-                           for name in expected_names)):
+                    or not all(killed_by(name, failed) for name in expected_names)):
                 raise RuntimeError(f"{label}: expected assertion did not kill mutant\n{mutant.stdout[-6000:]}")
         finally:
             path.write_text(original)
