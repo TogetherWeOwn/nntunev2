@@ -91,6 +91,7 @@ for (const surface of ['library', 'demo'] as const) {
 		expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 
 		await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+		if (surface === 'library') await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 		await expect(page.getByTestId('queue-announcement')).toHaveText(
 			surface === 'library' ? 'Queue cleared.' : ''
 		);

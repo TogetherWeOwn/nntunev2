@@ -62,12 +62,14 @@
 		formatQueueText,
 		keepCurrentAndUpcoming,
 		moveTrack,
+		naturalEndPolicy,
 		nextTrack,
 		playNext,
 		removeTrack,
 		selectTrack as selectQueueIndex,
 		shuffleUpcoming,
 		type QueueState,
+		type RepeatMode,
 		type Track
 	} from '#lib/player/queue.js';
 
@@ -91,6 +93,29 @@
 			window.localStorage.setItem(DENSITY_KEY, value);
 		} catch {
 			// Storage refused: keep the choice in memory without a banner.
+		}
+	}
+
+	const REPEAT_KEY = 'nntune:library-repeat:v1';
+	let repeat: RepeatMode = $state('off');
+
+	function readStoredRepeat(): RepeatMode {
+		try {
+			const value = window.localStorage.getItem(REPEAT_KEY);
+			return value === 'one' || value === 'queue' ? value : 'off';
+		} catch {
+			return 'off';
+		}
+	}
+
+	function onRepeatChange(event: Event): void {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		if (value !== 'off' && value !== 'one' && value !== 'queue') return;
+		repeat = value;
+		try {
+			window.localStorage.setItem(REPEAT_KEY, value);
+		} catch {
+			// Storage refused: keep the choice for this visit.
 		}
 	}
 
@@ -128,9 +153,15 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let queue: QueueState = $state(createQueue([]));
+	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
+	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let favoritesAnnouncement = $state('');
+	// One shared polite outcome for order, view and clear actions: a new
+	// outcome replaces the previous text (keyed re-announce), never queues.
+	let browseAnnouncement = $state('');
+	let browseAnnouncementVersion = $state(0);
 	/**
 	 * Explicit subset selection: page-local ordered stable IDs in checkbox
 	 * activation order. Never persisted, never fetched, never shared across
@@ -196,6 +227,8 @@
 	let extendSelection = false;
 	let queueAnnouncement = $state('');
 	let queueAnnouncementVersion = $state(0);
+	// Bumped by every queue edit; fences late play-from-top outcomes.
+	let playEpoch = 0;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -213,6 +246,83 @@
 	 */
 	let restoreFilterFocus = false;
 	let audioEl: HTMLAudioElement | undefined = $state();
+	// Native completion pauses before `ended`; retain intent only for that
+	// element, never for a manual pause, replaced source or account.
+	let playingElement: HTMLAudioElement | null = null;
+	let endGeneration = 0;
+
+	function currentAudioEvent(event: Event): HTMLAudioElement | null {
+		const element = event.currentTarget as HTMLAudioElement | null;
+		const source = resolveStreamUrl(queueCurrentTrack(queue));
+		return shareAlive && element && element === audioEl && element.isConnected &&
+			source && element.getAttribute('src') === source ? element : null;
+	}
+
+	function handlePlay(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (element && !element.paused && !element.ended) playingElement = element;
+	}
+
+	function handlePause(event: Event): void {
+		const element = currentAudioEvent(event);
+		if (!element || element.ended) return;
+		playingElement = null;
+		endGeneration += 1;
+	}
+
+	function handleMediaError(event: Event): void {
+		if (!currentAudioEvent(event)) return;
+		playingElement = null;
+		endGeneration += 1;
+	}
+
+	async function handleEnded(event: Event): Promise<void> {
+		const element = currentAudioEvent(event);
+		if (!element) return;
+		const result = naturalEndPolicy(queue, {
+			repeat,
+			radioActive: false,
+			continueRadio: false,
+			playing: playingElement === element,
+			validEnd: element.ended && element.error === null,
+			// Library has no sleep timer; any explicit pause clears intent above.
+			sleepComplete: false
+		});
+		if (result.action === 'ignore') return;
+		playingElement = null;
+		const generation = ++endGeneration;
+		queueAnnouncement = '';
+		if (result.action !== 'play') return;
+		const settings = {
+			volume: element.volume, muted: element.muted, playbackRate: element.playbackRate
+		};
+		// Replays must also retire a deferred inbound-share seek on this source.
+		clearShareFeedback();
+		pendingShareSeek = null;
+		replaceQueue(result.queue);
+		const targetQueue = queue;
+		await tick();
+		const target = audioEl;
+		const track = queueCurrentTrack(queue);
+		if (!shareAlive || generation !== endGeneration || queue !== targetQueue ||
+			!target || !target.isConnected || !track ||
+			target.getAttribute('src') !== resolveStreamUrl(track)) return;
+		try {
+			target.volume = settings.volume;
+			target.muted = settings.muted;
+			target.playbackRate = settings.playbackRate;
+			target.currentTime = 0;
+			playingElement = target;
+			await target.play();
+			if (!shareAlive || generation !== endGeneration || target !== audioEl ||
+				queue !== targetQueue || playingElement !== target) return;
+			queueAnnouncement = `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.`;
+			queueAnnouncementVersion += 1;
+		} catch {
+			// Autoplay can be refused; native controls remain available, no success claim.
+			if (generation === endGeneration && playingElement === target) playingElement = null;
+		}
+	}
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
 	let shareInvalid = $state(false);
@@ -317,6 +427,7 @@
 				const ids = new Set(state.items.map((track) => track.id));
 				const kept = queue.tracks.filter((track) => ids.has(track.id));
 				if (kept.length !== queue.tracks.length) {
+					queueConfirmGeneration += 1;
 					const currentId = queueCurrentTrack(queue)?.id ?? null;
 					const rebuilt = createQueue(kept);
 					const index =
@@ -403,6 +514,9 @@
 	const bulkAllQueued = $derived(
 		!libraryUnavailable && renderedItems.length > 0 && bulkMissing.length === 0
 	);
+	// Play-from-top stays enabled while everything is queued: selecting the
+	// first displayed track's slot is still useful.
+	const playDisplayedDisabled = $derived(libraryUnavailable || renderedItems.length === 0);
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const tabTitle = $derived(libraryTabTitle(currentTrack));
 	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
@@ -446,13 +560,33 @@
 	}
 
 	function queuedTrackFor(item: LibraryItem): Track {
-		// No stream URL until the streaming slice: playback wiring is out of
-		// scope, so the queue carries library display fields only.
+		// Library display fields only: the bulk append and the favorites
+		// export snapshot never carry a stream URL.
 		return {
 			id: item.id,
 			title: displayTitle(item),
+			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
 			artist: displayArtist(item) ?? '',
 			streamUrl: ''
+		};
+	}
+
+	// The play path carries the item's stream URL like row selection does.
+	// A separate one-parameter mapper (no positional flag), so a bare
+	// `.map(...)` reference can never bind the array index to it.
+	function playableTrackFor(item: LibraryItem): Track {
+		return { ...queuedTrackFor(item), streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl }) };
+	}
+
+	/**
+	 * The append core shared by the bulk action and play-from-top: missing
+	 * tracks join the end in displayed order, the existing arrangement and
+	 * current selection survive, and an empty queue starts at its first row.
+	 */
+	function appendMissingTracks(missing: readonly Track[]): QueueState {
+		return {
+			tracks: [...queue.tracks, ...missing],
+			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
 		};
 	}
 
@@ -463,14 +597,7 @@
 		pendingShareSeek = null;
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
-		replaceQueue(
-			addTrack(queue, {
-				id: item.id,
-				title: displayTitle(item),
-				artist: displayArtist(item) ?? '',
-				streamUrl: resolveStreamUrl({ streamUrl: item.streamUrl })
-			})
-		);
+		replaceQueue(addTrack(queue, playableTrackFor(item)));
 	}
 
 	/**
@@ -484,11 +611,56 @@
 	function addDisplayedTracksToQueue(): void {
 		const missing = bulkMissing;
 		if (missing.length === 0) return;
-		replaceQueue({
-			tracks: [...queue.tracks, ...missing.map(queuedTrackFor)],
-			currentIndex: queue.currentIndex < 0 ? 0 : queue.currentIndex
-		});
+		replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)));
 		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
+	}
+
+	/**
+	 * Non-destructive play-from-top: append the missing displayed tracks
+	 * through the shared core, then select the first appended one (or the
+	 * first displayed track's existing slot when everything is queued).
+	 * Playback is attempted once, inside the gesture's activation window; a
+	 * rejected play() leaves the track selected but paused and is reported
+	 * as such — never retried. Any queue replacement after this activation
+	 * (another action, an auth teardown) fences the late outcome.
+	 */
+	async function playDisplayedFromTop(): Promise<void> {
+		if (playDisplayedDisabled) return;
+		const missing = bulkMissing;
+		const skipped = missingDisplayedTracks(renderedItems, new Set()).length - missing.length;
+		// Appended IDs are new and unique, so one lookup finds the first
+		// appended track, or the first displayed track's existing slot.
+		const first = missing[0] ?? renderedItems[0];
+		const base = appendMissingTracks(missing.map(playableTrackFor));
+		const index = base.tracks.findIndex((track) => track.id === first?.id);
+		const target = base.tracks[index];
+		if (!target) return;
+		// Bulk-added slots are metadata-only. This explicit play gesture
+		// hydrates only its selected slot, preserving every other queued row.
+		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
+		base.tracks[index] = { ...target, streamUrl: source };
+		replaceQueue(selectQueueIndex(base, index));
+		const epoch = playEpoch;
+		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
+		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
+		let lead = `Selected ${title}; no stream to play.`;
+		if (source) {
+			await tick();
+			if (epoch !== playEpoch) return;
+			const element = audioEl;
+			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (element) {
+				try {
+					await element.play();
+					lead = `Playing ${title}.`;
+				} catch {
+					// Selected-but-paused is the truthful fallback; no retry.
+				}
+			}
+			if (epoch !== playEpoch) return;
+		}
+		queueAnnouncement = `${lead} ${counts}`;
+		queueAnnouncementVersion += 1;
 	}
 
 	function queueFavorites(): void {
@@ -638,6 +810,11 @@
 	}
 
 	function replaceQueue(next: QueueState): void {
+		// A no-op replacement (same queue object: Next on the last track,
+		// a duplicate row tap) still clears a stale move announcement —
+		// pinned by the queue-announcement banks — but must not fence a
+		// pending play() outcome: the selection it describes is unchanged.
+		if (next !== queue) playEpoch += 1;
 		const before = queueCurrentTrack(queue);
 		const after = queueCurrentTrack(next);
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
@@ -670,6 +847,9 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		endGeneration += 1;
+		playingElement = null;
+		if (audioEl && !audioEl.paused) audioEl.pause();
 		queueExportAuthGeneration += 1;
 		clearShareFeedback();
 		clearQueueShareFeedback(true);
@@ -802,6 +982,8 @@
 			shareInvalid = true;
 			return;
 		}
+		// A newly consumed navigation must not inherit consent for the old arrangement.
+		queueConfirmGeneration += 1;
 		selectTrack(target.trackId);
 		replaceQueue(
 			selectQueueIndex(queue, queue.tracks.findIndex((track) => track.id === target.trackId))
@@ -988,6 +1170,7 @@
 		// Announce real moves only: a no-op reorder must not chatter the
 		// live region.
 		if (reordered === queue) return;
+		playEpoch += 1;
 		queue = reordered;
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
@@ -1000,6 +1183,7 @@
 		// titles: the version refreshes the content inside the stable region.
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
+		playEpoch += 1;
 		// Removing the current row advances the current source; the restart
 		// outcome for the removed track must not carry onto its successor.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
@@ -1013,6 +1197,7 @@
 		// Announce real clears only: a no-op clear must not chatter the live
 		// region.
 		if (next === queue) return;
+		playEpoch += 1;
 		queue = next;
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
@@ -1032,6 +1217,7 @@
 		if (target === undefined) return;
 		const selected = selectQueueIndex(queue, index);
 		if (selected === queue) return;
+		playEpoch += 1;
 		// Direct selection always changes the current source (reselecting
 		// the current row returned above), so restart state resets here.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
@@ -1047,6 +1233,7 @@
 		// of listening, so the copy never calls them played.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
@@ -1057,6 +1244,7 @@
 		// region.
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
+		playEpoch += 1;
 		queue = trimmed;
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
@@ -1079,8 +1267,40 @@
 		void tick().then(() => viewSelect?.focus({ preventScroll: true }));
 	}
 
+	function announceBrowse(text: string): void {
+		browseAnnouncement = text;
+		browseAnnouncementVersion += 1;
+	}
+
+	const VIEW_LABELS = {
+		all: 'All tracks',
+		favorites: 'Favorites only',
+		selected: 'Selected only'
+	} as const;
+
+	function setView(next: typeof view): void {
+		// Announce real scope changes only: reselecting the current view
+		// changes nothing and stays silent.
+		if (next === view) return;
+		view = next;
+		announceBrowse(`Showing ${VIEW_LABELS[next]}`);
+	}
+
+	function onOrderChange(event: Event): void {
+		const select = event.currentTarget as HTMLSelectElement;
+		const next = select.value as LibraryOrder;
+		if (next === order) return;
+		order = next;
+		announceBrowse(`List ordered: ${select.selectedOptions[0]?.textContent?.trim() ?? next}`);
+	}
+
+	function onViewChange(event: Event): void {
+		const next = (event.currentTarget as HTMLSelectElement).value;
+		if (next === 'all' || next === 'favorites' || next === 'selected') setView(next);
+	}
+
 	function showAllTracks(): void {
-		view = 'all';
+		setView('all');
 		focusLibraryView();
 	}
 
@@ -1213,6 +1433,8 @@
 	}
 
 	function clearFind(): void {
+		// Announce real clears only: an already-empty find stays silent.
+		if (findQuery !== '') announceBrowse('Search cleared');
 		recordFindQuery();
 		findQuery = '';
 		if (typeof document !== 'undefined') {
@@ -1357,8 +1579,11 @@
 		// Clearing inside Selected only unmounts every row; only focus that
 		// sat inside one of them needs the Show-control fallback.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
+		// Announce real clears only: an already-empty selection stays silent.
+		const hadSelection = selectedIds.length > 0;
 		selectedIds = clearSelection(selectedIds);
 		rangeAnchorId = null;
+		if (hadSelection) announceBrowse('Selection cleared');
 		if (focusLeavesWithRows) focusAfterSelectedRowRemoval(null, null);
 	}
 
@@ -1459,6 +1684,7 @@
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
+		repeat = readStoredRepeat();
 		window.addEventListener('storage', handleAuthTransition);
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
@@ -1472,6 +1698,9 @@
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
+			endGeneration += 1;
+			playingElement = null;
+			if (audioEl && !audioEl.paused) audioEl.pause();
 			favoritesExportAlive = false;
 			releaseFavoritesDownload();
 			clearShareFeedback();
@@ -1509,6 +1738,7 @@
 		</p>
 	{/if}
 	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{shareStatus}</div>
+	<p data-testid="library-browse-status" class="nt-visually-hidden" aria-live="polite" aria-atomic="true">{#key browseAnnouncementVersion}{browseAnnouncement}{/key}</p>
 	{#if shareFallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="library-share-url">Track link</label>
@@ -1697,6 +1927,18 @@
 			{#if bulkAllQueued}
 				<p id="bulk-queue-hint">All displayed tracks are already in the queue.</p>
 			{/if}
+			<button
+				class="nt-button nt-bulk-queue-action"
+				type="button"
+				disabled={playDisplayedDisabled}
+				aria-describedby={playDisplayedDisabled ? 'play-displayed-hint' : undefined}
+				onclick={() => void playDisplayedFromTop()}
+			>
+				Play displayed from the top
+			</button>
+			{#if playDisplayedDisabled}
+				<p id="play-displayed-hint">No displayed tracks to play.</p>
+			{/if}
 		</div>
 
 		{#if libraryUnavailable}
@@ -1789,7 +2031,7 @@
 			</section>
 			<div class="nt-library-order">
 				<label for="library-order">Order tracks</label>
-				<select id="library-order" bind:value={order} aria-describedby="library-order-hint">
+				<select id="library-order" value={order} onchange={onOrderChange} aria-describedby="library-order-hint">
 					<option value="original">Original order</option>
 					<option value="title">Title A–Z</option>
 					<option value="artist">Artist A–Z</option>
@@ -1800,7 +2042,7 @@
 			</div>
 			<div class="nt-library-view">
 				<label for="library-view">Show</label>
-				<select id="library-view" bind:this={viewSelect} bind:value={view}>
+				<select id="library-view" bind:this={viewSelect} value={view} onchange={onViewChange}>
 					<option value="all">All tracks</option>
 					<option value="favorites">Favorites only</option>
 					<option value="selected">Selected only</option>
@@ -1815,7 +2057,7 @@
 				Group by artist
 			</button>
 			<p aria-live="polite" aria-atomic="true">{groupingAnnouncement}</p>
-			<p data-testid="library-find-count">
+			<p data-testid="library-find-count" role={loading ? undefined : 'status'}>
 				Showing {visibleItems.length} of {items.length} {visibleItems.length === 1 ? 'track' : 'tracks'}{findScope === 'title'
 					? ' (title only)'
 					: findScope === 'artist'
@@ -1908,6 +2150,8 @@
 				ontogglefavorite={toggleQueuedFavorite}
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
+				confirmDestructive
+				confirmGeneration={queueConfirmGeneration}
 				onnext={() => replaceQueue(nextTrack(queue))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queue))}
 				onmove={moveQueuedTrack}
@@ -1948,6 +2192,17 @@
 		</p>
 	{/if}
 
+	{#if !loading && !loadError && !libraryUnavailable && items.length > 0}
+		<div class="nt-library-repeat">
+			<label for="library-repeat">Repeat</label>
+			<select id="library-repeat" data-testid="player-repeat" value={repeat} onchange={onRepeatChange}>
+				<option value="off">Off</option>
+				<option value="one">One</option>
+				<option value="queue">Queue</option>
+			</select>
+			<p data-testid="repeat-status" role="status" aria-atomic="true">Repeat: {repeat === 'off' ? 'Off' : repeat === 'one' ? 'One' : 'Queue'}</p>
+		</div>
+	{/if}
 	{#if streamUrl}
 		<section aria-label="Player">
 			<h2>Now playing</h2>
@@ -1963,6 +2218,11 @@
 						data-testid="audio-player"
 						controls
 						src={streamUrl}
+						onplay={handlePlay}
+						onplaying={handlePlay}
+						onpause={handlePause}
+						onerror={handleMediaError}
+						onended={(event) => void handleEnded(event)}
 						onloadedmetadata={(event) => {
 							applyPendingShareSeek(event.currentTarget);
 							refreshRestartAvailability(event);
@@ -2058,11 +2318,43 @@
 
 
 <style>
+	.nt-visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
 	main {
 		--nt-library-row-padding: 0.25rem;
 	}
 	main[data-density='compact'] {
 		--nt-library-row-padding: 0;
+	}
+	.nt-library-repeat {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-3);
+	}
+	.nt-library-repeat select {
+		max-width: 100%;
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+	.nt-library-repeat select:focus-visible {
+		outline: 2px solid var(--nt-accent);
+		outline-offset: 2px;
 	}
 	.nt-library-density {
 		display: flex;

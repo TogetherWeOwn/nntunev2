@@ -274,6 +274,7 @@ test('PICK-B05 selection survives background refresh and composes with managemen
 	await page.getByTestId('player-next').click();
 	await expect(current(page)).toHaveAttribute('data-track-id', 'pick-alpha');
 	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('player-next')).toBeDisabled();
 	await expect(page.getByRole('button', { name: /^Select (Mike|Zulu|Alpha) Song$/ })).toHaveCount(0);

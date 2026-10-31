@@ -235,6 +235,7 @@ test('clear replaces the announcement with the cleared outcome', async ({ page }
 	const clear = page.getByRole('button', { name: 'Clear queue', exact: true });
 	await expect(clear).toBeVisible();
 	await clear.click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
 
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(announcement).toHaveText('Queue cleared.');

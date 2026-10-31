@@ -54,10 +54,20 @@
 		 * Whether the panel's polite regions are exposed as live statuses.
 		 * The library host suspends them while a library refresh is in
 		 * flight so the loading transient keeps a single page-level
-		 * status; content, controls and focus are untouched. Defaults to
-		 * exposed; component harnesses leave it on.
+		 * status; content, controls and focus are untouched. The open consent
+		 * warning stays live so a changed destructive scope is never silent.
+		 * Defaults to exposed; component harnesses leave it on.
 		 */
 		liveRegions?: boolean;
+		/**
+		 * Opt-in two-step guard for the two destructive intents (Clear queue,
+		 * Clear upcoming): the panel opens an inline Cancel/Confirm prompt and
+		 * reports the intent only after Confirm. Hosts that omit it keep the
+		 * one-step behavior.
+		 */
+		confirmDestructive?: boolean;
+		/** Host increments when implicit reconciliation replaces the consented arrangement. */
+		confirmGeneration?: number;
 	}
 
 	// Renamed locally: a `state` binding would shadow the `$state` rune.
@@ -79,8 +89,12 @@
 		announcement = '',
 		announcementVersion = 0,
 		filterQuery = $bindable(''),
-		liveRegions = true
+		liveRegions = true,
+		confirmDestructive = false,
+		confirmGeneration = 0
 	}: Props = $props();
+
+	const confirmId = $props.id();
 
 	let current = $derived(currentTrack(queue));
 
@@ -104,6 +118,7 @@
 	let list: HTMLOListElement | null = $state(null);
 	let emptyTarget: HTMLElement | null = $state(null);
 	let filterEmptyTarget: HTMLElement | null = $state(null);
+	let revealCurrentButtonEl: HTMLButtonElement | null = $state(null);
 
 	function currentRowElement(): HTMLElement | null {
 		return (
@@ -227,6 +242,122 @@
 		await tick();
 		if (!focusStranded(heldFocus, button)) return;
 		focusEmptyTarget();
+	}
+
+	/**
+	 * Pending destructive confirm. Panel-local on purpose: it dies with the
+	 * panel (route unmount, access-refusal alert branch) and dismisses itself
+	 * the moment its precondition goes away (queue emptied by an auth
+	 * transition, nothing left upcoming), so it can never act on, or survive
+	 * into, another account's queue.
+	 */
+	let pending: 'clear' | 'trim' | null = $state(null);
+	let pendingTrigger: HTMLButtonElement | null = null;
+	let pendingAction: (() => void) | undefined = $state();
+	let pendingGeneration = $state(0);
+	let confirmEl: HTMLFieldSetElement | null = $state(null);
+	let cancelButtonEl: HTMLButtonElement | null = $state(null);
+	let cancelNote = $state('');
+	let cancelNoteVersion = $state(0);
+
+	let pendingValid = $derived(
+		confirmDestructive && pendingGeneration === confirmGeneration &&
+		(pending === 'clear'
+			? trackCount > 0 && onclear !== undefined && pendingAction === onclear
+			: pending === 'trim' && upcoming > 0 && onclearupcoming !== undefined && pendingAction === onclearupcoming)
+	);
+
+	/** A disabled control may retain DOM focus until after the render flush. */
+	function hasLiveFocus(): boolean {
+		const active = document.activeElement;
+		return active instanceof HTMLElement && active !== document.body &&
+			active.isConnected && !active.matches(':disabled') && active.getAttribute('aria-disabled') !== 'true';
+	}
+
+	function focusVisible(target: HTMLElement | null): void {
+		target?.focus({ preventScroll: true });
+		target?.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+	}
+
+	function recoverConfirmFocus(): void {
+		if (hasLiveFocus()) return;
+		if (trackCount === 0) focusEmptyTarget();
+		else focusVisible(currentRowElement() ?? revealCurrentButtonEl);
+	}
+
+	async function dismissConfirm(): Promise<void> {
+		// Capture ownership BEFORE invalidity removes the focused prompt. An
+		// unrelated, still-live focus choice must survive background updates.
+		const heldFocus = confirmEl?.contains(document.activeElement) ?? false;
+		pending = null;
+		pendingTrigger = null;
+		pendingAction = undefined;
+		await tick();
+		if (heldFocus) recoverConfirmFocus();
+	}
+
+	$effect.pre(() => {
+		if (pending !== null && !pendingValid) void dismissConfirm();
+	});
+
+	async function openConfirm(kind: 'clear' | 'trim', event: Event): Promise<void> {
+		const button = event.currentTarget;
+		pendingTrigger = button instanceof HTMLButtonElement ? button : null;
+		cancelNote = '';
+		pendingAction = kind === 'clear' ? onclear : onclearupcoming;
+		pendingGeneration = confirmGeneration;
+		pending = kind;
+		await tick();
+		// Safe default first; Tab reaches Confirm next. Never hide keyboard focus.
+		if (pending === kind && pendingValid) focusVisible(cancelButtonEl);
+	}
+
+	function requestClear(event: Event): void {
+		if (!confirmDestructive) {
+			void reportClear(event);
+			return;
+		}
+		if (trackCount === 0) return;
+		void openConfirm('clear', event);
+	}
+
+	function requestTrim(event: Event): void {
+		if (!confirmDestructive) {
+			void reportTrim(event, onclearupcoming);
+			return;
+		}
+		if (upcoming <= 0) return;
+		void openConfirm('trim', event);
+	}
+
+	/** Cancel is a pure UI reset: nothing is reported, focus returns to the trigger. */
+	async function cancelConfirm(): Promise<void> {
+		const trigger = pendingTrigger;
+		const kind = pending;
+		if (kind === null) return;
+		pending = null;
+		pendingTrigger = null;
+		pendingAction = undefined;
+		cancelNote = kind === 'trim' ? 'Clear upcoming cancelled. Queue kept.' : 'Clear queue cancelled. Queue kept.';
+		cancelNoteVersion += 1;
+		await tick();
+		focusVisible(trigger);
+	}
+
+	async function acceptConfirm(event: Event): Promise<void> {
+		// A detached control from a dismissed prompt never authorizes a later one.
+		if (!(event.currentTarget instanceof HTMLButtonElement) || !event.currentTarget.isConnected) return;
+		if (pending === null || !pendingValid) return;
+		const action = pendingAction;
+		pending = null;
+		pendingTrigger = null;
+		pendingAction = undefined;
+		cancelNote = '';
+		action?.();
+		await tick();
+		// Recover any control disabled/removed by this action, but never steal
+		// a newer, still-live focus choice. Filtering stays explicit and intact.
+		recoverConfirmFocus();
 	}
 
 	let normalizedQuery = $derived(filterQuery.trim().toLowerCase());
@@ -353,6 +484,7 @@
 <button
 	type="button"
 	data-testid="queue-reveal-current"
+	bind:this={revealCurrentButtonEl}
 	disabled={selectedIndex < 0}
 	onclick={revealCurrent}
 >
@@ -495,7 +627,7 @@
 	<button
 		type="button"
 		disabled={selectedIndex < 0 || selectedIndex >= trackCount - 1}
-		onclick={(event) => void reportTrim(event, onclearupcoming)}
+		onclick={requestTrim}
 	>
 		Clear upcoming
 	</button>
@@ -513,10 +645,42 @@
 <button
 	type="button"
 	disabled={queue.tracks.length === 0}
-	onclick={(event) => void reportClear(event)}
+	onclick={requestClear}
 >
 	Clear queue
 </button>
+
+{#if pending !== null && pendingValid}
+	<!-- A fieldset keeps the prompt a labelled group without a dialog trap:
+		the rest of the page stays reachable and nothing is modal. -->
+	<fieldset class="queue-confirm" data-testid="queue-clear-confirm" bind:this={confirmEl}>
+		<legend>{pending === 'clear' ? 'Clear queue?' : 'Clear upcoming?'}</legend>
+		<p id="{confirmId}-message" aria-live="polite" aria-atomic="true">
+			{#if pending === 'clear'}
+				Remove all {trackCount} {trackCount === 1 ? 'track' : 'tracks'} from the queue? This cannot be undone.
+			{:else}
+				Remove {upcoming} upcoming {upcoming === 1 ? 'track' : 'tracks'} from the queue? The current track stays. This cannot be undone.
+			{/if}
+		</p>
+		<div class="queue-confirm-actions">
+			<button
+				type="button"
+				bind:this={cancelButtonEl}
+				aria-describedby="{confirmId}-message"
+				onclick={() => void cancelConfirm()}
+			>
+				Cancel
+			</button>
+			<button type="button" aria-describedby="{confirmId}-message" onclick={(event) => void acceptConfirm(event)}>
+				{pending === 'clear' ? 'Yes, clear queue' : 'Yes, clear upcoming'}
+			</button>
+		</div>
+	</fieldset>
+{/if}
+
+<!-- Polite outcome for a cancelled confirm; the queue-announcement region
+	stays reserved for real queue changes. -->
+<p data-testid="queue-confirm-feedback" aria-live={liveRegions ? 'polite' : undefined}>{#key cancelNoteVersion}{cancelNote}{/key}</p>
 
 <style>
 	.queue-filter {
@@ -570,6 +734,38 @@
 
 	.queue-star:focus-visible,
 	.queue-copy-link:focus-visible {
+		outline: 2px solid var(--nt-accent, currentColor);
+		outline-offset: 2px;
+	}
+
+	.queue-confirm {
+		min-width: 0;
+		margin-inline: 0;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		color: var(--nt-fg);
+		background: var(--nt-bg-raised);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+	}
+
+	.queue-confirm p {
+		overflow-wrap: anywhere;
+	}
+
+	.queue-confirm-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+
+	/* Touch-sized, with a ring that holds without the app stylesheet. */
+	.queue-confirm button {
+		min-height: 2.75rem;
+		padding: var(--nt-space-2) var(--nt-space-3);
+		font: inherit;
+	}
+
+	.queue-confirm button:focus-visible {
 		outline: 2px solid var(--nt-accent, currentColor);
 		outline-offset: 2px;
 	}
