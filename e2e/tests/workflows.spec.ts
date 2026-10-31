@@ -2819,6 +2819,7 @@ function assertBurstProbeStatic(source: string): void {
     "curl -s --connect-timeout 10 -m 30 -o /dev/null -D - -w '%{http_code}\\n' \\",
   );
   expect(source).toContain('for i in $(seq 1 11);');
+  expect(source).toContain('-H "authorization: Bearer $INGEST_GRANT"');
   expect(source).not.toContain('--retry');
 }
 
@@ -2858,6 +2859,7 @@ printf '%s\\n' "$code"
       env: {
         PATH: `${probe}:${process.env.PATH}`,
         INGEST_URL: 'http://stub.invalid',
+        INGEST_GRANT: 'v1.stub.stub',
         STUB_RECORD: join(probe, 'curl-args.log'),
         STUB_COUNT: join(probe, 'curl-count'),
         STUB_FINAL_CODE: '429',
