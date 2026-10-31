@@ -83,11 +83,14 @@ CASES = (
 
 
 def run(args):
+    # One test thread: with --nocapture, parallel tests interleave their panic
+    # text between `test <name> ... ` and `FAILED`, which breaks the per-name
+    # kill check in main() when a case lists several expected tests.
     prefix = (["cargo"] if os.environ.get("GITHUB_ACTIONS") == "true" else
               ["python3", "scripts/cargo_cache.py", "run", "--"])
     return subprocess.run(
         prefix + ["test", "--locked", "--manifest-path", "workers/api/Cargo.toml",
-                  "--features", "postgres-tests", *args, "--", "--nocapture"],
+                  "--features", "postgres-tests", *args, "--", "--nocapture", "--test-threads=1"],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=180,
     )
