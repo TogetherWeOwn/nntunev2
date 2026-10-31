@@ -3,6 +3,7 @@ import {
   request as playwrightRequest,
   type APIRequestContext,
   type APIResponse,
+  type Locator,
   type Page,
 } from '@playwright/test';
 import { API, TESTIDS, uniqueTestEmail } from './contract.js';
@@ -519,6 +520,60 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   });
 }
 
+/** Path the signup form posts to first (`registerStart` in the web client). */
+const REGISTER_START_PATH = '/v1/auth/passkey/register/start';
+
+/**
+ * Record the HTTP status of the page's next `registerStart` call (status
+ * only — never the request or response body).
+ */
+function recordRegisterStartStatus(page: Page): { status: number | null } {
+  const seen: { status: number | null } = { status: null };
+  page.on('response', (response) => {
+    if (seen.status === null && new URL(response.url()).pathname === REGISTER_START_PATH) {
+      seen.status = response.status();
+    }
+  });
+  return seen;
+}
+
+/**
+ * Wait for the signup submit to settle on the code step or the inline
+ * error. On timeout, name the state the page is actually in (fixed labels
+ * plus the `registerStart` HTTP status), so a rate limit or paywall (the
+ * page returns to the email step and opens the plan-limit notice), a hung
+ * request, or a browser without passkeys is distinguishable from a
+ * missing form. Never logs field values or response bodies.
+ */
+async function awaitSignupOutcome(
+  page: Page,
+  codeField: Locator,
+  error: Locator,
+  registerStatus: { status: number | null },
+): Promise<void> {
+  try {
+    await expect(async () => {
+      const onCodeStep = await codeField.isVisible().catch(() => false);
+      const onError = await error.isVisible().catch(() => false);
+      expect(onCodeStep || onError).toBe(true);
+    }).toPass({ timeout: 30_000 });
+  } catch {
+    const visible = async (locator: Locator) => locator.isVisible().catch(() => false);
+    const state = (await visible(page.getByTestId('plan-limit-notice')))
+      ? 'plan-limit notice open (registerStart answered a paywall/limit)'
+      : (await visible(page.getByText(/sending your email code/i)))
+        ? 'still sending (registerStart pending)'
+        : (await visible(page.getByText(/does not support passkeys/i)))
+          ? 'passkeys unsupported in this browser'
+          : 'back at the email step with no status';
+    throw new Error(
+      `[signup] neither signup code form nor signup error appeared: ${state}; ` +
+        `registerStart HTTP ${registerStatus.status ?? 'not observed'} ` +
+        '(names only — no values logged).',
+    );
+  }
+}
+
 /**
  * Submit the public /signup form as a fresh synthetic identity and require
  * the reachable first step of the real two-step flow: submit starts
@@ -541,15 +596,11 @@ export async function submitPublicUiSignup(page: Page, baseURL: string): Promise
   await waitForHydration(page, 'signup');
   await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  const registerStatus = recordRegisterStartStatus(page);
   await page.getByTestId(TESTIDS.signupSubmit).click();
-  // Either the code form appears, or an inline error explains why.
   const codeField = page.locator('input[name="magic_code"]');
   const error = page.getByTestId(TESTIDS.signupError);
-  await expect(async () => {
-    const onCodeStep = await codeField.isVisible().catch(() => false);
-    const onError = await error.isVisible().catch(() => false);
-    expect(onCodeStep || onError, 'neither signup code form nor signup error appeared').toBe(true);
-  }).toPass({ timeout: 30_000 });
+  await awaitSignupOutcome(page, codeField, error, registerStatus);
   expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
     false,
   );
@@ -693,15 +744,11 @@ export async function submitPublicUiSignupToByopWizard(
   await waitForHydration(page, 'signup');
   await expect(page.getByTestId(TESTIDS.signupEmail)).toBeVisible({ timeout: 15_000 });
   await page.getByTestId(TESTIDS.signupEmail).fill(email);
+  const registerStatus = recordRegisterStartStatus(page);
   await page.getByTestId(TESTIDS.signupSubmit).click();
-  // Either the code form appears, or an inline error explains why.
   const codeField = page.locator('input[name="magic_code"]');
   const error = page.getByTestId(TESTIDS.signupError);
-  await expect(async () => {
-    const onCodeStep = await codeField.isVisible().catch(() => false);
-    const onError = await error.isVisible().catch(() => false);
-    expect(onCodeStep || onError, 'neither signup code form nor signup error appeared').toBe(true);
-  }).toPass({ timeout: 30_000 });
+  await awaitSignupOutcome(page, codeField, error, registerStatus);
   expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
     false,
   );
