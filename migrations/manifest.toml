@@ -122,3 +122,8 @@ sha256 = "d4fc42468d1260df227c5b4b0b4721165429fb51c13a0265d4fadcb9931dc47e"
 file = "0025_session_refresh_claim_clock.sql"
 target = "app"
 sha256 = "120a35f3515e0c48e1df882f1eed17bb5eed425d9d91bf5da8ec86ec1f9318af"
+
+[[migration]]
+file = "0026_throwaway_declaration_proof.sql"
+target = "app"
+sha256 = "e0c9853e469a538032dd3f32afbb7d8d648f8d725be0fddededec16a57e0bb79"
