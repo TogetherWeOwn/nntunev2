@@ -1582,12 +1582,43 @@ staging = "dummy-hyperdrive-staging"
             RP_ORIGIN: 'https://staging.nntune.com',
             SESSION_TTL_SECS: '86400',
             HYPERDRIVE_CACHING_DISABLED: '1',
+            QA_CODE_SEAM: '1',
           },
           observability: { enabled: true, head_sampling_rate: 1 },
           hyperdrive: [{ binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' }],
         },
       },
     });
+  });
+
+  test('code seam is armed on staging only and never in a production config', () => {
+    // POST /api/test-codes must be served on staging (flag + route in the
+    // generated config) and stay the plain 404 in production: the flag may
+    // appear only under env.staging.vars, never at top level or in another
+    // env, and no production-capable workflow or committed config sets it.
+    // The QA_AUTH_TOKEN bearer is a Worker secret and never a [vars] entry.
+    const result = generateConfig();
+    expect(result.status, result.output).toBe(0);
+    const config = parseToml(result.toml!);
+    const env = config.env as Record<string, Record<string, Record<string, unknown>>>;
+    expect(env.staging?.vars?.QA_CODE_SEAM).toBe('1');
+    expect(Object.keys(env), 'no non-staging env in the generated config').toEqual(['staging']);
+    expect(config.vars, 'no top-level vars (would apply to the default/production env)').toBeUndefined();
+    expect(result.toml!).not.toMatch(/^\s*QA_AUTH_TOKEN\s*=/m);
+    const codeLines = (source: string) => source.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+    const production = readFileSync(new URL('deploy-production.yml', workflowDir), 'utf8');
+    for (const [name, source] of [
+      ['deploy-production.yml', production],
+      ['apps/web/wrangler.toml', readFileSync(new URL('../../apps/web/wrangler.toml', import.meta.url), 'utf8')],
+      ['workers/api/wrangler.toml.example', readFileSync(new URL('../../workers/api/wrangler.toml.example', import.meta.url), 'utf8')],
+    ] as const) {
+      expect(codeLines(source), `${name} must not arm the code seam`).not.toContain('QA_CODE_SEAM');
+      expect(codeLines(source), `${name} must not route the code seam`).not.toContain('/api/test-codes');
+    }
+    // Exactly one live assignment across deploy.yml: the staging-api generator.
+    const assignments = codeLines(deployWorkflow).match(/^\s*QA_CODE_SEAM\s*=.*$/gm) ?? [];
+    expect(assignments.map((line) => line.trim())).toEqual(['QA_CODE_SEAM = "1"']);
+    expect(codeLines(jobSection(deployWorkflow, 'staging-api'))).toContain('QA_CODE_SEAM = "1"');
   });
 
   test('the pinned staging deploy consumes that config and injects BUILD_SHA', () => {

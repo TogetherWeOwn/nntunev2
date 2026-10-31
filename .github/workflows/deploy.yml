@@ -263,6 +263,12 @@ jobs:
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
           SESSION_TTL_SECS = "86400"
           HYPERDRIVE_CACHING_DISABLED = "1"
+          # Staging-only emailed-code retrieval seam (POST /api/test-codes,
+          # example.test mailboxes only). Arms capture + retrieval; the
+          # QA_AUTH_TOKEN Worker secret (Operator-staged, never here)
+          # authenticates retrieval, and without it the seam stays the
+          # plain 404. No production config ever sets this flag.
+          QA_CODE_SEAM = "1"
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the
