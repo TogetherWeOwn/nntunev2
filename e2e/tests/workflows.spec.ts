@@ -1584,6 +1584,7 @@ staging = "dummy-hyperdrive-staging"
             RP_ORIGIN: 'https://staging.nntune.com',
             SESSION_TTL_SECS: '86400',
             HYPERDRIVE_CACHING_DISABLED: '1',
+            QA_CODE_SEAM: '1',
           },
           observability: { enabled: true, head_sampling_rate: 1 },
           hyperdrive: [{ binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' }],
@@ -1783,7 +1784,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // refuses traffic — both merge green without this pin. Names plus
     // ${...}/literal shape only, never secret values.
     expect(section).toMatch(
-      /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n/m,
+      /^[ \t]*\[env\.staging\.vars\]\n[ \t]+RP_ID = "\$\{API_RP_ID_STAGING\}"\n[ \t]+RP_ORIGIN = "\$\{API_RP_ORIGIN_STAGING\}"\n[ \t]+SESSION_TTL_SECS = "86400"\n[ \t]+HYPERDRIVE_CACHING_DISABLED = "1"\n(?:[ \t]*#.*\n)*[ \t]+QA_CODE_SEAM = "1"\n/m,
     );
     // Same-host routes: the generated staging config must serve /v1/*,
     // /healthz, plus the staging-only /api/test-codes and
@@ -2018,6 +2019,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '',
     );
     const droppedSessionTtlMutant = jobsBody.replace('          SESSION_TTL_SECS = "86400"\n', '');
+    // Staging QA seam flag dropped: both seams answer 404 and every
+    // minted-account journey spec fails on the seam.
+    const droppedQaSeamFlagMutant = jobsBody.replace('          QA_CODE_SEAM = "1"\n', '');
     const droppedCachingDisabledMutant = jobsBody.replace(
       '          HYPERDRIVE_CACHING_DISABLED = "1"\n',
       '',
@@ -2130,6 +2134,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       droppedRpOriginMutant,
       droppedSessionTtlMutant,
       droppedCachingDisabledMutant,
+      droppedQaSeamFlagMutant,
       shortSessionTtlMutant,
       cachingNotDisabledMutant,
       rpIdSwappedMutant,
@@ -2171,6 +2176,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertStagingApi(droppedRpOriginMutant)).toThrow();
     expect(() => assertStagingApi(droppedSessionTtlMutant)).toThrow();
     expect(() => assertStagingApi(droppedCachingDisabledMutant)).toThrow();
+    expect(() => assertStagingApi(droppedQaSeamFlagMutant)).toThrow();
     expect(() => assertStagingApi(shortSessionTtlMutant)).toThrow();
     expect(() => assertStagingApi(cachingNotDisabledMutant)).toThrow();
     expect(() => assertStagingApi(rpIdSwappedMutant)).toThrow();
@@ -2972,5 +2978,16 @@ test.describe('burst probe bounds (static + executed pin)', () => {
     expect(readme).toContain('scripts/search_rate_limit_burst.sh');
     expect(readme).toContain('never point this script at');
     expect(readme).toContain('production');
+  });
+});
+
+test.describe('staging-only QA seam flag (static pin)', () => {
+  test('production deploy config never arms or stages the QA seams', () => {
+    const prod = readFileSync(
+      new URL('../../.github/workflows/deploy-production.yml', import.meta.url),
+      'utf8',
+    );
+    expect(prod).not.toContain('QA_CODE_SEAM');
+    expect(prod).not.toContain('QA_AUTH_TOKEN');
   });
 });
