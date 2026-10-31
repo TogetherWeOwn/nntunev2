@@ -34,7 +34,8 @@ Follow `.github/pull_request_template.md`: what changed, why, how tested.
 Keep each PR to about **400 counted lines** or fewer, counted as the
 `pr-size` labels below count them (additions + deletions, excluding
 lockfiles, generated files and fixtures). Split larger work into a series of
-reviewable PRs. A PR that cannot be split adds one line to its body:
+reviewable PRs. A larger (`size/L` or `size/XL`) PR states either a split
+plan or one line in its body:
 
 ```text
 Size justification: <why this change cannot land in smaller pieces>
@@ -70,11 +71,13 @@ labels are the durable record behind it.
 - Every PR must pass the required status checks on `main` (the
   `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit`
   and `Devin Review`**.
-- **Human (board) approval is required to merge.** Agents and bots open,
-  update and mark PRs ready for review; they do not merge.
-- Bot review findings (CodeRabbit, Devin Review) are advisory. Fix real
-  defects or answer them in the thread with evidence; do not chase a score
-  or rework a PR only to silence a bot.
+- **Human (board) approval is required to merge.** This is company
+  process, not a GitHub setting (the ruleset requires 0 approving reviews).
+  Agents and bots open, update and mark PRs ready for review; they do not
+  merge.
+- Bot review (CodeRabbit, Devin Review) is part of the gate. Fix each
+  finding, or answer it in the thread with evidence from the code. Check a
+  suggested fix before applying it (the disproof pass in `REVIEW.md`).
 - Tests prove behaviour. Do not add bespoke oracle or proof scripts just to
   satisfy a reviewer; a new guard or gate script needs its own justification
   in the PR body (what it catches that tests cannot).

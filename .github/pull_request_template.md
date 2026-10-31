@@ -9,6 +9,8 @@
 ## How tested
 
 - [ ] `ci-ok` green
+- [ ] ≤ ~400 counted lines, or a split plan / `Size justification:` line
+  (see `CONTRIBUTING.md`)
 - [ ] Manual / staging notes (if applicable):
 
 ## Secrets affirmation
