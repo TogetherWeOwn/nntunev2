@@ -5,6 +5,7 @@ import {
   applyAccountToPage,
   retrieveStagedSignupCode,
   tryMintTestAccount,
+  waitForHydration,
 } from '../helpers/accounts.js';
 
 // Returning-user login leg: proves the real `/login` magic-link form signs
@@ -65,6 +66,7 @@ test('returning user signs in with an emailed magic link and lands on provider s
   // precede the first navigation.
   await applyAccountToPage(page, null, baseURL);
   await page.goto(`${baseURL}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await waitForHydration(page, 'login');
   await expect(page.getByRole('heading', { level: 1 }), 'login page did not render').toContainText(
     'Sign in',
   );
@@ -95,6 +97,7 @@ test('returning user signs in with an emailed magic link and lands on provider s
     waitUntil: 'domcontentloaded',
     timeout: 30_000,
   });
+  await waitForHydration(page, 'login-magic-link');
   const confirm = page.getByRole('button', { name: /sign in with this link/i });
   await expect(confirm, 'magic-link confirm not offered').toBeVisible({ timeout: 15_000 });
   await confirm.click();
@@ -127,6 +130,7 @@ test('login shows the same generic sent state for an unknown address', async ({ 
   // address-specific answer here would be an enumeration oracle.
   await applyAccountToPage(page, null, baseURL);
   await page.goto(`${baseURL}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await waitForHydration(page, 'login');
   const emailField = page.locator('input[name="email"]');
   await expect(emailField, 'login email field not visible').toBeVisible({ timeout: 15_000 });
   await emailField.fill(uniqueTestEmail('e2e-unknown'));
@@ -154,6 +158,7 @@ test('login surfaces a generic error when the magic-link request fails', async (
     });
   });
   await page.goto(`${baseURL}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await waitForHydration(page, 'login');
   const emailField = page.locator('input[name="email"]');
   await expect(emailField, 'login email field not visible').toBeVisible({ timeout: 15_000 });
   await emailField.fill(uniqueTestEmail('e2e-error'));

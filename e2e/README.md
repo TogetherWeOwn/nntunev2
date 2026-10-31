@@ -199,9 +199,14 @@ How the suite uses them:
 
 - `.github/workflows/e2e-staging.yml` — no `push` trigger. The full
   journey runs only as a reusable-workflow call from `deploy.yml`'s
-  `post-deploy-e2e` job, which `needs` the same run's `staging-web`
-  deploy, so a skipped/failed deploy cannot produce a full-journey PASS
-  and no run can start without its own deploy. A later main push can
+  `post-deploy-e2e` job, which `needs` the same run's `staging-web` and
+  `staging-api` jobs, so a skipped/failed job cannot produce a full-journey
+  PASS, no run can start without its own web deployment, and the journey
+  never runs against the previous api mid-deploy. A green `staging-api`
+  job is not an api deployment: when staging is unconfigured it succeeds
+  with `outcome=unconfigured`, which `deploy.yml` passes as
+  `api_deploy_outcome` so build identity reports the api as not redeployed
+  instead of claiming web=API=head. A later main push can
   still deploy staging mid-journey (deploy releases its job-level group
   when the deploy finishes while E2E serializes separately) — that
   timing fails the closing build-identity re-read instead of passing

@@ -170,7 +170,9 @@ function tlsControlHtml(variant: TlsVariant): string {
 
 async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
   const state: Omit<FakeByop, 'baseURL' | 'close'> = { pageHits: 0, testHits: [], saveHits: 0 };
-  const page = `<!doctype html><html><body>
+  // `data-hydrated` stands in for the app's post-hydration marker, which
+  // completeByopWizard waits for before touching the form (waitForHydration).
+  const page = `<!doctype html><html data-hydrated><body>
     <div id="step1">
       <label>Hostname <input data-testid="byop-host" name="host" /></label>
       <label>Port <select data-testid="byop-port" name="port">
