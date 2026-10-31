@@ -353,6 +353,40 @@ jobs:
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Red-deploy alert. The alerts Tail consumer only sees the serving Worker,
+  # and a failed deploy leaves the old one serving, so a red `staging-api`
+  # was silent (six main pushes after #815's unapplied migrations). Keep one
+  # open tracking issue while it is red (comment per red push, notifying
+  # repo watchers) and close it on the next deploy. Skipped/unconfigured
+  # and cancelled runs change nothing. Fixed text only, no log content.
+  staging-api-alert:
+    name: staging-api-alert
+    needs: [staging-api]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.staging-api.result == 'failure' || needs.staging-api.outputs.outcome == 'deployed') }}
+    concurrency:
+      group: ${{ github.workflow }}-staging-api-alert
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Open or update the red-deploy issue
+        if: needs.staging-api.result == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/staging_api_alert.py failed
+      - name: Close the red-deploy issue after recovery
+        if: needs.staging-api.result == 'success' && needs.staging-api.outputs.outcome == 'deployed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/staging_api_alert.py recovered
+
   # Post-deploy staging E2E (same run, same revision as the deploy above).
   # No always()/!cancelled(): with the implicit success() gate, this job is
   # skipped whenever `staging-web` is skipped (gate disabled / non-push) or

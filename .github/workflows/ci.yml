@@ -346,6 +346,8 @@ jobs:
           python3 .github/scripts/test_migrations_gate_manifest_shape.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
           python3 .github/scripts/test_migrations_gate_root_validity.py
+          python3 .github/scripts/test_migration_apply_declaration.py
+          python3 .github/scripts/test_staging_api_alert.py
 
   test-nntp:
     name: test-nntp
