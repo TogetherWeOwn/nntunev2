@@ -88,7 +88,7 @@ node --experimental-vm-modules --test workers/observability/tests/*.test.mjs
 The two runtime acceptance files are the independent frozen handoff; do not alter
 them to make implementation pass. CI's existing Node-24 `tail-projection` gate
 runs runtime syntax/acceptance in addition to all pre-existing helper suites.
-Wrangler 4.150.0 (the repository pin) does not recognize the `.toml.example`
+Wrangler 4.153.0 (the repository pin) does not recognize the `.toml.example`
 extension as a config: passing it directly reports a missing entry point. For a
 local bundle, copy the example to a run-owned scratch file named `wrangler.toml`,
 change only `main` to the absolute path of `workers/observability/runtime.mjs`,

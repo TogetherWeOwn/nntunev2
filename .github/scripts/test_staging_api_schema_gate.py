@@ -65,7 +65,8 @@ class SchemaGateTests(unittest.TestCase):
     def test_tls_verifies_hostname_with_the_system_ca_bundle(self):
         base = self.env["PLANETSCALE_MIGRATOR_URL_STAGING"].split("?", 1)[0]
         self.env["PGSSLROOTCERT"] = "/untrusted/ambient-ca.pem"
-        for suffix in ("", "?sslmode=verify-full"):
+        for suffix in ("", "?sslmode=verify-full", "?sslmode=verify-full&sslrootcert=system",
+                       "?sslrootcert=system"):
             with self.subTest(suffix=suffix):
                 self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + suffix
                 self.check()
@@ -78,6 +79,16 @@ class SchemaGateTests(unittest.TestCase):
         for mode in ("require", "verify-ca", "prefer", "allow", "disable"):
             with self.subTest(mode=mode):
                 self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + "?sslmode=" + mode
+                self.assertCategory("config")
+        self.assertEqual(self.calls, [])
+
+    def test_only_the_system_root_cert_option_is_accepted(self):
+        base = self.env["PLANETSCALE_MIGRATOR_URL_STAGING"].split("?", 1)[0] + "?sslmode=verify-full"
+        for extra in ("&sslrootcert=/tmp/attacker-ca.pem",
+                      "&sslrootcert=system&sslrootcert=system", "&sslrootcert=System",
+                      "&sslcert=/tmp/client.pem", "&options=-csearch_path%3Devil"):
+            with self.subTest(extra=extra):
+                self.env["PLANETSCALE_MIGRATOR_URL_STAGING"] = base + extra
                 self.assertCategory("config")
         self.assertEqual(self.calls, [])
 

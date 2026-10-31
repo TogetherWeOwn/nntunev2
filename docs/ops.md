@@ -330,6 +330,18 @@ this documentation update, nor evidence of separate compute/failure domains.
   login identities; do not alter grants or roles. Update this evidence only from
   that direct result, keeping host-reported statements clearly distinguished.
 
+### Staging migrations
+
+Nothing in CI applies `migrations/*.sql`; the staging deploy only runs a
+read-only schema gate and fails if the staging schema is behind the repo. Staging
+migrations are therefore applied out-of-band **before** merge, by the migrator
+role, after board approval for the DDL. A PR that adds or changes a migration
+must say so in its body, and the `migrations-staging` check fails until it does:
+`Staging migration: <files> — applied <YYYY-MM-DD> by <who>`, or
+`Staging migration: pending (blocked on <ticket>)` when the apply is still
+waiting on approval. A pending PR must not merge until the line is updated to
+`applied`; merging it anyway turns `staging-api` red.
+
 ### Hyperdrive bindings
 
 | Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |

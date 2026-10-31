@@ -414,7 +414,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     // applies. The exact checked-in block below the export line is untouched.
     const runnable =
       `export PATH="${bin}:$PATH"\n` +
-      script!.split('${{ env.WRANGLER_VERSION }}').join('4.150.0');
+      script!.split('${{ env.WRANGLER_VERSION }}').join('4.153.0');
     try {
       const fixture = join(scratch, 'deployments.json');
       writeFileSync(fixture, rawOutput);
@@ -470,7 +470,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     // value; pin both sides so the substitution cannot drift.
     expect(script).toContain('wrangler@${{ env.WRANGLER_VERSION }}');
     expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
-      'WRANGLER_VERSION: 4.150.0',
+      'WRANGLER_VERSION: 4.153.0',
     );
     // Pin the WORKER_NAME the seed step binds, the same way WRANGLER_VERSION
     // is pinned: the step must wire the production worker name, and the
@@ -504,7 +504,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     const args = result.argv.trim().split('\n');
     expect(args).toEqual([
       '--yes',
-      'wrangler@4.150.0',
+      'wrangler@4.153.0',
       'deployments',
       'list',
       '--env',
