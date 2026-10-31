@@ -11,8 +11,9 @@ number, because list prices change.
 This worksheet covers only the services listed below. It is **not** an
 all-in bill: Durable Objects (the `stream` Worker's `NntpPool` pool, the
 repair Worker's `RepairContainer` and transcode Worker's `TranscodeContainer`
-classes, and the alerts consumer's `ErrorRateAlerts`; see the non-storage
-bindings inventory in `docs/ops.md`), Containers (repair and transcode),
+classes, see the non-storage bindings inventory in `docs/ops.md`; and the
+alerts consumer's `ErrorRateAlerts`, see
+`workers/observability/wrangler.toml.example`), Containers (repair and transcode),
 Cloudflare Access (staging gate), domain/DNS and any non-Cloudflare,
 non-PlanetScale services are out of scope here and must be added before
 any total is quoted as complete. Workers Logs is priced prospectively in

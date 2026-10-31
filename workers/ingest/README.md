@@ -307,8 +307,10 @@ stub whose NZB references fixture message-ids.
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
   a failed send, shared-parser upload validation, and the pool-DO segment
   probe for uploads), but the consumer entry stays commented out in
-  `wrangler.toml.example`: the search step is not wired yet, so enabling the consumer now would burn every valid job's
-  retry budget against an unavailable boundary and quarantine it.
+  `wrangler.toml.example` until three blockers clear: the search step is
+  not wired (enabling the consumer would burn search jobs' retry budget
+  against an unavailable boundary and quarantine them), the library schema
+  is missing, and the repair re-verify loop is still open (both below).
 - Request bodies carry self-asserted `user_id` (1..=128 chars) until the
   accounts card authenticates callers; the key format already binds the
   user, so keys stay valid when auth lands.
@@ -543,6 +545,8 @@ probe; rerun it explicitly after checking the local/staging worker.
 
 ```sh
 python3 scripts/cargo_cache.py run -- test --manifest-path workers/ingest/Cargo.toml
+# without the bounded Cargo pool:
+cargo test --locked --manifest-path workers/ingest/Cargo.toml
 ```
 
 Pure modules carry inline unit tests; handlers stay thin so the contract
