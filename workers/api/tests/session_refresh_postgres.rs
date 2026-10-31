@@ -98,6 +98,7 @@ fn disposable_config(url: &str) -> Result<Config, &'static str> {
             }
             _ => false,
         })
+        || !config.get_hostaddrs().iter().all(|addr| addr.is_loopback())
     {
         return Err("test database hosts and addresses must be local");
     }
