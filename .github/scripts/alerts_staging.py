@@ -170,11 +170,15 @@ def list_namespaces(get):
 
 def verify(settings, namespaces, subdomain, versions, expected_logs):
     validate_logs_url(expected_logs)
-    obs = settings.get("observability") or {}
-    require(obs.get("enabled") is False, "OBSERVABILITY_NOT_OFF")
-    require((obs.get("logs") or {}).get("enabled") is False, "LOGS_NOT_OFF")
-    require((obs.get("logs") or {}).get("invocation_logs") is False, "INVOCATION_LOGS_NOT_OFF")
-    require((obs.get("traces") or {}).get("enabled") is False, "TRACES_NOT_OFF")
+    # The live settings endpoint omits the key entirely for a Worker whose
+    # observability is off (observed read-only 2026-10-31); a present block,
+    # including an explicit null, must still be fully and explicitly off.
+    if "observability" in settings:
+        obs = settings["observability"]
+        require(isinstance(obs, dict) and obs.get("enabled") is False, "OBSERVABILITY_NOT_OFF")
+        require((obs.get("logs") or {}).get("enabled") is False, "LOGS_NOT_OFF")
+        require((obs.get("logs") or {}).get("invocation_logs") is False, "INVOCATION_LOGS_NOT_OFF")
+        require((obs.get("traces") or {}).get("enabled") is False, "TRACES_NOT_OFF")
     date = settings.get("compatibility_date")
     require(isinstance(date, str) and date.split("T", 1)[0] == COMPATIBILITY_DATE,
             "COMPATIBILITY_DATE_DRIFT")
