@@ -70,7 +70,7 @@ emit the code.
 
 | code | HTTP status | retryable | owning worker | meaning |
 | --- | --- | --- | --- | --- |
-| `unauthorized` | 401 | false | api, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
+| `unauthorized` | 401 | false | api, ingest, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
 | `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |

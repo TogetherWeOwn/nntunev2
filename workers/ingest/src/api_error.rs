@@ -20,6 +20,11 @@ pub struct CodeSpec {
 /// Codes this worker may emit. Must match `docs/api-errors.md`.
 pub const REGISTRY: &[CodeSpec] = &[
     CodeSpec {
+        code: "unauthorized",
+        status: 401,
+        retryable: false,
+    },
+    CodeSpec {
         code: "plan_limit_exceeded",
         status: 402,
         retryable: false,
@@ -122,6 +127,9 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::by_code("unauthorized", message)
+    }
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::by_code("invalid_request", message)
     }

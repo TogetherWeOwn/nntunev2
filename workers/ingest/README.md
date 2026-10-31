@@ -310,9 +310,17 @@ stub whose NZB references fixture message-ids.
   out in `wrangler.toml.example`: the search/verify/repair steps are not
   wired yet, so enabling the consumer now would burn every valid job's
   retry budget against an unavailable boundary and quarantine it.
-- Request bodies carry self-asserted `user_id` (1..=128 chars) until the
-  accounts card authenticates callers; the key format already binds the
-  user, so keys stay valid when auth lands.
+- Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
+  `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
+  scoped `ingest:write` that the `api` Worker mints for the session user,
+  signed with the `INGEST_CALLER_SECRET` Worker secret (≥32 bytes). Auth
+  runs before the body is read, so a refused caller gets the generic 401
+  `unauthorized` with no queue, KV, throttle, ledger or meter side effect.
+  A missing or short secret fails closed with 503. The job's `user_id` is
+  the grant's. A body `user_id` is optional, and one that disagrees is
+  refused with 400. `GET /v1/ingest/jobs/:id` answers 404 for another
+  user's job, the same as an unknown id. The idempotency key format is
+  unchanged.
 - Hyperdrive library upsert (`src/library.rs`): one row per idempotency
   key, `ON CONFLICT DO UPDATE` so replays converge on the latest MB match.
 - Repair dispatch (`src/repair.rs`): missing blocks + par2 set → Container
