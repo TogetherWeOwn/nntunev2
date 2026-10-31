@@ -160,7 +160,6 @@
 
 <dialog
 	bind:this={dialog}
-	role="dialog"
 	class="paywall"
 	data-testid="plan-limit-notice"
 	aria-labelledby="paywall-headline"

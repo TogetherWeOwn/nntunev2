@@ -87,8 +87,9 @@ Registration is initial enrollment only. An existing account with any passkey
 receives the same-shaped stand-in/unusable challenge; finish also rejects it.
 Real registration requires inbox proof belonging to the challenge's user;
 optional/required invites are also validated. Proof is account-bound, not
-registration-challenge-bound. The proof claims and insertion are sequential,
-not a single enrollment-wide transaction. Never loosen these existing routes
+registration-challenge-bound. The proof claims and credential insertion commit
+in one enrollment transaction; a failed claim or insertion rolls them all back.
+Never loosen these existing routes
 to add another key. Sources: `workers/api/src/handlers.rs:1536-1546`,
 `workers/api/src/handlers.rs:1725-1839`.
 

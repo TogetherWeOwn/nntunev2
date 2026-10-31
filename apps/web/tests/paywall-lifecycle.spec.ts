@@ -255,7 +255,7 @@ async function expectMeaningfulPageFocus(page: Page): Promise<void> {
 		const active = document.activeElement;
 		return Boolean(active instanceof HTMLElement && active.isConnected
 			&& active !== document.body && active !== document.documentElement
-			&& !active.closest('[role="dialog"]')
+			&& !active.closest('dialog, [role="dialog"]')
 			&& active.matches('a[href], button, input, select, textarea, [tabindex]'));
 	})).toBe(true);
 }
