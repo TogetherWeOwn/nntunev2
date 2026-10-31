@@ -72,8 +72,14 @@ function assertNoSetCookie(headers: Record<string, string>, context: string): vo
   for (const [name, value] of Object.entries(headers)) {
     if (name.toLowerCase() !== 'set-cookie') continue;
     for (const line of value.split('\n')) {
-      const cookieName = line.split('=', 1)[0]!.trim();
-      if (cookieName !== ACCESS_EDGE_COOKIE) appCookies.push(cookieName || '(unnamed)');
+      // The name is before the first `=` of the leading name=value pair
+      // (attributes follow the first `;`). No `=` there means no name:
+      // never echo the raw pair.
+      const pair = line.split(';', 1)[0]!;
+      const eq = pair.indexOf('=');
+      const cookieName = eq === -1 ? '' : pair.slice(0, eq).trim();
+      if (eq === -1) appCookies.push('(malformed)');
+      else if (cookieName !== ACCESS_EDGE_COOKIE) appCookies.push(cookieName || '(unnamed)');
     }
   }
   if (appCookies.length > 0) {
@@ -302,6 +308,8 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
       'cf_authorization=SENTINEL; Path=/',
       'CF_Authorization_x=SENTINEL',
       '=SENTINEL',
+      'SENTINEL',
+      'CF_Authorization=SENTINEL\nSENTINEL; Path=/',
     ]) {
       let mixed = '';
       try {

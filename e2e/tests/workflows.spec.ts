@@ -2219,6 +2219,10 @@ test.describe('deployed-build identity wiring (static pin)', () => {
   test('deploy passes expected_sha from github.sha (never a checkout)', () => {
     const section = jobSection(deployWorkflow, 'post-deploy-e2e');
     expect(section).toContain('expected_sha: ${{ github.sha }}');
+    // The same-run api outcome reaches the build-identity verdict, so an
+    // unconfigured api lane is reported as not redeployed, never held to head.
+    expect(section).toContain('api_deploy_outcome: ${{ needs.staging-api.outputs.outcome }}');
+    expect(stagingWorkflow).toContain('API_DEPLOY_OUTCOME: ${{ inputs.api_deploy_outcome }}');
     expect(section).not.toContain('rev-parse');
   });
 

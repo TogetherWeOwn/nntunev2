@@ -386,6 +386,10 @@ jobs:
     with:
       post_deploy: true
       expected_sha: ${{ github.sha }}
+      # Same-run staging-api outcome, so build identity holds the API to
+      # expected_sha only when it deployed this run and says web=API=head
+      # is not claimed when it was unconfigured.
+      api_deploy_outcome: ${{ needs.staging-api.outputs.outcome }}
     secrets:
       STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}

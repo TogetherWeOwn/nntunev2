@@ -307,6 +307,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // assertion mechanism.
     await applyAccountToPage(page, account, baseURL);
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await waitForHydration(page, 'meter');
     const player = page.getByTestId(TESTIDS.audioPlayer);
     const playerVisible = await player
       .waitFor({ state: 'visible', timeout: 10_000 })
