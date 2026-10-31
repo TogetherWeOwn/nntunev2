@@ -2,10 +2,11 @@
 
 ## Role
 
-Advisory first pass in English. Find defects this PR introduces or makes
-reachable. Independent review and required CI are the merge gate. Do not
-approve, merge, enable auto-merge, edit code, or start fix sessions. This file
-guides analysis only; it is not a permission boundary.
+First-pass review in English. Find defects this PR introduces or makes
+reachable. Your check is one of the required checks in `CONTRIBUTING.md`;
+together with fixed or answered findings they are the merge gate. Do not approve,
+merge, enable auto-merge, edit code, or start fix sessions. This file guides
+analysis only; it is not a permission boundary.
 
 Read `README.md` (architecture choices are normative there), `AGENTS.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, and the ADRs in `docs/adr/` for the area
