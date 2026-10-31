@@ -83,6 +83,20 @@ class VerificationTests(unittest.TestCase):
             data[0]["observability"][section] = None
             with self.subTest(section=section), self.assertRaises(guard.GuardError):
                 self.verify(data)
+        for block in (None, {}, [], False, "off", {"enabled": False}):
+            data = fixtures()
+            data[0]["observability"] = block
+            with self.subTest(block=block), self.assertRaises(guard.GuardError):
+                self.verify(data)
+
+    def test_observability_key_omitted_by_live_settings_is_off(self):
+        # Live GET .../scripts/<worker>/settings for the deployed staging Worker
+        # (observability disabled) returned placement, compatibility_date,
+        # compatibility_flags, usage_model, tags, tail_consumers, logpush,
+        # annotations and bindings on 2026-10-31: no "observability" key at all.
+        data = fixtures()
+        del data[0]["observability"]
+        self.assertEqual(self.verify(data)["version_id"], "version-id")
 
     def test_compatibility_date_accepts_api_timestamp_and_rejects_drift(self):
         for value in ("2026-10-01", "2026-10-01T00:00:00Z"):
