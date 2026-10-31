@@ -28,6 +28,7 @@ use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
 pub mod api_error;
+pub mod caller_auth;
 pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
@@ -55,7 +56,7 @@ pub mod transcode;
 pub mod verify;
 
 use api_error::ApiError;
-use dispatch::validate_user_id;
+use caller_auth::Caller;
 use jobs::{validate_job_id, JobSource};
 use metering::{
     emit_meter, MeterOutcome, MeterSink, MeterWriteError, METER_DATASET, METER_DATASET_BINDING,
@@ -208,6 +209,54 @@ fn service_unavailable(message: &str) -> Result<Response> {
     let body = ApiError::service_unavailable(message).body_json();
     Response::from_body(worker::ResponseBody::Body(body.into_bytes()))
         .map(|r| r.with_status(503).with_headers(headers))
+}
+
+// --- Caller authentication (TWO-324) ------------------------------------------
+
+/// Authenticate the caller of an ingest route from its bearer grant
+/// (`src/caller_auth.rs`). Every route calls this first, before the body
+/// is read or any queue, KV, rate-limit, ledger or meter side effect. A
+/// refused caller gets the generic 401; a missing or short secret is a
+/// deploy misconfiguration and fails closed with 503.
+fn authenticate_caller(
+    req: &Request,
+    env: &Env,
+    trace_id: &str,
+) -> core::result::Result<Caller, Result<Response>> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env
+        .secret(caller_auth::CALLER_SECRET_VAR)
+        .ok()
+        .map(|s| s.to_string());
+    let now_s = worker::Date::now().as_millis() / 1000;
+    caller_auth_decision(authorization.as_deref(), secret.as_deref(), now_s).map_err(|err| {
+        if err.status == 503 {
+            emit(
+                Level::Error,
+                trace_id,
+                "ingest.auth.not_configured",
+                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+            );
+            service_unavailable("service unavailable")
+        } else {
+            json_error(err)
+        }
+    })
+}
+
+/// Pure decision behind [`authenticate_caller`]: the 401/503 split is
+/// unit-tested without a Worker runtime.
+fn caller_auth_decision(
+    authorization: Option<&str>,
+    secret: Option<&str>,
+    now_s: u64,
+) -> core::result::Result<Caller, ApiError> {
+    caller_auth::authenticate(authorization, secret, now_s).map_err(|err| match err {
+        caller_auth::AuthError::NotConfigured => {
+            ApiError::service_unavailable("service unavailable")
+        }
+        _ => ApiError::unauthorized("authentication required"),
+    })
 }
 
 // --- Search abuse guard (roadmap R6) -------------------------------------------
@@ -439,9 +488,6 @@ fn check_search(req: &SearchRequest) -> core::result::Result<(), &'static str> {
     if req.categories.len() > MAX_CATEGORIES {
         return Err("too many categories (max 16)");
     }
-    if !validate_user_id(&req.user_id) {
-        return Err("user_id must be 1..=128 chars without ':'");
-    }
     Ok(())
 }
 
@@ -452,9 +498,6 @@ fn parse_upload(text: &str) -> core::result::Result<NzbUploadRequest, &'static s
 fn check_upload(req: &NzbUploadRequest) -> core::result::Result<(), &'static str> {
     if req.filename.is_empty() || req.filename.len() > 255 {
         return Err("filename must be 1..=255 chars");
-    }
-    if !validate_user_id(&req.user_id) {
-        return Err("user_id must be 1..=128 chars without ':'");
     }
     Ok(())
 }
@@ -1309,6 +1352,10 @@ async fn store_upload_payload(env: &Env, payload_ref: &str, nzb_xml: &str, trace
 /// trace travels in every log line, in the `x-trace-id` response header, and
 /// in the queued message for the consumer.
 async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
+    let caller = match authenticate_caller(req, &ctx.env, trace_id) {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
+    };
     let text = match read_capped_text(req, MAX_SEARCH_BODY_BYTES).await {
         Ok(text) => text,
         Err(err) => return json_error(err),
@@ -1320,17 +1367,20 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Re
     if let Err(message) = check_search(&parsed) {
         return json_error(ApiError::invalid_request(message));
     }
+    if let Err(message) = caller_auth::bind_body_user(&caller, parsed.user_id.as_deref()) {
+        return json_error(ApiError::invalid_request(message));
+    }
     // Abuse guard before any dispatch is built or metered (roadmap R6):
     // per-IP AND per-account token buckets; a denied attempt consumes
     // nothing and answers the generic 429 + Retry-After.
     if let rate_limit::SearchDecision::Deny { retry_after_secs } =
-        check_search_attempt(req, &ctx.env, &parsed.user_id)
+        check_search_attempt(req, &ctx.env, &caller.user_id)
     {
         return search_rate_limited_response(retry_after_secs);
     }
     let q = parsed.query.trim().to_string();
     let mut msg = match dispatch::build_search_dispatch(
-        &parsed.user_id,
+        &caller.user_id,
         &q,
         &parsed.indexer_ref,
         &parsed.categories,
@@ -1372,6 +1422,10 @@ async fn search(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Re
 /// `nntune-core`, probes the pool DO, and verifies before matching. Same
 /// trace contract as [`search`]: log lines, response header, queued message.
 async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
+    let caller = match authenticate_caller(req, &ctx.env, trace_id) {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
+    };
     let text = match read_capped_text(req, MAX_UPLOAD_BODY_BYTES).await {
         Ok(text) => text,
         Err(err) => return json_error(err),
@@ -1381,6 +1435,9 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
         Err(message) => return json_error(ApiError::invalid_request(message)),
     };
     if let Err(message) = check_upload(&parsed) {
+        return json_error(ApiError::invalid_request(message));
+    }
+    if let Err(message) = caller_auth::bind_body_user(&caller, parsed.user_id.as_deref()) {
         return json_error(ApiError::invalid_request(message));
     }
     match estimate_nzb(&parsed.nzb_xml) {
@@ -1400,7 +1457,7 @@ async fn upload_nzb(req: &mut Request, ctx: &RouteContext<()>, trace_id: &str) -
                     ))
                 }
             }
-            let mut msg = match dispatch::build_upload_dispatch(&parsed.user_id, &parsed.nzb_xml) {
+            let mut msg = match dispatch::build_upload_dispatch(&caller.user_id, &parsed.nzb_xml) {
                 Ok(msg) => msg,
                 Err(message) => return json_error(ApiError::invalid_request(message)),
             };
@@ -1468,11 +1525,16 @@ fn healthz() -> Result<Response> {
 }
 
 /// Job checkpoint status: read the durable checkpoint written at
-/// admission and advanced by the Queue consumer. Unknown ids are 404; a
+/// admission and advanced by the Queue consumer. Unknown ids — and another
+/// user's job, which is indistinguishable from unknown — are 404; a
 /// checkpoint-store failure is 503 (never a fabricated status).
 /// Malformed IDs answer 404 without a log line (scanner noise stays out of
 /// the logs); valid IDs log one `status_checked` line under the trace.
-async fn job_status(ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
+async fn job_status(req: &Request, ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> {
+    let caller = match authenticate_caller(req, &ctx.env, trace_id) {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
+    };
     let id = ctx.param("id").cloned().unwrap_or_default();
     if !validate_job_id(&id) {
         return json_error(ApiError::not_found("unknown job id"));
@@ -1486,10 +1548,23 @@ async fn job_status(ctx: &RouteContext<()>, trace_id: &str) -> Result<Response> 
         "ingest.job.status_checked",
         serde_json::json!({"job_id": id, "build_sha": build_sha}),
     );
-    match checkpoint::get(&ctx.env, &id).await {
+    match owned_checkpoint(&caller, checkpoint::get(&ctx.env, &id).await) {
         Ok(Some(cp)) => Response::from_json(&cp),
         Ok(None) => json_error(ApiError::not_found("unknown job id")),
-        Err(_) => service_unavailable("checkpoint store unavailable"),
+        Err(()) => service_unavailable("checkpoint store unavailable"),
+    }
+}
+
+/// Ownership filter for [`job_status`]: a checkpoint owned by another user
+/// reads exactly like a missing one, so its state never leaks.
+fn owned_checkpoint<E>(
+    caller: &Caller,
+    loaded: core::result::Result<Option<jobs::JobCheckpoint>, E>,
+) -> core::result::Result<Option<jobs::JobCheckpoint>, ()> {
+    match loaded {
+        Ok(Some(cp)) if caller_auth::owns_job(caller, &cp.user_id) => Ok(Some(cp)),
+        Ok(_) => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
@@ -1757,7 +1832,7 @@ mod tests {
             .expect("a following route must bound the body")
             .0;
         let gate = route
-            .find("check_search_attempt(req, &ctx.env, &parsed.user_id)")
+            .find("check_search_attempt(req, &ctx.env, &caller.user_id)")
             .expect("search route must run the throttle gate");
         let denied = route
             .find("return search_rate_limited_response(retry_after_secs);")
@@ -1793,6 +1868,149 @@ mod tests {
             !wrapper.contains("SearchDecision::Allow"),
             "check_search_attempt must not short-circuit the glue with Allow"
         );
+    }
+
+    const AUTH_SECRET: &str = "test-secret-test-secret-test-secret!";
+    const AUTH_NOW: u64 = 1_800_000_000;
+
+    fn bearer_for(user_id: &str) -> String {
+        format!(
+            "Bearer {}",
+            caller_auth::issue(
+                user_id,
+                caller_auth::INGEST_WRITE_SCOPE,
+                AUTH_NOW + 600,
+                AUTH_SECRET.as_bytes()
+            )
+        )
+    }
+
+    fn caller(user_id: &str) -> Caller {
+        caller_auth_decision(Some(&bearer_for(user_id)), Some(AUTH_SECRET), AUTH_NOW).unwrap()
+    }
+
+    /// Slice one production route body (pre-test source, bounded by the
+    /// next `async fn` or the end of that source), as
+    /// `search_route_denial_short_circuits_before_dispatch`.
+    fn production_route(signature: &str) -> &'static str {
+        let rest = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("route {signature} must exist"))
+            .1;
+        rest.split_once("\nasync fn ")
+            .map_or(rest, |(body, _)| body)
+    }
+
+    #[test]
+    fn unauthenticated_caller_gets_generic_401_and_missing_secret_fails_closed() {
+        assert_eq!(caller("user_01").user_id, "user_01");
+        for header in [None, Some("Bearer v1.00.00"), Some("user_01")] {
+            let err = caller_auth_decision(header, Some(AUTH_SECRET), AUTH_NOW).unwrap_err();
+            assert_eq!((err.status, err.code), (401, "unauthorized"), "{header:?}");
+            assert_eq!(err.message, "authentication required");
+        }
+        let err = caller_auth_decision(Some(&bearer_for("user_01")), None, AUTH_NOW).unwrap_err();
+        assert_eq!((err.status, err.code), (503, "service_unavailable"));
+    }
+
+    #[test]
+    fn every_ingest_route_authenticates_before_any_side_effect() {
+        // The routes need wasm-bindgen, so pin their shape in source: the
+        // auth refusal returns before the body is read (search/upload) or
+        // the job id is looked at (status), hence before any queue, KV,
+        // throttle, ledger or meter call.
+        for (signature, first_effect) in [
+            ("async fn search(req: &mut Request", "read_capped_text("),
+            ("async fn upload_nzb(req: &mut Request", "read_capped_text("),
+            ("async fn job_status(req: &Request", "ctx.param(\"id\")"),
+        ] {
+            let route = production_route(signature);
+            let auth = route
+                .find("authenticate_caller(req, &ctx.env, trace_id)")
+                .unwrap_or_else(|| panic!("{signature} must authenticate"));
+            let refused = route
+                .find("Err(refused) => return refused,")
+                .unwrap_or_else(|| panic!("{signature} must return the refusal"));
+            let effect = route.find(first_effect).unwrap();
+            assert!(auth < refused && refused < effect, "{signature}");
+        }
+        let router = include_str!("lib.rs")
+            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .unwrap()
+            .1;
+        assert!(router.contains("job_status(&req, &ctx, &trace_id)"));
+    }
+
+    #[test]
+    fn job_user_comes_from_the_caller_never_the_body() {
+        // A body naming another user is refused before any dispatch; an
+        // absent or matching one is accepted, and dispatch keys on the
+        // authenticated caller only.
+        for (signature, dispatch) in [
+            (
+                "async fn search(req: &mut Request",
+                "build_search_dispatch(",
+            ),
+            (
+                "async fn upload_nzb(req: &mut Request",
+                "build_upload_dispatch(",
+            ),
+        ] {
+            let route = production_route(signature);
+            let bind = route
+                .find("caller_auth::bind_body_user(&caller, parsed.user_id.as_deref())")
+                .unwrap_or_else(|| panic!("{signature} must bind the body user"));
+            let built = route.find(dispatch).unwrap();
+            assert!(bind < built, "{signature}");
+            assert!(
+                !route.contains("&parsed.user_id"),
+                "{signature} trusts the body"
+            );
+        }
+        let me = caller("user_01");
+        let spoofed = parse_search(
+            &search_body("q", "vault_idx_01-ab", &[], 10, 0)
+                .replace("\"user_id\":\"user_01\"", "\"user_id\":\"user_02\""),
+        )
+        .unwrap();
+        assert_eq!(spoofed.user_id.as_deref(), Some("user_02"));
+        assert!(check_search(&spoofed).is_ok());
+        assert_eq!(
+            caller_auth::bind_body_user(&me, spoofed.user_id.as_deref()),
+            Err("user_id does not match the authenticated caller")
+        );
+        let spoofed_upload =
+            parse_upload(r#"{"user_id":"user_02","filename":"r.nzb","nzb_xml":"<nzb></nzb>"}"#)
+                .unwrap();
+        assert!(caller_auth::bind_body_user(&me, spoofed_upload.user_id.as_deref()).is_err());
+        let anonymous = parse_upload(r#"{"filename":"r.nzb","nzb_xml":"<nzb></nzb>"}"#).unwrap();
+        assert!(check_upload(&anonymous).is_ok());
+        assert_eq!(
+            caller_auth::bind_body_user(&me, anonymous.user_id.as_deref()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn cross_user_job_lookup_reads_as_unknown() {
+        let msg =
+            dispatch::build_search_dispatch("user_01", "q", "vault_idx_01-ab", &[], 10, 0).unwrap();
+        let cp = checkpoint::initial(&msg);
+        let (owner, other) = (caller("user_01"), caller("user_02"));
+        assert_eq!(
+            owned_checkpoint::<()>(&owner, Ok(Some(cp.clone()))),
+            Ok(Some(cp.clone()))
+        );
+        assert_eq!(owned_checkpoint::<()>(&other, Ok(Some(cp))), Ok(None));
+        assert_eq!(owned_checkpoint::<()>(&other, Ok(None)), Ok(None));
+        assert_eq!(owned_checkpoint(&owner, Err("kv down")), Err(()));
+        // The route renders `Ok(None)` as the same 404 as an unknown id.
+        let route = production_route("async fn job_status(req: &Request");
+        assert!(route.contains("owned_checkpoint(&caller, checkpoint::get(&ctx.env, &id).await)"));
+        assert!(route.contains("Ok(None) => json_error(ApiError::not_found(\"unknown job id\")),"));
     }
 
     #[test]
@@ -2877,7 +3095,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         })
         .get_async("/v1/ingest/jobs/:id", |req, ctx| async move {
             let trace_id = inbound_trace_id(&req);
-            job_status(&ctx, &trace_id)
+            job_status(&req, &ctx, &trace_id)
                 .await
                 .map(|r| with_trace(r, &trace_id))
         })
@@ -3079,6 +3297,7 @@ mod build_sha_tests {
             "ingest.payload.store_failed",
             "ingest.upload.received",
             "ingest.job.status_checked",
+            "ingest.auth.not_configured",
         ] {
             assert!(production.contains(event), "fetch entry must emit {event}");
         }
@@ -3086,12 +3305,12 @@ mod build_sha_tests {
         // substring: `let build_sha = …` alone must never satisfy this.
         // The four fetch lines plus the migrated operational emits carry
         // the key, so a dropped key at any one of them drops the count
-        // below seventeen. The detached library-db failure line owns its
+        // below eighteen. The detached library-db failure line owns its
         // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            17,
-            "all seventeen keyed lines must carry the build_sha key"
+            18,
+            "all eighteen keyed lines must carry the build_sha key"
         );
         assert_eq!(
             production

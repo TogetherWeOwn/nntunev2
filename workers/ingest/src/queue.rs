@@ -123,12 +123,13 @@ pub struct LibraryWrite {
 
 /// Search request body for `POST /v1/ingest/search`.
 ///
-/// `indexer_ref` is an opaque BYOP vault handle, never a raw key. `user_id`
-/// is self-asserted until the accounts card authenticates callers; it binds
-/// the idempotency key so today's queued jobs stay valid when auth lands.
+/// `indexer_ref` is an opaque BYOP vault handle, never a raw key. The job's
+/// user is the authenticated caller (`crate::caller_auth`); the optional
+/// body `user_id` is never trusted and is refused when it disagrees.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRequest {
-    pub user_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub query: String,
     pub indexer_ref: String,
     pub categories: Vec<u32>,
@@ -137,10 +138,11 @@ pub struct SearchRequest {
 }
 
 /// NZB upload body for `POST /v1/ingest/nzb` (JSON; caps in `nzb_intake`).
-/// `user_id` is self-asserted, as in [`SearchRequest`].
+/// The optional body `user_id` is checked, never trusted, as in [`SearchRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NzbUploadRequest {
-    pub user_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub filename: String,
     pub nzb_xml: String,
 }
@@ -338,7 +340,12 @@ mod tests {
             r#"{"query":"q","indexer_ref":"vault_01","categories":[],"limit":10,"page":0,"user_id":"user_01"}"#,
         )
         .unwrap();
-        assert_eq!(req.user_id, "user_01");
+        assert_eq!(req.user_id.as_deref(), Some("user_01"));
+        let anonymous: SearchRequest = serde_json::from_str(
+            r#"{"query":"q","indexer_ref":"vault_01","categories":[],"limit":10,"page":0}"#,
+        )
+        .unwrap();
+        assert_eq!(anonymous.user_id, None);
     }
 
     #[test]
@@ -347,6 +354,9 @@ mod tests {
             r#"{"filename":"r.nzb","nzb_xml":"<nzb></nzb>","user_id":"user_01"}"#,
         )
         .unwrap();
-        assert_eq!(req.user_id, "user_01");
+        assert_eq!(req.user_id.as_deref(), Some("user_01"));
+        let anonymous: NzbUploadRequest =
+            serde_json::from_str(r#"{"filename":"r.nzb","nzb_xml":"<nzb></nzb>"}"#).unwrap();
+        assert_eq!(anonymous.user_id, None);
     }
 }
