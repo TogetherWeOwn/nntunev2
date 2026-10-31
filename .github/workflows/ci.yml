@@ -345,6 +345,7 @@ jobs:
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
           python3 .github/scripts/test_migrations_gate_manifest_shape.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
+          python3 .github/scripts/test_migrations_staging_declaration.py
           python3 .github/scripts/test_migrations_gate_root_validity.py
 
   test-nntp:
