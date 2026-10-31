@@ -79,7 +79,11 @@ def connection_env(env, payload):
             or origin.get("port") != (url.port or 5432)):
         raise GateError("staging database does not match the selected binding")
     query = urllib.parse.parse_qs(url.query, strict_parsing=True)
-    if set(query) - {"sslmode"} or len(query.get("sslmode", [])) > 1:
+    # `sslrootcert=system` (libpq's system trust store, as PlanetScale issues
+    # it) is accepted only because the gate pins the system CA bundle below;
+    # any other root cert would point verification at an arbitrary file.
+    if (set(query) - {"sslmode", "sslrootcert"} or len(query.get("sslmode", [])) > 1
+            or query.get("sslrootcert", ["system"]) != ["system"]):
         raise GateError("unsupported staging connection options")
     sslmode = query.get("sslmode", ["verify-full"])[0]
     if sslmode != "verify-full":
