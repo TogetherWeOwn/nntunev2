@@ -149,7 +149,7 @@ export function apiDeployOutcome(): string {
  * wired. The serving API is then an earlier build and may legitimately
  * differ from head; the verdict says so instead of claiming web=API=head.
  */
-const API_NOT_REDEPLOYED = new Set(['skipped', 'unconfigured']);
+export const API_NOT_REDEPLOYED: ReadonlySet<string> = new Set(['skipped', 'unconfigured']);
 
 /**
  * Pull the API Worker build SHA out of a `GET /healthz` body.
@@ -203,8 +203,9 @@ export function extractApiBuildSha(bodyText: string, context: string): string | 
  *   The API must report exactly the promotion SHA; absent, `"unknown"`,
  *   malformed or different throws by name.
  * - `staging-api` skipped/unconfigured: the API was not redeployed, so a
- *   different SHA is legitimate. Returns `sameBuild: false` with a note the
- *   caller logs and annotates — never a silent pass, never a web=API claim.
+ *   different SHA is legitimate. Always returns `sameBuild: false` (even on
+ *   an equal SHA) with a note the caller logs and annotates — never a
+ *   silent pass, never a web=API claim.
  * - Any other outcome (failed, cancelled, unexpected): throws.
  */
 export function assertApiBuildMatchesPromotion(
@@ -215,14 +216,14 @@ export function assertApiBuildMatchesPromotion(
 ): { sameBuild: boolean; note: string } {
   const shown = apiSha ?? '(absent)';
   if (API_NOT_REDEPLOYED.has(outcome)) {
-    const sameBuild = apiSha === expectedSha;
+    // Never same-run evidence, even when an earlier API deploy happens to
+    // report the same SHA (for example a same-SHA rerun).
     return {
-      sameBuild,
-      note: sameBuild
-        ? `staging-api ${outcome} this run, yet the API already serves the promotion SHA ${expectedSha}.`
-        : `staging-api ${outcome} this run: the API was not redeployed and serves ${shown}, ` +
-          `which legitimately differs from the promotion SHA ${expectedSha}. ` +
-          'web=API=head is NOT claimed for this run.',
+      sameBuild: false,
+      note:
+        `staging-api ${outcome} this run: the API was not redeployed and serves ${shown} ` +
+        `(promotion SHA ${expectedSha}); a difference is legitimate. ` +
+        'web=API=head is NOT claimed for this run.',
     };
   }
   if (outcome !== '' && outcome !== 'deployed') {

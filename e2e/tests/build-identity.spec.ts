@@ -201,6 +201,12 @@ test.describe('API build identity assertion (offline fixtures)', () => {
       expect(verdict.note).toContain(HEAD);
       expect(verdict.note).toContain('NOT claimed');
     });
+
+    test(`staging-api "${outcome}": an equal API SHA is still not same-run evidence`, () => {
+      const verdict = assertApiBuildMatchesPromotion(HEAD, HEAD, outcome, 'api');
+      expect(verdict.sameBuild).toBe(false);
+      expect(verdict.note).toContain('NOT claimed');
+    });
   }
 
   test('failed or cancelled staging-api never passes', () => {
