@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+	import { describeJump, jumpMedia, type JumpDirection } from '#lib/player/relativeJump.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -373,6 +374,10 @@
 	let restartCanSeek = $state(false);
 	let restartStatus = $state('');
 	let restartStatusVersion = $state(0);
+	// One-shot readout for Back/Forward 10 seconds; cleared on source change
+	// and at the auth boundary.
+	let jumpStatus = $state('');
+	let jumpStatusVersion = $state(0);
 	// Sources whose pending inbound-share seek was superseded by an
 	// explicit restart (live position may still sit at the share target,
 	// so a remembered position must be fenced here, not re-derived).
@@ -806,6 +811,7 @@
 		if (before?.id !== after?.id || before?.streamUrl !== after?.streamUrl) {
 			restartCanSeek = false;
 			restartStatus = '';
+			jumpStatus = '';
 		}
 	}
 
@@ -857,6 +863,7 @@
 		restartSupersededSources.clear();
 		restartCanSeek = false;
 		restartStatus = '';
+		jumpStatus = '';
 		shareInvalid = false;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 	}
@@ -1157,6 +1164,23 @@
 				? withTitle('Restarted')
 				: withTitle('Could not restart')
 		);
+	}
+
+	/**
+	 * Back/Forward 10 seconds act on the mounted audio element for the current
+	 * source only. A jump supersedes a pending inbound-share seek so later
+	 * metadata events cannot undo it.
+	 */
+	function jumpRelative(direction: JumpDirection): void {
+		const element = audioEl;
+		const outcome =
+			element && streamUrl && element.getAttribute('src') === streamUrl
+				? jumpMedia(element, direction)
+				: ({ kind: 'unavailable' } as const);
+		if (outcome.kind === 'jumped') pendingShareSeek = null;
+		jumpStatus = describeJump(direction, outcome);
+		// Re-announce a repeated identical outcome.
+		jumpStatusVersion += 1;
 	}
 
 	if (typeof window !== 'undefined') {
@@ -2252,6 +2276,27 @@
 				<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 			{/if}
 			<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
+			<div class="nt-player-jump">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-back"
+					aria-label="Back 10 seconds"
+					onclick={() => jumpRelative('back')}
+				>
+					Back 10 s
+				</button>
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-forward"
+					aria-label="Forward 10 seconds"
+					onclick={() => jumpRelative('forward')}
+				>
+					Forward 10 s
+				</button>
+			</div>
+			<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
 		</section>
 	{/if}
 </main>
@@ -2439,6 +2484,15 @@
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;
+	}
+	.nt-player-jump {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		margin-block: var(--nt-space-2);
+	}
+	.nt-player-jump button {
+		min-height: 2.75rem;
 	}
 	.nt-library-order {
 		display: flex;
