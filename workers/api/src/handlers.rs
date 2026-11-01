@@ -1160,14 +1160,20 @@ fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
     }
 }
 
-/// True iff the request carries the staged QA bearer on an armed staging
-/// posture (`QA_CODE_SEAM` + `QA_AUTH_TOKEN`, the same gate as the seam
-/// routes). Such requests skip the per-IP auth-start and per-IP mail
-/// budgets: every journey spec shares one CI runner IP, and the bearer
-/// already unlocks account minting and code retrieval, so the exemption
-/// grants nothing it does not. Every other posture (production included)
-/// is false whatever header is presented.
-fn qa_rate_limit_exempt(cfg: &Config, req: &Request) -> bool {
+/// True iff the request names a synthetic `example.test` mailbox and
+/// carries the staged QA bearer on an armed staging posture
+/// (`QA_CODE_SEAM` + `QA_AUTH_TOKEN`, the same gate as the seam routes).
+/// Such requests skip the per-IP auth-start and per-IP mail budgets: every
+/// journey spec shares one CI runner IP, and the bearer already unlocks
+/// minting synthetic accounts, so the exemption grants nothing it does
+/// not. Routable mailboxes always spend both budgets, so even a leaked
+/// staging token cannot create unbounded real-address rows or mail. Every
+/// other posture (production included) is false whatever header is
+/// presented.
+fn qa_rate_limit_exempt(cfg: &Config, req: &Request, email: &str) -> bool {
+    if !is_example_test_mailbox(email) {
+        return false;
+    }
     let Some(expected) = cfg.qa_auth_token.as_deref().filter(|_| cfg.qa_code_seam) else {
         return false;
     };
@@ -1468,10 +1474,10 @@ where
     /// the full `source_ip`. Denial is `Err(retry_after_secs)` carrying
     /// the DENIED budget's window, so a burst denial back-off hint is
     /// the burst window, never the hourly one. A staged QA bearer on an
-    /// armed staging posture is admitted without spending either budget
-    /// (`qa_rate_limit_exempt`).
-    async fn admit_auth_start(&self, req: &Request) -> Result<(), u64> {
-        if qa_rate_limit_exempt(self.cfg, req) {
+    /// armed staging posture, for an `example.test` mailbox, is admitted
+    /// without spending either budget (`qa_rate_limit_exempt`).
+    async fn admit_auth_start(&self, req: &Request, email: &str) -> Result<(), u64> {
+        if qa_rate_limit_exempt(self.cfg, req, email) {
             return Ok(());
         }
         // Hourly budget AND the configured short-window burst budget
@@ -1512,10 +1518,10 @@ where
         // Outbound mail abuse cap BEFORE the per-email budget: one IP must
         // not email-bomb unlimited distinct victims. Any denial sends
         // nothing and stores no magic row. The staged QA bearer skips only
-        // this per-IP cap and only for unroutable `example.test` mailboxes,
-        // so even a leaked staging token cannot mail a real address past
-        // it; the global and per-email caps below still apply.
-        let mail_ip_ok = (is_example_test_mailbox(email) && qa_rate_limit_exempt(self.cfg, req))
+        // this per-IP cap and only for unroutable `example.test` mailboxes
+        // (`qa_rate_limit_exempt`); the global and per-email caps below
+        // still apply.
+        let mail_ip_ok = qa_rate_limit_exempt(self.cfg, req, email)
             || self
                 .store
                 .reserve_rate_limit(
@@ -1687,7 +1693,7 @@ where
     };
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
-    if let Err(retry_after) = ctx.admit_auth_start(req).await {
+    if let Err(retry_after) = ctx.admit_auth_start(req, &email).await {
         return throttled(retry_after);
     }
     let existing = match ctx.store.user_by_email(&email).await {
@@ -2056,7 +2062,7 @@ where
     // Per-IP admission before maintenance or lookup: unknown emails would
     // otherwise mint unbounded unbound challenge rows. Denial returns the
     // same fixed-shape 200 with an unstored challenge.
-    if ctx.admit_auth_start(req).await.is_err() {
+    if ctx.admit_auth_start(req, &email).await.is_err() {
         return json_response(
             200,
             serde_json::json!({
@@ -2436,7 +2442,7 @@ where
     // identical response (the mail-budget denial inside
     // `send_magic_link_if_allowed` likewise sends nothing and stores no
     // magic row on the same shape).
-    if ctx.admit_auth_start(req).await.is_err() {
+    if ctx.admit_auth_start(req, &email).await.is_err() {
         return json_response(200, serde_json::json!({"ok": true}));
     }
     // Identical response whether or not the account exists or the atomic
@@ -9043,24 +9049,39 @@ mod tests {
     }
 
     #[test]
-    fn qa_bearer_mail_exemption_never_covers_routable_mailboxes() {
-        // A leaked staging token must not email-bomb real addresses: the
-        // start budget is skipped, but the per-IP mail cap still binds for
-        // any mailbox outside `example.test`.
+    fn qa_bearer_exemption_never_covers_routable_mailboxes() {
+        // A leaked staging token must not create unbounded real-address
+        // rows or email-bomb real addresses: outside `example.test` the
+        // bearer spends the ordinary per-IP start budget, so user rows,
+        // challenges and mail all stop at it.
         let h = qa_harness();
         let bearer = format!("Bearer {QA_TOKEN}");
-        let total = MAIL_PER_IP_PER_HOUR + 10;
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
         for i in 0..total {
             let resp = h.call_authorized(
                 "/v1/auth/passkey/register/start",
                 serde_json::json!({"email": format!("victim{i}@example.com")}),
                 Some(bearer.as_str()),
             );
-            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            let expected = if i < AUTH_STARTS_PER_IP_PER_HOUR {
+                200
+            } else {
+                429
+            };
+            assert_eq!(resp.status, expected, "iteration {i}: {}", resp.body);
         }
         assert_eq!(
-            h.mailer.sent.borrow().len(),
-            MAIL_PER_IP_PER_HOUR as usize,
+            h.store.users.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no routable user row past the per-IP start budget"
+        );
+        assert_eq!(
+            h.store.challenges.borrow().len(),
+            AUTH_STARTS_PER_IP_PER_HOUR as usize,
+            "no routable challenge past the per-IP start budget"
+        );
+        assert!(
+            h.mailer.sent.borrow().len() <= MAIL_PER_IP_PER_HOUR as usize,
             "routable mailboxes stay under the per-IP mail cap"
         );
     }
