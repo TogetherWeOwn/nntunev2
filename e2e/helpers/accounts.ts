@@ -233,11 +233,48 @@ export async function anonymousApiGet(
   context: string,
   opts?: { timeout?: number },
 ): Promise<WallProbe> {
+  return anonymousApiFetch('GET', url, context, opts);
+}
+
+/**
+ * Anonymous OPTIONS with the same isolation contract as anonymousApiGet
+ * (fresh context, no Access pair, no bearer, no cookies, no follow). The
+ * caller supplies only the CORS request headers (Origin and
+ * Access-Control-Request-*), never credentials: a header named like an
+ * Access or session credential is refused before any request is sent.
+ */
+export async function anonymousApiOptions(
+  url: string,
+  corsHeaders: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<WallProbe> {
+  for (const name of Object.keys(corsHeaders)) {
+    if (!/^(origin|access-control-request-(method|headers))$/i.test(name)) {
+      throw new Error(
+        `[${context}] anonymous OPTIONS accepts only CORS request headers, got: ${name}.`,
+      );
+    }
+  }
+  return anonymousApiFetch('OPTIONS', url, context, { ...opts, headers: corsHeaders });
+}
+
+async function anonymousApiFetch(
+  method: 'GET' | 'OPTIONS',
+  url: string,
+  context: string,
+  opts?: { timeout?: number; headers?: Record<string, string> },
+): Promise<WallProbe> {
   const anon = await playwrightRequest.newContext();
   try {
     let res: APIResponse;
     try {
-      res = await anon.get(url, { timeout: opts?.timeout ?? 30_000, maxRedirects: 0 });
+      res = await anon.fetch(url, {
+        method,
+        headers: opts?.headers ?? {},
+        timeout: opts?.timeout ?? 30_000,
+        maxRedirects: 0,
+      });
     } catch {
       throw new Error(
         `[${context}] anonymous request transport failed (names only — no values logged). ` +
