@@ -57,8 +57,8 @@ async function reachUntestedStep3(page: Page): Promise<HeldTestWizard> {
 	await page.getByLabel('Hostname').fill('news.example.test');
 	await page.getByLabel('Username').fill('reader');
 	await page.getByLabel('Password').fill('fixture-password');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
 	await expect(page.getByRole('heading', { name: 'Test the connection' })).toBeVisible();
 
 	return {
