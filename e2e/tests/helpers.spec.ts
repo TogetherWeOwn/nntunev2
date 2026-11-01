@@ -27,6 +27,7 @@ import {
   tryMintTestAccount,
   awaitSignupOutcome,
   recordRegisterStartStatus,
+  signupInlineErrorMessage,
 } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
@@ -1613,6 +1614,16 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
 // Signup outcome diagnostics (offline, static pages): when neither the code
 // step nor the inline error appears, the failure must name the page state
 // and the registerStart status — never a field value.
+test.describe('signupInlineErrorMessage names the registerStart status', () => {
+  test('an observed status is named', () => {
+    expect(signupInlineErrorMessage({ status: 500 })).toContain('registerStart HTTP 500');
+  });
+
+  test('a request with no response is named as not observed', () => {
+    expect(signupInlineErrorMessage({ status: null })).toContain('registerStart HTTP not observed');
+  });
+});
+
 test.describe('awaitSignupOutcome names the signup page state', () => {
   const page_ = (body: string) =>
     `<!doctype html><html><body><input data-testid="signup-email" value="SENTINEL@example.test" />${body}</body></html>`;
