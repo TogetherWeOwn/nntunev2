@@ -10,10 +10,14 @@ Actions secrets (CI) or shell exports (local).
 
 ## Activation progression
 
-1. **Pre-deploy (now):** `STAGING_BASE_URL` is unset. Every spec skips with a
-   notice. PRs and `main` stay green; the `e2e-lint` CI job still typechecks
-   and lists the specs so the harness cannot rot silently. A skipped live
-   run is not acceptance evidence: it proves nothing about staging.
+1. **Pre-deploy (now):** `STAGING_BASE_URL` is unset. The synthetic smoke
+   (schedule/dispatch) skips with a notice, and the `e2e-lint` CI job still
+   typechecks and lists the specs so the harness cannot rot silently. PRs and
+   `main` stay green only while the deploy gate keeps `staging-web` from
+   running: once `staging-web` deploys, the post-deploy full journey fails
+   closed on an unset `STAGING_BASE_URL` instead of skipping, so a skipped
+   journey can never become promotion evidence. A skipped smoke run is not
+   acceptance evidence either: it proves nothing about staging.
 2. **Activation hold:** keep the Actions secret `STAGING_BASE_URL` unset until
    deployment exists and the authorized Operator provides a value-free delivery
    receipt for the existing QA Access pair through an approved secure source and
@@ -112,7 +116,7 @@ npm-based harness (`e2e/package-lock.json`).
 
 | Name | Required | Purpose |
 |---|---|---|
-| `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → skip with notice. |
+| `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → the synthetic smoke skips with notice; the post-deploy full journey fails closed. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
 | `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
@@ -209,7 +213,10 @@ How the suite uses them:
   6-hour schedule run the synthetic smoke only (monitoring, not
   post-deploy promotion evidence); dispatch defines no `post_deploy`
   input, so it cannot mint that evidence by hand.
-  Missing `STAGING_BASE_URL` → step-level skip with notice (pre-deploy).
+  Missing `STAGING_BASE_URL` → the synthetic smoke skips with notice
+  (pre-deploy); the post-deploy full journey fails in preflight, because a
+  skipped journey after a real `staging-web` deploy would otherwise pass
+  green and be accepted as promotion evidence.
   Both jobs require the Access pair in preflight before activating tests;
   configured staging never skips for missing credentials. The full journey
   additionally runs the evidence gate
