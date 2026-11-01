@@ -9363,7 +9363,8 @@ mod tests {
             "fast-fail must count live slots, never expired ones"
         );
         // Wiring pin: production must execute this shared constant via
-        // `query_one`, not a divergent literal or no guard at all. Deleting
+        // unnamed `query_typed` (TWO-434: a named statement fails through
+        // Hyperdrive), not a divergent literal or no guard at all. Deleting
         // the Pg fast-fail block (or inlining a hand-written literal) leaves
         // the FakeStore probe test green, so this assertion observes the
         // production path directly at compile time. Comments are stripped
@@ -9375,18 +9376,15 @@ mod tests {
             code.contains("RATE_LIMIT_EXHAUSTED_SQL"),
             "Pg reserve_rate_limit must execute the shared exhausted SQL"
         );
+        let sql_pos = code
+            .find("handlers::RATE_LIMIT_EXHAUSTED_SQL")
+            .expect("Pg passes the shared exhausted SQL");
+        let call_pos = code[..sql_pos]
+            .rfind(".query_typed(")
+            .expect("Pg fast-fail runs via unnamed query_typed");
         assert!(
-            code.contains("query_one("),
-            "Pg fast-fail must run the shared SQL via query_one"
-        );
-        let query_pos = code.find("query_one(").expect("query_one call");
-        assert!(
-            code[query_pos..]
-                .chars()
-                .take(300)
-                .collect::<String>()
-                .contains("RATE_LIMIT_EXHAUSTED_SQL"),
-            "Pg query_one call must pass the shared exhausted SQL"
+            sql_pos - call_pos < 120,
+            "Pg fast-fail must run the shared SQL via unnamed query_typed"
         );
         assert!(
             !code.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),

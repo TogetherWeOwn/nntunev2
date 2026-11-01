@@ -402,6 +402,59 @@ fn mint_path_statements_run_unnamed_through_query_typed() {
 }
 
 #[test]
+fn signup_path_statements_run_unnamed_through_query_typed() {
+    // TWO-434: after the mint path went unnamed, staging `register/start`
+    // still answered 500 through Hyperdrive. Every statement the public
+    // signup, its mail issuance and the code seam run must stay unnamed
+    // too: the Store methods below plus the shared free helpers they call
+    // (the reaper, the challenge prune and the rate-limit slot claims).
+    let source = production();
+    let store = source
+        .split_once("implStoreforPgStore{")
+        .expect("Store impl")
+        .1
+        .split_once("implSingleUseStoreforPgStore{")
+        .expect("SingleUseStore impl bounds the Store impl")
+        .0;
+    let methods = [
+        "insert_challenge",
+        "challenge_by_id",
+        "credentials_for_user",
+        "insert_magic",
+        "record_qa_issued_code",
+        "qa_issued_code",
+    ]
+    .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
+    let helpers = [
+        "reap_unverified_users_on",
+        "prune_expired_challenges_on",
+        "delete_expired_rate_limit_slots",
+        "claim_rate_limit_slot",
+    ]
+    .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
+    for (name, body) in methods.iter().chain(helpers.iter()) {
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must run its statements unnamed via query_typed"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(
+                !body.contains(named),
+                "{name} must not run a named prepared statement ({named})"
+            );
+        }
+    }
+}
+
+#[test]
 fn seam_delegates_to_the_shared_helper_with_the_opaque_error() {
     let source = production();
     let pgstore = source
