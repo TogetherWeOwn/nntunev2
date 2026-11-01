@@ -1,6 +1,6 @@
 # workers/ingest — ingest pipeline (slices 1–2: contracts + Queue wiring)
 
-User-scoped ingest jobs via Queues/Workflows:
+User-scoped ingest jobs via Queues (no Workflow class yet):
 
 ```text
 Indexer search (BYO key) ─┐
@@ -12,8 +12,8 @@ NZB upload ───────────────┘                     
 
 - `GET /healthz`: unauthenticated Worker-only health check returning `{"ok":true}` with `Cache-Control: no-store`; it does not access bindings.
 - Job state machine (`src/jobs.rs`): `Queued → Searching|Parsing →
-  Probing → Verifying → (Repairing → Verifying)? → Matching → Writing →
-  Done`, `Failed` terminal. Checkpoints make redelivery/replay converge;
+  Probing → Verifying → (Repairing → Verifying)? → Matching → Transcoding →
+  Writing → Done`, `Failed` terminal. Checkpoints make redelivery/replay converge;
   idempotency keys bind user + content sha + source ref (`:`-free fields, so
   triples cannot collide). Repair rounds are budgeted (`MAX_REPAIR_ROUNDS`):
   a perpetually failing verify ends in `Failed`, never in a loop.
@@ -306,10 +306,11 @@ stub whose NZB references fixture message-ids.
   key waits out the window and retries that write once in-invocation —
   `retry::decide_checkpoint` settlement, DLQ quarantine that never acks on
   a failed send, shared-parser upload validation, and the pool-DO segment
-  probe for uploads), but the consumer/workflow entries stay commented
-  out in `wrangler.toml.example`: the search/verify/repair steps are not
-  wired yet, so enabling the consumer now would burn every valid job's
-  retry budget against an unavailable boundary and quarantine it.
+  probe for uploads), but the consumer entry stays commented out in
+  `wrangler.toml.example` until three blockers clear: the search step is
+  not wired (enabling the consumer would burn search jobs' retry budget
+  against an unavailable boundary and quarantine them), the library schema
+  is missing, and the repair re-verify loop is still open (both below).
 - Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
   `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
   scoped `ingest:write` that the `api` Worker mints for the session user,
@@ -354,8 +355,8 @@ stub whose NZB references fixture message-ids.
   whose contract is `workers/repair/README.md`; this note only records
   the guard.
 - Metering (`src/metering.rs`): one `nntune_ingest_meter` event per
-  workflow step (workers-rs 0.3 has no Analytics Engine client, so the edge
-  write goes through the dataset binding's HTTP API).
+  workflow step, written through the `INGEST_METER` binding
+  (`EdgeMeterSink`, `src/lib.rs`).
 - Probe envelope + resume mapping (`src/probe.rs`), parse shape +
   intake cross-check + probe batching (`src/parse.rs`), synthetic fixtures
   (`src/fixtures.rs`), pipeline E2E (`tests/pipeline_e2e.rs`): happy path
@@ -553,8 +554,11 @@ probe; rerun it explicitly after checking the local/staging worker.
 ## Develop
 
 ```sh
-cargo test -p nntune-ingest
+python3 scripts/cargo_cache.py run -- test --manifest-path workers/ingest/Cargo.toml
 ```
+
+Exit 75 means the pool refused the run: retry later. Checkouts with no pool
+follow the root [README](../../README.md#test).
 
 Pure modules carry inline unit tests; handlers stay thin so the contract
 is reviewed, not mocked.

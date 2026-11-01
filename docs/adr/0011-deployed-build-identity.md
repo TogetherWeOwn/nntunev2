@@ -1,7 +1,6 @@
 # ADR 0011: Deployed-build identity separation
 
-- **Status:** Accepted design; implementation
-  and independent review gates remain.
+- **Status:** Accepted; implemented (`apps/web/src/routes/api/build/+server.ts`).
 - **Date:** 2026-10-17
 - **Roadmap:** M1 exit traceability row 7 (deployed-build identity gap).
 
@@ -98,6 +97,3 @@ why not in `/api/health`?
   needs a new ADR.
 - Rollback trust assumptions are out of scope here; they are owned by
   a separate card.
-- Until the build-identity surface lands, this ADR is the
-  contract its implementation PR is reviewed against; the reviewer checks
-  the diff for accuracy against that surface.

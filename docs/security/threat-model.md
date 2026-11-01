@@ -135,7 +135,9 @@ Verified against main post-merge (required checks report on
   flag stops suppression, it does not turn allows into failures — an
   allow comment on a real leak still reports the leak). ✅
 - All workflows declare least-privilege `permissions:` (`contents: read`,
-  plus `pull-requests: read` where the title must be read). ✅
+  plus `pull-requests: read` where the title must be read); the only write
+  scopes are `security-events` (codeql), `deployments` (`preview-web` in
+  deploy) and `issues`/`pull-requests` (pr-size labels). ✅
 - No `pull_request_target` anywhere (privilege-escalation vector banned). ✅
 - `actions/checkout` (and all other actions) pinned by SHA. ✅
 - `.gitignore` covers `.env*` (with `!.env.example` kept), `.dev.vars`,
@@ -440,9 +442,11 @@ security finding requiring a CISO disposition before merge):
 
 ## 13. Future Worker deploy-lane rollback: trust assumptions (docs-only)
 
-**Status: no Worker deploy lane exists.** `.github/workflows/deploy.yml`
-deploys `apps/web` only; no tracked workflow deploys the backend Workers
-under `workers/`. This section records trust assumptions only. It grants
+**Status: staging-only backend Worker lanes exist; production deploys `apps/web` only.**
+`.github/workflows/deploy.yml` deploys `apps/web` and, through `staging-api`,
+the api Worker to staging; `.github/workflows/deploy-alerts-staging.yml`
+deploys the `workers/observability` alerts consumer to staging. No tracked
+workflow deploys the other Workers under `workers/`. This section records trust assumptions only. It grants
 no deployment authorization, creates no lane, and changes neither the
 decided stack (§1) nor the standing review gate (§8).
 
