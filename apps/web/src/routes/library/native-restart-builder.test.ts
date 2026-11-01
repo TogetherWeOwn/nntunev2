@@ -4,6 +4,7 @@ import { addTrack, createQueue, currentTrack, selectTrack } from '#lib/player/qu
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -18,7 +19,7 @@ function restartFixture() {
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
 		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
-		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus'
+		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative'
 	]);
 	const handlers = parsed.statements.filter((node) =>
 		ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text)
@@ -45,7 +46,8 @@ function restartFixture() {
 	};
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget,
+		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
+		streamUrl: track.streamUrl,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `
@@ -55,19 +57,22 @@ function restartFixture() {
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
 		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '';
+		let jumpStatus = '', jumpStatusVersion = 0;
 		const restartSupersededSources = new Set();
 		let playEpoch = 0;
 		${compiled}
 		return {
-			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek,
+			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
+			sourceChange: resetRestartOnSourceChange,
 			refresh: () => refreshRestartAvailability({ currentTarget: element }),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue })
+			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek, queue, jumpStatus })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
 		applyShareLink: () => void;
 		applyPendingShareSeek: () => void;
+		jump: (direction: 'back' | 'forward') => void;
+		sourceChange: (before: unknown, after: unknown) => void;
 		refresh: () => void;
 		read: () => {
 			restartCanSeek: boolean;
@@ -75,6 +80,7 @@ function restartFixture() {
 			restartStatusVersion: number;
 			pendingShareSeek: unknown;
 			queue: ReturnType<typeof createQueue>;
+			jumpStatus: string;
 		};
 	};
 	page.refresh();
@@ -92,6 +98,37 @@ test('a new same-source share navigation supersedes an earlier restart marker', 
 	expect(media.position).toBe(42);
 	expect(page.read().pendingShareSeek).toBeNull();
 	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral']);
+});
+
+test('a jump readout clears on a same-source share and on a source change', async () => {
+	const { page, media, location, track } = restartFixture();
+	page.jump('forward');
+	expect(media.position).toBe(40);
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	location.search = '?track=coral&t=90';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(media.position).toBe(90);
+	expect(page.read().jumpStatus).toBe('');
+	page.jump('back');
+	page.sourceChange(track, { id: 'pine', streamUrl: '/test-audio/pine' });
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a refused jump still supersedes a pending share seek for the source', () => {
+	const { page, media, location } = restartFixture();
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	media.duration = 120;
+	media.refuse = true;
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('The player did not accept that jump.');
+	expect(page.read().pendingShareSeek).toBeNull();
+	media.refuse = false;
+	page.applyPendingShareSeek();
+	expect(media.position).toBe(30);
 });
 
 for (const invalid of ['range', 'duration', 'position'] as const) {
