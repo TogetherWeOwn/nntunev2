@@ -6,8 +6,10 @@ import { expect, test } from '@playwright/test';
 //   short_name, start_url, display: standalone, theme_color, and reachable
 //   192px + 512px icons.
 // - App head links the manifest and sets a matching theme-color meta.
-// - Manifest description, home meta description, and the landing paragraph
-//   disclose all four unwired capabilities and point to signup or BYOP setup.
+// - Manifest description, home meta description, and the visible landing summary
+//   describe today's demo, reject library/real-provider/offline promises,
+//   and point to signup or BYOP setup. The full per-capability home contract is
+//   protected separately in home-truthful-today.spec.ts.
 // Theme color #0b0d12 matches --nt-bg (dark default) in
 // src/lib/design/tokens.css. Name "NNTune" matches the landing heading.
 
@@ -19,11 +21,25 @@ const EXPECTED_MANIFEST = {
 	theme_color: '#0b0d12'
 } as const;
 
-const UNWIRED_CAPABILITIES = [
+const HONEST_TODAY =
+	'Try the demo player and its queue without an account. Your account library, favorites and a library-backed queue are not available yet. ' +
+	'Live search-to-stream over a real provider is not available. Streaming from a real provider is not available. ' +
+	'Offline caching of audio is not available. Browser snapshots store metadata only. ' +
+	'Bring your own Usenet provider account; access is never bundled or resold. Sign up to connect a provider.';
+
+const UNAVAILABLE =
+	/\b(?:not (?:yet )?(?:available|supported|working|wired|ready|implemented)|not wired(?: up)? yet|unavailable|unsupported|does not|doesn't|cannot|can't|no live|no offline)\b/i;
+// The demo queue lives in this tab's sessionStorage: it does not sync, follow
+// you to another device or browser, or persist beyond the session.
+const DEMO_QUEUE_OVERREACH =
+	/\b(?:sync\w*|(?:across|other|another|every|any|all)\s+(?:of\s+)?(?:your\s+)?(?:devices?|browsers?)|cloud|follows?\s+you|back(?:ed)?[- ]?up\w*|permanent\w*|forever|server\w*|offline)\b/i;
+const PROVIDER_SCOPE = /\b(?:real|live|Usenet|providers?)\b|\bsearch[- ]to[- ]stream\b/i;
+const UNAVAILABLE_CAPABILITIES = [
+	['library', /\blibrar\w*\b/i],
+	['queue', /\bqueue\w*\b/i],
 	['search', /\bsearch\w*\b/i],
 	['streaming', /\bstream\w*\b/i],
-	['library management', /\blibrar\w*\b/i],
-	['offline caching', /\boffline(?:[- ]friendly)? cach\w*\b/i]
+	['offline caching', /\boffline(?:[- ]friendly)? (?:audio )?cach\w*\b|\boffline (?:audio|music)\b|\b(?:listen|play|enjoy|take your music)\s+(?:anywhere|offline)\b/i]
 ] as const;
 
 function expectHonestPublicCopy(copy: unknown, surface: string): void {
@@ -31,15 +47,25 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	const text = (copy as string).replace(/\s+/g, ' ').trim();
 	const sentences = text.split(/[.!?;]+/).filter((sentence) => sentence.trim());
 
-	// Every capability mention needs its own sentence-local disclosure. A
-	// disclaimer elsewhere must not hide an old affirmative product claim.
-	for (const [capability, pattern] of UNWIRED_CAPABILITIES) {
-		const mentions = sentences.filter((sentence) => pattern.test(sentence));
-		expect(mentions.length, `${surface} should disclose ${capability}`).toBeGreaterThan(0);
-		for (const sentence of mentions) {
-			expect(sentence, `${surface}: ${capability} must be explicitly not wired yet`).toMatch(
-				/\bnot (?:yet wired(?: up)?|wired(?: up)? yet)\b/i
-			);
+	// Summaries may be brief; the full home bank pins each capability's detail.
+	// The demo needs no unwired disclaimer.
+	expect(
+		sentences.some((sentence) => /\bdemo\b/i.test(sentence) && !UNAVAILABLE.test(sentence)),
+		`${surface} should describe an available labelled demo`
+	).toBe(true);
+
+	// Keep disclosures sentence-local: honest copy elsewhere must not excuse an
+	// affirmative library, real-provider or offline-audio promise. Explicit demo
+	// streaming is not a real-provider chain, but the label cannot excuse one.
+	// The web app has no /api/library route yet, so no library claim is exempt.
+	// The demo player's own queue works; only a library-backed queue is unwired.
+	// The demo queue is session-local, so a demo sync or cross-device claim is not exempt.
+	for (const [capability, pattern] of UNAVAILABLE_CAPABILITIES) {
+		for (const sentence of sentences.filter((sentence) => pattern.test(sentence))) {
+			const demo = /\bdemo\b/i.test(sentence);
+			if (capability === 'queue' && demo && !/\blibrar\w*\b/i.test(sentence) && !DEMO_QUEUE_OVERREACH.test(sentence)) continue;
+			if ((capability === 'search' || capability === 'streaming') && demo && !PROVIDER_SCOPE.test(sentence)) continue;
+			expect(sentence, `${surface}: ${capability} must be explicitly unavailable`).toMatch(UNAVAILABLE);
 		}
 	}
 
@@ -48,17 +74,82 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	);
 }
 
-test('rejects the old streams headline prepended to otherwise honest copy', async () => {
-	// Survivor regression: /\bstreaming\b/i missed the exact old
-	// affirmative headline below, so the mutant was accepted. The
-	// streaming pattern must catch every stream verb form (streams,
-	// streaming, streamed) while honest copy still passes.
-	const honest =
-		'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
-	const mutant = `NNTune streams your music on Cloudflare. ${honest}`;
+test('accepts the truthful demo summary without a blanket disclaimer', async () => {
+	expect(() => expectHonestPublicCopy(HONEST_TODAY, 'demo control')).not.toThrow();
+});
 
-	expect(() => expectHonestPublicCopy(honest, 'regression control')).not.toThrow();
-	expect(() => expectHonestPublicCopy(mutant, 'regression mutant')).toThrow();
+test('accepts an unwired library beside an unwired provider chain', async () => {
+	expect(() =>
+		expectHonestPublicCopy(HONEST_TODAY.replaceAll('not available', 'not wired yet'), 'library control')
+	).not.toThrow();
+});
+
+test('accepts a concise demo summary without listing every unavailable feature', async () => {
+	expect(() =>
+		expectHonestPublicCopy('Try the demo player. Sign up and bring your own provider.', 'concise summary control')
+	).not.toThrow();
+});
+
+for (const claim of [
+	'NNTune manages your library locally in your browser.',
+	'NNTune manages your libraries locally in your browser.',
+	'Try the demo player and browser library.',
+	'Search your local library in your browser.'
+]) {
+	test(`rejects an affirmative library claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'library mutant')).toThrow(
+			'library must be explicitly unavailable'
+		);
+	});
+}
+
+for (const claim of [
+	'Your queue follows you across devices.',
+	'Queue tracks from your library.',
+	'Try the demo player and your library queue.'
+]) {
+	test(`rejects an affirmative non-demo queue claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'queue mutant')).toThrow(
+			/(?:queue|library) must be explicitly unavailable/
+		);
+	});
+}
+
+test('accepts the working demo queue', async () => {
+	expect(() => expectHonestPublicCopy(
+		`The demo player has a working queue you can reorder. ${HONEST_TODAY}`,
+		'demo queue control'
+	)).not.toThrow();
+});
+
+for (const claim of [
+	'The demo queue follows you across devices.',
+	'The demo queue syncs to your other browsers.',
+	'The demo player saves its queue to the cloud.',
+	'The demo queue is backed up permanently.'
+]) {
+	test(`rejects an unsupported demo queue claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'demo queue mutant')).toThrow(
+			'queue must be explicitly unavailable'
+		);
+	});
+}
+
+test('accepts demo streaming', async () => {
+	expect(() => expectHonestPublicCopy(
+		`The demo player streams sample tracks. ${HONEST_TODAY}`,
+		'demo streaming control'
+	)).not.toThrow();
+});
+
+test('rejects the old streams headline prepended to otherwise honest copy', async () => {
+	// Survivor regression: /\bstreaming\b/i missed the exact old headline.
+	const mutant = `NNTune streams your music on Cloudflare. ${HONEST_TODAY}`;
+
+	expect(() => expectHonestPublicCopy(HONEST_TODAY, 'regression control')).not.toThrow();
+	expect(() => expectHonestPublicCopy(mutant, 'regression mutant')).toThrow(
+		'streaming must be explicitly unavailable'
+	);
 });
 
 // Exercise the real helper, not the regexes in isolation: an honest
@@ -68,8 +159,6 @@ for (const [capability, wording, claim] of [
 	['search', 'searching', 'NNTune is searching Usenet for your music.'],
 	['search', 'searches', 'NNTune searches Usenet for your music.'],
 	['search', 'searched', 'NNTune searched Usenet for your music.'],
-	['library management', 'library', 'NNTune manages your library for you.'],
-	['library management', 'libraries', 'NNTune manages your libraries for you.'],
 	['offline caching', 'offline cache', 'Your offline cache is ready anywhere.'],
 	['offline caching', 'offline caches', 'Your offline caches are ready anywhere.'],
 	['offline caching', 'offline cached', 'Your music is offline cached for travel.'],
@@ -78,16 +167,27 @@ for (const [capability, wording, claim] of [
 	['offline caching', 'offline friendly cached', 'Your music is offline friendly cached for travel.']
 ] as const) {
 	test(`rejects affirmative ${wording} beside otherwise honest copy`, async () => {
-		const honest =
-			'NNTune: search, streaming, library management and offline caching are not wired yet. Sign up and bring your own Usenet provider account.';
-
-		expect(() => expectHonestPublicCopy(honest, 'sibling control')).not.toThrow();
-		expect(() => expectHonestPublicCopy(`${claim} ${honest}`, 'sibling mutant')).toThrow(
-			`${capability} must be explicitly not wired yet`
+		expect(() => expectHonestPublicCopy(HONEST_TODAY, 'sibling control')).not.toThrow();
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'sibling mutant')).toThrow(
+			`${capability} must be explicitly unavailable`
 		);
-		expect(() =>
-			expectHonestPublicCopy(honest.replace(capability, wording), 'sibling disclosure control')
-		).not.toThrow();
+		expect(() => expectHonestPublicCopy(
+			HONEST_TODAY.replace(new RegExp(capability, 'i'), wording),
+			'sibling disclosure control'
+		)).not.toThrow();
+	});
+}
+
+for (const [capability, claim] of [
+	['search', 'NNTune searches Usenet locally in your browser.'],
+	['streaming', 'The demo player streams music from your real provider.'],
+	['offline caching', 'Offline audio caching is ready now.'],
+	['offline caching', 'Listen offline now.']
+] as const) {
+	test(`rejects a misleading capability claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'capability mutant')).toThrow(
+			`${capability} must be explicitly unavailable`
+		);
 	});
 }
 
@@ -171,7 +271,7 @@ test('/manifest.webmanifest serves a valid PWA manifest with reachable icons', a
 	}
 });
 
-test('manifest description discloses unwired capabilities and points to setup', async ({ request }) => {
+test('manifest description describes demo availability and points to setup', async ({ request }) => {
 	const response = await request.get('/manifest.webmanifest');
 	expect(response.ok()).toBe(true);
 	const manifest = (await response.json()) as Record<string, unknown>;
@@ -179,7 +279,7 @@ test('manifest description discloses unwired capabilities and points to setup', 
 	expectHonestPublicCopy(manifest.description, 'manifest description');
 });
 
-test('home meta description discloses unwired capabilities and points to setup', async ({ page }) => {
+test('home meta description describes demo availability and points to setup', async ({ page }) => {
 	await page.goto('/');
 	const description = page.locator('meta[name="description"]');
 	await expect(description).toHaveCount(1);
@@ -187,12 +287,14 @@ test('home meta description discloses unwired capabilities and points to setup',
 	expectHonestPublicCopy(await description.getAttribute('content'), 'home meta description');
 });
 
-test('home landing paragraph discloses unwired capabilities and points to setup', async ({ page }) => {
+test('home landing summary describes demo availability and points to setup', async ({ page }) => {
 	await page.goto('/');
-	const paragraph = page.getByRole('main').locator('p').first();
+	const summary = await page.locator('meta[name="description"]').getAttribute('content');
+	expectHonestPublicCopy(summary, 'home summary');
+	const paragraph = page.getByRole('main').locator('p').filter({ hasText: summary! }).first();
 	await expect(paragraph).toBeVisible();
 
-	expectHonestPublicCopy(await paragraph.innerText(), 'home landing paragraph');
+	expectHonestPublicCopy(await paragraph.innerText(), 'home landing summary');
 });
 
 test('app head links the manifest and sets the matching theme-color', async ({ page }) => {

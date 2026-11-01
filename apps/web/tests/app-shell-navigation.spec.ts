@@ -916,7 +916,15 @@ test('[NAV-16] PWA head, landing honesty and login stay intact across navigation
 		'expected the manifest link on /. Builder: keep the root-layout head entries.'
 	).toHaveAttribute('href', '/manifest.webmanifest');
 	await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute('content', '#0b0d12');
-	await expect(page.getByRole('main').locator('p').first()).toContainText(/not wired yet/i);
+	// The shared truthful summary need not be the first paragraph; BYOP steps
+	// may precede it. Navigation must preserve today's local/demo availability.
+	const summary = await page.locator('meta[name="description"]').getAttribute('content');
+	expect(summary).toMatch(/\bdemo\b/i);
+	expect(summary).toMatch(/\blibrary\b/i);
+	expect(summary).toMatch(/\blocal(?:ly)?\b|\bbrowser\b/i);
+	await expect(
+		page.getByRole('main').locator('p').filter({ hasText: summary! }).first()
+	).toBeVisible();
 	await expectCurrent(page, '/', null);
 
 	await libraryLink(page).click();
