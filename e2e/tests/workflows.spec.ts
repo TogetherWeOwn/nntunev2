@@ -55,12 +55,24 @@ for (const [index, preflight] of preflights.entries()) {
       expect(preflight[1]).toContain('CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}');
     });
 
-    test('unconfigured staging skips offline', () => {
-      const result = runShell(script);
-      expect(result.status).toBe(0);
-      expect(result.output).toContain('configured=false');
-      expect(result.output).not.toContain('configured=true');
-    });
+    if (index === 0) {
+      test('unconfigured staging skips offline', () => {
+        const result = runShell(script);
+        expect(result.status).toBe(0);
+        expect(result.output).toContain('configured=false');
+        expect(result.output).not.toContain('configured=true');
+      });
+    } else {
+      // The journey runs only on the post-deploy call, whose green result
+      // staging-evidence accepts for promotion: a missing URL must fail, not
+      // skip every step and pass.
+      test('unconfigured staging fails closed instead of skipping', () => {
+        const result = runShell(script, dummyPair);
+        expect(result.status).not.toBe(0);
+        expect(result.output).toContain('STAGING_BASE_URL');
+        expect(result.output).not.toContain('configured=');
+      });
+    }
 
     for (const [name, pair] of [
       ['both missing', {}],
