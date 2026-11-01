@@ -437,9 +437,9 @@ async fn delete_expired_rate_limit_slots(
     now: i64,
 ) -> Result<(), StoreError> {
     client
-        .execute(
+        .query_typed(
             "DELETE FROM auth_rate_limit_slots WHERE expires_at <= $1",
-            &[&now],
+            &[(&now, Type::INT8)],
         )
         .await
         .map_err(|_| StoreError)?;
@@ -465,20 +465,27 @@ async fn claim_rate_limit_slot(
     // still claims atomically, so a concurrent race that passes this
     // snapshot simply fails closed there.
     let exhausted = client
-        .query_one(
+        .query_typed(
             handlers::RATE_LIMIT_EXHAUSTED_SQL,
-            &[&budget.scope_key, &budget.action, &now_i],
+            &[
+                (&budget.scope_key, Type::TEXT),
+                (&budget.action, Type::TEXT),
+                (&now_i, Type::INT8),
+            ],
         )
         .await
         .map_err(|_| StoreError)?
-        .get::<_, i64>(0);
+        .first()
+        .ok_or(StoreError)?
+        .try_get::<_, i64>(0)
+        .map_err(|_| StoreError)?;
     if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
         return Ok(None);
     }
     for slot in 0..budget.limit {
         let slot = i32::try_from(slot).map_err(|_| StoreError)?;
         let rows = client
-            .query(
+            .query_typed(
                 "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
                  VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (scope_key, action, slot) DO UPDATE \
@@ -486,11 +493,11 @@ async fn claim_rate_limit_slot(
                  WHERE auth_rate_limit_slots.expires_at <= $5 \
                  RETURNING slot",
                 &[
-                    &budget.scope_key,
-                    &budget.action,
-                    &slot,
-                    &expires_at,
-                    &now_i,
+                    (&budget.scope_key, Type::TEXT),
+                    (&budget.action, Type::TEXT),
+                    (&slot, Type::INT4),
+                    (&expires_at, Type::INT8),
+                    (&now_i, Type::INT8),
                 ],
             )
             .await
@@ -757,30 +764,37 @@ async fn claim_single_use_on(
     candidate: SingleUseClaim<'_>,
 ) -> Result<u64, StoreError> {
     let statement = candidate.statement();
-    type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
+    // Unnamed via `query_typed` (TWO-434): registration finish runs these
+    // claims through Hyperdrive, where a named `sN` statement can fail.
+    type Param<'a> = (&'a (dyn tokio_postgres::types::ToSql + Sync), Type);
     let rows = match &candidate {
         SingleUseClaim::MagicLink { record, now } => {
             let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
             let now = i64_of(*now).map_err(|_| StoreError)?;
             let params: [Param<'_>; 5] = [
-                &record.token_hash,
-                &record.user_id,
-                &record.email,
-                &expires,
-                &now,
+                (&record.token_hash, Type::TEXT),
+                (&record.user_id, Type::TEXT),
+                (&record.email, Type::TEXT),
+                (&expires, Type::INT8),
+                (&now, Type::INT8),
             ];
-            client.query(statement, &params[..]).await
+            client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Challenge { record, now } => {
             let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
             let now = i64_of(*now).map_err(|_| StoreError)?;
-            let params: [Param<'_>; 5] =
-                [&record.id, &record.rp_id, &record.origin, &expires, &now];
-            client.query(statement, &params[..]).await
+            let params: [Param<'_>; 5] = [
+                (&record.id, Type::TEXT),
+                (&record.rp_id, Type::TEXT),
+                (&record.origin, Type::TEXT),
+                (&expires, Type::INT8),
+                (&now, Type::INT8),
+            ];
+            client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Invite { record } => {
-            let params: [Param<'_>; 1] = [&record.code_hash];
-            client.query(statement, &params[..]).await
+            let params: [Param<'_>; 1] = [(&record.code_hash, Type::TEXT)];
+            client.query_typed(statement, &params[..]).await
         }
     }
     .map_err(|_| StoreError)?;
@@ -791,15 +805,15 @@ async fn insert_credential_on(
     client: &impl GenericClient,
     credential: &PasskeyCredential,
 ) -> Result<(), StoreError> {
-    client.execute(
+    client.query_typed(
         "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) \
          VALUES ($1, $2, $3, $4, $5)",
         &[
-            &credential.cred_id_b64url,
-            &credential.user_id,
-            &credential.public_key.as_slice(),
-            &i64::from(credential.sign_count),
-            &i64_of(credential.registered_at)?,
+            (&credential.cred_id_b64url, Type::TEXT),
+            (&credential.user_id, Type::TEXT),
+            (&credential.public_key.as_slice(), Type::BYTEA),
+            (&i64::from(credential.sign_count), Type::INT8),
+            (&i64_of(credential.registered_at)?, Type::INT8),
         ],
     ).await.map_err(|_| StoreError)?;
     Ok(())
@@ -816,14 +830,17 @@ async fn complete_registration_on(
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     // Reaping locks parents before cascading to proofs. Take the compatible
     // enrollment lock first, so a reaper skips us even after our proofs expire.
-    transaction
-        .query_opt(
+    let parent = transaction
+        .query_typed(
             "SELECT id FROM users WHERE id = $1 FOR KEY SHARE",
-            &[&credential.user_id],
+            &[(&credential.user_id, Type::TEXT)],
         )
         .await
-        .map_err(|_| StoreError)?
-        .ok_or(StoreError)?;
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: exactly one parent row, else the claim fails.
+    if parent.len() != 1 {
+        return Err(StoreError);
+    }
     let mut claims = vec![
         SingleUseClaim::Challenge {
             record: challenge,
@@ -859,10 +876,17 @@ async fn reap_unverified_users_on(
         .start()
         .await
         .map_err(|_| StoreError)?;
+    // Signup-path statements run unnamed via `query_typed` (TWO-434, same
+    // Hyperdrive reason as the mint path): no `sN` prepared statement can
+    // collide on, or go missing from, a pooled backend between round-trips.
     let candidates = transaction
-        .query(
+        .query_typed(
             &handlers::lock_unverified_users_sql(),
-            &[&cutoff, &protected_user_id, &now],
+            &[
+                (&cutoff, Type::INT8),
+                (&protected_user_id, Type::TEXT),
+                (&now, Type::INT8),
+            ],
         )
         .await
         .map_err(|_| StoreError)?;
@@ -877,9 +901,14 @@ async fn reap_unverified_users_on(
         // lock. A second READ COMMITTED statement sees that credential before
         // deleting; holding the parent locks prevents a new enrollment racing it.
         transaction
-            .execute(
+            .query_typed(
                 &handlers::reap_unverified_users_sql(),
-                &[&cutoff, &protected_user_id, &now, &ids],
+                &[
+                    (&cutoff, Type::INT8),
+                    (&protected_user_id, Type::TEXT),
+                    (&now, Type::INT8),
+                    (&ids, Type::TEXT_ARRAY),
+                ],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -894,11 +923,11 @@ async fn prune_expired_challenges_on(
     // Enrollment may hold a challenge while waiting on a later claim. Do not
     // stall unrelated auth starts once it expires; a later prune retries it.
     client
-        .execute(
+        .query_typed(
             "DELETE FROM auth_challenges WHERE id IN (\
              SELECT id FROM auth_challenges WHERE expires_at <= $1 \
              FOR UPDATE SKIP LOCKED)",
-            &[&i64_of(now)?],
+            &[(&i64_of(now)?, Type::INT8)],
         )
         .await
         .map_err(|_| StoreError)?;
@@ -963,16 +992,16 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "INSERT INTO auth_challenges (id, user_id, rp_id, origin, expires_at, consumed, purpose) \
                  VALUES ($1, $2, $3, $4, $5, FALSE, $6)",
                 &[
-                    &challenge.id,
-                    &user_id,
-                    &challenge.rp_id,
-                    &challenge.origin,
-                    &i64_of(challenge.expires_at)?,
-                    &purpose,
+                    (&challenge.id, Type::TEXT),
+                    (&user_id, Type::TEXT),
+                    (&challenge.rp_id, Type::TEXT),
+                    (&challenge.origin, Type::TEXT),
+                    (&i64_of(challenge.expires_at)?, Type::INT8),
+                    (&purpose, Type::TEXT),
                 ],
             )
             .await
@@ -985,33 +1014,38 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT id, user_id, rp_id, origin, expires_at, consumed, purpose \
                  FROM auth_challenges WHERE id = $1",
-                        &[&id],
+                        &[(&id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
-                    let expires_at = u64_of(expires_at)?;
-                    Ok(ChallengeRow {
-                        challenge: PasskeyChallenge {
-                            id: r.try_get("id").map_err(|_| StoreError)?,
-                            rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
-                            origin: r.try_get("origin").map_err(|_| StoreError)?,
-                            // The schema stores expiry only; nothing downstream
-                            // authorizes on issue time.
-                            issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
-                            expires_at,
-                            consumed: r.try_get("consumed").map_err(|_| StoreError)?,
-                        },
-                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                        purpose: r.try_get("purpose").map_err(|_| StoreError)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        let expires_at: i64 = r.try_get("expires_at").map_err(|_| StoreError)?;
+                        let expires_at = u64_of(expires_at)?;
+                        Ok(ChallengeRow {
+                            challenge: PasskeyChallenge {
+                                id: r.try_get("id").map_err(|_| StoreError)?,
+                                rp_id: r.try_get("rp_id").map_err(|_| StoreError)?,
+                                origin: r.try_get("origin").map_err(|_| StoreError)?,
+                                // The schema stores expiry only; nothing downstream
+                                // authorizes on issue time.
+                                issued_at: expires_at.saturating_sub(auth::CHALLENGE_TTL_SECS),
+                                expires_at,
+                                consumed: r.try_get("consumed").map_err(|_| StoreError)?,
+                            },
+                            user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                            purpose: r.try_get("purpose").map_err(|_| StoreError)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1080,7 +1114,7 @@ impl Store for PgStore {
                     "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE user_id = $1"
                 );
                 let rows = client
-                    .query(&sql, &[&user_id])
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 rows.iter().map(credential_from_row).collect()
@@ -1119,18 +1153,18 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "WITH pruned AS (DELETE FROM magic_link_tokens WHERE user_id = $2 AND expires_at <= $4 \
                  AND token_hash IN (SELECT token_hash FROM magic_link_tokens \
                  WHERE user_id = $2 AND expires_at <= $4 FOR UPDATE SKIP LOCKED)) \
                  INSERT INTO magic_link_tokens (token_hash, user_id, email, issued_at, expires_at, used) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
-                    &record.token_hash,
-                    &record.user_id,
-                    &record.email,
-                    &i64_of(record.issued_at)?,
-                    &i64_of(record.expires_at)?,
+                    (&record.token_hash, Type::TEXT),
+                    (&record.user_id, Type::TEXT),
+                    (&record.email, Type::TEXT),
+                    (&i64_of(record.issued_at)?, Type::INT8),
+                    (&i64_of(record.expires_at)?, Type::INT8),
                 ],
             )
             .await
@@ -1143,25 +1177,30 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT token_hash, user_id, email, issued_at, expires_at, used \
                  FROM magic_link_tokens WHERE token_hash = $1",
-                        &[&token_hash],
+                        &[(&token_hash, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    Ok(MagicLinkRecord {
-                        token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
-                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                        email: r.try_get("email").map_err(|_| StoreError)?,
-                        issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
-                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                        used: r.try_get("used").map_err(|_| StoreError)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        Ok(MagicLinkRecord {
+                            token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
+                            user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                            email: r.try_get("email").map_err(|_| StoreError)?,
+                            issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                            expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
+                            used: r.try_get("used").map_err(|_| StoreError)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1180,10 +1219,14 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "INSERT INTO qa_issued_codes (email, token, issued_at) VALUES ($1, $2, $3) \
                  ON CONFLICT (email) DO UPDATE SET token = EXCLUDED.token, issued_at = EXCLUDED.issued_at",
-                &[&email, &token, &i64_of(now)?],
+                &[
+                    (&email, Type::TEXT),
+                    (&token, Type::TEXT),
+                    (&i64_of(now)?, Type::INT8),
+                ],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -1195,20 +1238,25 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT token, issued_at FROM qa_issued_codes WHERE email = $1",
-                        &[&email],
+                        &[(&email, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    Ok(QaIssuedCode {
-                        token: r.try_get("token").map_err(|_| StoreError)?,
-                        issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        Ok(QaIssuedCode {
+                            token: r.try_get("token").map_err(|_| StoreError)?,
+                            issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1219,21 +1267,26 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
-                        &[&code_hash],
+                        &[(&code_hash, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    Ok(InviteRecord {
-                        code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
-                        used: r.try_get("used").map_err(|_| StoreError)?,
-                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        Ok(InviteRecord {
+                            code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
+                            used: r.try_get("used").map_err(|_| StoreError)?,
+                            created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1949,14 +2002,14 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "INSERT INTO audit_log (user_id, action, ok, source_ip, at) VALUES ($1, $2, $3, $4, $5)",
                 &[
-                    &event.user_id,
-                    &event.action,
-                    &event.ok,
-                    &event.source_ip,
-                    &i64_of(event.at)?,
+                    (&event.user_id, Type::TEXT),
+                    (&event.action, Type::TEXT),
+                    (&event.ok, Type::BOOL),
+                    (&event.source_ip, Type::TEXT),
+                    (&i64_of(event.at)?, Type::INT8),
                 ],
             )
             .await
