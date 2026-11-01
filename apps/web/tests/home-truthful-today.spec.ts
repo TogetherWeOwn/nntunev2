@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 // Protected acceptance bank: the Builder builds on this branch and never edits
-// this file. The public home describes today's demo/local capabilities, not a
+// this file. The public home describes today's demo capabilities, not a
 // working provider search-to-stream chain. No provider credentials are used.
 
 const STALE_BLANKET =
@@ -27,17 +27,16 @@ for (const [capability, pattern] of [
 	});
 }
 
-test('home today: library, favorites and queue are available locally in the browser', async ({ page }) => {
+test('home today: library, favorites and queue are disclosed as not available yet', async ({ page }) => {
+	// The web app has no /api/library route yet, so /library cannot list
+	// anything; the home must not claim a working library, favorites or queue.
 	await page.goto('/');
 	const blocks = (await page.getByRole('main').locator('p, li').allInnerTexts())
 		.map(normalize).flatMap((text) => text.split(/[.!?;]+/));
 	for (const capability of [/\blibrary\b/i, /\bfavou?rites\b/i, /\bqueue\b/i]) {
 		const mentions = blocks.filter((text) => capability.test(text));
-		expect(mentions.length, `${capability}: missing local capability disclosure`).toBeGreaterThan(0);
-		expect(
-			mentions.some((text) => /\b(?:local(?:ly)?|in (?:your|the) browser)\b/i.test(text) && !UNAVAILABLE.test(text)),
-			`${capability}: describe available local management, not the old blanket disclaimer`
-		).toBe(true);
+		expect(mentions.length, `${capability}: missing availability disclosure`).toBeGreaterThan(0);
+		for (const text of mentions) expect(text, `${capability}: must be explicitly unavailable`).toMatch(UNAVAILABLE);
 	}
 });
 
@@ -77,8 +76,9 @@ test('home today: visible summary, meta and install manifest tell the same truth
 	const summary = normalize((await meta.getAttribute('content')) ?? '');
 	expect(summary.length).toBeGreaterThan(0);
 	expect(summary).toMatch(/\bdemo\b/i);
-	expect(summary).toMatch(/\blibrary\b/i);
-	expect(summary).toMatch(/\blocal(?:ly)?\b|\bbrowser\b/i);
+	const library = summary.split(/[.!?;]+/).filter((text) => /\blibrary\b/i.test(text));
+	expect(library.length).toBeGreaterThan(0);
+	for (const text of library) expect(text).toMatch(UNAVAILABLE);
 	expect(summary).not.toMatch(STALE_BLANKET);
 
 	const response = await request.get('/manifest.webmanifest');

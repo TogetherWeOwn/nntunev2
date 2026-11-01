@@ -7,7 +7,7 @@ import { expect, test } from '@playwright/test';
 //   192px + 512px icons.
 // - App head links the manifest and sets a matching theme-color meta.
 // - Manifest description, home meta description, and the visible landing summary
-//   describe today's local library/demo, reject real-provider/offline promises,
+//   describe today's demo, reject library/real-provider/offline promises,
 //   and point to signup or BYOP setup. The full per-capability home contract is
 //   protected separately in home-truthful-today.spec.ts.
 // Theme color #0b0d12 matches --nt-bg (dark default) in
@@ -22,16 +22,16 @@ const EXPECTED_MANIFEST = {
 } as const;
 
 const HONEST_TODAY =
-	'Try the demo player without an account and manage your library, favorites and queue locally in your browser. ' +
+	'Try the demo player without an account. Your library, favorites and queue are not available yet. ' +
 	'Live search-to-stream over a real provider is not available. Streaming from a real provider is not available. ' +
 	'Offline caching of audio is not available. Browser snapshots store metadata only. ' +
 	'Bring your own Usenet provider account; access is never bundled or resold. Sign up to connect a provider.';
 
 const UNAVAILABLE =
 	/\b(?:not (?:yet )?(?:available|supported|working|wired|ready|implemented)|not wired(?: up)? yet|unavailable|unsupported|does not|doesn't|cannot|can't|no live|no offline)\b/i;
-const LOCAL = /\blocal(?:ly)?\b|\bbrowser\b/i;
 const PROVIDER_SCOPE = /\b(?:real|live|Usenet|providers?)\b|\bsearch[- ]to[- ]stream\b/i;
 const UNAVAILABLE_CAPABILITIES = [
+	['library', /\blibrar\w*\b/i],
 	['search', /\bsearch\w*\b/i],
 	['streaming', /\bstream\w*\b/i],
 	['offline caching', /\boffline(?:[- ]friendly)? (?:audio )?cach\w*\b|\boffline (?:audio|music)\b|\b(?:listen|play|enjoy|take your music)\s+(?:anywhere|offline)\b/i]
@@ -43,24 +43,20 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	const sentences = text.split(/[.!?;]+/).filter((sentence) => sentence.trim());
 
 	// Summaries may be brief; the full home bank pins each capability's detail.
-	// Neither available local management nor the demo needs an unwired disclaimer.
-	expect(
-		sentences.some((sentence) => /\blibrar\w*\b/i.test(sentence) && LOCAL.test(sentence) && !UNAVAILABLE.test(sentence)),
-		`${surface} should describe available local browser library management`
-	).toBe(true);
+	// The demo needs no unwired disclaimer.
 	expect(
 		sentences.some((sentence) => /\bdemo\b/i.test(sentence) && !UNAVAILABLE.test(sentence)),
 		`${surface} should describe an available labelled demo`
 	).toBe(true);
 
 	// Keep disclosures sentence-local: honest copy elsewhere must not excuse an
-	// affirmative real-provider or offline-audio promise. Explicit demo/local
-	// search is not a real-provider chain, but those labels cannot excuse one.
+	// affirmative library, real-provider or offline-audio promise. Explicit demo
+	// streaming is not a real-provider chain, but the label cannot excuse one.
+	// The web app has no /api/library route yet, so no library claim is exempt.
 	for (const [capability, pattern] of UNAVAILABLE_CAPABILITIES) {
 		for (const sentence of sentences.filter((sentence) => pattern.test(sentence))) {
 			const demo = /\bdemo\b/i.test(sentence);
-			const localSearch = capability === 'search' && LOCAL.test(sentence) && /\blibrar\w*\b/i.test(sentence);
-			if (capability !== 'offline caching' && (demo || localSearch) && !PROVIDER_SCOPE.test(sentence)) continue;
+			if ((capability === 'search' || capability === 'streaming') && demo && !PROVIDER_SCOPE.test(sentence)) continue;
 			expect(sentence, `${surface}: ${capability} must be explicitly unavailable`).toMatch(UNAVAILABLE);
 		}
 	}
@@ -70,38 +66,39 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	);
 }
 
-test('accepts the truthful local/demo summary without a blanket disclaimer', async () => {
-	expect(() => expectHonestPublicCopy(HONEST_TODAY, 'local/demo control')).not.toThrow();
+test('accepts the truthful demo summary without a blanket disclaimer', async () => {
+	expect(() => expectHonestPublicCopy(HONEST_TODAY, 'demo control')).not.toThrow();
 });
 
-test('accepts local library management beside an unwired provider chain', async () => {
+test('accepts an unwired library beside an unwired provider chain', async () => {
 	expect(() =>
 		expectHonestPublicCopy(HONEST_TODAY.replaceAll('not available', 'not wired yet'), 'library control')
 	).not.toThrow();
 });
 
-test('accepts a concise local/demo summary without listing every unavailable feature', async () => {
+test('accepts a concise demo summary without listing every unavailable feature', async () => {
 	expect(() =>
-		expectHonestPublicCopy(
-			'Try the demo player and browser library. Sign up and bring your own provider.',
-			'concise summary control'
-		)
+		expectHonestPublicCopy('Try the demo player. Sign up and bring your own provider.', 'concise summary control')
 	).not.toThrow();
 });
 
-for (const wording of ['library', 'libraries']) {
-	test(`accepts available local ${wording} beside truthful provider limits`, async () => {
-		expect(() => expectHonestPublicCopy(
-			`NNTune manages your ${wording} locally in your browser. ${HONEST_TODAY}`,
-			'local library control'
-		)).not.toThrow();
+for (const claim of [
+	'NNTune manages your library locally in your browser.',
+	'NNTune manages your libraries locally in your browser.',
+	'Try the demo player and browser library.',
+	'Search your local library in your browser.'
+]) {
+	test(`rejects an affirmative library claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'library mutant')).toThrow(
+			'library must be explicitly unavailable'
+		);
 	});
 }
 
-test('accepts scoped local library search and demo streaming', async () => {
+test('accepts demo streaming', async () => {
 	expect(() => expectHonestPublicCopy(
-		`Search your local library in your browser. The demo player streams sample tracks. ${HONEST_TODAY}`,
-		'local/demo search control'
+		`The demo player streams sample tracks. ${HONEST_TODAY}`,
+		'demo streaming control'
 	)).not.toThrow();
 });
 
@@ -234,7 +231,7 @@ test('/manifest.webmanifest serves a valid PWA manifest with reachable icons', a
 	}
 });
 
-test('manifest description describes local/demo availability and points to setup', async ({ request }) => {
+test('manifest description describes demo availability and points to setup', async ({ request }) => {
 	const response = await request.get('/manifest.webmanifest');
 	expect(response.ok()).toBe(true);
 	const manifest = (await response.json()) as Record<string, unknown>;
@@ -242,7 +239,7 @@ test('manifest description describes local/demo availability and points to setup
 	expectHonestPublicCopy(manifest.description, 'manifest description');
 });
 
-test('home meta description describes local/demo availability and points to setup', async ({ page }) => {
+test('home meta description describes demo availability and points to setup', async ({ page }) => {
 	await page.goto('/');
 	const description = page.locator('meta[name="description"]');
 	await expect(description).toHaveCount(1);
@@ -250,7 +247,7 @@ test('home meta description describes local/demo availability and points to setu
 	expectHonestPublicCopy(await description.getAttribute('content'), 'home meta description');
 });
 
-test('home landing summary describes local/demo availability and points to setup', async ({ page }) => {
+test('home landing summary describes demo availability and points to setup', async ({ page }) => {
 	await page.goto('/');
 	const summary = await page.locator('meta[name="description"]').getAttribute('content');
 	expectHonestPublicCopy(summary, 'home summary');
