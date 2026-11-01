@@ -27,6 +27,9 @@ WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 SELF_COMMAND = "python3 .github/scripts/test_ci_web_e2e_timeout.py"
 PNPM_COMMAND = "python3 .github/scripts/test_ci_pnpm_retry.py"
 RUST_CACHE_COMMAND = "python3 .github/scripts/test_ci_rust_cache.py"
+REQUIRED_CHECK_CONCURRENCY_COMMAND = (
+    "python3 .github/scripts/test_ci_required_check_concurrency.py"
+)
 
 
 class TestWebE2eTimeout(unittest.TestCase):
@@ -137,6 +140,35 @@ class TestWebE2eTimeout(unittest.TestCase):
         self.assertIn(step, job)
         self.assertTrue(
             check_required_step("public-text", job.replace(step, ""), RUST_CACHE_COMMAND)
+        )
+
+    def test_required_check_concurrency_guard_step_is_required_in_public_text(self):
+        """The required-check concurrency suite's step stays required.
+
+        That suite pins its own step too, but it cannot fail once the
+        step is gone, so this suite backstops it.
+        """
+        self.assertEqual(
+            check_required_step(
+                "public-text",
+                self.jobs["public-text"],
+                REQUIRED_CHECK_CONCURRENCY_COMMAND,
+            ),
+            [],
+        )
+
+    def test_removed_required_check_concurrency_step_fails(self):
+        """Deleting the required-check concurrency suite's step is caught here."""
+        job = self.jobs["public-text"]
+        step = (
+            "      - name: Structural-test the required-check concurrency policy\n"
+            "        run: " + REQUIRED_CHECK_CONCURRENCY_COMMAND + "\n"
+        )
+        self.assertIn(step, job)
+        self.assertTrue(
+            check_required_step(
+                "public-text", job.replace(step, ""), REQUIRED_CHECK_CONCURRENCY_COMMAND
+            )
         )
 
 

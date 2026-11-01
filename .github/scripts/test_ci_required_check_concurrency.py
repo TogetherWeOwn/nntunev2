@@ -122,7 +122,11 @@ class TestRequiredCheckConcurrency(unittest.TestCase):
                 )
 
     def test_self_step_is_required_in_public_text(self):
-        """This suite's public-text step stays required."""
+        """This suite's public-text step stays required.
+
+        test_ci_web_e2e_timeout.py pins the same step independently, so
+        deleting it still turns CI red even though this test stops running.
+        """
         jobs = split_jobs(self.ci)
         self.assertEqual(check_required_step("public-text", jobs["public-text"], SELF_COMMAND), [])
 
