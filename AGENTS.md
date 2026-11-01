@@ -46,3 +46,7 @@ Pool facts:
 - One interrupted run keeps its `lease.json` sentinel; a stale
   under-budget lease with a dead Cargo process group is recovered on
   the next acquire, anything else stays for Operator inspection.
+
+## Contributing
+
+PRs follow the org contract in `TogetherWeOwn/.github` CONTRIBUTING + this repo's overrides; the PR template's Attestation is mandatory.
