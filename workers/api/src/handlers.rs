@@ -1021,8 +1021,10 @@ pub struct Request {
     /// Raw `Origin` header value, if any.
     pub origin: Option<String>,
     /// Raw `Authorization` header value, if any. Carried so the
-    /// staging-only QA seam can check its bearer; no other handler reads
-    /// it (account authentication rides the session cookie).
+    /// staging-only QA seams and the staging QA rate-limit exemption
+    /// (`qa_rate_limit_exempt`) can check their bearer, and for the
+    /// native-REST bearer gate; account authentication rides the session
+    /// cookie.
     pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
@@ -1156,6 +1158,24 @@ fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// True iff the request carries the staged QA bearer on an armed staging
+/// posture (`QA_CODE_SEAM` + `QA_AUTH_TOKEN`, the same gate as the seam
+/// routes). Such requests skip the per-IP auth-start and per-IP mail
+/// budgets: every journey spec shares one CI runner IP, and the bearer
+/// already unlocks account minting and code retrieval, so the exemption
+/// grants nothing it does not. Every other posture (production included)
+/// is false whatever header is presented.
+fn qa_rate_limit_exempt(cfg: &Config, req: &Request) -> bool {
+    let Some(expected) = cfg.qa_auth_token.as_deref().filter(|_| cfg.qa_code_seam) else {
+        return false;
+    };
+    let presented = req
+        .authorization
+        .as_deref()
+        .and_then(|value| value.strip_prefix("Bearer "));
+    qa_bearer_ok(presented, expected)
 }
 
 /// One captured issuance for a synthetic mailbox (migration 0018).
@@ -1447,8 +1467,13 @@ where
     /// rotation inside one prefix cannot mint fresh budgets; audit logs keep
     /// the full `source_ip`. Denial is `Err(retry_after_secs)` carrying
     /// the DENIED budget's window, so a burst denial back-off hint is
-    /// the burst window, never the hourly one.
-    async fn admit_auth_start(&self) -> Result<(), u64> {
+    /// the burst window, never the hourly one. A staged QA bearer on an
+    /// armed staging posture is admitted without spending either budget
+    /// (`qa_rate_limit_exempt`).
+    async fn admit_auth_start(&self, req: &Request) -> Result<(), u64> {
+        if qa_rate_limit_exempt(self.cfg, req) {
+            return Ok(());
+        }
         // Hourly budget AND the configured short-window burst budget
         // (`AUTH_RATE_LIMIT_*`, default 10/60s), claimed as one
         // all-or-none decision: a burst-denied start must not burn an
@@ -1483,21 +1508,25 @@ where
         }
     }
 
-    async fn send_magic_link_if_allowed(&self, user_id: &str, email: &str) {
+    async fn send_magic_link_if_allowed(&self, req: &Request, user_id: &str, email: &str) {
         // Outbound mail abuse cap BEFORE the per-email budget: one IP must
         // not email-bomb unlimited distinct victims. Any denial sends
-        // nothing and stores no magic row.
-        let mail_ip_ok = self
-            .store
-            .reserve_rate_limit(
-                &rate_limit_ip_key(&self.source_ip),
-                "auth.mail_ip",
-                MAIL_PER_IP_PER_HOUR,
-                self.now,
-                AUTH_START_WINDOW_SECS,
-            )
-            .await
-            .unwrap_or(false);
+        // nothing and stores no magic row. The staged QA bearer skips only
+        // this per-IP cap and only for unroutable `example.test` mailboxes,
+        // so even a leaked staging token cannot mail a real address past
+        // it; the global and per-email caps below still apply.
+        let mail_ip_ok = (is_example_test_mailbox(email) && qa_rate_limit_exempt(self.cfg, req))
+            || self
+                .store
+                .reserve_rate_limit(
+                    &rate_limit_ip_key(&self.source_ip),
+                    "auth.mail_ip",
+                    MAIL_PER_IP_PER_HOUR,
+                    self.now,
+                    AUTH_START_WINDOW_SECS,
+                )
+                .await
+                .unwrap_or(false);
         if !mail_ip_ok {
             return;
         }
@@ -1658,7 +1687,7 @@ where
     };
     // Per-IP admission before user lookup or maintenance. The global budget
     // applies to outbound mail only, never to auth challenge issuance.
-    if let Err(retry_after) = ctx.admit_auth_start().await {
+    if let Err(retry_after) = ctx.admit_auth_start(req).await {
         return throttled(retry_after);
     }
     let existing = match ctx.store.user_by_email(&email).await {
@@ -1814,7 +1843,7 @@ where
     }
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
-    ctx.send_magic_link_if_allowed(&user.id, &email).await;
+    ctx.send_magic_link_if_allowed(req, &user.id, &email).await;
     shape(user.id.clone())
 }
 
@@ -2027,7 +2056,7 @@ where
     // Per-IP admission before maintenance or lookup: unknown emails would
     // otherwise mint unbounded unbound challenge rows. Denial returns the
     // same fixed-shape 200 with an unstored challenge.
-    if ctx.admit_auth_start().await.is_err() {
+    if ctx.admit_auth_start(req).await.is_err() {
         return json_response(
             200,
             serde_json::json!({
@@ -2407,13 +2436,13 @@ where
     // identical response (the mail-budget denial inside
     // `send_magic_link_if_allowed` likewise sends nothing and stores no
     // magic row on the same shape).
-    if ctx.admit_auth_start().await.is_err() {
+    if ctx.admit_auth_start(req).await.is_err() {
         return json_response(200, serde_json::json!({"ok": true}));
     }
     // Identical response whether or not the account exists or the atomic
     // per-email issuance budget has been exhausted.
     if let Ok(Some(user)) = ctx.store.user_by_email(&email).await {
-        ctx.send_magic_link_if_allowed(&user.id, &email).await;
+        ctx.send_magic_link_if_allowed(req, &user.id, &email).await;
     }
     json_response(200, serde_json::json!({"ok": true}))
 }
@@ -5027,6 +5056,24 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization: bearer.map(|token| format!("Bearer {token}")),
+                body: body.to_string().into_bytes(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+
+        /// Same-origin POST carrying a raw `Authorization` header value.
+        fn call_authorized(
+            &self,
+            path: &str,
+            body: serde_json::Value,
+            authorization: Option<&str>,
+        ) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                authorization: authorization.map(str::to_string),
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -8944,6 +8991,123 @@ mod tests {
             AUTH_STARTS_PER_IP_PER_HOUR as usize,
             "no challenge stored past the per-IP budget"
         );
+    }
+
+    #[test]
+    fn qa_bearer_skips_per_ip_start_and_mail_budgets_on_armed_staging() {
+        // TWO-434: every journey spec shares one CI runner IP, so the
+        // staged QA bearer on an armed staging posture is admitted past
+        // the per-IP start budget and, for synthetic mailboxes, the
+        // per-IP mail cap. Exempt starts spend nothing: an unexempt
+        // caller from the same IP still gets its full budget afterwards.
+        let h = qa_harness();
+        let bearer = format!("Bearer {QA_TOKEN}");
+        let total = AUTH_STARTS_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call_authorized(
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("journey{i}@example.test")}),
+                Some(bearer.as_str()),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+        }
+        for i in 0..total {
+            let resp = h.call_authorized(
+                "/v1/auth/magic/start",
+                serde_json::json!({"email": format!("journey{i}@example.test")}),
+                Some(bearer.as_str()),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+        }
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            2 * total as usize,
+            "synthetic mailboxes are mailed past the per-IP mail cap"
+        );
+        for i in 0..=AUTH_STARTS_PER_IP_PER_HOUR {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("plain{i}@example.test")}),
+            );
+            if i < AUTH_STARTS_PER_IP_PER_HOUR {
+                assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+            } else {
+                assert_eq!(
+                    resp.status, 429,
+                    "unexempt budget still binds: {}",
+                    resp.body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qa_bearer_mail_exemption_never_covers_routable_mailboxes() {
+        // A leaked staging token must not email-bomb real addresses: the
+        // start budget is skipped, but the per-IP mail cap still binds for
+        // any mailbox outside `example.test`.
+        let h = qa_harness();
+        let bearer = format!("Bearer {QA_TOKEN}");
+        let total = MAIL_PER_IP_PER_HOUR + 10;
+        for i in 0..total {
+            let resp = h.call_authorized(
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({"email": format!("victim{i}@example.com")}),
+                Some(bearer.as_str()),
+            );
+            assert_eq!(resp.status, 200, "iteration {i}: {}", resp.body);
+        }
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            MAIL_PER_IP_PER_HOUR as usize,
+            "routable mailboxes stay under the per-IP mail cap"
+        );
+    }
+
+    #[test]
+    fn qa_rate_limit_exemption_requires_armed_posture_and_exact_bearer() {
+        // Production (flag off), a flag armed without a staged token, a
+        // wrong or truncated bearer, and the right token without the
+        // `Bearer ` scheme all keep the ordinary per-IP start budget.
+        let right = format!("Bearer {QA_TOKEN}");
+        let armed = || cfg().with_qa_code_seam(true).with_qa_auth_token(QA_TOKEN);
+        let cases = [
+            (
+                "production",
+                cfg().with_qa_auth_token(QA_TOKEN),
+                right.as_str(),
+            ),
+            (
+                "flag without token",
+                cfg().with_qa_code_seam(true),
+                right.as_str(),
+            ),
+            ("wrong bearer", armed(), "Bearer wrong-token"),
+            ("truncated bearer", armed(), "Bearer test-qa-bearer-toke"),
+            ("no scheme", armed(), QA_TOKEN),
+        ];
+        for (label, config, authorization) in cases {
+            let mut h = harness();
+            h.config = config;
+            for i in 0..=AUTH_STARTS_PER_IP_PER_HOUR {
+                let resp = h.call_authorized(
+                    "/v1/auth/passkey/register/start",
+                    serde_json::json!({"email": format!("journey{i}@example.test")}),
+                    Some(authorization),
+                );
+                let expected = if i < AUTH_STARTS_PER_IP_PER_HOUR {
+                    200
+                } else {
+                    429
+                };
+                assert_eq!(
+                    resp.status, expected,
+                    "{label}, iteration {i}: {}",
+                    resp.body
+                );
+            }
+        }
     }
 
     #[test]

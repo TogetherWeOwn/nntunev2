@@ -6,6 +6,7 @@ import {
   assertAccessWall,
   assertNoAccessWall,
   isAccessWall,
+  isAuthStartRequest,
   isStagingOrigin,
   readApiBody,
   stagingBaseUrl,
@@ -714,6 +715,107 @@ test.describe('isStagingOrigin (credential scope gate)', () => {
     expect(foreign).toEqual({});
     expect(JSON.stringify(foreign)).not.toContain('dummy-client-secret');
     expect(JSON.stringify(foreign)).not.toContain('dummy-session');
+  });
+});
+
+test.describe('isAuthStartRequest (QA bearer scope gate, TWO-434)', () => {
+  const staging = 'https://staging.example';
+
+  test('matches POST to each auth-start route', () => {
+    for (const path of [
+      '/v1/auth/passkey/register/start',
+      '/v1/auth/passkey/login/start',
+      '/v1/auth/magic/start',
+    ]) {
+      expect(isAuthStartRequest('POST', `${staging}${path}`), path).toBe(true);
+      expect(isAuthStartRequest('post', `${staging}${path}?x=1`), path).toBe(true);
+    }
+  });
+
+  test('withholds from other methods, finishes, bearer routes and lookalikes', () => {
+    expect(isAuthStartRequest('GET', `${staging}/v1/auth/magic/start`)).toBe(false);
+    expect(isAuthStartRequest('OPTIONS', `${staging}/v1/auth/magic/start`)).toBe(false);
+    expect(isAuthStartRequest('POST', `${staging}/v1/auth/magic/finish`)).toBe(false);
+    expect(isAuthStartRequest('POST', `${staging}/v1/session/reauthenticate/start`)).toBe(false);
+    expect(isAuthStartRequest('POST', `${staging}/v1/playlists`)).toBe(false);
+    expect(isAuthStartRequest('POST', `${staging}/v1/auth/magic/start/`)).toBe(false);
+    expect(isAuthStartRequest('POST', `${staging}/x/v1/auth/magic/start`)).toBe(false);
+    expect(isAuthStartRequest('POST', 'not a url')).toBe(false);
+  });
+});
+
+test.describe('applyAccountToPage QA bearer scope (browser)', () => {
+  // Real Chromium check: an anonymous page sends the QA bearer on auth-start
+  // POSTs only, never on navigation or other API routes; a session page
+  // keeps its own bearer everywhere and never sends the QA token.
+  test('anonymous page carries the QA bearer on auth-start POSTs only', async () => {
+    let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+    try {
+      browser = await chromium.launch();
+    } catch (error) {
+      test.skip(true, `Chromium unavailable in this container (${(error as Error).message.split('\n')[0]}); runs in CI with --with-deps.`);
+      return;
+    }
+    const markerQa = 'dummy-qa-token-start-scope';
+    const markerSession = 'dummy-session-start-scope';
+    const hits: Array<{ method: string; url: string; authorization: string | undefined }> = [];
+    const staging = createServer((req: IncomingMessage, res) => {
+      hits.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization });
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<p>staging</p>');
+    });
+    const port = await new Promise<number>((resolve, reject) => {
+      staging.on('error', reject);
+      staging.listen(0, '127.0.0.1', () => resolve((staging.address() as AddressInfo).port));
+    });
+    const stagingOrigin = `http://127.0.0.1:${port}`;
+    const drive = async (account: Parameters<typeof applyAccountToPage>[1]): Promise<void> => {
+      const context = await browser!.newContext();
+      try {
+        const page = await context.newPage();
+        await applyAccountToPage(page, account, stagingOrigin);
+        await page.goto(`${stagingOrigin}/signup`, { waitUntil: 'domcontentloaded' });
+        await page.evaluate(async () => {
+          for (const path of ['/v1/auth/passkey/register/start', '/v1/auth/magic/start', '/v1/playlists']) {
+            await fetch(path, { method: 'POST', body: '{}' });
+          }
+          await fetch('/v1/auth/magic/start');
+        });
+      } finally {
+        await context.close();
+      }
+    };
+    try {
+      await withEnvAsync(
+        {
+          CF_ACCESS_CLIENT_ID: 'dummy-client-id-start-scope',
+          CF_ACCESS_CLIENT_SECRET: 'dummy-client-secret-start-scope',
+          QA_AUTH_TOKEN: markerQa,
+        },
+        async () => {
+          await drive(null);
+          const anonymous = hits.splice(0);
+          const auth = (method: string, url: string) =>
+            anonymous.find((hit) => hit.method === method && hit.url === url)?.authorization;
+          expect(auth('POST', '/v1/auth/passkey/register/start')).toBe(`Bearer ${markerQa}`);
+          expect(auth('POST', '/v1/auth/magic/start')).toBe(`Bearer ${markerQa}`);
+          expect(auth('POST', '/v1/playlists')).toBeUndefined();
+          expect(auth('GET', '/v1/auth/magic/start')).toBeUndefined();
+          expect(auth('GET', '/signup')).toBeUndefined();
+
+          await drive({ email: 'e2e@example.test', session: markerSession, viaApi: true });
+          const withSession = hits.splice(0);
+          expect(withSession.length).toBeGreaterThan(0);
+          for (const hit of withSession) {
+            expect(hit.authorization, `${hit.method} ${hit.url}`).toBe(`Bearer ${markerSession}`);
+          }
+          expect(JSON.stringify(withSession)).not.toContain(markerQa);
+        },
+      );
+    } finally {
+      await new Promise<void>((resolve) => staging.close(() => resolve()));
+      await browser.close().catch(() => {});
+    }
   });
 });
 
