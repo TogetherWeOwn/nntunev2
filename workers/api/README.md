@@ -337,6 +337,14 @@ This crate remains standalone (excluded from the root workspace), so use
   `VAULT_KEK_VERSION` (legacy) or `VAULT_KEK_V<N>` + `VAULT_KEK_CURRENT`
   (versioned) in `workers/api/src/worker_entry.rs`; marker/index in
   `migrations/0015_kek_rotation.sql`, design `docs/security/kek-rotation.md` §1–§2.)
+- **Ingest caller grants:** `ingest_grant::issue_at` mints the
+  `ingest:write` bearer that every `/v1/ingest/*` route requires, for the
+  authenticated session user only. The lifetime clamps to 900 s and the
+  signing key is the `INGEST_CALLER_SECRET` Worker secret, which must hold
+  the same value (≥32 bytes) on the api and ingest Workers. A short or
+  absent secret, or a user id ingest would reject, mints nothing. Both
+  crates pin `fixtures/ingest-caller-grant/vectors.json`. No api route
+  calls ingest yet.
 - **Never logged, never returned:** reads return booleans only
   (`redacted_summary`); `test connection` returns a boolean, never provider
   banners; audit events carry ids/results only — there is no field for
