@@ -10,8 +10,8 @@ measured findings) lives in `docs/youtube-backend-spike.md`.
 
 - `src/client.rs` — Innertube client table (`VISIONOS` first, pinned to
   the upstream `youtubei.js` table) and `/player` request construction.
-  The compiled-in try-order is the default; the Worker reads its ordered
-  client list from KV config.
+  The compiled-in try-order is the default; reading an ordered client list
+  from KV config arrives with the extraction wiring.
 - `src/player.rs` — `/player` response parsing: playability class, plain
   stream URLs vs `signatureCipher`, `n`-param and SABR flags, and the
   `ip=` value the gate correlates against.

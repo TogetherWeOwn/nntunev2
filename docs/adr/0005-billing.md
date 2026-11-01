@@ -7,7 +7,7 @@
 - **Revised:** 2026-10-18 — slice-1 per-play precursor: stream usage accrues in
   `stream_play_ledger` (per-play windows, `play:` keys, monthly folds), never a Stripe
   meter. The daily `usage_ledger` cap input is folded from these windows in a later
-  slice; no daily table exists yet.
+  slice; the table exists (migration 0021) but nothing folds into it yet.
 
 ## Decision
 

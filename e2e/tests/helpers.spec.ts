@@ -25,6 +25,7 @@ import {
   signupPathLabel,
   tryMintTestAccount,
   awaitSignupOutcome,
+  recordRegisterStartStatus,
 } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
@@ -1549,6 +1550,50 @@ test.describe('awaitSignupOutcome names the signup page state', () => {
     const message = await failure(page, '<p role="status">Sending your email code…</p>', null);
     expect(message).toContain('still sending');
     expect(message).toContain('registerStart HTTP not observed');
+  });
+
+  test('the registerStart observer feeds the real response status to the diagnostic', async ({
+    page,
+  }) => {
+    // A local page whose submit POSTs registerStart and gets a 429, like a
+    // rate-limited staging answer; the page then shows nothing.
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/v1/auth/passkey/register/start') {
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end('{"code":"rate_limited"}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(
+        '<!doctype html><html><body><button id="go">go</button><script>' +
+          "document.getElementById('go').onclick = () => " +
+          "fetch('/v1/auth/passkey/register/start', { method: 'POST' });" +
+          '</script></body></html>',
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await page.goto(`http://127.0.0.1:${port}/`);
+      const registerStatus = recordRegisterStartStatus(page);
+      await page.locator('#go').click();
+      await expect.poll(() => registerStatus.status).toBe(429);
+      let message = '';
+      try {
+        await awaitSignupOutcome(
+          page,
+          page.locator('input[name="magic_code"]'),
+          page.getByTestId('signup-error'),
+          registerStatus,
+          200,
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain('registerStart HTTP 429');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   test('unsupported passkeys and a bare email step are named', async ({ page }) => {

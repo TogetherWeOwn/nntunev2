@@ -564,7 +564,7 @@ const REGISTER_START_PATH = '/v1/auth/passkey/register/start';
  * Record the HTTP status of the page's next `registerStart` call (status
  * only — never the request or response body).
  */
-function recordRegisterStartStatus(page: Page): { status: number | null } {
+export function recordRegisterStartStatus(page: Page): { status: number | null } {
   const seen: { status: number | null } = { status: null };
   page.on('response', (response) => {
     if (seen.status === null && new URL(response.url()).pathname === REGISTER_START_PATH) {

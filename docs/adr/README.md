@@ -3,6 +3,7 @@
 | # | Decision |
 |---|---|
 | 0001 | [Core transport and SIMD](0001-nntune-core-transport-and-simd.md) |
+| 0001 | [Subsonic-compatible API port](0001-subsonic-api-port.md) |
 | 0002 | [Data model and ERD](0002-data-model.md) |
 | 0003 | [Cache scope and R2 layout](0003-cache-scope.md) |
 | 0004 | [Plan matrix](0004-plan-matrix.md) |
@@ -19,10 +20,12 @@
 The merged core ADR retains **0001**. The architecture branch's former
 `0001-stack.md` is now **0009**; data/cache/plan/billing/API retain 0002–0006.
 This avoids colliding with the already-merged core, mirror (0007) and auth (0008)
-records while preserving existing data/cache references. Historical stack
+records while preserving existing data/cache references. The Subsonic API port
+record also carries **0001**, so that number is not unique. Historical stack
 references to “ADR 0001” (including the stack/database context in ADR 0007)
-resolve to **0009**; “ADR 0001” for core transport/SIMD means the core record.
-New citations must use the linked filename and the unique number above.
+resolve to **0009**; any other unqualified “ADR 0001” means the core
+transport/SIMD record, never the Subsonic port record. New citations must use
+the linked filename, not the number alone.
 
 Existing implementation is not retroactively rewritten by an ADR. In particular,
 ADR 0008 and its applied auth migration remain authoritative for current auth;

@@ -424,8 +424,8 @@ or media already exist.
 Slice-1 precursor (`stream_play_ledger`, migration `0020`): per-play billed windows with
 deterministic `play:{user}:{track}:{play}` idempotency keys (128/512/512 limits, alphabet
 `[A-Za-z0-9_:-]`) and monthly `period_month` folds feed the rule-5 daily `usage_ledger`
-in a later slice; until then no daily `usage_ledger` table exists and no writer assumes its
-`(user_id, period)` upsert. Play-key binding, zero-row `SELECT` + classify (exact redelivery
+in a later slice; the daily `usage_ledger` table exists (migration 0021) but no writer folds
+into it or assumes its `(user_id, period)` upsert yet. Play-key binding, zero-row `SELECT` + classify (exact redelivery
 vs conflict), and the shared key vectors live in `workers/api/src/ledger.rs` with the stream
 worker's `derive_play_idempotency_key`. The precursor's `ledger_insert_statement` is a rule-3
 fenced writer: `SELECT ... FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL

@@ -15,8 +15,12 @@ surfaces as the `internal_error` envelope via `session_error_response`
 (`workers/api/src/handlers.rs`). The API's auth-throttle 429 likewise
 carries `{code: rate_limited, message, retryable: true}` with `Retry-After`
 (`throttled` in `workers/api/src/handlers.rs`, rendering
-`ApiError::rate_limited`). Other API and stream mappings are pinned
-for future HTTP wiring, not emitted by reachable HTTP paths here. Clients can
+`ApiError::rate_limited`). Reachable API paths in
+`workers/api/src/handlers.rs` also emit `invalid_request` (oversized body),
+`not_found` (unknown route), `forbidden` (bearer credential lacks the scope),
+`validation_failed` and `account_deleting` (credential mint), and
+`service_unavailable` (secure randomness unavailable). Stream mappings are
+pinned for future HTTP wiring, not emitted by reachable HTTP paths. Clients can
 handle auth, validation, billing limits, and upstream failures without
 per-worker special cases.
 

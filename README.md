@@ -19,7 +19,7 @@ metering primitives below are built to support them from day one.
 
 | Concern | Choice |
 |---|---|
-| Backend | **Rust** (`workers-rs` → `wasm32`) for **ALL** backend Workers, including Durable Objects |
+| Backend | **Rust** (`workers-rs` → `wasm32`) for backend Workers, including Durable Objects; the staging Tail alert Worker (`workers/observability`) is JavaScript |
 | Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
 | Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
@@ -90,11 +90,12 @@ the [agent notes](AGENTS.md#local-rust-builds-the-bounded-cargo-pool);
 checkouts without the pool use the bare commands as listed.
 
 ```sh
-# Rust workspace (core, config, stream, containers/repair, test fixtures)
+# Rust workspace (crates/*, workers/stream, workers/youtube,
+# containers/repair, containers/transcode)
 cargo test --workspace
 # Standalone Worker crates (excluded from the workspace in Cargo.toml; each
 # carries a committed lockfile: Cargo.lock plus workers/{api,ingest,mb,
-# repair}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
+# repair,transcode}/Cargo.lock, apps/web/pnpm-lock.yaml, e2e/package-lock.json).
 # The cargo-deny job's `Prove committed lockfiles are fresh` step checks
 # the workspace and api/mb/ingest/repair lockfiles (.github/workflows/ci.yml).
 # Those four Worker jobs also pass --locked to every test/clippy/check
@@ -106,6 +107,7 @@ cargo test --locked --manifest-path workers/api/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/mb/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
 cargo test --locked --manifest-path workers/repair/Cargo.toml --all-targets
+cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
 # Web frontend (from apps/web): unit tests, then typecheck
 pnpm test
 pnpm check
@@ -116,11 +118,7 @@ npm run e2e:list
 ```
 
 `npm run e2e:list` compiles the suite and lists the specs with no staging
-needed. Discovery snapshot, verified 2026-10-18 via
-`npm --prefix e2e run e2e:list` (with dev dependencies installed): 339
-tests in 20 files. Totals drift as specs land — re-run the command for a
-fresh count rather than quoting this one. Live staging runs stay in
-CI — see below.
+needed. Live staging runs stay in CI — see below.
 
 Public-repo hygiene gate (part of `ci-ok`, from the repo root):
 
@@ -178,11 +176,13 @@ production promotion is a separate gated lane.
 | `CLOUDFLARE_API_TOKEN` | Cloudflare deploys (Workers, R2, KV, Queues) |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account scope (full value kept private by repo policy) |
 | `PLANETSCALE_MIGRATOR_URL_STAGING` | Staging migrations to `nntunev2_staging` on the shared `main` cluster; production migrator remains deferred to its gated workflow |
-| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | **Pending:** not set as repo secrets; authorized QA credential wiring is required before enabling `STAGING_BASE_URL` for the staging E2E workflow |
+| `STAGING_BASE_URL` | Staging host the E2E workflow targets; unset means the staging E2E jobs skip |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service-token credentials the staging E2E workflow sends; required once `STAGING_BASE_URL` is set |
+| `QA_AUTH_TOKEN` | Bearer for the staging-only E2E seams; see `e2e/README.md` |
 
 The Access service-token resource ID is not a substitute for the two client
 credentials. Keep the Access gate enabled; do not publish or rotate the shared
-QA token to satisfy the pending wiring. See the [runbook](docs/ops.md) for the
+QA token. See the [runbook](docs/ops.md) for the
 current shared-cluster topology, host-reported isolation, and launch deferrals.
 
 `HYPERDRIVE_ID_STAGING`, `HYPERDRIVE_ID_PROD`, and `HYPERDRIVE_ID_MB` are
