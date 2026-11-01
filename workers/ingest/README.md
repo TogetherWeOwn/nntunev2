@@ -314,7 +314,9 @@ stub whose NZB references fixture message-ids.
 - Caller auth (`src/caller_auth.rs`): every `/v1/ingest/*` route requires
   `Authorization: Bearer <grant>`, a short-lived (≤15 min) HMAC grant
   scoped `ingest:write` that the `api` Worker mints for the session user,
-  signed with the `INGEST_CALLER_SECRET` Worker secret (≥32 bytes). Auth
+  signed with the `INGEST_CALLER_SECRET` Worker secret (≥32 bytes, same
+  value on both Workers; the api minter is `workers/api/src/ingest_grant.rs`,
+  and both crates pin `fixtures/ingest-caller-grant/vectors.json`). Auth
   runs before the body is read, so a refused caller gets the generic 401
   `unauthorized` with no queue, KV, throttle, ledger or meter side effect.
   A missing or short secret fails closed with 503. The job's `user_id` is
