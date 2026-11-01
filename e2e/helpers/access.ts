@@ -8,7 +8,7 @@
  * log or persist a secret value.
  */
 
-import { SUPPORTED_NNTP_PORTS } from './contract.js';
+import { API, SUPPORTED_NNTP_PORTS } from './contract.js';
 
 export interface WallProbe {
   status: number;
@@ -54,6 +54,24 @@ export function qaAuthHeader(): Record<string, string> {
 export function isStagingOrigin(requestUrl: string, baseURL: string): boolean {
   try {
     return new URL(requestUrl).origin === new URL(baseURL).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True iff the request is a POST to one of the API auth-start routes
+ * (`API.authStarts`, exact path). Only these carry the QA bearer from a
+ * browser page (TWO-434): every journey spec shares one CI runner IP, and
+ * staging admits a bearer-carrying start past the per-IP start budget. The
+ * bearer grants no identity there, and every other path (including the
+ * native-REST bearer routes) never sees it. Pure so offline self-tests pin
+ * the scope without a browser.
+ */
+export function isAuthStartRequest(method: string, requestUrl: string): boolean {
+  if (method.toUpperCase() !== 'POST') return false;
+  try {
+    return (API.authStarts as readonly string[]).includes(new URL(requestUrl).pathname);
   } catch {
     return false;
   }

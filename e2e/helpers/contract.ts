@@ -49,6 +49,14 @@ export const API = {
   // production. A renamed path fails the wizard-arrival spec with this key
   // named.
   testCodes: '/api/test-codes',
+  // API Worker auth-start routes that spend the shared per-IP start budget
+  // (`admit_auth_start` in `workers/api/src/handlers.rs`). Staging admits
+  // them past that budget when they carry the QA bearer (TWO-434).
+  authStarts: [
+    '/v1/auth/passkey/register/start',
+    '/v1/auth/passkey/login/start',
+    '/v1/auth/magic/start',
+  ],
   ingest: '/api/ingest',
   ingestStatus: (id: string) => `/api/ingest/${id}`,
   library: '/api/library',

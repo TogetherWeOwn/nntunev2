@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
+import { accessHeaders, assertNoAccessWall, qaAuthHeader, stagingBaseUrl } from '../helpers/access.js';
 import {
   apiGet,
   apiPost,
@@ -158,7 +158,9 @@ test('sign-out-everywhere revokes the session and closes follow-up checks', asyn
   const start = await apiPost(
     request,
     `${baseURL}/v1/auth/magic/start`,
-    anonymousMutationHeaders(baseURL),
+    // QA bearer on the start only: staging admits it past the per-IP start
+    // budget every journey spec shares (TWO-434). It grants no identity.
+    { ...anonymousMutationHeaders(baseURL), ...qaAuthHeader() },
     { email: account.email },
     'security-sign-out-everywhere-second-start',
   );

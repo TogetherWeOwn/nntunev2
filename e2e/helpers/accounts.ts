@@ -10,6 +10,7 @@ import { API, TESTIDS, uniqueTestEmail } from './contract.js';
 import {
   accessHeaders,
   assertNoAccessWall,
+  isAuthStartRequest,
   isStagingOrigin,
   qaAuthHeader,
   syntheticNntpEndpoint,
@@ -336,7 +337,7 @@ export async function applyAccountToPage(
   // A non-null account is an account-specific identity: without its own
   // nonblank session it must fail before any routing, never silently become
   // an Access-only page. Null stays allowed for the UI-signup fallback and
-  // health checks (Access pair only, no Authorization).
+  // health checks (Access pair only; Authorization only on auth-start POSTs).
   const session = accountSession(account);
   if (account && !session) {
     throw new Error(
@@ -347,13 +348,21 @@ export async function applyAccountToPage(
   }
   const stagingHeaders: Record<string, string> = { ...accessHeaders() };
   if (session) stagingHeaders.Authorization = `Bearer ${session}`;
+  // Anonymous pages put the QA bearer on auth-start POSTs only, so the
+  // public forms are admitted past the per-IP start budget every journey
+  // spec shares from one runner IP (TWO-434). It grants no identity: the
+  // page stays anonymous and the form remains the only way in.
+  const startHeaders: Record<string, string> = session ? {} : qaAuthHeader();
   const context = page.context();
   await context.unrouteAll({ behavior: 'wait' }).catch(() => {});
-  if (Object.keys(stagingHeaders).length === 0) return;
+  if (Object.keys(stagingHeaders).length === 0 && Object.keys(startHeaders).length === 0) return;
   const stagingOrigin = new URL(baseURL).origin;
   await context.route('**/*', async (route) => {
     const url = route.request().url();
     if (isStagingOrigin(url, stagingOrigin)) {
+      const extra = isAuthStartRequest(route.request().method(), url)
+        ? { ...stagingHeaders, ...startHeaders }
+        : stagingHeaders;
       // No-redirect fetch: route.continue({ headers }) would keep the headers
       // on the browser's automatic redirect follow to another origin. Fetching
       // with maxRedirects: 0 and fulfilling hands the 3xx to the browser as-is
@@ -363,7 +372,7 @@ export async function applyAccountToPage(
       // failed request, so a mid-test transport failure still fails closed.
       try {
         const response = await route.fetch({
-          headers: { ...route.request().headers(), ...stagingHeaders },
+          headers: { ...route.request().headers(), ...extra },
           maxRedirects: 0,
         });
         await route.fulfill({ response });

@@ -385,10 +385,10 @@ interface FakeRouteRecord {
   continued: boolean;
 }
 
-function fakeRoute(url: string): { route: unknown; record: FakeRouteRecord } {
+function fakeRoute(url: string, method = 'GET'): { route: unknown; record: FakeRouteRecord } {
   const record: FakeRouteRecord = { fulfilled: false, continued: false };
   const route = {
-    request: () => ({ url: () => url, headers: () => ({ 'x-original': '1' }) }),
+    request: () => ({ url: () => url, method: () => method, headers: () => ({ 'x-original': '1' }) }),
     fetch: async (opts: { headers: Record<string, string>; maxRedirects?: number }) => {
       record.fetched = opts;
       return { fakeResponse: true };
@@ -447,7 +447,7 @@ test.describe('applyAccountToPage browser credential scoping', () => {
     });
   });
 
-  test('null account stays Access-only (UI-signup fallback): no Authorization anywhere', async () => {
+  test('null account stays Access-only (UI-signup fallback): no Authorization outside auth-start POSTs', async () => {
     await withEnvAsync(pageEnv, async () => {
       const { page, handler } = fakePage();
       await applyAccountToPage(page, null, BASE);
@@ -459,6 +459,13 @@ test.describe('applyAccountToPage browser credential scoping', () => {
       expect(staging.record.fetched?.headers.Authorization).toBeUndefined();
       expect(staging.record.fetched?.headers['CF-Access-Client-Id']).toBe('dummy-client-id');
       expect(JSON.stringify(staging.record.fetched?.headers)).not.toContain(QA_SENTINEL);
+
+      // TWO-434: the auth-start POST alone carries the QA bearer, so the
+      // public form is admitted past the shared per-IP start budget.
+      const start = fakeRoute(`${BASE}/v1/auth/passkey/register/start`, 'POST');
+      await routeHandler!(start.route);
+      expect(start.record.fetched?.headers.Authorization).toBe(`Bearer ${QA_SENTINEL}`);
+      expect(start.record.fetched?.headers['CF-Access-Client-Id']).toBe('dummy-client-id');
     });
   });
 
