@@ -37,11 +37,15 @@ async function openWithTrack(page: Page) {
 	await expect(audio(page)).toHaveCount(1);
 }
 
-async function mockMedia(page: Page, time: number, duration: number) {
+async function mockMedia(page: Page, time: number, duration: number, seekableEnd = duration) {
 	await audio(page).evaluate(
-		(el: HTMLAudioElement, s: { time: number; duration: number }) => {
+		(el: HTMLAudioElement, s: { time: number; duration: number; seekableEnd: number }) => {
 			let current = s.time;
 			Object.defineProperty(el, 'duration', { value: s.duration, configurable: true });
+			Object.defineProperty(el, 'seekable', {
+				value: { length: 1, start: () => 0, end: () => s.seekableEnd },
+				configurable: true
+			});
 			Object.defineProperty(el, 'currentTime', {
 				get: () => current,
 				set: (next: number) => {
@@ -50,7 +54,7 @@ async function mockMedia(page: Page, time: number, duration: number) {
 				configurable: true
 			});
 		},
-		{ time, duration }
+		{ time, duration, seekableEnd }
 	);
 }
 
@@ -74,7 +78,7 @@ test('RJ-01 buttons jump the native player and announce politely', async ({ page
 	expect(await page.evaluate(() => ({ ...(window as unknown as { __rjCalls: object }).__rjCalls }))).toEqual(calls);
 });
 
-test('RJ-02 clamps at the start and reports unavailable media without writing', async ({ page }) => {
+test('RJ-02 clamps at the start and reports unseekable media without writing', async ({ page }) => {
 	await openWithTrack(page);
 	await mockMedia(page, 4, 120);
 	await page.getByRole('button', { name: 'Back 10 seconds' }).click();
@@ -86,5 +90,11 @@ test('RJ-02 clamps at the start and reports unavailable media without writing', 
 	await mockMedia(page, 5, Number.NaN);
 	await page.getByRole('button', { name: 'Forward 10 seconds' }).click();
 	expect(await position(page)).toBe(5);
-	await expect(feedback(page)).toHaveText(/has not reported its length/);
+	await expect(feedback(page)).toHaveText('Cannot jump: this track cannot seek yet.');
+
+	// A source served without range support reports only [0, 0] as seekable.
+	await mockMedia(page, 0, 120, 0);
+	await page.getByRole('button', { name: 'Forward 10 seconds' }).click();
+	expect(await position(page)).toBe(0);
+	await expect(feedback(page)).toHaveText('Cannot jump: this track cannot seek yet.');
 });

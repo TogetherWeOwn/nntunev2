@@ -1000,6 +1000,9 @@
 		// This navigation is a new gesture, not the seek that restart superseded.
 		restartSupersededSources.delete(`${target.trackId}\n${source}`);
 		pendingShareSeek = { ...target, streamUrl: source, appliedSeconds: null };
+		// A same-source share skips the source-change reset; the share moves the
+		// position, so an earlier jump readout no longer describes it.
+		jumpStatus = '';
 		// Try after the keyed audio mounts; metadata/duration events retry if
 		// the browser cannot seek yet and clamp a previously unknown duration.
 		void tick().then(() => applyPendingShareSeek());
@@ -1168,16 +1171,18 @@
 
 	/**
 	 * Back/Forward 10 seconds act on the mounted audio element for the current
-	 * source only. A jump supersedes a pending inbound-share seek so later
-	 * metadata events cannot undo it.
+	 * source only. Like restart, the gesture supersedes a pending inbound-share
+	 * seek for that source even if the jump is refused, so later metadata
+	 * events cannot move the position to the share time.
 	 */
 	function jumpRelative(direction: JumpDirection): void {
 		const element = audioEl;
-		const outcome =
-			element && streamUrl && element.getAttribute('src') === streamUrl
-				? jumpMedia(element, direction)
-				: ({ kind: 'unavailable' } as const);
-		if (outcome.kind === 'jumped') pendingShareSeek = null;
+		const current = queueCurrentTrack(queue);
+		const live = element && current && streamUrl && element.getAttribute('src') === streamUrl;
+		if (live && pendingShareSeek?.trackId === current.id && pendingShareSeek?.streamUrl === streamUrl) {
+			pendingShareSeek = null;
+		}
+		const outcome = live ? jumpMedia(element, direction) : ({ kind: 'unavailable' } as const);
 		jumpStatus = describeJump(direction, outcome);
 		// Re-announce a repeated identical outcome.
 		jumpStatusVersion += 1;
