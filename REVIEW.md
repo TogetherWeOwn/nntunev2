@@ -22,10 +22,8 @@ reviewed commit.
 
 Severity is impact times confidence, after the disproof pass below:
 
-- **Severe (red):** production-reachable exposure of a user's provider
-  credentials, cross-user library/cache access, a parser flaw reachable from
-  untrusted Usenet data, metering/ledger corruption, or a deploy that breaks
-  production — with the mechanism verified against the exact code and pinned
+- **Severe (red):** only an outcome listed under "What counts as Severe"
+  below, with the mechanism verified against the exact code and pinned
   dependencies involved.
 - **Non-severe:** a real defect with limited blast radius or a narrow trigger.
 - **Investigate/flag, not a bug:** the mechanism depends on an unverified
@@ -37,6 +35,37 @@ Severity is impact times confidence, after the disproof pass below:
   payloads. If it affects code already on `main` or deployed, do not describe
   it publicly: post only a non-sensitive notice that a private report under
   `SECURITY.md` is required.
+
+## What counts as Severe
+
+Severe only when merging the change would cause one of these:
+
+- **Data loss or corruption:** a retry that charges the Postgres flow ledger
+  twice, or an edit to an applied migration in `migrations/`.
+- **Security or auth/authz weakness:** a provider credential logged or
+  echoed in an error from `workers/api`, cross-user library/cache access, or
+  a `crates/nntune-core` parser that allocates from untrusted NZB/yEnc sizes
+  before bounding them.
+- **Production breakage or a broken deploy/rollback gate:** a
+  `deploy-production.yml` stage that fails without restoring the recorded
+  prior version, or a failed staging step in `deploy.yml` counted as
+  acceptance.
+- **Wrong user-visible behavior with no workaround:** a `workers/stream`
+  change that breaks playback for a supported Subsonic client.
+- **A test or gate that can no longer fail:**
+  `.github/scripts/migrations_gate.py` passing unread or malformed input.
+
+Not Severe (use Non-severe): missing edge-case tests (no empty-NZB case),
+naming (a function name in `crates/nntune-subsonic`), docs drift
+(`docs/ops.md` lagging a change), refactor suggestions (splitting
+`nzb.rs`), performance without a measured regression ("this may be slow"
+with no streaming/ingest size), and defensive checks for states the callers
+already prevent (re-validating a URL `nntune-ssrf-guard` already checked).
+
+These labels only grade a finding that already qualifies under "What
+merits a finding", "Test rigor" and "Skip"; they never make an item
+reportable. Most of the Not Severe items are skipped outright, and any
+that is still reported is Non-severe.
 
 ## Disproof pass (before posting any finding)
 
