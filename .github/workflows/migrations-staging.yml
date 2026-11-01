@@ -21,7 +21,16 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Never cancel: Dependabot fires two pull_request events ~1s apart at PR
+  # creation (opened, then edited) for the same head SHA, and cancelling the
+  # first leaves a permanent CANCELLED required check in the rollup next to
+  # its successful twin, which reads as a stuck PR. The job takes seconds,
+  # so queue the duplicate instead — `queue: max` so a third rapid event
+  # cannot cancel a still-pending run either (the default queue keeps only
+  # the newest pending run). Pinned by
+  # .github/scripts/test_ci_required_check_concurrency.py.
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   migrations-staging:
