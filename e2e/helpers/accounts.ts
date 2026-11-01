@@ -584,6 +584,19 @@ export function recordRegisterStartStatus(page: Page): { status: number | null }
 }
 
 /**
+ * Inline-error assertion message naming the `registerStart` HTTP status
+ * (a 5xx store failure, a 4xx refusal, or "not observed" when the request
+ * never got a response, e.g. a transport abort), so a red signup leg
+ * names the failing layer. Status only, never a value.
+ */
+export function signupInlineErrorMessage(registerStatus: { status: number | null }): string {
+  return (
+    'public UI signup showed an inline error: ' +
+    `registerStart HTTP ${registerStatus.status ?? 'not observed'} (names only — no values logged)`
+  );
+}
+
+/**
  * Wait for the signup submit to settle on the code step or the inline
  * error. On timeout, name the state the page is actually in (fixed labels
  * plus the `registerStart` HTTP status), so a rate limit or paywall (the
@@ -648,7 +661,7 @@ export async function submitPublicUiSignup(page: Page, baseURL: string): Promise
   const codeField = page.locator('input[name="magic_code"]');
   const error = page.getByTestId(TESTIDS.signupError);
   await awaitSignupOutcome(page, codeField, error, registerStatus);
-  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+  expect(await error.isVisible().catch(() => false), signupInlineErrorMessage(registerStatus)).toBe(
     false,
   );
   await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({
@@ -796,7 +809,7 @@ export async function submitPublicUiSignupToByopWizard(
   const codeField = page.locator('input[name="magic_code"]');
   const error = page.getByTestId(TESTIDS.signupError);
   await awaitSignupOutcome(page, codeField, error, registerStatus);
-  expect(await error.isVisible().catch(() => false), 'public UI signup showed an inline error').toBe(
+  expect(await error.isVisible().catch(() => false), signupInlineErrorMessage(registerStatus)).toBe(
     false,
   );
   await expect(codeField, 'public UI signup did not reach the emailed-code step').toBeVisible({

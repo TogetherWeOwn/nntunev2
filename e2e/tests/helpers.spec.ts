@@ -1,4 +1,5 @@
 import { test, expect, chromium, type APIRequestContext } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -27,6 +28,7 @@ import {
   tryMintTestAccount,
   awaitSignupOutcome,
   recordRegisterStartStatus,
+  signupInlineErrorMessage,
 } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
@@ -1613,6 +1615,33 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
 // Signup outcome diagnostics (offline, static pages): when neither the code
 // step nor the inline error appears, the failure must name the page state
 // and the registerStart status — never a field value.
+test.describe('signupInlineErrorMessage names the registerStart status', () => {
+  test('an observed status is named', () => {
+    expect(signupInlineErrorMessage({ status: 500 })).toContain('registerStart HTTP 500');
+  });
+
+  test('a request with no response is named as not observed', () => {
+    expect(signupInlineErrorMessage({ status: null })).toContain('registerStart HTTP not observed');
+  });
+
+  // Static pin: both public-signup helpers must assert the inline error
+  // through the formatter, so reverting either one to a constant message
+  // (losing the status on a red staging leg) fails offline.
+  for (const name of ['submitPublicUiSignup', 'submitPublicUiSignupToByopWizard']) {
+    test(`${name} asserts the inline error with the registerStart status`, () => {
+      const source = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+      const marker = `export async function ${name}(`;
+      const start = source.indexOf(marker);
+      expect(start, `${name} is missing`).toBeGreaterThan(-1);
+      const rest = source.slice(start + marker.length);
+      const next = rest.search(/\nexport /);
+      const body = next === -1 ? rest : rest.slice(0, next);
+      expect(body).toContain('signupInlineErrorMessage(registerStatus)');
+      expect(body).not.toContain("'public UI signup showed an inline error'");
+    });
+  }
+});
+
 test.describe('awaitSignupOutcome names the signup page state', () => {
   const page_ = (body: string) =>
     `<!doctype html><html><body><input data-testid="signup-email" value="SENTINEL@example.test" />${body}</body></html>`;
