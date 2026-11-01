@@ -1177,25 +1177,30 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT token_hash, user_id, email, issued_at, expires_at, used \
                  FROM magic_link_tokens WHERE token_hash = $1",
-                        &[&token_hash],
+                        &[(&token_hash, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    Ok(MagicLinkRecord {
-                        token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
-                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                        email: r.try_get("email").map_err(|_| StoreError)?,
-                        issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
-                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                        used: r.try_get("used").map_err(|_| StoreError)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        Ok(MagicLinkRecord {
+                            token_hash: r.try_get("token_hash").map_err(|_| StoreError)?,
+                            user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                            email: r.try_get("email").map_err(|_| StoreError)?,
+                            issued_at: u64_of(r.try_get("issued_at").map_err(|_| StoreError)?)?,
+                            expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
+                            used: r.try_get("used").map_err(|_| StoreError)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1262,21 +1267,26 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                let rows = client
+                    .query_typed(
                         "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
-                        &[&code_hash],
+                        &[(&code_hash, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    Ok(InviteRecord {
-                        code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
-                        used: r.try_get("used").map_err(|_| StoreError)?,
-                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        Ok(InviteRecord {
+                            code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
+                            used: r.try_get("used").map_err(|_| StoreError)?,
+                            created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1992,14 +2002,14 @@ impl Store for PgStore {
         Self::bounded(async {
         let client = self.connect().await?;
         client
-            .execute(
+            .query_typed(
                 "INSERT INTO audit_log (user_id, action, ok, source_ip, at) VALUES ($1, $2, $3, $4, $5)",
                 &[
-                    &event.user_id,
-                    &event.action,
-                    &event.ok,
-                    &event.source_ip,
-                    &i64_of(event.at)?,
+                    (&event.user_id, Type::TEXT),
+                    (&event.action, Type::TEXT),
+                    (&event.ok, Type::BOOL),
+                    (&event.source_ip, Type::TEXT),
+                    (&i64_of(event.at)?, Type::INT8),
                 ],
             )
             .await
