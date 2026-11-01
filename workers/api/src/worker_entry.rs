@@ -764,30 +764,37 @@ async fn claim_single_use_on(
     candidate: SingleUseClaim<'_>,
 ) -> Result<u64, StoreError> {
     let statement = candidate.statement();
-    type Param<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
+    // Unnamed via `query_typed` (TWO-434): registration finish runs these
+    // claims through Hyperdrive, where a named `sN` statement can fail.
+    type Param<'a> = (&'a (dyn tokio_postgres::types::ToSql + Sync), Type);
     let rows = match &candidate {
         SingleUseClaim::MagicLink { record, now } => {
             let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
             let now = i64_of(*now).map_err(|_| StoreError)?;
             let params: [Param<'_>; 5] = [
-                &record.token_hash,
-                &record.user_id,
-                &record.email,
-                &expires,
-                &now,
+                (&record.token_hash, Type::TEXT),
+                (&record.user_id, Type::TEXT),
+                (&record.email, Type::TEXT),
+                (&expires, Type::INT8),
+                (&now, Type::INT8),
             ];
-            client.query(statement, &params[..]).await
+            client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Challenge { record, now } => {
             let expires = i64_of(record.expires_at).map_err(|_| StoreError)?;
             let now = i64_of(*now).map_err(|_| StoreError)?;
-            let params: [Param<'_>; 5] =
-                [&record.id, &record.rp_id, &record.origin, &expires, &now];
-            client.query(statement, &params[..]).await
+            let params: [Param<'_>; 5] = [
+                (&record.id, Type::TEXT),
+                (&record.rp_id, Type::TEXT),
+                (&record.origin, Type::TEXT),
+                (&expires, Type::INT8),
+                (&now, Type::INT8),
+            ];
+            client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Invite { record } => {
-            let params: [Param<'_>; 1] = [&record.code_hash];
-            client.query(statement, &params[..]).await
+            let params: [Param<'_>; 1] = [(&record.code_hash, Type::TEXT)];
+            client.query_typed(statement, &params[..]).await
         }
     }
     .map_err(|_| StoreError)?;
@@ -798,15 +805,15 @@ async fn insert_credential_on(
     client: &impl GenericClient,
     credential: &PasskeyCredential,
 ) -> Result<(), StoreError> {
-    client.execute(
+    client.query_typed(
         "INSERT INTO webauthn_credentials (cred_id, user_id, public_key, sign_count, registered_at) \
          VALUES ($1, $2, $3, $4, $5)",
         &[
-            &credential.cred_id_b64url,
-            &credential.user_id,
-            &credential.public_key.as_slice(),
-            &i64::from(credential.sign_count),
-            &i64_of(credential.registered_at)?,
+            (&credential.cred_id_b64url, Type::TEXT),
+            (&credential.user_id, Type::TEXT),
+            (&credential.public_key.as_slice(), Type::BYTEA),
+            (&i64::from(credential.sign_count), Type::INT8),
+            (&i64_of(credential.registered_at)?, Type::INT8),
         ],
     ).await.map_err(|_| StoreError)?;
     Ok(())
@@ -823,14 +830,17 @@ async fn complete_registration_on(
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     // Reaping locks parents before cascading to proofs. Take the compatible
     // enrollment lock first, so a reaper skips us even after our proofs expire.
-    transaction
-        .query_opt(
+    let parent = transaction
+        .query_typed(
             "SELECT id FROM users WHERE id = $1 FOR KEY SHARE",
-            &[&credential.user_id],
+            &[(&credential.user_id, Type::TEXT)],
         )
         .await
-        .map_err(|_| StoreError)?
-        .ok_or(StoreError)?;
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: exactly one parent row, else the claim fails.
+    if parent.len() != 1 {
+        return Err(StoreError);
+    }
     let mut claims = vec![
         SingleUseClaim::Challenge {
             record: challenge,

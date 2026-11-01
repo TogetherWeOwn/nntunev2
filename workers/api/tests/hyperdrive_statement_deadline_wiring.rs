@@ -405,9 +405,10 @@ fn mint_path_statements_run_unnamed_through_query_typed() {
 fn signup_path_statements_run_unnamed_through_query_typed() {
     // TWO-434: after the mint path went unnamed, staging `register/start`
     // still answered 500 through Hyperdrive. Every statement the public
-    // signup, its mail issuance and the code seam run must stay unnamed
-    // too: the Store methods below plus the shared free helpers they call
-    // (the reaper, the challenge prune and the rate-limit slot claims).
+    // signup start and finish, its mail issuance and the code seam run must
+    // stay unnamed too: the Store methods below plus the shared free helpers
+    // they call (the reaper, the challenge prune, the rate-limit slot
+    // claims and the registration transaction with its single-use claims).
     let source = production();
     let store = source
         .split_once("implStoreforPgStore{")
@@ -430,6 +431,9 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
         "claim_rate_limit_slot",
+        "complete_registration_on",
+        "claim_single_use_on",
+        "insert_credential_on",
     ]
     .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
     for (name, body) in methods.iter().chain(helpers.iter()) {
