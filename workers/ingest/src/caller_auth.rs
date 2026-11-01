@@ -311,6 +311,42 @@ mod tests {
         );
     }
 
+    /// TWO-331: the api Worker's minter (`workers/api/src/ingest_grant.rs`)
+    /// pins the same file, so both sides agree byte for byte.
+    #[test]
+    fn shared_api_vectors_reproduce_and_verify() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/ingest-caller-grant/vectors.json"
+        ))
+        .expect("vectors parse");
+        let vectors = doc["vectors"].as_array().expect("vectors array");
+        assert!(vectors.len() >= 4);
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let secret = v["secret"].as_str().unwrap();
+            let user_id = v["user_id"].as_str().unwrap();
+            let now = v["now_unix"].as_u64().unwrap();
+            let token = v["token"].as_str().unwrap();
+            assert_eq!(
+                issue(
+                    user_id,
+                    INGEST_WRITE_SCOPE,
+                    v["exp_unix"].as_u64().unwrap(),
+                    secret.as_bytes()
+                ),
+                token,
+                "{name}"
+            );
+            assert_eq!(
+                authenticate(Some(&format!("Bearer {token}")), Some(secret), now),
+                Ok(Caller {
+                    user_id: user_id.to_string()
+                }),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn body_user_must_match_the_caller() {
         let caller = Caller {

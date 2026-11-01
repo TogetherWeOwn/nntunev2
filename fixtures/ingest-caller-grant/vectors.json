@@ -1,0 +1,41 @@
+{
+  "_comment": "TWO-331: api ingest_grant::issue_at must mint `token`; ingest caller_auth::issue must reproduce it and verify must accept it at now_unix. Generated with Python hmac (independent of both crates).",
+  "vectors": [
+    {
+      "name": "basic",
+      "secret": "test-secret-test-secret-test-secret!",
+      "user_id": "user_01",
+      "now_unix": 1800000000,
+      "ttl_secs": 600,
+      "exp_unix": 1800000600,
+      "token": "v1.757365725f30317c696e676573743a77726974657c31383030303030363030.a58e3b433bf182d62d490f65857445890f4729e4ab30f35f3bafa7797f02f735"
+    },
+    {
+      "name": "ttl_clamped_to_cap",
+      "secret": "test-secret-test-secret-test-secret!",
+      "user_id": "user_01",
+      "now_unix": 1800000000,
+      "ttl_secs": 86400,
+      "exp_unix": 1800000900,
+      "token": "v1.757365725f30317c696e676573743a77726974657c31383030303030393030.79fd942156207920aab398438a7a23ab39e69d1b86ff5b81e0f6b46dd180111e"
+    },
+    {
+      "name": "at_cap",
+      "secret": "0123456789abcdef0123456789abcdef",
+      "user_id": "3f02f41c-703c-4f20-9b6d-1707ab5fd3c8",
+      "now_unix": 1700000000,
+      "ttl_secs": 900,
+      "exp_unix": 1700000900,
+      "token": "v1.33663032663431632d373033632d346632302d396236642d3137303761623566643363387c696e676573743a77726974657c31373030303030393030.ce52d94245bf0585e08f9550522e08f5e4c8ea637e74f339d11a9ce210c57e5d"
+    },
+    {
+      "name": "long_secret_hashed_key",
+      "secret": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+      "user_id": "user_02",
+      "now_unix": 1750000000,
+      "ttl_secs": 1,
+      "exp_unix": 1750000001,
+      "token": "v1.757365725f30327c696e676573743a77726974657c31373530303030303031.02395614606766039bbafd980fdeb2e39053a8d74938b5bcbf3eab212ef1af12"
+    }
+  ]
+}

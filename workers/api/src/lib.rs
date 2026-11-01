@@ -18,6 +18,7 @@ pub mod auth;
 pub mod b64;
 pub mod billing;
 pub mod handlers;
+pub mod ingest_grant;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
