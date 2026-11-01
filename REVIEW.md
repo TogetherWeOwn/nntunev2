@@ -62,6 +62,11 @@ naming (a function name in `crates/nntune-subsonic`), docs drift
 with no streaming/ingest size), and defensive checks for states the callers
 already prevent (re-validating a URL `nntune-ssrf-guard` already checked).
 
+These labels only grade a finding that already qualifies under "What
+merits a finding", "Test rigor" and "Skip"; they never make an item
+reportable. Most of the Not Severe items are skipped outright, and any
+that is still reported is Non-severe.
+
 ## Disproof pass (before posting any finding)
 
 Try to prove your own candidate wrong first:
