@@ -27,17 +27,24 @@ for (const [capability, pattern] of [
 	});
 }
 
-test('home today: library, favorites and queue are disclosed as not available yet', async ({ page }) => {
+test('home today: library, favorites and a library-backed queue are disclosed as not available yet', async ({ page }) => {
 	// The web app has no /api/library route yet, so /library cannot list
-	// anything; the home must not claim a working library, favorites or queue.
+	// anything; the home must not claim a working library, favorites or
+	// library-backed queue. The demo player's own queue works and may be named.
 	await page.goto('/');
 	const blocks = (await page.getByRole('main').locator('p, li').allInnerTexts())
 		.map(normalize).flatMap((text) => text.split(/[.!?;]+/));
+	const demoQueue = (text: string): boolean =>
+		/\bdemo\b/i.test(text) && /\bqueue\b/i.test(text) && !/\blibrar\w*\b/i.test(text);
 	for (const capability of [/\blibrary\b/i, /\bfavou?rites\b/i, /\bqueue\b/i]) {
-		const mentions = blocks.filter((text) => capability.test(text));
+		const mentions = blocks.filter((text) => capability.test(text) && !demoQueue(text));
 		expect(mentions.length, `${capability}: missing availability disclosure`).toBeGreaterThan(0);
 		for (const text of mentions) expect(text, `${capability}: must be explicitly unavailable`).toMatch(UNAVAILABLE);
 	}
+	// The working demo queue must not be swept into the unavailable disclosure.
+	const demo = blocks.filter(demoQueue);
+	expect(demo.length, 'describe the working demo queue').toBeGreaterThan(0);
+	for (const text of demo) expect(text, 'the demo queue works').not.toMatch(UNAVAILABLE);
 });
 
 test('home today: live provider search-to-stream is explicitly not available', async ({ page }) => {

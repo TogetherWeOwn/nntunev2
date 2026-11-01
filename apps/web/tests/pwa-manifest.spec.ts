@@ -22,7 +22,7 @@ const EXPECTED_MANIFEST = {
 } as const;
 
 const HONEST_TODAY =
-	'Try the demo player without an account. Your library, favorites and queue are not available yet. ' +
+	'Try the demo player and its queue without an account. Your account library, favorites and a library-backed queue are not available yet. ' +
 	'Live search-to-stream over a real provider is not available. Streaming from a real provider is not available. ' +
 	'Offline caching of audio is not available. Browser snapshots store metadata only. ' +
 	'Bring your own Usenet provider account; access is never bundled or resold. Sign up to connect a provider.';
@@ -32,6 +32,7 @@ const UNAVAILABLE =
 const PROVIDER_SCOPE = /\b(?:real|live|Usenet|providers?)\b|\bsearch[- ]to[- ]stream\b/i;
 const UNAVAILABLE_CAPABILITIES = [
 	['library', /\blibrar\w*\b/i],
+	['queue', /\bqueue\w*\b/i],
 	['search', /\bsearch\w*\b/i],
 	['streaming', /\bstream\w*\b/i],
 	['offline caching', /\boffline(?:[- ]friendly)? (?:audio )?cach\w*\b|\boffline (?:audio|music)\b|\b(?:listen|play|enjoy|take your music)\s+(?:anywhere|offline)\b/i]
@@ -53,9 +54,11 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	// affirmative library, real-provider or offline-audio promise. Explicit demo
 	// streaming is not a real-provider chain, but the label cannot excuse one.
 	// The web app has no /api/library route yet, so no library claim is exempt.
+	// The demo player's own queue works; only a library-backed queue is unwired.
 	for (const [capability, pattern] of UNAVAILABLE_CAPABILITIES) {
 		for (const sentence of sentences.filter((sentence) => pattern.test(sentence))) {
 			const demo = /\bdemo\b/i.test(sentence);
+			if (capability === 'queue' && demo && !/\blibrar\w*\b/i.test(sentence)) continue;
 			if ((capability === 'search' || capability === 'streaming') && demo && !PROVIDER_SCOPE.test(sentence)) continue;
 			expect(sentence, `${surface}: ${capability} must be explicitly unavailable`).toMatch(UNAVAILABLE);
 		}
@@ -94,6 +97,25 @@ for (const claim of [
 		);
 	});
 }
+
+for (const claim of [
+	'Your queue follows you across devices.',
+	'Queue tracks from your library.',
+	'Try the demo player and your library queue.'
+]) {
+	test(`rejects an affirmative non-demo queue claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'queue mutant')).toThrow(
+			/(?:queue|library) must be explicitly unavailable/
+		);
+	});
+}
+
+test('accepts the working demo queue', async () => {
+	expect(() => expectHonestPublicCopy(
+		`The demo player has a working queue you can reorder. ${HONEST_TODAY}`,
+		'demo queue control'
+	)).not.toThrow();
+});
 
 test('accepts demo streaming', async () => {
 	expect(() => expectHonestPublicCopy(
