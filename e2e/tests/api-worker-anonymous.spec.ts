@@ -1,14 +1,29 @@
 import { test, expect } from '@playwright/test';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
-import { apiGet, apiOptions, apiPost } from '../helpers/accounts.js';
+import {
+  accessHeaders,
+  assertAccessWall,
+  assertNoAccessWall,
+  stagingBaseUrl,
+} from '../helpers/access.js';
+import { anonymousApiGet, anonymousApiOptions, apiGet, apiPost } from '../helpers/accounts.js';
 
 // Anonymous API Worker contract (no app session by construction): liveness
-// answers 200, vault/session routes answer the generic 401, unknown paths
-// answer the 404 envelope, and known-path preflights answer an empty 204.
+// answers 200, vault/session routes answer the generic 401, and unknown
+// paths answer the 404 envelope.
+//
+// Preflight is an edge concern on staging (TWO-411, option 2): Cloudflare
+// Access answers every OPTIONS itself with a bare 403 and never passes it
+// to the Worker ("Bypass OPTIONS preflight requests to origin" stays off so
+// no unauthenticated request reaches the origin). The live preflight test
+// asserts that edge answer instead of the Worker's. The Worker's own
+// preflight contract (empty 204 on known paths, 404 envelope otherwise, and
+// the exact-Origin CORS grants) is pinned by the Rust unit tests in
+// `workers/api/src/worker_entry.rs`: `render_preserves_empty_preflight_response`
+// and the `cors_headers_*` tests (`cors_headers_preflight_adds_method_and_header_grants`).
 //
 // Sessionless construction here means the Cloudflare Access pair ONLY (no
 // Authorization bearer, no cookies — the Playwright `request` fixture starts
-// cookieless per test). Access itself is the staging edge: every probe below
+// cookieless per test). Access itself is the staging edge: every Worker probe below
 // first clears `assertNoAccessWall`, proving the response came from the
 // Worker rather than the edge wall. The same-origin base serves the Worker
 // paths (`/healthz`, `/v1/*`) exactly like the session specs do
@@ -35,7 +50,7 @@ const ANONYMOUS_401_POST_PATHS = ['/v1/session/refresh', '/v1/session/revoke-all
 /** Unknown-path probe: served by no Worker route, so the catch-all 404 owns it. */
 const UNKNOWN_PATH = '/v1/e2e-probe-no-such-route';
 
-/** Known-path preflight probes: liveness plus the authed surface. */
+/** Known-path preflight probes (answered by Access): liveness plus the authed surface. */
 const PREFLIGHT_PATHS = ['/healthz', '/v1/vault'] as const;
 
 /**
@@ -135,6 +150,52 @@ export function assertGenericAnonymous401(probe: DenialProbe): void {
     throw new Error(
       `[${context}] anonymous 401 body carries a non-generic error message: ` +
         'expected the generic denial (names only — no values logged).',
+    );
+  }
+}
+
+/**
+ * The staging edge preflight verdict: Cloudflare Access's bare 403 for an
+ * anonymous OPTIONS, which never reaches the Worker. The Worker has no 403
+ * path for OPTIONS and answers only an empty 204 or the JSON 404 envelope,
+ * so any of these means the preflight reached it (or something else answered
+ * it): a status other than 403, a non-HTML body, the absence of the bare
+ * Cloudflare 403 page, a CORS grant (`access-control-allow-*`, set only by
+ * the Worker's `cors_headers`), or a cookie. The page carries no Access
+ * markers, so the live test pairs this with `assertAccessWall` on an
+ * anonymous GET of the same path to prove Access is in front. Failures name
+ * the gate and header names only, never a value.
+ */
+export function assertEdgePreflightDenial(probe: DenialProbe): void {
+  const { status, headers, bodyText, context } = probe;
+  if (status !== 403) {
+    throw new Error(
+      `[${context}] expected the edge 403 for an anonymous preflight, got HTTP ${status}: ` +
+        'Access must answer OPTIONS without passing it to the Worker ' +
+        '(names only — no values logged).',
+    );
+  }
+  assertNoSetCookie(headers, context);
+  const grants = Object.keys(headers).filter((name) => /^access-control-allow-/i.test(name));
+  if (grants.length > 0) {
+    throw new Error(
+      `[${context}] edge preflight 403 carries Worker CORS grants (${grants.join(', ')}): ` +
+        'the preflight reached the Worker.',
+    );
+  }
+  const contentType = Object.entries(headers).find(
+    ([name]) => name.toLowerCase() === 'content-type',
+  )?.[1];
+  if (!contentType || !/^text\/html\b/i.test(contentType)) {
+    throw new Error(
+      `[${context}] edge preflight 403 must be the Cloudflare HTML page, ` +
+        'got a non-HTML content type (names only — no values logged).',
+    );
+  }
+  if (!/<title>\s*403 Forbidden\s*<\/title>/i.test(bodyText) || !/>\s*cloudflare\s*</i.test(bodyText)) {
+    throw new Error(
+      `[${context}] edge preflight 403 body is not the bare Cloudflare 403 page ` +
+        `(${bodyText.length} chars received; names only — no values logged).`,
     );
   }
 }
@@ -378,6 +439,77 @@ test.describe('anonymous worker verdicts (offline, no staging)', () => {
     expect(cookie).not.toContain('SENTINEL');
   });
 
+  test('edge preflight verdict accepts the bare Access 403 and rejects Worker answers', () => {
+    const ok = {
+      status: 403,
+      headers: { 'content-type': 'text/html; charset=UTF-8', server: 'cloudflare' },
+      bodyText: '<html>\n<head><title>403 Forbidden</title></head>\n<body>\n<center><h1>403 Forbidden</h1></center>\n<hr><center>cloudflare</center>\n</body>\n</html>\n',
+      context: 'offline',
+    };
+    assertEdgePreflightDenial(ok);
+
+    // The Worker's own answers (empty 204, JSON 404) mean the preflight
+    // reached the origin: exactly what Access must prevent.
+    for (const status of [204, 200, 302, 401, 404]) {
+      expect(
+        () => assertEdgePreflightDenial({ ...ok, status }),
+        `status ${status} must fail`,
+      ).toThrow(/expected the edge 403/);
+    }
+    expect(
+      () =>
+        assertEdgePreflightDenial({
+          ...ok,
+          headers: { ...ok.headers, 'access-control-allow-origin': 'https://SENTINEL' },
+        }),
+      'Worker CORS grants must fail',
+    ).toThrow(/carries Worker CORS grants \(access-control-allow-origin\)/);
+    expect(
+      () =>
+        assertEdgePreflightDenial({
+          ...ok,
+          headers: { 'content-type': 'application/json' },
+          bodyText: '{"code":"forbidden"}',
+        }),
+      'a JSON 403 is an app answer, not the edge page',
+    ).toThrow(/non-HTML content type/);
+    expect(
+      () => assertEdgePreflightDenial({ ...ok, headers: {} }),
+      'a missing content type must fail',
+    ).toThrow(/non-HTML content type/);
+    expect(
+      () => assertEdgePreflightDenial({ ...ok, bodyText: '' }),
+      'an empty 403 must fail',
+    ).toThrow(/not the bare Cloudflare 403 page/);
+    expect(
+      () => assertEdgePreflightDenial({ ...ok, bodyText: '<html><title>403 Forbidden</title>app</html>' }),
+      'an HTML 403 without the Cloudflare signature must fail',
+    ).toThrow(/not the bare Cloudflare 403 page/);
+    let cookie = '';
+    try {
+      assertEdgePreflightDenial({ ...ok, headers: { ...ok.headers, 'set-cookie': 'a=SENTINEL' } });
+    } catch (error) {
+      cookie = (error as Error).message;
+    }
+    expect(cookie, 'denials must not set cookies').toMatch(/must not set a cookie/);
+    expect(cookie).not.toContain('SENTINEL');
+    for (const fn of [
+      () =>
+        assertEdgePreflightDenial({
+          ...ok,
+          headers: { ...ok.headers, 'access-control-allow-origin': 'https://SENTINEL' },
+        }),
+      () => assertEdgePreflightDenial({ ...ok, bodyText: 'SENTINEL' }),
+    ]) {
+      expect(fn).toThrow();
+      try {
+        fn();
+      } catch (error) {
+        expect((error as Error).message).not.toContain('SENTINEL');
+      }
+    }
+  });
+
   test('probe paths stay pinned to the anonymous Worker contract', () => {
     // These assertions pin the paths used by the live probes.
     // Configured staging legs check them against the served Worker.
@@ -521,42 +653,31 @@ test.describe('anonymous API Worker contract (staging)', () => {
     assertNotFoundEnvelope({ status: res.status(), headers: res.headers(), bodyText, context });
   });
 
-  test('OPTIONS preflight on known worker paths answers 204 with an empty body', async ({
-    request,
-  }) => {
+  test('anonymous OPTIONS preflight is answered by Access and never reaches the Worker', async () => {
     const baseURL = stagingBaseUrl('skip', 'api-worker-preflight');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
-    // Same-origin preflight (not a cross-origin CORS probe): the Worker
-    // answers 204 with an empty body for known paths regardless of Origin.
-    // The credentialed CORS header contract (exact-Origin allow-list) is
-    // unit-tested in `workers/api/src/worker_entry.rs` (`cors_headers_*`);
-    // the E2E job does not receive the Worker's configured origin, so no
-    // Allow-* headers are asserted here.
-    const headers: Record<string, string> = {
-      ...accessHeaders(),
+    // Same-origin browser-shaped preflight from a fresh anonymous context:
+    // no Access pair, no bearer, no cookies, no follow. Access answers it at
+    // the edge (TWO-411 option 2). The Worker's preflight contract is
+    // unit-tested in `workers/api/src/worker_entry.rs` (see file header).
+    const corsHeaders: Record<string, string> = {
       Origin: new URL(baseURL).origin,
       'Access-Control-Request-Method': 'GET',
       'Access-Control-Request-Headers': 'content-type',
     };
-    expect(headers['Authorization'], 'worker probe must carry no app session').toBeUndefined();
 
     for (const path of PREFLIGHT_PATHS) {
       const context = `api-worker-preflight ${path}`;
-      const res = await apiOptions(request, `${baseURL}${path}`, headers, context);
-      const bodyText = await res.text().catch(() => '');
-      assertNoAccessWall(
-        { status: res.status(), headers: res.headers(), bodyText, url: `${baseURL}${path}` },
-        context,
-      );
-      expect(
-        res.status(),
-        `[${context}] preflight for a known worker path must answer 204`,
-      ).toBe(204);
-      expect(bodyText.length, `[${context}] preflight must carry an empty body`).toBe(0);
-      assertNoSetCookie(res.headers(), context);
+      const preflight = await anonymousApiOptions(`${baseURL}${path}`, corsHeaders, context);
+      assertEdgePreflightDenial({ ...preflight, context });
+
+      // The bare 403 carries no Access markers, so prove Access is the edge
+      // on the same path: an anonymous GET must hit the Access wall.
+      const gate = await anonymousApiGet(`${baseURL}${path}`, `${context} access-gate`);
+      assertAccessWall(gate, `${context} access-gate`);
     }
   });
 });

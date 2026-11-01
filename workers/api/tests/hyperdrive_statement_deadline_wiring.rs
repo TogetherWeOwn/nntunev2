@@ -357,6 +357,51 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
 }
 
 #[test]
+fn mint_path_statements_run_unnamed_through_query_typed() {
+    // TWO-222: tokio-postgres names prepared statements `sN` per isolate, and
+    // a named statement can collide on, or go missing from, a
+    // Hyperdrive-pooled backend between round-trips. The mint seam's three
+    // statements must stay unnamed (`query_typed`); reverting any of them to
+    // a named-preparing call fails here, not as a staging 500.
+    let source = production();
+    let store = source
+        .split_once("implStoreforPgStore{")
+        .expect("Store impl")
+        .1
+        .split_once("implSingleUseStoreforPgStore{")
+        .expect("SingleUseStore impl bounds the Store impl")
+        .0;
+    let mut pieces = store.split("asyncfn");
+    pieces.next().expect("preamble before the first method");
+    let pieces: Vec<&str> = pieces.collect();
+    for name in ["user_by_email", "insert_user", "insert_session"] {
+        let piece = pieces
+            .iter()
+            .find(|piece| method_name(piece) == name)
+            .unwrap_or_else(|| panic!("{name} piece"));
+        assert_eq!(
+            piece.matches(".query_typed(").count(),
+            1,
+            "{name} must run exactly one unnamed query_typed statement"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(
+                !piece.contains(named),
+                "{name} must not run a named prepared statement ({named})"
+            );
+        }
+    }
+}
+
+#[test]
 fn seam_delegates_to_the_shared_helper_with_the_opaque_error() {
     let source = production();
     let pgstore = source
