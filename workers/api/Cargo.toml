@@ -64,7 +64,7 @@ name = "session_refresh_postgres"
 required-features = ["postgres-tests"]
 
 [dev-dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 # Test-only RNG for the KEK rotation acceptance fixtures (native tests only;
 # the crate itself uses getrandom, so this never ships to wasm32).
