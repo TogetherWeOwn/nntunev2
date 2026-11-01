@@ -8,6 +8,10 @@ const STALE_BLANKET =
 	/search,?\s+streaming,?\s+library management\s+and\s+offline caching\s+are not wired yet/i;
 const UNAVAILABLE =
 	/\b(?:not (?:yet )?(?:available|supported|working|wired|ready|implemented)|not wired(?: up)? yet|unavailable|unsupported|does not|doesn't|cannot|can't|no live|no offline)\b/i;
+// The demo queue lives in this tab's sessionStorage: it does not sync, follow
+// you to another device or browser, or persist beyond the session.
+const DEMO_QUEUE_OVERREACH =
+	/\b(?:sync\w*|(?:across|other|another|every|any|all)\s+(?:of\s+)?(?:your\s+)?(?:devices?|browsers?)|cloud|follows?\s+you|back(?:ed)?[- ]?up\w*|permanent\w*|forever|server\w*|offline)\b/i;
 const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim();
 
 for (const [capability, pattern] of [
@@ -30,12 +34,14 @@ for (const [capability, pattern] of [
 test('home today: library, favorites and a library-backed queue are disclosed as not available yet', async ({ page }) => {
 	// The web app has no /api/library route yet, so /library cannot list
 	// anything; the home must not claim a working library, favorites or
-	// library-backed queue. The demo player's own queue works and may be named.
+	// library-backed queue. The demo player's own queue works and may be named,
+	// but only as a session-local queue: sync or cross-device claims are not exempt.
 	await page.goto('/');
 	const blocks = (await page.getByRole('main').locator('p, li').allInnerTexts())
 		.map(normalize).flatMap((text) => text.split(/[.!?;]+/));
 	const demoQueue = (text: string): boolean =>
-		/\bdemo\b/i.test(text) && /\bqueue\b/i.test(text) && !/\blibrar\w*\b/i.test(text);
+		/\bdemo\b/i.test(text) && /\bqueue\b/i.test(text) && !/\blibrar\w*\b/i.test(text) &&
+		!DEMO_QUEUE_OVERREACH.test(text);
 	for (const capability of [/\blibrary\b/i, /\bfavou?rites\b/i, /\bqueue\b/i]) {
 		const mentions = blocks.filter((text) => capability.test(text) && !demoQueue(text));
 		expect(mentions.length, `${capability}: missing availability disclosure`).toBeGreaterThan(0);

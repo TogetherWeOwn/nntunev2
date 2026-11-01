@@ -29,6 +29,10 @@ const HONEST_TODAY =
 
 const UNAVAILABLE =
 	/\b(?:not (?:yet )?(?:available|supported|working|wired|ready|implemented)|not wired(?: up)? yet|unavailable|unsupported|does not|doesn't|cannot|can't|no live|no offline)\b/i;
+// The demo queue lives in this tab's sessionStorage: it does not sync, follow
+// you to another device or browser, or persist beyond the session.
+const DEMO_QUEUE_OVERREACH =
+	/\b(?:sync\w*|(?:across|other|another|every|any|all)\s+(?:of\s+)?(?:your\s+)?(?:devices?|browsers?)|cloud|follows?\s+you|back(?:ed)?[- ]?up\w*|permanent\w*|forever|server\w*|offline)\b/i;
 const PROVIDER_SCOPE = /\b(?:real|live|Usenet|providers?)\b|\bsearch[- ]to[- ]stream\b/i;
 const UNAVAILABLE_CAPABILITIES = [
 	['library', /\blibrar\w*\b/i],
@@ -55,10 +59,11 @@ function expectHonestPublicCopy(copy: unknown, surface: string): void {
 	// streaming is not a real-provider chain, but the label cannot excuse one.
 	// The web app has no /api/library route yet, so no library claim is exempt.
 	// The demo player's own queue works; only a library-backed queue is unwired.
+	// The demo queue is session-local, so a demo sync or cross-device claim is not exempt.
 	for (const [capability, pattern] of UNAVAILABLE_CAPABILITIES) {
 		for (const sentence of sentences.filter((sentence) => pattern.test(sentence))) {
 			const demo = /\bdemo\b/i.test(sentence);
-			if (capability === 'queue' && demo && !/\blibrar\w*\b/i.test(sentence)) continue;
+			if (capability === 'queue' && demo && !/\blibrar\w*\b/i.test(sentence) && !DEMO_QUEUE_OVERREACH.test(sentence)) continue;
 			if ((capability === 'search' || capability === 'streaming') && demo && !PROVIDER_SCOPE.test(sentence)) continue;
 			expect(sentence, `${surface}: ${capability} must be explicitly unavailable`).toMatch(UNAVAILABLE);
 		}
@@ -116,6 +121,19 @@ test('accepts the working demo queue', async () => {
 		'demo queue control'
 	)).not.toThrow();
 });
+
+for (const claim of [
+	'The demo queue follows you across devices.',
+	'The demo queue syncs to your other browsers.',
+	'The demo player saves its queue to the cloud.',
+	'The demo queue is backed up permanently.'
+]) {
+	test(`rejects an unsupported demo queue claim: ${claim}`, async () => {
+		expect(() => expectHonestPublicCopy(`${claim} ${HONEST_TODAY}`, 'demo queue mutant')).toThrow(
+			'queue must be explicitly unavailable'
+		);
+	});
+}
 
 test('accepts demo streaming', async () => {
 	expect(() => expectHonestPublicCopy(
