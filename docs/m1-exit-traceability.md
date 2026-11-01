@@ -71,7 +71,7 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   to the MB-match milestone, not the M1 exit list: after the journey
   completes, the library track must carry a non-empty `recording_mbids`
   list filled by the release-to-recordings route, pinned offline by
-  `e2e/tests/helpers.spec.ts:1286` (`isMbid`), `:1141`
+  `e2e/tests/helpers.spec.ts:1287` (`isMbid`), `:1141`
   (`extractLibraryItems`) and `:1163` (`extractRecordingMbids`). The live
   leg is FIXMEd until the staging MB mirror can match the synthetic
   fixture (see the spec comment for the un-fixme paths); it sits below

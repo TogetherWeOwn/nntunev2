@@ -1,4 +1,5 @@
 import { test, expect, chromium, type APIRequestContext } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -1622,6 +1623,23 @@ test.describe('signupInlineErrorMessage names the registerStart status', () => {
   test('a request with no response is named as not observed', () => {
     expect(signupInlineErrorMessage({ status: null })).toContain('registerStart HTTP not observed');
   });
+
+  // Static pin: both public-signup helpers must assert the inline error
+  // through the formatter, so reverting either one to a constant message
+  // (losing the status on a red staging leg) fails offline.
+  for (const name of ['submitPublicUiSignup', 'submitPublicUiSignupToByopWizard']) {
+    test(`${name} asserts the inline error with the registerStart status`, () => {
+      const source = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
+      const marker = `export async function ${name}(`;
+      const start = source.indexOf(marker);
+      expect(start, `${name} is missing`).toBeGreaterThan(-1);
+      const rest = source.slice(start + marker.length);
+      const next = rest.search(/\nexport /);
+      const body = next === -1 ? rest : rest.slice(0, next);
+      expect(body).toContain('signupInlineErrorMessage(registerStatus)');
+      expect(body).not.toContain("'public UI signup showed an inline error'");
+    });
+  }
 });
 
 test.describe('awaitSignupOutcome names the signup page state', () => {
