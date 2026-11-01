@@ -30,7 +30,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Never cancel: Dependabot fires two pull_request events ~1s apart at PR
+  # creation (opened, then edited) for the same head SHA, and cancelling the
+  # first leaves a permanent CANCELLED required check in the rollup next to
+  # its successful twin, which reads as a stuck PR. The job takes seconds,
+  # so queue the duplicate instead.
+  cancel-in-progress: false
 
 jobs:
   pr-lint:
