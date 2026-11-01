@@ -15,6 +15,7 @@ use crate::auth::MagicLinkRecord;
 use crate::handlers::StoreError;
 use crate::session::SessionRecord;
 use crate::vault::AuditEvent;
+use tokio_postgres::types::Type;
 
 pub(crate) trait RedemptionTransaction: Sized {
     /// Bound statement execution on the database side, inside this
@@ -97,14 +98,34 @@ const INSERT_AUDIT: &str =
 const PG_DB_NOW: &str = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT";
 const PG_USER_ROW_LOCK: &str = " FOR KEY SHARE";
 
-fn pg_params<'a>(params: &'a [Param<'a>]) -> Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)> {
+/// Typed binds for unnamed `query_typed` execution (TWO-539, same
+/// Hyperdrive reason as the mint and signup paths): one unnamed
+/// Parse/Bind/Execute/Sync round-trip per statement, so no `sN`
+/// prepared-statement name can collide on, or go missing from, a
+/// pooled backend. Each variant's `Type` matches the migration column
+/// it binds (0002: TEXT/BIGINT/INTEGER/BOOLEAN).
+fn pg_params<'a>(
+    params: &'a [Param<'a>],
+) -> Vec<(&'a (dyn tokio_postgres::types::ToSql + Sync), Type)> {
     params
         .iter()
         .map(|param| match param {
-            Param::Text(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
-            Param::Int64(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
-            Param::Int32(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
-            Param::Bool(value) => value as &(dyn tokio_postgres::types::ToSql + Sync),
+            Param::Text(value) => (
+                value as &(dyn tokio_postgres::types::ToSql + Sync),
+                Type::TEXT,
+            ),
+            Param::Int64(value) => (
+                value as &(dyn tokio_postgres::types::ToSql + Sync),
+                Type::INT8,
+            ),
+            Param::Int32(value) => (
+                value as &(dyn tokio_postgres::types::ToSql + Sync),
+                Type::INT4,
+            ),
+            Param::Bool(value) => (
+                value as &(dyn tokio_postgres::types::ToSql + Sync),
+                Type::BOOL,
+            ),
         })
         .collect()
 }
@@ -126,7 +147,7 @@ impl RedemptionTransaction for tokio_postgres::Transaction<'_> {
         let statement = claim_statement(PG_DB_NOW, PG_USER_ROW_LOCK);
         let params = claim_params(magic)?;
         let params = pg_params(&params);
-        self.query(statement.as_str(), params.as_slice())
+        self.query_typed(statement.as_str(), params.as_slice())
             .await
             .map(|rows| rows.len())
             .map_err(|_| StoreError)
@@ -135,7 +156,7 @@ impl RedemptionTransaction for tokio_postgres::Transaction<'_> {
     async fn insert_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         let params = session_params(session)?;
         let params = pg_params(&params);
-        self.execute(INSERT_SESSION, params.as_slice())
+        self.query_typed(INSERT_SESSION, params.as_slice())
             .await
             .map(|_| ())
             .map_err(|_| StoreError)
@@ -144,7 +165,7 @@ impl RedemptionTransaction for tokio_postgres::Transaction<'_> {
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
         let params = audit_params(event)?;
         let params = pg_params(&params);
-        self.execute(INSERT_AUDIT, params.as_slice())
+        self.query_typed(INSERT_AUDIT, params.as_slice())
             .await
             .map(|_| ())
             .map_err(|_| StoreError)

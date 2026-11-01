@@ -462,6 +462,87 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
 }
 
 #[test]
+fn magic_finish_path_statements_run_unnamed_through_query_typed() {
+    // TWO-539: after the signup path went unnamed, staging magic-link
+    // finish still answered 500 through Hyperdrive (login-magic-link and
+    // sign-out-everywhere on run 41278067667). Every statement those two
+    // legs run must stay unnamed too: the redemption transaction's claim,
+    // session insert and audit insert (in `magic_redemption.rs`, not
+    // `worker_entry.rs`), plus the Store methods the legs hit next —
+    // the session and vault reads behind `authenticate`/`GET /v1/vault`,
+    // and the two revoke-all sweeps. The finish path's rate-limit claim
+    // and `magic_by_hash` are already pinned by the signup test above.
+    const NAMED: [&str; 7] = [
+        ".query(",
+        ".query_one(",
+        ".query_opt(",
+        ".query_raw(",
+        ".execute(",
+        ".execute_raw(",
+        ".prepare",
+    ];
+    let source = production();
+    let store = source
+        .split_once("implStoreforPgStore{")
+        .expect("Store impl")
+        .1
+        .split_once("implSingleUseStoreforPgStore{")
+        .expect("SingleUseStore impl bounds the Store impl")
+        .0;
+    for name in [
+        "session_by_id",
+        "vault_by_user",
+        "revoke_all_sessions",
+        "revoke_all_native_credentials",
+    ] {
+        let body = function_body(store, &format!("asyncfn{name}("));
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must run its statements unnamed via query_typed"
+        );
+        for named in NAMED {
+            assert!(
+                !body.contains(named),
+                "{name} must not run a named prepared statement ({named})"
+            );
+        }
+    }
+    // The production redemption transaction lives outside worker_entry:
+    // slice its `tokio_postgres::Transaction` impl (comments stripped,
+    // whitespace normalized, like `production()` above) and pin the
+    // same rule. `SET LOCAL` stays on `batch_execute` (simple-query
+    // protocol, never a named prepared statement).
+    let redemption: String = include_str!("../src/magic_redemption.rs")
+        .split_once("#[cfg(all(test,")
+        .expect("magic_redemption test-module boundary")
+        .0
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<String>()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let pg_impl = redemption
+        .split_once("implRedemptionTransactionfortokio_postgres::Transaction<'_>{")
+        .expect("production redemption transaction impl")
+        .1
+        .split_once("pub(crate)asyncfnredeem(")
+        .expect("redeem bounds the transaction impl")
+        .0;
+    assert_eq!(
+        pg_impl.matches(".query_typed(").count(),
+        3,
+        "claim, session insert and audit insert must each run unnamed via query_typed"
+    );
+    for named in NAMED {
+        assert!(
+            !pg_impl.contains(named),
+            "redemption transaction must not run a named prepared statement ({named})"
+        );
+    }
+}
+
+#[test]
 fn seam_delegates_to_the_shared_helper_with_the_opaque_error() {
     let source = production();
     let pgstore = source

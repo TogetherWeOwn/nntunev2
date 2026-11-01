@@ -1360,26 +1360,34 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-                    .query_opt(
+                // Unnamed via `query_typed` (TWO-539): every authenticated
+                // request runs this lookup through Hyperdrive, where a
+                // named `sN` statement can fail on a pooled backend.
+                let rows = client
+                    .query_typed(
                         "SELECT id, user_id, created_at, expires_at, rotation_counter, revoked \
                  FROM sessions WHERE id = $1",
-                        &[&id],
+                        &[(&id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                row.map(|r| {
-                    let counter: i32 = r.try_get("rotation_counter").map_err(|_| StoreError)?;
-                    Ok(SessionRecord {
-                        id: r.try_get("id").map_err(|_| StoreError)?,
-                        user_id: r.try_get("user_id").map_err(|_| StoreError)?,
-                        created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
-                        expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
-                        rotation_counter: u32::try_from(counter).map_err(|_| StoreError)?,
-                        revoked: r.try_get("revoked").map_err(|_| StoreError)?,
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|r| {
+                        let counter: i32 = r.try_get("rotation_counter").map_err(|_| StoreError)?;
+                        Ok(SessionRecord {
+                            id: r.try_get("id").map_err(|_| StoreError)?,
+                            user_id: r.try_get("user_id").map_err(|_| StoreError)?,
+                            created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
+                            expires_at: u64_of(r.try_get("expires_at").map_err(|_| StoreError)?)?,
+                            rotation_counter: u32::try_from(counter).map_err(|_| StoreError)?,
+                            revoked: r.try_get("revoked").map_err(|_| StoreError)?,
+                        })
                     })
-                })
-                .transpose()
+                    .transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1527,10 +1535,12 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends); the affected count was never read here.
                 client
-                    .execute(
+                    .query_typed(
                         "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",
-                        &[&user_id],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -1693,15 +1703,18 @@ impl Store for PgStore {
                     return Ok(0);
                 }
                 let client = self.connect().await?;
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends); `RETURNING id` keeps the revoked count the
+                // `execute` result used to carry.
                 let revoked = client
-                    .execute(
+                    .query_typed(
                         "UPDATE native_rest_credentials SET revoked_at = $2 \
-                 WHERE user_id = $1 AND revoked_at IS NULL",
-                        &[&user_id, &i64_of(now)?],
+                 WHERE user_id = $1 AND revoked_at IS NULL RETURNING id",
+                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
-                Ok(revoked)
+                Ok(revoked.len() as u64)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1730,15 +1743,21 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                let row = client
-            .query_opt(
-                "SELECT kek_version, dek_wrapped_nonce, dek_wrapped, payload_nonce, payload, \
+                // Unnamed via `query_typed` (TWO-539, Hyperdrive pooled
+                // backends).
+                let rows = client
+                    .query_typed(
+                        "SELECT kek_version, dek_wrapped_nonce, dek_wrapped, payload_nonce, payload, \
                  indexer_configured, updated_at FROM provider_vaults WHERE user_id = $1",
-                &[&user_id],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-                row.map(|r| {
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(|r| {
                     let kek_version: i32 = r.try_get("kek_version").map_err(|_| StoreError)?;
                     Ok(VaultRow {
                         blob: VaultBlob {
