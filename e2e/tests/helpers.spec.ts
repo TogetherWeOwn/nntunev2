@@ -24,6 +24,8 @@ import {
   requireApiAccount,
   signupPathLabel,
   tryMintTestAccount,
+  awaitSignupOutcome,
+  recordRegisterStartStatus,
 } from '../helpers/accounts.js';
 
 // Helper self-tests (pure functions only): no browser page, no staging.
@@ -1503,5 +1505,101 @@ test.describe('plan-limit refusal verdict (offline pins)', () => {
         context: 'plan-limit-stream',
       }),
     ).toThrow(/retryable flag disagrees/);
+  });
+});
+
+// Signup outcome diagnostics (offline, static pages): when neither the code
+// step nor the inline error appears, the failure must name the page state
+// and the registerStart status — never a field value.
+test.describe('awaitSignupOutcome names the signup page state', () => {
+  const page_ = (body: string) =>
+    `<!doctype html><html><body><input data-testid="signup-email" value="SENTINEL@example.test" />${body}</body></html>`;
+  const failure = async (
+    page: import('@playwright/test').Page,
+    body: string,
+    status: number | null,
+  ): Promise<string> => {
+    await page.setContent(page_(body));
+    try {
+      await awaitSignupOutcome(
+        page,
+        page.locator('input[name="magic_code"]'),
+        page.getByTestId('signup-error'),
+        { status },
+        200,
+      );
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return '';
+  };
+
+  test('code step or inline error settles without throwing', async ({ page }) => {
+    expect(await failure(page, '<input name="magic_code" />', 200)).toBe('');
+    expect(await failure(page, '<p data-testid="signup-error">x</p>', 500)).toBe('');
+  });
+
+  test('plan-limit notice names a paywall/limit answer and its status', async ({ page }) => {
+    const message = await failure(page, '<dialog open data-testid="plan-limit-notice">limit</dialog>', 429);
+    expect(message).toContain('plan-limit notice open');
+    expect(message).toContain('registerStart HTTP 429');
+    expect(message).not.toContain('SENTINEL');
+  });
+
+  test('pending request names the sending state', async ({ page }) => {
+    const message = await failure(page, '<p role="status">Sending your email code…</p>', null);
+    expect(message).toContain('still sending');
+    expect(message).toContain('registerStart HTTP not observed');
+  });
+
+  test('the registerStart observer feeds the real response status to the diagnostic', async ({
+    page,
+  }) => {
+    // A local page whose submit POSTs registerStart and gets a 429, like a
+    // rate-limited staging answer; the page then shows nothing.
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/v1/auth/passkey/register/start') {
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end('{"code":"rate_limited"}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(
+        '<!doctype html><html><body><button id="go">go</button><script>' +
+          "document.getElementById('go').onclick = () => " +
+          "fetch('/v1/auth/passkey/register/start', { method: 'POST' });" +
+          '</script></body></html>',
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await page.goto(`http://127.0.0.1:${port}/`);
+      const registerStatus = recordRegisterStartStatus(page);
+      await page.locator('#go').click();
+      await expect.poll(() => registerStatus.status).toBe(429);
+      let message = '';
+      try {
+        await awaitSignupOutcome(
+          page,
+          page.locator('input[name="magic_code"]'),
+          page.getByTestId('signup-error'),
+          registerStatus,
+          200,
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain('registerStart HTTP 429');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test('unsupported passkeys and a bare email step are named', async ({ page }) => {
+    expect(
+      await failure(page, '<p role="status">This browser does not support passkeys.</p>', null),
+    ).toContain('passkeys unsupported');
+    expect(await failure(page, '', 201)).toContain('back at the email step with no status');
   });
 });
