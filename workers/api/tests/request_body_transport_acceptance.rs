@@ -433,6 +433,7 @@ fn transport_failure_never_invokes_the_handler() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -461,6 +462,7 @@ fn oversized_never_invokes_the_handler() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -490,6 +492,7 @@ fn complete_invokes_the_handler_once_with_exactly_the_collected_bytes() {
                     body: "from-handler".to_string(),
                     set_cookie: Some("cookie".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -524,6 +527,7 @@ fn complete_empty_invokes_the_handler_with_an_empty_body() {
                     body: "ok".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -1168,8 +1172,13 @@ fn worker_entry_dispatch_uses_the_tested_collection_and_gate() {
         .expect("worker dispatch entry exists");
     let dispatch_code = &code[dispatch_at..];
     assert!(
-        dispatch_code.contains("collect_body("),
-        "Worker dispatch must collect through the tested collect_body seam"
+        dispatch_code.contains("collect_body_with_cap("),
+        "Worker dispatch must collect through the tested collection seam"
+    );
+    assert!(
+        dispatch_code.contains("handlers::max_body_bytes("),
+        "Worker dispatch must pass the per-route bound (not a literal cap) \
+         so collection cannot drift from the in-handler gate"
     );
     assert!(
         dispatch_code.contains("dispatch_collected("),

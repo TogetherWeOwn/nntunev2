@@ -162,10 +162,11 @@ How the suite uses them:
   shell. The credentialed app-shell test in the same file is the authorized
   control. The anonymous probe changes no Access policy, needs no
   credential, and never emits response bodies, headers or cookies.
-- Test-account sessions minted by the seam travel as
-  `Authorization: Bearer <session>` (contract owned by the auth card —
-  `helpers/accounts.ts` names it; cookie sessions would update the helper +
-  specs together).
+- Test-account sessions minted by the seam travel as the `__Host-`
+  session cookie in browser pages (planted by `applyAccountToPage` — the
+  only credential session routes such as `POST /v1/vault/*` accept) and as
+  `Authorization: Bearer <session>` in account-specific API calls (contract
+  owned by the auth card — `helpers/accounts.ts` names it).
 - Test accounts are throwaway (`e2e+<stamp>@example.test`); the API seam is
   tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there

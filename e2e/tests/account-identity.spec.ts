@@ -2,7 +2,9 @@ import { test, expect, type APIRequestContext, type Page } from '@playwright/tes
 import {
   accountHeaders,
   applyAccountToPage,
+  browserSessionCookie,
   requireApiAccount,
+  SESSION_COOKIE_NAME,
   tryMintTestAccount,
   type TestAccount,
 } from '../helpers/accounts.js';
@@ -47,17 +49,24 @@ import {
 //     to the QA token. Every accountHeaders caller is account-specific.
 //
 // applyAccountToPage(page, account, baseURL):
-//   - `null` stays allowed (Access-only routing for the UI-signup fallback
-//     and health checks): staging-origin requests carry the Access pair
-//     only, no Authorization, no QA token.
+//   - `null` plants no cookie (clearing any earlier plant, so a re-applied
+//     page cannot leak the previous identity) and stays allowed
+//     (Access-only routing for the UI-signup fallback and health checks):
+//     staging-origin requests carry the Access pair only, no Authorization,
+//     no QA token.
 //   - A non-null account without a nonblank session THROWS naming the
-//     missing session/credential BEFORE any route is registered — a
-//     sessionless minted account must not silently become the page's
-//     (non-)identity for account-specific browser assertions.
-//   - With a session: staging-origin requests are fetched with
+//     missing session/credential BEFORE any route is registered or cookie
+//     planted — a sessionless minted account must not silently become the
+//     page's (non-)identity for account-specific browser assertions.
+//   - With a session: the minted session is planted as the `__Host-`
+//     session cookie (pinned name, host-only origin scope, `Path=/`,
+//     `Secure`, `HttpOnly`, `SameSite=Lax` — the only credential session
+//     routes accept), and staging-origin requests are fetched with
 //     maxRedirects: 0 carrying `Bearer <session>` (never the QA token);
 //     foreign-origin requests continue unmodified (origin scoping and
 //     no-follow protections preserved).
+//   - Non-https origins (the offline http doubles) get no cookie plant:
+//     `__Host-` is Secure-only and the browser would reject it there.
 //
 // Account isolation: two minted accounts (including a distinct capped /
 // `plan` account) keep distinct emails and credentials; each account's
@@ -405,17 +414,41 @@ function fakeRoute(url: string, method = 'GET'): { route: unknown; record: FakeR
 
 type RouteHandler = (route: unknown) => Promise<void>;
 
-function fakePage(): { page: Page; handler: () => RouteHandler | undefined } {
+interface FakeCookiePlant {
+  name: string;
+  value: string;
+  url: string;
+  secure?: boolean;
+  httpOnly?: boolean;
+  sameSite?: string;
+}
+
+function fakePage(): {
+  page: Page;
+  handler: () => RouteHandler | undefined;
+  cookies: FakeCookiePlant[];
+  cleared: () => number;
+} {
   let routeHandler: RouteHandler | undefined;
+  const cookies: FakeCookiePlant[] = [];
+  let cleared = 0;
   const context = {
     unrouteAll: async () => undefined,
     route: async (_pattern: string, handler: RouteHandler) => {
       routeHandler = handler;
     },
+    addCookies: async (plants: FakeCookiePlant[]) => {
+      cookies.push(...plants);
+    },
+    clearCookies: async () => {
+      cleared += 1;
+    },
   };
   return {
     page: { context: () => context } as unknown as Page,
     handler: () => routeHandler,
+    cookies,
+    cleared: () => cleared,
   };
 }
 
@@ -428,10 +461,22 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
   test('session account: staging origin gets its bearer (no QA token), foreign origin continues clean', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler } = fakePage();
+      const { page, handler, cookies, cleared } = fakePage();
       await applyAccountToPage(page, sessionAccount(), BASE);
+      expect(cleared(), 'a planted session must not clear cookies').toBe(0);
       const routeHandler = handler();
       expect(routeHandler, 'no route registered for a session account').toBeDefined();
+
+      // The minted session rides as the `__Host-` session cookie: pinned
+      // name, host-only origin scope, Secure/HttpOnly/Lax. The value is
+      // compared as an opaque token — never logged, never split.
+      expect(cookies).toHaveLength(1);
+      expect(cookies[0]?.name).toBe(SESSION_COOKIE_NAME);
+      expect(cookies[0]?.value).toBe('sentinel-session-a');
+      expect(cookies[0]?.url).toBe(`${BASE}/`);
+      expect(cookies[0]?.secure).toBe(true);
+      expect(cookies[0]?.httpOnly).toBe(true);
+      expect(cookies[0]?.sameSite).toBe('Lax');
 
       const staging = fakeRoute(`${BASE}/library`);
       await routeHandler!(staging.route);
@@ -449,10 +494,16 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
   test('null account stays Access-only (UI-signup fallback): no Authorization outside auth-start POSTs', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler } = fakePage();
+      const { page, handler, cookies, cleared } = fakePage();
       await applyAccountToPage(page, null, BASE);
       const routeHandler = handler();
       expect(routeHandler, 'no Access-only route registered for null account').toBeDefined();
+      expect(cookies, 'anonymous page must plant no session cookie').toHaveLength(0);
+      // A re-applied null must not inherit an earlier identity's cookie.
+      await applyAccountToPage(page, sessionAccount(), BASE);
+      expect(cookies).toHaveLength(1);
+      await applyAccountToPage(page, null, BASE);
+      expect(cleared(), 'null re-apply must clear the planted session cookie').toBeGreaterThan(0);
 
       const staging = fakeRoute(`${BASE}/signup`);
       await routeHandler!(staging.route);
@@ -471,21 +522,40 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
   test('a non-null sessionless account throws before any route is registered', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler } = fakePage();
+      const { page, handler, cookies } = fakePage();
       await expect(
         applyAccountToPage(page, { email: 'setup-only@example.test', viaApi: true }, BASE),
       ).rejects.toThrow(/session|credential|minted/i);
       expect(handler()).toBeUndefined();
+      expect(cookies, 'throwing account must plant no session cookie').toHaveLength(0);
     });
   });
 
   test('a blank-session account throws before any route is registered', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler } = fakePage();
+      const { page, handler, cookies } = fakePage();
       await expect(
         applyAccountToPage(page, sessionAccount({ session: '   ' }), BASE),
       ).rejects.toThrow(/session|credential|minted/i);
       expect(handler()).toBeUndefined();
+      expect(cookies, 'blank-session account must plant no session cookie').toHaveLength(0);
     });
+  });
+
+  test('browserSessionCookie pins the host-only Secure scope on https, nothing elsewhere', () => {
+    // Pinned scope: the `__Host-` plant the server accepts (no Domain, Path
+    // from the origin root, Secure + HttpOnly + Lax).
+    const plant = browserSessionCookie('sentinel-session-a', BASE);
+    expect(plant?.name).toBe(SESSION_COOKIE_NAME);
+    expect(plant?.url).toBe(`${BASE}/`);
+    expect(plant?.secure).toBe(true);
+    expect(plant?.httpOnly).toBe(true);
+    expect(plant?.sameSite).toBe('Lax');
+    // No plant without a usable session, on non-https origins (the offline
+    // http doubles — `__Host-` is Secure-only), or on garbage URLs.
+    expect(browserSessionCookie(undefined, BASE)).toBeNull();
+    expect(browserSessionCookie('   ', BASE)).toBeNull();
+    expect(browserSessionCookie('sentinel-session-a', 'http://127.0.0.1:9/')).toBeNull();
+    expect(browserSessionCookie('sentinel-session-a', 'not a url')).toBeNull();
   });
 });
