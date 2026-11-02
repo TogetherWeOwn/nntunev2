@@ -77,6 +77,10 @@ const fixtureEnv = (overrides: Record<string, string | undefined> = {}) => ({
   SYNTHETIC_NNTP_PASS: DUMMY_PASS,
   SYNTHETIC_NNTP_PORT: '563',
   SYNTHETIC_NNTP_TLS: 'on',
+  // Pinned to the run default (not inherited): a developer running with
+  // E2E_NNTP_MAX_CONNECTIONS=3 would otherwise submit 3 while the positive
+  // controls below assert 2. The explicit-override leg keeps its own '3'.
+  E2E_NNTP_MAX_CONNECTIONS: '2',
   ...overrides,
 });
 
