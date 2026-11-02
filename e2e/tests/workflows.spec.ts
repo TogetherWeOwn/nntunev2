@@ -1003,7 +1003,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // pushes would be cancelled before ever deploying. Job-level groups
     // release when the deploy finishes; E2E serializes on e2e-staging.
     expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
-    for (const job of ['staging-web', 'staging-api', 'preview-web']) {
+    for (const job of ['staging-web', 'staging-api']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
       expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
@@ -1011,8 +1011,8 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // staging-api serializes on its own group: one pending job per group,
     // so sharing staging-web's group lets a push's own lanes cancel each
     // other and leaves web and api at different SHAs with no post-deploy
-    // E2E. (preview-web shares the web expression but only runs on PR
-    // events, so it never contends with the push-only lanes.)
+    // E2E. (No per-PR preview lane exists, so nothing else contends with
+    // the push-only lanes.)
     const webGroup = jobSection(deployWorkflow, 'staging-web').match(/^      group: (.+)$/m)![1];
     const apiGroup = jobSection(deployWorkflow, 'staging-api').match(/^      group: (.+)$/m)![1];
     expect(apiGroup).toContain('staging-api');
@@ -1701,7 +1701,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    expect(names).toEqual(['gate', 'post-deploy-e2e', 'staging-api', 'staging-web']);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
@@ -1710,11 +1710,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   };
 
   const assertDeployBody = (body: string) => {
-    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(2);
     expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
-    // Exact command pin: staging-web deploys to staging, staging-api
-    // deploys the api Worker to staging with the public BUILD_SHA var, and
-    // preview-web runs `preview`. A bare `command: deploy` (no --env)
+    // Exact command pin: staging-web deploys to staging and staging-api
+    // deploys the api Worker to staging with the public BUILD_SHA var —
+    // no `preview` lane exists. A bare `command: deploy` (no --env)
     // deploys the top-level worker name, which equals the production env
     // name — count checks alone miss it, so pin every wrangler-action
     // command value exactly.
@@ -1727,7 +1727,6 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     ).toEqual([
       'deploy --env staging',
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
-      'preview',
     ]);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
@@ -1758,9 +1757,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   const assertNoBackendPath = (body: string) => {
     // Header comments (above `jobs:`) legitimately name workers/ and the
     // Hyperdrive gate; outside `staging-api` the jobs body itself stays
-    // web-only with no production path. Case-sensitive: the preview job
-    // carries a `Workers preview deployment` comment (no path), which must
-    // keep passing.
+    // web-only with no production path. Case-sensitive: a comment such as
+    // `Workers preview deployment` (no path) must keep passing.
     // Production pin: no job carries the `production` word at all in code
     // (comments stripped) — that covers `--env production`,
     // `--env=production`, `environment: production`, the mapping form
@@ -1869,9 +1867,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   });
 
   test('only the evidenced staging steps run a wrangler deploy', () => {
-    // staging-web deploys apps/web to staging, staging-api deploys the api
-    // Worker to staging with BUILD_SHA, preview-web runs `preview` (not
-    // deploy). Any additional wrangler deploy — action or raw `wrangler
+    // staging-web deploys apps/web to staging and staging-api deploys the
+    // api Worker to staging with BUILD_SHA (no preview lane exists). Any
+    // additional wrangler deploy — action or raw `wrangler
     // deploy` CLI — is a backend-lane candidate until evidenced.
     assertDeployBody(jobsBody);
     expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
@@ -1978,10 +1976,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
     const workerMutant = `${jobsBody}${workerJob}`;
     const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
-    // Bare `command: deploy` on preview-web: no --env, no `wrangler deploy`
-    // string, no workers/ or production marker — only the exact command pin
-    // catches it, and it would deploy the production worker name.
-    const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Reintroduced preview lane running a bare `command: deploy`: no --env,
+    // no `wrangler deploy` string, no workers/ or production marker — only
+    // the exact command pin catches it, and it would deploy the production
+    // worker name.
+    const bareDeployMutant =
+      `${jobsBody}\n  preview-web:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3\n        with:\n          command: deploy\n`;
     // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
     // contiguous `wrangler deploy` substring check but still deploys.
     const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;

@@ -133,11 +133,10 @@ Deploys are push-triggered in CI; there is nothing to deploy from a laptop:
 - Pushing to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
   `staging-web` deploys `apps/web`, then `post-deploy-e2e` sequences the full
   Playwright journey after both that web deploy and the `staging-api` job
-  succeed. Pull requests use
-  `preview-web` for web previews. The `gate` job checks for
+  succeed. Pull requests get no preview deploy; PR CI (lint/test/build)
+  stays. The `gate` job checks for
   `CLOUDFLARE_API_TOKEN`; deploys also require `CLOUDFLARE_ACCOUNT_ID`.
-  Without the token, deploy/preview jobs skip, so fork PRs get neither a
-  deploy nor a staging PASS.
+  Without the token, deploy jobs skip.
 - The same push also runs the staging-only API Worker lane, `staging-api`,
   behind the same token gate. Its deploy steps skip if any public Actions
   variable is missing: `HYPERDRIVE_ID_STAGING`, `API_RP_ID_STAGING` or
