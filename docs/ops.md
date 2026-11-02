@@ -570,7 +570,7 @@ The production lane refuses any production vars beyond `name` in
 `node ci/check-production-secrets-shape.mjs`, which enforces the offline
 policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
 no bindings and needs no secrets, so its production env table must carry
-only `name` (current state: `apps/web/wrangler.toml:35-36`). It runs in the
+only `name` (current state: `apps/web/wrangler.toml:31-32`). It runs in the
 `deploy-production` job after that job checks out the validated promotion
 SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
 (preflight checks out the dispatch tip,
