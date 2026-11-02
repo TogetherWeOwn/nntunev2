@@ -387,7 +387,10 @@ export async function anonymousGet(
  * browserSessionCookie): session routes (`POST /v1/vault/*` for the BYOP
  * wizard's test/save, `/v1/session/*`, …) authenticate by cookie only and
  * ignore the bearer, so without this plant every wizard test-connection
- * fails closed as unauthenticated. Second, headers are attached ONLY to
+ * fails closed as unauthenticated. When no plant applies (a null account,
+ * or a non-https offline double) any previously planted session cookie is
+ * cleared instead, so a re-applied page is anonymous and cookieless rather
+ * than leaking the earlier identity. Second, headers are attached ONLY to
  * the staging origin via a context route: `extraHTTPHeaders`/
  * `setExtraHTTPHeaders` would also send the Access service token and
  * session bearer to cross-origin subresources (fonts, analytics,
@@ -419,10 +422,12 @@ export async function applyAccountToPage(
   }
   // Cookie-first: session routes ignore the bearer, so the minted session
   // must ride as the `__Host-` cookie before any navigation or wizard fetch.
-  // Null accounts (and non-https offline doubles) get no plant by
-  // construction — the page stays anonymous and cookieless.
+  // Null accounts (and non-https offline doubles) get no plant — any cookie
+  // a previous apply planted is cleared instead, so the page stays
+  // anonymous and cookieless even when identities are re-applied.
   const cookie = browserSessionCookie(session, baseURL);
   if (cookie) await page.context().addCookies([cookie]);
+  else await page.context().clearCookies();
   const stagingHeaders: Record<string, string> = { ...accessHeaders() };
   if (session) stagingHeaders.Authorization = `Bearer ${session}`;
   // Anonymous pages put the QA bearer on auth-start POSTs only, so the

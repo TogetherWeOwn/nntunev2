@@ -49,9 +49,11 @@ import {
 //     to the QA token. Every accountHeaders caller is account-specific.
 //
 // applyAccountToPage(page, account, baseURL):
-//   - `null` plants no cookie and stays allowed (Access-only routing for the
-//     UI-signup fallback and health checks): staging-origin requests carry
-//     the Access pair only, no Authorization, no QA token.
+//   - `null` plants no cookie (clearing any earlier plant, so a re-applied
+//     page cannot leak the previous identity) and stays allowed
+//     (Access-only routing for the UI-signup fallback and health checks):
+//     staging-origin requests carry the Access pair only, no Authorization,
+//     no QA token.
 //   - A non-null account without a nonblank session THROWS naming the
 //     missing session/credential BEFORE any route is registered or cookie
 //     planted — a sessionless minted account must not silently become the
@@ -425,9 +427,11 @@ function fakePage(): {
   page: Page;
   handler: () => RouteHandler | undefined;
   cookies: FakeCookiePlant[];
+  cleared: () => number;
 } {
   let routeHandler: RouteHandler | undefined;
   const cookies: FakeCookiePlant[] = [];
+  let cleared = 0;
   const context = {
     unrouteAll: async () => undefined,
     route: async (_pattern: string, handler: RouteHandler) => {
@@ -436,11 +440,15 @@ function fakePage(): {
     addCookies: async (plants: FakeCookiePlant[]) => {
       cookies.push(...plants);
     },
+    clearCookies: async () => {
+      cleared += 1;
+    },
   };
   return {
     page: { context: () => context } as unknown as Page,
     handler: () => routeHandler,
     cookies,
+    cleared: () => cleared,
   };
 }
 
@@ -453,8 +461,9 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
   test('session account: staging origin gets its bearer (no QA token), foreign origin continues clean', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler, cookies } = fakePage();
+      const { page, handler, cookies, cleared } = fakePage();
       await applyAccountToPage(page, sessionAccount(), BASE);
+      expect(cleared(), 'a planted session must not clear cookies').toBe(0);
       const routeHandler = handler();
       expect(routeHandler, 'no route registered for a session account').toBeDefined();
 
@@ -485,11 +494,16 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
   test('null account stays Access-only (UI-signup fallback): no Authorization outside auth-start POSTs', async () => {
     await withEnvAsync(pageEnv, async () => {
-      const { page, handler, cookies } = fakePage();
+      const { page, handler, cookies, cleared } = fakePage();
       await applyAccountToPage(page, null, BASE);
       const routeHandler = handler();
       expect(routeHandler, 'no Access-only route registered for null account').toBeDefined();
       expect(cookies, 'anonymous page must plant no session cookie').toHaveLength(0);
+      // A re-applied null must not inherit an earlier identity's cookie.
+      await applyAccountToPage(page, sessionAccount(), BASE);
+      expect(cookies).toHaveLength(1);
+      await applyAccountToPage(page, null, BASE);
+      expect(cleared(), 'null re-apply must clear the planted session cookie').toBeGreaterThan(0);
 
       const staging = fakeRoute(`${BASE}/signup`);
       await routeHandler!(staging.route);
