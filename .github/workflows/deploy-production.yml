@@ -31,6 +31,13 @@ name: deploy-production
 # - Post-promotion verification probes the same public-route set as the
 #   stage gates against the production origin and proves the serving build
 #   is the promoted one (GET /api/build equals the deploy SHA).
+# - The deploy job records a promotion receipt (promotion.json, uploaded as
+#   the attempt-bound production-promotion-<sha>-<run>-<attempt> artifact)
+#   and the `release` job calls release.yml, which proves that receipt
+#   (ci/release-request.cjs + ci/release-promotion-proof.cjs) and tags the
+#   deployed commit with a CalVer version (vYYYY.MDD.P) through the shared
+#   TogetherWeOwn/.github calver releaser — the same wiring two-web-next
+#   uses. A re-promote of a tagged commit skips green without a tag.
 #
 # Secrets (names only): production-only Cloudflare credentials live in the
 # production Environment (PRODUCTION_CLOUDFLARE_API_TOKEN,
@@ -347,3 +354,54 @@ jobs:
           done
           echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
           exit 1
+      - name: Record successful production promotion
+        # Success-only and after the identity-aware smoke above. Write inline
+        # because the selected deployment checkout can predate this receipt
+        # protocol. release.yml proves this receipt before tagging.
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const receipt = {
+            schema: 1,
+            repository: process.env.GITHUB_REPOSITORY,
+            workflow: '.github/workflows/deploy-production.yml',
+            job: 'deploy-production',
+            sha: process.env.DEPLOY_SHA,
+            promoted_version_id: process.env.PROMOTED_VERSION_ID,
+            run_id: process.env.GITHUB_RUN_ID,
+            run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+          };
+          if (!/^[0-9a-f]{40}$/.test(receipt.sha ?? '') ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(receipt.promoted_version_id ?? '') ||
+              !/^[1-9][0-9]*$/.test(receipt.run_id ?? '') ||
+              !/^[1-9][0-9]*$/.test(receipt.run_attempt ?? '')) {
+            throw new Error('Invalid production promotion receipt identity');
+          }
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'promotion.json'), JSON.stringify(receipt) + '\n');
+          NODE
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          PROMOTED_VERSION_ID: ${{ steps.gradual.outputs.promoted-version-id }}
+      - name: Upload production promotion proof
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-promotion-${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/promotion.json
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: release
+    # Tag the commit that is now live and publish its notes (release.yml),
+    # only after the production deploy succeeds. preflight.outputs.sha is
+    # the promoted commit (DEPLOY_SHA), never main's tip.
+    needs: [preflight, deploy-production]
+    permissions:
+      actions: read # Read only this repository's promotion evidence.
+      contents: write # Create the tag and its GitHub Release.
+    uses: ./.github/workflows/release.yml
+    with:
+      sha: ${{ needs.preflight.outputs.sha }}
+      promotion_run_id: ${{ github.run_id }}
+      promotion_run_attempt: ${{ github.run_attempt }}

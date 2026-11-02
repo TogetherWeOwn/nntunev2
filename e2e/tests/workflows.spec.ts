@@ -1752,6 +1752,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
         );
       }
     }
+    // Staging environment record: both deploy lanes bind the staging GitHub
+    // Environment (assertStagingEnv pins the exact block), so push-to-main
+    // deployment records land only in `staging`.
+    assertStagingEnv(body, 'staging-web');
+    assertStagingEnv(body, 'staging-api');
   };
 
   const assertNoBackendPath = (body: string) => {
@@ -1772,12 +1777,28 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(codeLines(jobSection(body, 'staging-api')).toLowerCase()).not.toContain('production');
   };
 
+  // Both push-to-main deploy lanes bind the `staging` GitHub Environment
+  // (mapping form, name + url), so deployment records land only in
+  // `staging` — never an unscoped record and never `production`
+  // (assertNoBackendPath still bans that word in code). The anchored
+  // block pin below rejects a renamed, repointed or dropped mapping;
+  // the production-word pin rejects a swapped one.
+  const stagingEnvBlock =
+    '    environment:\n      name: staging\n      url: https://staging.nntune.com\n';
+  const assertStagingEnv = (body: string, job: string) => {
+    expect(
+      jobSection(body, job),
+      `${job} must bind the staging GitHub environment`,
+    ).toContain(stagingEnvBlock);
+  };
+
   const assertStagingApi = (body: string) => {
     // Evidence the api staging lane must keep: push-only + token gate,
     // staging-only deploy with the public BUILD_SHA var, the fail-closed
     // Hyperdrive cache-disabled gate (CI-only --allow-skip forbidden), and
-    // no GitHub-environment mapping (which would resolve prod-scoped
-    // secrets and protection rules).
+    // the staging GitHub-environment mapping (staging-scoped by name:
+    // this lane never reads production secrets or protection rules, and
+    // never deploys --env production).
     const section = jobSection(body, 'staging-api');
     expect(section).toContain('needs: [gate]');
     const condition = jobIf(body, 'staging-api');
@@ -1787,7 +1808,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
     expect(section).toContain('check_hyperdrive_cache.sh');
     expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
-    expect(section, 'api lane must not map a GitHub environment').not.toMatch(/^\s*environment:/m);
+    expect(section, 'api lane must bind the staging GitHub environment').toContain(
+      stagingEnvBlock,
+    );
     // Own concurrency group: sharing staging-web's group lets a push's
     // own lanes cancel each other (one pending job per group).
     expect(section).toContain('group: ${{ github.workflow }}-staging-api-${{ github.ref }}');
@@ -1998,6 +2021,15 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '    needs: [gate]\n    if: ${{ github.event_name == ',
       '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
     );
+    // Dropped staging environment mapping on exactly one lane: that lane's
+    // deployment record would land unscoped instead of in `staging`. The
+    // block appears exactly twice (staging-web, staging-api); split it so
+    // each mutant drops one lane's copy.
+    const envParts = jobsBody.split(stagingEnvBlock);
+    expect(envParts, 'staging env block must appear exactly twice').toHaveLength(3);
+    const noWebStagingEnvMutant = envParts[0] + envParts.slice(1).join(stagingEnvBlock);
+    const noApiStagingEnvMutant =
+      envParts.slice(0, 2).join(stagingEnvBlock) + envParts[2];
     // Quoted production environment value.
     const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
@@ -2150,6 +2182,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       flagFirstMutant,
       envMappingMutant,
       quotedEnvMutant,
+      noWebStagingEnvMutant,
+      noApiStagingEnvMutant,
       allowSkipMutant,
       noBuildShaMutant,
       sharedGroupMutant,
@@ -2191,6 +2225,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertDeployBody(flagFirstMutant)).toThrow();
     expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
     expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noWebStagingEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noApiStagingEnvMutant)).toThrow();
+    expect(() => assertStagingApi(noApiStagingEnvMutant)).toThrow();
     expect(() => assertStagingApi(allowSkipMutant)).toThrow();
     expect(() => assertStagingApi(noBuildShaMutant)).toThrow();
     expect(() => assertDeployBody(noBuildShaMutant)).toThrow();
