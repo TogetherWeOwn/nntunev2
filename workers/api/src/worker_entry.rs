@@ -446,6 +446,15 @@ async fn delete_expired_rate_limit_slots(
     Ok(())
 }
 
+/// Claimed-slot attempts per [`claim_rate_limit_slot`] call. Each attempt
+/// is one statement; a retry only happens when a concurrent claim stole
+/// the selected slot between our snapshot and the insert (the conflict
+/// clause then matches nothing). Past this bound the caller fails closed
+/// as exhausted, so a contended pool degrades to denials, never to a
+/// hung gate: every attempt shares the caller's `TOTAL_TIMEOUT_MS`
+/// deadline via `Self::bounded`.
+const RATE_LIMIT_CLAIM_ATTEMPTS: u32 = 4;
+
 /// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
 /// claimed slot index (the pair path needs it for its compensating
 /// release), `Ok(None)` is an exhausted budget. Caller has already
@@ -460,10 +469,8 @@ async fn claim_rate_limit_slot(
     // O(1) fast-fail on the exhausted path (single source of truth:
     // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
     // test): without this guard every denied request pays one DELETE
-    // plus `limit` conflicting upserts (~101 statements with 100 row
-    // locks for the 100-slot finish lookup budget). The slot loop below
-    // still claims atomically, so a concurrent race that passes this
-    // snapshot simply fails closed there.
+    // plus a full-pool anti-join claim that finds nothing. A concurrent
+    // race that passes this snapshot simply fails closed below.
     let exhausted = client
         .query_typed(
             handlers::RATE_LIMIT_EXHAUSTED_SQL,
@@ -482,12 +489,22 @@ async fn claim_rate_limit_slot(
     if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
         return Ok(None);
     }
-    for slot in 0..budget.limit {
-        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+    // One statement per attempt, never one per occupied slot: the
+    // `generate_series` anti-join selects the lowest free-or-expired slot
+    // pool-wide, so an admitted request costs O(1) round trips no matter
+    // how full the pool is. A sequential per-slot loop would make the Nth
+    // admitted request pay N conflicting upserts inside one transaction
+    // (up to ~3300 for the bearer pair near the hourly cap), hitting the
+    // store deadline as a 404 before the budget is used up.
+    let limit_hi = i32::try_from(budget.limit.saturating_sub(1)).map_err(|_| StoreError)?;
+    for _ in 0..RATE_LIMIT_CLAIM_ATTEMPTS {
         let rows = client
             .query_typed(
                 "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                 VALUES ($1, $2, $3, $4) \
+                 SELECT $1, $2, s, $3 FROM generate_series(0, $4) AS s \
+                 LEFT JOIN auth_rate_limit_slots AS t \
+                 ON t.scope_key = $1 AND t.action = $2 AND t.slot = s AND t.expires_at > $5 \
+                 WHERE t.slot IS NULL ORDER BY s LIMIT 1 \
                  ON CONFLICT (scope_key, action, slot) DO UPDATE \
                  SET expires_at = EXCLUDED.expires_at \
                  WHERE auth_rate_limit_slots.expires_at <= $5 \
@@ -495,15 +512,15 @@ async fn claim_rate_limit_slot(
                 &[
                     (&budget.scope_key, Type::TEXT),
                     (&budget.action, Type::TEXT),
-                    (&slot, Type::INT4),
                     (&expires_at, Type::INT8),
+                    (&limit_hi, Type::INT4),
                     (&now_i, Type::INT8),
                 ],
             )
             .await
             .map_err(|_| StoreError)?;
-        if !rows.is_empty() {
-            return Ok(Some(slot));
+        if let Some(row) = rows.first() {
+            return Ok(Some(row.try_get::<_, i32>(0).map_err(|_| StoreError)?));
         }
     }
     Ok(None)
