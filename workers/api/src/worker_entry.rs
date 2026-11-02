@@ -560,6 +560,21 @@ pub fn session_retry_store_for_postgres_test(
     }
 }
 
+/// The log-safe shape of a dead driver task: the 5-char Postgres `SqlState`
+/// code only, never the message/detail (which can carry host/role strings).
+/// `tokio_postgres::Error` extracts the real code; test stubs return fixed
+/// shapes so the leak-proof test can feed hostile strings through the same
+/// path production uses.
+trait DriverErrorCode {
+    fn sqlstate(&self) -> Option<String>;
+}
+
+impl DriverErrorCode for tokio_postgres::Error {
+    fn sqlstate(&self) -> Option<String> {
+        PgStore::sqlstate_of(self.code())
+    }
+}
+
 impl PgStore {
     /// Race a store operation against the caller's budget, expiring to the
     /// opaque `StoreError`. Every `Store` method runs its connect plus
@@ -638,7 +653,12 @@ impl PgStore {
         )
         .await;
         if connected.is_err() {
-            let _ = Self::db_failure(reached.get(), &self.trace_id, &build_sha_from_env(env));
+            let _ = Self::db_failure(
+                reached.get(),
+                &self.trace_id,
+                &build_sha_from_env(env),
+                None,
+            );
         }
         connected
     }
@@ -651,8 +671,17 @@ impl PgStore {
             .as_ref()
             .map(build_sha_from_env)
             .unwrap_or_else(|| crate::logging::BUILD_SHA_UNKNOWN.to_string());
-        let _ = Self::db_failure(event, &self.trace_id, &build_sha);
+        let _ = Self::db_failure(event, &self.trace_id, &build_sha, None);
         StoreError
+    }
+
+    /// Fixed-shape Postgres error class for a dead driver task: the 5-char
+    /// `SqlState` code only, never the message/detail (which can carry host,
+    /// role or other identifiers). Anything that is not exactly five ASCII
+    /// alphanumerics maps to `None` so only the fixed shape can reach logs.
+    fn sqlstate_of(code: Option<&tokio_postgres::error::SqlState>) -> Option<String> {
+        let code = code?.code().to_string();
+        (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
     }
 
     async fn connection_diagnostic<F, E>(
@@ -662,24 +691,34 @@ impl PgStore {
     ) -> Option<String>
     where
         F: std::future::Future<Output = Result<(), E>>,
+        E: DriverErrorCode,
     {
-        if connection.await.is_err() {
-            Self::db_failure("api.db.connection_error", trace_id, build_sha)
-        } else {
-            None
+        match connection.await {
+            Ok(()) => None,
+            Err(err) => Self::db_failure(
+                "api.db.connection_error",
+                trace_id,
+                build_sha,
+                err.sqlstate(),
+            ),
         }
     }
 
     /// The one database-failure record shape. No detail in logs: driver
     /// errors can carry host/role strings, so only the fixed event name
-    /// says where it failed.
-    fn db_failure(event: &str, trace_id: &str, build_sha: &str) -> Option<String> {
-        emit_record(
-            crate::logging::Level::Error,
-            event,
-            trace_id,
-            serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha}),
-        )
+    /// says where it failed, plus the optional fixed-shape `sqlstate`
+    /// 5-char code (never message/detail).
+    fn db_failure(
+        event: &str,
+        trace_id: &str,
+        build_sha: &str,
+        sqlstate: Option<String>,
+    ) -> Option<String> {
+        let mut fields = serde_json::json!({"error_class": "service_unavailable", "build_sha": build_sha, "release": build_sha});
+        if let Some(code) = sqlstate {
+            fields["sqlstate"] = serde_json::Value::String(code);
+        }
+        emit_record(crate::logging::Level::Error, event, trace_id, fields)
     }
 
     /// Fenced vault-upsert statement (ADR 0002 rule 3), shared by
@@ -3077,6 +3116,28 @@ mod tests {
 
     const REQUEST_TRACE: &str = "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c";
 
+    /// Test-only driver errors: the hostile string models a driver error
+    /// whose message/detail carries identifiers (never logged — no code to
+    /// extract), while the coded stub models one with a fixed-shape code.
+    impl DriverErrorCode for &str {
+        fn sqlstate(&self) -> Option<String> {
+            None
+        }
+    }
+
+    impl DriverErrorCode for () {
+        fn sqlstate(&self) -> Option<String> {
+            None
+        }
+    }
+
+    struct CodedDriverError;
+    impl DriverErrorCode for CodedDriverError {
+        fn sqlstate(&self) -> Option<String> {
+            Some("53300".to_string())
+        }
+    }
+
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
     const DB_FAILURE_EVENTS: [&str; 8] = [
@@ -3179,6 +3240,30 @@ mod tests {
             );
             assert!(!line.contains("private-"));
             assert!(!line.contains(hostile));
+            // A coded driver failure logs the fixed-shape code and nothing
+            // else: exact field equality proves no message/detail leaked.
+            let line = PgStore::connection_diagnostic(
+                std::future::ready(Err::<(), _>(CodedDriverError)),
+                &trace_id,
+                "unknown",
+            )
+            .now_or_never()
+            .expect("synthetic driver is ready")
+            .expect("failure emits a record");
+            let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(record["event"], "api.db.connection_error");
+            assert_eq!(
+                record["fields"],
+                serde_json::json!({"error_class": "service_unavailable", "build_sha": "unknown", "release": "unknown", "sqlstate": "53300"})
+            );
+            assert!(!line.contains(hostile));
+            // The code gate keeps only the 5-char shape: a real SqlState
+            // constant passes, anything else (or nothing) maps to no field.
+            assert_eq!(
+                PgStore::sqlstate_of(Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)),
+                Some("23505".to_string())
+            );
+            assert_eq!(PgStore::sqlstate_of(None), None);
             assert!(PgStore::connection_diagnostic(
                 std::future::ready(Ok::<(), ()>(())),
                 &trace_id,
@@ -3188,7 +3273,7 @@ mod tests {
             .unwrap()
             .is_none());
             for event in DB_FAILURE_EVENTS {
-                let line = PgStore::db_failure(event, &trace_id, "unknown")
+                let line = PgStore::db_failure(event, &trace_id, "unknown", None)
                     .expect("every db failure event must pass the event validator");
                 let record: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(record["event"], event);
@@ -3219,7 +3304,7 @@ mod tests {
             .expect("a closing brace must bound connect")
             .0;
         assert!(
-            connect_body.contains("Self::db_failure(reached.get()"),
+            connect_body.contains("Self::db_failure(") && connect_body.contains("reached.get()"),
             "a failed connect must emit the phase it reached"
         );
         for event in DB_FAILURE_EVENTS {
