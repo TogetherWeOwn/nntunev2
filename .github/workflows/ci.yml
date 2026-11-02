@@ -906,6 +906,37 @@ jobs:
           node --check ci/check-production-secrets-shape.mjs
           node --check ci/test-check-production-secrets-shape.mjs
 
+  # Promotion receipt proof unit tests (release lane): the proof helpers
+  # stay dependency-free, so node --test and stdlib unittest run them with
+  # no install. The suite pins every receipt refusal (wrong SHA, run,
+  # attempt, repository, workflow, job, schema and version id), the artifact
+  # name and plan request shape, the release retry/repair wiring, and the
+  # receipt archive bounds, so loosening a proof check or dropping the repair
+  # path goes red. The parse step executes no network calls but runs each
+  # entry point the same way CI does, so a broken entrypoint goes red too.
+  # Keep this job id in ci-ok's needs.
+  release-proof:
+    name: release-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Unit-test the promotion receipt proof
+        run: node --test ci/test-release-promotion-proof.cjs
+      - name: Unit-test the receipt archive bounds
+        run: python3 ci/test_read_promotion_receipt.py
+      - name: Promotion proof scripts parse clean
+        run: |
+          node --check ci/release-promotion-proof.cjs
+          node --check ci/release-request.cjs
+          node --check ci/test-release-promotion-proof.cjs
+          python3 -m py_compile ci/read-promotion-receipt.py ci/test_read_promotion_receipt.py
+
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
   # changed files and the self-test step pins the whole tree clean, so only
@@ -1323,7 +1354,7 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
