@@ -121,6 +121,9 @@ npm-based harness (`e2e/package-lock.json`).
 | `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
 | `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
+| `TEST_NZB_PATH` | staging real-NZB mode only | Runtime path of the secret-held real-NZB subset staged by the workflow prepare step (`RUNNER_TEMP` only). Set to an existing file → legs ingest the real NZB and decoded-audio legs skip by name; unset → synthetic fixtures. Never set locally. |
+| `REAL_NZB_MODE` | CI only | `true` when the prepare step staged the real NZB; drives the journey gate's extended allow-list instead of the standard single-fixme budget. |
+| `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | CI workflow secrets only | Halves of the xz-compressed, base64-encoded real NZB (48 KB secret cap). Rebuilt into `RUNNER_TEMP` only with a SHA-256 prefix check, truncated to one whole data file, then the full NZB is deleted. Secret names only, never values. |
 
 How the suite uses them:
 
@@ -198,6 +201,31 @@ How the suite uses them:
   402, `rate_limited` on 429) with a present, status-consistent retryable
   flag, the upgrade CTA pointer (a matching key whose value points at
   `/pricing`), and no secret leakage.
+- Staging real-NZB mode (secret-held RAR set): the checked-in synthetic NZBs
+  are served only by the local Rust fixture server and answer `430` on the
+  real staging provider, so the post-deploy journey stages a real NZB
+  instead. The full NZB is xz-compressed, base64-encoded and split across
+  the `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` repo secrets (secret names only,
+  never values); the e2e job's prepare step rebuilds it into `RUNNER_TEMP`
+  alone with a SHA-256 prefix check, truncates it with
+  `scripts/prepare-real-nzb.mjs` to the first non-PAR2 file (verbatim, all
+  segments — one whole data file, so ingest stays off the repair path and
+  the run avoids pulling the full release), then deletes the full NZB.
+  Legs ingest `TEST_NZB_PATH` when it names an existing file
+  (`helpers/real-nzb-fixture.ts`) and keep the synthetic files otherwise, so
+  local runs need no environment set. Owner rule (public repo): no NZB
+  bytes, message-IDs, subjects, file names or segment lists in the repo or
+  public logs — the prepare step prints only file counts, skips carry a
+  static reason, failure artifacts stay sanitized junit-only, and the full
+  NZB never leaves `RUNNER_TEMP`. Honest scope: the real NZB is a RAR/PAR2
+  set and the stream chain serves transcode artifacts of audio inputs only,
+  so real-NZB mode proves ingest + matching (import completes, library row
+  appears) while the Range, meter, playback, seek, Media Session,
+  over-limit-stream, two-track and queue-order legs skip by name until RAR
+  read (and the per-file manifest for legs needing 2+ tracks) lands. The
+  journey gate budgets that fixed allow-list via `REAL_NZB_MODE` instead of
+  the standard single-fixme budget; any failure or off-list skip still fails
+  the run in both modes.
 
 ## CI
 

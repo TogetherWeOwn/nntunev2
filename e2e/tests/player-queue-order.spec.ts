@@ -18,6 +18,11 @@ import {
 } from '../helpers/accounts.js';
 import { queueOrderFailure } from '../helpers/queue-order.js';
 import {
+  REAL_NZB_RAR_SKIP,
+  realNzbActive,
+  resolveRealNzbFixture,
+} from '../helpers/real-nzb-fixture.js';
+import {
   SECOND_SINGLE_TRACK_FIXTURE_FILE,
   SINGLE_TRACK_FIXTURE_FILE,
   resolveTwoTrackFixture,
@@ -61,13 +66,21 @@ test.describe.serial('player queue follows library-selection order', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
-    const staging = resolveTwoTrackFixture(
-      {
-        singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE),
-        secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE),
-      },
-      existsSync,
-    );
+    // Staging real-NZB mode (secret-held RAR set) stages the single runtime
+    // file instead of the two synthetic uploads: one upload is one library
+    // row, so this ingest test proves ingest + matching while the
+    // queue-order test below skips by name until ≥2 tracks are stageable.
+    const realNzb = resolveRealNzbFixture(process.env.TEST_NZB_PATH, existsSync);
+    const staging =
+      realNzb !== null
+        ? { staged: [realNzb], isTwoTrack: false }
+        : resolveTwoTrackFixture(
+            {
+              singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE),
+              secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE),
+            },
+            existsSync,
+          );
     const minted = await tryMintTestAccount(request, baseURL);
     // Evidence provenance: this test duplicates the signup branch, so it
     // records the same bounded signup-path label (no account data).
@@ -121,6 +134,10 @@ test.describe.serial('player queue follows library-selection order', () => {
     const baseURL = stagingBaseUrl('skip', 'queue-order');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     // Same identity discipline as the ingest journey: queue order must run

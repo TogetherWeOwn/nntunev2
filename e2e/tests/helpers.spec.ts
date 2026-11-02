@@ -1,7 +1,18 @@
 import { test, expect, chromium, type APIRequestContext } from '@playwright/test';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  REAL_NZB_PATH_ENV,
+  REAL_NZB_RAR_SKIP,
+  fixtureNzbOr,
+  realNzbActive,
+  resolveRealNzbFixture,
+} from '../helpers/real-nzb-fixture.js';
 import {
   accessHeaders,
   assertAccessWall,
@@ -1732,5 +1743,151 @@ test.describe('awaitSignupOutcome names the signup page state', () => {
       await failure(page, '<p role="status">This browser does not support passkeys.</p>', null),
     ).toContain('passkeys unsupported');
     expect(await failure(page, '', 201)).toContain('back at the email step with no status');
+  });
+});
+
+test.describe('real-NZB fixture resolution (offline pins)', () => {
+  // The staging provider is real NNTP, so the checked-in synthetic NZBs
+  // answer 430 there and the workflow stages a secret-held real NZB at the
+  // TEST_NZB_PATH runtime path instead. These pins keep the resolution pure
+  // and offline: an unset, blank or missing path keeps the synthetic
+  // fallback, and only an existing file activates real-NZB mode. The
+  // resolver never reads the file — presence only, never content.
+  test('unset, blank or missing path resolves null (synthetic fallback)', () => {
+    expect(resolveRealNzbFixture(undefined, () => true)).toBeNull();
+    expect(resolveRealNzbFixture('', () => true)).toBeNull();
+    expect(resolveRealNzbFixture('   ', () => true)).toBeNull();
+    expect(resolveRealNzbFixture('/runner-temp/staging-real.nzb', () => false)).toBeNull();
+  });
+
+  test('a set path resolves only when the file exists, trimmed', () => {
+    const staged = '/runner-temp/staging-real.nzb';
+    expect(resolveRealNzbFixture(staged, (p) => p === staged)).toBe(staged);
+    expect(resolveRealNzbFixture(`  ${staged}  `, (p) => p === staged)).toBe(staged);
+  });
+
+  test('offline (no staged file) stays on the synthetic fallback and inactive', () => {
+    withEnv({ [REAL_NZB_PATH_ENV]: undefined }, () => {
+      expect(realNzbActive()).toBe(false);
+      expect(fixtureNzbOr('/repo/e2e/fixtures/synthetic.nzb')).toBe(
+        '/repo/e2e/fixtures/synthetic.nzb',
+      );
+    });
+  });
+
+  test('a staged file activates the fixture and wins over the fallback', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'real-nzb-pin-'));
+    try {
+      const staged = join(dir, 'staging-real.nzb');
+      writeFileSync(staged, '<nzb></nzb>');
+      withEnv({ [REAL_NZB_PATH_ENV]: staged }, () => {
+        expect(realNzbActive()).toBe(true);
+        expect(fixtureNzbOr('/repo/e2e/fixtures/synthetic.nzb')).toBe(staged);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('env name and skip reason are static text carrying no NZB content', () => {
+    expect(REAL_NZB_PATH_ENV).toBe('TEST_NZB_PATH');
+    expect(REAL_NZB_RAR_SKIP).toContain('real-NZB fixture mode');
+    expect(REAL_NZB_RAR_SKIP).toContain('until RAR read lands');
+  });
+});
+
+test.describe('prepare-real-nzb script (offline pins)', () => {
+  // Executes the exact checked-in script (not a copy of its logic) against
+  // synthetic inputs only — never the secret-held NZB. The script writes a
+  // single-file subset (first non-PAR2 file, verbatim, all segments) so the
+  // journey ingests one whole data file without the full release download.
+  const scriptPath = fileURLToPath(new URL('../scripts/prepare-real-nzb.mjs', import.meta.url));
+  const fixtureDir = fileURLToPath(new URL('../fixtures/', import.meta.url));
+
+  function runPrepare(args: string[]): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync(process.execPath, [scriptPath, ...args], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { PATH: process.env.PATH },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  const countSegments = (doc: string): number => (doc.match(/<segment\b/g) ?? []).length;
+
+  test('single-file synthetic fixture round-trips with counts-only stdout', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-nzb-pin-'));
+    try {
+      const out = join(dir, 'staging.nzb');
+      const run = runPrepare(['--input', join(fixtureDir, 'synthetic.nzb'), '--output', out]);
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain('input files=1, output files=1');
+      // Counts only — never IDs, subjects, file names or segment lists.
+      expect(run.stdout).not.toContain('<segment');
+      expect(run.stdout).not.toContain('@nntune.test');
+      const input = readFileSync(join(fixtureDir, 'synthetic.nzb'), 'utf8');
+      const output = readFileSync(out, 'utf8');
+      expect(output).toContain('<file');
+      expect(countSegments(output)).toBe(countSegments(input));
+      expect(countSegments(output)).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a leading PAR2 file (inner-quoted or bare subject) is skipped for the data file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-nzb-pin-'));
+    try {
+      const input = join(dir, 'full.nzb');
+      const out = join(dir, 'staging.nzb');
+      const doc =
+        '<?xml version="1.0" encoding="UTF-8"?>\n<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">\n' +
+        '  <head><meta type="title">pin</meta></head>\n' +
+        '  <file poster="p" date="1" subject="release [01/02] - "inner.par2" yEnc">' +
+        '<groups><group>g</group></groups>' +
+        '<segments><segment bytes="1" number="1">par2seg</segment></segments></file>\n' +
+        '  <file poster="p" date="1" subject="release [02/02] - "inner.dat" yEnc">' +
+        '<groups><group>g</group></groups>' +
+        '<segments><segment bytes="1" number="1">dataseg</segment></segments></file>\n</nzb>\n';
+      writeFileSync(input, doc);
+      const run = runPrepare(['--input', input, '--output', out]);
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain('input files=2, output files=1');
+      const output = readFileSync(out, 'utf8');
+      expect(output).toContain('dataseg');
+      expect(output).not.toContain('par2seg');
+
+      const bareInput = join(dir, 'bare.nzb');
+      const bareOut = join(dir, 'bare-staging.nzb');
+      writeFileSync(
+        bareInput,
+        doc
+          .replace('subject="release [01/02] - "inner.par2" yEnc"', 'subject="inner.par2"')
+          .replace('subject="release [02/02] - "inner.dat" yEnc"', 'subject="inner.dat"'),
+      );
+      const bare = runPrepare(['--input', bareInput, '--output', bareOut]);
+      expect(bare.status).toBe(0);
+      expect(bare.stdout).toContain('input files=2, output files=1');
+      const bareOutput = readFileSync(bareOut, 'utf8');
+      expect(bareOutput).toContain('dataseg');
+      expect(bareOutput).not.toContain('par2seg');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('unreadable input and missing argv fail closed without content', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prepare-nzb-pin-'));
+    try {
+      const missing = runPrepare(['--input', join(dir, 'absent.nzb'), '--output', join(dir, 'o.nzb')]);
+      expect(missing.status).not.toBe(0);
+      const usage = runPrepare([]);
+      expect(usage.status).toBe(2);
+      expect(usage.stderr).toContain('--input');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -33,9 +33,19 @@ import {
   type TestAccount,
   waitForHydration,
 } from '../helpers/accounts.js';
+import {
+  REAL_NZB_RAR_SKIP,
+  fixtureNzbOr,
+  realNzbActive,
+} from '../helpers/real-nzb-fixture.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURE_NZB = path.resolve(here, '../fixtures/synthetic.nzb');
+// Staging real-NZB mode (secret-held RAR set, `TEST_NZB_PATH` staged by the
+// workflow) ingests the runtime file; every other run keeps the synthetic
+// fixture served by the local fixture server. Legs that need decoded audio
+// or a streamable track skip by name in real-NZB mode (RAR read pending) —
+// ingest, reload, recording_mbids and the ingest-refusal leg still run.
+const FIXTURE_NZB = fixtureNzbOr(path.resolve(here, '../fixtures/synthetic.nzb'));
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
 // usage meter moves → plan metadata stays consistent → browser playback,
@@ -224,6 +234,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of probing anonymously when neither a minted
     // session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'range');
     const headers = accountHeaders(account);
     const libraryUrl = `${baseURL}${API.library}`;
@@ -275,6 +289,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'meter');
     const headers = accountHeaders(account);
     const usageUrl = `${baseURL}${API.usage}`;
@@ -342,6 +360,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // Same identity discipline as Range/meter: playback must run as the
     // ingesting account, never anonymously or as the generic QA seam.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'playback');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -546,6 +568,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of driving the player anonymously when neither a
     // minted session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'player-seek');
 
     const pageErrors: string[] = [];
@@ -756,6 +782,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // playing gate precedes the metadata read so the assertion runs during
     // browser playback, not against an idle element.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'media-session');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -899,6 +929,13 @@ test.describe('plan limit', () => {
     const baseURL = stagingBaseUrl('skip', 'plan-limit-stream');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    if (realNzbActive()) {
+      // The capped stream leg needs a pre-seeded streamable track, which the
+      // RAR set cannot produce until RAR read lands. Refusal-shape coverage
+      // continues through the ingest-refusal leg below, which needs no audio.
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const capped = await mintCappedAccount(request, baseURL, 'plan-limit-stream');

@@ -29,10 +29,24 @@
  *   - "ingested track carries recording_mbids": test.fixme in
  *     e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending).
  *
+ * Real-NZB mode (REAL_NZB_MODE=true, set by the workflow when it staged the
+ * secret-held RAR-set fixture): the legs below skip by name because the RAR
+ * set proves ingest + matching but yields no streamable track until RAR read
+ * lands (one upload is one library row until the per-file manifest lands).
+ * The extended allow-list is fixed here (each entry still binds to its owning
+ * spec file and is consumed once), and the effective budget becomes the
+ * extended list's length — MAX_ALLOWED_SKIPS keeps governing standard mode.
+ * Any failure, or any skip outside the active list, still fails the gate in
+ * both modes.
+ *
  * Environment:
  *   JUNIT_PATH            junit evidence to parse (default: test-results/junit.xml,
  *                         relative to the e2e/ working directory in CI).
- *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 1, the fixme above).
+ *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 1, the fixme above;
+ *                         standard mode only — real-NZB mode budgets the
+ *                         extended allow-list below instead).
+ *   REAL_NZB_MODE         'true' when the run staged the secret-held real NZB
+ *                         (workflow sets it from the prepare step's output).
  *   REQUIRE_QA_AUTH_TOKEN 'true' requires QA_AUTH_TOKEN to be set (journey job only;
  *                         the synthetic smoke does not use the account seam).
  *   QA_AUTH_TOKEN         checked for presence only — its value is never read,
@@ -47,6 +61,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 
 const JUNIT_PATH = process.env.JUNIT_PATH ?? 'test-results/junit.xml';
 const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '1');
+const REAL_NZB_MODE = (process.env.REAL_NZB_MODE ?? '') === 'true';
 const REQUIRE_QA_AUTH_TOKEN = (process.env.REQUIRE_QA_AUTH_TOKEN ?? '') === 'true';
 const SUMMARY_PATH = process.env.GITHUB_STEP_SUMMARY || null;
 
@@ -62,6 +77,62 @@ const ALLOWED_SKIPS = [
     reason: 'test.fixme in e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending)',
   },
 ];
+
+// Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
+// streamable track until RAR read lands; one upload is one library row until
+// the per-file manifest lands). Active only when REAL_NZB_MODE=true.
+const REAL_NZB_ALLOWED_SKIPS = [
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'streaming answers byte Ranges with 206 + Content-Range',
+    reason: 'real-NZB mode: RAR set yields no streamable track until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'usage meter increases after streaming and shows plan metadata',
+    reason: 'real-NZB mode: meter needs the deterministic stream the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'synthetic audio actually plays in the browser',
+    reason: 'real-NZB mode: no decodable staged audio until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'player UI seek moves the active audio position and playback continues',
+    reason: 'real-NZB mode: player seek needs the playback the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'Media Session metadata reflects the playing ingested track',
+    reason: 'real-NZB mode: metadata read runs during playback the RAR set cannot feed',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'over-limit staging account is refused with a plan-limit status',
+    reason:
+      'real-NZB mode: capped stream leg needs a pre-seeded streamable track; ' +
+      'refusal-shape coverage continues through the ingest-refusal leg',
+  },
+  {
+    file: 'two-track-fixture.spec.ts',
+    match: 'two-track fixture stages',
+    reason: 'real-NZB mode: one RAR-set upload is one library row until the per-file manifest lands',
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'player queue advances in library-selection order',
+    reason: 'real-NZB mode: queue order needs 2+ tracks; the RAR set stages one row',
+  },
+];
+
+const ACTIVE_ALLOWED_SKIPS = REAL_NZB_MODE
+  ? [...ALLOWED_SKIPS, ...REAL_NZB_ALLOWED_SKIPS]
+  : ALLOWED_SKIPS;
+
+// Standard mode budgets MAX_ALLOWED_SKIPS; real-NZB mode budgets the full
+// extended allow-list (each entry still consumed at most once below).
+const EFFECTIVE_BUDGET = REAL_NZB_MODE ? ACTIVE_ALLOWED_SKIPS.length : MAX_ALLOWED_SKIPS;
 
 function fail(message) {
   process.stdout.write(`${TAG} FAIL: ${message}\n`);
@@ -202,7 +273,7 @@ const skippedNames = parseSkippedNames(xml);
 // and one entry cannot cover two skips.
 const consumedAllowances = new Set();
 const unknownSkips = skippedNames.filter((title) => {
-  const idx = ALLOWED_SKIPS.findIndex(
+  const idx = ACTIVE_ALLOWED_SKIPS.findIndex(
     (entry, i) => !consumedAllowances.has(i) && title.includes(entry.file) && title.includes(entry.match),
   );
   if (idx === -1) return true;
@@ -219,8 +290,8 @@ summaryLines = [
     ? `Skipped (${skippedNames.length} listed in junit evidence):\n${skippedNames.map((n) => `- ${n}`).join('\n')}`
     : 'Skipped: none listed in junit evidence.',
   '',
-  `Skip budget: at most ${MAX_ALLOWED_SKIPS} from the documented allow-list ` +
-    `(${ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
+  `Skip budget (${REAL_NZB_MODE ? 'real-NZB mode' : 'standard mode'}): at most ${EFFECTIVE_BUDGET} ` +
+    `from the documented allow-list (${ACTIVE_ALLOWED_SKIPS.map((e) => `"${e.match}"`).join('; ')}).`,
   '',
   ...(tokenMissing ? [tokenLine, ''] : []),
 ];
@@ -236,9 +307,9 @@ if (tests === 0) fail('zero journeys ran (no test cases in junit evidence).');
 if (ran === 0) {
   fail(`every journey skipped (0 ran, ${skipped} skipped) — staging evidence is empty.`);
 }
-if (skipped > MAX_ALLOWED_SKIPS) {
+if (skipped > EFFECTIVE_BUDGET) {
   fail(
-    `skip count ${skipped} is above the allow-list budget of ${MAX_ALLOWED_SKIPS} ` +
+    `skip count ${skipped} is above the allow-list budget of ${EFFECTIVE_BUDGET} ` +
       '(every extra skip needs a documented reason).',
   );
 }

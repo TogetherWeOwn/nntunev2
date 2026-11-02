@@ -67,6 +67,13 @@ on:
         required: false
       SYNTHETIC_NNTP_PASS:
         required: false
+      # Secret-held real NZB (xz-compressed, base64-encoded, split in two:
+      # GitHub caps a secret at 48 KB). Rebuilt into RUNNER_TEMP only by the
+      # e2e job's prepare step below — never into the repo, never into logs.
+      NNTUNE_TEST_NZB_XZ_B64_1:
+        required: false
+      NNTUNE_TEST_NZB_XZ_B64_2:
+        required: false
   workflow_dispatch:
   schedule:
     # Synthetic monitor cadence (off-minute to avoid thundering herd).
@@ -332,6 +339,45 @@ jobs:
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
+      - name: Prepare staging real-NZB fixture (secret-held, RUNNER_TEMP only)
+        id: real-nzb
+        # The staging provider is a real NNTP service: the checked-in synthetic
+        # NZBs answer 430 there, so the secret-held real NZB (rebuilt here from
+        # the NNTUNE_TEST_NZB_XZ_B64_1/_2 halves) is staged instead. Owner rule
+        # (public repo): no NZB bytes, message-IDs, subjects, file names or
+        # segment lists in the repo or public logs — the halves travel as env
+        # only, the full NZB lives in RUNNER_TEMP alone (deleted after
+        # truncation), and this step prints only counts and names, never
+        # content. Absent halves are not a failure: the journey falls back to
+        # the synthetic fixtures (standard mode).
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          NNTUNE_TEST_NZB_XZ_B64_1: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_1 }}
+          NNTUNE_TEST_NZB_XZ_B64_2: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_2 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NNTUNE_TEST_NZB_XZ_B64_1:-}" ] || [ -z "${NNTUNE_TEST_NZB_XZ_B64_2:-}" ]; then
+            echo "real NZB halves unset — journey runs on synthetic fixtures (standard mode)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          full="$RUNNER_TEMP/test.nzb"
+          staged="$RUNNER_TEMP/staging-real.nzb"
+          printf '%s%s' "$NNTUNE_TEST_NZB_XZ_B64_1" "$NNTUNE_TEST_NZB_XZ_B64_2" \
+            | base64 -d | xz -d > "$full"
+          prefix="$(sha256sum "$full" | cut -c1-16)"
+          if [ "$prefix" != "f37c136a6b3eface" ]; then
+            rm -f "$full"
+            echo "::error::real-NZB integrity prefix mismatch; refusing to stage (names only)."
+            exit 1
+          fi
+          node scripts/prepare-real-nzb.mjs --input "$full" --output "$staged"
+          rm -f "$full"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "path=$staged" >> "$GITHUB_OUTPUT"
+
       - name: Run full journey
         if: steps.staging.outputs.configured == 'true'
         working-directory: e2e
@@ -345,6 +391,13 @@ jobs:
           SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+          # Runtime real-NZB fixture staged by the prepare step above
+          # (RUNNER_TEMP path only, never content): when ready, legs ingest
+          # the secret-held RAR set instead of the synthetic fixtures and
+          # decoded-audio legs skip by name (see e2e/README.md). Empty when
+          # the halves are unset — legs keep the synthetic files.
+          TEST_NZB_PATH: ${{ steps.real-nzb.outputs.path }}
+          REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}
           # Promotion SHA from the push-triggered deploy run (inputs.expected_sha,
           # set by deploy.yml from github.sha) — never a source checkout. The
           # build-identity spec fails closed when it is absent or malformed.
@@ -358,7 +411,9 @@ jobs:
         # failed, and turns an all-skipped green run red. Unconfigured
         # staging never reaches here: the preflight fails the job. The skip
         # budget covers only the remaining recording_mbids test.fixme;
-        # every other skip (including queue order) fails the job.
+        # every other skip (including queue order) fails the job — except in
+        # real-NZB mode, where the gate budgets its fixed extended allow-list
+        # of RAR-set skips instead (REAL_NZB_MODE from the prepare step).
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
         if: always() && steps.staging.outputs.configured == 'true'
@@ -367,6 +422,7 @@ jobs:
           MAX_ALLOWED_SKIPS: '1'
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}
         run: node scripts/enforce-journey-evidence.mjs
 
       - name: Publish signup-path evidence summary

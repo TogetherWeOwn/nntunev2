@@ -21,6 +21,7 @@ import {
   resolveTwoTrackFixture,
   twoTrackPreconditionFailure,
 } from '../helpers/two-track-fixture.js';
+import { REAL_NZB_RAR_SKIP, realNzbActive } from '../helpers/real-nzb-fixture.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = path.resolve(here, '../fixtures');
@@ -114,6 +115,12 @@ test.describe.serial('two-track fixture stages library tracks (staging)', () => 
     const baseURL = stagingBaseUrl('skip', 'two-track-fixture');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    if (realNzbActive()) {
+      // One RAR-set upload is one library row until the per-file manifest
+      // lands, so the ≥2-track precondition cannot pass in real-NZB mode.
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const staging = resolveTwoTrackFixture(
