@@ -244,6 +244,8 @@ jobs:
         run: python3 .github/scripts/test_ci_web_e2e_timeout.py
       - name: Structural-test the Rust cache and coverage concurrency
         run: python3 .github/scripts/test_ci_rust_cache.py
+      - name: Structural-test the required-check concurrency policy
+        run: python3 .github/scripts/test_ci_required_check_concurrency.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
