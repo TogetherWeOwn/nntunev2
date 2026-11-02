@@ -199,16 +199,21 @@ test('provider answers 430 for a never-posted article on one connection', async 
     statVerdict,
     budgetMaxConnections: budget.maxConnections,
   };
+  let attachError: unknown = null;
   try {
     await testInfo.attach('provider-430-control-counts', {
       body: JSON.stringify(evidence, null, 2),
       contentType: 'application/json',
     });
-  } catch {
-    // Evidence must never mask the control outcome: a failed attach still
-    // propagates the original failure below.
+  } catch (error) {
+    // Evidence must never mask the control outcome: the original protocol
+    // failure still propagates first below. But a green control with no
+    // counts evidence is a silent pass, so an attach failure with no
+    // protocol failure propagates as its own error.
+    attachError = error;
   }
   if (failure) throw failure;
+  if (attachError) throw attachError;
   expect(
     peakConnections <= budget.maxConnections,
     `[provider-430] opened ${peakConnections} connections against a budget of ${budget.maxConnections}.`,
