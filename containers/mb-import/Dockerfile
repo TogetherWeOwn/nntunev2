@@ -16,7 +16,7 @@ RUN chmod 0755 /job/etl.sh /job/etl.py /job/tests/test_etl.sh /job/tests/test_et
  && bash /job/tests/test_etl_reference_graphs.sh \
  && touch /tmp/mb-import-tests-passed
 
-FROM rust:1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS validator
+FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS validator
 WORKDIR /src
 # The root Cargo.lock is tracked, proven fresh in CI (`cargo metadata
 # --locked`) and audited by cargo-deny. Copy the full (dockerignored)
