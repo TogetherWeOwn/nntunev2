@@ -99,9 +99,8 @@ again"}`, vault `400 {"error":"vault unavailable"}`, internal
 require an exact `Origin` header match.
 
 Known limits of this slice: attestation `x5c` chains reject (no CA
-trust store yet); test-connection dials the vetted IP literal, so a
-provider certificate issued only for the hostname fails closed as
-`ok:false` on TLS ports; magic-link delivery needs the operator's
+trust store yet); test-connection dials the validated hostname (runtime TLS SNI/verify),
+proving TCP+TLS reachability only with no NNTP exchange; magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
 passkey signup cannot complete its inbox-proof step);
 test-connection is a direct bounded dial, not yet routed through the
@@ -216,19 +215,21 @@ both as credentials.
   `Dialer::probe` on the vetted target (`workers/api/src/handlers.rs`),
   and the Worker entry wires that dialer to `SocketDialer`
   (`workers/api/src/worker_entry.rs`).
-- The dial targets only the vetted IP literals (at most
-  `MAX_DIAL_ADDRESSES` in `workers/api/src/vault.rs`), never a second
-  DNS lookup (`workers/api/src/handlers.rs`,
-  `workers/api/src/worker_entry.rs`); the per-address and total
+- The dial targets the validated hostname (at most
+  `MAX_DIAL_ADDRESSES` bounded attempts in
+  `workers/api/src/worker_entry.rs`), never a second DNS lookup of our
+  own — the runtime resolves for routing (`workers/api/src/handlers.rs`,
+  `workers/api/src/worker_entry.rs`); the per-attempt and total
   deadlines come from `DIAL_TIMEOUT_MS` / `TOTAL_TIMEOUT_MS` in
   `workers/api/src/vault.rs`, with per-user concurrency capped by
   `MAX_TEST_CONCURRENCY` in `workers/api/src/vault.rs`.
-- TLS fails closed on hostname-only certificates: `probe_one` in
-  `workers/api/src/worker_entry.rs` dials the IP literal with the
-  runtime socket, so the runtime validates the certificate against the
-  dialed address and a hostname-only provider certificate returns
-  `ok:false` instead of bypassing the pin
-  (`workers/api/src/worker_entry.rs`).
+- TLS verifies against the hostname: `probe_attempt` in
+  `workers/api/src/worker_entry.rs` dials the validated hostname with
+  the runtime socket, so the runtime SNI-verifies the certificate
+  against that name. No peer-IP check exists: workerd reports the dial
+  string itself as `SocketInfo.remote_address`, so containment is the
+  fresh dial-time validation, the allowlisted port, the timeouts, and no
+  application bytes exchanged (`workers/api/src/worker_entry.rs`).
 - Stream-pool routing is not yet in place: the per-user `NntpPool`
   Durable Object and its probe/body lanes live in `workers/stream`
   (`workers/stream/src/lib.rs`, `workers/stream/src/runtime.rs`,

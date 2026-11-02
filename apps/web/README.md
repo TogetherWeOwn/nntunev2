@@ -57,7 +57,7 @@ of scope here (tracked separately as Wasm enforcement).
 The tracked Wrangler config is [`wrangler.toml`](wrangler.toml) in this
 directory (staging/production names, no backend bindings or secret values).
 [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml) runs
-`staging-web` on pushes to `main` and `preview-web` on pull requests. Its
+`staging-web` on pushes to `main` (no per-PR preview deploys). Its
 `gate` job checks for `CLOUDFLARE_API_TOKEN`; deploys also require the
 `CLOUDFLARE_ACCOUNT_ID` secret (names only; the full account ID stays private).
 `post-deploy-e2e` follows a successful `staging-web`, not `staging-api`.

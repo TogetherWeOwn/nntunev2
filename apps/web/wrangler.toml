@@ -12,10 +12,6 @@ compatibility_flags = ["nodejs_als"]
 binding = "ASSETS"
 directory = ".svelte-kit/cloudflare"
 
-# Required for `wrangler preview` (per-PR preview job in deploy.yml).
-# Empty block is intentional: assets/compat stay top-level.
-[previews]
-
 [env.staging]
 name = "nntune-web-staging"
 # Staging catch-all: the api Worker owns the more specific

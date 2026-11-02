@@ -1,5 +1,5 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
-//! DNS-over-HTTPS resolution, pinned-address socket probing, and the
+//! DNS-over-HTTPS resolution, vetted-peer socket probing, and the
 //! magic-link mailer webhook. Request security decisions live in
 //! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
 //! caching-disabled attestation below) live here and refuse to serve
@@ -2393,23 +2393,42 @@ impl AsyncDns for DohDns {
     }
 }
 
-// --- Pinned-address dialer ----------------------------------------------------------------------
-
+// --- Hostname dialer ----------------------------------------------------------------------------------
+///
+/// The probe dials the validated hostname (never a second DNS lookup of
+/// our own): the runtime resolves it for routing and uses the same name
+/// for TLS SNI and certificate verification. Dialing a vetted IP literal
+/// instead verifies the certificate against the address, so a
+/// hostname-only certificate fails closed (`ok:false`) against every
+/// real provider.
+///
+/// There is deliberately no connected-peer check: workerd reports the
+/// dial string itself as `SocketInfo.remote_address` for outbound
+/// sockets, so a hostname dial can never yield a peer IP to vet. SSRF
+/// containment is the handler's fresh dial-time validation (resolve ALL
+/// DNS records, reject non-public ranges) immediately before this probe,
+/// the allowlisted port, the dial/total timeouts, and no application
+/// bytes ever exchanged. A validate-to-dial DNS flip is an accepted
+/// residual (threat model §3). See the threat model §3 pinning note.
 struct SocketDialer;
 
-async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
+/// The dial host for one probe attempt: the validated hostname — never
+/// an IP literal (TLS would verify the certificate against the address).
+/// A seam so tests pin the root-cause line: the `connect` target must be
+/// the hostname.
+fn probe_dial_host(target: &ValidatedTarget) -> &str {
+    target.host()
+}
+
+async fn probe_attempt(host: &str, port: u16, tls: bool) -> bool {
     let secure = if tls {
         worker::SecureTransport::On
     } else {
         worker::SecureTransport::Off
     };
-    // Dial the vetted IP literal only — the runtime must not re-resolve
-    // the hostname. With TLS on, the runtime validates the certificate
-    // against the dialed address; a hostname-only certificate therefore
-    // fails closed (`ok:false`) rather than bypassing the pin.
     let mut socket = match worker::Socket::builder()
         .secure_transport(secure)
-        .connect(addr.to_string(), port)
+        .connect(host, port)
     {
         Ok(socket) => socket,
         Err(_) => return false,
@@ -2438,10 +2457,16 @@ impl Dialer for SocketDialer {
         // The dialed port is the validated target's own allowlisted port —
         // never a caller-supplied substitute.
         let port = target.port();
+        let host = probe_dial_host(target);
         let mut deadline = std::pin::pin!(Delay::from(Duration::from_millis(TOTAL_TIMEOUT_MS)));
         let mut attempts = std::pin::pin!(async {
-            for addr in target.addresses().iter().take(MAX_DIAL_ADDRESSES) {
-                if probe_one(*addr, port, tls).await {
+            // Bounded attempts: each dial lets the runtime resolve the
+            // validated hostname fresh (routing plus TLS SNI/verify, with
+            // runtime address fallback across answers). No application
+            // bytes are ever exchanged — the probe proves TCP+TLS
+            // reachability only.
+            for _ in 0..MAX_DIAL_ADDRESSES {
+                if probe_attempt(host, port, tls).await {
                     return true;
                 }
             }
@@ -4817,6 +4842,39 @@ mod tests {
         assert!(
             !compensated.get(),
             "expiry drops the future: in-future compensation never runs"
+        );
+    }
+
+    #[test]
+    fn probe_dials_the_validated_hostname_not_an_ip_literal() {
+        // Root-cause pin: the `connect` target must be the validated
+        // hostname (runtime SNI/verify), never a vetted IP literal (TLS
+        // would verify the certificate against the address and fail every
+        // hostname-only certificate). A peer-IP check is impossible here:
+        // workerd reports the dial string itself as
+        // `SocketInfo.remote_address`, so it can never vet the peer.
+        struct ListDns(Vec<IpAddr>);
+        impl crate::vault::DnsResolver for ListDns {
+            fn resolve(&self, _host: &str) -> Vec<IpAddr> {
+                self.0.clone()
+            }
+        }
+        let target = crate::vault::ProviderConfig {
+            host: "news.example.com".into(),
+            port: 563,
+            tls: true,
+            username: "u".into(),
+            password: "p".into(),
+            max_connections: 2,
+            allow_insecure_plaintext: false,
+        }
+        .validate(&ListDns(vec!["93.184.216.34".parse().unwrap()]))
+        .expect("public fixture address validates");
+        let host = probe_dial_host(&target);
+        assert_eq!(host, "news.example.com");
+        assert!(
+            host.parse::<IpAddr>().is_err(),
+            "dial target must stay a hostname, never an IP literal"
         );
     }
 }

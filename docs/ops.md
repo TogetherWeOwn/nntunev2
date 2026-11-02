@@ -570,7 +570,7 @@ The production lane refuses any production vars beyond `name` in
 `node ci/check-production-secrets-shape.mjs`, which enforces the offline
 policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
 no bindings and needs no secrets, so its production env table must carry
-only `name` (current state: `apps/web/wrangler.toml:35-36`). It runs in the
+only `name` (current state: `apps/web/wrangler.toml:31-32`). It runs in the
 `deploy-production` job after that job checks out the validated promotion
 SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
 (preflight checks out the dispatch tip,
@@ -657,7 +657,7 @@ never reads or prints values
 This section defines evidence only. It does not create a lane.
 
 **Current claim boundary.** `.github/workflows/deploy.yml` deploys
-`apps/web` (`staging-web` on push, `preview-web` on pull requests) plus the
+`apps/web` (`staging-web` on push; no per-PR preview) plus the
 api Worker staging lane (`staging-api` on push, staging only, skipped until
 the Operator wires the staging variables).
 `.github/workflows/deploy-alerts-staging.yml` deploys only the

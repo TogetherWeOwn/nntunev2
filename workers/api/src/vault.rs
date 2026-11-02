@@ -212,9 +212,16 @@ fn host_shape_ok(host: &str) -> bool {
 // vector reuse in `tests/security_regressions.rs`. Do not fork it here.
 
 /// Vetted destination for one immediate outbound connection. Do not store
-/// this across requests: validate again at dial/fetch time, connect only to
-/// an address from this set, and retain `host` for TLS SNI/certificate checks
-/// and the HTTP Host header. Never let the transport re-resolve the hostname.
+/// this across requests: validate again at dial/fetch time, dial `host`
+/// (the runtime resolves it for routing and uses it for TLS SNI/certificate
+/// checks and the HTTP Host header — never dial a bare IP literal for TLS,
+/// which would verify the certificate against the address). The dialed
+/// `addresses` are the vetted set the hostname resolved to at validation
+/// time; workerd reports the dial string itself as
+/// `SocketInfo.remote_address`, so a socket probe cannot check the
+/// connected peer against this set — containment is the fresh validation
+/// plus the allowlisted port and timeouts. Never let the transport
+/// re-resolve the hostname itself.
 #[derive(Debug)]
 pub struct ValidatedTarget {
     host: String,
@@ -271,10 +278,14 @@ fn resolve_public_target(
 /// can change after the save; the save-time check alone is bypassable).
 ///
 /// The caller MUST:
-/// - resolve fresh (this function) and pin the transport dial/fetch to the
-///   returned [`ValidatedTarget::addresses`] — never re-resolve the hostname
-///   in the transport (no second DNS lookup);
-/// - retain [`ValidatedTarget::host`] for TLS SNI/certificate checks;
+/// - resolve fresh (this function) and dial [`ValidatedTarget::host`] —
+///   the runtime resolves it for routing and uses it for TLS
+///   SNI/certificate checks (never dial a bare IP literal for TLS);
+///   never re-resolve the hostname in the transport itself (no second
+///   DNS lookup). No connected-peer check exists at the socket layer:
+///   workerd reports the dial string as `SocketInfo.remote_address`, so
+///   the returned [`ValidatedTarget::addresses`] document what the
+///   hostname vetted as — they cannot gate the open socket;
 /// - dial [`ValidatedTarget::port`] only;
 /// - enforce [`TestConnectionBudget`] timeouts and the
 ///   [`test_attempt_allowed`] / [`concurrent_test_allowed`] gates before
