@@ -1,5 +1,5 @@
 //! Worker runtime wiring: env config, Hyperdrive Postgres store,
-//! DNS-over-HTTPS resolution, pinned-address socket probing, and the
+//! DNS-over-HTTPS resolution, vetted-peer socket probing, and the
 //! magic-link mailer webhook. Request security decisions live in
 //! `handlers`; startup fail-closed gates (env config plus the Hyperdrive
 //! caching-disabled attestation below) live here and refuse to serve
@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio_postgres::types::Type;
@@ -2376,23 +2376,50 @@ impl AsyncDns for DohDns {
     }
 }
 
-// --- Pinned-address dialer ----------------------------------------------------------------------
-
+// --- Vetted-peer dialer --------------------------------------------------------------------------
+///
+/// The probe dials the validated hostname (never a second DNS lookup of
+/// our own): the runtime resolves it once for routing and uses the same
+/// name for TLS SNI and certificate verification. Dialing a vetted IP
+/// literal instead verifies the certificate against the address, so a
+/// hostname-only certificate fails closed (`ok:false`) against every
+/// real provider. The SSRF pin survives as a peer check
+/// ([`probe_peer_vetted`]): a socket whose connected peer is outside the
+/// handler-vetted set is closed without exchanging application bytes, so
+/// a validate-to-dial DNS flip cannot redirect the probe at a target the
+/// handler never vetted. See the threat model §3 pinning note.
 struct SocketDialer;
 
-async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
+/// Whether a freshly opened probe socket reached a vetted peer.
+///
+/// `remote_address` is the runtime-reported `opened()` peer (`IP:port`,
+/// bracketed v6 with port, or a bare IP literal). Membership in `vetted`
+/// is required; anything missing or unparseable fails closed. The peer
+/// port needs no separate check: TCP connected it to the vetted port by
+/// construction. Pure (no runtime calls) so unit tests pin it natively.
+fn probe_peer_vetted(remote_address: Option<&str>, vetted: &[IpAddr]) -> bool {
+    let Some(remote) = remote_address else {
+        return false;
+    };
+    let ip = remote
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip())
+        .or_else(|_| remote.parse::<IpAddr>());
+    match ip {
+        Ok(ip) => vetted.contains(&ip),
+        Err(_) => false,
+    }
+}
+
+async fn probe_attempt(host: &str, port: u16, tls: bool, vetted: &[IpAddr]) -> bool {
     let secure = if tls {
         worker::SecureTransport::On
     } else {
         worker::SecureTransport::Off
     };
-    // Dial the vetted IP literal only — the runtime must not re-resolve
-    // the hostname. With TLS on, the runtime validates the certificate
-    // against the dialed address; a hostname-only certificate therefore
-    // fails closed (`ok:false`) rather than bypassing the pin.
     let mut socket = match worker::Socket::builder()
         .secure_transport(secure)
-        .connect(addr.to_string(), port)
+        .connect(host, port)
     {
         Ok(socket) => socket,
         Err(_) => return false,
@@ -2403,7 +2430,10 @@ async fn probe_one(addr: IpAddr, port: u16, tls: bool) -> bool {
         std::future::poll_fn(|cx| {
             use std::task::Poll;
             if let Poll::Ready(result) = opened.as_mut().poll(cx) {
-                return Poll::Ready(result.is_ok());
+                return Poll::Ready(match result {
+                    Ok(info) => probe_peer_vetted(info.remote_address.as_deref(), vetted),
+                    Err(_) => false,
+                });
             }
             if let Poll::Ready(()) = delay.as_mut().poll(cx) {
                 return Poll::Ready(false);
@@ -2423,8 +2453,14 @@ impl Dialer for SocketDialer {
         let port = target.port();
         let mut deadline = std::pin::pin!(Delay::from(Duration::from_millis(TOTAL_TIMEOUT_MS)));
         let mut attempts = std::pin::pin!(async {
-            for addr in target.addresses().iter().take(MAX_DIAL_ADDRESSES) {
-                if probe_one(*addr, port, tls).await {
+            // Bounded attempts: each dial lets the runtime resolve the
+            // validated hostname fresh (routing plus TLS SNI/verify), and
+            // each opened socket must report a peer inside the
+            // handler-vetted set or it is closed and retried. No
+            // application bytes are ever exchanged — the probe proves
+            // TCP+TLS reachability only.
+            for _ in 0..MAX_DIAL_ADDRESSES {
+                if probe_attempt(target.host(), port, tls, target.addresses()).await {
                     return true;
                 }
             }
@@ -4770,6 +4806,42 @@ mod tests {
             !compensated.get(),
             "expiry drops the future: in-future compensation never runs"
         );
+    }
+
+    #[test]
+    fn probe_peer_vetted_accepts_only_vetted_peers() {
+        // The probe dials the validated hostname (runtime SNI/verify) and
+        // enforces the vetted-set pin on the connected peer: only a peer
+        // inside the handler-vetted set counts as reachable. Anything
+        // missing or unparseable fails closed.
+        let vetted: Vec<IpAddr> = vec![
+            "93.184.216.34".parse().unwrap(),
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
+        ];
+        // Same-set peers in every reported shape.
+        assert!(probe_peer_vetted(Some("93.184.216.34:563"), &vetted));
+        assert!(probe_peer_vetted(Some("93.184.216.34"), &vetted));
+        assert!(probe_peer_vetted(
+            Some("[2606:2800:220:1:248:1893:25c8:1946]:563"),
+            &vetted
+        ));
+        assert!(probe_peer_vetted(
+            Some("2606:2800:220:1:248:1893:25c8:1946"),
+            &vetted
+        ));
+        // Outside the vetted set (validate-to-dial DNS flip), missing, or
+        // unparseable: fail closed.
+        assert!(!probe_peer_vetted(Some("203.0.113.7:563"), &vetted));
+        assert!(!probe_peer_vetted(Some("203.0.113.7"), &vetted));
+        assert!(!probe_peer_vetted(None, &vetted));
+        assert!(!probe_peer_vetted(Some(""), &vetted));
+        assert!(!probe_peer_vetted(Some("not-an-address"), &vetted));
+        assert!(!probe_peer_vetted(
+            Some("93.184.216.34:99999999999"),
+            &vetted
+        ));
+        // An empty vetted set accepts nothing.
+        assert!(!probe_peer_vetted(Some("93.184.216.34:563"), &[]));
     }
 }
 

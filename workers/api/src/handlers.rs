@@ -1013,13 +1013,17 @@ pub(crate) async fn deliver_mail_with_deadline(
 }
 
 /// Bounded outbound probe for `test connection`. Implementations dial
-/// ONLY addresses from `target` (never re-resolve `target.host()`), at
-/// exactly `target.port()` (the allowlisted port the target was vetted
-/// for — callers pass no port, so a substitute can never be smuggled in),
-/// keep the hostname for TLS SNI/certificate checks where the runtime
-/// supports it, apply the per-address and total `vault` timeout constants,
-/// attempt no more than `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a
-/// bare boolean — banners/errors never leave the dialer.
+/// `target.host()` (the runtime resolves it once for routing and uses it
+/// for TLS SNI/certificate checks — an IP-literal dial would verify the
+/// certificate against the address and fail every hostname-only
+/// certificate), at exactly `target.port()` (the allowlisted port the
+/// target was vetted for — callers pass no port, so a substitute can
+/// never be smuggled in), enforce that the connected peer is an address
+/// from `target` (a re-resolved peer outside the vetted set is closed
+/// without exchanging application bytes), apply the per-attempt and
+/// total `vault` timeout constants, attempt no more than
+/// `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a bare
+/// boolean — banners/errors never leave the dialer.
 pub trait Dialer {
     fn probe(&self, target: &ValidatedTarget, tls: bool) -> impl Future<Output = bool>;
 }
