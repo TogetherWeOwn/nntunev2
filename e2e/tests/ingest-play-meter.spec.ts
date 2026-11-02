@@ -1,7 +1,5 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   API,
   TESTIDS,
@@ -35,17 +33,21 @@ import {
 } from '../helpers/accounts.js';
 import {
   REAL_NZB_RAR_SKIP,
-  fixtureNzbOr,
   realNzbActive,
+  requireRealNzbFixture,
 } from '../helpers/real-nzb-fixture.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-// Staging real-NZB mode (secret-held RAR set, `TEST_NZB_PATH` staged by the
-// workflow) ingests the runtime file; every other run keeps the synthetic
-// fixture served by the local fixture server. Legs that need decoded audio
-// or a streamable track skip by name in real-NZB mode (RAR read pending) —
-// ingest, reload, recording_mbids and the ingest-refusal leg still run.
-const FIXTURE_NZB = fixtureNzbOr(path.resolve(here, '../fixtures/synthetic.nzb'));
+// Golden path part 2: ingest the staged real NZB (secret-held RAR set,
+// `TEST_NZB_PATH` staged by the workflow into `RUNNER_TEMP` only — there are
+// no checked-in NZB fixtures) → stream with Range seeks → usage meter moves
+// → plan metadata stays consistent → browser playback, seek and Media
+// Session → separately minted over-limit staging accounts are refused on
+// stream and on ingest with the documented plan-limit status (headers, code,
+// upgrade CTA, no leaks). Legs that need decoded audio or a streamable track
+// skip by name in real-NZB mode (RAR read pending — see REAL_NZB_RAR_SKIP):
+// ingest, reload, recording_mbids and the ingest-refusal leg still run. The
+// upload path resolves lazily inside the uploading tests so a missing staging
+// fails the run red, never silently.
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
 // usage meter moves → plan metadata stays consistent → browser playback,
@@ -145,7 +147,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await waitForHydration(page, 'ingest');
     const fileInput = page.getByTestId(TESTIDS.importFile);
     await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-    await fileInput.setInputFiles(FIXTURE_NZB);
+    await fileInput.setInputFiles(requireRealNzbFixture());
     const status = page.getByTestId(TESTIDS.importStatus);
     await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
     await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
@@ -351,7 +353,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await expect(page.getByTestId(TESTIDS.usageMeter).first()).toBeVisible({ timeout: 15_000 });
   });
 
-  test('synthetic audio actually plays in the browser', async ({ page, request }) => {
+  test('ingested audio actually plays in the browser', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'playback');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
@@ -486,7 +488,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
       await expect
         .poll(async () => playbackFailure(await snapshot(), baseline), {
           timeout: 15_000,
-          message: 'synthetic audio did not enter the playing state and advance',
+          message: 'ingested audio did not enter the playing state and advance',
         })
         .toBeNull();
       before = await snapshot();
@@ -495,15 +497,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
     expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
   });
 
-  // FIXMEd until the staging MB mirror can match the synthetic fixture:
-  // synthetic.nzb's subject ("NNTune-Fixture sine-660 [01/03]") derives to
-  // the plain-title query "NNTune-Fixture sine-660", which has no release in
-  // the shared MB mirror, so the library write is empty by design
+  // FIXMEd until the staging MB mirror can match the staged real NZB: the
+  // secret-held RAR set derives its match query from real Usenet subjects,
+  // and whether the shared MB mirror holds that release is unproven — an
+  // empty mirror match keeps the library write empty by design
   // (library_write_for in workers/ingest/src/matching.rs drops recordings
   // without a release; the queue consumer resolves unmatched to Vec::new()).
   // Below playback and FIXMEd, so it can never fail or skip a later step.
-  // Un-fixme paths: (a) ingest an `Artist - Album` fixture for a real,
-  // unambiguous mirrored release, or (b) seed a fixture release in staging.
+  // Un-fixme path: confirm the mirror holds the real NZB's release (or seed
+  // it in staging) once RAR-set ingest + matching evidence exists.
   test.fixme('ingested track carries recording_mbids', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'recording-mbids');
     if (!baseURL) {
@@ -553,9 +555,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
   // The seek is performed while PAUSED. That is what makes the assertion
   // non-vacuous: a paused position cannot drift into the seeked region by
   // natural playback advance, so arriving there while still paused can only
-  // be the seek. It also works with the pinned 210 ms synthetic WAV
-  // (crates/nntune-test-nntp fixtures), where seek-while-playing would race
-  // the end of the track.
+  // be the seek. (This leg skips by name in real-NZB mode — see
+  // REAL_NZB_RAR_SKIP — so the note below covers non-staged runs only: the
+  // short in-memory corpus tones keep seek-while-playing from racing the end
+  // of the track.)
   test('player UI seek moves the active audio position and playback continues', async ({
     page,
     request,
@@ -1022,7 +1025,7 @@ test.describe('plan limit', () => {
       request,
       ingestUrl,
       { ...headers, 'Content-Type': 'application/octet-stream' },
-      readFileSync(FIXTURE_NZB),
+      readFileSync(requireRealNzbFixture()),
       'plan-limit-ingest',
     );
     const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');

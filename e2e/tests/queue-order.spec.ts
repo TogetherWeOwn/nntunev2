@@ -1,7 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { queueOrderFailure } from '../helpers/queue-order.js';
-import { twoTrackPreconditionFailure } from '../helpers/two-track-fixture.js';
 
 // Offline acceptance for the queue-order verdict used by the live
 // "player queue advances in library-selection order" spec in
@@ -19,37 +18,42 @@ import { twoTrackPreconditionFailure } from '../helpers/two-track-fixture.js';
 const journey = readFileSync(new URL('./player-queue-order.spec.ts', import.meta.url), 'utf8');
 
 test.describe('queue-order journey wiring (offline)', () => {
-  test('ingest resolves and uploads both single-file fixtures in the same account', () => {
-    // Two sequential 240s ingest waits must not inherit the old 300s test bound.
+  test('ingest resolves and uploads the staged real NZB in the same account', () => {
+    // The serial ingest wait must not inherit the old 300s test bound.
     const serialAt = journey.indexOf("test.describe.serial('player queue follows library-selection order'");
     const ingestAt = journey.indexOf("test('NZB fixture ingests and appears in the library'");
     expect(serialAt).toBeGreaterThan(-1);
     expect(ingestAt).toBeGreaterThan(serialAt);
     expect(journey.slice(serialAt, ingestAt)).toContain('test.describe.configure({ timeout: 600_000 });');
-    expect(journey).toContain('singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE)');
-    expect(journey).toContain('secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE)');
-    expect(journey).toMatch(/resolveTwoTrackFixture\([\s\S]*?existsSync/);
-    expect(journey).toMatch(/for \(const nzb of staging\.staged\) \{[\s\S]*?await fileInput\.setInputFiles\(nzb\)/);
+    // One upload of the staged secret-held real NZB — lazy, so a missing
+    // staging fails the run red (no checked-in fixtures since TWO-1169).
+    expect(journey).toContain('const stagedNzb = requireRealNzbFixture()');
+    expect(journey).toContain('await fileInput.setInputFiles(stagedNzb)');
+    expect(journey).not.toContain('resolveTwoTrackFixture');
+    expect(journey).not.toContain('FIXTURES_DIR');
     expect(journey).toContain('sharedAccount = minted');
     expect(journey).toContain('const account = sharedAccount ??');
     expect(journey).toContain('const headers = accountHeaders(account)');
   });
 
-  test('queue-order is active when configured and skips only pre-deploy', () => {
+  test('queue-order is active when configured and parked by name in real-NZB mode', () => {
     expect(journey).toContain("test('player queue advances in library-selection order'");
     expect(journey).not.toContain('test.fixme(');
     expect(journey).toMatch(/test\.skip\(\s*!process\.env\.STAGING_BASE_URL/);
     expect(journey).toContain("stagingBaseUrl('skip', 'queue-order')");
+    // The real NZB stages a single library row, so the ≥2-track assertion is
+    // parked until RAR-set playback + multi-track staging land (TWO-1174) —
+    // the skip reason links the follow-up and the gate allow-lists the title.
+    expect(journey).toContain('REAL_NZB_RAR_SKIP');
+    expect(journey).toContain('RAR_PLAYBACK_FOLLOW_UP');
   });
 
   test('distinct-track precondition fails by name before browser queue waits', () => {
-    const preconditionAt = journey.indexOf('twoTrackPreconditionFailure(apiIds)');
-    expect(preconditionAt).toBeGreaterThan(-1);
-    expect(journey.indexOf('const rows = page.getByTestId(TESTIDS.libraryItem)')).toBeGreaterThan(preconditionAt);
-    expect(journey).toContain("expect(precondition, `[queue-order] ${precondition ?? 'two-track precondition met'}`).toBeNull()");
-    expect(twoTrackPreconditionFailure(['only-track'])).toMatch(/only 1 track.*second synthetic track is missing/);
-    expect(twoTrackPreconditionFailure(['only-track', 'only-track'])).not.toBeNull();
-    expect(twoTrackPreconditionFailure(['track-a', 'track-b'])).toBeNull();
+    expect(journey).toContain('apiIds.length');
+    expect(journey).toContain('[queue-order] library holds fewer than 2 tracks');
+    expect(journey.indexOf('const rows = page.getByTestId(TESTIDS.libraryItem)')).toBeGreaterThan(
+      journey.indexOf('[queue-order] library holds fewer than 2 tracks'),
+    );
   });
 });
 
@@ -108,9 +112,9 @@ test.describe('queueOrderFailure (queue vs library-selection order, offline fixt
   });
 
   test('longer queue fails naming the extra id', () => {
-    const failure = queueOrderFailure(['track-a', 'track-b'], ['track-a', 'track-b', 'track-c']);
+    const failure = queueOrderFailure(['track-a', 'track-b', 'track-c'], ['track-a', 'track-b', 'track-d']);
     expect(failure).not.toBeNull();
-    expect(failure).toMatch(/track-c/);
+    expect(failure).toMatch(/track-d/);
   });
 
   test('duplicate id in the queue fails', () => {

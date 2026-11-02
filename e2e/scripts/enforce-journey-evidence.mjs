@@ -29,15 +29,17 @@
  *   - "ingested track carries recording_mbids": test.fixme in
  *     e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending).
  *
- * Real-NZB mode (REAL_NZB_MODE=true, set by the workflow when it staged the
- * secret-held RAR-set fixture): the legs below skip by name because the RAR
- * set proves ingest + matching but yields no streamable track until RAR read
+ * Real-NZB mode (REAL_NZB_MODE=true, set by the workflow after it stages the
+ * secret-held RAR-set fixture — the only journey mode since TWO-1169 deleted
+ * every checked-in NZB): the legs below skip by name because the RAR set
+ * proves ingest + matching but yields no streamable track until RAR read
  * lands (one upload is one library row until the per-file manifest lands).
  * The extended allow-list is fixed here (each entry still binds to its owning
  * spec file and is consumed once), and the effective budget becomes the
- * extended list's length — MAX_ALLOWED_SKIPS keeps governing standard mode.
- * Any failure, or any skip outside the active list, still fails the gate in
- * both modes.
+ * extended list's length — MAX_ALLOWED_SKIPS keeps governing the non-staged
+ * (offline) mode. Any failure, or any skip outside the active list, still
+ * fails the gate in both modes. The provider 430 control is never allow-
+ * listed: it must run.
  *
  * Environment:
  *   JUNIT_PATH            junit evidence to parse (default: test-results/junit.xml,
@@ -94,7 +96,7 @@ const REAL_NZB_ALLOWED_SKIPS = [
   },
   {
     file: 'ingest-play-meter.spec.ts',
-    match: 'synthetic audio actually plays in the browser',
+    match: 'ingested audio actually plays in the browser',
     reason: 'real-NZB mode: no decodable staged audio until RAR read lands',
   },
   {
@@ -113,11 +115,6 @@ const REAL_NZB_ALLOWED_SKIPS = [
     reason:
       'real-NZB mode: capped stream leg needs a pre-seeded streamable track; ' +
       'refusal-shape coverage continues through the ingest-refusal leg',
-  },
-  {
-    file: 'two-track-fixture.spec.ts',
-    match: 'two-track fixture stages',
-    reason: 'real-NZB mode: one RAR-set upload is one library row until the per-file manifest lands',
   },
   {
     file: 'player-queue-order.spec.ts',

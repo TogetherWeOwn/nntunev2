@@ -2,15 +2,15 @@ import { test, expect } from '@playwright/test';
 import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 
 // Offline acceptance for the browser-playback verdict used by the live
-// "synthetic audio actually plays in the browser" spec in
+// "ingested audio actually plays in the browser" spec in
 // ingest-play-meter.spec.ts. No staging, no credentials, no skip guard:
 // these cases pin that an HTTP 206 / loaded / paused element can never be
 // reported as playing, while a genuinely advancing element can.
 //
-// The synthetic staged track is a ~0.1 s WAV (1724 bytes — see
-// e2e/fixtures/synthetic.nzb), so "played through and ended" is a pass:
-// by the time a poll samples the element it may already be ended. Ended
-// only passes together with recorded playing/advancement evidence.
+// The staged track is a sub-second tone (the in-memory sine corpus — no
+// checked-in NZB fixtures since TWO-1169), so "played through and ended" is
+// a pass: by the time a poll samples the element it may already be ended.
+// Ended only passes together with recorded playing/advancement evidence.
 
 function evidence(overrides: Partial<PlaybackEvidence> = {}): PlaybackEvidence {
   return {
@@ -34,7 +34,7 @@ test.describe('playbackFailure (browser playback verdict, offline fixtures)', ()
     ).toBeNull();
   });
 
-  test('played through to ended passes for the sub-second synthetic track', () => {
+  test('played through to ended passes for the sub-second staged track', () => {
     expect(
       playbackFailure(
         evidence({ sawPlaying: true, paused: true, ended: true, currentTime: 0.11, maxCurrentTime: 0.11 }),

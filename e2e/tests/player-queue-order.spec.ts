@@ -1,7 +1,4 @@
 import { test, expect } from '@playwright/test';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { API, TESTIDS } from '../helpers/contract.js';
 import { readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import {
@@ -18,25 +15,24 @@ import {
 } from '../helpers/accounts.js';
 import { queueOrderFailure } from '../helpers/queue-order.js';
 import {
+  RAR_PLAYBACK_FOLLOW_UP,
   REAL_NZB_RAR_SKIP,
   realNzbActive,
-  resolveRealNzbFixture,
+  requireRealNzbFixture,
 } from '../helpers/real-nzb-fixture.js';
-import {
-  SECOND_SINGLE_TRACK_FIXTURE_FILE,
-  SINGLE_TRACK_FIXTURE_FILE,
-  resolveTwoTrackFixture,
-  twoTrackPreconditionFailure,
-} from '../helpers/two-track-fixture.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURES_DIR = path.resolve(here, '../fixtures');
-
-// Queue-order journey: ingest both single-file NZB fixtures, queue the tracks in
-// library-selection order, and require the player queue to advance in that
-// same order. The offline `apps/web/tests/player-queue.spec.ts` pins queue
+// Queue-order journey: ingest the secret-held real NZB, queue the library in
+// selection order, and require the player queue to advance in that same
+// order. The offline `apps/web/tests/player-queue.spec.ts` pins queue
 // mechanics with mocked audio; this spec is the staging side — a real
 // ingested library, real selection order.
+//
+// The real NZB is a RAR set that yields a single library row, so the ingest
+// test below proves ingest + matching while the queue-order test skips by
+// name until ≥2 tracks are stageable (RAR-set playback + multi-track staging
+// un-park under TWO-1174). There are no checked-in NZB fixtures (TWO-1169
+// deleted them all): the ingest path resolves lazily inside the test so a
+// missing staging fails the run red, never silently.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -53,7 +49,7 @@ const NOW_PLAYING = 'now-playing';
 const PLAYER_NEXT = 'player-next';
 
 test.describe.serial('player queue follows library-selection order', () => {
-  // Two sequential ingest jobs (queue + NNTP fetch + verify) can take minutes.
+  // The ingest job (queue + NNTP fetch + verify) can take minutes.
   test.describe.configure({ timeout: 600_000 });
 
   // Serial file: the queue-order test reuses the ingest test's account so
@@ -66,21 +62,9 @@ test.describe.serial('player queue follows library-selection order', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
-    // Staging real-NZB mode (secret-held RAR set) stages the single runtime
-    // file instead of the two synthetic uploads: one upload is one library
-    // row, so this ingest test proves ingest + matching while the
-    // queue-order test below skips by name until ≥2 tracks are stageable.
-    const realNzb = resolveRealNzbFixture(process.env.TEST_NZB_PATH, existsSync);
-    const staging =
-      realNzb !== null
-        ? { staged: [realNzb], isTwoTrack: false }
-        : resolveTwoTrackFixture(
-            {
-              singleTrack: path.resolve(FIXTURES_DIR, SINGLE_TRACK_FIXTURE_FILE),
-              secondSingle: path.resolve(FIXTURES_DIR, SECOND_SINGLE_TRACK_FIXTURE_FILE),
-            },
-            existsSync,
-          );
+    // One upload of the staged real NZB: one ingest job, one library row.
+    // Lazy so a missing staging fails this run red (no synthetic fallback).
+    const stagedNzb = requireRealNzbFixture();
     const minted = await tryMintTestAccount(request, baseURL);
     // Evidence provenance: this test duplicates the signup branch, so it
     // records the same bounded signup-path label (no account data).
@@ -104,23 +88,19 @@ test.describe.serial('player queue follows library-selection order', () => {
     // password rather than ingesting into a provider-less account.
     await completeByopWizard(page, baseURL);
 
-    // Two single-file uploads in this account: two jobs and two rows per
-    // idempotency key. One multi-file NZB still yields only one library row.
-    for (const nzb of staging.staged) {
-      await page.goto(`${baseURL}/library/import`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30_000,
-      });
-      await waitForHydration(page, 'player-queue-order');
-      const fileInput = page.getByTestId(TESTIDS.importFile);
-      await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-      await fileInput.setInputFiles(nzb);
-      const status = page.getByTestId(TESTIDS.importStatus);
-      await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
-      await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
-        timeout: 240_000,
-      });
-    }
+    await page.goto(`${baseURL}/library/import`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30_000,
+    });
+    await waitForHydration(page, 'player-queue-order');
+    const fileInput = page.getByTestId(TESTIDS.importFile);
+    await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
+    await fileInput.setInputFiles(stagedNzb);
+    const status = page.getByTestId(TESTIDS.importStatus);
+    await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
+    await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
+      timeout: 240_000,
+    });
     await page.goto(`${baseURL}/library`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await expect(
       page.getByTestId(TESTIDS.libraryItem).first(),
@@ -128,8 +108,10 @@ test.describe.serial('player queue follows library-selection order', () => {
     ).toBeVisible({ timeout: 60_000 });
   });
 
-  // Runs after both uploads under the same ingesting identity. A missing
-  // second upload fails the API precondition by name before any queue wait.
+  // Parked until RAR-set playback + multi-track staging land
+  // (RAR_PLAYBACK_FOLLOW_UP): the real NZB yields a single library row, so
+  // the ≥2-track queue assertion has nothing to run against. Skips by name —
+  // the evidence gate allow-lists this title in real-NZB mode.
   test('player queue advances in library-selection order', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'queue-order');
     if (!baseURL) {
@@ -137,7 +119,7 @@ test.describe.serial('player queue follows library-selection order', () => {
       return;
     }
     if (realNzbActive()) {
-      test.skip(true, REAL_NZB_RAR_SKIP);
+      test.skip(true, `${REAL_NZB_RAR_SKIP} (un-parks under ${RAR_PLAYBACK_FOLLOW_UP})`);
       return;
     }
     // Same identity discipline as the ingest journey: queue order must run
@@ -159,8 +141,10 @@ test.describe.serial('player queue follows library-selection order', () => {
     const apiIds = Array.isArray(apiItems)
       ? apiItems.map((item) => item?.id).filter((id): id is string => typeof id === 'string')
       : [];
-    const precondition = twoTrackPreconditionFailure(apiIds);
-    expect(precondition, `[queue-order] ${precondition ?? 'two-track precondition met'}`).toBeNull();
+    expect(
+      apiIds.length,
+      '[queue-order] library holds fewer than 2 tracks — queue-order needs ≥2',
+    ).toBeGreaterThanOrEqual(2);
 
     // Names only: a page-error message can embed the staging origin or other
     // values that must stay out of public CI artifacts.

@@ -196,24 +196,24 @@ export function stagingBaseUrl(required: 'skip' | 'fail-closed', context: string
   return raw;
 }
 
-/** Synthetic NNTP endpoint the BYOP wizard points at (hosted fixture server or test provider). */
+/** Real staging NNTP endpoint the BYOP wizard points at (a real provider despite the `SYNTHETIC_` names). */
 export interface NntpEndpoint {
   host: string;
   port: number;
   user: string;
-  // The fixture harness only supports TLS-on: syntheticNntpEndpoint rejects
+  // The harness only supports TLS-on: syntheticNntpEndpoint rejects
   // TLS-off outright, so no endpoint with tls=false can exist here.
   tls: true;
 }
 
 /**
- * NNTP endpoint config. Host/user have fixture defaults (not secrets); the
+ * NNTP endpoint config. Host/user have harness defaults (not secrets); the
  * password has NO default and stays in the environment. TLS defaults on.
  *
- * Fail closed on a fixture transport the BYOP wizard cannot represent:
+ * Fail closed on a provider transport the BYOP wizard cannot represent:
  * only the UI allowlist ports (119 / 563) are accepted, and TLS-off is
  * rejected outright — the product allows plaintext only behind an explicit
- * in-page acknowledgement the fixture is not configured to give, so the
+ * in-page acknowledgement the harness is not configured to give, so the
  * harness must never enable (or silently ignore) plaintext on its behalf.
  */
 export function syntheticNntpEndpoint(): NntpEndpoint & { hasPassword: boolean } {

@@ -183,6 +183,9 @@ test.describe('credential scope (static pins)', () => {
       'build-identity.spec.ts',
       'zz-build-identity-final.spec.ts',
       'api-worker-anonymous.spec.ts',
+      // The provider 430 control speaks raw NNTP over TLS (no HTTP at all),
+      // so it can never carry credentials on a raw request call — pin that.
+      'provider-430-control.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -2348,6 +2351,10 @@ test.describe('deployed-build identity wiring (static pin)', () => {
     expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
     expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
     expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
+    // No checked-in NZB fixtures (TWO-1169): the retired two-track offline
+    // spec is gone, and the provider-budget offline pins run in its place.
+    expect(pkg.scripts['test:unit']).not.toContain('two-track-fixture');
+    expect(pkg.scripts['test:unit']).toContain('tests/provider-budget.spec.ts');
   });
 });
 
@@ -2480,22 +2487,23 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
   });
 
-  // Real-NZB mode (REAL_NZB_MODE=true): the secret-held RAR set proves
-  // ingest + matching but yields no streamable track until RAR read lands,
-  // so the decoded-audio legs skip by name under a fixed extended
-  // allow-list that budgets the run instead of MAX_ALLOWED_SKIPS. Standard
-  // mode is unchanged — the queue-order negative above still holds there.
+  // Real-NZB mode (REAL_NZB_MODE=true — the only journey mode since TWO-1169
+  // deleted every checked-in NZB): the secret-held RAR set proves ingest +
+  // matching but yields no streamable track until RAR read lands, so the
+  // decoded-audio legs skip by name under a fixed extended allow-list that
+  // budgets the run instead of MAX_ALLOWED_SKIPS. The provider 430 control
+  // is never allow-listed: it must run. Standard mode is unchanged — the
+  // queue-order negative above still holds there.
   const REAL_NZB_SKIP_CASES: Array<[string, string]> = [
     ['ingest-play-meter.spec.ts', 'streaming answers byte Ranges with 206 + Content-Range'],
     ['ingest-play-meter.spec.ts', 'usage meter increases after streaming and shows plan metadata'],
-    ['ingest-play-meter.spec.ts', 'synthetic audio actually plays in the browser'],
+    ['ingest-play-meter.spec.ts', 'ingested audio actually plays in the browser'],
     [
       'ingest-play-meter.spec.ts',
       'player UI seek moves the active audio position and playback continues',
     ],
     ['ingest-play-meter.spec.ts', 'Media Session metadata reflects the playing ingested track'],
     ['ingest-play-meter.spec.ts', 'over-limit staging account is refused with a plan-limit status'],
-    ['two-track-fixture.spec.ts', 'two-track fixture stages ≥2 synthetic tracks in the library'],
     ['player-queue-order.spec.ts', 'player queue advances in library-selection order'],
   ];
 
@@ -2513,7 +2521,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('real-NZB mode passes the fixme plus the fixed RAR-set skips', () => {
     const result = runGateScript(realNzbXml(), { REAL_NZB_MODE: 'true' });
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 10 | 1 | 9 | 0 |');
+    expect(result.summary).toContain('| 9 | 1 | 8 | 0 |');
     expect(result.summary).toContain('real-NZB mode');
     expect(result.summary).toContain('PASS');
   });
@@ -2628,13 +2636,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
   test('allow-list reasons name the owning specs', () => {
     // Standard mode still budgets only the recording_mbids fixme: the
-    // queue-order and two-track entries below live in the real-NZB-only
-    // list, which is inert unless REAL_NZB_MODE=true.
+    // queue-order entry below lives in the real-NZB-only list, which is
+    // inert unless REAL_NZB_MODE=true. The retired two-track wiring must not
+    // reappear in the gate (TWO-1169 deleted every checked-in NZB).
     expect(gateScriptSource).toContain('ingest-play-meter');
     expect(gateScriptSource).toContain('REAL_NZB_ALLOWED_SKIPS');
     expect(gateScriptSource).toContain('REAL_NZB_MODE');
     expect(gateScriptSource).toContain('player-queue-order');
-    expect(gateScriptSource).toContain('two-track-fixture');
+    expect(gateScriptSource).not.toContain('two-track-fixture');
     expect(gateScriptSource).toContain('reason');
   });
 
@@ -2744,14 +2753,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 });
 
 test.describe('staging real-NZB prepare step (static pin)', () => {
-  // The checked-in synthetic NZBs answer 430 on the real staging provider,
-  // so the e2e job rebuilds the secret-held real NZB into RUNNER_TEMP and
-  // truncates it to one whole data file before the journey. Owner rule
-  // (public repo): no NZB bytes, message-IDs, subjects, file names or
-  // segment lists in the repo or public logs — the halves travel as env
-  // only, the full NZB never leaves RUNNER_TEMP, and the step prints only
-  // counts and names. These pins keep the wiring (and the silence) honest
-  // offline.
+  // There are no checked-in NZB fixtures (TWO-1169 deleted them all), so the
+  // e2e job rebuilds the secret-held real NZB into RUNNER_TEMP and truncates
+  // it to one whole data file before the journey — unset halves fail the job
+  // red instead of minting synthetic evidence. Owner rule (public repo): no
+  // NZB bytes, message-IDs, subjects, file names or segment lists in the
+  // repo or public logs — the halves travel as env only, the full NZB never
+  // leaves RUNNER_TEMP, and the step prints only counts and names. These pins
+  // keep the wiring (and the silence) honest offline.
   const section = jobSection(stagingWorkflow, 'e2e');
   const marker = '      - name: Prepare staging real-NZB fixture';
   const prepareStart = section.indexOf(marker);
@@ -2777,10 +2786,10 @@ test.describe('staging real-NZB prepare step (static pin)', () => {
     expect(prepareBlock).toContain('f37c136a6b3eface');
     expect(prepareBlock).toContain('prepare-real-nzb.mjs');
     expect(prepareBlock).toContain('ready=true');
-    expect(prepareBlock).toContain('ready=false');
+    expect(prepareBlock).not.toContain('ready=false');
     expect(prepareBlock).toContain('GITHUB_OUTPUT');
-    // Absent halves fall back to synthetic fixtures instead of failing.
-    expect(prepareBlock).toContain('synthetic fixtures (standard mode)');
+    // Absent halves fail closed — no synthetic fallback exists anymore.
+    expect(prepareBlock).toContain('no synthetic fallback');
     // The full NZB is deleted after truncation: only the staged subset
     // survives the step.
     expect(prepareBlock).toContain('rm -f');
@@ -2792,9 +2801,27 @@ test.describe('staging real-NZB prepare step (static pin)', () => {
     expect(prepareBlock).not.toMatch(/echo[^\n]*NNTUNE_TEST_NZB/);
   });
 
-  test('journey and gate read the staged path and mode from the prepare step', () => {
+  test('journey and gate read the staged path, mode and provider budget from the prepare step', () => {
     expect(section).toContain('TEST_NZB_PATH: ${{ steps.real-nzb.outputs.path }}');
     expect(section).toContain('REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}');
+    // Shared account with production: the run-wide provider connection cap
+    // (default 2, hard max 10 — see e2e/helpers/provider-budget.ts).
+    expect(section).toContain(`E2E_NNTP_MAX_CONNECTIONS: '2'`);
+  });
+
+  test('provider 430 control constrains itself to one connection with fail-fast 502', () => {
+    const control = readFileSync(
+      new URL('./provider-430-control.spec.ts', import.meta.url),
+      'utf8',
+    );
+    // One direct connection, no retries (file-level retries: 0), socket
+    // closed in a finally, 502 fails fast with no retry loop.
+    expect(control).toContain('test.describe.configure({ retries: 0 })');
+    expect(control).toMatch(/finally[\s\S]*socket\.destroy\(\)/);
+    expect(control).toContain('failing fast with no retry');
+    expect(control).toContain('peakConnections');
+    expect(control).toContain('bytesFetched');
+    expect(control).toContain('E2E_NNTP_MAX_CONNECTIONS');
   });
 
   test('deploy passes both halves explicitly under their own names', () => {
@@ -2805,6 +2832,17 @@ test.describe('staging real-NZB prepare step (static pin)', () => {
     expect(deploySection).toContain(
       'NNTUNE_TEST_NZB_XZ_B64_2: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_2 }}',
     );
+  });
+
+  test('ci carries the tracked-NZB guard and gates ci-ok on it', () => {
+    // No checked-in NZB fixtures anywhere (TWO-1169): the guard fails closed
+    // on any tracked *.nzb and the required ci-ok aggregate depends on it.
+    const guardAt = ciWorkflow.indexOf('  nzb-guard:\n');
+    expect(guardAt, 'ci.yml must carry the nzb-guard job').toBeGreaterThan(-1);
+    expect(ciWorkflow.slice(guardAt, guardAt + 2000)).toContain("git ls-files '*.nzb'");
+    const ciOkAt = ciWorkflow.indexOf('  ci-ok:\n');
+    expect(ciOkAt, 'ci.yml must carry the ci-ok aggregate').toBeGreaterThan(-1);
+    expect(ciWorkflow.slice(ciOkAt, ciOkAt + 1500)).toContain('nzb-guard');
   });
 });
 

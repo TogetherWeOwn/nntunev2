@@ -141,7 +141,7 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | | |
 | 2† | Signup | Synthetic user can create an account and sign in | | |
 | 3† | BYOP configuration | Synthetic provider credentials are accepted, stored encrypted, and never appear in logs or UI after entry | | |
-| 4† | Ingest | Synthetic fixture (`e2e/fixtures/synthetic.nzb` or successor) ingests to a playable library item | | |
+| 4† | Ingest | Staged secret-held real NZB (no checked-in fixtures since TWO-1169) ingests; ingest + matching verdict is the library row, decoded-audio legs skip by name until RAR read lands (TWO-1174) | | |
 | 5† | Play / seek | The ingested item plays and seeks in the web player | | |
 | 6 | Metering | Playback/ingest usage is metered against the synthetic account | | |
 | 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | | |

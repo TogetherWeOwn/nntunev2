@@ -7,17 +7,18 @@ import { completeByopWizard } from '../helpers/accounts.js';
 // BYOP transport-fidelity acceptance tests (offline, mocked browser page).
 //
 // Contract under test: the BYOP wizard helper must fail CLOSED when it
-// cannot make the page match the synthetic fixture transport, instead of
+// cannot make the page match the configured provider transport (a real
+// staging provider behind the `SYNTHETIC_NNTP_*` names), instead of
 // silently submitting whatever the page defaults to.
 //
 // - syntheticNntpEndpoint() only accepts the ports the real BYOP UI/API
 //   allowlist offers (119 / 563). Any other valid TCP port is a config
 //   error, named before any page interaction — never a selectOption
 //   timeout deep in the wizard.
-// - TLS-off fixture config is rejected before interaction. The product
+// - TLS-off provider config is rejected before interaction. The product
 //   only allows plaintext behind an explicit in-page acknowledgement;
-//   the fixture env has no such opt-in, so the harness must not enable
-//   (or silently ignore) plaintext on the fixture's behalf.
+//   the harness env has no such opt-in, so the harness must not enable
+//   (or silently ignore) plaintext on the provider's behalf.
 // - For a supported config, completeByopWizard explicitly sets AND
 //   verifies the TLS checkbox's requested state. A missing, unusable or
 //   un-settable TLS control fails with a names-only diagnostic BEFORE
