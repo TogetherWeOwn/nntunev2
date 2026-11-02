@@ -566,18 +566,38 @@ the promotion action. Re-dispatch the lane after seeding.
 
 The production lane refuses any production vars beyond `name` in
 `[env.production]` before uploading a version. The gate step
-(`.github/workflows/deploy-production.yml:226-234`) runs
+(`.github/workflows/deploy-production.yml:233-241`) runs
 `node ci/check-production-secrets-shape.mjs`, which enforces the offline
 policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
 no bindings and needs no secrets, so its production env table must carry
 only `name` (current state: `apps/web/wrangler.toml:31-32`). It runs in the
 `deploy-production` job after that job checks out the validated promotion
-SHA (`.github/workflows/deploy-production.yml:203-207`), not in preflight
+SHA (`.github/workflows/deploy-production.yml:210-214`), not in preflight
 (preflight checks out the dispatch tip,
-`.github/workflows/deploy-production.yml:77-79`). It is an offline
+`.github/workflows/deploy-production.yml:84-86`). It is an offline
 shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
+
+### Production promotion publishes a CalVer release
+
+After a successful production promotion and its post-promotion smoke, the
+deploy job records a promotion receipt (`Record successful production
+promotion`, uploaded as the attempt-bound
+`production-promotion-<sha>-<run>-<attempt>` artifact) and the `release`
+job calls `.github/workflows/release.yml` with the deployed SHA and the
+producing run id/attempt. `release.yml` proves the receipt
+(`ci/release-request.cjs` + `ci/release-promotion-proof.cjs`: the run must
+be a main-branch `workflow_dispatch` of `deploy-production.yml` whose
+promotion, smoke and receipt steps all succeeded in order) and then plans
+and publishes a calendar version (`vYYYY.MDD.P`, e.g. `v2026.1102.1`)
+through the shared `TogetherWeOwn/.github` CalVer releaser (policy
+`production-promotion`; notes grouped by `release-please-config.json`
+changelog-sections). A re-promote of an already-tagged commit skips green
+without a tag. Production therefore only ever deploys on the release path
+(`environment: production`, human-gated); push to `main` deploys staging
+only (`environment: staging` on both deploy jobs). No other GitHub
+environment exists on this repo.
 
 - [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
   SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
@@ -588,7 +608,7 @@ never reads or prints values
   dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
-  (`.github/workflows/deploy-production.yml:226-234` runs
+  (`.github/workflows/deploy-production.yml:233-241` runs
   `ci/check-production-secrets-shape.mjs`, which refuses any
   `[env.production]` table beyond `name`). Same-checker CI coverage
   (`.github/workflows/ci.yml:824-842`) is not promotion evidence on its

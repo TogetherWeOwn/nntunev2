@@ -9,6 +9,13 @@ name: deploy
 #   so a skipped or failed deploy cannot produce a full-journey PASS, and
 #   the journey never runs against the previous api while the new one is
 #   still deploying.
+# - Both deploy jobs bind the `staging` GitHub Environment (name + url
+#   below), so push-to-main deployment records land only in `staging`.
+#   The environment carries no protection rules or secrets: approval and
+#   credentials stay repo-level (the `gate` job + repo secrets/vars), and
+#   a skipped lane (gate disabled, staging unconfigured) still skips
+#   without approval. Production records land only in `production` via
+#   deploy-production.yml; no other environment exists on this repo.
 # - Push deploys need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
 #   When the token is absent, the jobs skip via the `gate` job below
@@ -87,6 +94,10 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Push-to-main staging record (see the header): no rules, no secrets.
+    environment:
+      name: staging
+      url: https://staging.nntune.com
     defaults:
       run:
         working-directory: apps/web
@@ -139,6 +150,12 @@ jobs:
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Push-to-main staging record (see the header): no rules, no secrets.
+    # Staging-scoped by name only — this lane never reads production
+    # secrets or protection rules, and never deploys --env production.
+    environment:
+      name: staging
+      url: https://staging.nntune.com
     outputs:
       deployed: ${{ steps.deployment.outputs.deployed }}
       outcome: ${{ steps.deployment.outputs.outcome }}
