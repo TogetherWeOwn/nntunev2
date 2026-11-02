@@ -198,6 +198,7 @@ fn at_cap_body_dispatches_through_the_public_gate() {
                     body: format!(r#"{{"ok":true,"body_len":{len}}}"#),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -228,6 +229,7 @@ fn cap_plus_one_body_fails_closed_through_the_public_gate() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },

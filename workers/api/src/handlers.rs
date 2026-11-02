@@ -55,6 +55,27 @@ use crate::webauthn;
 /// Request bodies above this size reject before routing (not an oracle:
 /// size only, same for every route).
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
+/// Intake-route body cap: `POST /api/ingest` carries an NZB document, not
+/// API JSON, so it gets its own bound. The value parities the NZB intake
+/// ceiling (`workers/ingest/src/nzb_intake.rs::MAX_NZB_BYTES`, the threat
+/// model's documented 2 MiB direct-XML-upload cap): the guard must accept
+/// every document the intake path itself accepts, or a lawful upload
+/// would 400 before the cap check runs. Kept as a cited literal rather
+/// than a cross-crate dependency (the ingest worker's dependency graph
+/// must not ship in this worker); bump both together.
+pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Per-route request-body bound: the NZB intake route accepts document
+/// uploads, every other route takes API-sized bodies. Both the entry's
+/// collection gate and the pre-routing size check call this, so the two
+/// caps cannot drift apart.
+pub fn max_body_bytes(method: &str, path: &str) -> usize {
+    if method == "POST" && path == "/api/ingest" {
+        INGEST_BODY_LIMIT_BYTES
+    } else {
+        MAX_BODY_BYTES
+    }
+}
 /// Magic links issuable per email inside the link TTL window.
 pub const MAGIC_LINKS_PER_WINDOW: u64 = 3;
 /// Admitted inline auth-mail send budget (client-visible auth-start contract:
@@ -605,6 +626,40 @@ pub trait Store {
             Ok(None)
         }
     }
+    /// Ingest jobs consumed today (UTC) from the daily `usage_ledger`
+    /// aggregate (migration 0021): 0 when no row exists yet. The intake
+    /// cap guard feeds this to `plan_limits::check_ingest_write`; the
+    /// staging-only over-limit mint seeds it. Default 0 keeps out-of-tree
+    /// `Store` impls compiling (their guard allows until the write path
+    /// lands); production and the test fake override it.
+    fn ingest_jobs_today(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, now);
+            Ok(0)
+        }
+    }
+    /// Seed today's `usage_ledger` ingest count to at least `ingest_jobs`
+    /// (an idempotent reseed never lowers the count): the staging-only
+    /// over-limit mint pre-seeds a capped account this way, so the intake
+    /// guard refuses it without hammering a real path. Positive counts
+    /// only; implementations must not create users or sessions. Default
+    /// no-op keeps out-of-tree `Store` impls compiling; production and
+    /// the test fake override it.
+    fn seed_qa_ingest_usage(
+        &self,
+        user_id: &str,
+        now: u64,
+        ingest_jobs: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (user_id, now, ingest_jobs);
+            Ok(())
+        }
+    }
     /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
     /// Expired slots may be reused; concurrent calls must never exceed the cap.
     fn reserve_rate_limit(
@@ -1024,7 +1079,8 @@ pub struct Request {
     /// staging-only QA seams and the staging QA rate-limit exemption
     /// (`qa_rate_limit_exempt`) can check their bearer, and for the
     /// native-REST bearer gate; account authentication rides the session
-    /// cookie.
+    /// cookie, except the NZB intake route, which takes the session as a
+    /// Bearer (the programmatic ingest caller holds no cookie jar).
     pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
@@ -1036,6 +1092,11 @@ pub struct Response {
     pub set_cookie: Option<String>,
     /// `Retry-After` seconds for a 429; the entry renders the header.
     pub retry_after: Option<u64>,
+    /// Extra response headers the entry renders verbatim (plan-limit
+    /// `x-plan-limit` / `x-plan-reset` today). Values must be names-only
+    /// by construction — see `plan_limits::Denial::headers`; never put
+    /// account data here.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 fn json_response(status: u16, body: serde_json::Value) -> Response {
@@ -1044,6 +1105,7 @@ fn json_response(status: u16, body: serde_json::Value) -> Response {
         body: body.to_string(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -1069,6 +1131,7 @@ fn account_deleting_response() -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -1085,6 +1148,7 @@ fn unavailable() -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -1098,6 +1162,7 @@ fn session_error_response(error: session::SessionError) -> Response {
                 body: error.body_json(),
                 set_cookie: None,
                 retry_after: None,
+                extra_headers: Vec::new(),
             }
         }
     }
@@ -1110,6 +1175,7 @@ pub(crate) fn invalid_request() -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -1299,6 +1365,7 @@ fn throttled(retry_after_secs: u64) -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     };
     resp.retry_after = Some(retry_after_secs);
     resp
@@ -1464,6 +1531,40 @@ where
         let claims = session::require_fresh_session(&keys, &token, self.now, &record)
             .map_err(session_error_response)?;
         Ok((claims, token))
+    }
+
+    /// Ordinary session authentication for the NZB intake route, which
+    /// takes the session as an `Authorization: Bearer` header (the
+    /// programmatic ingest caller holds no cookie jar) instead of the
+    /// session cookie. Same checks as `authenticate` with `mutation:
+    /// false` — signature, row, revocation, counter, expiry — with the
+    /// transport swapped and no Origin gate (a Bearer-carrying POST is
+    /// never a simple request, so browsers preflight it; CSRF needs no
+    /// Origin pin here). A presented native-REST (`ntk_`) credential is
+    /// not a session and fails closed with the generic 401; scoped
+    /// ingest submission uses `POST /v1/ingest*` with `ingest:submit`.
+    async fn authenticate_bearer_session(
+        &self,
+        req: &Request,
+    ) -> Result<(SessionClaims, String), Response> {
+        let token = req
+            .authorization
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|token| !token.is_empty())
+            .ok_or_else(generic_auth)?;
+        let keys = self.cfg.session_keys();
+        let claims =
+            session::verify_session_dual(&keys, token, self.now).map_err(session_error_response)?;
+        let record = self
+            .store
+            .session_by_id(&claims.session_id)
+            .await
+            .map_err(|_| internal())?
+            .ok_or_else(generic_auth)?;
+        let claims = session::verify_stored_session(&keys, token, self.now, &record)
+            .map_err(session_error_response)?;
+        Ok((claims, token.to_string()))
     }
 
     /// Per-IP admission shared by register, login and magic start routes.
@@ -3241,6 +3342,7 @@ fn validation_failed(message: &str) -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -3252,6 +3354,7 @@ fn scope_forbidden() -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -3262,6 +3365,7 @@ fn not_found() -> Response {
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -3380,6 +3484,7 @@ where
         .to_string(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -3611,6 +3716,7 @@ where
             body: error.body_json(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         }
     };
     let Some(expected) = ctx
@@ -3680,6 +3786,7 @@ where
         body: error.body_json(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     };
     let not_found = || error_response(crate::api_error::ApiError::not_found("not found"));
     let refused =
@@ -3708,9 +3815,13 @@ where
     if !is_example_test_mailbox(&email) {
         return not_found();
     }
-    if !matches!(body.plan.as_deref(), None | Some("free")) {
+    if !matches!(
+        body.plan.as_deref(),
+        None | Some("free") | Some("overlimit")
+    ) {
         return refused("unsupported plan");
     }
+    let overlimit = matches!(body.plan.as_deref(), Some("overlimit"));
     match ctx.store.user_by_email(&email).await {
         Ok(None) => {}
         Ok(Some(_)) => return refused("account exists"),
@@ -3720,11 +3831,11 @@ where
         return unavailable();
     };
     // Everything that can fail without touching the store runs first, so
-    // only a failed session write can leave a user row behind; that row
-    // holds no session, credential or vault and is removed by the
-    // unverified-signup reaper (`unverified_user_filter`), and the E2E
-    // never retries the same mailbox. The stored session row is also what
-    // exempts a minted account from that reaper.
+    // only a failed session or usage-seed write can leave a user row
+    // behind; that row holds no session, credential or vault and is
+    // removed by the unverified-signup reaper (`unverified_user_filter`),
+    // and the E2E never retries the same mailbox. The stored session row
+    // is also what exempts a minted account from that reaper.
     let (token, record) = match ctx.prepare_session(&user_id) {
         Ok(prepared) => prepared,
         Err(resp) => return resp,
@@ -3741,8 +3852,70 @@ where
     if ctx.store.insert_session(&record).await.is_err() {
         return internal();
     }
+    if overlimit {
+        // A capped account is a free-capped account whose daily ingest
+        // aggregate is pre-seeded to the cap: the intake guard refuses it
+        // without hammering a real path, and the seed (not the plan
+        // string, which is never stored) is what the guard reads.
+        let cap = u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day);
+        if ctx
+            .store
+            .seed_qa_ingest_usage(&user.id, ctx.now, cap)
+            .await
+            .is_err()
+        {
+            return internal();
+        }
+    }
     ctx.audit(&user.id, "qa.test_account_mint", true).await;
     json_response(201, serde_json::json!({"email": email, "session": token}))
+}
+
+/// Render a plan-limit denial on the wire (`docs/api-errors.md` 402 /
+/// 429 rows): status, names-only body, and the limit + reset headers (plus
+/// `retry-after` on 429) the client needs to render the upgrade path.
+fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
+    Response {
+        status: denial.status,
+        body: denial.body_json(),
+        set_cookie: None,
+        retry_after: denial.retry_after_secs,
+        extra_headers: denial.headers(),
+    }
+}
+
+/// Cap guard on the NZB intake path (`POST /api/ingest`): the caller's
+/// session (Bearer transport) is authenticated, today's ingest aggregate
+/// is checked against the caller's caps, and a capped caller is refused
+/// with the plan-limit wire. Everyone else falls through to the plain
+/// 404 — the ingest-write path owns the accept arm and has not landed
+/// yet, so this slice only refuses; it never accepts a job. Paid-cap
+/// resolution lands with the subscription-read slice, so free caps apply
+/// to every caller until then (conservative: refuse early, never
+/// over-admit). The request body is never inspected: refusal is an
+/// identity-plus-usage decision, so a capped caller cannot buy
+/// processing by shaping the upload.
+async fn ingest_cap_guard<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate_bearer_session(req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let ingest_today = match ctx.store.ingest_jobs_today(&claims.user_id, ctx.now).await {
+        Ok(usage) => u32::try_from(usage).unwrap_or(u32::MAX),
+        Err(_) => return internal(),
+    };
+    match crate::plan_limits::check_ingest_write(crate::plan_limits::PlanId::Free, ingest_today)
+        .denial()
+    {
+        Some(denial) => plan_limit_refusal(denial),
+        None => not_found(),
+    }
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
@@ -3756,11 +3929,13 @@ where
 /// `POST /api/test-accounts` seams are
 /// deliberately absent: their POST arms match independently, and listing
 /// them here would answer `OPTIONS` with 204 in every posture — making the
-/// seams enumerable from production.
+/// seams enumerable from production. `POST /api/ingest` IS listed: it is
+/// a real route (cap guard today, write path later), not a seam.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
         "/healthz"
+            | "/api/ingest"
             | "/v1/auth/passkey/register/start"
             | "/v1/auth/passkey/register/finish"
             | "/v1/auth/passkey/login/start"
@@ -3821,6 +3996,7 @@ pub(crate) fn preflight_response() -> Response {
         body: String::new(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -3841,7 +4017,7 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if req.body.len() > MAX_BODY_BYTES {
+    if req.body.len() > max_body_bytes(&req.method, &req.path) {
         return invalid_request();
     }
     if let crate::native_rest::RouteDecision::Bearer(required) =
@@ -3883,6 +4059,11 @@ where
         }
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
+        // NZB intake cap guard: refuses capped callers with the plan-limit
+        // wire, 404s everyone else until the write path lands. The scope
+        // map denies this path to bearer credentials, so the gate above
+        // skips it and the guard owns session authentication.
+        ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Single-segment credential ids only; deeper shapes 404 inside
@@ -4054,6 +4235,10 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
+        /// Mirror of the daily `usage_ledger` ingest aggregate, keyed by
+        /// `(user_id, UTC epoch day)`: the epoch-day key matches the
+        /// production `to_timestamp($2)::date` period boundary.
+        usage: RefCell<HashMap<(String, u64), u64>>,
     }
 
     impl Store for FakeStore {
@@ -4230,6 +4415,27 @@ mod tests {
         }
         async fn qa_issued_code(&self, email: &str) -> Result<Option<QaIssuedCode>, StoreError> {
             Ok(self.qa_codes.borrow().get(email).cloned())
+        }
+        async fn ingest_jobs_today(&self, user_id: &str, now: u64) -> Result<u64, StoreError> {
+            Ok(self
+                .usage
+                .borrow()
+                .get(&(user_id.to_string(), now / 86_400))
+                .copied()
+                .unwrap_or(0))
+        }
+        async fn seed_qa_ingest_usage(
+            &self,
+            user_id: &str,
+            now: u64,
+            ingest_jobs: u64,
+        ) -> Result<(), StoreError> {
+            let mut usage = self.usage.borrow_mut();
+            let slot = usage
+                .entry((user_id.to_string(), now / 86_400))
+                .or_insert(0);
+            *slot = (*slot).max(ingest_jobs);
+            Ok(())
         }
         async fn reserve_rate_limit(
             &self,
@@ -5431,9 +5637,9 @@ mod tests {
     #[test]
     fn qa_mint_seam_refuses_unsupported_plans_and_existing_accounts() {
         let h = qa_harness();
-        // No route enforces plan caps yet: a capped account is refused by
-        // name instead of being minted as an ordinary one.
-        for plan in ["overlimit", "plus", ""] {
+        // Plans with no enforcement meaning are refused by name instead of
+        // being minted as ordinary accounts.
+        for plan in ["plus", ""] {
             let resp = h.call_mint_seam(
                 serde_json::json!({"email": "capped@example.test", "plan": plan}),
                 Some(QA_TOKEN),
@@ -5452,6 +5658,101 @@ mod tests {
         assert_eq!(resp.status, 422, "{}", resp.body);
         assert!(!resp.body.contains("taken@"));
         assert!(h.store.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn qa_mint_seam_mints_overlimit_with_seeded_ingest_usage() {
+        let h = qa_harness();
+        // The capped account mints as 201 like a free one, but today's
+        // ingest aggregate is pre-seeded to the free cap, so the intake
+        // guard refuses it without touching a real path.
+        let resp = h.call_mint_seam(
+            serde_json::json!({"email": "capped@example.test", "plan": "overlimit"}),
+            Some(QA_TOKEN),
+        );
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["email"], "capped@example.test");
+        let session = body["session"].as_str().unwrap();
+        assert!(!session.is_empty());
+        let user = block_on(h.store.user_by_email("capped@example.test"))
+            .unwrap()
+            .expect("minted user exists");
+        let usage = block_on(h.store.ingest_jobs_today(&user.id, NOW)).unwrap();
+        assert_eq!(
+            usage,
+            u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day)
+        );
+    }
+
+    /// Mint through the seam and return the raw per-account session token.
+    fn mint_session(h: &Harness, email: &str, plan: Option<&str>) -> String {
+        let mut payload = serde_json::json!({"email": email});
+        if let Some(plan) = plan {
+            payload["plan"] = serde_json::json!(plan);
+        }
+        let resp = h.call_mint_seam(payload, Some(QA_TOKEN));
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        body["session"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn ingest_guard_refuses_seeded_account_with_plan_limit_wire() {
+        let h = qa_harness();
+        let session = mint_session(&h, "capped@example.test", Some("overlimit"));
+        let resp = h.call_bearer("POST", "/api/ingest", Some(format!("Bearer {session}")));
+        assert_eq!(resp.status, 402, "{}", resp.body);
+        // Status-consistent refusal body: the terminal 402 code, a
+        // non-retryable flag, and the upgrade pointer.
+        assert_eq!(
+            resp.body,
+            r#"{"code":"plan_limit_exceeded","message":"plan limit reached","retryable":false,"upgrade_url":"/pricing"}"#
+        );
+        // The limit + reset headers the client renders the upgrade path
+        // from; names-only by construction (no account data can flow in).
+        let limit = resp
+            .extra_headers
+            .iter()
+            .find(|(name, _)| name == "x-plan-limit")
+            .expect("x-plan-limit header");
+        assert!(limit.1.starts_with("ingest_today="), "{}", limit.1);
+        let reset = resp
+            .extra_headers
+            .iter()
+            .find(|(name, _)| name == "x-plan-reset")
+            .expect("x-plan-reset header");
+        assert_eq!(reset.1, "next-utc-day");
+        assert!(resp.retry_after.is_none());
+        assert!(!resp.body.contains("capped@"));
+    }
+
+    #[test]
+    fn ingest_guard_falls_through_to_404_for_fresh_account() {
+        let h = qa_harness();
+        // A free account with no usage passes the guard to the plain 404:
+        // the write path owns the accept arm and has not landed yet.
+        let session = mint_session(&h, "fresh@example.test", None);
+        let resp = h.call_bearer("POST", "/api/ingest", Some(format!("Bearer {session}")));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert!(resp.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn ingest_guard_rejects_unauthenticated_callers() {
+        let h = qa_harness();
+        // No bearer at all: the generic session 401 (this route is
+        // documented, so there is no existence oracle to protect).
+        let resp = h.call_bearer("POST", "/api/ingest", None);
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        // A native-REST credential is not a session: fail closed, even
+        // when the credential shape itself is well-formed.
+        let resp = h.call_bearer(
+            "POST",
+            "/api/ingest",
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
     }
 
     #[test]
@@ -10858,6 +11159,7 @@ mod tests {
         // entry adds credentialed CORS headers on exact-origin match).
         for path in [
             "/healthz",
+            "/api/ingest",
             "/v1/auth/passkey/register/start",
             "/v1/auth/passkey/register/finish",
             "/v1/auth/passkey/login/start",
