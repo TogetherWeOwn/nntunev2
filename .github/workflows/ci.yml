@@ -96,7 +96,10 @@ jobs:
       - name: Fail on any tracked NZB fixture
         run: |
           set -euo pipefail
-          tracked="$(git ls-files '*.nzb')"
+          # Case-insensitive: an uppercase `.NZB`/`.Nzb` spelling bypasses a
+          # lowercase-only pathspec, so enumerate every tracked path and
+          # filter instead of matching `*.nzb` directly.
+          tracked="$(git ls-files | grep -i '\.nzb$' || true)"
           if [ -n "$tracked" ]; then
             echo "::error::tracked *.nzb fixtures are forbidden (TWO-1169):"
             printf '%s\n' "$tracked"

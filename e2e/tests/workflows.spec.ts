@@ -2841,9 +2841,14 @@ test.describe('staging real-NZB prepare step (static pin)', () => {
   test('ci carries the tracked-NZB guard and gates ci-ok on it', () => {
     // No checked-in NZB fixtures anywhere (TWO-1169): the guard fails closed
     // on any tracked *.nzb and the required ci-ok aggregate depends on it.
+    // The match is case-insensitive: an uppercase `.NZB` spelling bypasses a
+    // lowercase-only `git ls-files '*.nzb'` pathspec, so the guard must filter
+    // every tracked path instead.
     const guardAt = ciWorkflow.indexOf('  nzb-guard:\n');
     expect(guardAt, 'ci.yml must carry the nzb-guard job').toBeGreaterThan(-1);
-    expect(ciWorkflow.slice(guardAt, guardAt + 2000)).toContain("git ls-files '*.nzb'");
+    const guard = ciWorkflow.slice(guardAt, guardAt + 2000);
+    expect(guard).toContain("grep -i '\\.nzb$'");
+    expect(guard).not.toContain("git ls-files '*.nzb'");
     const ciOkAt = ciWorkflow.indexOf('  ci-ok:\n');
     expect(ciOkAt, 'ci.yml must carry the ci-ok aggregate').toBeGreaterThan(-1);
     expect(ciWorkflow.slice(ciOkAt, ciOkAt + 1500)).toContain('nzb-guard');

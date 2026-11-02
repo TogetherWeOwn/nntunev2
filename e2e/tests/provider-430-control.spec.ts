@@ -133,7 +133,12 @@ test('provider answers 430 for a never-posted article on one connection', async 
   });
 
   // Every exit path closes the one connection: success, 502 fail-fast,
-  // auth failure, timeout. No path holds the socket.
+  // auth failure, timeout. No path holds the socket. Evidence attaches on
+  // failure too (verdict 'error', still counts-only) so a 502 or an auth
+  // rejection leaves peak-connection/byte evidence for the provider-budget
+  // investigation instead of an empty attachment list.
+  let statVerdict = 'error';
+  let failure: unknown = null;
   try {
     await connected;
 
@@ -178,6 +183,9 @@ test('provider answers 430 for a never-posted article on one connection', async 
 
     socket.write('QUIT\r\n');
     await readReplyLine(socket, buffer, 'provider-430-quit').catch(() => 'quit-unconfirmed');
+    statVerdict = '430';
+  } catch (error) {
+    failure = error;
   } finally {
     socket.destroy();
     peakConnections = Math.max(peakConnections, 1);
@@ -188,13 +196,24 @@ test('provider answers 430 for a never-posted article on one connection', async 
   const evidence = {
     peakConnections,
     bytesFetched: buffer.bytes,
-    statVerdict: '430',
+    statVerdict,
     budgetMaxConnections: budget.maxConnections,
   };
-  await testInfo.attach('provider-430-control-counts', {
-    body: JSON.stringify(evidence, null, 2),
-    contentType: 'application/json',
-  });
+  let attachError: unknown = null;
+  try {
+    await testInfo.attach('provider-430-control-counts', {
+      body: JSON.stringify(evidence, null, 2),
+      contentType: 'application/json',
+    });
+  } catch (error) {
+    // Evidence must never mask the control outcome: the original protocol
+    // failure still propagates first below. But a green control with no
+    // counts evidence is a silent pass, so an attach failure with no
+    // protocol failure propagates as its own error.
+    attachError = error;
+  }
+  if (failure) throw failure;
+  if (attachError) throw attachError;
   expect(
     peakConnections <= budget.maxConnections,
     `[provider-430] opened ${peakConnections} connections against a budget of ${budget.maxConnections}.`,
