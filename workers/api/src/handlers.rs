@@ -100,7 +100,7 @@ const AUTH_START_WINDOW_SECS: u64 = 3600;
 /// generic auth error as any other failure. Ten per challenge TTL admits
 /// legitimate single attempts and typo retries while cutting off
 /// bombardment; 100 per 5 min per IP bounds lookup floods while admitting
-/// NAT bursts (the Pg slot reservation caps at 100).
+/// NAT bursts (the Pg slot reservation caps at 3000, well above this pool).
 const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
@@ -118,10 +118,10 @@ const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
 /// pair, so a burst-denied attempt burns neither budget. Per-credential
 /// rate limits and plan entitlements (ADR 0010) follow with the data
 /// routes; this pool only bounds unauthenticated lookup work.
-const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
-const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
-const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
-const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
+pub(crate) const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
+pub(crate) const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
+pub(crate) const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
+pub(crate) const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
 /// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
 /// while cutting distinct-email loops. Global capacity is reserved only for
 /// outbound mail, so exhaustion cannot block auth challenge issuance.

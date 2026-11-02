@@ -4124,6 +4124,37 @@ mod tests {
     }
 
     #[test]
+    fn bearer_lookup_budgets_pass_the_store_admissibility_gate() {
+        // Regression: the bearer gate's hardcoded pools (300/min, 3000/hr)
+        // once exceeded MAX_BUDGET_SLOTS (then 100), so the production
+        // pair claim denied EVERY bearer before any credential lookup —
+        // uniform 404, never the 403 the scope check returns — while the
+        // FakeStore-based unit tests (no cap) stayed green and staging
+        // showed mint-201 plus all-404 bearers. Pin the real gate against
+        // the real consts so the two can never drift apart again.
+        let min = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_min",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+            window_secs: crate::handlers::BEARER_LOOKUP_WINDOW_SECS,
+        };
+        let hour = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_hour",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR,
+            window_secs: crate::handlers::BEARER_LOOKUP_HOUR_WINDOW_SECS,
+        };
+        assert!(rate_limit_budget_admissible(&min));
+        assert!(rate_limit_budget_admissible(&hour));
+        // And the cap still bounds the slot scan: the largest live budget
+        // is the hourly pool above.
+        assert_eq!(
+            u64::from(crate::rate_limit::MAX_BUDGET_SLOTS),
+            crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR
+        );
+    }
+
+    #[test]
     fn config_from_env_applies_the_rate_limit_overlay() {
         use crate::rate_limit::RateLimitConfig;
         // Behavioral half: drive the exact fn `config_from_env` calls
