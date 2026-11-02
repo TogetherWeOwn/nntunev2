@@ -100,7 +100,7 @@ const AUTH_START_WINDOW_SECS: u64 = 3600;
 /// generic auth error as any other failure. Ten per challenge TTL admits
 /// legitimate single attempts and typo retries while cutting off
 /// bombardment; 100 per 5 min per IP bounds lookup floods while admitting
-/// NAT bursts (the Pg slot reservation caps at 100).
+/// NAT bursts (the Pg slot reservation caps at 3000, well above this pool).
 const REGISTER_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const LOGIN_FINISH_ATTEMPTS_PER_CHALLENGE: u64 = 10;
 const MAGIC_FINISH_ATTEMPTS_PER_IP: u64 = 10;
@@ -118,10 +118,10 @@ const FINISH_ATTEMPT_WINDOW_SECS: u64 = crate::auth::CHALLENGE_TTL_SECS;
 /// pair, so a burst-denied attempt burns neither budget. Per-credential
 /// rate limits and plan entitlements (ADR 0010) follow with the data
 /// routes; this pool only bounds unauthenticated lookup work.
-const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
-const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
-const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
-const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
+pub(crate) const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN: u64 = 300;
+pub(crate) const BEARER_LOOKUP_WINDOW_SECS: u64 = 60;
+pub(crate) const BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR: u64 = 3000;
+pub(crate) const BEARER_LOOKUP_HOUR_WINDOW_SECS: u64 = 3600;
 /// Per-IP auth-start admission: 30/hour admits legitimate multi-user NAT
 /// while cutting distinct-email loops. Global capacity is reserved only for
 /// outbound mail, so exhaustion cannot block auth challenge issuance.
@@ -197,10 +197,10 @@ pub fn reap_unverified_users_sql() -> String {
 /// source of truth for the `PgStore::reserve_rate_limit` O(1) guard
 /// (called from `worker_entry`) and the statement-shape test below. The
 /// production guard must stay a single `SELECT COUNT(*)` over the live
-/// window; without it every denied request pays one DELETE plus `limit`
-/// conflicting upserts (~101 statements with 100 row locks for the
-/// 100-slot finish-lookup budget). The `FakeStore` mirror exercises the
-/// same exhausted-decision behavior and counts slot probes.
+/// window; without it every denied request pays one DELETE plus a
+/// full-pool anti-join claim that scans `limit` rows and finds nothing.
+/// The `FakeStore` mirror exercises the same exhausted-decision behavior
+/// and counts slot probes.
 pub const RATE_LIMIT_EXHAUSTED_SQL: &str = "SELECT COUNT(*) FROM auth_rate_limit_slots \
      WHERE scope_key = $1 AND action = $2 AND expires_at > $3";
 
@@ -9702,6 +9702,59 @@ mod tests {
         assert!(
             !code.contains("SELECT COUNT(*) FROM auth_rate_limit_slots"),
             "Pg must not carry a divergent fast-fail literal"
+        );
+    }
+
+    #[test]
+    fn rate_limit_claim_sql_is_single_statement() {
+        // Regression pin for the bearer hourly scan: the production claim
+        // must select a free slot pool-wide in one statement
+        // (`generate_series` anti-join), never one upsert per occupied
+        // slot. A sequential per-slot loop makes the Nth admitted request
+        // pay N conflicting upserts inside one transaction (up to ~3300
+        // for the bearer pair near the hourly cap), hitting the store
+        // deadline as a 404 before the budget is used up. Reintroducing
+        // the loop leaves every behavioral test green (fakes claim
+        // in-memory), so this shape test observes the production path
+        // directly at compile time. Comments are stripped first: the
+        // explanatory comment naming the technique must not satisfy the
+        // pin on its own.
+        let entry = include_str!("worker_entry.rs");
+        let code = strip_line_comments(entry);
+        let claim_pos = code
+            .find("async fn claim_rate_limit_slot")
+            .expect("Pg claim fn exists");
+        let claim_end = code[claim_pos..]
+            .find("\n}\n")
+            .map(|i| claim_pos + i)
+            .expect("Pg claim fn end");
+        let body = &code[claim_pos..claim_end];
+        assert!(
+            body.contains("generate_series"),
+            "Pg claim must select a free slot with a generate_series anti-join"
+        );
+        assert!(
+            !body.contains("for slot in 0.."),
+            "Pg claim must not scan slots one upsert at a time"
+        );
+        assert!(
+            body.contains("RATE_LIMIT_CLAIM_ATTEMPTS"),
+            "Pg claim retries must stay bounded and fail closed"
+        );
+        // Contention pin: overlapping claims must not all queue on the
+        // lowest free slot (K simultaneous claims need K attempts for the
+        // last finisher, so 5 parallel bearer lookups on a fresh pool
+        // exhaust a bound of 4 with 2996 slots free). Each attempt must
+        // rotate its search start. Reverting to `ORDER BY s LIMIT 1`
+        // leaves every behavioral test green (fakes claim in-memory),
+        // so this shape test observes the production path directly.
+        assert!(
+            body.contains("CLAIM_DISPERSAL"),
+            "Pg claim must rotate the free-slot search start per attempt"
+        );
+        assert!(
+            !body.contains("ORDER BY s LIMIT 1"),
+            "Pg claim must not force every contender onto the lowest free slot"
         );
     }
 
