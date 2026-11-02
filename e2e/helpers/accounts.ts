@@ -22,16 +22,76 @@ export interface TestAccount {
   email: string;
   /**
    * Opaque session for the minted account, when the seam provisions one.
-   * Contract (owned by the auth card): the staging API accepts it as
-   * `Authorization: Bearer <session>`. Account-specific assertions require
-   * this per-account credential; QA_AUTH_TOKEN is seam-setup-only and never
-   * substitutes for it. Absent is a setup-only result.
-   * If the auth card implements cookie sessions instead, update
-   * accountHeaders/applyAccountToPage together with the specs.
+   * Browser pages present it as the `__Host-` session cookie (planted by
+   * applyAccountToPage — the only credential session routes accept);
+   * account-specific API calls present it as `Authorization: Bearer`.
+   * QA_AUTH_TOKEN is seam-setup-only and never substitutes for it. Absent
+   * is a setup-only result.
+   * If the auth card changes the session presentation again, update
+   * browserSessionCookie/applyAccountToPage together with the specs.
    */
   session?: string;
   /** True when minted via the API seam (skip the UI signup form). */
   viaApi: boolean;
+}
+
+/**
+ * Name of the web session cookie the staging API authenticates session
+ * routes with. Mirrors `COOKIE_NAME` in `workers/api/src/session.rs`: the
+ * `__Host-` prefix locks the cookie to `Path=/`, `Secure`, no `Domain`
+ * (host-only) by construction — the browser rejects any plant that
+ * deviates, so the plant below pins exactly those attributes. Cookie
+ * sessions are the only credential session routes (`POST /v1/vault/*`,
+ * `/v1/session/*`, …) accept; the `Authorization` bearer is ignored there
+ * (see security-sign-out-everywhere.spec.ts). Names only — never a value.
+ */
+export const SESSION_COOKIE_NAME = '__Host-nntune-session';
+
+/**
+ * A session-cookie plant for `BrowserContext.addCookies`, scoped to the
+ * staging origin. Pure (no browser needed) so offline self-tests pin the
+ * scope without launching Chromium.
+ */
+export interface BrowserSessionCookie {
+  name: string;
+  value: string;
+  url: string;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: 'Lax';
+}
+
+/**
+ * Build the session-cookie plant for a browser page identity, or null when
+ * no plant applies. A plant needs a nonblank session on an https origin:
+ * `__Host-` cookies are Secure-only, so planting on a non-https origin (the
+ * offline http test doubles) would be rejected by the browser — those
+ * origins keep the header-only identity and get no plant. Staging is always
+ * https (see stagingBaseUrl), so live runs always plant. An unparseable
+ * baseURL also yields null instead of throwing: the route setup below owns
+ * URL validation for live callers.
+ */
+export function browserSessionCookie(
+  session: string | undefined,
+  baseURL: string,
+): BrowserSessionCookie | null {
+  const token = nonblankString(session);
+  if (!token) return null;
+  let origin: string;
+  try {
+    origin = new URL(baseURL).origin;
+  } catch {
+    return null;
+  }
+  if (!origin.startsWith('https://')) return null;
+  return {
+    name: SESSION_COOKIE_NAME,
+    value: token,
+    url: `${origin}/`,
+    secure: true,
+    httpOnly: true,
+    sameSite: 'Lax',
+  };
 }
 
 /**
@@ -319,16 +379,26 @@ export async function anonymousGet(
 
 /**
  * Authenticate a browser page as a minted account. Call BEFORE the first
- * navigation: the route applies to subsequent loads, never past ones.
+ * navigation: the route applies to subsequent loads, never past ones, and
+ * the session cookie must be planted before the first request carries it.
  *
- * Headers are attached ONLY to the staging origin via a context route:
- * `extraHTTPHeaders`/`setExtraHTTPHeaders` would also send the Access
- * service token and session bearer to cross-origin subresources (fonts,
- * analytics, stream/store URLs, payment redirects). Anything off-origin
- * continues unmodified. Staging requests are fetched with maxRedirects: 0
- * and fulfilled back to the browser, so a 302 to another origin is followed
+ * Two credentials are installed for a session account. First, the minted
+ * session is planted as the `__Host-` session cookie (see
+ * browserSessionCookie): session routes (`POST /v1/vault/*` for the BYOP
+ * wizard's test/save, `/v1/session/*`, …) authenticate by cookie only and
+ * ignore the bearer, so without this plant every wizard test-connection
+ * fails closed as unauthenticated. Second, headers are attached ONLY to
+ * the staging origin via a context route: `extraHTTPHeaders`/
+ * `setExtraHTTPHeaders` would also send the Access service token and
+ * session bearer to cross-origin subresources (fonts, analytics,
+ * stream/store URLs, payment redirects). Anything off-origin continues
+ * unmodified. Staging requests are fetched with maxRedirects: 0 and
+ * fulfilled back to the browser, so a 302 to another origin is followed
  * WITHOUT the credential headers — the follow-up request is evaluated fresh
- * by this handler. Re-entrant: replaces any previous scope routing.
+ * by this handler. The browser attaches the planted cookie to same-origin
+ * navigations and fetches itself, and the route handler forwards it with
+ * the merged request headers. Re-entrant: replaces any previous scope
+ * routing. Null accounts plant nothing and stay cookieless.
  */
 export async function applyAccountToPage(
   page: Page,
@@ -347,6 +417,12 @@ export async function applyAccountToPage(
         'QA seam token cannot stand in for an account identity (names only — no values logged).',
     );
   }
+  // Cookie-first: session routes ignore the bearer, so the minted session
+  // must ride as the `__Host-` cookie before any navigation or wizard fetch.
+  // Null accounts (and non-https offline doubles) get no plant by
+  // construction — the page stays anonymous and cookieless.
+  const cookie = browserSessionCookie(session, baseURL);
+  if (cookie) await page.context().addCookies([cookie]);
   const stagingHeaders: Record<string, string> = { ...accessHeaders() };
   if (session) stagingHeaders.Authorization = `Bearer ${session}`;
   // Anonymous pages put the QA bearer on auth-start POSTs only, so the
