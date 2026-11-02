@@ -289,8 +289,15 @@ fn background_connection_error_keeps_the_existing_redacted_build_identity() {
     // whole PgStore impl block (mirroring the store_body pin), not just
     // the connect body.
     let pgstore = pgstore_impl(&source);
-    assert!(pgstore.contains("connection.await.is_err()"));
+    // The driver result is matched, not discarded: only the fixed-shape
+    // SqlState code is threaded into the failure record, never the
+    // message/detail (which can carry host/role strings).
+    assert!(pgstore.contains("matchconnection.await"));
+    assert!(pgstore.contains("err.sqlstate()"));
     assert!(pgstore.contains("\"api.db.connection_error\""));
+    // The code gate keeps only the 5-char shape before anything reaches logs.
+    assert!(pgstore.contains("fnsqlstate_of("));
+    assert!(pgstore.contains("(code.len()==5"));
     let fields = calls(pgstore, "json!");
     assert!(
         !fields.is_empty(),
