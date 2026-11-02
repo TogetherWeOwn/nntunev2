@@ -6,7 +6,7 @@
 ## Status note — 2026-10-19: slice 2 shipped
 
 Slice 2 is implemented at `origin/main`: the Worker HTTP entry
-(`workers/api/src/worker_entry.rs:1869`, `pub async fn dispatch`,
+(`workers/api/src/worker_entry.rs:1888`, `pub async fn dispatch`,
 reachable from the `#[worker::event(fetch)]` entry in
 `workers/api/src/lib.rs`) serves auth traffic over the Hyperdrive
 Postgres store, and WebAuthn signature verification is live via

@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::types::Type;
@@ -455,6 +456,16 @@ async fn delete_expired_rate_limit_slots(
 /// deadline via `Self::bounded`.
 const RATE_LIMIT_CLAIM_ATTEMPTS: u32 = 4;
 
+/// Per-attempt dispersal for [`claim_rate_limit_slot`]: successive attempts
+/// start their free-slot search at successive offsets, so K overlapping
+/// claims on one scope (parallel page loads sharing an IP budget on a
+/// fresh hourly pool) aim at K distinct slots instead of all colliding on
+/// slot 0 and spending the [`RATE_LIMIT_CLAIM_ATTEMPTS`] budget on each
+/// other. Monotonic, not random: decorrelation is all the anti-join
+/// needs, and a 32-bit counter keeps wasm32 (no OS RNG at this layer)
+/// and unit fakes deterministic.
+static CLAIM_DISPERSAL: AtomicU32 = AtomicU32::new(0);
+
 /// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
 /// claimed slot index (the pair path needs it for its compensating
 /// release), `Ok(None)` is an exhausted budget. Caller has already
@@ -490,21 +501,28 @@ async fn claim_rate_limit_slot(
         return Ok(None);
     }
     // One statement per attempt, never one per occupied slot: the
-    // `generate_series` anti-join selects the lowest free-or-expired slot
-    // pool-wide, so an admitted request costs O(1) round trips no matter
-    // how full the pool is. A sequential per-slot loop would make the Nth
-    // admitted request pay N conflicting upserts inside one transaction
-    // (up to ~3300 for the bearer pair near the hourly cap), hitting the
-    // store deadline as a 404 before the budget is used up.
+    // `generate_series` anti-join selects a free-or-expired slot pool-wide
+    // from a per-attempt rotated start, so an admitted request costs O(1)
+    // round trips no matter how full the pool is. A sequential per-slot
+    // loop would make the Nth admitted request pay N conflicting upserts
+    // inside one transaction (up to ~3300 for the bearer pair near the
+    // hourly cap), hitting the store deadline as a 404 before the budget
+    // is used up.
     let limit_hi = i32::try_from(budget.limit.saturating_sub(1)).map_err(|_| StoreError)?;
     for _ in 0..RATE_LIMIT_CLAIM_ATTEMPTS {
+        // Fresh offset per attempt, not per call: a loser re-enters at a
+        // different start instead of queueing behind the winner's slot.
+        // Masked to the budget so the modulo below always lands in range
+        // (the exhausted fast-fail above already returned for limit 0).
+        let start = u64::from(CLAIM_DISPERSAL.fetch_add(1, Ordering::Relaxed)) % budget.limit.max(1);
+        let start_i = i64_of(start)?;
         let rows = client
             .query_typed(
                 "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
                  SELECT $1, $2, s, $3 FROM generate_series(0, $4) AS s \
                  LEFT JOIN auth_rate_limit_slots AS t \
                  ON t.scope_key = $1 AND t.action = $2 AND t.slot = s AND t.expires_at > $5 \
-                 WHERE t.slot IS NULL ORDER BY s LIMIT 1 \
+                 WHERE t.slot IS NULL ORDER BY ((s::BIGINT + $6) % ($4::BIGINT + 1)) LIMIT 1 \
                  ON CONFLICT (scope_key, action, slot) DO UPDATE \
                  SET expires_at = EXCLUDED.expires_at \
                  WHERE auth_rate_limit_slots.expires_at <= $5 \
@@ -515,6 +533,7 @@ async fn claim_rate_limit_slot(
                     (&expires_at, Type::INT8),
                     (&limit_hi, Type::INT4),
                     (&now_i, Type::INT8),
+                    (&start_i, Type::INT8),
                 ],
             )
             .await

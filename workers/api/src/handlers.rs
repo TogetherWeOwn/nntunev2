@@ -9741,6 +9741,21 @@ mod tests {
             body.contains("RATE_LIMIT_CLAIM_ATTEMPTS"),
             "Pg claim retries must stay bounded and fail closed"
         );
+        // Contention pin: overlapping claims must not all queue on the
+        // lowest free slot (K simultaneous claims need K attempts for the
+        // last finisher, so 5 parallel bearer lookups on a fresh pool
+        // exhaust a bound of 4 with 2996 slots free). Each attempt must
+        // rotate its search start. Reverting to `ORDER BY s LIMIT 1`
+        // leaves every behavioral test green (fakes claim in-memory),
+        // so this shape test observes the production path directly.
+        assert!(
+            body.contains("CLAIM_DISPERSAL"),
+            "Pg claim must rotate the free-slot search start per attempt"
+        );
+        assert!(
+            !body.contains("ORDER BY s LIMIT 1"),
+            "Pg claim must not force every contender onto the lowest free slot"
+        );
     }
 
     #[test]

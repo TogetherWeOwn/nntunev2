@@ -113,7 +113,7 @@ presented at finish, not necessarily the one used at start. Sources:
   `https://staging.nntune.com`. These are config-file observations, not live
   settings. RP ID must exactly equal the canonical origin host; one configured
   origin, not a multi-origin list. HTTPS except explicitly enabled loopback dev.
-  Sources: `workers/api/src/worker_entry.rs:186-187`, `config/prod.json:6-7`,
+  Sources: `workers/api/src/worker_entry.rs:187-188`, `config/prod.json:6-7`,
   `config/staging.json:6-7`, `workers/api/src/auth.rs:185-203`.
 - Verifier checks client-data type/challenge/exact origin, rejects crossOrigin,
   verifies RP-ID hash and requires UP plus UV. ES256 and EdDSA are accepted;
@@ -181,7 +181,7 @@ preserves it; no method-specific proof receipt is in session claims. Existing
 reauth replaces only the current session, atomically revoking its predecessor
 and inserting the replacement. Sources: `workers/api/src/session.rs:19-26`,
 `workers/api/src/session.rs:67-79`, `workers/api/src/session.rs:358-416`,
-`workers/api/src/worker_entry.rs:1079-1125`.
+`workers/api/src/worker_entry.rs:1098-1144`.
 
 Revoke-all authenticates cookie plus Origin, without freshness; revokes native
 REST credentials and all account sessions via separate sweeps; does not delete
