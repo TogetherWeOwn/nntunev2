@@ -136,8 +136,8 @@ Verified against main post-merge (required checks report on
   allow comment on a real leak still reports the leak). ✅
 - All workflows declare least-privilege `permissions:` (`contents: read`,
   plus `pull-requests: read` where the title must be read); the only write
-  scopes are `security-events` (codeql), `deployments` (`preview-web` in
-  deploy) and `issues`/`pull-requests` (pr-size labels). ✅
+  scopes are `security-events` (codeql) and `issues`/`pull-requests`
+  (pr-size labels). ✅
 - No `pull_request_target` anywhere (privilege-escalation vector banned). ✅
 - `actions/checkout` (and all other actions) pinned by SHA. ✅
 - `.gitignore` covers `.env*` (with `!.env.example` kept), `.dev.vars`,

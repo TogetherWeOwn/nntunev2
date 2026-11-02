@@ -657,7 +657,7 @@ never reads or prints values
 This section defines evidence only. It does not create a lane.
 
 **Current claim boundary.** `.github/workflows/deploy.yml` deploys
-`apps/web` (`staging-web` on push, `preview-web` on pull requests) plus the
+`apps/web` (`staging-web` on push; no per-PR preview) plus the
 api Worker staging lane (`staging-api` on push, staging only, skipped until
 the Operator wires the staging variables).
 `.github/workflows/deploy-alerts-staging.yml` deploys only the
