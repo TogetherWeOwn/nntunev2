@@ -2487,14 +2487,17 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
   });
 
-  // Real-NZB mode (REAL_NZB_MODE=true — the only journey mode since TWO-1169
-  // deleted every checked-in NZB): the secret-held RAR set proves ingest +
-  // matching but yields no streamable track until RAR read lands, so the
-  // decoded-audio legs skip by name under a fixed extended allow-list that
-  // budgets the run instead of MAX_ALLOWED_SKIPS. The provider 430 control
-  // is never allow-listed: it must run. Standard mode is unchanged — the
-  // queue-order negative above still holds there.
+  // Real-NZB mode (REAL_NZB_MODE=true — the only journey mode since the
+  // checked-in NZBs were deleted): the secret-held RAR set feeds no
+  // completable ingest (no RAR read in the pipeline) and hence no
+  // streamable track until RAR read lands, so ingest completion, reload and
+  // the decoded-audio legs skip by name under a fixed extended allow-list
+  // that budgets the run instead of MAX_ALLOWED_SKIPS. The provider 430
+  // control is never allow-listed: it must run. Standard mode is
+  // unchanged — the queue-order negative above still holds there.
   const REAL_NZB_SKIP_CASES: Array<[string, string]> = [
+    ['ingest-play-meter.spec.ts', 'NZB fixture ingests and appears in the library'],
+    ['ingest-play-meter.spec.ts', 'ingested library persists across reload without re-import'],
     ['ingest-play-meter.spec.ts', 'streaming answers byte Ranges with 206 + Content-Range'],
     ['ingest-play-meter.spec.ts', 'usage meter increases after streaming and shows plan metadata'],
     ['ingest-play-meter.spec.ts', 'ingested audio actually plays in the browser'],
@@ -2505,6 +2508,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     ['ingest-play-meter.spec.ts', 'Media Session metadata reflects the playing ingested track'],
     ['ingest-play-meter.spec.ts', 'over-limit staging account is refused with a plan-limit status'],
     ['player-queue-order.spec.ts', 'player queue advances in library-selection order'],
+    ['player-queue-order.spec.ts', 'NZB fixture ingests and appears in the library'],
   ];
 
   function realNzbXml(): string {
@@ -2521,7 +2525,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   test('real-NZB mode passes the fixme plus the fixed RAR-set skips', () => {
     const result = runGateScript(realNzbXml(), { REAL_NZB_MODE: 'true' });
     expect(result.status).toBe(0);
-    expect(result.summary).toContain('| 9 | 1 | 8 | 0 |');
+    expect(result.summary).toContain('| 12 | 1 | 11 | 0 |');
     expect(result.summary).toContain('real-NZB mode');
     expect(result.summary).toContain('PASS');
   });

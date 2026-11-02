@@ -76,7 +76,11 @@ function isPar2File(fileBlock) {
   const tag = fileBlock.match(/<file\b[\s\S]*?>/);
   if (!tag || !tag[0].includes('subject=')) return false;
   const region = tag[0].slice(tag[0].indexOf('subject='));
-  return /\.par2(?=["'\s()\]]|$)/i.test(region);
+  // The lookahead admits `&` because well-formed NZB XML escapes inner
+  // quotes as `&quot;` — a `.par2` name is usually `...&quot;name.par2&quot;`,
+  // so without `&` the PAR2 index would stage as the data file (its name
+  // sorts before any `.part01.rar`).
+  return /\.par2(?=["'\s()\]&]|$)/i.test(region);
 }
 
 function main() {

@@ -143,7 +143,7 @@ type TlsVariant = 'checked' | 'unchecked' | 'missing' | 'not-checkbox' | 'revert
 interface FakeByop {
   baseURL: string;
   pageHits: number;
-  testHits: Array<{ tls: string; port: string }>;
+  testHits: Array<{ tls: string; port: string; connections: string }>;
   saveHits: number;
   close: () => Promise<void>;
 }
@@ -183,6 +183,7 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       ${tlsControlHtml(variant)}
       <label>Username <input data-testid="byop-user" name="username" /></label>
       <label>Password <input data-testid="byop-pass" name="password" type="password" /></label>
+      <label>Connections <input data-testid="byop-connections" name="maxConnections" type="number" min="1" max="50" value="4" /></label>
       <button type="button" onclick="show('step2')">Continue</button>
     </div>
     <div id="step2" style="display:none">
@@ -203,8 +204,10 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       async function runTest() {
         const tls = document.querySelector('[data-testid=byop-tls]');
         const port = document.querySelector('[data-testid=byop-port]');
+        const connections = document.querySelector('[data-testid=byop-connections]');
         await fetch('/__hit/test?tls=' + encodeURIComponent(tls ? String(!!tls.checked) : 'absent')
-          + '&port=' + encodeURIComponent(port ? port.value : 'absent'), { method: 'POST' });
+          + '&port=' + encodeURIComponent(port ? port.value : 'absent')
+          + '&connections=' + encodeURIComponent(connections ? connections.value : 'absent'), { method: 'POST' });
         document.querySelector('[data-testid=byop-status]').style.display = 'block';
         document.querySelector('[data-testid=byop-save]').style.display = 'block';
       }
@@ -226,6 +229,7 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       state.testHits.push({
         tls: url.searchParams.get('tls') ?? '',
         port: url.searchParams.get('port') ?? '',
+        connections: url.searchParams.get('connections') ?? '',
       });
       res.writeHead(204);
       res.end();
@@ -308,7 +312,7 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('checked', fixtureEnv());
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '563' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '2' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();
@@ -319,7 +323,21 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('unchecked', fixtureEnv());
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '563' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '2' }]);
+      expect(fake.saveHits).toBe(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  test('submits the provider budget as the connections count', async () => {
+    const { fake, error } = await runWizard(
+      'checked',
+      fixtureEnv({ E2E_NNTP_MAX_CONNECTIONS: '3' }),
+    );
+    try {
+      expect(error?.message ?? null).toBeNull();
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '3' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();
@@ -330,7 +348,7 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('checked', fixtureEnv({ SYNTHETIC_NNTP_PORT: '119' }));
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '119' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '119', connections: '2' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();

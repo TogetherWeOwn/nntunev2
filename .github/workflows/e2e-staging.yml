@@ -391,11 +391,14 @@ jobs:
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
           # Runtime real-NZB fixture staged by the prepare step above
-          # (RUNNER_TEMP path only, never content): legs ingest the
-          # secret-held RAR set and decoded-audio legs skip by name
-          # (see e2e/README.md). The prepare step fails closed when the
-          # halves are unset, so an empty path here is a red run, never a
-          # silent pass.
+          # (RUNNER_TEMP path only, never content). Live legs are signup,
+          # the BYOP wizard (test-connection included), the provider 430
+          # control and the intake-level ingest-refusal leg; the RAR set
+          # can feed no completable ingest (no RAR read in the pipeline),
+          # so ingest-completion, reload and decoded-audio legs skip by
+          # name (see e2e/README.md). The prepare step fails closed when
+          # the halves are unset, so an empty path here is a red run,
+          # never a silent pass.
           TEST_NZB_PATH: ${{ steps.real-nzb.outputs.path }}
           REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}
           # Per-run provider connection budget (shared account with

@@ -30,10 +30,13 @@
  *     e2e/tests/ingest-play-meter.spec.ts (recording_mbids contract pending).
  *
  * Real-NZB mode (REAL_NZB_MODE=true, set by the workflow after it stages the
- * secret-held RAR-set fixture — the only journey mode since TWO-1169 deleted
- * every checked-in NZB): the legs below skip by name because the RAR set
- * proves ingest + matching but yields no streamable track until RAR read
- * lands (one upload is one library row until the per-file manifest lands).
+ * secret-held RAR-set fixture — the only journey mode since the checked-in
+ * NZBs were deleted): the legs below skip by name because the RAR set can
+ * feed no completable ingest (the pipeline has no RAR read) and hence no
+ * streamable track until RAR read lands (one upload is one library row
+ * until the per-file manifest lands). Live legs in this mode are signup,
+ * the BYOP wizard (test-connection included), the provider 430 control and
+ * the intake-level ingest-refusal leg.
  * The extended allow-list is fixed here (each entry still binds to its owning
  * spec file and is consumed once), and the effective budget becomes the
  * extended list's length — MAX_ALLOWED_SKIPS keeps governing the non-staged
@@ -81,9 +84,22 @@ const ALLOWED_SKIPS = [
 ];
 
 // Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
-// streamable track until RAR read lands; one upload is one library row until
-// the per-file manifest lands). Active only when REAL_NZB_MODE=true.
+// completable ingest until RAR read lands — the pipeline fails an RAR-only
+// subset permanent at transcode before any library row — hence no
+// streamable track either; one upload is one library row until the per-file
+// manifest lands). Active only when REAL_NZB_MODE=true.
 const REAL_NZB_ALLOWED_SKIPS = [
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason:
+      'real-NZB mode: RAR set cannot complete ingest (no RAR read in the pipeline) until RAR read lands',
+  },
+  {
+    file: 'ingest-play-meter.spec.ts',
+    match: 'ingested library persists across reload without re-import',
+    reason: 'real-NZB mode: no completable ingest means no library row to reload',
+  },
   {
     file: 'ingest-play-meter.spec.ts',
     match: 'streaming answers byte Ranges with 206 + Content-Range',
@@ -120,6 +136,11 @@ const REAL_NZB_ALLOWED_SKIPS = [
     file: 'player-queue-order.spec.ts',
     match: 'player queue advances in library-selection order',
     reason: 'real-NZB mode: queue order needs 2+ tracks; the RAR set stages one row',
+  },
+  {
+    file: 'player-queue-order.spec.ts',
+    match: 'NZB fixture ingests and appears in the library',
+    reason: 'real-NZB mode: its ingest leg cannot complete either (no RAR read)',
   },
 ];
 

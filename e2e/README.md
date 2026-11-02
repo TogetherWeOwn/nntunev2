@@ -218,20 +218,28 @@ How the suite uses them:
   public logs — the prepare step prints only file counts, skips carry a
   static reason, failure artifacts stay sanitized junit-only, and the full
   NZB never leaves `RUNNER_TEMP`. Honest scope: the real NZB is a RAR/PAR2
-  set and the stream chain serves transcode artifacts of audio inputs only,
-  so real-NZB mode proves ingest + matching (import completes, library row
-  appears) while the Range, meter, playback, seek, Media Session,
-  over-limit-stream and queue-order legs skip by name until RAR read (and
-  the per-file manifest for legs needing 2+ tracks) lands — parked legs
-  un-park under TWO-1174. The journey gate budgets that fixed allow-list
-  via `REAL_NZB_MODE` instead of the standard single-fixme budget; any
-  failure or off-list skip still fails the run in both modes.
+  set and the ingest pipeline has no RAR read (transcode inputs skip
+  non-audio files), so an RAR-only subset fails permanent at transcode
+  before any library row is written — there is currently no completable
+  ingest. Live legs in real-NZB mode are signup, the BYOP wizard with
+  test-connection, the provider 430 control and the intake-level
+  ingest-refusal leg; the ingest-completion, reload, Range, meter,
+  playback, seek, Media Session, over-limit-stream and queue-order legs
+  skip by name until RAR read (and the per-file manifest for legs needing
+  2+ tracks) lands — parked legs un-park under TWO-1174. The journey gate
+  budgets that fixed allow-list via `REAL_NZB_MODE` instead of the
+  standard single-fixme budget; any failure or off-list skip still fails
+  the run in both modes.
 - Provider budget + 430 control: the staging NNTP provider is a shared
   account with production, so each run holds at most a trickle of
   connections. The workflow concurrency group (`e2e-staging`,
   cancel-in-progress: false) serializes provider runs, and
   `E2E_NNTP_MAX_CONNECTIONS` (default 2, hard max 10 —
   `helpers/provider-budget.ts`) caps each run so 8+ connections stay free.
+  The BYOP wizard joins the budget: `completeByopWizard` sets its
+  connections input from the run budget and verifies it (testid
+  `byop-connections`, pinned by `tests/byop-transport.spec.ts`), so the
+  wizard-saved connection count can never exceed the run cap.
   Legs fetch only the segments they need. `tests/provider-430-control.spec.ts`
   is the live proof that costs almost nothing: one direct NNTP connection
   asserting a minted never-posted probe ID answers 430 — 502 fails fast

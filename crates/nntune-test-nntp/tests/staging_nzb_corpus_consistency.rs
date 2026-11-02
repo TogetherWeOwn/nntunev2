@@ -155,15 +155,26 @@ fn corpus_by_id() -> HashMap<String, Article> {
 /// only NZB source under test: no file reads, no checked-in fixtures.
 fn generated_nzb(ids: &[&str]) -> String {
     let corpus = corpus_by_id();
-    let articles: Vec<&Article> = ids
-        .iter()
+    nntune_test_nntp::nzb_for(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+}
+
+/// Build an in-memory TRUE multipart NZB: one `<file>` element with the
+/// given corpus message-IDs as sequentially numbered segments. The shape
+/// the production parser must accept for multi-part posts (one file per
+/// segment never exercises it).
+fn generated_multipart_nzb(ids: &[&str]) -> String {
+    let corpus = corpus_by_id();
+    nntune_test_nntp::nzb_for_multipart(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+}
+
+fn corpus_articles<'a>(corpus: &'a HashMap<String, Article>, ids: &[&str]) -> Vec<&'a Article> {
+    ids.iter()
         .map(|id| {
             corpus
                 .get(*id)
                 .unwrap_or_else(|| panic!("unknown corpus id {id}"))
         })
-        .collect();
-    nntune_test_nntp::nzb_for(&articles, "alt.binaries.nntune.test")
+        .collect()
 }
 
 /// Validate an NZB document against the default corpus. Returns every
@@ -416,8 +427,13 @@ fn framing_param(body: &[u8], framing: &str, key: &str) -> Option<String> {
 /// framing has no `=ypart` and lands at offset 0). Returns the reassembled
 /// file bytes in `ids` order.
 async fn fetch_and_reassemble(ids: &[&str]) -> Vec<u8> {
-    let text = generated_nzb(ids);
-    let parsed = parse_nzb(&text);
+    fetch_and_reassemble_doc(&generated_nzb(ids)).await
+}
+
+/// Document variant: reassemble a caller-built NZB (e.g. a true multipart
+/// document from [`generated_multipart_nzb`]) instead of a per-ID build.
+async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
+    let parsed = parse_nzb(text);
     assert!(
         !parsed.segments().is_empty(),
         "generated NZB declares no segments"
@@ -517,12 +533,23 @@ async fn generated_single_part_nzb_reconstructs_canonical_wav_via_nntp() {
 
 #[tokio::test]
 async fn generated_multi_part_nzb_reconstructs_canonical_wav_via_nntp() {
-    let reassembled = fetch_and_reassemble(&[
+    // True multipart shape: ONE file, THREE numbered segments. One file
+    // per segment would pass even if the parser rejected multi-segment
+    // files, so the shape itself is asserted first.
+    let text = generated_multipart_nzb(&[
         "<multi-660-part1-of-3@nntune.test>",
         "<multi-660-part2-of-3@nntune.test>",
         "<multi-660-part3-of-3@nntune.test>",
-    ])
-    .await;
+    ]);
+    let parsed = parse_nzb(&text);
+    assert_eq!(parsed.files.len(), 1, "multipart NZB must carry one file");
+    let numbers: Vec<u32> = parsed.files[0].segments.iter().map(|s| s.number).collect();
+    assert_eq!(
+        numbers,
+        vec![1, 2, 3],
+        "segments must number 1..=3 in order"
+    );
+    let reassembled = fetch_and_reassemble_doc(&text).await;
 
     assert_eq!(&reassembled[0..4], b"RIFF", "payload is not a WAV");
     assert_eq!(&reassembled[8..12], b"WAVE", "payload is not a WAV");
@@ -544,16 +571,29 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
     // DOCTYPE as XXE hardening). This test runs the production components —
     // `nntune_core::nzb::parse` (the parser the ingest upload handler calls),
     // `NntpClient` and `yenc::decode_to` — so a generated document the upload
-    // would reject with a 400 fails here.
-    let ids = ["<single-yenc-001@nntune.test>"];
-    let text = generated_nzb(&ids);
+    // would reject with a 400 fails here. The document is the true
+    // multipart shape (one file, three numbered segments): a production
+    // parser that rejected multi-segment files must fail this test, which
+    // a single-part document could never catch.
+    let ids = [
+        "<multi-660-part1-of-3@nntune.test>",
+        "<multi-660-part2-of-3@nntune.test>",
+        "<multi-660-part3-of-3@nntune.test>",
+    ];
+    let text = generated_multipart_nzb(&ids);
     let document = nntune_core::nzb::parse(text.as_bytes())
         .expect("production NZB parser accepts the generated fixture");
     assert_eq!(document.files.len(), 1, "generated NZB carries one file");
     let file = &document.files[0];
-    assert!(
-        !file.segments.is_empty(),
-        "generated NZB declares no segments"
+    assert_eq!(
+        file.segments.len(),
+        3,
+        "multipart file must carry three segments"
+    );
+    assert_eq!(
+        file.segments.iter().map(|s| s.number).collect::<Vec<_>>(),
+        vec![1usize, 2, 3],
+        "production segments must number 1..=3 in order"
     );
 
     // The production parse must agree with the corpus view: the same segment
@@ -622,7 +662,7 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
 
     assert_eq!(
         reassembled,
-        generate_wav_bytes(440.0, 120, 8000),
-        "production pipeline does not reproduce the canonical 440 Hz WAV"
+        generate_wav_bytes(660.0, 210, 8000),
+        "production pipeline does not reproduce the canonical 660 Hz WAV"
     );
 }

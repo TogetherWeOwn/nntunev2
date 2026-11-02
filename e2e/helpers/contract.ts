@@ -18,6 +18,7 @@ export const TESTIDS = {
   byopUser: 'byop-user',
   byopPass: 'byop-pass',
   byopTls: 'byop-tls',
+  byopConnections: 'byop-connections',
   byopTest: 'byop-test-connection',
   byopSave: 'byop-save',
   byopStatus: 'byop-status',

@@ -44,8 +44,10 @@ test.describe('queue-order journey wiring (offline)', () => {
     // The real NZB stages a single library row, so the ≥2-track assertion is
     // parked until RAR-set playback + multi-track staging land (TWO-1174) —
     // the skip reason links the follow-up and the gate allow-lists the title.
+    // The ingest leg parks too (no completable ingest without RAR read).
     expect(journey).toContain('REAL_NZB_RAR_SKIP');
     expect(journey).toContain('RAR_PLAYBACK_FOLLOW_UP');
+    expect(journey).toContain('No completable ingest exists in real-NZB mode');
   });
 
   test('distinct-track precondition fails by name before browser queue waits', () => {
@@ -112,9 +114,9 @@ test.describe('queueOrderFailure (queue vs library-selection order, offline fixt
   });
 
   test('longer queue fails naming the extra id', () => {
-    const failure = queueOrderFailure(['track-a', 'track-b', 'track-c'], ['track-a', 'track-b', 'track-d']);
+    const failure = queueOrderFailure(['track-a', 'track-b'], ['track-a', 'track-b', 'track-c']);
     expect(failure).not.toBeNull();
-    expect(failure).toMatch(/track-d/);
+    expect(failure).toMatch(/track-c/);
   });
 
   test('duplicate id in the queue fails', () => {

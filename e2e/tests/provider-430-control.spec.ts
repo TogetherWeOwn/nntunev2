@@ -107,13 +107,29 @@ test('provider answers 430 for a never-posted article on one connection', async 
   });
   peakConnections = 1;
   // Fail fast on connect: no retries, no reconnects — an unreachable provider
-  // is a red control, not a wait loop.
+  // is a red control, not a wait loop. The deadline timer is cleared on both
+  // outcomes (and listeners removed on timeout) so a fast success does not
+  // leave a 20 s timer holding the Playwright worker open after the socket
+  // is destroyed.
   const connected = new Promise<void>((resolve, reject) => {
-    socket.once('secureConnect', () => resolve());
-    socket.once('error', (error: Error) =>
-      reject(new Error(`[provider-430] provider connect failed (names only): ${error.name}`)),
-    );
-    setTimeout(() => reject(new Error('[provider-430] provider connect timed out.')), STEP_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      socket.off('secureConnect', onSecureConnect);
+      socket.off('error', onSocketError);
+      socket.destroy();
+      reject(new Error('[provider-430] provider connect timed out.'));
+    }, STEP_TIMEOUT_MS);
+    const onSecureConnect = (): void => {
+      clearTimeout(timer);
+      socket.off('error', onSocketError);
+      resolve();
+    };
+    const onSocketError = (error: Error): void => {
+      clearTimeout(timer);
+      socket.off('secureConnect', onSecureConnect);
+      reject(new Error(`[provider-430] provider connect failed (names only): ${error.name}`));
+    };
+    socket.once('secureConnect', onSecureConnect);
+    socket.once('error', onSocketError);
   });
 
   // Every exit path closes the one connection: success, 502 fail-fast,

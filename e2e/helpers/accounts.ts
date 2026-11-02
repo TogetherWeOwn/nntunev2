@@ -16,6 +16,7 @@ import {
   syntheticNntpEndpoint,
   type WallProbe,
 } from './access.js';
+import { readProviderBudget } from './provider-budget.js';
 
 export interface TestAccount {
   email: string;
@@ -518,6 +519,24 @@ export async function completeByopWizard(page: Page, baseURL: string): Promise<v
   await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
   await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
   await page.getByTestId(TESTIDS.byopPass).fill(password);
+  // Provider connection budget (owner rule — the provider account is shared
+  // with production): the account must save no more than the run-wide cap,
+  // or ingest's pool would exceed it. Set AND verify, like the TLS toggle
+  // below: a missing or un-settable connections control fails before any
+  // test/save submission. Names only in diagnostics, never values.
+  const budget = readProviderBudget(process.env).maxConnections;
+  const connections = page.getByTestId(TESTIDS.byopConnections);
+  try {
+    await expect(connections).toHaveCount(1);
+    await connections.fill(String(budget));
+    await expect(connections).toHaveValue(String(budget));
+  } catch {
+    throw new Error(
+      '[byop] could not set and verify the BYOP connections control to the ' +
+        'provider budget: refusing to test or save with an uncapped connection ' +
+        'count (names only — no values logged).',
+    );
+  }
   // Fail closed on transport fidelity: explicitly set AND verify the TLS
   // checkbox's requested state. A missing, unusable or un-settable control
   // must stop the wizard here — never submit test/save with whatever

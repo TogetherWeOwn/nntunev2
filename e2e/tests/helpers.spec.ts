@@ -1888,6 +1888,29 @@ test.describe('prepare-real-nzb script (offline pins)', () => {
       const bareOutput = readFileSync(bareOut, 'utf8');
       expect(bareOutput).toContain('dataseg');
       expect(bareOutput).not.toContain('par2seg');
+
+      // Real NZBs serialize inner quotes as &quot; (fixtures.rs::xml_escape
+      // does the same), so the PAR2 lookahead must see past the entity.
+      const escInput = join(dir, 'esc.nzb');
+      const escOut = join(dir, 'esc-staging.nzb');
+      writeFileSync(
+        escInput,
+        doc
+          .replace(
+            'subject="release [01/02] - "inner.par2" yEnc"',
+            'subject="release [01/02] - &quot;inner.par2&quot; yEnc"',
+          )
+          .replace(
+            'subject="release [02/02] - "inner.dat" yEnc"',
+            'subject="release [02/02] - &quot;inner.dat&quot; yEnc"',
+          ),
+      );
+      const esc = runPrepare(['--input', escInput, '--output', escOut]);
+      expect(esc.status).toBe(0);
+      expect(esc.stdout).toContain('input files=2, output files=1');
+      const escOutput = readFileSync(escOut, 'utf8');
+      expect(escOutput).toContain('dataseg');
+      expect(escOutput).not.toContain('par2seg');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

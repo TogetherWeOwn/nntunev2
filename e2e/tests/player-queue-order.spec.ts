@@ -27,12 +27,13 @@ import {
 // mechanics with mocked audio; this spec is the staging side — a real
 // ingested library, real selection order.
 //
-// The real NZB is a RAR set that yields a single library row, so the ingest
-// test below proves ingest + matching while the queue-order test skips by
-// name until ≥2 tracks are stageable (RAR-set playback + multi-track staging
-// un-park under TWO-1174). There are no checked-in NZB fixtures (TWO-1169
-// deleted them all): the ingest path resolves lazily inside the test so a
-// missing staging fails the run red, never silently.
+// The real NZB is a RAR set the pipeline cannot complete (no RAR read — an
+// RAR-only subset fails permanent at transcode before any library row), so
+// both the ingest leg and the queue-order leg skip by name in real-NZB mode
+// until RAR-set playback + multi-track staging land and un-park under
+// TWO-1174. There are no checked-in NZB fixtures (TWO-1169 deleted them
+// all): the ingest path resolves lazily inside the test so a missing
+// staging fails the run red, never silently.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -60,6 +61,12 @@ test.describe.serial('player queue follows library-selection order', () => {
     const baseURL = stagingBaseUrl('skip', 'queue-order-ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // No completable ingest exists in real-NZB mode (RAR set, no RAR read),
+    // so this leg skips by name like every other ingest-completion leg.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     // One upload of the staged real NZB: one ingest job, one library row.

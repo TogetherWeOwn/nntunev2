@@ -45,9 +45,12 @@ import {
 // stream and on ingest with the documented plan-limit status (headers, code,
 // upgrade CTA, no leaks). Legs that need decoded audio or a streamable track
 // skip by name in real-NZB mode (RAR read pending — see REAL_NZB_RAR_SKIP):
-// ingest, reload, recording_mbids and the ingest-refusal leg still run. The
-// upload path resolves lazily inside the uploading tests so a missing staging
-// fails the run red, never silently.
+// the secret-held RAR set cannot complete ingest (the pipeline has no RAR
+// read: an RAR-only subset leaves zero transcode inputs and fails permanent
+// before any library row), so ingest completion and reload skip too — only
+// the intake-level ingest-refusal leg still runs. The upload path resolves
+// lazily inside the uploading tests so a missing staging fails the run red,
+// never silently.
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
 // usage meter moves → plan metadata stays consistent → browser playback,
@@ -117,6 +120,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Real-NZB mode cannot complete ingest: the staged RAR subset has no
+    // decodable audio and the pipeline fails it permanent at transcode
+    // (zero transcode inputs, no library row) — parked by name until RAR
+    // read lands. Live provider proof in this mode is the BYOP wizard's
+    // test-connection plus the provider 430 control.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     const minted = await tryMintTestAccount(request, baseURL);
     // Evidence provenance: this test duplicates the signup branch, so it
     // records the same bounded signup-path label (no account data).
@@ -147,7 +159,17 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await waitForHydration(page, 'ingest');
     const fileInput = page.getByTestId(TESTIDS.importFile);
     await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-    await fileInput.setInputFiles(requireRealNzbFixture());
+    // Names-only failure: Playwright prints the input path when the upload
+    // control rejects the file, and junit goes to public artifacts — never
+    // leak the staged path (RUNNER_TEMP layout) into the failure text.
+    try {
+      await fileInput.setInputFiles(requireRealNzbFixture());
+    } catch {
+      throw new Error(
+        'NZB upload control rejected the staged fixture file (names only — ' +
+          'path withheld from public artifacts).',
+      );
+    }
     const status = page.getByTestId(TESTIDS.importStatus);
     await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
     await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
@@ -164,6 +186,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'reload');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // No completable ingest in real-NZB mode means no library row to reload.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));

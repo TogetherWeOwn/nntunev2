@@ -14,12 +14,13 @@
  * those — only the environment-variable name and static skip reasons. Legs
  * must never log the resolved path's contents, only its presence.
  *
- * Honest scope: the secret NZB is a RAR/PAR2 set, and the staging stream
- * chain serves transcode artifacts of audio inputs only
- * (`workers/ingest/src/transcode.rs` skips non-audio files), so the real NZB
- * proves ingest + matching (import completes, library row appears) but no
- * streamable track until RAR read lands. Legs that need decoded audio or
- * ≥2 tracks skip by name in real-NZB mode (see `REAL_NZB_RAR_SKIP` and the
+ * Honest scope: the secret NZB is a RAR/PAR2 set and the ingest pipeline
+ * has no RAR read (`workers/ingest` transcode inputs skip non-audio files),
+ * so an RAR-only subset fails permanent at transcode before any library row
+ * is written. The real NZB currently proves signup, BYOP + test-connection,
+ * the intake-level ingest-refusal leg and the provider 430 control — but no
+ * completable ingest or streamable track until RAR read lands. Legs that need
+ * them skip by name in real-NZB mode (see `REAL_NZB_RAR_SKIP` and the
  * journey evidence gate's real-NZB allow-list); the skip reason links the
  * RAR-set playback follow-up (TWO-1174). The 430 control leg needs no NZB
  * at all (it uses a random, never-posted message-ID).
@@ -37,13 +38,15 @@ export const REAL_NZB_PATH_ENV = 'TEST_NZB_PATH';
 export const RAR_PLAYBACK_FOLLOW_UP = 'TWO-1174';
 
 /**
- * Static skip reason for legs the RAR-set real NZB cannot feed (streaming,
- * playback, meter, queue order): ingest + matching run, decoded-audio legs
- * wait for RAR read. Fixed text — carries no NZB content and no values.
+ * Static skip reason for legs the RAR-set real NZB cannot feed (ingest
+ * completion, reload, streaming, playback, meter, queue order): no
+ * completable ingest exists until RAR read lands. Fixed text — carries no
+ * NZB content and no values.
  */
 export const REAL_NZB_RAR_SKIP =
-  'real-NZB fixture mode (secret-held RAR set): ingest + matching run, but no ' +
-  'streamable track exists until RAR read lands — decoded-audio legs skip by name ' +
+  'real-NZB fixture mode (secret-held RAR set): no completable ingest exists ' +
+  'until RAR read lands (the pipeline fails an RAR-only subset permanent at ' +
+  'transcode), so ingest, reload and decoded-audio legs skip by name ' +
   '(see e2e/README.md); parked legs un-park under TWO-1174.';
 
 /**
