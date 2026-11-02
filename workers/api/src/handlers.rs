@@ -1013,15 +1013,16 @@ pub(crate) async fn deliver_mail_with_deadline(
 }
 
 /// Bounded outbound probe for `test connection`. Implementations dial
-/// `target.host()` (the runtime resolves it once for routing and uses it
-/// for TLS SNI/certificate checks — an IP-literal dial would verify the
+/// `target.host()` (the runtime resolves it for routing and uses it for
+/// TLS SNI/certificate checks — an IP-literal dial would verify the
 /// certificate against the address and fail every hostname-only
 /// certificate), at exactly `target.port()` (the allowlisted port the
 /// target was vetted for — callers pass no port, so a substitute can
-/// never be smuggled in), enforce that the connected peer is an address
-/// from `target` (a re-resolved peer outside the vetted set is closed
-/// without exchanging application bytes), apply the per-attempt and
-/// total `vault` timeout constants, attempt no more than
+/// never be smuggled in). There is no connected-peer check: workerd
+/// reports the dial string itself as `SocketInfo.remote_address`, so no
+/// peer IP exists to vet — containment is the handler's fresh dial-time
+/// validation plus the timeouts below. Apply the per-attempt and total
+/// `vault` timeout constants, attempt no more than
 /// `vault::MAX_DIAL_ADDRESSES`, follow no redirects, and return a bare
 /// boolean — banners/errors never leave the dialer.
 pub trait Dialer {

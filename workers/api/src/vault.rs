@@ -215,9 +215,13 @@ fn host_shape_ok(host: &str) -> bool {
 /// this across requests: validate again at dial/fetch time, dial `host`
 /// (the runtime resolves it for routing and uses it for TLS SNI/certificate
 /// checks and the HTTP Host header — never dial a bare IP literal for TLS,
-/// which would verify the certificate against the address), and enforce
-/// that the connected peer is an address from this set. Never let the
-/// transport re-resolve the hostname itself.
+/// which would verify the certificate against the address). The dialed
+/// `addresses` are the vetted set the hostname resolved to at validation
+/// time; workerd reports the dial string itself as
+/// `SocketInfo.remote_address`, so a socket probe cannot check the
+/// connected peer against this set — containment is the fresh validation
+/// plus the allowlisted port and timeouts. Never let the transport
+/// re-resolve the hostname itself.
 #[derive(Debug)]
 pub struct ValidatedTarget {
     host: String,
@@ -277,10 +281,11 @@ fn resolve_public_target(
 /// - resolve fresh (this function) and dial [`ValidatedTarget::host`] —
 ///   the runtime resolves it for routing and uses it for TLS
 ///   SNI/certificate checks (never dial a bare IP literal for TLS);
-///   verify the connected peer is one of the returned
-///   [`ValidatedTarget::addresses`] and close anything else without
-///   exchanging application bytes — never re-resolve the hostname in the
-///   transport itself (no second DNS lookup);
+///   never re-resolve the hostname in the transport itself (no second
+///   DNS lookup). No connected-peer check exists at the socket layer:
+///   workerd reports the dial string as `SocketInfo.remote_address`, so
+///   the returned [`ValidatedTarget::addresses`] document what the
+///   hostname vetted as — they cannot gate the open socket;
 /// - dial [`ValidatedTarget::port`] only;
 /// - enforce [`TestConnectionBudget`] timeouts and the
 ///   [`test_attempt_allowed`] / [`concurrent_test_allowed`] gates before

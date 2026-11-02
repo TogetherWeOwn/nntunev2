@@ -69,7 +69,7 @@ NZB upload ───────────────┘                     
   its traits in this tree, and no HTTP response or decision log emitted by
   a running Worker comes from it. Its fake-DNS/fake-transport tests prove
   model behavior only (`tests/indexer_fetch_ssrf_guard.rs`). The separate `workers/api` vault validator
-  (`IndexerConfig::validate` in `workers/api/src/vault.rs:367`) still checks the indexer URL at
+  (`IndexerConfig::validate` in `workers/api/src/vault.rs:372`) still checks the indexer URL at
   save/validate time; it is not an indexer fetch transport either.
 
 ## Indexer fetch policy library — no runtime indexer fetching
