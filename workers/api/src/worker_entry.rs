@@ -1263,6 +1263,59 @@ impl Store for PgStore {
         .await
     }
 
+    async fn ingest_jobs_today(&self, user_id: &str, now: u64) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // UTC-day boundary in SQL (`to_timestamp($2)::date`), so
+                // the period matches the fake's epoch-day key exactly: no
+                // local-time skew between the two implementations.
+                let rows = client
+                    .query_typed(
+                        "SELECT ingest_jobs FROM usage_ledger WHERE user_id = $1 \
+                         AND period = to_timestamp($2)::date",
+                        &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // `query_opt`'s rule: more than one row is an error.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    None => Ok(0),
+                    Some(row) => u64_of(row.try_get("ingest_jobs").map_err(|_| StoreError)?),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn seed_qa_ingest_usage(
+        &self,
+        user_id: &str,
+        now: u64,
+        ingest_jobs: u64,
+    ) -> Result<(), StoreError> {
+        Self::bounded(async {
+        let client = self.connect().await?;
+        client
+            .query_typed(
+                "INSERT INTO usage_ledger (user_id, period, ingest_jobs) VALUES ($1, to_timestamp($2)::date, $3) \
+                 ON CONFLICT (user_id, period) DO UPDATE SET ingest_jobs = GREATEST(usage_ledger.ingest_jobs, EXCLUDED.ingest_jobs)",
+                &[
+                    (&user_id, Type::TEXT),
+                    (&i64_of(now)?, Type::INT8),
+                    (&i64_of(ingest_jobs)?, Type::INT8),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        Ok(())
+        }, TOTAL_TIMEOUT_MS).await
+    }
+
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
         Self::bounded(
             async {
@@ -2469,33 +2522,45 @@ fn render_header_pairs(
     response: &handlers::Response,
     cors: &[(&'static str, String)],
     trace_id: &str,
-) -> Vec<(&'static str, String)> {
+) -> Vec<(String, String)> {
     let mut pairs = vec![
         (
-            "content-type",
+            "content-type".to_string(),
             "application/json; charset=utf-8".to_string(),
         ),
         (
-            "content-security-policy",
+            "content-security-policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string(),
         ),
-        ("cache-control", "no-store".to_string()),
-        ("x-content-type-options", "nosniff".to_string()),
-        (crate::logging::TRACE_HEADER, trace_id.to_string()),
+        ("cache-control".to_string(), "no-store".to_string()),
+        ("x-content-type-options".to_string(), "nosniff".to_string()),
+        (
+            crate::logging::TRACE_HEADER.to_string(),
+            trace_id.to_string(),
+        ),
     ];
     if let Some(cookie) = &response.set_cookie {
-        pairs.push(("set-cookie", cookie.clone()));
+        pairs.push(("set-cookie".to_string(), cookie.clone()));
     }
     if let Some(retry_after) = response.retry_after {
         pairs.push((
-            crate::rate_limit::RETRY_AFTER_HEADER,
+            crate::rate_limit::RETRY_AFTER_HEADER.to_string(),
             crate::rate_limit::retry_after_header_value(retry_after),
         ));
+    }
+    // Caller-supplied extra headers (plan-limit denials): rendered
+    // verbatim after the security set, so they can neither suppress nor
+    // precede it.
+    for (name, value) in &response.extra_headers {
+        pairs.push((name.clone(), value.clone()));
     }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
     // appends it.
-    pairs.extend(cors.iter().cloned());
+    pairs.extend(
+        cors.iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone())),
+    );
     pairs
 }
 
@@ -2506,7 +2571,7 @@ fn render(
 ) -> WorkerResult<Response> {
     let headers = Headers::new();
     for (name, value) in render_header_pairs(response, cors, trace_id) {
-        headers.append(name, &value)?;
+        headers.append(&name, &value)?;
     }
     Ok(
         Response::from_body(ResponseBody::Body(response.body.clone().into_bytes()))?
@@ -2521,6 +2586,7 @@ fn internal_response() -> handlers::Response {
         body: r#"{"error":"internal error"}"#.to_string(),
         set_cookie: None,
         retry_after: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -2601,9 +2667,11 @@ where
     }
 }
 
-/// Collect one request body with the existing hard cap
-/// (`handlers::MAX_BODY_BYTES`, the single source of truth — no second
-/// size constant). Rules:
+/// Collect one request body with an explicit byte cap. The default-cap
+/// wrapper below is the single source of truth for API routes
+/// (`handlers::MAX_BODY_BYTES`); per-route overrides (the NZB intake)
+/// pass their own cap so the collection seam and the in-handler gate
+/// stay on the same bound. Rules (in terms of `cap_bytes`):
 /// - `declared_len` is the parsed `Content-Length` (`None` when absent
 ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 ///   stream is not polled at all.
@@ -2628,7 +2696,20 @@ pub async fn collect_body<S: BodyChunkStream>(
     declared_len: Option<usize>,
     source: BodySource<S>,
 ) -> CollectedBody {
-    if declared_len.is_some_and(|len| len > handlers::MAX_BODY_BYTES) {
+    collect_body_with_cap(declared_len, source, handlers::MAX_BODY_BYTES).await
+}
+
+/// [`collect_body`] with a caller-chosen cap: the entry passes the
+/// per-route bound (`handlers::max_body_bytes`), so document-upload
+/// routes accept their documents while API routes keep the pinned
+/// default. Behavior is otherwise identical; the default-cap suite
+/// pins `collect_body` unchanged.
+pub async fn collect_body_with_cap<S: BodyChunkStream>(
+    declared_len: Option<usize>,
+    source: BodySource<S>,
+    cap_bytes: usize,
+) -> CollectedBody {
+    if declared_len.is_some_and(|len| len > cap_bytes) {
         return CollectedBody::Oversized;
     }
     let mut stream = match source {
@@ -2648,9 +2729,9 @@ pub async fn collect_body<S: BodyChunkStream>(
             }
             Some(Err(BodyReadError)) => return CollectedBody::TransportFailure,
             Some(Ok(chunk)) => {
-                // `body.len() <= MAX` is invariant, so this never overflows
+                // `body.len() <= cap` is invariant, so this never overflows
                 // and never buffers past the cap.
-                if chunk.len() > handlers::MAX_BODY_BYTES - body.len() {
+                if chunk.len() > cap_bytes - body.len() {
                     return CollectedBody::Oversized;
                 }
                 body.extend_from_slice(&chunk);
@@ -2865,7 +2946,15 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             Err(_) => BodySource::SetupFailed,
         }
     };
-    let collected = collect_body(declared_len, source).await;
+    // Per-route collection bound (the NZB intake accepts documents; API
+    // routes keep the pinned default): the in-handler gate re-checks the
+    // same bound as defense in depth, so the two cannot drift apart.
+    let collected = collect_body_with_cap(
+        declared_len,
+        source,
+        handlers::max_body_bytes(req.method().as_ref(), &req.path()),
+    )
+    .await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -2993,12 +3082,14 @@ mod tests {
                     body: r#"{"ok":true}"#.to_string(),
                     set_cookie: Some("session=synthetic; HttpOnly".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 },
                 handlers::Response {
                     status: 401,
                     body: r#"{"error":"unauthorized"}"#.to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 },
                 handlers::invalid_request(),
                 handlers::preflight_response(),
@@ -3017,10 +3108,14 @@ mod tests {
                         .count(),
                     1
                 );
-                assert!(pairs.contains(&(crate::logging::TRACE_HEADER, trace_id.clone())));
-                assert!(cors.iter().all(|pair| pairs.contains(pair)));
+                assert!(
+                    pairs.contains(&(crate::logging::TRACE_HEADER.to_string(), trace_id.clone()))
+                );
+                assert!(cors.iter().all(|pair| pairs
+                    .iter()
+                    .any(|(name, value)| name == pair.0 && value == &pair.1)));
                 if let Some(cookie) = &response.set_cookie {
-                    assert!(pairs.contains(&("set-cookie", cookie.clone())));
+                    assert!(pairs.contains(&("set-cookie".to_string(), cookie.clone())));
                 }
                 assert!(!format!("{pairs:?}").contains(hostile));
             }
@@ -3409,11 +3504,11 @@ mod tests {
         // wasm-bindgen Response accessors cannot run on native targets.
         let headers = render_header_pairs(response, &[], REQUEST_TRACE);
         assert!(headers.contains(&(
-            "content-security-policy",
+            "content-security-policy".to_string(),
             "default-src 'none'; frame-ancestors 'none'".to_string()
         )));
-        assert!(headers.contains(&("x-content-type-options", "nosniff".to_string())));
-        assert!(headers.contains(&("cache-control", "no-store".to_string())));
+        assert!(headers.contains(&("x-content-type-options".to_string(), "nosniff".to_string())));
+        assert!(headers.contains(&("cache-control".to_string(), "no-store".to_string())));
     }
 
     #[test]
@@ -3423,11 +3518,12 @@ mod tests {
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&response, &[], REQUEST_TRACE);
 
         assert!(headers.contains(&(
-            "content-type",
+            "content-type".to_string(),
             "application/json; charset=utf-8".to_string()
         )));
         assert_render_security_headers(&response);
@@ -3440,6 +3536,7 @@ mod tests {
             body: r#"{"error":"invalid request"}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
 
         assert_render_security_headers(&response);
@@ -3464,14 +3561,19 @@ mod tests {
             body: r#"{"error":"rate_limited"}"#.to_string(),
             set_cookie: None,
             retry_after: Some(3600),
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&throttled, &[], REQUEST_TRACE);
-        assert!(headers.contains(&(crate::rate_limit::RETRY_AFTER_HEADER, "3600".to_string())));
+        assert!(headers.contains(&(
+            crate::rate_limit::RETRY_AFTER_HEADER.to_string(),
+            "3600".to_string()
+        )));
         let plain = handlers::Response {
             status: 200,
             body: r#"{"ok":true}"#.to_string(),
             set_cookie: None,
             retry_after: None,
+            extra_headers: Vec::new(),
         };
         let headers = render_header_pairs(&plain, &[], REQUEST_TRACE);
         assert!(!headers

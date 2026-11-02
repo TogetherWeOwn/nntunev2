@@ -122,7 +122,8 @@ jobs:
   # follow-up jobs, each with its own evidence). Push to `main` only, gated
   # on the same token gate as staging-web. Serves the staging host on
   # /v1/* and /healthz plus the staging-only /api/test-codes and
-  # /api/test-accounts seams (routes derived from API_RP_ID_STAGING);
+  # /api/test-accounts seams and the plan-cap-guarded POST /api/ingest
+  # intake (routes derived from API_RP_ID_STAGING);
   # the web Worker owns the catch-all. Passes the
   # public BUILD_SHA var so worker log records carry the deploy SHA (never
   # a secret); secrets live only in Cloudflare and are never written here.
@@ -245,7 +246,8 @@ jobs:
           name = "nntune-api-staging"
 
           # Same-host split: this Worker serves /v1/*, /healthz, plus the
-          # staging-only /api/test-codes and /api/test-accounts seams on
+          # staging-only /api/test-codes and /api/test-accounts seams and
+          # the plan-cap-guarded POST /api/ingest intake on
           # the staging host, while
           # the web Worker owns the catch-all (see apps/web/wrangler.toml);
           # the most specific route wins. Route hosts derive from
@@ -262,6 +264,12 @@ jobs:
           zone_name = "nntune.com"
           [[env.staging.routes]]
           pattern = "${API_RP_ID_STAGING}/healthz"
+          zone_name = "nntune.com"
+          # Plan-cap intake (not a QA seam): authenticated callers only;
+          # over-cap accounts get the plan-limit refusal, everyone else
+          # falls through to the in-handler 404 until the write path lands.
+          [[env.staging.routes]]
+          pattern = "${API_RP_ID_STAGING}/api/ingest"
           zone_name = "nntune.com"
 
           [env.staging.vars]

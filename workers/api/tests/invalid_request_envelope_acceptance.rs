@@ -354,6 +354,7 @@ fn dispatch_rejection(collected: CollectedBody) -> handlers::Response {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: Some("must-never-appear".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -412,6 +413,7 @@ fn complete_body_still_dispatches_through_the_gate() {
                     body: format!(r#"{{"body_len":{body_len}}}"#),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },

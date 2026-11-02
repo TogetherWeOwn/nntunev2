@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
 import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
 import {
   apiGet,
@@ -10,8 +10,10 @@ import {
 
 // Scoped native REST credentials (ADR 0010, paired acceptance card,
 // paired build card): mint → scoped route 404 (gate passed; data routes
-// pending) → revoke → 401/403, scope-matrix denials by name, header-only
-// transport, names-only diagnostics.
+// pending) → revoke → 404 (revoked/unknown bearers are the same plain 404
+// as header-absent callers — uniform posture, no existence oracle),
+// scope-matrix denials by name, header-only transport, names-only
+// diagnostics.
 //
 // NO file-level skip here by design (see demo-audio-contract.spec.ts): the
 // offline describe pins the contract table on every PR (via
@@ -110,6 +112,68 @@ function sessionCookieHeaders(account: TestAccount | null): Record<string, strin
   };
 }
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Issuance with bounded retry over transient store blips: the mint path
+ * 500s when its session/credential store call fails, and a brief store
+ * outage 500s every mint attempt inside a test window (observed on the
+ * staging journey — two independent mints 500ing seconds after a healthy
+ * mint, then recovery). Bounded to 3 attempts with ~5s/~10s waits (inside
+ * the 120s test timeout), covering 500/503 only; any 4xx verdict fails
+ * fast and is never retried. Intermediate bodies are never read (only the
+ * 201 body is parsed); assertions name statuses only.
+ */
+async function mintCredential(
+  request: APIRequestContext,
+  nativeBase: string,
+  mintHeaders: Record<string, string>,
+  label: string,
+  scopes: Scope[],
+  context: string,
+): Promise<{ secret: string; id: string }> {
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const res = await apiPost(
+      request,
+      `${nativeBase}${ISSUE_PATH}`,
+      mintHeaders,
+      { label, scopes, ttl_secs: 3600 },
+      context,
+    );
+    lastStatus = res.status();
+    assertNoAccessWall(
+      { status: lastStatus, headers: res.headers(), bodyText: '', url: ISSUE_PATH },
+      context,
+    );
+    if (lastStatus === 201) {
+      const body = (await res.json()) as Record<string, unknown>;
+      const secret = body.secret;
+      const id = body.id;
+      expect(typeof secret === 'string' && secret.length > 0, 'issuance returns a secret').toBe(
+        true,
+      );
+      expect(
+        (secret as string).startsWith('ntk_'),
+        'display form carries the ntk_ class prefix',
+      ).toBe(true);
+      expect(typeof id === 'string', 'issuance returns an id').toBe(true);
+      return { secret: secret as string, id: id as string };
+    }
+    if (lastStatus !== 500 && lastStatus !== 503) {
+      break;
+    }
+    if (attempt < 3) {
+      await sleep(attempt === 1 ? 5_000 : 10_000);
+    }
+  }
+  expect(lastStatus, 'issuance must answer 201 (4xx fails fast; 500/503 retried 3x)').toBe(201);
+  // Unreachable (the expect above throws on any non-201): satisfies the
+  // return type only, never a second failure path.
+  throw new Error('[scoped-credentials] unreachable issuance fallthrough (names only).');
+}
+
 test.describe('credential contract table (offline, no staging)', () => {
   test('scope vocabulary matches ADR 0010 exactly', () => {
     expect([...SCOPES]).toEqual([
@@ -148,7 +212,9 @@ test.describe('credential contract table (offline, no staging)', () => {
 });
 
 test.describe('staging credential lifecycle', () => {
-  test('mint → scoped route 404 (gate passed) → revoke → 401/403', async ({ request }) => {
+  test('mint → scoped route 404 (gate passed) → revoke → 404 (fail closed)', async ({
+    request,
+  }) => {
     const webBase = stagingBaseUrl('skip', 'scoped-credentials-lifecycle');
     if (!webBase) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
@@ -173,38 +239,24 @@ test.describe('staging credential lifecycle', () => {
     };
     const revokeHeaders = privilegedHeaders(account, webBase);
 
-    // Mint a library:read credential (one-time secret).
-    const mint = await apiPost(
+    // Mint a library:read credential (one-time secret). The helper
+    // checks the access wall on every attempt and retries boundedly
+    // over transient store-blip 500s.
+    const { secret: secretValue, id: idValue } = await mintCredential(
       request,
-      `${nativeBase}${ISSUE_PATH}`,
+      nativeBase,
       mintHeaders,
-      { label: 'e2e-lifecycle', scopes: ['library:read'], ttl_secs: 3600 },
+      'e2e-lifecycle',
+      ['library:read'],
       'scoped-credentials-mint',
     );
-    const mintBody = await mint.text().catch(() => '');
-    assertNoAccessWall(
-      { status: mint.status(), headers: mint.headers(), bodyText: '', url: ISSUE_PATH },
-      'scoped-credentials-mint',
-    );
-    expect(mint.status(), 'issuance must answer 201 once implemented').toBe(201);
-    const minted = JSON.parse(mintBody) as Record<string, unknown>;
-    const secret = minted.secret;
-    expect(typeof secret === 'string' && secret.length > 0, 'issuance returns a secret').toBe(
-      true,
-    );
-    expect(
-      (secret as string).startsWith('ntk_'),
-      'display form carries the ntk_ class prefix',
-    ).toBe(true);
-    const credentialId = minted.id;
-    expect(typeof credentialId === 'string', 'issuance returns an id').toBe(true);
-
-    const secretValue = secret as string;
-    const idValue = credentialId as string;
 
     // Scoped route: the bearer passes the gate, then lands on the
-    // documented 404 until the data routes land (a presented-but-invalid
-    // bearer would be 401 instead, so 404 proves the gate passed).
+    // documented 404 until the data routes land. Presented-but-invalid
+    // bearers are the SAME plain 404 (uniform posture per ADR 0010 — a
+    // distinct status would be a route-existence oracle), so 404 here
+    // proves the gate passed only together with the wrong-scope 403
+    // pinned in the matrix test below.
     const scoped = await apiGet(
       request,
       `${nativeBase}${CANONICAL_ROUTE['library:read'].path}`,
@@ -227,17 +279,18 @@ test.describe('staging credential lifecycle', () => {
     });
     expect(revokeRes.status(), 'revocation must answer 200 once implemented').toBe(200);
 
-    // The revoked credential fails closed — and the denial names nothing.
+    // The revoked credential fails closed with the same plain 404 as a
+    // header-absent caller (uniform posture per ADR 0010 — revoked,
+    // expired, and unknown bearers must not disclose route existence;
+    // only a valid credential on the wrong scope is the distinct 403) —
+    // and the denial names nothing.
     const denied = await apiGet(
       request,
       `${nativeBase}${CANONICAL_ROUTE['library:read'].path}`,
       bearerHeaders(secretValue),
       'scoped-credentials-revoked',
     );
-    expect(
-      [401, 403].includes(denied.status()),
-      'revoked credential must fail closed with 401/403',
-    ).toBe(true);
+    expect(denied.status(), 'revoked credential must fail closed with 404').toBe(404);
     const deniedBody = await denied.text().catch(() => '');
     expect(deniedBody.includes(secretValue), 'denial must not echo the secret').toBe(false);
   });
@@ -261,16 +314,16 @@ test.describe('staging credential lifecycle', () => {
     const bare = await apiGet(request, target, accessHeaders(), 'scoped-credentials-bare');
     expect([401, 403, 404].includes(bare.status()), 'bare call must fail closed').toBe(true);
 
-    // Garbage bearer.
+    // Garbage bearer: an unknown credential is the same plain 404 as a
+    // header-absent caller (uniform posture per ADR 0010 — only
+    // wrong-scope is the distinct 403).
     const garbage = await apiGet(
       request,
       target,
       bearerHeaders('ntk_no-such-credential-000000000000000000000'),
       'scoped-credentials-garbage',
     );
-    expect([401, 403].includes(garbage.status()), 'unknown credential must fail closed').toBe(
-      true,
-    );
+    expect(garbage.status(), 'unknown credential must fail closed with 404').toBe(404);
 
     // Session cookie WITHOUT an Authorization bearer: credential routes
     // must not fall back to the cookie (plain 404 until the data routes
@@ -324,19 +377,19 @@ test.describe('staging credential lifecycle', () => {
       'Content-Type': 'application/json',
     };
 
+    // Bounded retry over transient store-blip 500s (see mintCredential):
+    // a single store outage previously 500ed both matrix mints in the
+    // same window, and the whole-test retry only re-ran the failure.
     const mintFor = async (scope: Scope): Promise<string> => {
-      const res = await apiPost(
+      const { secret } = await mintCredential(
         request,
-        `${nativeBase}${ISSUE_PATH}`,
+        nativeBase,
         matrixMintHeaders,
-        { label: `e2e-matrix-${scope}`, scopes: [scope], ttl_secs: 3600 },
+        `e2e-matrix-${scope}`,
+        [scope],
         'scoped-credentials-matrix-mint',
       );
-      expect(res.status(), 'matrix issuance must answer 201 once implemented').toBe(201);
-      const body = (await res.json()) as Record<string, unknown>;
-      const secret = body.secret;
-      expect(typeof secret === 'string', 'matrix issuance returns a secret').toBe(true);
-      return secret as string;
+      return secret;
     };
 
     const call = async (method: 'GET' | 'POST', path: string, secret: string): Promise<number> => {

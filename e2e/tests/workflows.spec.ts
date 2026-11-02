@@ -1605,6 +1605,7 @@ staging = "dummy-hyperdrive-staging"
             { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/ingest', zone_name: 'nntune.com' },
           ],
           vars: {
             RP_ID: 'staging.nntune.com',
