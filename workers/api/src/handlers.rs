@@ -3769,11 +3769,14 @@ struct QaTestAccountBody {
 /// Same gates as [`qa_test_codes`] and in the same order: flag armed plus
 /// bearer staged (else the unknown-route 404), constant-time bearer (else
 /// a names-only 401), then a well-formed synthetic mailbox (else 404).
-/// Only the default plan is minted: `plan` absent or `"free"`. Any other
-/// plan is a fixed 422 — no route enforces plan caps yet, so a capped
-/// account cannot be honestly provisioned and is never faked. An address
-/// that already has an account is a fixed 422 too, never handed a new
-/// session (mint, not sign-in). Nothing here echoes the mailbox or token.
+/// Two plans mint: `plan` absent or `"free"` provisions a plain account,
+/// while `"overlimit"` additionally seeds the account's daily ingest usage
+/// at the free cap so the `POST /api/ingest` plan-cap guard (see
+/// [`ingest_cap_guard`]) honestly refuses it — the plan string itself is
+/// never stored, and a capped account is never faked. Any other plan is a
+/// fixed 422. An address that already has an account is a fixed 422 too,
+/// never handed a new session (mint, not sign-in). Nothing here echoes the
+/// mailbox or token.
 async fn qa_test_accounts<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -3874,6 +3877,10 @@ where
 /// Render a plan-limit denial on the wire (`docs/api-errors.md` 402 /
 /// 429 rows): status, names-only body, and the limit + reset headers (plus
 /// `retry-after` on 429) the client needs to render the upgrade path.
+/// Note: both `retry_after` and `Denial::headers()` render `retry-after`
+/// on a 429, so the first 429-shaped denial on a path using this helper
+/// must dedupe one of them. Every denial on the ingest path today is a
+/// 402 (no `retry-after`), so no duplication exists yet.
 fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
     Response {
         status: denial.status,

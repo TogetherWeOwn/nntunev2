@@ -169,7 +169,9 @@ async function mintCredential(
     }
   }
   expect(lastStatus, 'issuance must answer 201 (4xx fails fast; 500/503 retried 3x)').toBe(201);
-  throw new Error('[scoped-credentials] issuance never answered 201 (names only).');
+  // Unreachable (the expect above throws on any non-201): satisfies the
+  // return type only, never a second failure path.
+  throw new Error('[scoped-credentials] unreachable issuance fallthrough (names only).');
 }
 
 test.describe('credential contract table (offline, no staging)', () => {
