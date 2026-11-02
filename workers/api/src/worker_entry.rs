@@ -514,7 +514,8 @@ async fn claim_rate_limit_slot(
         // different start instead of queueing behind the winner's slot.
         // Masked to the budget so the modulo below always lands in range
         // (the exhausted fast-fail above already returned for limit 0).
-        let start = u64::from(CLAIM_DISPERSAL.fetch_add(1, Ordering::Relaxed)) % budget.limit.max(1);
+        let start =
+            u64::from(CLAIM_DISPERSAL.fetch_add(1, Ordering::Relaxed)) % budget.limit.max(1);
         let start_i = i64_of(start)?;
         let rows = client
             .query_typed(
