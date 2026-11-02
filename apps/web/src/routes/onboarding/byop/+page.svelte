@@ -515,6 +515,7 @@
 				Connections
 				<input
 					id="byop-maxConnections"
+					data-testid="byop-connections"
 					aria-invalid={errors.maxConnections ? 'true' : undefined}
 					aria-describedby={errors.maxConnections ? 'byop-maxConnections-error' : undefined}
 					name="maxConnections"

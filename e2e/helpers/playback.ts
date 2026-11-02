@@ -9,10 +9,10 @@
  * pure lets e2e/tests/playback.spec.ts pin it offline: a loaded, paused or
  * errored element must never be reported as playing.
  *
- * The synthetic staged track is sub-second (~0.1 s WAV, see
- * e2e/fixtures/synthetic.nzb), so an element that played through and ended
- * passes — but only with a recorded `playing` event and a position that
- * advanced past the baseline taken before the gesture. `ended` alone, a
+ * The staged track is a sub-second tone (the in-memory sine corpus — no
+ * checked-in NZB fixtures since TWO-1169), so an element that played through
+ * and ended passes — but only with a recorded `playing` event and a position
+ * that advanced past the baseline taken before the gesture. `ended` alone, a
  * seek to the end, or metadata alone never passes.
  */
 

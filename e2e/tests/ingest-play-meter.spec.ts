@@ -1,7 +1,5 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   API,
   TESTIDS,
@@ -33,9 +31,26 @@ import {
   type TestAccount,
   waitForHydration,
 } from '../helpers/accounts.js';
+import {
+  REAL_NZB_RAR_SKIP,
+  realNzbActive,
+  requireRealNzbFixture,
+} from '../helpers/real-nzb-fixture.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURE_NZB = path.resolve(here, '../fixtures/synthetic.nzb');
+// Golden path part 2: ingest the staged real NZB (secret-held RAR set,
+// `TEST_NZB_PATH` staged by the workflow into `RUNNER_TEMP` only — there are
+// no checked-in NZB fixtures) → stream with Range seeks → usage meter moves
+// → plan metadata stays consistent → browser playback, seek and Media
+// Session → separately minted over-limit staging accounts are refused on
+// stream and on ingest with the documented plan-limit status (headers, code,
+// upgrade CTA, no leaks). Legs that need decoded audio or a streamable track
+// skip by name in real-NZB mode (RAR read pending — see REAL_NZB_RAR_SKIP):
+// the secret-held RAR set cannot complete ingest (the pipeline has no RAR
+// read: an RAR-only subset leaves zero transcode inputs and fails permanent
+// before any library row), so ingest completion and reload skip too — only
+// the intake-level ingest-refusal leg still runs. The upload path resolves
+// lazily inside the uploading tests so a missing staging fails the run red,
+// never silently.
 
 // Golden path part 2: ingest the NZB fixture → stream with Range seeks →
 // usage meter moves → plan metadata stays consistent → browser playback,
@@ -105,6 +120,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Real-NZB mode cannot complete ingest: the staged RAR subset has no
+    // decodable audio and the pipeline fails it permanent at transcode
+    // (zero transcode inputs, no library row) — parked by name until RAR
+    // read lands. Live provider proof in this mode is the BYOP wizard's
+    // test-connection plus the provider 430 control.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     const minted = await tryMintTestAccount(request, baseURL);
     // Evidence provenance: this test duplicates the signup branch, so it
     // records the same bounded signup-path label (no account data).
@@ -135,7 +159,17 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await waitForHydration(page, 'ingest');
     const fileInput = page.getByTestId(TESTIDS.importFile);
     await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-    await fileInput.setInputFiles(FIXTURE_NZB);
+    // Names-only failure: Playwright prints the input path when the upload
+    // control rejects the file, and junit goes to public artifacts — never
+    // leak the staged path (RUNNER_TEMP layout) into the failure text.
+    try {
+      await fileInput.setInputFiles(requireRealNzbFixture());
+    } catch {
+      throw new Error(
+        'NZB upload control rejected the staged fixture file (names only — ' +
+          'path withheld from public artifacts).',
+      );
+    }
     const status = page.getByTestId(TESTIDS.importStatus);
     await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
     await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
@@ -152,6 +186,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'reload');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // No completable ingest in real-NZB mode means no library row to reload.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
@@ -224,6 +263,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of probing anonymously when neither a minted
     // session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'range');
     const headers = accountHeaders(account);
     const libraryUrl = `${baseURL}${API.library}`;
@@ -275,6 +318,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'meter');
     const headers = accountHeaders(account);
     const usageUrl = `${baseURL}${API.usage}`;
@@ -333,7 +380,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await expect(page.getByTestId(TESTIDS.usageMeter).first()).toBeVisible({ timeout: 15_000 });
   });
 
-  test('synthetic audio actually plays in the browser', async ({ page, request }) => {
+  test('ingested audio actually plays in the browser', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'playback');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
@@ -342,6 +389,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // Same identity discipline as Range/meter: playback must run as the
     // ingesting account, never anonymously or as the generic QA seam.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'playback');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -464,7 +515,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
       await expect
         .poll(async () => playbackFailure(await snapshot(), baseline), {
           timeout: 15_000,
-          message: 'synthetic audio did not enter the playing state and advance',
+          message: 'ingested audio did not enter the playing state and advance',
         })
         .toBeNull();
       before = await snapshot();
@@ -473,15 +524,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
     expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
   });
 
-  // FIXMEd until the staging MB mirror can match the synthetic fixture:
-  // synthetic.nzb's subject ("NNTune-Fixture sine-660 [01/03]") derives to
-  // the plain-title query "NNTune-Fixture sine-660", which has no release in
-  // the shared MB mirror, so the library write is empty by design
+  // FIXMEd until the staging MB mirror can match the staged real NZB: the
+  // secret-held RAR set derives its match query from real Usenet subjects,
+  // and whether the shared MB mirror holds that release is unproven — an
+  // empty mirror match keeps the library write empty by design
   // (library_write_for in workers/ingest/src/matching.rs drops recordings
   // without a release; the queue consumer resolves unmatched to Vec::new()).
   // Below playback and FIXMEd, so it can never fail or skip a later step.
-  // Un-fixme paths: (a) ingest an `Artist - Album` fixture for a real,
-  // unambiguous mirrored release, or (b) seed a fixture release in staging.
+  // Un-fixme path: confirm the mirror holds the real NZB's release (or seed
+  // it in staging) once RAR-set ingest + matching evidence exists.
   test.fixme('ingested track carries recording_mbids', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'recording-mbids');
     if (!baseURL) {
@@ -531,9 +582,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
   // The seek is performed while PAUSED. That is what makes the assertion
   // non-vacuous: a paused position cannot drift into the seeked region by
   // natural playback advance, so arriving there while still paused can only
-  // be the seek. It also works with the pinned 210 ms synthetic WAV
-  // (crates/nntune-test-nntp fixtures), where seek-while-playing would race
-  // the end of the track.
+  // be the seek. (This leg skips by name in real-NZB mode — see
+  // REAL_NZB_RAR_SKIP — so the note below covers non-staged runs only: the
+  // short in-memory corpus tones keep seek-while-playing from racing the end
+  // of the track.)
   test('player UI seek moves the active audio position and playback continues', async ({
     page,
     request,
@@ -546,6 +598,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of driving the player anonymously when neither a
     // minted session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'player-seek');
 
     const pageErrors: string[] = [];
@@ -756,6 +812,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // playing gate precedes the metadata read so the assertion runs during
     // browser playback, not against an idle element.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'media-session');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -901,6 +961,13 @@ test.describe('plan limit', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    if (realNzbActive()) {
+      // The capped stream leg needs a pre-seeded streamable track, which the
+      // RAR set cannot produce until RAR read lands. Refusal-shape coverage
+      // continues through the ingest-refusal leg below, which needs no audio.
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     const capped = await mintCappedAccount(request, baseURL, 'plan-limit-stream');
     // Stream AS the capped account: its session (not the default identity)
     // must be the credential on these calls, or a 206 would falsely pass.
@@ -985,7 +1052,7 @@ test.describe('plan limit', () => {
       request,
       ingestUrl,
       { ...headers, 'Content-Type': 'application/octet-stream' },
-      readFileSync(FIXTURE_NZB),
+      readFileSync(requireRealNzbFixture()),
       'plan-limit-ingest',
     );
     const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');

@@ -7,17 +7,18 @@ import { completeByopWizard } from '../helpers/accounts.js';
 // BYOP transport-fidelity acceptance tests (offline, mocked browser page).
 //
 // Contract under test: the BYOP wizard helper must fail CLOSED when it
-// cannot make the page match the synthetic fixture transport, instead of
+// cannot make the page match the configured provider transport (a real
+// staging provider behind the `SYNTHETIC_NNTP_*` names), instead of
 // silently submitting whatever the page defaults to.
 //
 // - syntheticNntpEndpoint() only accepts the ports the real BYOP UI/API
 //   allowlist offers (119 / 563). Any other valid TCP port is a config
 //   error, named before any page interaction — never a selectOption
 //   timeout deep in the wizard.
-// - TLS-off fixture config is rejected before interaction. The product
+// - TLS-off provider config is rejected before interaction. The product
 //   only allows plaintext behind an explicit in-page acknowledgement;
-//   the fixture env has no such opt-in, so the harness must not enable
-//   (or silently ignore) plaintext on the fixture's behalf.
+//   the harness env has no such opt-in, so the harness must not enable
+//   (or silently ignore) plaintext on the provider's behalf.
 // - For a supported config, completeByopWizard explicitly sets AND
 //   verifies the TLS checkbox's requested state. A missing, unusable or
 //   un-settable TLS control fails with a names-only diagnostic BEFORE
@@ -142,7 +143,7 @@ type TlsVariant = 'checked' | 'unchecked' | 'missing' | 'not-checkbox' | 'revert
 interface FakeByop {
   baseURL: string;
   pageHits: number;
-  testHits: Array<{ tls: string; port: string }>;
+  testHits: Array<{ tls: string; port: string; connections: string }>;
   saveHits: number;
   close: () => Promise<void>;
 }
@@ -182,6 +183,7 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       ${tlsControlHtml(variant)}
       <label>Username <input data-testid="byop-user" name="username" /></label>
       <label>Password <input data-testid="byop-pass" name="password" type="password" /></label>
+      <label>Connections <input data-testid="byop-connections" name="maxConnections" type="number" min="1" max="50" value="4" /></label>
       <button type="button" onclick="show('step2')">Continue</button>
     </div>
     <div id="step2" style="display:none">
@@ -202,8 +204,10 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       async function runTest() {
         const tls = document.querySelector('[data-testid=byop-tls]');
         const port = document.querySelector('[data-testid=byop-port]');
+        const connections = document.querySelector('[data-testid=byop-connections]');
         await fetch('/__hit/test?tls=' + encodeURIComponent(tls ? String(!!tls.checked) : 'absent')
-          + '&port=' + encodeURIComponent(port ? port.value : 'absent'), { method: 'POST' });
+          + '&port=' + encodeURIComponent(port ? port.value : 'absent')
+          + '&connections=' + encodeURIComponent(connections ? connections.value : 'absent'), { method: 'POST' });
         document.querySelector('[data-testid=byop-status]').style.display = 'block';
         document.querySelector('[data-testid=byop-save]').style.display = 'block';
       }
@@ -225,6 +229,7 @@ async function startFakeByop(variant: TlsVariant): Promise<FakeByop> {
       state.testHits.push({
         tls: url.searchParams.get('tls') ?? '',
         port: url.searchParams.get('port') ?? '',
+        connections: url.searchParams.get('connections') ?? '',
       });
       res.writeHead(204);
       res.end();
@@ -307,7 +312,7 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('checked', fixtureEnv());
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '563' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '2' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();
@@ -318,7 +323,21 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('unchecked', fixtureEnv());
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '563' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '2' }]);
+      expect(fake.saveHits).toBe(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  test('submits the provider budget as the connections count', async () => {
+    const { fake, error } = await runWizard(
+      'checked',
+      fixtureEnv({ E2E_NNTP_MAX_CONNECTIONS: '3' }),
+    );
+    try {
+      expect(error?.message ?? null).toBeNull();
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '563', connections: '3' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();
@@ -329,7 +348,7 @@ test.describe('completeByopWizard transport fidelity (mocked browser page)', () 
     const { fake, error } = await runWizard('checked', fixtureEnv({ SYNTHETIC_NNTP_PORT: '119' }));
     try {
       expect(error?.message ?? null).toBeNull();
-      expect(fake.testHits).toEqual([{ tls: 'true', port: '119' }]);
+      expect(fake.testHits).toEqual([{ tls: 'true', port: '119', connections: '2' }]);
       expect(fake.saveHits).toBe(1);
     } finally {
       await fake.close();

@@ -119,8 +119,11 @@ npm-based harness (`e2e/package-lock.json`).
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → the synthetic smoke skips with notice; the post-deploy full journey fails closed. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
 | `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
-| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Hosted fixture server or test provider (defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a fixture transport the wizard cannot represent. |
+| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Real staging NNTP provider (a real service despite the `SYNTHETIC_` names — rename needs an operator; defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a transport the wizard cannot represent. |
 | `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
+| `TEST_NZB_PATH` | post-deploy journey | Runtime path of the secret-held real-NZB subset staged by the workflow prepare step (`RUNNER_TEMP` only). Legs ingest it via `requireRealNzbFixture()` and decoded-audio legs skip by name; unset → the run fails red (no synthetic fallback since TWO-1169). Never set locally. |
+| `REAL_NZB_MODE` | CI only | `true` when the prepare step staged the real NZB; drives the journey gate's extended allow-list instead of the standard single-fixme budget. |
+| `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | CI workflow secrets only | Halves of the xz-compressed, base64-encoded real NZB (48 KB secret cap). Rebuilt into `RUNNER_TEMP` only with a SHA-256 prefix check, truncated to one whole data file, then the full NZB is deleted. Secret names only, never values. |
 
 How the suite uses them:
 
@@ -198,6 +201,51 @@ How the suite uses them:
   402, `rate_limited` on 429) with a present, status-consistent retryable
   flag, the upgrade CTA pointer (a matching key whose value points at
   `/pricing`), and no secret leakage.
+- Staging real-NZB mode (secret-held RAR set, the only journey mode since
+  TWO-1169 deleted every checked-in NZB): the post-deploy journey ingests a
+  real NZB staged by the workflow. The full NZB is xz-compressed,
+  base64-encoded and split across the `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` repo
+  secrets (secret names only, never values); the e2e job's prepare step
+  rebuilds it into `RUNNER_TEMP` alone with a SHA-256 prefix check,
+  truncates it with `scripts/prepare-real-nzb.mjs` to the first non-PAR2
+  file (verbatim, all segments — one whole data file, so ingest stays off
+  the repair path and the run avoids pulling the full release), then deletes
+  the full NZB. Unset halves fail the job red instead of minting synthetic
+  evidence. Legs resolve the upload lazily via `requireRealNzbFixture()`
+  over `TEST_NZB_PATH` (`helpers/real-nzb-fixture.ts`) — a missing staging
+  fails the run, never a silent pass. Owner rule (public repo): no NZB
+  bytes, message-IDs, subjects, file names or segment lists in the repo or
+  public logs — the prepare step prints only file counts, skips carry a
+  static reason, failure artifacts stay sanitized junit-only, and the full
+  NZB never leaves `RUNNER_TEMP`. Honest scope: the real NZB is a RAR/PAR2
+  set and the ingest pipeline has no RAR read (transcode inputs skip
+  non-audio files), so an RAR-only subset fails permanent at transcode
+  before any library row is written — there is currently no completable
+  ingest. Live legs in real-NZB mode are signup, the BYOP wizard with
+  test-connection, the provider 430 control and the intake-level
+  ingest-refusal leg; the ingest-completion, reload, Range, meter,
+  playback, seek, Media Session, over-limit-stream and queue-order legs
+  skip by name until RAR read (and the per-file manifest for legs needing
+  2+ tracks) lands — parked legs un-park under TWO-1174. The journey gate
+  budgets that fixed allow-list via `REAL_NZB_MODE` instead of the
+  standard single-fixme budget; any failure or off-list skip still fails
+  the run in both modes.
+- Provider budget + 430 control: the staging NNTP provider is a shared
+  account with production, so each run holds at most a trickle of
+  connections. The workflow concurrency group (`e2e-staging`,
+  cancel-in-progress: false) serializes provider runs, and
+  `E2E_NNTP_MAX_CONNECTIONS` (default 2, hard max 10 —
+  `helpers/provider-budget.ts`) caps each run so 8+ connections stay free.
+  The BYOP wizard joins the budget: `completeByopWizard` sets its
+  connections input from the run budget and verifies it (testid
+  `byop-connections`, pinned by `tests/byop-transport.spec.ts`), so the
+  wizard-saved connection count can never exceed the run cap.
+  Legs fetch only the segments they need. `tests/provider-430-control.spec.ts`
+  is the live proof that costs almost nothing: one direct NNTP connection
+  asserting a minted never-posted probe ID answers 430 — 502 fails fast
+  with no retry (Playwright retries disabled for the file), the socket
+  closes in a `finally`, and counts-only evidence (peak connections, bytes
+  fetched) attaches to the run for the PR evidence comment.
 
 ## CI
 

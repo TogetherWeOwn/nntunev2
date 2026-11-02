@@ -23,6 +23,7 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	byopUser: '../routes/onboarding/byop/+page.svelte',
 	byopPass: '../routes/onboarding/byop/+page.svelte',
 	byopTls: '../routes/onboarding/byop/+page.svelte',
+	byopConnections: '../routes/onboarding/byop/+page.svelte',
 	byopTest: '../routes/onboarding/byop/+page.svelte',
 	byopSave: '../routes/onboarding/byop/+page.svelte',
 	byopStatus: '../routes/onboarding/byop/+page.svelte',
