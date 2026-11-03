@@ -89,9 +89,11 @@ Stream Worker serves Range requests over one shared, curated collection
 ADR 0013/0014). The signed grant is the only serve authorization: it is
 minted at the API issuance gate only after entitlement
 (plan/subscription) checks, binds user + track (the v2 payload also
-carries the play id and lease epoch), and is verified before any source
-is touched. Cache presence is never authorization and its absence is
-never a denial. Collection bytes are shared and content-addressed, not
+carries the play id and lease epoch, landing with the play route; the
+merged grant module still binds `user_id|track_id|exp`), and is
+verified before any source is touched. Cache presence is never
+authorization and its absence is never a denial. Collection bytes are
+shared and content-addressed, not
 per-user — ADR 0013 superseded ADR 0003's per-user own-provider grant
 layer on 2026-11-03 — so the per-user security state is the metering
 key: delivered-byte intervals keyed `(user, track, play)`.
