@@ -383,6 +383,7 @@ impl Harness {
             dns: &NoNetwork,
             now,
             source_ip: ip.into(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         };
         let request = handlers::Request {
             method: "POST".into(),
@@ -395,6 +396,7 @@ impl Harness {
             cookie: None,
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: json!({"email": email}).to_string().into_bytes(),
         };
         let attempts_before = self.mailer.attempts.borrow().len();

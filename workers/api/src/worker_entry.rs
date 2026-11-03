@@ -268,6 +268,20 @@ fn config_from_env(env: &Env) -> Option<Config> {
         }
         (None, Some(_)) | (Some(_), None) => return None,
     };
+    // Stripe test-mode secrets (Checkout-shape slice): both optional at
+    // startup — unprovisioned paths fail closed per-request (the webhook
+    // 500s so Stripe retries it; purchases refuse without a Stripe call)
+    // while every other route keeps serving. A staged bearer must be a
+    // test-mode key: `sk_live_` or any other shape refuses the whole
+    // startup before any traffic is served. Blank reads as absent.
+    let stripe_secret = env_string(env, "STRIPE_SECRET_KEY");
+    if let Some(key) = stripe_secret.as_deref() {
+        if !crate::stripe::valid_secret_key(key) {
+            return None;
+        }
+    }
+    let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
+    let config = config.with_stripe(stripe_secret, stripe_webhook);
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -698,6 +712,28 @@ impl PgStore {
             );
         }
         connected
+    }
+
+    /// Map one `billing_operations` row to its single-flight shape: the
+    /// payload fields parse tolerantly (a corrupt payload degrades to no
+    /// reuse, never to a blocked flight).
+    fn checkout_op_from_row(
+        row: &tokio_postgres::Row,
+    ) -> Result<crate::billing_reconcile::StoredCheckoutOp, StoreError> {
+        let payload: String = row.try_get("request_payload").map_err(|_| StoreError)?;
+        let (price_id, session_id) =
+            crate::billing_reconcile::parse_checkout_operation_payload(&payload);
+        let subscription: Option<String> = row
+            .try_get("stripe_subscription_id")
+            .map_err(|_| StoreError)?;
+        Ok(crate::billing_reconcile::StoredCheckoutOp {
+            id: row.try_get("id").map_err(|_| StoreError)?,
+            user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+            state: row.try_get("state").map_err(|_| StoreError)?,
+            price_id,
+            session_id,
+            subscription_id: subscription,
+        })
     }
 
     /// Opaque `StoreError` for a failed statement, after an
@@ -2370,6 +2406,399 @@ impl Store for PgStore {
         .await
     }
 
+    async fn claim_webhook_event(&self, event_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // First claim wins: one row on insert, none on a retried
+                // delivery (`ON CONFLICT DO NOTHING`), so duplicates ack
+                // 200 with no state change.
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::claim_webhook_event_statement(),
+                        &[(&event_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.claim_webhook_event")
+                    })?;
+                Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn load_reconcile_input(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+        Self::bounded(
+            async {
+                let failed = || {
+                    self.statement_failed("api.db.statement_failed.load_reconcile_input")
+                };
+                let client = self.connect().await?;
+                let account_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_account_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if account_rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let stripe_customer_id = account_rows
+                    .first()
+                    .map(|row| {
+                        row.try_get::<_, Option<String>>("stripe_customer_id")
+                            .map_err(|_| StoreError)
+                    })
+                    .transpose()?
+                    .flatten();
+                let live_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if live_rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let live = live_rows
+                    .first()
+                    .map(|row| {
+                        Ok::<_, StoreError>(crate::billing_reconcile::LiveRow {
+                            stripe_subscription_id: row
+                                .try_get("stripe_subscription_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_customer_id: row
+                                .try_get("stripe_customer_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_item_id: row
+                                .try_get("stripe_subscription_item_id")
+                                .map_err(|_| StoreError)?,
+                            stripe_price_id: row
+                                .try_get("stripe_price_id")
+                                .map_err(|_| StoreError)?,
+                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                            status: row.try_get("status").map_err(|_| StoreError)?,
+                            paid_through_unix: row
+                                .try_get::<_, Option<i64>>("paid_through_unix")
+                                .map_err(|_| StoreError)?,
+                            grace_until_unix: row
+                                .try_get::<_, Option<i64>>("grace_until_unix")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .transpose()?;
+                let binding_rows = client
+                    .query_typed(
+                        crate::billing_reconcile::price_bindings_select_statement(),
+                        &[],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let bindings = binding_rows
+                    .iter()
+                    .map(|row| {
+                        Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
+                            price_id: row
+                                .try_get("stripe_price_id")
+                                .map_err(|_| StoreError)?,
+                            plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                            selectable: row.try_get("selectable").map_err(|_| StoreError)?,
+                            livemode: row.try_get("livemode").map_err(|_| StoreError)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(crate::billing_reconcile::ReconcileInput {
+                    stripe_customer_id,
+                    live,
+                    bindings,
+                })
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn user_for_stripe_customer(
+        &self,
+        customer_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_user_by_customer_select_statement(),
+                        &[(&customer_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.user_for_stripe_customer")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // UNIQUE on `stripe_customer_id` says this never happens).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("user_id").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let failed = || {
+                    self.statement_failed("api.db.statement_failed.store_reconcile_outcome")
+                };
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| failed())?;
+                // One transaction under the per-user advisory lock: coverage
+                // advances monotonically while history inserts converge on
+                // the invoice id — duplicates and out-of-order replays land
+                // the same stored state.
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_lock_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let row = &outcome.row;
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::store_reconciled_subscription_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&row.stripe_subscription_id, Type::TEXT),
+                            (&row.stripe_customer_id, Type::TEXT),
+                            (&row.stripe_item_id, Type::TEXT),
+                            (&row.stripe_price_id, Type::TEXT),
+                            (&row.plan_id, Type::TEXT),
+                            (&row.status, Type::TEXT),
+                            (&row.current_period_end_unix, Type::INT8),
+                            (&row.cancel_at_period_end, Type::BOOL),
+                            (&row.paid_through_unix, Type::INT8),
+                            (&row.paid_invoice_id, Type::TEXT),
+                            (&row.grace_until_unix, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                for history in &outcome.history {
+                    transaction
+                        .query_typed(
+                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&history.stripe_invoice_id, Type::TEXT),
+                                (&history.stripe_subscription_id, Type::TEXT),
+                                (&history.plan_id, Type::TEXT),
+                                (&history.period_start_unix, Type::INT8),
+                                (&history.period_end_unix, Type::INT8),
+                                (&history.amount_cents, Type::INT8),
+                                (&history.currency, Type::TEXT),
+                                (&history.paid_at_unix, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                }
+                transaction.commit().await.map_err(|_| failed())?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_checkout_operation(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::open_checkout_operation_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.open_checkout_operation")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // partial unique admits at most one open flight per user).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(Self::checkout_op_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn create_checkout_operation(
+        &self,
+        op_id: &str,
+        user_id: &str,
+        price_id: &str,
+        customer_id: Option<&str>,
+    ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let failed = || {
+                    self.statement_failed("api.db.statement_failed.create_checkout_operation")
+                };
+                let client = self.connect().await?;
+                // The operation id is its own request key (fresh UUID per
+                // attempt, never reused across attempts); the partial
+                // unique — not this key — arbitrates the race.
+                let payload = crate::billing_reconcile::checkout_operation_payload(price_id, None);
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::create_checkout_operation_statement(),
+                        &[
+                            (&op_id, Type::TEXT),
+                            (&user_id, Type::TEXT),
+                            (&op_id, Type::TEXT),
+                            (&payload, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if rows.len() == 1 {
+                    // Winner: bind the Stripe customer to the account, but
+                    // only when unbound — an existing binding is never
+                    // overwritten by a racing second customer create.
+                    if let Some(customer) = customer_id {
+                        client
+                            .query_typed(
+                                crate::billing_reconcile::bind_account_customer_statement(),
+                                &[(&user_id, Type::TEXT), (&customer, Type::TEXT)],
+                            )
+                            .await
+                            .map_err(|_| failed())?;
+                    }
+                    return Ok(
+                        crate::billing_reconcile::CreateOpOutcome::Created(
+                            crate::billing_reconcile::StoredCheckoutOp {
+                                id: op_id.to_string(),
+                                user_id: user_id.to_string(),
+                                state: "pending".to_string(),
+                                price_id: Some(price_id.to_string()),
+                                session_id: None,
+                                subscription_id: None,
+                            },
+                        ),
+                    );
+                }
+                // Loser: converge on the winner's row (same operation id,
+                // hence the same Stripe idempotency key) instead of
+                // minting a second subscription.
+                let winner = client
+                    .query_typed(
+                        crate::billing_reconcile::open_checkout_operation_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                if winner.len() > 1 {
+                    return Err(StoreError);
+                }
+                winner
+                    .first()
+                    .map(Self::checkout_op_from_row)
+                    .transpose()?
+                    .map(crate::billing_reconcile::CreateOpOutcome::Existing)
+                    .ok_or(StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn checkout_operation_by_id(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing_reconcile::checkout_operation_by_id_select_statement(),
+                        &[(&op_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.checkout_operation_by_id")
+                    })?;
+                // `query_opt`'s rule: more than one row is an error (the
+                // operation id is the primary key).
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first().map(Self::checkout_op_from_row).transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn update_checkout_operation(
+        &self,
+        op_id: &str,
+        state: &str,
+        price_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Best-effort mark: the session already exists under the
+                // operation's idempotency key, so a lost mark only costs a
+                // retrieve on the next attempt — never a duplicate.
+                let payload =
+                    crate::billing_reconcile::checkout_operation_payload(price_id, session_id);
+                let subscription: Option<String> = None;
+                client
+                    .query_typed(
+                        crate::billing_reconcile::update_checkout_operation_statement(),
+                        &[
+                            (&op_id, Type::TEXT),
+                            (&state, Type::TEXT),
+                            (&payload, Type::TEXT),
+                            (&subscription, Type::TEXT),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.update_checkout_operation")
+                    })?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
@@ -2933,6 +3362,190 @@ impl Mailer for WebhookMailer {
     }
 }
 
+// --- Stripe transport ----------------------------------------------------------------------------------
+
+// Stripe HTTPS transport over `worker::Fetch`: bearer test secret plus
+// the pinned `Stripe-Version` on every call, `Idempotency-Key` on the two
+// creations (derived from the billing operation id, so retried creations
+// replay instead of duplicating). Unprovisioned (no secret configured)
+// every call fails closed to a transport error — the handlers map that to
+// the same generic 500 as any store outage, never to an entitlement
+// change. Secret material rides the `Authorization` header only; nothing
+// here logs header values or response bodies.
+struct WorkerStripeTransport {
+    secret_key: Option<String>,
+}
+
+impl WorkerStripeTransport {
+    async fn send<T>(&self, req: &crate::stripe::StripeRequest) -> crate::stripe::StripeResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        use crate::stripe::{StripeError, STRIPE_API_BASE, STRIPE_API_VERSION};
+        let key = self
+            .secret_key
+            .as_deref()
+            .ok_or_else(StripeError::transport)?;
+        let headers = Headers::new();
+        headers
+            .set("Authorization", &format!("Bearer {key}"))
+            .map_err(|_| StripeError::transport())?;
+        headers
+            .set("Stripe-Version", STRIPE_API_VERSION)
+            .map_err(|_| StripeError::transport())?;
+        if let Some(idempotency) = req.idempotency_key.as_deref() {
+            headers
+                .set("Idempotency-Key", idempotency)
+                .map_err(|_| StripeError::transport())?;
+        }
+        let method = match req.method {
+            "POST" => Method::Post,
+            "DELETE" => Method::Delete,
+            _ => Method::Get,
+        };
+        if req.method == "POST" {
+            headers
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .map_err(|_| StripeError::transport())?;
+        }
+        let url = format!("{STRIPE_API_BASE}{}", req.path);
+        let mut init = RequestInit::new();
+        init.with_method(method).with_headers(headers);
+        if req.method == "POST" {
+            init.with_body(Some(req.body.clone().into()));
+        }
+        let request =
+            Request::new_with_init(&url, &init).map_err(|_| StripeError::transport())?;
+        let mut response = Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|_| StripeError::transport())?;
+        let status = response.status_code();
+        let body = response.text().await.map_err(|_| StripeError::transport())?;
+        if (200..300).contains(&status) {
+            serde_json::from_str(&body).map_err(|_| StripeError::transport())
+        } else {
+            Err(StripeError::parse(status, body.as_bytes()))
+        }
+    }
+}
+
+impl crate::stripe::StripeTransport for WorkerStripeTransport {
+    fn create_customer(
+        &self,
+        req: crate::stripe::CreateCustomer,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Customer>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::create_customer_request(
+                &req.operation_id,
+                req.user_id.as_deref(),
+                req.test_clock.as_deref(),
+            ))
+            .await
+        })
+    }
+    fn create_checkout_session(
+        &self,
+        req: crate::stripe::CreateCheckoutSession,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::create_checkout_session_request(
+                &req.operation_id,
+                &req.customer_id,
+                &req.price_id,
+                &req.success_url,
+                &req.cancel_url,
+            ))
+            .await
+        })
+    }
+    fn retrieve_checkout_session(
+        &self,
+        session_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_checkout_session_request(&session_id))
+                .await
+        })
+    }
+    fn retrieve_subscription(
+        &self,
+        subscription_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_subscription_request(&subscription_id))
+                .await
+        })
+    }
+    fn retrieve_invoice(
+        &self,
+        invoice_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::retrieve_invoice_request(&invoice_id))
+                .await
+        })
+    }
+    fn list_invoice_lines(
+        &self,
+        invoice_id: String,
+        starting_after: Option<String>,
+        limit: u8,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::list_invoice_lines_request(
+                &invoice_id,
+                starting_after.as_deref(),
+                limit,
+            ))
+            .await
+        })
+    }
+    fn list_invoices(
+        &self,
+        req: crate::stripe::ListInvoices,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
+    > {
+        Box::pin(async move {
+            // An unfiltered list is never issued: without a customer or a
+            // subscription the builder refuses, and the transport fails
+            // closed instead of listing the account's invoices.
+            let request = crate::stripe::list_invoices_request(
+                req.customer_id.as_deref(),
+                req.subscription_id.as_deref(),
+                req.paid_only,
+                req.limit,
+            )
+            .ok_or_else(crate::stripe::StripeError::transport)?;
+            self.send(&request).await
+        })
+    }
+    fn cancel_subscription(
+        &self,
+        subscription_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::cancel_subscription_request(&subscription_id))
+                .await
+        })
+    }
+}
+
 // --- Fetch dispatch ------------------------------------------------------------------------------------
 
 fn render_header_pairs(
@@ -3389,9 +4002,19 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
+        // Raw Stripe signature for the billing webhook carve-out (header
+        // keys are lowercased above): the signature IS the webhook's auth,
+        // so it rides its own field, never the bearer gate.
+        stripe_signature: headers_map.get("stripe-signature").cloned(),
         // Template only: the gate replaces this with the collected bytes
         // on `Complete` and never dispatches it otherwise.
         body: Vec::new(),
+    };
+    // Stripe transport for this request: the provisioned test secret, or
+    // fail-closed per call when unprovisioned (the handlers gate on the
+    // same config before any Stripe call).
+    let stripe = WorkerStripeTransport {
+        secret_key: config.stripe_secret_key.clone(),
     };
     let ctx = handlers::Ctx {
         cfg: &config,
@@ -3408,6 +4031,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         },
         dialer: &SocketDialer,
         dns: &DohDns,
+        stripe: &stripe,
         now: worker::Date::now().as_millis() / 1000,
         source_ip: client_source_ip(&headers_map),
     };
@@ -3493,7 +4117,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 8] = [
+    const DB_FAILURE_EVENTS: [&str; 16] = [
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -3502,6 +4126,14 @@ mod tests {
         "api.db.statement_failed.user_by_email",
         "api.db.statement_failed.insert_user",
         "api.db.statement_failed.insert_session",
+        "api.db.statement_failed.claim_webhook_event",
+        "api.db.statement_failed.load_reconcile_input",
+        "api.db.statement_failed.user_for_stripe_customer",
+        "api.db.statement_failed.store_reconcile_outcome",
+        "api.db.statement_failed.open_checkout_operation",
+        "api.db.statement_failed.create_checkout_operation",
+        "api.db.statement_failed.checkout_operation_by_id",
+        "api.db.statement_failed.update_checkout_operation",
     ];
 
     #[test]
@@ -3675,6 +4307,9 @@ mod tests {
                 .expect("db failure events are api.db.<kind>.<operation>");
             let method = production
                 .split_once(&format!("async fn {operation}(&self"))
+                .or_else(|| {
+                    production.split_once(&format!("async fn {operation}(\n        &self,"))
+                })
                 .unwrap_or_else(|| panic!("store method {operation} must exist"))
                 .1
                 .split_once("\n    async fn ")

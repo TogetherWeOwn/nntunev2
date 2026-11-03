@@ -414,6 +414,7 @@ fn template_request(method: &str, path: &str) -> handlers::Request {
         cookie: None,
         origin: Some(ORIGIN.to_string()),
         authorization: None,
+        stripe_signature: None,
         body: TEMPLATE_BODY.to_vec(),
     }
 }
@@ -838,6 +839,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -857,6 +859,7 @@ impl Harness {
             cookie,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: TEMPLATE_BODY.to_vec(),
         };
         let ctx = self.ctx();

@@ -417,6 +417,7 @@ impl Harness {
             dns: &self.dns,
             now,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -427,6 +428,7 @@ impl Harness {
             cookie: None,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"email": email}).to_string().into_bytes(),
         };
         block_on(handlers::handle(&self.ctx_at(now), &request))

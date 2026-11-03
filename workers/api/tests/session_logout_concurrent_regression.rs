@@ -421,6 +421,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -431,6 +432,7 @@ impl Harness {
             cookie,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: b"{}".to_vec(),
         };
         block_on(handlers::handle(&self.ctx(), &request))
