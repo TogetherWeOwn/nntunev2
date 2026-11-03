@@ -5193,9 +5193,7 @@ mod tests {
         // accepted-job read, and the insert binds the same width.
         for column in ["file_count", "segment_count"] {
             assert!(
-                production.contains(&format!(
-                    "try_get::<_, Option<i32>>(\"{column}\")"
-                )),
+                production.contains(&format!("try_get::<_, Option<i32>>(\"{column}\")")),
                 "{column} must decode as i32"
             );
         }
