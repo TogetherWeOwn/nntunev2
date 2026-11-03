@@ -37,6 +37,8 @@ EXPECTED = {
         "postgres_admin_role_change_audits_each_replaced_value",
         "postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value",
         "postgres_admin_setting_writes_serialize_per_key",
+        "postgres_admin_write_refused_after_actor_demotion",
+        "postgres_admin_simultaneous_opposing_demotions_keep_one_admin",
     )
 }
 EXPECTED_CONFIG = {

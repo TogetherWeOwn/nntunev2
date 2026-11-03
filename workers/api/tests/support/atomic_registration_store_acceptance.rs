@@ -11,6 +11,7 @@ use super::{
     prune_expired_challenges_on, reap_unverified_users_on,
 };
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
+use crate::handlers::AdminWriteOutcome;
 use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -1474,14 +1475,26 @@ async fn seed_admin_test_users(client: &Client) -> (String, String) {
     let prefix = format!("admin-foundation-{:016x}", rand::random::<u64>());
     let actor_id = format!("{prefix}-actor");
     let subject_id = format!("{prefix}-subject");
-    for (id, email) in [
-        (actor_id.as_str(), format!("{prefix}-actor@example.com")),
-        (subject_id.as_str(), format!("{prefix}-subject@example.com")),
+    for (id, email, role) in [
+        (
+            actor_id.as_str(),
+            format!("{prefix}-actor@example.com"),
+            "admin",
+        ),
+        (
+            subject_id.as_str(),
+            format!("{prefix}-subject@example.com"),
+            "member",
+        ),
     ] {
+        // The actor seeds as an admin: the write transactions now
+        // re-read the actor's role under their locks, and these tests
+        // exercise authorized writes except where they demote the
+        // actor deliberately.
         client
             .execute(
-                "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
-                &[&id, &email, &(NOW as i64)],
+                "INSERT INTO users (id, email, created_at, role) VALUES ($1, $2, $3, $4)",
+                &[&id, &email, &(NOW as i64), &role],
             )
             .await
             .expect("seed admin acceptance user");
@@ -1524,14 +1537,20 @@ fn postgres_admin_role_change_audits_each_replaced_value() {
             admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
                 .await
                 .expect("promote subject");
-        assert_eq!(previous.as_deref(), Some("member"));
+        assert_eq!(
+            previous,
+            AdminWriteOutcome::Applied(Some("member".to_string()))
+        );
         assert_eq!(role_of(&client, &subject).await, "admin");
 
         let previous =
             admin_set_user_role_on(&mut client, &actor, &subject, "member", "198.51.100.9", NOW)
                 .await
                 .expect("demote subject");
-        assert_eq!(previous.as_deref(), Some("admin"));
+        assert_eq!(
+            previous,
+            AdminWriteOutcome::Applied(Some("admin".to_string()))
+        );
         assert_eq!(role_of(&client, &subject).await, "member");
 
         assert_eq!(
@@ -1549,7 +1568,7 @@ fn postgres_admin_role_change_audits_each_replaced_value() {
             admin_set_user_role_on(&mut client, &actor, &missing, "admin", "198.51.100.9", NOW)
                 .await
                 .expect("missing subject is not a store error");
-        assert_eq!(previous, None);
+        assert_eq!(previous, AdminWriteOutcome::SubjectMissing);
         assert!(role_audit_chain(&client, &missing).await.is_empty());
     });
 }
@@ -1561,10 +1580,19 @@ fn postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value() {
         let holder = connect().await;
         let (actor, subject) = seed_admin_test_users(&holder).await;
 
-        // Hold the subject row lock behind an uncommitted promotion. A
-        // snapshot read would keep seeing 'member'; the production
-        // FOR UPDATE read must wait for the commit and then see 'admin'.
+        // The write locks in the fixed production order (actor row,
+        // then subject row), so the holder takes the actor row first
+        // and both rows wait behind one uncommitted promotion of the
+        // subject. A snapshot read would keep seeing the subject as
+        // 'member'; the production FOR UPDATE reads must wait for the
+        // commit and then see 'admin' — and had the holder demoted the
+        // actor instead, the re-check would refuse the write (pinned
+        // by the demotion regressions below).
         holder.batch_execute("BEGIN").await.expect("begin holder");
+        holder
+            .execute("SELECT id FROM users WHERE id = $1 FOR UPDATE", &[&actor])
+            .await
+            .expect("holder locks the actor row");
         holder
             .execute("UPDATE users SET role = 'admin' WHERE id = $1", &[&subject])
             .await
@@ -1599,8 +1627,8 @@ fn postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value() {
             .expect("contender task")
             .expect("contender write after lock release");
         assert_eq!(
-            previous.as_deref(),
-            Some("admin"),
+            previous,
+            AdminWriteOutcome::Applied(Some("admin".to_string())),
             "the returned/audited old value must be the committed value replaced"
         );
         assert_eq!(role_of(&holder, &subject).await, "member");
@@ -1633,12 +1661,12 @@ fn postgres_admin_setting_writes_serialize_per_key() {
             admin_set_app_setting_on(&mut client, &actor, KEY, "14", "198.51.100.9", NOW)
                 .await
                 .expect("first setting write");
-        assert_eq!(previous.as_deref(), Some("7"));
+        assert_eq!(previous, AdminWriteOutcome::Applied(Some("7".to_string())));
         let previous =
             admin_set_app_setting_on(&mut client, &actor, KEY, "30", "198.51.100.9", NOW)
                 .await
                 .expect("second setting write");
-        assert_eq!(previous.as_deref(), Some("14"));
+        assert_eq!(previous, AdminWriteOutcome::Applied(Some("14".to_string())));
 
         // Hold the per-key advisory lock behind an uncommitted rewrite to
         // 9; the contender must wait and then replace 9, not the stale 30
@@ -1675,7 +1703,7 @@ fn postgres_admin_setting_writes_serialize_per_key() {
             .await
             .expect("contender task")
             .expect("contender write after lock release");
-        assert_eq!(previous.as_deref(), Some("9"));
+        assert_eq!(previous, AdminWriteOutcome::Applied(Some("9".to_string())));
 
         let chain: Vec<(Option<String>, String)> = client
             .query(
@@ -1718,7 +1746,7 @@ fn postgres_admin_setting_writes_serialize_per_key() {
         )
         .await
         .expect("first write of absent key");
-        assert_eq!(previous, None);
+        assert_eq!(previous, AdminWriteOutcome::Applied(None));
         let old_is_json_null: bool = client
             .query_one(
                 "SELECT details -> 'old' = 'null'::jsonb FROM audit_log \
@@ -1747,5 +1775,134 @@ fn postgres_admin_setting_writes_serialize_per_key() {
         )
         .await
         .expect("restore seeded per-window value");
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_write_refused_after_actor_demotion() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, subject) = seed_admin_test_users(&client).await;
+        const KEY: &str = "invite_member_min_paid_months";
+
+        // The guard authorized this actor when they were an admin, but
+        // by the time the write transaction runs another admin has
+        // demoted them. The in-transaction re-check must refuse BOTH
+        // write kinds: no role change, no setting change, no audit row.
+        client
+            .execute("UPDATE users SET role = 'member' WHERE id = $1", &[&actor])
+            .await
+            .expect("demote the actor mid-flight");
+
+        let role_outcome =
+            admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
+                .await
+                .expect("role write by demoted actor is a typed refusal, not an error");
+        assert_eq!(role_outcome, AdminWriteOutcome::ActorNotAdmin);
+        assert_eq!(role_of(&client, &subject).await, "member");
+        assert!(
+            role_audit_chain(&client, &subject).await.is_empty(),
+            "a refused role write audits nothing"
+        );
+
+        let setting_outcome =
+            admin_set_app_setting_on(&mut client, &actor, KEY, "99", "198.51.100.9", NOW)
+                .await
+                .expect("settings write by demoted actor is a typed refusal, not an error");
+        assert_eq!(setting_outcome, AdminWriteOutcome::ActorNotAdmin);
+        let stored: String = client
+            .query_one("SELECT value FROM app_settings WHERE key = $1", &[&KEY])
+            .await
+            .expect("seeded setting still present")
+            .get(0);
+        assert_eq!(stored, "3", "the refusal replaced nothing");
+        let audits: i64 = client
+            .query_one(
+                "SELECT count(*) FROM audit_log \
+                 WHERE action = 'settings.changed' AND user_id = $1",
+                &[&actor],
+            )
+            .await
+            .expect("count refused-actor settings audits")
+            .get(0);
+        assert_eq!(audits, 0, "a refused settings write audits nothing");
+
+        // A never-admin actor is the same refusal: the re-check does
+        // not trust the caller to have been authorized at all.
+        let stranger =
+            admin_set_user_role_on(&mut client, &subject, &actor, "member", "198.51.100.9", NOW)
+                .await
+                .expect("role write by a member actor is a typed refusal");
+        assert_eq!(stranger, AdminWriteOutcome::ActorNotAdmin);
+        assert_eq!(role_of(&client, &actor).await, "member");
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_simultaneous_opposing_demotions_keep_one_admin() {
+    run_test(async {
+        let client = connect().await;
+        let (admin_a, admin_b) = seed_admin_test_users(&client).await;
+        client
+            .execute("UPDATE users SET role = 'admin' WHERE id = $1", &[&admin_b])
+            .await
+            .expect("promote the second admin");
+
+        // Both admins pass the handler guard concurrently, then each
+        // tries to demote the other. The shared serialization lock
+        // runs the two transactions in some order: the first commits,
+        // the second re-reads its own role as 'member' and applies
+        // nothing — so exactly one admin survives instead of zero,
+        // and the fixed lock order keeps the pair deadlock-free.
+        let (a1, b1) = (admin_a.clone(), admin_b.clone());
+        let demote_b = tokio::spawn(async move {
+            let mut client = connect().await;
+            admin_set_user_role_on(&mut client, &a1, &b1, "member", "198.51.100.9", NOW).await
+        });
+        let (a2, b2) = (admin_a.clone(), admin_b.clone());
+        let demote_a = tokio::spawn(async move {
+            let mut client = connect().await;
+            admin_set_user_role_on(&mut client, &b2, &a2, "member", "198.51.100.9", NOW).await
+        });
+        let outcomes = [
+            demote_b
+                .await
+                .expect("demote-b task")
+                .expect("demote-b write"),
+            demote_a
+                .await
+                .expect("demote-a task")
+                .expect("demote-a write"),
+        ];
+        let applied = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AdminWriteOutcome::Applied(_)))
+            .count();
+        let refused = outcomes
+            .iter()
+            .filter(|outcome| **outcome == AdminWriteOutcome::ActorNotAdmin)
+            .count();
+        assert_eq!(
+            (applied, refused),
+            (1, 1),
+            "exactly one demotion applies and one is refused: {outcomes:?}"
+        );
+
+        let roles = [
+            role_of(&client, &admin_a).await,
+            role_of(&client, &admin_b).await,
+        ];
+        assert_eq!(
+            roles.iter().filter(|role| role.as_str() == "admin").count(),
+            1,
+            "opposing demotions must never reach zero admins: {roles:?}"
+        );
+
+        // Exactly one audit row landed across both subjects.
+        let audits = role_audit_chain(&client, &admin_a).await.len()
+            + role_audit_chain(&client, &admin_b).await.len();
+        assert_eq!(audits, 1, "only the applied demotion audits");
     });
 }

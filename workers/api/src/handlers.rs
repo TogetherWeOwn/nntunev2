@@ -440,6 +440,24 @@ impl Config {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreError;
 
+/// Outcome of one admin write transaction (migration 0026). The
+/// transaction serializes every admin write and re-reads the actor's
+/// role under its locks, so a write authorized by the guard can still
+/// lose the race to a demotion that committed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminWriteOutcome {
+    /// The write and its audit row committed; carries the value the
+    /// write replaced (`None` = no prior stored value).
+    Applied(Option<String>),
+    /// The subject user does not exist (role writes only); nothing was
+    /// written or audited.
+    SubjectMissing,
+    /// The actor was no longer an admin when the write transaction
+    /// re-read their role; nothing was written or audited. The handler
+    /// answers the plain 404, as for any non-admin caller.
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -918,8 +936,10 @@ pub trait Store {
     }
     /// Set a user's role and write the extended `user.role_changed`
     /// audit row (actor, subject, old-to-new) in one transaction:
-    /// the role must never change without its audit row. Returns the
-    /// previous role, or `None` when the subject does not exist.
+    /// the role must never change without its audit row. The
+    /// transaction re-reads the actor's role under its locks (see
+    /// `AdminWriteOutcome`), so two admins passing the guard
+    /// concurrently cannot demote each other to zero admins.
     /// Fail-closed default; production and the test fake override it.
     fn admin_set_user_role(
         &self,
@@ -928,7 +948,7 @@ pub trait Store {
         _new_role: &str,
         _source_ip: &str,
         _now: u64,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+    ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Every `app_settings` row as `(key, value)` pairs (migration
@@ -940,9 +960,10 @@ pub trait Store {
     }
     /// Upsert one `app_settings` row and write the extended
     /// `settings.changed` audit row (actor, old-to-new) in one
-    /// transaction. Returns the previous stored value, or `None` when no
-    /// row existed. Fail-closed default; production and the test fake
-    /// override it.
+    /// transaction, revalidating the actor's role under the write
+    /// serialization lock (see `AdminWriteOutcome`): a settings write
+    /// can never commit after its actor's demotion. Fail-closed
+    /// default; production and the test fake override it.
     fn admin_set_app_setting(
         &self,
         _actor_user_id: &str,
@@ -950,7 +971,7 @@ pub trait Store {
         _new_value: &str,
         _source_ip: &str,
         _now: u64,
-    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+    ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Persist a freshly issued native REST credential row (migration
@@ -1624,16 +1645,20 @@ where
     /// session claim — is exactly `admin`. Mutations additionally
     /// require the fresh-session step-up, like credential minting.
     ///
-    /// A presented `Authorization` header is refused outright with 403
-    /// before any session work: admin routes are `SessionOnly` in the
-    /// scope map, and native/API-key credentials can never call them —
-    /// not even alongside a valid admin cookie. An authenticated
-    /// non-admin gets the same 403; an unauthenticated caller keeps the
-    /// generic 401 every other session route gives.
+    /// The admin surface is non-enumerable (TWO-70 A-AC1): every caller
+    /// who is not a confirmed admin gets the plain 404 an unknown path
+    /// gives, whatever went wrong — a presented `Authorization` header
+    /// (admin routes are `SessionOnly` in the scope map, and
+    /// native/API-key credentials can never call them, not even
+    /// alongside a valid admin cookie), a missing, invalid or non-admin
+    /// session, or a stale session on a mutation. Only a caller already
+    /// known to be an admin can hear anything else (the step-up prompt
+    /// below, validation, the generic 500) — so no response a non-admin
+    /// can elicit distinguishes an admin path from a nonexistent one.
     ///
-    /// Role is checked before freshness: a non-admin must hear 403,
-    /// never a step-up prompt that reauthenticating could not satisfy.
-    /// Only a caller already known to be an admin can be asked to
+    /// Role is checked before freshness: a non-admin must hear the
+    /// plain 404, never a step-up prompt that reauthenticating could
+    /// not satisfy. Only a confirmed admin can be asked to
     /// reauthenticate for a mutation.
     async fn authenticate_admin(
         &self,
@@ -1641,16 +1666,27 @@ where
         mutation: bool,
     ) -> Result<SessionClaims, Response> {
         if req.authorization.is_some() {
-            return Err(admin_forbidden());
+            return Err(not_found());
         }
-        let (claims, token) = self.authenticate(req, mutation).await?;
+        // `authenticate`'s own failures (a bad or missing cookie, and
+        // for mutations a missing or foreign Origin) collapse to the
+        // same plain 404: the caller is not yet known to be an admin.
+        let (claims, token) = self
+            .authenticate(req, mutation)
+            .await
+            .map_err(|_| not_found())?;
+        // A role-read failure collapses to the same 404: until the role
+        // is confirmed the caller is not known to be an admin, and a
+        // 500 here (which an unknown path never produces) would
+        // enumerate the surface. Production logs the failed statement
+        // server-side, so the outage stays visible to operators.
         let role = self
             .store
             .user_role(&claims.user_id)
             .await
-            .map_err(|_| internal())?;
+            .map_err(|_| not_found())?;
         if !crate::admin::is_admin_role(role.as_deref()) {
-            return Err(admin_forbidden());
+            return Err(not_found());
         }
         if mutation {
             let record = self
@@ -3457,20 +3493,6 @@ fn scope_forbidden() -> Response {
     }
 }
 
-fn admin_forbidden() -> Response {
-    // Names the outcome only: this surface needs an admin session. The
-    // same body answers a non-admin session and a presented bearer
-    // credential, so neither learns anything about the other's path.
-    let error = crate::api_error::ApiError::by_code("forbidden", "admin session required");
-    Response {
-        status: error.status,
-        body: error.body_json(),
-        set_cookie: None,
-        retry_after: None,
-        extra_headers: Vec::new(),
-    }
-}
-
 fn not_found() -> Response {
     let error = crate::api_error::ApiError::not_found("not found");
     Response {
@@ -4040,11 +4062,15 @@ where
 
 // --- Admin surface (migration 0026) ---------------------------------------------------------
 //
-// Session-only and role-gated by `authenticate_admin`: the scope map
-// marks every path below `SessionOnly`, so bearer credentials never
-// reach these handlers through the gate, and the guard refuses a
-// presented `Authorization` header outright. Role and settings writes
-// land together with their extended audit rows in one store transaction.
+// Session-only, role-gated by `authenticate_admin`, and non-enumerable
+// (TWO-70 A-AC1): the scope map marks every path below `SessionOnly`,
+// so bearer credentials never reach these handlers through the gate,
+// and the guard answers every non-admin probe — presented bearer,
+// missing, bad or non-admin session — with the plain 404. Preflight
+// agrees (`options_preflight_served` excludes the whole namespace).
+// Role and settings writes land together with their extended audit
+// rows in one store transaction that re-reads the actor's role under
+// its locks (`AdminWriteOutcome`).
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4133,7 +4159,12 @@ where
         )
         .await
     {
-        Ok(previous) => previous,
+        Ok(AdminWriteOutcome::Applied(previous)) => previous,
+        // The actor lost admin between the guard and the write
+        // transaction's re-check: answer as any non-admin is answered.
+        Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
+            return not_found();
+        }
         Err(_) => return internal(),
     };
     // The previous value is reported at its effective resolution: no
@@ -4198,9 +4229,20 @@ where
         )
         .await
     {
-        Ok(Some(previous)) => previous,
-        Ok(None) => return not_found(),
+        Ok(AdminWriteOutcome::Applied(previous)) => previous,
+        // Unknown subject, or the actor stopped being an admin
+        // between the guard and the write transaction's re-check —
+        // both are the plain 404.
+        Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
+            return not_found();
+        }
         Err(_) => return internal(),
+    };
+    let Some(previous) = previous else {
+        // A role write always replaces a stored role (the subject row
+        // exists and `users.role` is NOT NULL); a store reporting
+        // otherwise is broken, never a success with a null old role.
+        return internal();
     };
     json_response(
         200,
@@ -4224,7 +4266,10 @@ where
 /// deliberately absent: their POST arms match independently, and listing
 /// them here would answer `OPTIONS` with 204 in every posture — making the
 /// seams enumerable from production. `POST /api/ingest` IS listed: it is
-/// a real route (cap guard today, write path later), not a seam.
+/// a real route (cap guard today, write path later), not a seam. The
+/// admin routes are absent for the same non-enumerability reason
+/// (TWO-70 A-AC1): their callers are first-party and same-origin, so
+/// nothing needs a preflight answer, and log lines name them `unknown`.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -4245,7 +4290,6 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
             | "/v1/credentials"
-            | "/v1/admin/settings"
     )
 }
 
@@ -4257,7 +4301,20 @@ pub fn is_known_path(path: &str) -> bool {
 /// the API surface. A presented `Authorization` header never changes this
 /// posture (the OPTIONS method maps `Deny`, so the bearer gate is
 /// skipped): preflight answers the path, not the caller.
+///
+/// The `/v1/admin/` namespace is excluded wholesale (TWO-70 A-AC1): the
+/// admin guard answers every non-admin caller with the plain 404, and a
+/// 204 preflight would enumerate the surface the guard hides. Prefix,
+/// not shape: every path under the namespace — real, mistyped or
+/// imaginary — 404s identically, while lookalikes without the trailing
+/// slash (`/v1/adminx`) never enter the namespace and keep their normal
+/// (unserved) posture. The scope map still classifies the real admin
+/// operations `SessionOnly` for the bearer gate; preflight simply never
+/// consults it for these paths.
 fn options_preflight_served(path: &str) -> bool {
+    if path == "/v1/admin" || path.starts_with("/v1/admin/") {
+        return false;
+    }
     if is_known_path(path) {
         return true;
     }
@@ -4370,9 +4427,9 @@ where
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         // Single-segment setting keys and `{id}/role` only; deeper or
-        // malformed shapes 404 inside the handlers. The scope map marks
-        // both `SessionOnly`, so `options_preflight_served` covers their
-        // preflights without an `is_known_path` entry.
+        // malformed shapes 404 inside the handlers. Neither path gets
+        // an `is_known_path` or preflight answer: the admin namespace
+        // is non-enumerable (see `options_preflight_served`).
         ("PUT", path) if path.starts_with("/v1/admin/settings/") => {
             admin_setting_put(ctx, req).await
         }
@@ -4534,6 +4591,10 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
         fail_magic_audit: RefCell<bool>,
+        /// Role-read outage pin: `user_role` fails like a production
+        /// query error, which the admin guard must collapse to the
+        /// plain 404 (never a distinguishing 500).
+        fail_user_role_lookup: RefCell<bool>,
         /// Session-row lookup outage pin: `session_by_id` fails like a
         /// production query error, which `authenticate` maps to a 500.
         fail_session_lookup: RefCell<bool>,
@@ -5309,6 +5370,9 @@ mod tests {
             Ok(())
         }
         async fn user_role(&self, user_id: &str) -> Result<Option<String>, StoreError> {
+            if *self.fail_user_role_lookup.borrow() {
+                return Err(StoreError);
+            }
             if !self.users.borrow().contains_key(user_id) {
                 return Ok(None);
             }
@@ -5327,9 +5391,15 @@ mod tests {
             new_role: &str,
             source_ip: &str,
             now: u64,
-        ) -> Result<Option<String>, StoreError> {
+        ) -> Result<AdminWriteOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminWriteOutcome::ActorNotAdmin),
+            }
             if !self.users.borrow().contains_key(subject_user_id) {
-                return Ok(None);
+                return Ok(AdminWriteOutcome::SubjectMissing);
             }
             let previous = self
                 .user_roles
@@ -5349,7 +5419,7 @@ mod tests {
                 Some(subject_user_id),
                 serde_json::json!({"old": previous, "new": new_role}),
             ));
-            Ok(Some(previous))
+            Ok(AdminWriteOutcome::Applied(Some(previous)))
         }
         async fn app_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
             Ok(self
@@ -5366,7 +5436,11 @@ mod tests {
             new_value: &str,
             source_ip: &str,
             now: u64,
-        ) -> Result<Option<String>, StoreError> {
+        ) -> Result<AdminWriteOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminWriteOutcome::ActorNotAdmin),
+            }
             let previous = self
                 .app_settings_rows
                 .borrow_mut()
@@ -5380,7 +5454,7 @@ mod tests {
                 None,
                 serde_json::json!({"key": key, "old": previous, "new": new_value}),
             ));
-            Ok(previous)
+            Ok(AdminWriteOutcome::Applied(previous))
         }
     }
 
@@ -8045,17 +8119,49 @@ mod tests {
         let member_cookie = magic_login(&h, "member@example.com");
         let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
 
-        // No session: the generic 401 every session route gives.
+        // The admin surface is non-enumerable (TWO-70 A-AC1): no
+        // session, a garbage session and an authenticated non-admin
+        // session all get the plain 404 an unknown path gives — never
+        // a 401 or 403 that would confirm the route exists — and no
+        // settings leak.
         let anon = h.call_full("GET", "/v1/admin/settings", None, None, None);
-        assert_eq!(anon.status, 401, "{}", anon.body);
-
-        // Authenticated but not admin: 403, and no settings leak.
-        let denied = h.call_full("GET", "/v1/admin/settings", None, Some(member_cookie), None);
-        assert_eq!(denied.status, 403, "{}", denied.body);
+        assert_eq!(anon.status, 404, "{}", anon.body);
+        let garbage = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some("__Host-nntune-session=not-a-token".to_string()),
+            None,
+        );
+        assert_eq!(garbage.status, 404, "{}", garbage.body);
+        let denied = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(denied.status, 404, "{}", denied.body);
         assert_eq!(
             denied.body,
-            r#"{"code":"forbidden","message":"admin session required","retryable":false}"#
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
         );
+        // Byte-identical to the unknown-path answer: no oracle.
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        assert_eq!(denied.body, unknown.body);
+        assert_eq!(anon.body, unknown.body);
+
+        // A role-read outage is the same plain 404 for a member AND
+        // for an admin session: until the role is confirmed, the
+        // caller is not known to be an admin, so the guard never
+        // answers the 500 an unknown path cannot produce.
+        *h.store.fail_user_role_lookup.borrow_mut() = true;
+        for cookie in [member_cookie, admin_cookie.clone()] {
+            let resp = h.call_full("GET", "/v1/admin/settings", None, Some(cookie), None);
+            assert_eq!(resp.status, 404, "{}", resp.body);
+            assert_eq!(resp.body, unknown.body);
+        }
+        *h.store.fail_user_role_lookup.borrow_mut() = false;
 
         // Admin: every typed key at its built-in default while no rows
         // exist (the pre-seed posture).
@@ -8068,7 +8174,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_sessions_hear_403_for_members_and_step_up_only_for_admins() {
+    fn stale_sessions_hear_404_for_members_and_step_up_only_for_admins() {
         let h = harness();
         seed_user(&h, "member1", "member@example.com");
         let member_cookie = magic_login(&h, "member@example.com");
@@ -8094,10 +8200,10 @@ mod tests {
             block_on(handle(&stale_ctx, &req))
         };
 
-        // A stale MEMBER session gets 403, not the step-up prompt:
-        // reauthenticating could never authorize them.
+        // A stale MEMBER session gets the plain 404, not the step-up
+        // prompt: reauthenticating could never authorize them.
         let member = stale_put(&member_cookie);
-        assert_eq!(member.status, 403, "{}", member.body);
+        assert_eq!(member.status, 404, "{}", member.body);
 
         // A stale ADMIN session gets the step-up for a mutation...
         let admin = stale_put(&admin_cookie);
@@ -8123,17 +8229,22 @@ mod tests {
     }
 
     #[test]
-    fn admin_routes_refuse_presented_bearer_credentials_with_403() {
+    fn admin_routes_refuse_presented_bearer_credentials_with_404() {
         let h = harness();
         let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
 
-        // Bearer only, no cookie: 403 (never the bearer gate's 404).
+        // Bearer only, no cookie: the plain 404, like every other
+        // non-admin probe of the namespace.
         let bearer_only = h.call_bearer(
             "GET",
             "/v1/admin/settings",
             Some("Bearer ntk_synthetic".to_string()),
         );
-        assert_eq!(bearer_only.status, 403, "{}", bearer_only.body);
+        assert_eq!(bearer_only.status, 404, "{}", bearer_only.body);
+        assert_eq!(
+            bearer_only.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
 
         // A valid admin cookie does not rescue a presented bearer header.
         let req = Request {
@@ -8145,7 +8256,78 @@ mod tests {
             body: Vec::new(),
         };
         let both = block_on(handle(&h.ctx(), &req));
-        assert_eq!(both.status, 403, "{}", both.body);
+        assert_eq!(both.status, 404, "{}", both.body);
+    }
+
+    #[test]
+    fn admin_preflight_never_maps_the_admin_namespace() {
+        // Non-enumerability must hold on preflight too (TWO-70 A-AC1):
+        // every path in the `/v1/admin` namespace — real, dynamic,
+        // mistyped — answers OPTIONS with the plain 404, never the
+        // empty 204 a served path gets.
+        let h = harness();
+        for path in [
+            "/v1/admin",
+            "/v1/admin/",
+            "/v1/admin/settings",
+            "/v1/admin/settings/invite_default_expiry_days",
+            "/v1/admin/users/u_1/role",
+            "/v1/admin/no-such-thing",
+        ] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+            assert_eq!(
+                resp.body, r#"{"code":"not_found","message":"not found","retryable":false}"#,
+                "{path}"
+            );
+        }
+        // The lookalike outside the namespace is simply unserved.
+        let resp = h.call_full("OPTIONS", "/v1/adminx", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
+        // And a genuinely served session path still clears preflight:
+        // the exclusion is the namespace, not SessionOnly paths.
+        let resp = h.call_full("OPTIONS", "/v1/me", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn admin_write_store_recheck_refuses_a_demoted_actor() {
+        // The write transactions re-read the actor's role under their
+        // locks (production) / at write time (this fake): an actor
+        // demoted after passing the guard writes and audits nothing.
+        let h = harness();
+        let _admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        seed_user(&h, "member1", "member@example.com");
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let role = block_on(h.store.admin_set_user_role(
+            "admin1",
+            "member1",
+            "admin",
+            "198.51.100.9",
+            NOW,
+        ))
+        .unwrap();
+        assert_eq!(role, AdminWriteOutcome::ActorNotAdmin);
+        let setting = block_on(h.store.admin_set_app_setting(
+            "admin1",
+            "invite_default_expiry_days",
+            "14",
+            "198.51.100.9",
+            NOW,
+        ))
+        .unwrap();
+        assert_eq!(setting, AdminWriteOutcome::ActorNotAdmin);
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
     #[test]
@@ -8164,7 +8346,7 @@ mod tests {
             Some(member_cookie),
             Some(ORIGIN),
         );
-        assert_eq!(denied.status, 403, "{}", denied.body);
+        assert_eq!(denied.status, 404, "{}", denied.body);
         assert!(h.store.app_settings_rows.borrow().is_empty());
         assert!(h
             .store
@@ -8250,7 +8432,7 @@ mod tests {
 
         // Self-promotion by a member never reaches the store.
         let self_serve = put_role(&member_cookie, "member1", "admin");
-        assert_eq!(self_serve.status, 403, "{}", self_serve.body);
+        assert_eq!(self_serve.status, 404, "{}", self_serve.body);
         assert_eq!(
             block_on(h.store.user_role("member1")).unwrap().as_deref(),
             Some("member")
@@ -8305,7 +8487,7 @@ mod tests {
         let demoted = put_role(&admin_cookie, "member1", "member");
         assert_eq!(demoted.status, 200, "{}", demoted.body);
         let no_longer = h.call_full("GET", "/v1/admin/settings", None, Some(member_cookie), None);
-        assert_eq!(no_longer.status, 403, "{}", no_longer.body);
+        assert_eq!(no_longer.status, 404, "{}", no_longer.body);
     }
 
     #[test]

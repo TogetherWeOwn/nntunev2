@@ -122,8 +122,8 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
         extra.add(runner.PREFIX + "postgres_unlisted_surprise")
         self.assert_rejected_before_execution(extra)
 
-    def test_expected_inventory_has_eighteen_db_cases_and_four_config_cases(self):
-        self.assertEqual(len(runner.EXPECTED), 18)
+    def test_expected_inventory_has_twenty_db_cases_and_four_config_cases(self):
+        self.assertEqual(len(runner.EXPECTED), 20)
         self.assertIn(
             runner.PREFIX + "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
             runner.EXPECTED,
