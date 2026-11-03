@@ -189,8 +189,7 @@ fn assert_bounded(piece: &str, name: &str) {
     // the method runs must sit inside the bound operation, sharing the one
     // TOTAL_TIMEOUT_MS race with the statements.
     assert!(
-        call.args[0].contains("self.connect()")
-            || call.args[0].contains("self.connect_mirror()"),
+        call.args[0].contains("self.connect()") || call.args[0].contains("self.connect_mirror()"),
         "{name} must run its connect inside the bound operation"
     );
     assert_eq!(

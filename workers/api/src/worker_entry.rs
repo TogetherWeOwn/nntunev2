@@ -808,7 +808,9 @@ impl PgStore {
         let reached = std::cell::Cell::new("api.db.connect_failed.mirror_binding");
         let connected = with_deadline(
             async {
-                let hyperdrive = env.hyperdrive(MIRROR_HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+                let hyperdrive = env
+                    .hyperdrive(MIRROR_HYPERDRIVE_BINDING)
+                    .map_err(|_| StoreError)?;
                 reached.set("api.db.connect_failed.mirror_socket");
                 let socket = worker::Socket::builder()
                     .secure_transport(worker::SecureTransport::StartTls)
@@ -3547,9 +3549,8 @@ impl Store for PgStore {
                 release_mbids.sort();
                 release_mbids.dedup();
                 let mirror = self.connect_mirror().await?;
-                let statement_failed = || {
-                    self.statement_failed("api.db.statement_failed.catalogue_library")
-                };
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_library");
                 let rows = mirror
                     .query_typed(
                         crate::catalogue::library_recordings_statement(),
@@ -3627,9 +3628,8 @@ impl Store for PgStore {
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
                 let mirror = self.connect_mirror().await?;
-                let statement_failed = || {
-                    self.statement_failed("api.db.statement_failed.catalogue_artists")
-                };
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_artists");
                 let rows = mirror
                     .query_typed(
                         crate::catalogue::artists_list_statement(),
@@ -3672,9 +3672,8 @@ impl Store for PgStore {
                     .collect::<Result<_, _>>()?;
                 let member_releases = crate::catalogue::member_release_mbids(&member);
                 let mirror = self.connect_mirror().await?;
-                let statement_failed = || {
-                    self.statement_failed("api.db.statement_failed.catalogue_releases")
-                };
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_releases");
                 let rows = mirror
                     .query_typed(
                         crate::catalogue::releases_list_statement(),
@@ -3720,9 +3719,8 @@ impl Store for PgStore {
                 let (member_releases, member_recordings, member_pairs) =
                     crate::catalogue::member_pair_arrays(&member);
                 let mirror = self.connect_mirror().await?;
-                let statement_failed = || {
-                    self.statement_failed("api.db.statement_failed.catalogue_tracks")
-                };
+                let statement_failed =
+                    || self.statement_failed("api.db.statement_failed.catalogue_tracks");
                 let rows = mirror
                     .query_typed(
                         crate::catalogue::tracks_list_statement(),

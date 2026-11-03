@@ -725,12 +725,7 @@ mod surface_acceptance {
         }
         // Absent-bearer dispatch: session serves, anonymous 401s.
         let (h, cookie, _bearer, _id) = bearer_harness();
-        for path in [
-            "/v1/library",
-            "/v1/artists",
-            "/v1/releases",
-            "/v1/tracks",
-        ] {
+        for path in ["/v1/library", "/v1/artists", "/v1/releases", "/v1/tracks"] {
             let served = request(&h, "GET", path, None, Some(&cookie));
             assert_eq!(served.status, 200, "GET {path}: session serves");
             assert_eq!(served.body, "[]", "GET {path}: fixture store holds no rows");
@@ -816,14 +811,11 @@ mod surface_acceptance {
             .expect("login sets a session pair");
         let via_cookie = request(&h, "GET", ALIAS, None, Some(&cookie));
         assert_eq!(via_cookie.status, 200, "GET {ALIAS}: cookie serves");
-        let via_bearer = request(
-            &h,
-            "GET",
-            ALIAS,
-            Some(&format!("Bearer {session}")),
-            None,
+        let via_bearer = request(&h, "GET", ALIAS, Some(&format!("Bearer {session}")), None);
+        assert_eq!(
+            via_bearer.status, 200,
+            "GET {ALIAS}: session-as-Bearer serves"
         );
-        assert_eq!(via_bearer.status, 200, "GET {ALIAS}: session-as-Bearer serves");
         assert_eq!(
             via_bearer.body, via_cookie.body,
             "GET {ALIAS}: one shape on both session transports"

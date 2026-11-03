@@ -448,8 +448,7 @@ pub fn assemble_library_rows(
         .iter()
         .filter_map(|hit| {
             enrichment_key(&hit.release_mbid).and_then(|release| {
-                enrichment_key(&hit.recording_mbid)
-                    .map(|recording| ((release, recording), hit))
+                enrichment_key(&hit.recording_mbid).map(|recording| ((release, recording), hit))
             })
         })
         .collect();
@@ -1033,9 +1032,7 @@ mod tests {
         // `release_mbid` column would sort matched rows by release text,
         // not recency).
         assert!(statement.contains("(l.release_mbid IS NULL) AS matched_last"));
-        assert!(
-            statement.contains("ORDER BY matched_last ASC, job_id DESC, recording_ord ASC")
-        );
+        assert!(statement.contains("ORDER BY matched_last ASC, job_id DESC, recording_ord ASC"));
         // Unnest preserves album order with ordinality.
         assert!(statement.contains("WITH ORDINALITY"));
     }
@@ -1136,7 +1133,10 @@ mod tests {
                 release_mbid: "not-a-uuid".to_string(),
             },
         ];
-        assert_eq!(member_release_mbids(&releases), vec![GOOD_RELEASE.to_string()]);
+        assert_eq!(
+            member_release_mbids(&releases),
+            vec![GOOD_RELEASE.to_string()]
+        );
         let rows = vec![
             MembershipTrackPairRow {
                 release_mbid: GOOD_RELEASE.to_string(),
@@ -1158,7 +1158,10 @@ mod tests {
         let (releases, recordings, pairs) = member_pair_arrays(&rows);
         assert_eq!(releases, vec![GOOD_RELEASE.to_string()]);
         assert_eq!(recordings, vec![GOOD_MBID.to_string()]);
-        assert_eq!(pairs, vec![(GOOD_RELEASE.to_string(), GOOD_MBID.to_string())]);
+        assert_eq!(
+            pairs,
+            vec![(GOOD_RELEASE.to_string(), GOOD_MBID.to_string())]
+        );
         let member = TrackDbRow {
             release_mbid: GOOD_RELEASE.to_ascii_uppercase(),
             recording_mbid: GOOD_MBID_UPPER.to_string(),
@@ -1210,9 +1213,19 @@ mod tests {
             // Fully matched row.
             page_row("job-1", Some(GOOD_RELEASE), Some(GOOD_MBID), 1),
             // Uppercase stored MBIDs (uuid comparison is case-insensitive).
-            page_row("job-2", Some(&GOOD_RELEASE.to_ascii_uppercase()), Some(GOOD_MBID_UPPER), 1),
+            page_row(
+                "job-2",
+                Some(&GOOD_RELEASE.to_ascii_uppercase()),
+                Some(GOOD_MBID_UPPER),
+                1,
+            ),
             // Unknown-but-well-formed MBIDs: every enrichment degrades.
-            page_row("job-3", Some("bbbbbbbb-1111-2222-3333-444444444444"), Some("99999999-1111-2222-3333-444444444444"), 1),
+            page_row(
+                "job-3",
+                Some("bbbbbbbb-1111-2222-3333-444444444444"),
+                Some("99999999-1111-2222-3333-444444444444"),
+                1,
+            ),
             // Poisoned stored MBIDs: degrade, never error, never match.
             page_row("job-4", Some("not-a-uuid"), Some("also-not-a-uuid"), 1),
             // Unmatched upload: NULL recording, job id identity.
@@ -1284,10 +1297,7 @@ mod tests {
         assert_eq!(unknown.release_title, None);
         // Poisoned stored MBIDs degrade too, and match nothing.
         let poisoned = &rows[3];
-        assert_eq!(
-            poisoned.recording_mbid.as_deref(),
-            Some("also-not-a-uuid")
-        );
+        assert_eq!(poisoned.recording_mbid.as_deref(), Some("also-not-a-uuid"));
         assert_eq!(poisoned.recording_title, None);
         assert_eq!(poisoned.release_title, None);
         // Unmatched upload: NULL recording, job-id identity downstream.

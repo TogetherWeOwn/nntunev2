@@ -3953,10 +3953,7 @@ where
 
 /// Shared store read plus serialization for the two library routes: the
 /// caller arrives authenticated, this only assembles the entries.
-async fn catalogue_library_entries<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    user_id: &str,
-) -> Response
+async fn catalogue_library_entries<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, user_id: &str) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -8968,8 +8965,7 @@ mod tests {
                 return Err(StoreError);
             }
             let pairs = self.fake_member_pairs(user_id);
-            let owned: std::collections::HashSet<&(String, String)> =
-                pairs.iter().collect();
+            let owned: std::collections::HashSet<&(String, String)> = pairs.iter().collect();
             Ok(self
                 .catalogue_tracks
                 .borrow()
@@ -22703,10 +22699,15 @@ mod tests {
             .map(|(_, value)| value)
             .expect("login sets a session pair");
         // Session-as-Bearer with no cookie serves the identical entries.
-        let via_bearer =
-            h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
+        let via_bearer = h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
         assert_eq!(via_bearer.status, 200, "{}", via_bearer.body);
-        let via_cookie = h.call_full("GET", "/api/library", None, Some(cookie.clone()), Some(ORIGIN));
+        let via_cookie = h.call_full(
+            "GET",
+            "/api/library",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
         assert_eq!(via_cookie.status, 200, "{}", via_cookie.body);
         assert_eq!(
             via_bearer.body, via_cookie.body,
@@ -22925,16 +22926,29 @@ mod tests {
                 resp.body
             );
         }
-        let forbidden =
-            h.call_full("GET", &format!("/v1/releases/{OTHER_RELEASE}"), None, Some(cookie.clone()), Some(ORIGIN));
+        let forbidden = h.call_full(
+            "GET",
+            &format!("/v1/releases/{OTHER_RELEASE}"),
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
         assert_eq!(forbidden.status, 404, "{}", forbidden.body);
         for path in ["/v1/artists", "/v1/releases", "/v1/tracks"] {
             let resp = h.call_full("GET", path, None, Some(cookie_b.clone()), Some(ORIGIN));
             assert_eq!(resp.status, 200, "{path}: {}", resp.body);
-            assert_eq!(resp.body, "[]", "{path}: a caller with no ledger sees no rows");
+            assert_eq!(
+                resp.body, "[]",
+                "{path}: a caller with no ledger sees no rows"
+            );
         }
-        let stranger =
-            h.call_full("GET", &format!("/v1/releases/{CAT_RELEASE}"), None, Some(cookie_b), Some(ORIGIN));
+        let stranger = h.call_full(
+            "GET",
+            &format!("/v1/releases/{CAT_RELEASE}"),
+            None,
+            Some(cookie_b),
+            Some(ORIGIN),
+        );
         assert_eq!(stranger.status, 404, "{}", stranger.body);
     }
 
