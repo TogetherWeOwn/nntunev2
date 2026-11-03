@@ -101,22 +101,35 @@ describe('billing play-gate surfaces (spec §4/§3.3/§3.4)', () => {
 		expect(model?.headline).toBe('Subscribe to start listening');
 	});
 
-	it('at-cap names the reset instant from x-plan-reset and keeps the upgrade path', () => {
-		const model = toPaywallModel({
-			status: 402,
-			headers: new Headers({ 'x-plan-reset': '2026-12-01T00:00:00Z' }),
-			body: { code: 'plan_limit_exceeded' }
-		});
-		expect(model?.code).toBe('plan_limit_exceeded');
-		expect(model?.ctaHref).toBe('/pricing');
-		expect(model?.detail).toContain('reset 1 Dec, 00:00 UTC');
-		expect(model?.detail).toContain('track already playing finishes');
+	it('at-cap renders the real wire: stream_hours_month dimension + next-utc-month hint', () => {
+		// Server `Denial::headers` sends `x-plan-limit: stream_hours_month=100`
+		// and the static hint `x-plan-reset: next-utc-month` (never a
+		// timestamp); mid-November, the reset instant is 1 Dec 00:00 UTC.
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-11-15T12:00:00Z'));
+		try {
+			const model = toPaywallModel({
+				status: 402,
+				headers: new Headers({
+					'x-plan-limit': 'stream_hours_month=100',
+					'x-plan-reset': 'next-utc-month'
+				}),
+				body: { code: 'plan_limit_exceeded' }
+			});
+			expect(model?.code).toBe('plan_limit_exceeded');
+			expect(model?.ctaHref).toBe('/pricing');
+			expect(model?.headline).toBe("You've used all your listening hours");
+			expect(model?.detail).toContain('reset 1 Dec, 00:00 UTC');
+			expect(model?.detail).toContain('track already playing finishes');
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it('at-cap without a reset header stays honest and finite', () => {
 		const model = toPaywallModel({
 			status: 402,
-			headers: new Headers(),
+			headers: new Headers({ 'x-plan-limit': 'stream_hours_month=100' }),
 			body: { code: 'plan_limit_exceeded' }
 		});
 		expect(model?.detail).toBe(
@@ -124,10 +137,34 @@ describe('billing play-gate surfaces (spec §4/§3.3/§3.4)', () => {
 		);
 	});
 
+	it('the daily ingest refusal (ingest_today=5) gets generic copy, never listening-hours wording', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers({
+				'x-plan-limit': 'ingest_today=5',
+				'x-plan-reset': 'next-utc-day'
+			}),
+			body: { code: 'plan_limit_exceeded' }
+		});
+		expect(model?.code).toBe('plan_limit_exceeded');
+		expect(model?.headline).toBe("You've reached your plan limit");
+		expect(model?.detail).not.toContain('listening hours');
+		expect(model?.detail).not.toContain('playback pauses');
+	});
+
+	it('a coded refusal with no dimension header also stays generic', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'plan_limit_exceeded' }
+		});
+		expect(model?.headline).toBe("You've reached your plan limit");
+	});
+
 	it('concurrent-stream 429 uses the two-level other-device truth, no instant-stop promise', () => {
 		const model = toPaywallModel({
 			status: 429,
-			headers: new Headers({ 'x-plan-limit': 'concurrent_streams' }),
+			headers: new Headers({ 'x-plan-limit': 'concurrent_streams=1' }),
 			body: { code: 'rate_limited' }
 		});
 		expect(model?.kind).toBe('retryable');

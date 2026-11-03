@@ -107,6 +107,10 @@ describe('billing loader with no subscription (never subscribed)', () => {
 		expect(body).toMatch(/couldn't confirm an active plan/i);
 		expect(body).toContain('Current plan: No plan');
 		expect(body).toContain('Compare all plans');
+		// The purchase route is the primary action, not a portal button for
+		// a billing record that does not exist yet.
+		expect(body).toContain('See plans');
+		expect(body).not.toContain('Manage billing');
 		expect(body).not.toContain('Upgrade to');
 		expect(body).not.toContain('Retry');
 		// Usage is loaded but never scored against an unconfirmed plan.
@@ -226,6 +230,28 @@ describe('billing loader controls around server state', () => {
 		expect(data.usageStatus).not.toBeNull();
 		expect(data.usageStatus?.upgradeTo).toBeNull();
 		expect(data.loadError).toMatch(/payment failed/i);
+		expect(data.loadError).toMatch(/grace period/i);
+		expectReadOnlyBillingCalls(calls);
+	});
+
+	it('paid-coverage past_due (graceUntil null) gets payment copy that names no grace period', async () => {
+		const subscription = {
+			state: 'active',
+			planId: 'pro',
+			status: 'past_due',
+			currentPeriodEnd: futureIso(),
+			graceUntil: null,
+			cancelAtPeriodEnd: false
+		};
+		const calls: RecordedCall[] = [];
+		const data = await loadPage(loaderFetch(subscription, calls));
+
+		expect(data.planUnknown).toBe(false);
+		expect(data.planId).toBe('pro');
+		expect(data.manageBillingOnly).toBe(true);
+		expect(data.loadError).toMatch(/payment failed/i);
+		expect(data.loadError).toMatch(/paid period/i);
+		expect(data.loadError).not.toMatch(/grace/i);
 		expectReadOnlyBillingCalls(calls);
 	});
 

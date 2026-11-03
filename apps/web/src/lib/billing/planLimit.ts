@@ -15,14 +15,22 @@ import { formatResetInstant } from './usage';
  * - 402 `subscription_required` (spec §4): playback-only gate — browsing,
  *   search and library stay usable. `reason: never_subscribed` routes to
  *   `/pricing`; `reason: lapsed` routes to `/account/billing` (portal).
- * - 402 `plan_limit_exceeded` (spec §3.3): the monthly cap surface, with
- *   the `x-plan-reset` instant when present and the upgrade path.
+ * - 402 `plan_limit_exceeded` (spec §3.3): the monthly cap surface, but
+ *   only when `x-plan-limit` names the `stream_hours_month` dimension —
+ *   the same code covers other caps (the daily ingest guard sends
+ *   `ingest_today=5`), and those get the generic plan-limit copy rather
+ *   than exhausted-listening-hours wording. `x-plan-reset` carries the
+ *   server's static `next-utc-month` hint, rendered as the next UTC
+ *   month start.
  * - 429 -> retryable: the same paywall, plus a retry countdown parsed from
  *   the `Retry-After` header (delta-seconds or HTTP-date). The user can wait
  *   out the countdown or upgrade immediately. `x-plan-limit:
- *   concurrent_streams` names the other-device surface (spec §3.4's
+ *   concurrent_streams=<cap>` names the other-device surface (spec §3.4's
  *   two-level truth: the other device pauses itself within ~15 s, its
  *   next track is refused, already-delivered audio is not recalled).
+ *
+ * The wire shape of the limit headers is `x-plan-limit: <dimension>=<cap>`
+ * (server `Denial::headers`); only the dimension before `=` is matched.
  *
  * Analytics: when the paywall is displayed, `trackPaywallShown` fires the
  * event {@link PAYWALL_SHOWN_EVENT} (`usage_limit_paywall_shown`) exactly
@@ -132,12 +140,31 @@ function bodyField(body: unknown, key: string): string | null {
 }
 
 /**
- * At-cap detail (spec §3.3): new playback pauses until the reset instant
- * from `x-plan-reset` (the next UTC month start) — rendered via the §3.2
- * reset formatter — or until an upgrade; a track already playing finishes.
+ * Limit dimension from `x-plan-limit: <dimension>=<cap>` (the server's
+ * `Denial::headers` shape). Bare dimension names are tolerated; an absent
+ * or blank header yields null, which never picks a dimensioned surface.
  */
-function atCapDetail(headers: Headers): string {
-	const reset = formatResetInstant(headers.get('x-plan-reset'));
+function limitDimension(headers: Headers): string | null {
+	const raw = headers.get('x-plan-limit');
+	if (raw === null) return null;
+	const dimension = raw.split('=')[0]?.trim();
+	return dimension ? dimension : null;
+}
+
+/**
+ * At-cap detail (spec §3.3): new playback pauses until the reset instant
+ * or an upgrade; a track already playing finishes. `x-plan-reset` is the
+ * server's static `next-utc-month` hint (never a timestamp to parse), so
+ * the instant rendered is the next UTC month start computed from `now`
+ * via the §3.2 reset formatter; a literal date value still renders as-is.
+ */
+function atCapDetail(headers: Headers, now: Date = new Date()): string {
+	const hint = headers.get('x-plan-reset')?.trim();
+	const resetsAt =
+		hint === 'next-utc-month'
+			? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString()
+			: hint;
+	const reset = formatResetInstant(resetsAt);
 	const resetClause = reset ? ` Your hours ${reset.replace(/^Resets/, 'reset')}.` : '';
 	return (
 		`New playback pauses until your hours reset or you upgrade — ` +
@@ -229,8 +256,11 @@ export function formatCountdown(totalSeconds: number): string {
  * The registered billing codes pick the surface (spec §4/§3.3/§3.4):
  * `subscription_required` distinguishes never-subscribed (→ pricing) from
  * lapsed (→ billing page / portal); `plan_limit_exceeded` is the at-cap
- * surface; a 429 naming `concurrent_streams` is the other-device
- * surface. Uncoded limit responses keep the generic copy.
+ * surface only for the `stream_hours_month` dimension (the same code
+ * covers the daily ingest cap); a 429 naming `concurrent_streams` is the
+ * other-device surface. Every other limit response — other dimensions,
+ * a missing dimension, uncoded bodies — keeps the generic copy, so a
+ * non-playback refusal never claims listening hours are exhausted.
  */
 export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 	if (res.status !== 402 && res.status !== 429) return null;
@@ -269,7 +299,9 @@ export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 		};
 	}
 
-	if (code === 'plan_limit_exceeded') {
+	const dimension = limitDimension(res.headers);
+
+	if (code === 'plan_limit_exceeded' && dimension === 'stream_hours_month') {
 		return {
 			...base,
 			ctaHref: PRICING_HREF,
@@ -278,7 +310,7 @@ export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 		};
 	}
 
-	if (!terminal && res.headers.get('x-plan-limit') === 'concurrent_streams') {
+	if (!terminal && dimension === 'concurrent_streams') {
 		return {
 			...base,
 			ctaHref: PRICING_HREF,

@@ -25,6 +25,20 @@ export interface Plan {
 	blurb: string;
 }
 
+/**
+ * Max blurb from the live cap, never a second hard-coded figure: the
+ * static row and `planFromDTO` share this, so a plans-table change can
+ * never leave the blurb quoting hours the quota cell contradicts. The
+ * "unlimited" wording (spec §2.1) is allowed only with the figure
+ * present, and only while the figure is a physical month ceiling
+ * (31 days × 24 h = 744) — below that the blurb states the hours plainly.
+ */
+function maxBlurb(streamHoursMonth: number): string {
+	return streamHoursMonth >= 744
+		? `Unlimited listening — ${streamHoursMonth} hours a month, every hour there is.`
+		: `${streamHoursMonth} hours a month of listening.`;
+}
+
 export const PLANS: Plan[] = [
 	{
 		id: 'free',
@@ -60,10 +74,9 @@ export const PLANS: Plan[] = [
 		streamHoursMonth: 750,
 		maxConcurrentStreams: 1,
 		selectable: true,
-		// "Unlimited" wording is allowed only with the 750 h figure present
-		// (spec §2.1); it is part of this blurb and of the pricing table's
-		// hours column wherever the blurb renders.
-		blurb: 'Unlimited listening — 750 hours a month, every hour there is.'
+		// `maxBlurb` keeps the "unlimited" wording (spec §2.1) next to the
+		// live figure; the pricing table's hours column shows it too.
+		blurb: maxBlurb(750)
 	}
 ];
 
@@ -101,7 +114,10 @@ export function planFromDTO(dto: {
 		priceCents: dto.priceCents,
 		streamHoursMonth: dto.streamHoursMonth,
 		maxConcurrentStreams: dto.maxConcurrentStreams,
-		selectable: dto.selectable
+		selectable: dto.selectable,
+		// Quota-dependent copy regenerates from the hydrated cap so the
+		// blurb can never quote a superseded figure next to the new quota.
+		blurb: dto.id === 'max' ? maxBlurb(dto.streamHoursMonth) : base.blurb
 	};
 }
 

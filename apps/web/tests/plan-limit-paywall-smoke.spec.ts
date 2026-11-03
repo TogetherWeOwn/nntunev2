@@ -65,7 +65,11 @@ test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => 
 		checkoutRequests += 1;
 		return route.fulfill({
 			status: 402,
-			headers: { 'content-type': 'application/json' },
+			headers: {
+				'content-type': 'application/json',
+				'x-plan-limit': 'stream_hours_month=100',
+				'x-plan-reset': 'next-utc-month'
+			},
 			body: JSON.stringify({ error: 'plan_limit_exceeded' })
 		});
 	});
@@ -75,7 +79,7 @@ test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
-	// A coded plan_limit_exceeded is the at-cap surface (spec §3.3).
+	// The stream_hours_month dimension names the at-cap surface (spec §3.3).
 	await expect(dialog.getByRole('heading')).toHaveText("You've used all your listening hours");
 	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
 	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);

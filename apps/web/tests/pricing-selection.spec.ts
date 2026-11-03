@@ -390,6 +390,10 @@ test('401 selection hands off to signup with the chosen plan', async ({ page }) 
 test('402 selection shows the paywall, no inline alert, and restores choices', async ({ page }) => {
 	const stub = await stubCheckout(page, {
 		status: 402,
+		headers: {
+			'x-plan-limit': 'stream_hours_month=100',
+			'x-plan-reset': 'next-utc-month'
+		},
 		body: { error: 'plan_limit_exceeded' }
 	});
 
@@ -398,7 +402,7 @@ test('402 selection shows the paywall, no inline alert, and restores choices', a
 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
-	// A coded plan_limit_exceeded is the at-cap surface (spec §3.3).
+	// The stream_hours_month dimension names the at-cap surface (spec §3.3).
 	await expect(dialog.getByRole('heading')).toHaveText("You've used all your listening hours");
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	expect(stub.requests).toEqual([

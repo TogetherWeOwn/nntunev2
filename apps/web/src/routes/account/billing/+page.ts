@@ -122,12 +122,17 @@ export const load: PageLoad = async ({ fetch }) => {
 					: `Subscription is ${subscription.status ?? 'lapsed'} — manage billing to resolve; playback resumes once your subscription is active again.`
 			);
 		} else if (manageBillingOnly && subscription)
-			// Only reachable for in-grace past_due: every other lapsed state
-			// is planUnknown, and only past_due has a grace window. The plan
-			// is confirmed so no other notice renders, yet the failed payment
-			// still needs attention before the window closes.
+			// Reachable for confirmed `past_due` (every other lapsed state is
+			// planUnknown): the plan is confirmed so no other notice renders,
+			// yet the failed payment still needs attention. `past_due` covers
+			// two server states, and only one is a grace period — with
+			// `graceUntil` set, access runs on renewed grace; without it the
+			// subscription is still inside already-paid coverage and no grace
+			// window has started, so the copy must not name one.
 			notices.push(
-				'Your last payment failed — manage billing to resolve; your plan stays active during the grace period.'
+				subscription.graceUntil
+					? 'Your last payment failed — manage billing to resolve; your plan stays active during the grace period.'
+					: 'Your last payment failed — manage billing to resolve; your plan stays active through the end of your paid period.'
 			);
 		if (usageFailed) notices.push('Could not load usage.');
 	}

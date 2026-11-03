@@ -69,6 +69,30 @@ describe('planFromDTO', () => {
 		expect(merged?.blurb).toBe(getPlan('plus')?.blurb);
 	});
 
+	it('regenerates the Max blurb from the hydrated cap, never a stale figure', () => {
+		const at700 = planFromDTO({
+			id: 'max',
+			priceCents: 2500,
+			streamHoursMonth: 700,
+			maxConcurrentStreams: 1,
+			selectable: true
+		});
+		expect(at700?.blurb).toContain('700');
+		expect(at700?.blurb).not.toContain('750');
+		// Below the physical month ceiling the unlimited wording goes too.
+		expect(at700?.blurb).not.toContain('Unlimited');
+
+		const at800 = planFromDTO({
+			id: 'max',
+			priceCents: 2500,
+			streamHoursMonth: 800,
+			maxConcurrentStreams: 1,
+			selectable: true
+		});
+		expect(at800?.blurb).toContain('Unlimited');
+		expect(at800?.blurb).toContain('800');
+	});
+
 	it('returns undefined for a plan id the client has no copy for', () => {
 		expect(
 			planFromDTO({

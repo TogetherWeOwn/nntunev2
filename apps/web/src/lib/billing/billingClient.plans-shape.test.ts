@@ -6,14 +6,16 @@ import { BillingApiError, fetchPlans, type PlanDTO } from './billingClient';
  * payloads must be validated at the client boundary before any caller
  * renders pricing from them.
  *
- * Contract under test (envelope only; per-plan field validation is a
- * separate slice and deliberately not pinned here):
+ * Contract under test (envelope + per-row display fields):
  * - The body is an object whose `plans` field is an array.
+ * - Every row carries a non-empty string `id`, finite non-negative
+ *   `priceCents`/`streamHoursMonth`/`maxConcurrentStreams`, and a
+ *   boolean `selectable`.
  * - A valid envelope resolves with that array unchanged, including an
  *   empty array; unknown extra fields are allowed.
  * - Anything else rejects (so loaders take their existing recoverable
- *   failure path) instead of resolving `undefined`, a string, or any
- *   other non-array value the pricing page would try to render.
+ *   failure path) instead of resolving `undefined`, a string, or a
+ *   malformed row the pricing page would render as `$NaN/mo`.
  * - HTTP error semantics are unchanged.
  */
 
@@ -106,6 +108,25 @@ describe('fetchPlans rejects malformed successful envelopes', () => {
 
 	it('rejects an envelope whose plans live under a different key', async () => {
 		await expectMalformedRejection(jsonOk({ items: [PLUS] }));
+	});
+
+	it.each([
+		['a row missing its price', { id: 'plus', selectable: true }],
+		['a row with an empty id', { ...PLUS, id: '' }],
+		['a row with a non-string id', { ...PLUS, id: 7 }],
+		['a row with a negative price', { ...PLUS, priceCents: -1 }],
+		['a row with a string price', { ...PLUS, priceCents: '800' }],
+		['a row with NaN hours', { ...PLUS, streamHoursMonth: Number.NaN }],
+		['a row missing maxConcurrentStreams', { id: 'plus', priceCents: 800, streamHoursMonth: 100, selectable: true }],
+		['a row with a non-boolean selectable', { ...PLUS, selectable: 'yes' }],
+		['a null row', null],
+		['a string row', 'plus']
+	])('rejects %s instead of hydrating it over the fallback', async (_label, row) => {
+		await expectMalformedRejection(jsonOk({ plans: [row] }));
+	});
+
+	it('rejects the whole payload when one row among good ones is malformed', async () => {
+		await expectMalformedRejection(jsonOk({ plans: [PLUS, { id: 'pro', selectable: true }] }));
 	});
 });
 

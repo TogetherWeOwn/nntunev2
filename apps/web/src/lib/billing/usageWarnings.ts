@@ -3,8 +3,12 @@
  *
  * Shown-state lives client-side in `localStorage`, keyed
  * `period + threshold` — no server table, no email. A new period
- * re-arms every threshold naturally because the key changes. Storage
- * is best-effort: when it is unavailable (SSR, privacy mode, quota),
+ * re-arms every threshold naturally because the key changes. The keys
+ * carry no account identity, so the auth boundary clears them
+ * (`clearUsageWarnings`, called from `invalidateLibraryCache` on every
+ * sign-in/sign-out): one account's shown-warning can never suppress
+ * another account's warning on a shared browser. Storage is
+ * best-effort: when it is unavailable (SSR, privacy mode, quota),
  * warnings simply do not fire — meter display never depends on this
  * module, and a missing warning is a copy nicety, not an enforcement
  * gap (the server refuses at the cap regardless).
@@ -23,6 +27,13 @@ function keyFor(period: string, threshold: WarningThreshold): string {
 export interface WarningStorage {
 	getItem(key: string): string | null;
 	setItem(key: string, value: string): void;
+}
+
+/** Enumerable storage for the auth-boundary clear (real `localStorage`). */
+export interface ClearableWarningStorage extends WarningStorage {
+	removeItem(key: string): void;
+	key(index: number): string | null;
+	readonly length: number;
 }
 
 function defaultStorage(): WarningStorage | null {
@@ -57,6 +68,28 @@ export function pendingUsageWarnings(
 		}
 	}
 	return pending;
+}
+
+/**
+ * Drop every shown-warning flag, all periods and thresholds. Called at
+ * the auth boundary (sign-in/sign-out via `invalidateLibraryCache`) so a
+ * shared browser never carries one account's warning history into the
+ * next account. Best-effort and never throws.
+ */
+export function clearUsageWarnings(
+	storage: ClearableWarningStorage | null = defaultStorage() as ClearableWarningStorage | null
+): void {
+	if (!storage) return;
+	try {
+		const doomed: string[] = [];
+		for (let i = 0; i < storage.length; i++) {
+			const key = storage.key(i);
+			if (key !== null && key.startsWith(`${KEY_PREFIX}:`)) doomed.push(key);
+		}
+		for (const key of doomed) storage.removeItem(key);
+	} catch {
+		/* best-effort; see module docs */
+	}
 }
 
 /** Record thresholds as shown for this period (call after displaying). */

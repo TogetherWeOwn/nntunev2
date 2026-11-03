@@ -217,15 +217,30 @@ function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 
 /**
  * Successful GET /v1/plans DTO guard. The body must be an object whose
- * `plans` field is an array (possibly empty). Unknown extra envelope
- * fields are allowed and entries pass through verbatim; per-plan field
- * validation is out of scope. Anything else rejects into the existing
- * recoverable loader path instead of reaching pricing rendering as
- * `undefined`, a string, or any other non-array value.
+ * `plans` field is an array (possibly empty), and every row must carry
+ * the full display shape: a non-empty string `id`, finite non-negative
+ * `priceCents`/`streamHoursMonth`/`maxConcurrentStreams`, and a boolean
+ * `selectable`. Unknown extra fields (envelope or row) are allowed.
+ * Anything else — including one malformed row among good ones — rejects
+ * the whole payload into the existing recoverable loader path, so a
+ * partial row can never hydrate over the pricing fallback and render
+ * `$NaN/mo` in place of every plan.
  */
+function isValidPlanRow(row: unknown): row is PlanDTO {
+	if (typeof row !== 'object' || row === null || Array.isArray(row)) return false;
+	const record = row as Record<string, unknown>;
+	if (typeof record.id !== 'string' || record.id.length === 0) return false;
+	if (!isFiniteNonNegativeNumber(record.priceCents)) return false;
+	if (!isFiniteNonNegativeNumber(record.streamHoursMonth)) return false;
+	if (!isFiniteNonNegativeNumber(record.maxConcurrentStreams)) return false;
+	if (typeof record.selectable !== 'boolean') return false;
+	return true;
+}
+
 function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
-	return Array.isArray((data as Record<string, unknown>).plans);
+	const plans = (data as Record<string, unknown>).plans;
+	return Array.isArray(plans) && plans.every(isValidPlanRow);
 }
 
 /** One budget for dispatch, headers and JSON consumption, including error bodies. */

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+	clearUsageWarnings,
 	markUsageWarningsShown,
 	pendingUsageWarnings,
+	type ClearableWarningStorage,
 	type WarningStorage
 } from './usageWarnings';
 
@@ -11,6 +13,23 @@ function memoryStorage(initial: Record<string, string> = {}): WarningStorage {
 		getItem: (key) => map.get(key) ?? null,
 		setItem: (key, value) => {
 			map.set(key, value);
+		}
+	};
+}
+
+function clearableStorage(initial: Record<string, string> = {}): ClearableWarningStorage {
+	const map = new Map(Object.entries(initial));
+	return {
+		getItem: (key) => map.get(key) ?? null,
+		setItem: (key, value) => {
+			map.set(key, value);
+		},
+		removeItem: (key) => {
+			map.delete(key);
+		},
+		key: (index) => [...map.keys()][index] ?? null,
+		get length() {
+			return map.size;
 		}
 	};
 }
@@ -49,6 +68,20 @@ describe('pendingUsageWarnings', () => {
 	it('never fires without storage or a period', () => {
 		expect(pendingUsageWarnings('2026-11', 0.99, null)).toEqual([]);
 		expect(pendingUsageWarnings('', 0.99, memoryStorage())).toEqual([]);
+	});
+
+	it('clearUsageWarnings re-arms warnings for the next account on a shared browser', () => {
+		const storage = clearableStorage({ 'unrelated:key': 'keep-me' });
+		markUsageWarningsShown('2026-11', [80, 95], storage);
+		markUsageWarningsShown('2026-10', [80], storage);
+		expect(pendingUsageWarnings('2026-11', 0.99, storage)).toEqual([]);
+
+		clearUsageWarnings(storage);
+
+		expect(pendingUsageWarnings('2026-11', 0.99, storage)).toEqual([80, 95]);
+		expect(pendingUsageWarnings('2026-10', 0.85, storage)).toEqual([80]);
+		expect(storage.getItem('unrelated:key')).toBe('keep-me');
+		expect(() => clearUsageWarnings(null)).not.toThrow();
 	});
 
 	it('treats throwing storage as already shown (never spams)', () => {
