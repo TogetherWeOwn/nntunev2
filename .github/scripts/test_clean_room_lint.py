@@ -118,6 +118,30 @@ class TestBrand(unittest.TestCase):
         )
         self.assertIn("competitor-colour", rules_for("rgb(0x1e,0xd7,0x60)"))
 
+    def test_split_byte_literals_flag_across_lines(self):
+        # A formatter that puts one tuple byte per line must not hide the
+        # colour: the split-byte scan is multiline-aware and reports the
+        # line of the first byte.
+        hits = find_violations("Color(\n  0x1D,\n  0xB9,\n  0x54,\n)")
+        self.assertEqual([(2, "competitor-colour")], hits)
+        self.assertIn(
+            "competitor-colour",
+            rules_for("rgb(0x1e,\r\n0xd7,\r\n0x60)"),
+        )
+
+    def test_non_tuple_bytes_across_lines_are_clean(self):
+        # Only an adjacent tuple matches; other tokens between the bytes
+        # break the colour even when they sit on neighbouring lines.
+        self.assertEqual(
+            [], find_violations("bytes 0x1D,\nfoo,\n0xB9,\n0x54")
+        )
+
+    def test_single_line_split_literal_reports_once(self):
+        self.assertEqual(
+            [(1, "competitor-colour")],
+            find_violations("rgb(0x1e,0xd7,0x60)"),
+        )
+
 
 class TestEvidencePath(unittest.TestCase):
     def test_flags_host_research_path(self):

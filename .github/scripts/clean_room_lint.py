@@ -31,8 +31,8 @@ itself carry the contiguous shapes it bans:
     (`#1D` + `B954`, `#1E` + `D760`) or 8 digits with any alpha suffix
     (`#RRGGBBAA`; `AARRGGBB` forms match too, via the opaque-alpha
     suffix check), plus split literals (`0x1D, 0xB9, 0x54` in any
-    spacing/case). A longer hex run that merely contains the digits
-    is not the colour and does not match.
+    spacing/case, including one byte per line). A longer hex run that
+    merely contains the digits is not the colour and does not match.
   host-evidence-path
     An absolute host research path (`/home/<user>/research/...`) or a
     `research/<evidence-dir>` fragment. Matched by shape so the real
@@ -119,7 +119,9 @@ _COLOUR = re.compile(
     re.IGNORECASE,
 )
 # Split literals: three adjacent hex bytes spelling the colour
-# (0x1D, 0xB9, 0x54 in any spacing/case).
+# (0x1D, 0xB9, 0x54 in any spacing/case). `\s` spans newlines, so a
+# tuple formatted one byte per line matches too when this pattern is
+# run over the whole text (see find_violations).
 _GREENS = (("1D", "B9", "54"), ("1E", "D7", "60"))
 _COLOUR_SPLIT = re.compile(
     "|".join(rf"0x{x}\s*,\s*0x{y}\s*,\s*0x{z}" for x, y, z in _GREENS),
@@ -159,6 +161,21 @@ def find_violations(text, path=""):
                 continue
             if pattern.search(line):
                 hits.append((lineno, rule_id))
+    # A split-byte colour formatted one byte per line is invisible to
+    # the per-line scan. Re-run that one pattern over the whole text
+    # (its `\s*` separators span newlines, but only whitespace and the
+    # two commas may sit between the bytes, so unrelated bytes on
+    # neighbouring lines do not match) and report the first byte's
+    # line. Matches without a newline were already found above.
+    seen = set(hits)
+    for match in _COLOUR_SPLIT.finditer(text):
+        if "\n" not in match.group(0):
+            continue
+        hit = (text.count("\n", 0, match.start()) + 1, "competitor-colour")
+        if hit not in seen:
+            seen.add(hit)
+            hits.append(hit)
+    hits.sort()
     return hits
 
 
