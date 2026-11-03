@@ -450,9 +450,11 @@ pub struct StoredAdminIngestJob {
 }
 
 /// Outcome of one guarded upload transaction: the stored row plus
-/// whether this attempt converged on a pre-existing row, or the actor
+/// whether this attempt converged on a pre-existing row, the actor
 /// re-check refusal (nothing written or audited — the handler answers
-/// the plain 404, as for any non-admin caller).
+/// the plain 404, as for any non-admin caller), or the account-deletion
+/// fence refusal (nothing written or audited — the handler answers the
+/// typed `account_deleting` 409, like every other fenced writer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminIngestUploadOutcome {
     Stored {
@@ -460,6 +462,7 @@ pub enum AdminIngestUploadOutcome {
         deduplicated: bool,
     },
     ActorNotAdmin,
+    AccountDeleting,
 }
 
 /// Outcome of the store-level delete primitive (no route serves it):

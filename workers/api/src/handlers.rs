@@ -4778,6 +4778,9 @@ where
                 // The actor lost admin between the guard and the write
                 // transaction's re-check: answer as any non-admin is.
                 Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                // The actor scheduled account deletion: ADR 0002 rule 3
+                // fences the write, answered with the typed 409.
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
                 Err(_) => internal(),
             }
         }
@@ -4822,6 +4825,7 @@ where
                     json_response(status, view)
                 }
                 Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
                 Err(_) => internal(),
             }
         }
@@ -5696,8 +5700,11 @@ where
     if req.body.len() > max_body_bytes(&req.method, &req.path) {
         // Oversized admin uploads answer the 413 failure shape (with a
         // null job: nothing was parsed, so no row and no audit), never
-        // the generic 400 — the entry's collection gate mirrors this
-        // for bodies that never reach the handler.
+        // the generic 400. This branch serves only direct-handle
+        // callers: the entry's collection gate answers the uniform 400
+        // instead, because it runs before authentication and a
+        // route-distinctive answer there would disclose the admin
+        // ingest path to unauthenticated callers.
         if req.method == "POST" && req.path == "/v1/admin/ingest" {
             return admin_ingest_oversized();
         }
@@ -7101,10 +7108,19 @@ mod tests {
             attempt: &AdminIngestAttempt,
         ) -> Result<AdminIngestUploadOutcome, StoreError> {
             // Mirror the production transaction: re-read the actor's
-            // role at write time and refuse a demoted actor's write.
+            // role at write time and refuse a demoted actor's write;
+            // a deleting actor is fenced like every other writer of
+            // user-owned state (ADR 0002 rule 3).
             match self.user_role(&attempt.actor_user_id).await? {
                 role if crate::admin::is_admin_role(role.as_deref()) => {}
                 _ => return Ok(AdminIngestUploadOutcome::ActorNotAdmin),
+            }
+            if self
+                .deleting_users
+                .borrow()
+                .contains(&attempt.actor_user_id)
+            {
+                return Ok(AdminIngestUploadOutcome::AccountDeleting);
             }
             if let Some(job) = self.ingest_jobs.borrow().get(&attempt.job_id) {
                 // Convergent replay: the deterministic id already
@@ -12490,7 +12506,8 @@ mod tests {
     fn admin_ingest_rejection_legs_carry_fixed_vocabulary() {
         // (case, body, status, wire code, reason). The oversized leg is
         // built through `handle` so the in-handler pre-gate answers the
-        // 413 null-job shape exactly like the entry's collection seam.
+        // 413 null-job shape; the entry's collection seam answers the
+        // uniform 400 instead (it runs before authentication).
         let oversize = vec![b'a'; crate::admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES + 1];
         let mut truncated = minimal_ingest_nzb();
         truncated.truncate(truncated.len() / 2);
@@ -13051,6 +13068,58 @@ mod tests {
             AdminIngestUploadOutcome::ActorNotAdmin
         );
         assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
+    fn admin_ingest_deleting_actor_is_fenced() {
+        // ADR 0002 rule 3 fences every writer of user-owned state: the
+        // upload's job/original rows carry the actor's id under an
+        // ON DELETE RESTRICT FK, so a deleting actor's upload is refused
+        // with the typed `account_deleting` 409 — no job, no original,
+        // no audit — even though the session is still valid and the
+        // actor is still an admin through the grace window.
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("admin1".to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let denied = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(denied.status, 409, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#,
+            "{}",
+            denied.body
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert!(h.store.ingest_originals.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        // The store primitive reports the refusal directly.
+        let attempt = AdminIngestAttempt {
+            actor_user_id: "admin1".to_string(),
+            job_id: "adm_synthetic000000000000000000000000000".to_string(),
+            idempotency_key: "admin:synthetic".to_string(),
+            content_sha256_hex: "0".repeat(64),
+            nzb_bytes: 10,
+            file_count: None,
+            segment_count: None,
+            failure: Some(crate::admin_ingest::FailureReason::Malformed),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            block_on(h.store.admin_ingest_upload(&attempt)).unwrap(),
+            AdminIngestUploadOutcome::AccountDeleting
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
         assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 

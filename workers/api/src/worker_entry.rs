@@ -1268,12 +1268,21 @@ async fn admin_set_app_setting_on(
 /// Read one stored admin job row (migration 0030) from a locked SELECT:
 /// `None` for unknown ids and pipeline rows (the readers fence on
 /// `source = 'admin'`, so the pipeline ledger never leaks through).
+/// `file_count`/`segment_count` are INTEGER columns, so they decode as
+/// `i32` — tokio-postgres rejects an INT4 column for `i64`, even on
+/// NULL, which would fail every accepted-job read closed.
 fn stored_admin_ingest_job_from(
     row: &tokio_postgres::Row,
     has_original: bool,
 ) -> Result<StoredAdminIngestJob, StoreError> {
-    let file_count: Option<i64> = row.try_get("file_count").map_err(|_| StoreError)?;
-    let segment_count: Option<i64> = row.try_get("segment_count").map_err(|_| StoreError)?;
+    let file_count: Option<i64> = row
+        .try_get::<_, Option<i32>>("file_count")
+        .map_err(|_| StoreError)?
+        .map(i64::from);
+    let segment_count: Option<i64> = row
+        .try_get::<_, Option<i32>>("segment_count")
+        .map_err(|_| StoreError)?
+        .map(i64::from);
     Ok(StoredAdminIngestJob {
         job_id: row.try_get("id").map_err(|_| StoreError)?,
         db_status: row.try_get("status").map_err(|_| StoreError)?,
@@ -1308,9 +1317,16 @@ async fn admin_ingest_upload_on(
         )
         .await
         .map_err(|_| StoreError)?;
+    // The actor row locks here so a deletion scheduled concurrently
+    // either committed first (and is seen below) or waits behind this
+    // transaction. ADR 0002 rule 3 fences every writer of user-owned
+    // state: the upload's job/original rows carry the actor's id under
+    // an ON DELETE RESTRICT FK, so a deleting actor is refused like any
+    // other fenced writer (typed 409, nothing written or audited),
+    // exactly like the role write fences its deleting subject.
     let actor = transaction
         .query_typed(
-            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            "SELECT role, deleting_at IS NOT NULL AS deleting FROM users WHERE id = $1 FOR UPDATE",
             &[(&attempt.actor_user_id, Type::TEXT)],
         )
         .await
@@ -1324,6 +1340,15 @@ async fn admin_ingest_upload_on(
         .transpose()?;
     if !crate::admin::is_admin_role(actor_role.as_deref()) {
         return Ok(AdminIngestUploadOutcome::ActorNotAdmin);
+    }
+    if actor
+        .first()
+        .map(|row| row.try_get::<_, bool>("deleting"))
+        .transpose()
+        .map_err(|_| StoreError)?
+        .unwrap_or(false)
+    {
+        return Ok(AdminIngestUploadOutcome::AccountDeleting);
     }
     let existing = transaction
         .query_typed(
@@ -1411,8 +1436,18 @@ async fn admin_ingest_upload_on(
     } else {
         "queued"
     };
-    let file_count = attempt.file_count.map(i64_of).transpose()?;
-    let segment_count = attempt.segment_count.map(i64_of).transpose()?;
+    // INTEGER columns bind `i32` (like every other INTEGER write in
+    // this file, e.g. the KEK version below): an `i64` param against an
+    // INTEGER column depends on assignment-cast tolerance the reads
+    // above already refuse, so both sides speak the column width.
+    let file_count = attempt
+        .file_count
+        .map(|v| i32::try_from(v).map_err(|_| StoreError))
+        .transpose()?;
+    let segment_count = attempt
+        .segment_count
+        .map(|v| i32::try_from(v).map_err(|_| StoreError))
+        .transpose()?;
     let failure_reason = attempt.failure.map(|reason| reason.as_str().to_string());
     transaction
         .query_typed(
@@ -1427,8 +1462,8 @@ async fn admin_ingest_upload_on(
                 (&db_status, Type::TEXT),
                 (&attempt.content_sha256_hex, Type::TEXT),
                 (&i64_of(attempt.nzb_bytes)?, Type::INT8),
-                (&file_count, Type::INT8),
-                (&segment_count, Type::INT8),
+                (&file_count, Type::INT4),
+                (&segment_count, Type::INT4),
                 (&failure_reason, Type::TEXT),
             ],
         )
@@ -1568,9 +1603,12 @@ async fn admin_ingest_delete_on(
         )
         .await
         .map_err(|_| StoreError)?;
+    // `RETURNING id`: a DELETE without RETURNING yields no result
+    // rows, so the emptiness check below would always report Missing
+    // even when the transaction just removed the job.
     let deleted = transaction
         .query_typed(
-            "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin' RETURNING id",
             &[(&job_id, Type::TEXT)],
         )
         .await
@@ -1923,10 +1961,14 @@ impl Store for PgStore {
                 // `accepted_at` is BIGINT epoch seconds (the 0022 converged
                 // shape), so the UTC day is epoch/86400 — exactly the
                 // fake's epoch-day key; no local-time skew is possible.
+                // Pipeline rows only: admin-upload rows (migration 0030)
+                // carry the uploading admin's id for the FK/fence, and
+                // counting them here would burn the ordinary daily
+                // intake allowance on admin activity.
                 let rows = client
                     .query_typed(
                         "SELECT COUNT(*)::BIGINT AS ingest_jobs FROM ingest_jobs WHERE user_id = $1 \
-                         AND accepted_at / 86400 = $2 / 86400",
+                         AND accepted_at / 86400 = $2 / 86400 AND source = 'pipeline'",
                         &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
@@ -4392,9 +4434,13 @@ pub async fn collect_body_with_cap<S: BodyChunkStream>(
 /// uniform pre-routing rejection (`handlers::invalid_request`: status
 /// 400, body `{"code":"invalid_request","message":"invalid request",
 /// "retryable":false}`, no `set_cookie`), so the
-/// gate can never drift from it — except an oversized admin NZB
-/// upload, which answers the route's own 413 (`admin_ingest_oversized`)
-/// so the collection seam and the in-handler pre-gate agree. The Worker
+/// gate can never drift from it. Oversized answers stay route-blind on
+/// purpose: this seam runs before authentication and cannot tell an
+/// admin from a probe, so a route-distinctive 413 here would disclose
+/// the admin ingest path to unauthenticated callers (a bare
+/// Content-Length suffices — the stream is never polled). The route's
+/// own 413 (`admin_ingest_oversized`) lives only in the in-handler
+/// pre-gate, for direct-handle callers that reach it. The Worker
 /// entry passes a handler that calls `handlers::handle`, so a rejected
 /// body can cause no store, mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
@@ -4410,11 +4456,6 @@ where
         CollectedBody::Complete(bytes) => {
             request.body = bytes;
             handler(request).await
-        }
-        CollectedBody::Oversized
-            if request.method == "POST" && request.path == "/v1/admin/ingest" =>
-        {
-            handlers::admin_ingest_oversized()
         }
         CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::invalid_request(),
     }
@@ -5095,7 +5136,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_gate_answers_oversize_per_route_without_dispatching() {
+    fn dispatch_gate_answers_oversize_uniformly_without_dispatching() {
         // The handler must never run on a rejected body: reaching it
         // would let a truncated upload act.
         let probe = |collected: CollectedBody, method: &str, path: &str| {
@@ -5105,23 +5146,22 @@ mod tests {
                 |_| async { panic!("rejected bodies never dispatch") },
             ))
         };
-        // An oversized admin upload answers the route's own 413
-        // null-job shape — the same body the in-handler pre-gate
-        // serves — so the collection seam and the handler cannot drift.
+        // Oversized stays route-blind: the seam runs before
+        // authentication, so a route-distinctive 413 for the admin
+        // ingest path would disclose it to unauthenticated callers.
+        // The route's own 413 lives only in the in-handler pre-gate,
+        // for direct-handle callers that reach it.
         let admin = probe(CollectedBody::Oversized, "POST", "/v1/admin/ingest");
-        assert_eq!(admin.status, 413);
+        assert_eq!(admin.status, 400);
         assert_eq!(
             admin.body,
-            r#"{"code":"payload_too_large","job_id":null,"reason":"too_large","status":"failed"}"#
-        );
-        // Every other oversized route keeps the generic 400, and a
-        // transport failure is never an upload-shaped answer.
-        let other = probe(CollectedBody::Oversized, "POST", "/api/ingest");
-        assert_eq!(other.status, 400);
-        assert_eq!(
-            other.body,
             r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
         );
+        // Every other oversized route answers the same generic 400, and
+        // a transport failure is never an upload-shaped answer.
+        let other = probe(CollectedBody::Oversized, "POST", "/api/ingest");
+        assert_eq!(other.status, 400);
+        assert_eq!(other.body, admin.body);
         let failed = probe(CollectedBody::TransportFailure, "POST", "/v1/admin/ingest");
         assert_eq!(failed.status, 400);
         assert_eq!(failed.body, other.body);
@@ -5135,6 +5175,74 @@ mod tests {
             },
         ));
         assert_eq!(seen.status, 400);
+    }
+
+    #[test]
+    fn admin_ingest_pg_statements_hold_their_contracts() {
+        // The FakeStore route suite cannot see these Postgres-only
+        // faults, so pin the statement shapes the same way the fence
+        // tests pin theirs: slice the pre-test source so this test's
+        // own literals cannot satisfy it.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        // INTEGER columns decode as `i32`: tokio-postgres rejects an
+        // INT4 column for `i64` (even NULL), which failed every
+        // accepted-job read, and the insert binds the same width.
+        for column in ["file_count", "segment_count"] {
+            assert!(
+                production.contains(&format!(
+                    "try_get::<_, Option<i32>>(\"{column}\")"
+                )),
+                "{column} must decode as i32"
+            );
+        }
+        assert!(
+            !production.contains("Option<i64> = row.try_get(\"file_count\")"),
+            "file_count must not decode as i64"
+        );
+        assert!(
+            !production.contains("Option<i64> = row.try_get(\"segment_count\")"),
+            "segment_count must not decode as i64"
+        );
+        // A DELETE without RETURNING yields no result rows, so the
+        // emptiness check would always report Missing.
+        assert!(
+            production.contains(
+                "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin' RETURNING id"
+            ),
+            "the admin job delete must RETURN its id"
+        );
+        // Admin-upload rows carry the uploading admin's id for the
+        // FK/fence; counting them would burn the ordinary daily intake
+        // allowance on admin activity.
+        let today_body = production
+            .split_once("async fn ingest_jobs_today(")
+            .expect("ingest_jobs_today must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("a closing brace must bound ingest_jobs_today")
+            .0;
+        assert!(
+            today_body.contains("AND source = 'pipeline'"),
+            "the daily intake count must fence out admin-source rows"
+        );
+        // The upload writes user-owned rows under a RESTRICT FK, so
+        // ADR 0002 rule 3 fences a deleting actor like every other
+        // writer — the locked actor re-select must read the marker.
+        let upload_body = production
+            .split_once("async fn admin_ingest_upload_on(")
+            .expect("admin_ingest_upload_on must exist")
+            .1
+            .split_once("async fn admin_ingest_delete_on(")
+            .expect("the delete fn must bound the upload fn")
+            .0;
+        assert!(
+            upload_body.contains("deleting_at IS NOT NULL AS deleting"),
+            "the upload actor re-check must read the deletion marker"
+        );
     }
 
     #[test]
