@@ -202,8 +202,13 @@ impl LeaseHeartbeat {
 //
 // The Worker binds fields positionally and never interpolates. Epoch and
 // timestamps are BIGINT Unix seconds (migration 0029 domain). Both
-// writers carry the account-deletion fence (ADR 0002 rule 3): a user
-// with `deleting_at` set — or no user row at all — writes nothing.
+// writers carry the account-deletion fence in its locking form (ADR
+// 0002 rule 3): the eligible `users` row is read `FOR SHARE` inside the
+// write (`writer_fence`, the same shape the ledger uses), so the
+// deletion scheduler's row lock cannot slip `deleting_at` past an
+// in-flight lease write — a user with `deleting_at` set, or no user row
+// at all, writes nothing, and a write that passes the fence commits
+// before any later deletion marker can.
 
 /// Parameters: user_id. The user's lease row, if any.
 pub fn playback_lease_select_statement() -> &'static str {
@@ -221,7 +226,7 @@ pub fn playback_lease_select_statement() -> &'static str {
 /// row, never from a client-supplied value, so concurrent acquires
 /// cannot mint colliding epochs.
 pub fn playback_lease_acquire_statement() -> &'static str {
-    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 WHERE EXISTS (SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL) ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
 }
 
 /// Parameters: user_id, session_id, play_id, epoch, expires_at, now.
@@ -232,7 +237,7 @@ pub fn playback_lease_acquire_statement() -> &'static str {
 /// from the same holder can arrive out of order, and an older request
 /// must never shorten the deadline a newer one already stored.
 pub fn playback_lease_touch_statement() -> &'static str {
-    "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND EXISTS (SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL) RETURNING expires_at"
+    "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
 }
 
 #[cfg(test)]
@@ -349,11 +354,11 @@ mod tests {
         );
         assert_eq!(
             playback_lease_acquire_statement(),
-            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 WHERE EXISTS (SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL) ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
         );
         assert_eq!(
             playback_lease_touch_statement(),
-            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND EXISTS (SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL) RETURNING expires_at"
+            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
         );
     }
 

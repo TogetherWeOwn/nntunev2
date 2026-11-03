@@ -10,7 +10,8 @@
 -- live lease gets zero rows (the 429); takeover and post-expiry
 -- acquires bump the epoch; the touch extends only the exact holder
 -- and never shortens a stored deadline (out-of-order heartbeats);
--- both writers refuse a deleting account; ever-paid distinguishes
+-- both writers refuse a deleting account through the locking
+-- writer fence; ever-paid distinguishes
 -- paid-once from never-paid.
 
 BEGIN;
@@ -23,7 +24,7 @@ VALUES ('pls-user', 'pls-user@example.com', 1000),
 -- First acquire: epoch 1.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-1', 'track-1', 'play-1', 1, 2000, 1955 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-1', 'track-1', 'play-1', 1, 2000, 1955 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1955 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -33,7 +34,7 @@ SELECT epoch INTO TEMP TABLE pls_got1 FROM got;
 -- Same session, new track (queue advance): replaces, epoch 2.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-1', 'track-2', 'play-2', 1, 2010, 1965 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-1', 'track-2', 'play-2', 1, 2010, 1965 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1965 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -43,7 +44,7 @@ SELECT epoch INTO TEMP TABLE pls_got2 FROM got;
 -- Another session against the live lease, no takeover: zero rows.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -53,7 +54,7 @@ SELECT count(*) AS n INTO TEMP TABLE pls_got3 FROM got;
 -- Same other session WITH takeover: epoch 3, holder changes.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR TRUE
     RETURNING epoch
@@ -63,7 +64,8 @@ SELECT epoch INTO TEMP TABLE pls_got4 FROM got;
 -- Touch by the displaced holder (stale epoch): zero rows.
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
-    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
@@ -71,7 +73,8 @@ SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
 -- Touch by the current holder: extends.
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
-    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
     RETURNING expires_at
 )
 SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
@@ -81,7 +84,8 @@ SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
 -- stored deadline must not shorten.
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2050), updated_at = GREATEST(playback_leases.updated_at, 1970)
-    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
     RETURNING expires_at
 )
 SELECT expires_at INTO TEMP TABLE pls_touch_reordered FROM touched;
@@ -89,7 +93,7 @@ SELECT expires_at INTO TEMP TABLE pls_touch_reordered FROM touched;
 -- After expiry (now past 2100) a third session acquires: epoch 4.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-3', 'track-4', 'play-4', 1, 2200, 2155 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-3', 'track-4', 'play-4', 1, 2200, 2155 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 2155 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -115,7 +119,7 @@ WHERE id = 'pls-user';
 
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    SELECT 'pls-user', 'sess-4', 'track-5', 'play-5', 1, 2300, 2255 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    SELECT 'pls-user', 'sess-4', 'track-5', 'play-5', 1, 2300, 2255 FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 2255 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -124,7 +128,8 @@ SELECT count(*) AS n INTO TEMP TABLE pls_acquire_deleting FROM got;
 
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2400), updated_at = GREATEST(playback_leases.updated_at, 2260)
-    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_deleting FROM touched;
