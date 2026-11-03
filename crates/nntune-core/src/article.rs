@@ -405,20 +405,32 @@ fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
         // stay glued to their group token and folding lands after ", ".
         let words: Vec<&str> = value.split(' ').collect();
         let mut current = first_prefix.clone();
-        for word in words {
+        // Whether the space run currently being folded already broke onto
+        // a continuation line: unfolding removes only the CRLF, so that
+        // leading space already IS one literal space. The run's final
+        // (trailing) space must not add another, or the round trip gains
+        // one; reset by every non-space word.
+        let mut run_folded = false;
+        for (i, &word) in words.iter().enumerate() {
             if word.is_empty() {
                 // Extra space from a run of consecutive spaces: keep it
                 // literal on this line. Folding here would drop it (the
                 // continuation's leading space already accounts for one
                 // separator), so break first when the line is full and
-                // carry the space onto the new line.
+                // carry the space onto the new line — except the run's
+                // final space after a fold, which the leading space
+                // already represents.
                 if current.len() >= 78 {
                     lines.push(current);
                     current = String::from(" ");
+                    run_folded = true;
                 }
-                current.push(' ');
+                if !(i + 1 == words.len() && run_folded) {
+                    current.push(' ');
+                }
                 continue;
             }
+            run_folded = false;
             if current.len() + word.len() < 78 {
                 if !current.ends_with(' ') && !current.ends_with(": ") {
                     current.push(' ');

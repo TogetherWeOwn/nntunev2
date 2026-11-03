@@ -382,6 +382,35 @@ fn folded_repeated_spaces_unfold_losslessly() {
 }
 
 #[test]
+fn folded_trailing_space_at_boundary_unfolds_losslessly() {
+    // A trailing space that lands exactly on the 78-byte fold boundary must
+    // survive the round trip byte-for-byte: the continuation's leading space
+    // IS the trailing space after unfolding (CRLF is removed, the space
+    // stays), so folding must not add another one.
+    for subject in [
+        format!("{} ", "a".repeat(69)),
+        format!("{}  ", "a".repeat(69)),
+        format!("{} ", "a".repeat(70)),
+    ] {
+        let headers = ArticleHeaders::new(
+            "poster@example.invalid",
+            &["example.test.alpha"],
+            &subject,
+            "Tue, 03 Nov 2026 12:00:00 +0000",
+            "post-id-005@example.invalid",
+        )
+        .expect("valid headers");
+        let block = headers.render().expect("render");
+        let parsed = parse_headers(&block);
+        let (_, unfolded) = parsed
+            .iter()
+            .find(|(n, _)| n == "Subject")
+            .expect("Subject present");
+        assert_eq!(unfolded, &subject, "round trip changed trailing spaces");
+    }
+}
+
+#[test]
 fn unfittable_single_token_fails_closed() {
     // No spaces to fold at and over 998 bytes: refuse rather than emit an
     // over-long line.
