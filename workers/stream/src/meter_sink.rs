@@ -43,9 +43,17 @@ pub const METER_SINK_SECRET_VAR: &str = "METER_SINK_SECRET";
 /// (or absent) secret never signs — windows stay pending instead of
 /// flushing under a weak key.
 pub const MIN_SECRET_BYTES: usize = 32;
-/// Windows per flush request; the api body cap admits a full batch of
-/// worst-case windows with headroom.
+/// Windows per flush request (count bound; the api side enforces the
+/// same number).
 pub const MAX_BATCH_WINDOWS: usize = 64;
+/// Serialized-body bound for one flush request. A full count batch of
+/// worst-case windows (512-byte track and play ids) runs well past
+/// the api Worker's 32 KiB request-body cap, which would refuse every
+/// retry of the same batch before the sink ever ran — so batches are
+/// packed by serialized bytes as well as by count, at half the api
+/// cap. One window is at most ~1.5 KiB serialized, so a byte-packed
+/// batch always advances.
+pub const MAX_BATCH_BODY_BYTES: usize = 16 * 1024;
 /// In-flight plays retained per user. One user holds one live lease,
 /// so real concurrency is a handful of plays; the cap only bounds a
 /// report flood. Beyond it, fully-flushed plays are evicted first,
@@ -185,24 +193,46 @@ impl MeterBook {
         true
     }
 
-    /// Cumulative windows not yet acknowledged, oldest first, capped
-    /// at [`MAX_BATCH_WINDOWS`] for one request.
+    /// Cumulative windows not yet acknowledged, oldest first, packed
+    /// for one request: at most [`MAX_BATCH_WINDOWS`] windows whose
+    /// serialized batch stays within [`MAX_BATCH_BODY_BYTES`]. Always
+    /// returns at least the oldest pending window when one exists, so
+    /// every flush makes progress; the rest stay pending for the
+    /// continuation alarm.
     pub fn pending_windows(&self) -> Vec<WindowReport> {
         let mut pending: Vec<(&String, &PlayMeter)> =
             self.plays.iter().filter(|(_, p)| p.pending()).collect();
         pending.sort_by_key(|(_, p)| p.started_at);
-        pending
-            .into_iter()
-            .take(MAX_BATCH_WINDOWS)
-            .map(|(play_id, play)| WindowReport {
+        let mut windows: Vec<WindowReport> = Vec::new();
+        for (play_id, play) in pending.into_iter().take(MAX_BATCH_WINDOWS) {
+            let window = WindowReport {
                 user_id: self.user_id.clone(),
                 track_id: play.track_id.clone(),
                 play_id: play_id.clone(),
                 union_bytes: play.union.total_bytes(),
                 file_bytes: play.file_bytes,
                 started_at: play.started_at,
-            })
-            .collect()
+            };
+            if windows.is_empty() {
+                // Always pack at least the oldest window so the flush
+                // advances; one window is ~1.5 KiB at worst, far under
+                // the cap.
+                windows.push(window);
+                continue;
+            }
+            // Exact by construction: measure the body the flush would
+            // sign with this window added, not an estimate. A
+            // serialization failure is unreachable for these
+            // plain-data structs; treat it as "does not fit" and the
+            // window simply waits for a later batch.
+            let mut candidate = windows.clone();
+            candidate.push(window);
+            match batch_body(&candidate) {
+                Some(body) if body.len() <= MAX_BATCH_BODY_BYTES => windows = candidate,
+                _ => break,
+            }
+        }
+        windows
     }
 
     pub fn has_pending(&self) -> bool {
@@ -457,5 +487,63 @@ mod tests {
         assert_eq!(METER_SINK_SECRET_VAR, "METER_SINK_SECRET");
         assert_eq!(MIN_SECRET_BYTES, 32);
         assert_eq!(MAX_BATCH_WINDOWS, 64);
+        assert_eq!(MAX_BATCH_BODY_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn batches_pack_by_serialized_bytes_not_just_count() {
+        // Worst-case identities: 512-byte play and track ids. 64 such
+        // windows serialize far past the api's 32 KiB body cap, which
+        // would refuse every retry of the same batch; the packer must
+        // stop by bytes and later batches must advance to the rest.
+        let wide = "t".repeat(512);
+        let mut book = MeterBook::new("user-1");
+        for i in 0..64u64 {
+            let play_id = format!("{i:03}-{}", "p".repeat(508));
+            assert_eq!(play_id.len(), 512);
+            assert!(book.record(&interval(&play_id, &wide, 0, 100), 100 + i));
+        }
+        let sent = book.pending_windows();
+        assert!(!sent.is_empty(), "a byte-packed batch always advances");
+        assert!(sent.len() < 64, "the byte cap binds before the count cap");
+        let body = batch_body(&sent).expect("batch serializes");
+        assert!(
+            body.len() <= MAX_BATCH_BODY_BYTES,
+            "batch body {} exceeds {}",
+            body.len(),
+            MAX_BATCH_BODY_BYTES
+        );
+        // After the api answers those terminally, the next batch picks
+        // up exactly where this one stopped — no wedge, no repeats.
+        let terminal: Vec<String> = sent.iter().map(|w| w.play_id.clone()).collect();
+        book.mark_flushed(&sent, &terminal);
+        let next = book.pending_windows();
+        assert!(!next.is_empty());
+        assert!(next.iter().all(|w| !terminal.contains(&w.play_id)));
+        let body = batch_body(&next).expect("batch serializes");
+        assert!(body.len() <= MAX_BATCH_BODY_BYTES);
+    }
+
+    #[test]
+    fn ack_applied_to_a_fresh_book_keeps_midflight_bytes_pending() {
+        // The flush's api fetch awaits with the DO input gates open,
+        // so /delivered can record and persist a newer book while a
+        // batch is in flight. The runtime therefore applies the ack
+        // to a RELOADED book; this pins that the merge keeps the
+        // mid-flight growth pending instead of marking it flushed
+        // (its 202 already told the play route not to retry).
+        let mut persisted = MeterBook::new("user-1");
+        assert!(persisted.record(&interval("play-1", "track-1", 0, 100), 100));
+        // The flush snapshot: union 100 in flight.
+        let sent = persisted.pending_windows();
+        // Mid-flight: [100, 200) lands and is saved.
+        assert!(persisted.record(&interval("play-1", "track-1", 100, 200), 105));
+        // The ack for the 100-byte snapshot arrives and is applied to
+        // the fresh book.
+        persisted.mark_flushed(&sent, &["play-1".to_string()]);
+        let pending = persisted.pending_windows();
+        assert_eq!(pending.len(), 1, "mid-flight bytes stay pending");
+        assert_eq!(pending[0].union_bytes, 200);
+        assert_eq!(persisted.plays["play-1"].flushed_bytes, 100);
     }
 }

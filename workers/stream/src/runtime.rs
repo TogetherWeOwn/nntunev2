@@ -376,11 +376,17 @@ impl DurableObject for NntpPool {
 
     /// Meter flush alarm: drains pending play windows to the api sink
     /// and re-arms itself while any remain ([`NntpPool::flush_meter`]).
-    /// Never errors out — failure paths reschedule explicitly so the
-    /// runtime's alarm retry policy is not a second retry engine.
+    /// Failure paths reschedule explicitly; only when the reschedule
+    /// itself fails (the alarm storage write) does this error out, so
+    /// the platform's alarm retry is the backstop of last resort
+    /// instead of a silently stranded book.
     async fn alarm(&self) -> Result<Response> {
-        self.flush_meter().await;
-        Response::empty()
+        match self.flush_meter().await {
+            Ok(()) => Response::empty(),
+            Err(()) => Err(worker::Error::RustError(
+                "meter flush could not reschedule its alarm".to_string(),
+            )),
+        }
     }
 }
 
@@ -508,7 +514,13 @@ impl NntpPool {
         if self.save_meter_book(&book).await.is_err() {
             return storage_busy().into();
         }
-        self.arm_meter_alarm(METER_FLUSH_DELAY_MS).await;
+        // The 202 tells the play route to stop retrying, so it is
+        // only earned once a flush alarm demonstrably exists: on an
+        // arming failure answer busy and let the route re-report —
+        // the duplicate merges to zero and re-arms.
+        if self.arm_meter_alarm(METER_FLUSH_DELAY_MS).await.is_err() {
+            return storage_busy().into();
+        }
         crate::delivered::DeliveredReply::from(Ok(())).into()
     }
 
@@ -539,18 +551,24 @@ impl NntpPool {
 
     /// Arm the flush alarm unless one is already pending: one alarm
     /// drains the whole book, so re-arming per report would only push
-    /// the flush later.
-    async fn arm_meter_alarm(&self, delay_ms: i64) {
+    /// the flush later. `Err` means no alarm is known to exist — the
+    /// caller must not acknowledge work as durably scheduled.
+    async fn arm_meter_alarm(&self, delay_ms: i64) -> core::result::Result<(), ()> {
         let storage = self.state.storage();
-        if let Ok(Some(_)) = storage.get_alarm().await {
-            return;
+        match storage.get_alarm().await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => storage.set_alarm(delay_ms).await.map_err(|_| ()),
+            Err(_) => Err(()),
         }
-        let _ = storage.set_alarm(delay_ms).await;
     }
 
     /// Unconditionally (re)schedule the next flush attempt.
-    async fn reschedule_meter_alarm(&self, delay_ms: i64) {
-        let _ = self.state.storage().set_alarm(delay_ms).await;
+    async fn reschedule_meter_alarm(&self, delay_ms: i64) -> core::result::Result<(), ()> {
+        self.state
+            .storage()
+            .set_alarm(delay_ms)
+            .await
+            .map_err(|_| ())
     }
 
     /// One flush pass: send the pending cumulative windows to the api
@@ -558,25 +576,26 @@ impl NntpPool {
     /// while anything remains. Every failure path keeps the windows
     /// pending and schedules a retry — a window is only ever dropped
     /// by the api naming it terminal, or by the flushed-retention
-    /// eviction after an ack.
-    async fn flush_meter(&self) {
+    /// eviction after an ack. `Err` is reserved for "the retry alarm
+    /// itself could not be scheduled"; the alarm handler surfaces it
+    /// so the platform retries the alarm instead of stranding the
+    /// book.
+    async fn flush_meter(&self) -> core::result::Result<(), ()> {
         let Some(pool_user) = self.state.id().name() else {
-            return;
+            return Ok(());
         };
         let Ok(mut book) = self.load_meter_book(&pool_user).await else {
-            self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
-            return;
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
         };
         let now_unix = Date::now().as_millis() / 1000;
         let sent = book.pending_windows();
         if sent.is_empty() {
             book.evict_flushed(now_unix);
             let _ = self.save_meter_book(&book).await;
-            return;
+            return Ok(());
         }
         let Some(body) = meter_sink::batch_body(&sent) else {
-            self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
-            return;
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
         };
         let secret = self
             .env
@@ -587,27 +606,37 @@ impl NntpPool {
             meter_sink::authorization_header(secret.as_deref(), now_unix, &body)
         else {
             // Unprovisioned or short secret: never flush unsigned.
-            self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
-            return;
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
         };
         let ack = match self.post_meter_batch(&authorization, body).await {
             Ok(ack) => ack,
             Err(()) => {
-                self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
-                return;
+                return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
             }
+        };
+        // The fetch above awaited with the input gates open (they
+        // only hold during storage operations), so /delivered may
+        // have recorded and saved a newer book mid-flight. Apply the
+        // ack to a RELOADED book: saving the pre-fetch copy would
+        // erase those intervals, and their 202 already told the play
+        // route not to retry. `mark_flushed` clamps to each play's
+        // current union, so mid-flight growth stays pending. If the
+        // reload fails, leave everything pending — re-sending the
+        // same cumulative snapshots is a no-op at the api.
+        let Ok(mut book) = self.load_meter_book(&pool_user).await else {
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
         };
         book.mark_flushed(&sent, &ack.terminal_play_ids());
         book.evict_flushed(now_unix);
         if self.save_meter_book(&book).await.is_err() {
             // The api already converged these cumulative snapshots;
             // re-sending them after a storage failure is a no-op there.
-            self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
-            return;
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
         }
         if book.has_pending() {
-            self.reschedule_meter_alarm(METER_CONTINUE_DELAY_MS).await;
+            return self.reschedule_meter_alarm(METER_CONTINUE_DELAY_MS).await;
         }
+        Ok(())
     }
 
     /// POST one signed batch to the api sink and parse its ack. Any
