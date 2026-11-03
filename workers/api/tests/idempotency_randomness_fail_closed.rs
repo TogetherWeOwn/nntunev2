@@ -653,7 +653,7 @@ fn deterministic_play_keys_and_invalid_rows_are_unchanged() {
         Err(LedgerError::Invalid),
         "zero-byte rows must still fail closed"
     );
-    // Migration 0029 retired the nominal-rate equality: seconds are
+    // Migration 0031 retired the nominal-rate equality: seconds are
     // caller-derived (proportional derivation in ledger.rs), so a value
     // disagreeing with ceil(bytes / 48_000) is accepted, and only the
     // decoupled per-row cap still fails closed.

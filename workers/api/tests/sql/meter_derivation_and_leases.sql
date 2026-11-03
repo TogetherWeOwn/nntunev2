@@ -1,5 +1,5 @@
--- Regression test for migrations 0029 (meter derivation snapshots +
--- playback leases) and 0030 (ledger seconds floor). Run after ALL
+-- Regression test for migrations 0031 (meter derivation snapshots +
+-- playback leases) and 0032 (ledger seconds floor). Run after ALL
 -- migrations are applied (see ../run_migration_tests.sh). Everything
 -- happens inside one transaction that is rolled back, so it leaves no
 -- rows; any broken expectation RAISEs and (with ON_ERROR_STOP) fails
@@ -7,7 +7,7 @@
 --
 -- Scope: the 0020 nominal-rate CHECK is gone (a row whose seconds do
 -- not equal ceil(bytes / 48000) is accepted), the decoupled range
--- CHECKs stay (with 0030's `>= 1` seconds floor), the nullable
+-- CHECKs stay (with 0032's `>= 1` seconds floor), the nullable
 -- `file_bytes` / `duration_ms` snapshot columns exist and reject
 -- negatives, the sink upsert replaces the snapshot pair per advancing
 -- flush (stored rows always recompute), and `playback_leases` exists
@@ -36,11 +36,11 @@ BEGIN
           AND contype = 'c'
           AND pg_get_constraintdef(oid) LIKE '%48000%'
     ) THEN
-        RAISE EXCEPTION 'nominal-rate CHECK survived migration 0029';
+        RAISE EXCEPTION 'nominal-rate CHECK survived migration 0031';
     END IF;
 
     IF to_regclass('public.playback_leases') IS NULL THEN
-        RAISE EXCEPTION 'playback_leases missing after 0029';
+        RAISE EXCEPTION 'playback_leases missing after 0031';
     END IF;
 END $$;
 
@@ -54,7 +54,7 @@ INSERT INTO stream_play_ledger
 VALUES ('play:mdl-user:track-1:play-1', 'mdl-user', 'track-1', '2026-11',
         120, 15000000, 1761955200, 30000000, 240000);
 
--- Pre-0029 shape still inserts (snapshots default NULL), and a
+-- Pre-0031 shape still inserts (snapshots default NULL), and a
 -- fallback-rate row keeps NULL snapshots.
 INSERT INTO stream_play_ledger
     (idempotency_key, user_id, track_id, period_month, stream_seconds,
@@ -93,7 +93,7 @@ BEGIN
         NULL;
     END;
 
-    -- Migration 0030: the seconds floor the retired rate CHECK used to
+    -- Migration 0032: the seconds floor the retired rate CHECK used to
     -- imply. Zero seconds for positive bytes is rejected at the schema,
     -- exactly as prepare_ledger_row rejects it at the writer boundary.
     IF EXISTS (
@@ -102,7 +102,7 @@ BEGIN
           AND contype = 'c'
           AND pg_get_constraintdef(oid) LIKE '%stream_seconds >= 0%'
     ) THEN
-        RAISE EXCEPTION 'pre-0030 zero-allowing seconds CHECK survived';
+        RAISE EXCEPTION 'pre-0032 zero-allowing seconds CHECK survived';
     END IF;
     BEGIN
         INSERT INTO stream_play_ledger
@@ -110,7 +110,7 @@ BEGIN
              stream_seconds, bytes_served, recorded_at)
         VALUES ('play:mdl-user:track-5:play-5', 'mdl-user', 'track-5',
                 '2026-11', 0, 48000, 1761955200);
-        RAISE EXCEPTION 'zero stream_seconds was accepted after 0030';
+        RAISE EXCEPTION 'zero stream_seconds was accepted after 0032';
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;

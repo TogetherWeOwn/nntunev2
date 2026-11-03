@@ -23,7 +23,7 @@
 //!   (`ceil(union_bytes * duration / file_size)`, clamped to
 //!   `duration + 2 s`), falling back to the nominal
 //!   [`STREAM_BYTES_PER_SEC`] rate only when duration or file size is
-//!   unknown. Until migration 0029 the nominal rate was the only
+//!   unknown. Until migration 0031 the nominal rate was the only
 //!   derivation and the schema enforced it; it over-counts FLAC roughly
 //!   2-3.7x, so [`prepare_ledger_row`] now bounds caller-derived seconds
 //!   instead of recomputing the rate, and [`prepare_play_window`] is the
@@ -52,23 +52,23 @@
 //!   retried). Conflicts are flagged, never silently converged.
 //! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes and
 //!   [`MAX_STREAM_SECONDS_PER_ROW`] seconds — decoupled sanity caps since
-//!   migration 0029 (the byte cap keeps its historical value); zero-byte
+//!   migration 0031 (the byte cap keeps its historical value); zero-byte
 //!   and zero-second rows are rejected — an empty row bills nothing and
 //!   only widens the table, and no derivation of positive bytes yields
-//!   zero seconds (migration 0030 mirrors the floor in the schema).
+//!   zero seconds (migration 0032 mirrors the floor in the schema).
 
 use std::collections::BTreeMap;
 
 /// Nominal bytes per stream second: the fallback derivation rate when a
 /// play's duration or file size is unknown ([`derive_stream_seconds`]).
 /// Historically the only derivation (enforced by migration 0020's rate
-/// CHECK, dropped in 0029); the stream worker's legacy meter pins the same
+/// CHECK, dropped in 0031); the stream worker's legacy meter pins the same
 /// literal, so a drift fails the suite on either side instead of silently
 /// re-billing history.
 pub const STREAM_BYTES_PER_SEC: u64 = 48_000;
 /// Maximum stream seconds one row may attribute (24 h of audio).
 pub const MAX_STREAM_SECONDS_PER_ROW: u64 = 86_400;
-/// Maximum bytes one row may carry. A sanity cap since migration 0029;
+/// Maximum bytes one row may carry. A sanity cap since migration 0031;
 /// the value is historical (24 h at the old nominal rate) and no longer
 /// coupled to the derivation.
 pub const MAX_BYTES_PER_ROW: u64 = 4_147_200_000;
@@ -312,8 +312,8 @@ fn check_key(value: &str) -> Result<String, LedgerError> {
 /// floor restores the retired rate equality's implicit guarantee: every
 /// derivation bills a positive byte count at least one second, so a
 /// zero-second row can never be a faithful derivation of its bytes (and
-/// migration 0030 enforces the same floor in the schema).
-/// Until migration 0029 it also required the nominal-rate equality
+/// migration 0032 enforces the same floor in the schema).
+/// Until migration 0031 it also required the nominal-rate equality
 /// `seconds == ceil(bytes / STREAM_BYTES_PER_SEC)`; that coupling is
 /// retired with the rate CHECK it mirrored.
 ///
@@ -469,7 +469,7 @@ pub fn resolve_duration_ms(
 /// Validated play-window intent for the meter sink: one play's
 /// delivered-byte union and the seconds derived from it, plus the
 /// `file_bytes` / `duration_ms` snapshots the derivation consumed
-/// (migration 0029 columns; `None` when the nominal-rate fallback
+/// (migration 0031 columns; `None` when the nominal-rate fallback
 /// derived the seconds). The Worker binds it to
 /// [`ledger_play_window_upsert_statement`]. Never serialized to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,7 +723,7 @@ mod tests {
         // Literal pins: the fallback rate re-bills history and the row caps
         // move the corruption tripwire, so each changes only deliberately.
         // The byte cap keeps its historical value but is NOT pinned to
-        // `86_400 * 48_000` anymore: migration 0029 decoupled the caps
+        // `86_400 * 48_000` anymore: migration 0031 decoupled the caps
         // from the derivation, so asserting the product would re-couple
         // them in the suite.
         assert_eq!(STREAM_BYTES_PER_SEC, 48_000);
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn prepare_bounds_seconds_without_rate_coupling() {
-        // Since migration 0029 the prepare gate bounds caller-derived
+        // Since migration 0031 the prepare gate bounds caller-derived
         // seconds instead of recomputing the nominal rate: a FLAC window
         // whose proportional seconds sit far below ceil(bytes / 48_000)
         // prepares fine. The floor stays: zero seconds for positive

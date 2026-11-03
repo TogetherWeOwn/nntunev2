@@ -1,8 +1,8 @@
--- NNTune v2 migration 0030: ledger stream_seconds floor.
+-- NNTune v2 migration 0032: ledger stream_seconds floor.
 --
 -- Migration 0020's rate CHECK implicitly guaranteed `stream_seconds >= 1`
 -- on every row (seconds were `ceil(bytes / 48000)` over a `bytes >= 1`
--- domain, so no zero-second row could ever be written). Migration 0029
+-- domain, so no zero-second row could ever be written). Migration 0031
 -- retired that CHECK when the derivation moved to delivered-byte
 -- proportion, leaving only the column's `>= 0` range CHECK — while the
 -- api Worker's `prepare_ledger_row` still refuses zero seconds for
@@ -10,8 +10,8 @@
 -- migration restores the floor in the schema so a persisted row meets
 -- the same rule the writer enforces: `[1, 86400]`.
 --
--- Data safety: no existing row can violate the new CHECK — before 0029
--- the rate CHECK made zero seconds impossible, and since 0029 the only
+-- Data safety: no existing row can violate the new CHECK — before 0031
+-- the rate CHECK made zero seconds impossible, and since 0031 the only
 -- writer path is the prepare boundary that rejects them.
 --
 -- Replay-safety (run_migration_tests.sh re-applies every migration):

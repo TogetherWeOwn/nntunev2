@@ -1,4 +1,4 @@
--- NNTune v2 migration 0029: meter derivation snapshots + playback leases.
+-- NNTune v2 migration 0031: meter derivation snapshots + playback leases.
 --
 -- Two changes for the playback-enforcement / hour-meter slice:
 --

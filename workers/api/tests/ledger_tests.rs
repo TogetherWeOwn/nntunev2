@@ -456,55 +456,55 @@ fn stream_play_feeds_the_ledger_without_silent_replays() {
 #[test]
 fn migration_pins_rate_retirement_and_persisted_caps() {
     // The migrations are the persisted half of the prepare gate. 0020
-    // created the table WITH the nominal-rate CHECK; 0029 retires that
+    // created the table WITH the nominal-rate CHECK; 0031 retires that
     // coupling (it over-counts FLAC) and adds the derivation snapshot
-    // columns. If 0029's drop loses its 48000 definition match it drops
+    // columns. If 0031's drop loses its 48000 definition match it drops
     // nothing (or the wrong CHECK) and every proportionally derived row
     // fails at the DB; if the snapshot columns vanish the sink upsert
     // fails. This test reads both migration files so either mutant
     // fails the suite.
     const MIGRATION: &str = include_str!("../../../migrations/0020_stream_play_ledger.sql");
     const DERIVATION: &str =
-        include_str!("../../../migrations/0029_meter_derivation_and_leases.sql");
+        include_str!("../../../migrations/0031_meter_derivation_and_leases.sql");
     let rate = ledger::STREAM_BYTES_PER_SEC.to_string();
     assert!(
         MIGRATION.contains(&format!("bytes_served / {rate}")),
-        "0020 must still spell the rate CHECK 0029 retires ({rate})"
+        "0020 must still spell the rate CHECK 0031 retires ({rate})"
     );
     assert!(
         DERIVATION.contains(&format!("'%{rate}%'")),
-        "0029 must find the rate CHECK by its {rate} definition"
+        "0031 must find the rate CHECK by its {rate} definition"
     );
     assert!(
         DERIVATION.contains("DROP CONSTRAINT"),
-        "0029 must drop the rate CHECK"
+        "0031 must drop the rate CHECK"
     );
     assert!(
         DERIVATION.contains("ADD COLUMN IF NOT EXISTS file_bytes"),
-        "0029 must add the file_bytes snapshot column"
+        "0031 must add the file_bytes snapshot column"
     );
     assert!(
         DERIVATION.contains("ADD COLUMN IF NOT EXISTS duration_ms"),
-        "0029 must add the duration_ms snapshot column"
+        "0031 must add the duration_ms snapshot column"
     );
     assert!(
         DERIVATION.contains("CREATE TABLE IF NOT EXISTS playback_leases ("),
-        "0029 must create the playback lease table"
+        "0031 must create the playback lease table"
     );
-    // 0030 restores the floor the retired rate CHECK implied: the
+    // 0032 restores the floor the retired rate CHECK implied: the
     // schema must refuse the zero-second rows `prepare_ledger_row`
     // refuses, or a non-prepare writer could persist unbilled plays.
-    const FLOOR: &str = include_str!("../../../migrations/0030_ledger_seconds_floor.sql");
+    const FLOOR: &str = include_str!("../../../migrations/0032_ledger_seconds_floor.sql");
     assert!(
         FLOOR.contains("'%stream_seconds >= 0%'"),
-        "0030 must find the zero-allowing range CHECK by its definition"
+        "0032 must find the zero-allowing range CHECK by its definition"
     );
     assert!(
         FLOOR.contains(&format!(
             "CHECK (stream_seconds >= 1 AND stream_seconds <= {})",
             ledger::MAX_STREAM_SECONDS_PER_ROW
         )),
-        "0030 must bound stream_seconds to [1, MAX_STREAM_SECONDS_PER_ROW]"
+        "0032 must bound stream_seconds to [1, MAX_STREAM_SECONDS_PER_ROW]"
     );
     // Literal pin: the fallback rate re-bills history, so drift is
     // deliberate only.

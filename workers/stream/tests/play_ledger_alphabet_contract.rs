@@ -450,7 +450,7 @@ fn valid_play_accounting_and_identity_binding_are_unchanged() {
         prepare_play_ledger_row(USER, TRACK, PLAY, 0, 0, AT),
         Err(LedgerError::Invalid)
     );
-    // Migration 0029 retired the nominal-rate equality: seconds are
+    // Migration 0031 retired the nominal-rate equality: seconds are
     // caller-derived (proportional derivation in the api ledger), so a
     // value the old rate would have rounded differently now prepares,
     // and only the decoupled per-row second cap still fails closed.
