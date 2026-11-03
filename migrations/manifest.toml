@@ -127,3 +127,8 @@ sha256 = "120a35f3515e0c48e1df882f1eed17bb5eed425d9d91bf5da8ec86ec1f9318af"
 file = "0026_plan_reseed_no_trial.sql"
 target = "app"
 sha256 = "b3668efdfd27bd81d9a9f86441c29925963943c30ed969303bd518af91f30b0c"
+
+[[migration]]
+file = "0027_posted_files.sql"
+target = "app"
+sha256 = "0cc1e99a7cb35858257b2eb41e4ca43984b39e72948d4ccc4d228691c583239a"

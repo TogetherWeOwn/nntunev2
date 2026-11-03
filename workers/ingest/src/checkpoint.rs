@@ -20,12 +20,20 @@
 //! judgement in their metadata, so a lost progress write only costs a
 //! re-adoption scan, never correctness — while the checkpoint key keeps
 //! its exactly-one-write-per-delivery discipline.
+//!
+//! Two-spool verification (stage B2.5, `two_spool::TwoSpoolProgress`) keeps
+//! its per-article resume state under a third key
+//! (`ingest:two-spool:<job_id>`, [`get_two_spool`]/[`put_two_spool`]) with
+//! the same single-writer discipline. Crash recovery re-reads the slots
+//! and `STAT`s/re-posts only the unsettled articles; the key carries
+//! indexes, never message-IDs.
 
 use worker::{Env, Result};
 
 use crate::jobs::{validate_job_id, JobCheckpoint, JobState};
 use crate::queue::QueueMsg;
 use crate::retry::redrive_checkpoint;
+use crate::two_spool::TwoSpoolProgress;
 use crate::verify::VerifyProgress;
 
 pub const STATE_KV_BINDING: &str = "INGEST_STATE";
@@ -202,6 +210,35 @@ pub async fn put_verify(env: &Env, job_id: &str, progress: &VerifyProgress) -> R
     put_json(env, key, &serde_json::to_string(progress)?).await
 }
 
+fn two_spool_key(job_id: &str) -> Option<String> {
+    validate_job_id(job_id).then(|| format!("ingest:two-spool:{job_id}"))
+}
+
+/// Load one job's two-spool (stage B2.5) resume state (see the module
+/// docs). A missing key means the round never started; the caller starts
+/// a fresh [`TwoSpoolProgress`](crate::two_spool::TwoSpoolProgress).
+pub async fn get_two_spool(env: &Env, job_id: &str) -> Result<Option<TwoSpoolProgress>> {
+    let key =
+        two_spool_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    let store = env.kv(STATE_KV_BINDING)?;
+    store
+        .get(&key)
+        .json::<TwoSpoolProgress>()
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))
+}
+
+/// Store one job's two-spool resume state. The consumer's two-spool step
+/// is the only writer, at most once per delivery, before the checkpoint
+/// persist of the same delivery — mirroring [`put_verify`]. Both funnel
+/// through [`put_json`], so the exactly-two-writers pin on the checkpoint
+/// key is untouched.
+pub async fn put_two_spool(env: &Env, job_id: &str, progress: &TwoSpoolProgress) -> Result<()> {
+    let key =
+        two_spool_key(job_id).ok_or_else(|| worker::Error::RustError("invalid job id".into()))?;
+    put_json(env, key, &serde_json::to_string(progress)?).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +385,10 @@ mod tests {
             Some("ingest:verify:job_01-a")
         );
         assert!(verify_key("../secret").is_none());
+        assert_eq!(
+            two_spool_key("job_01-a").as_deref(),
+            Some("ingest:two-spool:job_01-a")
+        );
+        assert!(two_spool_key("../secret").is_none());
     }
 }
