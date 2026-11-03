@@ -265,7 +265,8 @@ impl Par2Creator {
             pushed: 0,
             whole_md5: md5::Context::new(),
             first16k_md5: md5::Context::new(),
-            first16k_remaining: FIRST_16K_SPAN.min(usize::try_from(total_len).unwrap_or(usize::MAX)),
+            first16k_remaining: FIRST_16K_SPAN
+                .min(usize::try_from(total_len).unwrap_or(usize::MAX)),
             slice_md5: md5::Context::new(),
             slice_crc: crc32fast::Hasher::new(),
             ifsc: Vec::with_capacity(data_usize),
@@ -301,8 +302,7 @@ impl Par2Creator {
         }
         while !chunk.is_empty() {
             let take = (self.slice_size - self.slice_fill).min(chunk.len());
-            self.slice_buf[self.slice_fill..self.slice_fill + take]
-                .copy_from_slice(&chunk[..take]);
+            self.slice_buf[self.slice_fill..self.slice_fill + take].copy_from_slice(&chunk[..take]);
             self.slice_md5.consume(&chunk[..take]);
             self.slice_crc.update(&chunk[..take]);
             self.slice_fill += take;
@@ -359,8 +359,7 @@ impl Par2Creator {
             if factor == 0 {
                 continue;
             }
-            let acc_e =
-                &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
+            let acc_e = &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
             gf16::madd(acc_e, &self.slice_scratch, factor);
         }
 
@@ -545,7 +544,7 @@ pub fn recover_slices(
 
     Ok(missing
         .into_iter()
-        .zip(out.into_iter())
+        .zip(out)
         .map(|(i, w)| (i as u32, words_to_bytes(&w)))
         .collect())
 }

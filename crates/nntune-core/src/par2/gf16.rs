@@ -242,8 +242,12 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
     // Regroups alternating nibble lanes into [first-8 | second-8].
     static REGROUP: [u8; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
     // Keeps the low / high 8 lanes of a lookup result.
-    static KEEP_LO: [u8; 16] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
-    static KEEP_HI: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    static KEEP_LO: [u8; 16] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    static KEEP_HI: [u8; 16] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
     // Folds [A0..A7, B0..B7] to (A^B) in the low 8 lanes.
     static FOLD_HI_DOWN: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7];
     // Spreads 8 lane values to even (or, masked, odd) byte lanes.

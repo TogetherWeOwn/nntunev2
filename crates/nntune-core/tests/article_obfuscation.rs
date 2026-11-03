@@ -5,8 +5,8 @@
 //! message-IDs, ±6h date jitter, allow-list group picks), header render and
 //! parse-back (order, folding, brackets), fail-closed framing validation,
 //! single-part encode→decode at the full article payload size, a two-part
-//! multipart round trip, and a loopback POST against the synthetic NNTP
-//! server (post → STAT → fetch → decode, re-post duplicate, 440 toggle).
+//! multipart round trip, and a loopback POST against an inline fake server
+//! (post → STAT → fetch → decode, re-post duplicate, 440 toggle).
 //! All IDs, subjects, groups, and dates are synthetic placeholders. No real
 //! provider is contacted.
 
@@ -587,6 +587,258 @@ fn date_parser_agrees_with_known_weekday() {
     );
 }
 
+/// Minimal inline `POST`-capable fake NNTP server for the loopback test.
+///
+/// Kept inside this test file so the suite compiles and runs standalone:
+/// the shared `nntune-test-nntp` fake server answers retrieval commands
+/// only, so posting tests script their own transport (see `tests/post.rs`)
+/// or serve a loopback here. Speaks just enough NNTP — greeting,
+/// `MODE READER`, `AUTHINFO USER`, `POST` (`340`/`240`, `435` duplicate,
+/// `440` while disabled), `STAT` (`223`/`430`), `ARTICLE` (`220` + the
+/// dot-stuffed stored bytes, `430` when missing), `QUIT`. Received articles
+/// are dot-unstuffed on store, so fetching returns the posted bytes.
+#[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
+mod loopback {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    struct State {
+        /// `(bracketed message-ID, unstuffed article bytes)` in arrival order.
+        posted: Vec<(String, Vec<u8>)>,
+        posting_allowed: bool,
+    }
+
+    pub struct LoopbackServer {
+        addr: SocketAddr,
+        state: Arc<Mutex<State>>,
+    }
+
+    impl LoopbackServer {
+        pub async fn spawn() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let state = Arc::new(Mutex::new(State {
+                posted: Vec::new(),
+                posting_allowed: true,
+            }));
+            let serve = Arc::clone(&state);
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                serve_connection(stream, serve).await;
+            });
+            LoopbackServer { addr, state }
+        }
+
+        pub fn addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        pub async fn is_stored(&self, message_id: &str) -> bool {
+            let want = bracket(message_id);
+            self.state
+                .lock()
+                .await
+                .posted
+                .iter()
+                .any(|(id, _)| *id == want)
+        }
+
+        pub async fn posted_ids(&self) -> Vec<String> {
+            self.state
+                .lock()
+                .await
+                .posted
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        }
+
+        pub async fn set_posting_allowed(&self, allowed: bool) {
+            self.state.lock().await.posting_allowed = allowed;
+        }
+    }
+
+    fn bracket(id: &str) -> String {
+        let id = id.trim();
+        if id.starts_with('<') {
+            id.to_string()
+        } else {
+            format!("<{id}>")
+        }
+    }
+
+    fn message_id_of(raw: &[u8]) -> Option<String> {
+        let head_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(raw.len());
+        for line in String::from_utf8_lossy(&raw[..head_end]).split("\r\n") {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case("message-id") {
+                return Some(bracket(v.trim()));
+            }
+        }
+        None
+    }
+
+    async fn read_line(
+        lines: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        buf: &mut Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        buf.clear();
+        match lines.read_until(b'\n', buf).await {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                let mut line = buf.as_slice();
+                if line.ends_with(b"\n") {
+                    line = &line[..line.len() - 1];
+                    if line.ends_with(b"\r") {
+                        line = &line[..line.len() - 1];
+                    }
+                }
+                Some(line.to_vec())
+            }
+        }
+    }
+
+    async fn serve_connection(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader);
+        let mut buf = Vec::new();
+        writer.write_all(b"200 loopback ready\r\n").await.ok();
+        loop {
+            let Some(raw_line) = read_line(&mut lines, &mut buf).await else {
+                break;
+            };
+            let text = String::from_utf8_lossy(&raw_line);
+            let (cmd, arg) = match text.find(' ') {
+                Some(i) => (
+                    text[..i].to_ascii_uppercase(),
+                    text[i + 1..].trim().to_string(),
+                ),
+                None => (text.to_ascii_uppercase(), String::new()),
+            };
+            match cmd.as_str() {
+                "MODE" => {
+                    writer.write_all(b"500 no\r\n").await.ok();
+                }
+                "AUTHINFO" => {
+                    writer.write_all(b"281 ok\r\n").await.ok();
+                }
+                "POST" => {
+                    if !state.lock().await.posting_allowed {
+                        writer.write_all(b"440 Posting not allowed\r\n").await.ok();
+                        continue;
+                    }
+                    writer.write_all(b"340 Send article\r\n").await.ok();
+                    let mut raw = Vec::new();
+                    loop {
+                        let Some(line) = read_line(&mut lines, &mut buf).await else {
+                            break;
+                        };
+                        if line == b"." {
+                            break;
+                        }
+                        // Dot-unstuff: strip one dot from any dotted line.
+                        let start = usize::from(line.first() == Some(&b'.'));
+                        raw.extend_from_slice(&line[start..]);
+                        raw.extend_from_slice(b"\r\n");
+                    }
+                    if raw.is_empty() {
+                        writer.write_all(b"441 Posting failed\r\n").await.ok();
+                        continue;
+                    }
+                    let id = message_id_of(&raw)
+                        .unwrap_or_else(|| format!("<posted-{}@loopback.test>", raw.len()));
+                    let mut st = state.lock().await;
+                    if st.posted.iter().any(|(existing, _)| *existing == id) {
+                        writer
+                            .write_all(format!("435 Duplicate article {id}\r\n").as_bytes())
+                            .await
+                            .ok();
+                    } else {
+                        st.posted.push((id.clone(), raw));
+                        writer
+                            .write_all(format!("240 Article received {id}\r\n").as_bytes())
+                            .await
+                            .ok();
+                    }
+                }
+                "STAT" => {
+                    let st = state.lock().await;
+                    let found = st
+                        .posted
+                        .iter()
+                        .position(|(existing, _)| *existing == bracket(&arg))
+                        .map(|i| i + 1);
+                    match found {
+                        Some(n) => {
+                            writer
+                                .write_all(format!("223 {n} {}\r\n", bracket(&arg)).as_bytes())
+                                .await
+                                .ok();
+                        }
+                        None => {
+                            writer.write_all(b"430 No such article\r\n").await.ok();
+                        }
+                    }
+                }
+                "ARTICLE" => {
+                    let found = {
+                        let st = state.lock().await;
+                        st.posted
+                            .iter()
+                            .position(|(existing, _)| *existing == bracket(&arg))
+                            .map(|i| (i + 1, st.posted[i].clone()))
+                    };
+                    match found {
+                        Some((n, (id, raw))) => {
+                            writer
+                                .write_all(format!("220 {n} {id}\r\n").as_bytes())
+                                .await
+                                .ok();
+                            // Dot-stuff on serve so the client's
+                            // dot-unstuffing restores the stored bytes.
+                            let mut segs: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
+                            if segs.last() == Some(&b"".as_slice()) {
+                                segs.pop();
+                            }
+                            for seg in segs {
+                                let seg = seg.strip_suffix(b"\r").unwrap_or(seg);
+                                if seg.starts_with(b".") {
+                                    writer.write_all(b".").await.ok();
+                                }
+                                writer.write_all(seg).await.ok();
+                                writer.write_all(b"\r\n").await.ok();
+                            }
+                            writer.write_all(b".\r\n").await.ok();
+                        }
+                        None => {
+                            writer.write_all(b"430 No such article\r\n").await.ok();
+                        }
+                    }
+                }
+                "QUIT" => {
+                    writer.write_all(b"205 Bye\r\n").await.ok();
+                    break;
+                }
+                _ => {
+                    writer.write_all(b"500 Unknown command\r\n").await.ok();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
 #[tokio::test]
 async fn loopback_post_stat_fetch_and_duplicate() {
@@ -594,9 +846,10 @@ async fn loopback_post_stat_fetch_and_duplicate() {
 
     use nntune_core::nntp::{NntpClient, NntpConfig, PostOutcome};
     use nntune_core::transports::connect_native;
-    use nntune_test_nntp::TestNntpServer;
 
-    let server = TestNntpServer::spawn_for_test().await;
+    use self::loopback::LoopbackServer;
+
+    let server = LoopbackServer::spawn().await;
     let config = NntpConfig {
         host: "127.0.0.1".into(),
         port: server.addr().port(),

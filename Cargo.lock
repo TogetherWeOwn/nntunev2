@@ -917,7 +917,6 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "md5",
- "nntune-test-nntp",
  "quick-xml",
  "rustls",
  "sha2",
