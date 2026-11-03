@@ -8,8 +8,10 @@
 -- Scope: first acquire lands at epoch 1; same-session re-acquire
 -- replaces the track and bumps the epoch; another session facing a
 -- live lease gets zero rows (the 429); takeover and post-expiry
--- acquires bump the epoch; the touch extends only the exact holder;
--- ever-paid distinguishes paid-once from never-paid.
+-- acquires bump the epoch; the touch extends only the exact holder
+-- and never shortens a stored deadline (out-of-order heartbeats);
+-- both writers refuse a deleting account; ever-paid distinguishes
+-- paid-once from never-paid.
 
 BEGIN;
 
@@ -21,7 +23,7 @@ VALUES ('pls-user', 'pls-user@example.com', 1000),
 -- First acquire: epoch 1.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    VALUES ('pls-user', 'sess-1', 'track-1', 'play-1', 1, 2000, 1955)
+    SELECT 'pls-user', 'sess-1', 'track-1', 'play-1', 1, 2000, 1955 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1955 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -31,7 +33,7 @@ SELECT epoch INTO TEMP TABLE pls_got1 FROM got;
 -- Same session, new track (queue advance): replaces, epoch 2.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    VALUES ('pls-user', 'sess-1', 'track-2', 'play-2', 1, 2010, 1965)
+    SELECT 'pls-user', 'sess-1', 'track-2', 'play-2', 1, 2010, 1965 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1965 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -41,7 +43,7 @@ SELECT epoch INTO TEMP TABLE pls_got2 FROM got;
 -- Another session against the live lease, no takeover: zero rows.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    VALUES ('pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975)
+    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -51,7 +53,7 @@ SELECT count(*) AS n INTO TEMP TABLE pls_got3 FROM got;
 -- Same other session WITH takeover: epoch 3, holder changes.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    VALUES ('pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975)
+    SELECT 'pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR TRUE
     RETURNING epoch
@@ -60,24 +62,34 @@ SELECT epoch INTO TEMP TABLE pls_got4 FROM got;
 
 -- Touch by the displaced holder (stale epoch): zero rows.
 WITH touched AS (
-    UPDATE playback_leases SET expires_at = 2100, updated_at = 1980
-    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
+    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
 
 -- Touch by the current holder: extends.
 WITH touched AS (
-    UPDATE playback_leases SET expires_at = 2100, updated_at = 1980
-    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     RETURNING expires_at
 )
 SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
 
+-- Out-of-order touch by the current holder (older deadline 2050,
+-- arriving after the 2100 write): still matches the holder, but the
+-- stored deadline must not shorten.
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2050), updated_at = GREATEST(playback_leases.updated_at, 1970)
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    RETURNING expires_at
+)
+SELECT expires_at INTO TEMP TABLE pls_touch_reordered FROM touched;
+
 -- After expiry (now past 2100) a third session acquires: epoch 4.
 WITH got AS (
     INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
-    VALUES ('pls-user', 'sess-3', 'track-4', 'play-4', 1, 2200, 2155)
+    SELECT 'pls-user', 'sess-3', 'track-4', 'play-4', 1, 2200, 2155 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
     ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
     WHERE playback_leases.expires_at <= 2155 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
     RETURNING epoch
@@ -94,6 +106,28 @@ VALUES ('pls-never', 'sub_pls_never', 'cus_pls_never', 'si_pls_never',
         'price_pls', 'plus', 'incomplete', NULL),
        ('pls-lapsed', 'sub_pls_lapsed', 'cus_pls_lapsed', 'si_pls_lapsed',
         'price_pls', 'plus', 'canceled', TIMESTAMPTZ '2026-01-01 00:00:00+00');
+
+-- Deletion fence: once the account is deleting, both writers refuse
+-- (zero rows, stored lease unchanged) even for an otherwise-valid
+-- post-expiry acquire and the exact holder's touch.
+UPDATE users SET deleting_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'
+WHERE id = 'pls-user';
+
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    SELECT 'pls-user', 'sess-4', 'track-5', 'play-5', 1, 2300, 2255 WHERE EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 2255 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
+    RETURNING epoch
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_acquire_deleting FROM got;
+
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2400), updated_at = GREATEST(playback_leases.updated_at, 2260)
+    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4 AND EXISTS (SELECT 1 FROM users WHERE id = 'pls-user' AND deleting_at IS NULL)
+    RETURNING expires_at
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_touch_deleting FROM touched;
 
 DO $$
 BEGIN
@@ -114,6 +148,15 @@ BEGIN
     END IF;
     IF (SELECT expires_at FROM pls_touch_ok) <> 2100 THEN
         RAISE EXCEPTION 'holder touch must extend the lease';
+    END IF;
+    IF (SELECT expires_at FROM pls_touch_reordered) <> 2100 THEN
+        RAISE EXCEPTION 'out-of-order touch must not shorten the stored deadline';
+    END IF;
+    IF (SELECT n FROM pls_acquire_deleting) <> 0 THEN
+        RAISE EXCEPTION 'acquire must refuse a deleting account (zero rows)';
+    END IF;
+    IF (SELECT n FROM pls_touch_deleting) <> 0 THEN
+        RAISE EXCEPTION 'touch must refuse a deleting account (zero rows)';
     END IF;
     IF (SELECT epoch FROM pls_got5) <> 4 THEN
         RAISE EXCEPTION 'post-expiry acquire must bump the epoch';
