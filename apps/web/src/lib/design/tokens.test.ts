@@ -91,10 +91,29 @@ for (const block of topBlocks(css)) {
 	}
 }
 
-// Same cascade the browser applies: plain roots in file order (dark
-// defaults), then the light overlays, then the forced-appearance wins.
+// Same cascades the browser applies: plain roots in file order (dark
+// defaults), then the light overlays. The attribute override wins over the
+// media query, so attribute-light resolves with or without a light OS;
+// system-light (no attribute, light OS — the default path) resolves from
+// the media block alone. Gating only the merged `light` once masked a token
+// missing from the media block, so both cascades resolve and both are gated.
 const dark = resolveAll([...plain, ...attrDark]);
 const light = resolveAll([...plain, ...mediaLight, ...attrLight]);
+const systemLight = resolveAll([...plain, ...mediaLight]);
+
+/**
+ * Dark pairs gate one cascade; light pairs gate both the
+ * explicit-attribute cascade and the system (media-query-only) cascade,
+ * so a token missing from either block fails instead of falling through
+ * to the dark default unseen.
+ */
+function themesFor(label: string): Array<[string, VarMap]> {
+	if (label.startsWith('dark')) return [['dark', dark]];
+	return [
+		['attribute-light', light],
+		['system-light', systemLight]
+	];
+}
 
 const roots = plain;
 
@@ -134,6 +153,7 @@ describe('design tokens: protected nine', () => {
 			expect(roots[0].get(name), `original :root ${name}`).toBe(values.dark);
 			expect(dark.get(name), `resolved dark ${name}`).toBe(values.dark);
 			expect(light.get(name), `resolved light ${name}`).toBe(values.light);
+			expect(systemLight.get(name), `resolved system-light ${name}`).toBe(values.light);
 		});
 	}
 });
@@ -169,12 +189,22 @@ describe('design tokens: new layer presence', () => {
 		]) {
 			expect(dark.get(name), `dark ${name}`).toMatch(/\S/);
 			expect(light.get(name), `light ${name}`).toMatch(/\S/);
+			expect(systemLight.get(name), `system-light ${name}`).toMatch(/\S/);
+		}
+	});
+
+	it('system-light and attribute-light resolve identically (no media/attribute divergence)', () => {
+		const keys = new Set([...light.keys(), ...systemLight.keys()]);
+		expect(keys.size, 'resolved token count').toBeGreaterThan(0);
+		for (const key of keys) {
+			expect(systemLight.get(key), `system-light ${key}`).toBe(light.get(key));
 		}
 	});
 
 	it('focus ring resolves to the accent color with fixed geometry', () => {
 		expect(dark.get('--nt-focus-ring')).toBe(dark.get('--nt-accent'));
 		expect(light.get('--nt-focus-ring')).toBe(light.get('--nt-accent'));
+		expect(systemLight.get('--nt-focus-ring')).toBe(systemLight.get('--nt-accent'));
 		expect(dark.get('--nt-focus-ring-width')).toBe('2px');
 		expect(dark.get('--nt-focus-ring-offset')).toBe('2px');
 	});
@@ -299,11 +329,13 @@ describe('design tokens: contrast gates', () => {
 	];
 	for (const [label, fg, bg] of textPairs) {
 		it(`text ${label} meets 4.5:1`, () => {
-			const theme = label.startsWith('dark') ? dark : light;
-			const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
-			expect(ratio, `${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(
-				4.5
-			);
+			for (const [themeLabel, theme] of themesFor(label)) {
+				const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
+				expect(
+					ratio,
+					`${themeLabel} ${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`
+				).toBeGreaterThanOrEqual(4.5);
+			}
 		});
 	}
 
@@ -319,11 +351,13 @@ describe('design tokens: contrast gates', () => {
 	];
 	for (const [label, fg, bg] of focusPairs) {
 		it(`focus ${label} meets 3:1`, () => {
-			const theme = label.startsWith('dark') ? dark : light;
-			const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
-			expect(ratio, `${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(
-				3
-			);
+			for (const [themeLabel, theme] of themesFor(label)) {
+				const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
+				expect(
+					ratio,
+					`${themeLabel} ${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`
+				).toBeGreaterThanOrEqual(3);
+			}
 		});
 	}
 
@@ -339,11 +373,13 @@ describe('design tokens: contrast gates', () => {
 	];
 	for (const [label, fg, bg] of graphicPairs) {
 		it(`graphic ${label} meets 3:1 (never body text alone)`, () => {
-			const theme = label.startsWith('dark') ? dark : light;
-			const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
-			expect(ratio, `${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(
-				3
-			);
+			for (const [themeLabel, theme] of themesFor(label)) {
+				const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
+				expect(
+					ratio,
+					`${themeLabel} ${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`
+				).toBeGreaterThanOrEqual(3);
+			}
 		});
 	}
 });
