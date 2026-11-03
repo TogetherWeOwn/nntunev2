@@ -335,6 +335,18 @@ async fn repost_of_hidden_id_repairs_instead_of_duplicating() {
     let before = c.cmd("GROUP alt.binaries.nntune.test").await;
     assert!(before.starts_with("211"), "pre-hide GROUP: {before:?}");
     let count_before: u64 = before.split_whitespace().nth(1).unwrap().parse().unwrap();
+    // The fixture's original article number, for the stale-number check below.
+    let (rx_first, rx_block) = c.cmd_block("XOVER 1-").await;
+    assert!(rx_first.starts_with("224"), "got {rx_first:?}");
+    let number: u32 = String::from_utf8_lossy(&rx_block)
+        .lines()
+        .find(|l| l.contains(id))
+        .expect("fixture in XOVER")
+        .split('\t')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     server.hide(id).await;
     let reply = c
@@ -364,6 +376,10 @@ async fn repost_of_hidden_id_repairs_instead_of_duplicating() {
         .filter(|l| l.contains(id))
         .count();
     assert_eq!(hits, 1, "repaired ID listed {hits}x");
+    // The fixture's original number retires with it: a numeric lookup of the
+    // stale number is 430, pinning the `find_visible_by_number` shadowing.
+    let stale = c.cmd(&format!("STAT {number}")).await;
+    assert!(stale.starts_with("430"), "stale number resolves: {stale:?}");
     // The repaired bytes are stored once and served back.
     assert_eq!(server.posted_count().await, 1);
     let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
