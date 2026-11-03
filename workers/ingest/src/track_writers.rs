@@ -1,4 +1,5 @@
-//! `tracks` + `track_sources` writers: pure statements (migration 0022).
+//! `tracks` + `track_sources` writers: pure statements (migrations
+//! 0022/0027 — 0027 globalises `track_sources` to one slot per track).
 //!
 //! Pipeline position: the `Writing` step runs after `Matching` (and after
 //! `Transcoding` in the B6 pipeline — `track_media` rows key on `track_id`,
@@ -50,27 +51,31 @@
 //! `nzb_ref_payload_format` number alongside the sealed payload shape. The
 //! wire-up binds this module's [`TrackSourceParams`] from that mint output.
 //!
-//! Both statements select through the standard `writer_fence` (the owner's
-//! `users` row `FOR SHARE` while `deleting_at IS NULL`, ADR 0002 rule 3),
-//! so no track row appears after deletion is scheduled. `tracks` carries no
-//! user identity, so its fence owner (`$6`) is bound but not inserted — it
-//! gates the write without becoming a column. `tracks.id` is likewise not
-//! bound: the surrogate is DB-owned (`gen_random_uuid()`), the writer
-//! declares the natural key `(release_id, medium_no, track_no)`, and the
-//! wire-up re-selects the id ([`select_track_id_by_position_sql`]).
+//! Both statements select through the publishing-job `writer_fence` (the
+//! `ingest_jobs` row `FOR SHARE`, ADR 0002 rule 3), so no track row appears
+//! for a job that was never persisted or has since been removed. Neither
+//! table carries user identity, so the fence job (`$6` for tracks, `$2` for
+//! sources) is bound but — for tracks — not inserted: it gates the write
+//! without becoming a column. (Sources insert their fence job as
+//! `source_job_id`; the fence additionally proves the referenced row
+//! exists.) The wire-up must bind a `validate_job_id`-checked job id and
+//! must have persisted the `ingest_jobs` row first — an unpersisted job id
+//! fences the write to zero rows. `tracks.id` is likewise not bound: the
+//! surrogate is DB-owned (`gen_random_uuid()`), the writer declares the
+//! natural key `(release_id, medium_no, track_no)`, and the wire-up
+//! re-selects the id ([`select_track_id_by_position_sql`]).
 //! `duration_ms` stays NULL — no probe stage measures audio length yet.
 //!
 //! Both conflict targets are `DO NOTHING` (first writer wins): the rows are
-//! cross-user shared (`tracks`) or per-user single-slot (`track_sources`
-//! PK `(user_id, track_id)`), MB-derived values are stable so honest
-//! replays are identical either way, and a divergent later write is a
-//! pipeline bug that must not flap a shared row. A zero-row write is either
-//! a benign replay or a fenced account; the consumer separates them with
+//! cross-user shared (`tracks`) or a single global slot per track
+//! (`track_sources` PK `(track_id)`), MB-derived values are stable so
+//! honest replays are identical either way, and a divergent later write is
+//! a pipeline bug that must not flap a shared row. A zero-row write is
+//! either a benign replay or a fenced job; the consumer separates them with
 //! the PK selects plus [`classify_track_zero_rows`], never by assuming.
 
 use nntune_core::nzb::File;
 
-use crate::dispatch::validate_user_id;
 use crate::jobs::validate_job_id;
 use crate::matching::MbRecording;
 use crate::queue::validate_mbid;
@@ -258,28 +263,28 @@ pub fn validate_track_row(row: &TrackRow) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// `$n` parameter order for [`upsert_track_sql`]. `user_id` ($6) is the
-/// fence owner only — bound, never inserted.
+/// `$n` parameter order for [`upsert_track_sql`]. `source_job_id` ($6) is
+/// the publishing job the fence holds — bound, never inserted.
 pub const TRACK_INSERT_PARAM_ORDER: [&str; 6] = [
     "mbid",
     "release_id",
     "title",
     "medium_no",
     "track_no",
-    "user_id",
+    "source_job_id",
 ];
 
 /// Idempotent `tracks` write for one backed pair. `id` is DB-owned (the
 /// `gen_random_uuid()` default) and `duration_ms` stays NULL, so neither
 /// is bound. `ON CONFLICT (release_id, medium_no, track_no) DO NOTHING`:
 /// the natural key is the convergence point, first writer wins, and every
-/// replay converges. A zero-row write is a benign replay or a fenced
-/// account; the consumer separates them with
+/// replay converges. A zero-row write is a benign replay or a fenced job;
+/// the consumer separates them with
 /// [`select_track_id_by_position_sql`] plus [`classify_track_zero_rows`].
 /// UUID parameters cast through text so `tokio_postgres` accepts Rust
 /// strings; positions bind as `i32` to match the `INTEGER` columns.
 pub fn upsert_track_sql() -> &'static str {
-    "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
+    "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM ingest_jobs WHERE id = $6 FOR SHARE) AS writer_fence ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
 }
 
 /// Fetch the track id after an [`upsert_track_sql`] write, by the natural
@@ -291,7 +296,7 @@ pub fn select_track_id_by_position_sql() -> &'static str {
 }
 
 /// One `track_sources` row's bound values, in
-/// [`TRACK_SOURCE_PARAM_ORDER`] (`$1`..=`$10`) order. The edge executor
+/// [`TRACK_SOURCE_PARAM_ORDER`] (`$1`..=`$9`) order. The edge executor
 /// binds exactly these values in field order; keeping the projection here
 /// lets the order be unit-tested without a database. `indexer_id` is `None`
 /// until the `indexers` table lands (see the module docs); the envelope
@@ -299,7 +304,6 @@ pub fn select_track_id_by_position_sql() -> &'static str {
 /// reuse, never from a local mint (spec §7: KEK never in ingest).
 #[derive(Clone, PartialEq, Eq)]
 pub struct TrackSourceParams<'a> {
-    pub user_id: &'a str,
     pub track_id: &'a str,
     pub source_job_id: &'a str,
     pub indexer_id: Option<&'a str>,
@@ -318,7 +322,6 @@ pub struct TrackSourceParams<'a> {
 impl std::fmt::Debug for TrackSourceParams<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrackSourceParams")
-            .field("user_id", &self.user_id)
             .field("track_id", &self.track_id)
             .field("source_job_id", &self.source_job_id)
             .field("indexer_id", &self.indexer_id)
@@ -344,9 +347,6 @@ impl std::fmt::Debug for TrackSourceParams<'_> {
 /// the format number alongside the sealed payload shape, and an invented
 /// allowlist here would break that contract.
 pub fn validate_track_source_params(params: &TrackSourceParams) -> Result<(), &'static str> {
-    if !validate_user_id(params.user_id) {
-        return Err("user id must be 1..=128 chars without ':' or NUL");
-    }
     if !validate_mbid(params.track_id) {
         return Err("track id must be canonical 8-4-4-4-12 hex");
     }
@@ -378,8 +378,7 @@ pub fn validate_track_source_params(params: &TrackSourceParams) -> Result<(), &'
 
 /// `$n` parameter order for [`upsert_track_source_sql`]. The envelope
 /// version is a SQL literal (`2`), not a parameter.
-pub const TRACK_SOURCE_PARAM_ORDER: [&str; 10] = [
-    "user_id",
+pub const TRACK_SOURCE_PARAM_ORDER: [&str; 9] = [
     "track_id",
     "source_job_id",
     "indexer_id",
@@ -391,24 +390,24 @@ pub const TRACK_SOURCE_PARAM_ORDER: [&str; 10] = [
     "nzb_ref_payload_format",
 ];
 
-/// Idempotent `track_sources` write: one provenance slot per
-/// `(user_id, track_id)`, job-bound. The envelope version is the `2`
+/// Idempotent `track_sources` write: one global provenance slot per
+/// `track_id`, published by the fence job. The envelope version is the `2`
 /// literal: only v2 mint output is bindable, never a caller-supplied
-/// version. `ON CONFLICT (user_id, track_id) DO NOTHING` — first
-/// provenance wins, every replay converges. A zero-row write is a benign
-/// replay or a fenced account; the consumer separates them with
+/// version. `ON CONFLICT (track_id) DO NOTHING` — first provenance wins,
+/// every replay converges. A zero-row write is a benign replay or a fenced
+/// job; the consumer separates them with
 /// [`select_track_source_by_pk_sql`] plus [`classify_track_zero_rows`].
 /// UUID parameters cast through text for string bindings; the cast keeps
 /// a nullable `indexer_id` as NULL.
 pub fn upsert_track_source_sql() -> &'static str {
-    "INSERT INTO track_sources (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id) DO NOTHING"
+    "INSERT INTO track_sources (track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) SELECT $1::text::uuid, $2, $3::text::uuid, $4, 2, $5, $6, $7, $8, $9 FROM (SELECT id FROM ingest_jobs WHERE id = $2 FOR SHARE) AS writer_fence ON CONFLICT (track_id) DO NOTHING"
 }
 
 /// Fetch the source row after a zero-row [`upsert_track_source_sql`]
-/// write so the consumer can separate a benign replay from a fenced
-/// account. Parameters: `user_id` ($1), `track_id` ($2).
+/// write so the consumer can separate a benign replay from a fenced job.
+/// Parameter: `track_id` ($1).
 pub fn select_track_source_by_pk_sql() -> &'static str {
-    "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2::text::uuid"
+    "SELECT track_id FROM track_sources WHERE track_id = $1::text::uuid"
 }
 
 /// Outcome of one fenced idempotent track write.
@@ -419,9 +418,9 @@ pub enum TrackWriteOutcome {
     /// Zero rows but the row exists: a redelivery converged on the
     /// already-written row.
     Duplicate,
-    /// Zero rows and no row exists: the owner's fence refused the
-    /// write (account deleting or erased). Permanent.
-    AccountDeleting,
+    /// Zero rows and no row exists: the fence refused the write (the
+    /// publishing job is gone — never persisted, or removed). Permanent.
+    FenceRefused,
 }
 
 /// Classify a zero-row fenced track write by whether the PK select found
@@ -431,7 +430,7 @@ pub const fn classify_track_zero_rows(row_exists: bool) -> TrackWriteOutcome {
     if row_exists {
         TrackWriteOutcome::Duplicate
     } else {
-        TrackWriteOutcome::AccountDeleting
+        TrackWriteOutcome::FenceRefused
     }
 }
 
@@ -470,7 +469,7 @@ mod tests {
             upsert_track_sql(),
             "INSERT INTO tracks (mbid, release_id, title, medium_no, track_no) \
              SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 \
-             FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
+             FROM (SELECT id FROM ingest_jobs WHERE id = $6 FOR SHARE) AS writer_fence \
              ON CONFLICT (release_id, medium_no, track_no) DO NOTHING"
         );
         assert_eq!(
@@ -481,17 +480,17 @@ mod tests {
                 "title",
                 "medium_no",
                 "track_no",
-                "user_id"
+                "source_job_id"
             ]
         );
         let sql = upsert_track_sql();
-        // The fence binds the owner ($6) even though tracks carries no user
-        // identity: the owner gates the write without becoming a column.
-        // Dropping the marker check, the lock, or the in-statement join
-        // fails here (ADR 0002 rule 3).
+        // The fence binds the publishing job ($6) even though tracks
+        // carries no job column: the job gates the write without becoming
+        // one. Dropping the marker check, the lock, or the in-statement
+        // join fails here (ADR 0002 rule 3).
         assert!(
             sql.contains(
-                "SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM users WHERE id = $6 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+                "SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM ingest_jobs WHERE id = $6 FOR SHARE) AS writer_fence"
             ),
             "{sql}"
         );
@@ -519,15 +518,14 @@ mod tests {
     fn track_source_insert_shape_is_pinned() {
         assert_eq!(
             upsert_track_source_sql(),
-            "INSERT INTO track_sources (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) \
-             SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 \
-             FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence \
-             ON CONFLICT (user_id, track_id) DO NOTHING"
+            "INSERT INTO track_sources (track_id, source_job_id, indexer_id, nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, nzb_ref_payload_format) \
+             SELECT $1::text::uuid, $2, $3::text::uuid, $4, 2, $5, $6, $7, $8, $9 \
+             FROM (SELECT id FROM ingest_jobs WHERE id = $2 FOR SHARE) AS writer_fence \
+             ON CONFLICT (track_id) DO NOTHING"
         );
         assert_eq!(
             TRACK_SOURCE_PARAM_ORDER,
             [
-                "user_id",
                 "track_id",
                 "source_job_id",
                 "indexer_id",
@@ -542,7 +540,7 @@ mod tests {
         let sql = upsert_track_source_sql();
         assert!(
             sql.contains(
-                "SELECT $1, $2::text::uuid, $3, $4::text::uuid, $5, 2, $6, $7, $8, $9, $10 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+                "SELECT $1::text::uuid, $2, $3::text::uuid, $4, 2, $5, $6, $7, $8, $9 FROM (SELECT id FROM ingest_jobs WHERE id = $2 FOR SHARE) AS writer_fence"
             ),
             "{sql}"
         );
@@ -552,13 +550,26 @@ mod tests {
         // The envelope version is a literal, never a caller value: only v2
         // mint output is bindable.
         assert!(sql.contains("nzb_ref_envelope_version"), "{sql}");
-        assert!(sql.contains(", $5, 2, $6,"), "{sql}");
-        // One provenance slot per (user, track): first job wins, replays
+        assert!(sql.contains(", $4, 2, $5,"), "{sql}");
+        // One global provenance slot per track: first job wins, replays
         // converge.
-        assert!(
-            sql.contains("ON CONFLICT (user_id, track_id) DO NOTHING"),
-            "{sql}"
-        );
+        assert!(sql.contains("ON CONFLICT (track_id) DO NOTHING"), "{sql}");
+    }
+
+    #[test]
+    fn no_statement_mentions_user_id() {
+        // track_sources is global (migration 0027): no statement in this
+        // module may name the removed owner column. The fence holds the
+        // publishing job, never a users row.
+        for sql in [
+            upsert_track_sql(),
+            upsert_track_source_sql(),
+            select_track_id_by_position_sql(),
+            select_track_source_by_pk_sql(),
+        ] {
+            assert!(!sql.contains("user_id"), "{sql}");
+            assert!(!sql.contains("users"), "{sql}");
+        }
     }
 
     #[test]
@@ -569,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             select_track_source_by_pk_sql(),
-            "SELECT user_id, track_id FROM track_sources WHERE user_id = $1 AND track_id = $2::text::uuid"
+            "SELECT track_id FROM track_sources WHERE track_id = $1::text::uuid"
         );
     }
 
@@ -577,7 +588,7 @@ mod tests {
     fn zero_rows_classify_by_row_existence() {
         assert_eq!(
             classify_track_zero_rows(false),
-            TrackWriteOutcome::AccountDeleting
+            TrackWriteOutcome::FenceRefused
         );
         assert_eq!(classify_track_zero_rows(true), TrackWriteOutcome::Duplicate);
     }
@@ -929,7 +940,7 @@ mod tests {
         }
     }
 
-    // No constructor helper: ten fields would trip clippy's
+    // No constructor helper: nine fields would trip clippy's
     // too_many_arguments, so tests build one `base` literal and mutate it
     // per case with struct-update syntax.
 
@@ -940,7 +951,6 @@ mod tests {
         let wrapped = [0u8; ENVELOPE_WRAPPED_DEK_BYTES];
         let payload_nonce = [1u8; ENVELOPE_NONCE_BYTES];
         let params = TrackSourceParams {
-            user_id: "user_01",
             track_id: REC1,
             source_job_id: "job_0123456789abcdef",
             indexer_id: None,
@@ -952,7 +962,6 @@ mod tests {
             nzb_ref_payload_format: 1,
         };
         // Field order is the `$n` binding order in TRACK_SOURCE_PARAM_ORDER.
-        assert_eq!(params.user_id, "user_01");
         assert_eq!(params.track_id, REC1);
         assert_eq!(params.source_job_id, "job_0123456789abcdef");
         assert_eq!(params.indexer_id, None);
@@ -962,7 +971,7 @@ mod tests {
         assert_eq!(params.nzb_ref_dek_wrapped, wrapped.as_slice());
         assert_eq!(params.nzb_ref_payload_nonce, payload_nonce.as_slice());
         assert_eq!(params.nzb_ref_payload_format, 1);
-        assert_eq!(TRACK_SOURCE_PARAM_ORDER.len(), 10);
+        assert_eq!(TRACK_SOURCE_PARAM_ORDER.len(), 9);
         assert!(validate_track_source_params(&params).is_ok());
         // A UUID indexer binds once the indexers table lands; today the
         // wire-up passes None.
@@ -981,7 +990,6 @@ mod tests {
         let wrapped = [0u8; ENVELOPE_WRAPPED_DEK_BYTES];
         let payload_nonce = [1u8; ENVELOPE_NONCE_BYTES];
         let base = TrackSourceParams {
-            user_id: "user_01",
             track_id: REC1,
             source_job_id: "job_0123456789abcdef",
             indexer_id: None,
@@ -994,18 +1002,6 @@ mod tests {
         };
         assert!(validate_track_source_params(&base).is_ok());
         // Each case mutates one field; the message names the bad field.
-        let long_user = "u".repeat(129);
-        for user in ["", long_user.as_str(), "has:colon"] {
-            let params = TrackSourceParams {
-                user_id: user,
-                ..base.clone()
-            };
-            assert_eq!(
-                validate_track_source_params(&params),
-                Err("user id must be 1..=128 chars without ':' or NUL"),
-                "{user:?}"
-            );
-        }
         for (params, reason) in [
             (
                 TrackSourceParams {
@@ -1104,7 +1100,6 @@ mod tests {
         let wrapped = [0xABu8; ENVELOPE_WRAPPED_DEK_BYTES];
         let payload_nonce = [0xABu8; ENVELOPE_NONCE_BYTES];
         let params = TrackSourceParams {
-            user_id: "user_01",
             track_id: REC1,
             source_job_id: "job_0123456789abcdef",
             indexer_id: None,
@@ -1116,7 +1111,7 @@ mod tests {
             nzb_ref_payload_format: 1,
         };
         let dumped = format!("{params:?}");
-        assert!(dumped.contains("user_01"), "{dumped}");
+        assert!(dumped.contains("job_0123456789abcdef"), "{dumped}");
         assert!(dumped.contains(REC1), "{dumped}");
         assert!(!dumped.contains("171"), "sealed byte leaked: {dumped}");
         assert!(dumped.contains("nzb_ref_encrypted_len"), "{dumped}");
