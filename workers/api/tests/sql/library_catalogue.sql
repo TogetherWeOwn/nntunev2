@@ -487,11 +487,15 @@ BEGIN
     END IF;
 
     -- Track collection (`tracks_list_statement` shape): release, then true
-    -- album position, scoped to the member release ($1) and recording ($2)
-    -- arrays. The probe is still a SUPERSET — the (second release, Track
-    -- Two) row has no (dddddddd, 22222222) member pair for user-lib-1 (job
-    -- F pairs dddddddd with 11111111 only), so the store's exact-pair
-    -- retention drops it after the probe.
+    -- album position, joining the member pairs ($1, $2) as aligned unnest
+    -- columns so each pair binds one exact (release, recording) join key.
+    -- The columns below are user-lib-1's distinct normalized pairs in
+    -- `member_pair_columns` order (job E's uppercase release merges with
+    -- job A's; job B's unknown release matches no mirror row). The
+    -- (second release, Track Two) row has no (dddddddd, 22222222) member
+    -- pair (job F pairs dddddddd with 11111111 only), so the join never
+    -- returns it — unlike the old independent-ANY probe, nothing is left
+    -- for a post-filter to drop.
     -- (track_no is SMALLINT: cast to text so the TEXT[] accumulator matches.)
     SELECT array_agg(track_no::text ORDER BY release_mbid, medium_no, track_no) INTO actual FROM (
         SELECT t.release_mbid::text AS release_mbid, t.recording_mbid::text AS recording_mbid,
@@ -500,11 +504,12 @@ BEGIN
         FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid
         JOIN mb_release r ON r.mbid = t.release_mbid
         LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid
-        WHERE t.release_mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[])
-          AND t.recording_mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444}'::uuid[])
+        JOIN unnest('{aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[],
+                    '{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444,11111111-1111-2222-3333-444444444444}'::uuid[]) AS p(rel, rec)
+          ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
         ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT 50
     ) s;
-    IF actual <> ARRAY['1', '2', '3', '1', '2'] THEN
+    IF actual <> ARRAY['1', '2', '3', '1'] THEN
         RAISE EXCEPTION 'track collection order wrong: %', actual;
     END IF;
     -- user-lib-2's single member pair probes exactly one occurrence: one

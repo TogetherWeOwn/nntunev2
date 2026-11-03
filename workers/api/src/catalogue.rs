@@ -443,11 +443,17 @@ pub fn enrichment_key(raw: &str) -> Option<String> {
 /// `(release, medium, track)`, not `(release, recording)`), and the page
 /// carries one row per ingest-array element in album order. Hits for one
 /// pair are therefore kept as a position-sorted list and dealt out in page
-/// order: the i-th page occurrence takes the i-th album position, so
-/// repeated recordings keep their distinct positions instead of collapsing
-/// onto one row. Occurrences past the known positions reuse the last hit,
-/// keeping the sequence non-decreasing; the single-pair case behaves
-/// exactly as before.
+/// order within each ingest job: the i-th page occurrence of one job takes
+/// the i-th album position, so repeated recordings keep their distinct
+/// positions instead of collapsing onto one row. Occurrences past the known
+/// positions reuse the last hit, keeping the sequence non-decreasing.
+///
+/// Dealing never crosses ingest jobs: the ledger stores deduplicated
+/// recording arrays (each MBID keeps its first position), so one job holds
+/// each pair at most once and repeated pair occurrences across distinct
+/// jobs are independent references to the same deduplicated recording.
+/// Every job's first occurrence therefore takes the canonical first album
+/// position rather than dealing follow-on positions to unrelated uploads.
 pub fn assemble_library_rows(
     page: &[LibraryPageRow],
     recordings: &[LibraryRecordingHit],
@@ -475,15 +481,17 @@ pub fn assemble_library_rows(
     for hits in track_by_pair.values_mut() {
         hits.sort_by_key(|hit| (hit.medium_no, hit.track_no));
     }
-    let mut consumed: HashMap<(String, String), usize> = HashMap::new();
-    let mut take_track_hit = |release: &str, recording: &str| -> Option<&LibraryTrackHit> {
-        let key = (release.to_string(), recording.to_string());
-        let hits = track_by_pair.get(&key)?;
-        let used = consumed.entry(key).or_insert(0);
-        let hit = hits.get((*used).min(hits.len().saturating_sub(1))).copied();
-        *used += 1;
-        hit
-    };
+    let mut consumed: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut take_track_hit =
+        |job: &str, release: &str, recording: &str| -> Option<&LibraryTrackHit> {
+            let pair = (release.to_string(), recording.to_string());
+            let hits = track_by_pair.get(&pair)?;
+            let key = (job.to_string(), release.to_string(), recording.to_string());
+            let used = consumed.entry(key).or_insert(0);
+            let hit = hits.get((*used).min(hits.len().saturating_sub(1))).copied();
+            *used += 1;
+            hit
+        };
     let release_by_mbid: HashMap<String, &LibraryReleaseHit> = releases
         .iter()
         .filter_map(|hit| enrichment_key(&hit.release_mbid).map(|key| (key, hit)))
@@ -499,7 +507,7 @@ pub fn assemble_library_rows(
                 .as_deref()
                 .and_then(|key| release_by_mbid.get(key));
             let track_hit = match (&release_key, &recording_key) {
-                (Some(release), Some(recording)) => take_track_hit(release, recording),
+                (Some(release), Some(recording)) => take_track_hit(&row.job_id, release, recording),
                 _ => None,
             };
             LibraryDbRow {
@@ -1500,6 +1508,39 @@ mod tests {
             positions,
             vec![(Some(1), Some(1)), (Some(1), Some(10)), (Some(1), Some(10))]
         );
+    }
+
+    #[test]
+    fn assemble_library_rows_shares_canonical_position_across_jobs() {
+        // Two distinct jobs store the same deduplicated (release, recording)
+        // pair: each is an independent reference, so both take the canonical
+        // first album position instead of dealing follow-on positions to an
+        // unrelated upload.
+        let page = vec![
+            page_row("job-1", Some(GOOD_RELEASE), Some(GOOD_MBID), 1),
+            page_row("job-2", Some(GOOD_RELEASE), Some(GOOD_MBID), 1),
+        ];
+        let tracks = vec![
+            LibraryTrackHit {
+                release_mbid: GOOD_RELEASE.to_string(),
+                recording_mbid: GOOD_MBID.to_string(),
+                medium_no: Some(1),
+                track_no: Some(10),
+            },
+            LibraryTrackHit {
+                release_mbid: GOOD_RELEASE.to_string(),
+                recording_mbid: GOOD_MBID.to_string(),
+                medium_no: Some(1),
+                track_no: Some(1),
+            },
+        ];
+        let rows = assemble_library_rows(&page, &[], &tracks, &[]);
+        assert_eq!(rows.len(), 2);
+        let positions: Vec<(Option<i16>, Option<i16>)> = rows
+            .iter()
+            .map(|row| (row.medium_no, row.track_no))
+            .collect();
+        assert_eq!(positions, vec![(Some(1), Some(1)), (Some(1), Some(1))]);
     }
 
     #[test]
