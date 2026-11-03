@@ -19,6 +19,12 @@ import {
   type MediaSessionSnapshot,
 } from '../helpers/media-session.js';
 import {
+  resumeFloorAfterSeek,
+  seekProofFailure,
+  seekViaPlayerUi,
+  togglePlayViaPlayerUi,
+} from '../helpers/player-ui.js';
+import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
@@ -496,14 +502,12 @@ test.describe.serial('ingest → play → meter → browser', () => {
           }
           return start;
         });
-        // User gesture #2: the player's own visible play control. Native
-        // <audio controls> live in shadow DOM, and in the Desktop Chrome
-        // project the leftmost control is play/pause — clicking the element
-        // centre would hit the seek bar instead. This respects autoplay
-        // policy; no evaluate-driven play() call is made.
-        const box = await audio.boundingBox();
-        expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
-        await audio.click({ position: { x: 20, y: Math.floor(((box?.height ?? 40) / 2)) } });
+        // User gesture #2: the player's own visible play control (custom
+        // player-play-pause button, or the native toggle while controls are
+        // still rendered — see helpers/player-ui.ts). Clicking the audio
+        // element centre would hit the seek bar instead. This respects
+        // autoplay policy; no evaluate-driven play() call is made.
+        await togglePlayViaPlayerUi(page, audio);
       } else {
         // Already playing but not yet past 0: require further advancement
         // rather than toggling it paused with another click.
@@ -567,9 +571,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
   // Player-UI seek, as distinct from the API Range control above: that test
   // proves the stream endpoint answers byte ranges; this one proves the
   // user-visible player actually moves the active track's playback position
-  // when a person seeks, and can play from there. The seek is a click on the
-  // native controls timeline (the contract markup is `<audio controls>`),
-  // never a `currentTime` assignment and never a test-issued Range GET.
+  // when a person seeks, and can play from there. The seek is a pointer
+  // press on the player's seek surface — `player-seek` slider in the custom
+  // player bar, or the native controls timeline before it (see
+  // helpers/player-ui.ts) — never a `currentTime` assignment and never a
+  // test-issued Range GET.
   //
   // After the meter/plan-limit specs on purpose: the library player is still a
   // contract placeholder, so on configured staging this test fails by name
@@ -630,7 +636,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
       ended: boolean;
       errorCode: number | null;
       hasSource: boolean;
-      hasControls: boolean;
     }> =>
       player.evaluate((element) => {
         const audio = element as HTMLAudioElement;
@@ -641,7 +646,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
           ended: audio.ended,
           errorCode: audio.error?.code ?? null,
           hasSource: audio.currentSrc !== '',
-          hasControls: audio.controls,
         };
       });
 
@@ -664,21 +668,16 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const ready = await audioState();
     expect(ready.hasSource, 'player has no media source for the selected track').toBe(true);
     expect(ready.errorCode, 'player reported a media error before seeking').toBeNull();
-    expect(
-      ready.hasControls,
-      'player no longer exposes native controls — update this UI seek to the new controls',
-    ).toBe(true);
-
-    const box = await player.boundingBox();
-    expect(box, 'player has no layout box to click').not.toBeNull();
-    const { width, height } = box as { width: number; height: number };
-    // The native play/pause toggle sits at the left edge of the control bar.
-    const togglePosition = { x: 16, y: Math.round(height / 2) };
+    // No `controls` assertion: the seek surface (custom `player-seek`
+    // slider or native timeline) is chosen at act time by
+    // helpers/player-ui.ts, which fails by name when neither exists —
+    // the custom player bar removing native controls is the plan, not a
+    // failure. See e2e/README.md ("Player contract migration").
 
     // Reach a paused state through the UI: selecting the track may autoplay
     // (the 210 ms fixture can also have already ended, which reads paused).
     if (!ready.paused) {
-      await player.click({ position: togglePosition });
+      await togglePlayViaPlayerUi(page, player);
     }
     await expect
       .poll(async () => (await audioState()).paused, {
@@ -688,18 +687,19 @@ test.describe.serial('ingest → play → meter → browser', () => {
       .toBe(true);
     const beforeSeek = await audioState();
 
-    // User-visible seek: click the timeline a little past its middle. The
-    // timeline does not span the full element width (play button and time
-    // labels flank it), so assert the requested REGION — well past the
-    // opening stretch, short of the end — rather than an exact timestamp.
-    // `currentTime` is the position the native timeline renders; there is
-    // no separate visible-position hook.
+    // User-visible seek: press the seek surface a little past its middle.
+    // The native timeline does not span the full element width (play
+    // button and time labels flank it), so assert the requested REGION —
+    // well past the opening stretch, short of the end — rather than an
+    // exact timestamp (seekProofRegion, pinned offline by
+    // tests/player-ui.spec.ts). `currentTime` is the position the player
+    // UI renders; there is no separate visible-position hook.
     //
     // Movement is proven by a `seeked` event (counted by a listener installed
     // before the click), not by distance from the pre-seek position: with
     // selection-autoplay the pause can land arbitrarily close to where the
-    // timeline click lands, so a distance predicate can never become true
-    // even when the seek worked.
+    // seek click lands, so a distance predicate can never become true even
+    // when the seek worked.
     await player.evaluate((element) => {
       const audio = element as HTMLAudioElement & { __seeked?: number };
       audio.__seeked = 0;
@@ -707,12 +707,8 @@ test.describe.serial('ingest → play → meter → browser', () => {
         audio.__seeked = (audio.__seeked ?? 0) + 1;
       });
     });
-    await player.click({
-      position: { x: Math.round(width * 0.55), y: Math.round(height / 2) },
-    });
+    const seekTarget = await seekViaPlayerUi(page, player, 0.55);
 
-    const regionLow = beforeSeek.duration * 0.3;
-    const regionHigh = beforeSeek.duration * 0.95;
     await expect
       .poll(
         async () => {
@@ -721,23 +717,14 @@ test.describe.serial('ingest → play → meter → browser', () => {
             (element) =>
               (element as HTMLAudioElement & { __seeked?: number }).__seeked ?? 0,
           );
-          // Still-paused is part of the match: while paused, only the seek
-          // itself can have moved the position into the region, and the
-          // `seeked` event proves a seek completed rather than the position
-          // having started there.
-          return (
-            state.paused &&
-            state.currentTime >= regionLow &&
-            state.currentTime <= regionHigh &&
-            seeked > 0
-          );
+          return seekProofFailure(state, seekTarget.fraction, seeked > 0);
         },
         {
           timeout: 15_000,
           message: 'seeking via the player UI did not move the paused audio position',
         },
       )
-      .toBe(true);
+      .toBeNull();
     const afterSeek = await audioState();
     expect(afterSeek.errorCode, 'player reported a media error after seeking').toBeNull();
 
@@ -762,7 +749,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
         audio.__resumeMin = Math.min(audio.__resumeMin ?? Infinity, audio.currentTime);
       });
     });
-    await player.click({ position: togglePosition });
+    await togglePlayViaPlayerUi(page, player);
     let polledMin = Infinity;
     await expect
       .poll(
@@ -791,7 +778,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     expect(
       resumeMin,
       'playback restarted instead of continuing from the seek',
-    ).toBeGreaterThanOrEqual(afterSeek.currentTime - beforeSeek.duration * 0.05);
+    ).toBeGreaterThanOrEqual(resumeFloorAfterSeek(afterSeek.currentTime, beforeSeek.duration));
     const continued = await audioState();
     expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
     expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
@@ -889,9 +876,9 @@ test.describe.serial('ingest → play → meter → browser', () => {
         recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
       });
     });
-    const box = await audio.boundingBox();
-    expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
-    await audio.click({ position: { x: 20, y: Math.floor((box?.height ?? 40) / 2) } });
+    // The player's own visible play control (either generation — see
+    // helpers/player-ui.ts), never an element-centre click (that seeks).
+    await togglePlayViaPlayerUi(page, audio);
     await expect
       .poll(
         async () =>

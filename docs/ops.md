@@ -344,7 +344,7 @@ waiting on approval. A pending PR must not merge until the line is updated to
 
 ### Admin bootstrap (owner promotion)
 
-Migration 0026 adds `users.role` (`member` default). The admin API can
+Migration 0027 adds `users.role` (`member` default). The admin API can
 change roles only for an existing admin, and an admin can never change
 their own role through it — so the **first** admin in each environment is
 promoted by this reviewed operator step, run by the migrator role, never

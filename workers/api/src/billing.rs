@@ -10,18 +10,17 @@
 //! reads it.
 //!
 //! ADR sources: rule 4 of `docs/adr/0002-data-model.md` (subscription slots
-//! are not entitlement) plus the trial/payment gate in
+//! are not entitlement) plus the payment gate in
 //! `docs/adr/0004-plan-matrix.md` and the lifecycle in
-//! `docs/adr/0005-billing.md`. The plans seed rows in the migration are the
+//! `docs/adr/0005-billing.md`. There is no trial: a Stripe-reported
+//! `trialing` status is unknown here and fails closed (ADR 0005 revision
+//! of 2026-11-03). The plans seed rows in the reseed migration are the
 //! ADR 0004 decision table verbatim, pinned by
 //! `seed_rows_match_adr_0004` via `include_str!` — the same doc-parity
 //! technique as `plan_limits::caps_match_adr_0004_decision_table` — so
 //! editing the ADR without reseeding (or vice versa) fails the suite.
 //!
 //! Resolution contract (`resolve_effective_plan`):
-//! - `trialing` with `now < trial_end` → free caps, entitled. `active` on
-//!   free is never entitled, and an expired trial is a hard paywall: a late
-//!   webhook cannot extend free access.
 //! - `active` on a paid plan → that plan while `paid_through_at` covers now,
 //!   or for [`RENEWAL_SETTLEMENT_ALLOWANCE_SECS`] past a non-NULL paid end
 //!   when no scheduled cancellation awaits (Stripe's normal draft/charge
@@ -38,10 +37,9 @@
 //!   stored verbatim (no DB CHECK) and fail closed here.
 //!
 //! The Worker binds both SELECTs below (the live-slot subscription row plus
-//! the billing-account row) and feeds them to the pure predicate. The
-//! account row carries trial history for the creation path's trial-eligibility
-//! check (ADR 0005: only NULL history is trial-eligible); entitlement itself
-//! derives from the subscription row only.
+//! the billing-account row) and feeds them to the pure predicate.
+//! Entitlement derives from the subscription row only; the account row
+//! carries the Stripe customer binding for the creation path.
 
 use crate::plan_limits::{resolve_or_free, PlanId};
 
@@ -70,26 +68,17 @@ pub struct SubscriptionView<'a> {
     pub plan_id: &'a str,
     pub status: &'a str,
     pub cancel_at_period_end: bool,
-    pub trial_end_unix: Option<i64>,
     pub paid_through_at_unix: Option<i64>,
     pub grace_until_unix: Option<i64>,
 }
 
-/// The billing-account row the Worker selects alongside the subscription.
-/// Trial history for the creation path (ADR 0005): only NULL history here
-/// AND in the tombstone index is trial-eligible. Not an entitlement input.
+/// The billing-account row the Worker selects alongside the subscription:
+/// the Stripe customer binding for the creation path. Not an entitlement
+/// input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BillingAccountView<'a> {
     pub user_id: &'a str,
     pub stripe_customer_id: Option<&'a str>,
-    pub trial_started_at_unix: Option<i64>,
-}
-
-/// Trial-history probe for the creation path (ADR 0005 step 1): `true` once
-/// the write-once `trial_started_at` is set — that user (and that email
-/// history) is never trial-eligible again, with or without a card.
-pub fn trial_already_started(account: Option<BillingAccountView<'_>>) -> bool {
-    matches!(account, Some(a) if a.trial_started_at_unix.is_some())
 }
 
 fn closed() -> EffectivePlan {
@@ -113,17 +102,6 @@ pub fn resolve_effective_plan(
     };
     let plan = resolve_or_free(sub.plan_id);
     match sub.status {
-        "trialing" => match sub.trial_end_unix {
-            // Live trial: free caps only. The stored plan id is ignored on
-            // purpose — a `trialing` row never confers paid caps even if it
-            // names one.
-            Some(end) if now_unix < end => EffectivePlan {
-                plan: PlanId::Free,
-                entitled: true,
-            },
-            // Expired trial (or a trial row with no end): hard paywall.
-            _ => closed(),
-        },
         "active" => {
             // `active` on free is never entitled: saving a card or a late
             // webhook must not extend free access.
@@ -187,15 +165,15 @@ pub fn resolve_effective_plan(
 // closed. Unknown statuses are stored verbatim by design (no DB CHECK) and
 // fail closed in `resolve_effective_plan`, never in SQL.
 
-/// Parameters: user_id. The account row for trial history, if any.
+/// Parameters: user_id. The billing-account row, if any.
 pub fn billing_account_select_statement() -> &'static str {
-    "SELECT user_id, stripe_customer_id, EXTRACT(EPOCH FROM trial_started_at)::BIGINT AS trial_started_at_unix FROM billing_accounts WHERE user_id = $1"
+    "SELECT user_id, stripe_customer_id FROM billing_accounts WHERE user_id = $1"
 }
 
 /// Parameters: user_id. The single live-slot subscription row, if any.
 /// Timestamps arrive as Unix seconds (NULL stays NULL).
 pub fn subscription_live_select_statement() -> &'static str {
-    "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM trial_end)::BIGINT AS trial_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')"
+    "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
 }
 
 #[cfg(test)]
@@ -207,12 +185,12 @@ mod tests {
     fn statements_match_exact_text() {
         assert_eq!(
             billing_account_select_statement(),
-            "SELECT user_id, stripe_customer_id, EXTRACT(EPOCH FROM trial_started_at)::BIGINT AS trial_started_at_unix FROM billing_accounts WHERE user_id = $1",
+            "SELECT user_id, stripe_customer_id FROM billing_accounts WHERE user_id = $1",
             "billing account select",
         );
         assert_eq!(
             subscription_live_select_statement(),
-            "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM trial_end)::BIGINT AS trial_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')",
+            "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')",
             "live subscription select",
         );
     }
@@ -225,57 +203,40 @@ mod tests {
     #[test]
     fn seed_rows_match_adr_0004() {
         // The ADR 0004 decision table is the single source for the plans
-        // seed: parse it and assert every tier's INSERT tuple in migration
-        // 0021 carries the same values (price $ to cents, cache GiB to
-        // bytes), so editing the table without reseeding — or reseeding
+        // seed: parse it and assert every row's INSERT tuple in the reseed
+        // migration (0026, the effective seed — 0021's original seed is
+        // superseded and never edited) carries the same values (price $
+        // to cents), so editing the table without reseeding — or reseeding
         // without the table — fails instead of silently repricing. Same
         // include_str! doc-parity pattern as
         // plan_limits::caps_match_adr_0004_decision_table.
         let doc = include_str!("../../../docs/adr/0004-plan-matrix.md");
-        let migration = include_str!("../../../migrations/0021_billing_schema.sql");
+        let migration = include_str!("../../../migrations/0026_plan_reseed_no_trial.sql");
         let mut seen = HashSet::new();
         for line in doc.lines().filter(|l| l.starts_with('|')) {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-            // cells: ["", plan, price, stream hrs, concurrent, library,
-            //          ingest, cache GiB, retention days, priority, ""].
+            // cells: ["", plan, price, stream hrs, concurrent, ""].
             // Header/separator rows lack a `$` price.
-            if cells.len() < 10 || !cells[2].starts_with('$') {
+            if cells.len() < 5 || !cells[2].starts_with('$') {
                 continue;
             }
-            let (id, dollars, stream_hrs, concurrent, library, ingest, gib, retention, priority) =
-                match cells[1] {
-                    p if p.starts_with("Free") => (
-                        "free", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Plus" => (
-                        "plus", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Pro 5x" => (
-                        "pro-5x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Pro 20x" => (
-                        "pro-20x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
-                        &cells[7], &cells[8], &cells[9],
-                    ),
-                    _ => continue,
-                };
-            let cents: i64 = dollars
+            let id = match cells[1] {
+                p if p.starts_with("Free") => "free",
+                "Plus" => "plus",
+                "Pro" => "pro",
+                "Max" => "max",
+                _ => continue,
+            };
+            let cents: i64 = cells[2]
                 .trim_start_matches('$')
                 .replace(',', "")
                 .parse::<i64>()
                 .expect("ADR price parses")
                 * 100;
-            let gib: i64 = gib.replace(',', "").parse().expect("ADR cache GiB parses");
             let expected = format!(
-                "('{id}', {cents}, {stream_hrs}, {concurrent}, {library}, {ingest}, '{priority}', {bytes}, {retention})",
-                stream_hrs = stream_hrs.replace(',', ""),
-                concurrent = concurrent.replace(',', ""),
-                library = library.replace(',', ""),
-                ingest = ingest.replace(',', ""),
-                bytes = gib * 1_073_741_824,
+                "('{id}', {cents}, {stream_hrs}, {concurrent})",
+                stream_hrs = cells[3].replace(',', ""),
+                concurrent = cells[4].replace(',', ""),
             );
             assert!(
                 migration.contains(&expected),
@@ -283,11 +244,12 @@ mod tests {
             );
             seen.insert(id);
         }
-        assert_eq!(seen.len(), 4, "ADR table must pin all four tiers");
-        // Seeds stay replay-safe: the migration gate reapplies every file.
+        assert_eq!(seen.len(), 4, "ADR table must pin all four rows");
+        // The reseed upserts, so replaying it is a clean no-op that also
+        // re-asserts the corrected values over 0021's original seed.
         assert!(
-            migration.contains("ON CONFLICT (id) DO NOTHING"),
-            "plans seed must be replay-safe"
+            migration.contains("ON CONFLICT (id) DO UPDATE"),
+            "plans reseed must be replay-safe"
         );
     }
 
@@ -303,7 +265,6 @@ mod tests {
         plan_id: &'a str,
         status: &'a str,
         cancel_at_period_end: bool,
-        trial_end_unix: Option<i64>,
         paid_through_at_unix: Option<i64>,
         grace_until_unix: Option<i64>,
     ) -> SubscriptionView<'a> {
@@ -311,7 +272,6 @@ mod tests {
             plan_id,
             status,
             cancel_at_period_end,
-            trial_end_unix,
             paid_through_at_unix,
             grace_until_unix,
         }
@@ -329,61 +289,36 @@ mod tests {
     }
 
     #[test]
-    fn trial_window() {
-        // Live trial: free caps, entitled.
-        assert_eq!(
-            resolve_effective_plan(
-                Some(sub("free", "trialing", true, Some(NOW + DAY), None, None)),
-                NOW
-            ),
-            EffectivePlan {
-                plan: PlanId::Free,
-                entitled: true,
-            }
-        );
-        // Trial end is strict: the exact second cuts to the paywall.
-        for end in [NOW, NOW - 1, NOW - 14 * DAY] {
+    fn trialing_is_unknown_and_closed() {
+        // No flow can produce a trial (ADR 0005 revision of 2026-11-03):
+        // a Stripe-reported `trialing` is an unknown status → fail closed,
+        // even with live paid coverage on the row and even on a paid plan.
+        for plan_id in ["free", "plus"] {
             assert_eq!(
                 resolve_effective_plan(
-                    Some(sub("free", "trialing", true, Some(end), None, None)),
+                    Some(sub(
+                        plan_id,
+                        "trialing",
+                        true,
+                        Some(NOW + DAY),
+                        Some(NOW + 6 * DAY)
+                    )),
                     NOW
                 ),
                 closed(),
-                "trial end {end} must be closed"
+                "trialing on {plan_id} must be closed"
             );
         }
-        // A trial row with no end never entitles (fail closed, never open).
-        assert_eq!(
-            resolve_effective_plan(Some(sub("free", "trialing", true, None, None, None)), NOW),
-            closed()
-        );
-        // `trialing` never confers paid caps, even if the row names one.
-        assert_eq!(
-            resolve_effective_plan(
-                Some(sub("plus", "trialing", true, Some(NOW + DAY), None, None)),
-                NOW
-            ),
-            EffectivePlan {
-                plan: PlanId::Free,
-                entitled: true,
-            }
-        );
     }
 
     #[test]
     fn active_free_is_never_entitled() {
         // Saving a card / a late webhook flipping free to `active` grants
-        // nothing (ADR 0004 trial gate).
-        for (trial_end, paid) in [
-            (Some(NOW + DAY), None),
-            (None, Some(NOW + DAY)),
-            (None, None),
-        ] {
+        // nothing (ADR 0004 payment gate): the reserved `free` row never
+        // entitles, whatever the coverage fields say.
+        for paid in [Some(NOW + DAY), None] {
             assert_eq!(
-                resolve_effective_plan(
-                    Some(sub("free", "active", false, trial_end, paid, None)),
-                    NOW
-                ),
+                resolve_effective_plan(Some(sub("free", "active", false, paid, None)), NOW),
                 closed(),
                 "active free must never entitle"
             );
@@ -392,7 +327,7 @@ mod tests {
 
     #[test]
     fn active_paid_coverage_and_settlement() {
-        let live = sub("plus", "active", false, None, Some(NOW + DAY), None);
+        let live = sub("plus", "active", false, Some(NOW + DAY), None);
         assert_eq!(
             resolve_effective_plan(Some(live), NOW),
             EffectivePlan {
@@ -401,11 +336,11 @@ mod tests {
             }
         );
         // Inside the 3h allowance past a confirmed end: still the paid plan.
-        let settling = sub("pro-5x", "active", false, None, Some(NOW - 7_200), None);
+        let settling = sub("pro", "active", false, Some(NOW - 7_200), None);
         assert_eq!(
             resolve_effective_plan(Some(settling), NOW),
             EffectivePlan {
-                plan: PlanId::Pro5x,
+                plan: PlanId::Pro,
                 entitled: true,
             }
         );
@@ -413,7 +348,7 @@ mod tests {
         // not terminal (ADR 0005) — access runs to paid_through_at. Only the
         // settlement allowance below excludes it. This pins the live arm
         // against a `&& !cancel` regression (paying users cut at cancel time).
-        let scheduled_live = sub("plus", "active", true, None, Some(NOW + DAY), None);
+        let scheduled_live = sub("plus", "active", true, Some(NOW + DAY), None);
         assert_eq!(
             resolve_effective_plan(Some(scheduled_live), NOW),
             EffectivePlan {
@@ -423,23 +358,22 @@ mod tests {
         );
         // Exactly at the bound cuts (strict `<`, never sliding).
         let at_bound = sub(
-            "pro-5x",
+            "pro",
             "active",
             false,
-            None,
             Some(NOW - RENEWAL_SETTLEMENT_ALLOWANCE_SECS),
             None,
         );
         assert_eq!(resolve_effective_plan(Some(at_bound), NOW), closed());
         // Scheduled cancellation gets no allowance: paid end passed is done.
-        let scheduled = sub("plus", "active", true, None, Some(NOW - 1), None);
+        let scheduled = sub("plus", "active", true, Some(NOW - 1), None);
         assert_eq!(resolve_effective_plan(Some(scheduled), NOW), closed());
         // An `active` row with no confirmed coverage grants nothing (the
         // allowance requires a non-NULL previously paid end).
-        let unpaid = sub("plus", "active", false, None, None, None);
+        let unpaid = sub("plus", "active", false, None, None);
         assert_eq!(resolve_effective_plan(Some(unpaid), NOW), closed());
         // Lapsed well past the allowance is closed.
-        let lapsed = sub("plus", "active", false, None, Some(NOW - 30 * DAY), None);
+        let lapsed = sub("plus", "active", false, Some(NOW - 30 * DAY), None);
         assert_eq!(resolve_effective_plan(Some(lapsed), NOW), closed());
     }
 
@@ -447,7 +381,7 @@ mod tests {
     fn past_due_holds_paid_then_renewal_grace_only() {
         // Still inside confirmed coverage (failed mid-period upgrade keeps
         // the paid tier, never grants the unpaid higher one).
-        let covered = sub("plus", "past_due", false, None, Some(NOW + DAY), None);
+        let covered = sub("plus", "past_due", false, Some(NOW + DAY), None);
         assert_eq!(
             resolve_effective_plan(Some(covered), NOW),
             EffectivePlan {
@@ -457,24 +391,23 @@ mod tests {
         );
         // Past coverage but inside a renewal grace: the last paid plan.
         let grace = sub(
-            "pro-20x",
+            "max",
             "past_due",
             false,
-            None,
             Some(NOW - DAY),
             Some(NOW + 6 * DAY),
         );
         assert_eq!(
             resolve_effective_plan(Some(grace), NOW),
             EffectivePlan {
-                plan: PlanId::Pro20x,
+                plan: PlanId::Max,
                 entitled: true,
             }
         );
         // cancel_at_period_end never gates past_due: the coverage and grace
         // arms ignore it by design (ADR 0005 pins no cancel exclusion for
         // past_due) — pin both so a `&& !cancel` backport fails loudly.
-        let covered_cancel = sub("plus", "past_due", true, None, Some(NOW + DAY), None);
+        let covered_cancel = sub("plus", "past_due", true, Some(NOW + DAY), None);
         assert_eq!(
             resolve_effective_plan(Some(covered_cancel), NOW),
             EffectivePlan {
@@ -483,39 +416,31 @@ mod tests {
             }
         );
         let grace_cancel = sub(
-            "pro-20x",
+            "max",
             "past_due",
             true,
-            None,
             Some(NOW - DAY),
             Some(NOW + 6 * DAY),
         );
         assert_eq!(
             resolve_effective_plan(Some(grace_cancel), NOW),
             EffectivePlan {
-                plan: PlanId::Pro20x,
+                plan: PlanId::Max,
                 entitled: true,
             }
         );
         // Grace end is strict; past it is closed.
-        let grace_over = sub(
-            "pro-20x",
-            "past_due",
-            false,
-            None,
-            Some(NOW - 8 * DAY),
-            Some(NOW),
-        );
+        let grace_over = sub("max", "past_due", false, Some(NOW - 8 * DAY), Some(NOW));
         assert_eq!(resolve_effective_plan(Some(grace_over), NOW), closed());
         // First-payment failure (no paid end, even with a grace value
         // present): no grace without a previous paid period.
-        let first_failure = sub("plus", "past_due", false, None, None, Some(NOW + 6 * DAY));
+        let first_failure = sub("plus", "past_due", false, None, Some(NOW + 6 * DAY));
         assert_eq!(resolve_effective_plan(Some(first_failure), NOW), closed());
         // Coverage lapsed and no grace stored: closed.
-        let no_grace = sub("plus", "past_due", false, None, Some(NOW - DAY), None);
+        let no_grace = sub("plus", "past_due", false, Some(NOW - DAY), None);
         assert_eq!(resolve_effective_plan(Some(no_grace), NOW), closed());
         // `past_due` on free confers nothing.
-        let free_due = sub("free", "past_due", false, None, Some(NOW + DAY), None);
+        let free_due = sub("free", "past_due", false, Some(NOW + DAY), None);
         assert_eq!(resolve_effective_plan(Some(free_due), NOW), closed());
     }
 
@@ -539,9 +464,8 @@ mod tests {
                         "plus",
                         status,
                         false,
-                        None,
                         Some(NOW + DAY),
-                        Some(NOW + 6 * DAY)
+                        Some(NOW + 6 * DAY),
                     )),
                     NOW
                 ),
@@ -555,30 +479,15 @@ mod tests {
     fn unknown_plan_ids_fail_closed() {
         // An unrecognised tier limits on, never unlimited: free caps, and no
         // entitlement is invented for it — even with live paid coverage.
-        for unknown in ["", "FREE", "pro", "enterprise", "free "] {
+        for unknown in ["", "FREE", "pro-5x", "pro-20x", "enterprise", "free "] {
             assert_eq!(
                 resolve_effective_plan(
-                    Some(sub(unknown, "active", false, None, Some(NOW + DAY), None)),
+                    Some(sub(unknown, "active", false, Some(NOW + DAY), None)),
                     NOW
                 ),
                 closed(),
                 "plan {unknown:?} must fail closed"
             );
         }
-    }
-
-    #[test]
-    fn trial_history_probe() {
-        assert!(!trial_already_started(None));
-        assert!(!trial_already_started(Some(BillingAccountView {
-            user_id: "u",
-            stripe_customer_id: None,
-            trial_started_at_unix: None,
-        })));
-        assert!(trial_already_started(Some(BillingAccountView {
-            user_id: "u",
-            stripe_customer_id: Some("cus_123"),
-            trial_started_at_unix: Some(NOW - 30 * DAY),
-        })));
     }
 }

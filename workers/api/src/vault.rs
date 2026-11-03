@@ -872,13 +872,13 @@ pub struct AuditEvent {
     pub ok: bool,
     pub source_ip: String,
     pub at: u64,
-    /// The user an actor acted on (migration 0026), when the action has
+    /// The user an actor acted on (migration 0027), when the action has
     /// one — e.g. the target of an admin role change, where `user_id`
     /// stays the acting admin. `None` for self-actions.
     #[serde(default)]
     pub subject_user_id: Option<String>,
     /// Canonical JSON object with ids and old-to-new scalar values only
-    /// (migration 0026 `details JSONB`). Never secret or code material:
+    /// (migration 0027 `details JSONB`). Never secret or code material:
     /// no credentials, tokens, invite codes or their hashes — writers
     /// reference rows by id.
     #[serde(default)]
@@ -918,7 +918,7 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
     }
 }
 
-/// An [`audit_event`] carrying the migration-0026 extension: the subject
+/// An [`audit_event`] carrying the migration-0027 extension: the subject
 /// user the actor acted on and a details object (ids and old-to-new
 /// scalar values only; serialized here so the stored form is canonical).
 pub fn audit_event_extended(

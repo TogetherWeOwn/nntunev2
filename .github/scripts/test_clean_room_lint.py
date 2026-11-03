@@ -1,0 +1,256 @@
+"""Unit tests for clean_room_lint.
+
+FIXTURE NOTE: this file holds manufactured violations (brand words,
+extraction shapes, evidence paths) to trial the check. It is excluded
+from the lint itself via DEFINITIONAL_EXCLUSIONS in clean_room_lint —
+exact path only, no directory or extension exemptions.
+"""
+
+import contextlib
+import io
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from clean_room_lint import (
+    find_path_violations,
+    find_violations,
+    main,
+    redact_path,
+)
+
+
+def rules_for(text, path=""):
+    return sorted({rule for _, rule in find_violations(text, path)})
+
+
+class TestExtraction(unittest.TestCase):
+    def test_flags_googlevideo(self):
+        self.assertIn(
+            "youtube-extraction",
+            rules_for("stream https://rr1---sn.example.googlevideo.com/videoplayback"),
+        )
+
+    def test_flags_youtubei(self):
+        self.assertIn(
+            "youtube-extraction", rules_for('fetch("/youtubei/v1/player")')
+        )
+
+    def test_flags_yt_dlp_forms(self):
+        self.assertIn("youtube-extraction", rules_for("run yt-dlp -x"))
+        self.assertIn("youtube-extraction", rules_for("import yt_dlp"))
+
+    def test_flags_uppercase(self):
+        self.assertIn("youtube-extraction", rules_for("YT-DLP"))
+
+    def test_bare_youtubei_word_does_not_match(self):
+        # The rule bans the endpoint shape, not the substring.
+        self.assertNotIn("youtube-extraction", rules_for("the youtubei client"))
+
+    def test_official_embed_is_clean(self):
+        self.assertEqual(
+            [],
+            find_violations(
+                '<iframe src="https://www.youtube-nocookie.com/embed/abc123">'
+            ),
+        )
+
+
+class TestBrand(unittest.TestCase):
+    def test_flags_name_any_case(self):
+        self.assertIn("competitor-brand", rules_for("import from Spotify"))
+        self.assertIn("competitor-brand", rules_for("spotify-green theme"))
+        self.assertIn("competitor-brand", rules_for("SPOTIFY"))
+
+    def test_flags_branded_font_name_via_brand_rule(self):
+        self.assertIn(
+            "competitor-brand", rules_for("font-family: 'Spotify Mix', sans-serif")
+        )
+
+    def test_underscore_separated_tokens_flag(self):
+        # Underscores separate tokens in asset names and identifiers;
+        # \b alone would treat these as one word and miss the brand.
+        self.assertIn("competitor-brand", rules_for('SPOTIFY_CLIENT_ID = "x"'))
+        self.assertIn("competitor-brand", rules_for("spotify_logo.svg"))
+        self.assertIn("competitor-font", rules_for("CircularStd_Book.woff2"))
+
+    def test_name_inside_longer_token_does_not_flag(self):
+        self.assertEqual([], find_violations("xspotify2 is a made-up string"))
+
+    def test_flags_circular_capital(self):
+        self.assertIn("competitor-font", rules_for("font-family: Circular"))
+        self.assertIn("competitor-font", rules_for("CircularSp book"))
+        self.assertIn("competitor-font", rules_for("CircularStd-Medium"))
+        self.assertIn("competitor-font", rules_for("CircularTT"))
+
+    def test_lowercase_circular_is_clean(self):
+        self.assertEqual([], find_violations("a circular buffer of segments"))
+
+    def test_flags_brand_greens(self):
+        self.assertIn("competitor-colour", rules_for("--accent: #1DB954"))
+        self.assertIn("competitor-colour", rules_for("color: #1ed760"))
+        self.assertIn("competitor-colour", rules_for("0x1DB954"))
+
+    def test_neighbouring_hex_is_clean(self):
+        self.assertEqual([], find_violations("--accent: #7c9aff"))
+
+    def test_green_with_alpha_suffix_flags(self):
+        # #RRGGBBAA renders the banned green; opacity is not a defence.
+        self.assertIn("competitor-colour", rules_for("--accent: #1DB954FF"))
+        self.assertIn("competitor-colour", rules_for("--accent: #1ed76080"))
+        self.assertIn("competitor-colour", rules_for("0xFF1DB954"))
+
+    def test_unrelated_eight_digit_colour_is_clean(self):
+        # #AA1DB954 is RGB AA1DB9 + alpha 54, not a banned green.
+        self.assertEqual([], find_violations("--accent: #AA1DB954"))
+
+    def test_hash_ending_in_green_digits_is_clean(self):
+        self.assertEqual(
+            [],
+            find_violations("rev 9f2c41db954e rejected; id deadbeef1db954 ok"),
+        )
+
+    def test_split_byte_literals_flag(self):
+        self.assertIn(
+            "competitor-colour", rules_for("Color(0xFF, 0x1D, 0xB9, 0x54)")
+        )
+        self.assertIn("competitor-colour", rules_for("rgb(0x1e,0xd7,0x60)"))
+
+    def test_split_byte_literals_flag_across_lines(self):
+        # A formatter that puts one tuple byte per line must not hide the
+        # colour: the split-byte scan is multiline-aware and reports the
+        # line of the first byte.
+        hits = find_violations("Color(\n  0x1D,\n  0xB9,\n  0x54,\n)")
+        self.assertEqual([(2, "competitor-colour")], hits)
+        self.assertIn(
+            "competitor-colour",
+            rules_for("rgb(0x1e,\r\n0xd7,\r\n0x60)"),
+        )
+
+    def test_non_tuple_bytes_across_lines_are_clean(self):
+        # Only an adjacent tuple matches; other tokens between the bytes
+        # break the colour even when they sit on neighbouring lines.
+        self.assertEqual(
+            [], find_violations("bytes 0x1D,\nfoo,\n0xB9,\n0x54")
+        )
+
+    def test_single_line_split_literal_reports_once(self):
+        self.assertEqual(
+            [(1, "competitor-colour")],
+            find_violations("rgb(0x1e,0xd7,0x60)"),
+        )
+
+
+class TestEvidencePath(unittest.TestCase):
+    def test_flags_host_research_path(self):
+        self.assertIn(
+            "host-evidence-path",
+            rules_for("evidence in /home/someone/research/notes/"),
+        )
+
+    def test_flags_evidence_dir_fragment(self):
+        self.assertIn(
+            "host-evidence-path", rules_for("see research/nntune-spotify/xpui")
+        )
+
+    def test_bare_research_word_is_clean(self):
+        self.assertEqual([], find_violations("further research is needed"))
+
+
+class TestSpikeAllowlist(unittest.TestCase):
+    def test_spike_worker_skips_extraction_only(self):
+        path = "workers/youtube/src/client.rs"
+        self.assertNotIn(
+            "youtube-extraction", rules_for("yt-dlp style client", path)
+        )
+        # Every other rule still applies under the allowlist.
+        self.assertIn("competitor-brand", rules_for("Spotify", path))
+        self.assertIn("host-evidence-path", rules_for("/home/u/research/x", path))
+
+    def test_spike_doc_skips_extraction(self):
+        self.assertNotIn(
+            "youtube-extraction",
+            rules_for("googlevideo", "docs/youtube-backend-spike.md"),
+        )
+
+    def test_similar_paths_are_not_allowlisted(self):
+        self.assertIn(
+            "youtube-extraction", rules_for("yt-dlp", "workers/youtube2/src/lib.rs")
+        )
+        self.assertIn(
+            "youtube-extraction", rules_for("yt-dlp", "docs/other-spike.md")
+        )
+
+
+class TestPathScan(unittest.TestCase):
+    def test_branded_asset_name_flags(self):
+        self.assertIn(
+            "competitor-brand",
+            find_path_violations("apps/web/static/spotify-logo.svg"),
+        )
+        self.assertIn(
+            "competitor-brand",
+            find_path_violations("apps/web/static/spotify_logo.svg"),
+        )
+        self.assertIn(
+            "competitor-font",
+            find_path_violations("apps/web/static/CircularStd_Book.woff2"),
+        )
+
+    def test_clean_path(self):
+        self.assertEqual(
+            [], find_path_violations("apps/web/src/lib/player/queue.ts")
+        )
+
+    def test_definitional_files_skip_content_scan(self):
+        # AGENTS.md states the ban list and so necessarily names the
+        # banned things; its content must not fail the gate.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "AGENTS.md"])
+        self.assertEqual(0, rc)
+
+
+class TestMain(unittest.TestCase):
+    def test_unreadable_input_fails_closed(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "no/such/file.txt"])
+        self.assertEqual(1, rc)
+        self.assertIn("read-error", buf.getvalue())
+
+    def test_report_never_prints_matched_bytes(self):
+        # Matched bytes must not reach public CI logs: file:line + rule
+        # id only.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "docs/youtube-backend-spike.md"])
+        self.assertEqual(0, rc)  # spike doc is allowlisted for extraction
+        self.assertNotIn("yt-dlp", buf.getvalue())
+
+    def test_path_violation_report_is_redacted(self):
+        # A banned path must fail without re-publishing its own bytes:
+        # the annotation carries the redacted path, never the shape.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "research/nntune-spotify/notes.txt"])
+        self.assertEqual(1, rc)
+        out = buf.getvalue()
+        self.assertNotIn("nntune-spotify", out)
+        self.assertNotIn("spotify", out.lower())
+        self.assertIn("host-evidence-path", out)
+
+    def test_redact_path_masks_and_preserves(self):
+        self.assertEqual(
+            "apps/web/src/lib/player/queue.ts",
+            redact_path("apps/web/src/lib/player/queue.ts"),
+        )
+        redacted = redact_path("static/spotify_logo.svg")
+        self.assertNotIn("spotify", redacted)
+        self.assertTrue(redacted.endswith("_logo.svg"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,8 +33,9 @@
 
 use nntune_api::plan_limits::PlanId;
 use nntune_api::plan_limits::{
-    check_concurrent, CONCURRENT_RETRY_AFTER_SECS, LIMIT_HEADER, PLAN_LIMIT_MESSAGE,
-    RATE_LIMIT_MESSAGE, RESET_HEADER, RETRY_AFTER_HEADER, UPGRADE_KEY, UPGRADE_URL,
+    check_concurrent, CONCURRENT_RETRY_AFTER_SECS, DAILY_INGEST_LIMIT, LIMIT_HEADER,
+    PLAN_LIMIT_MESSAGE, RATE_LIMIT_MESSAGE, RESET_HEADER, RETRY_AFTER_HEADER, UPGRADE_KEY,
+    UPGRADE_URL,
 };
 
 #[test]
@@ -121,12 +122,9 @@ fn concurrent_429_carries_30s_retry_after() {
 fn refusal_body_carries_literal_upgrade_pointer() {
     // The serialized 402 body embeds the literal key and value (not just the
     // symbols): any drift in either literal flips this pin.
-    let denial = nntune_api::plan_limits::check_ingest_write(
-        PlanId::Free,
-        PlanId::Free.caps().ingest_jobs_day,
-    )
-    .denial()
-    .expect("at-cap ingest must deny");
+    let denial = nntune_api::plan_limits::check_ingest_write(DAILY_INGEST_LIMIT)
+        .denial()
+        .expect("at-cap ingest must deny");
     let body = denial.body_json();
     assert!(
         body.contains("\"upgrade_url\":\"/pricing\""),

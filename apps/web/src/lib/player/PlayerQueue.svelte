@@ -576,7 +576,7 @@
 					disabled={index === 0}
 					onclick={() => onmove?.(index, 0)}
 				>
-					Move to top
+					Top
 				</button>
 				<button
 					type="button"
@@ -584,7 +584,7 @@
 					disabled={index === trackCount - 1}
 					onclick={() => onmove?.(index, trackCount - 1)}
 				>
-					Move to bottom
+					Bottom
 				</button>
 			{/if}
 			<button

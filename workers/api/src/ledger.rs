@@ -6,17 +6,14 @@
 //! statements the Worker entry binds against PlanetScale Postgres via
 //! Hyperdrive — never string-interpolated SQL.
 //!
-//! Table identity (Paperclip Review `6508688`, warning 1): this is NOT the
-//! accepted ADR 0002/0004 daily `usage_ledger` (`period DATE`, `ingest_jobs`,
-//! `UNIQUE (user_id, period)`, additive `ON CONFLICT (user_id, period)
-//! DO UPDATE`). That daily aggregate remains the cap-enforcement shape and is
-//! built in a later slice by folding these per-play windows (and ingest
-//! accepts). To keep the future `CREATE TABLE IF NOT EXISTS usage_ledger`
-//! from silently no-op'ing on a colliding name and then failing its
-//! `ON CONFLICT (user_id, period)`, this slice's per-play table is named
-//! `stream_play_ledger` (`migrations/0020_stream_play_ledger.sql`). See the
-//! amendment notes in `docs/adr/0002-data-model.md`, `0004-plan-matrix.md`
-//! and `0005-billing.md`.
+//! Table identity (Paperclip Review `6508688`, warning 1): this per-play
+//! table is named `stream_play_ledger`
+//! (`migrations/0020_stream_play_ledger.sql`), distinct from the former
+//! daily `usage_ledger` aggregate. The ADR revision of 2026-11-03 retired
+//! that daily fold (dropped in migration 0026): monthly stream usage is
+//! the direct indexed `SUM` over this table, and the daily ingest count
+//! derives from accepted `ingest_jobs` rows. See `docs/adr/0002-data-model.md`,
+//! `0004-plan-matrix.md` and `0005-billing.md`.
 //!
 //! Rules:
 //! - One [`LedgerRow`] per billed play window: (`user_id`, `track_id`,

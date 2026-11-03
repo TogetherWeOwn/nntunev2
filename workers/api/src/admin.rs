@@ -1,5 +1,5 @@
 //! Admin foundation vocabulary: user roles and the typed `app_settings`
-//! keys (migration 0026). Pure decisions only — no DB, no clock — so the
+//! keys (migration 0027). Pure decisions only — no DB, no clock — so the
 //! guard, the handlers and the settings accessors share one definition
 //! of what a role or a setting value may be.
 //!
@@ -10,7 +10,7 @@
 //! (a database that predates the seed behaves exactly like the seed).
 
 /// The only two role values `users.role` may hold (CHECK constraint in
-/// migration 0026). Anything else read back from the DB is not an admin.
+/// migration 0027). Anything else read back from the DB is not an admin.
 pub const ROLE_MEMBER: &str = "member";
 pub const ROLE_ADMIN: &str = "admin";
 
@@ -79,7 +79,7 @@ impl SettingKey {
     }
 
     /// Value used when no `app_settings` row exists yet. Matches the
-    /// migration 0026 seed, so a pre-seed database behaves identically.
+    /// migration 0027 seed, so a pre-seed database behaves identically.
     pub fn default_value(self) -> u32 {
         match self {
             SettingKey::InviteDefaultExpiryDays => 7,

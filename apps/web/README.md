@@ -50,7 +50,17 @@ To update the budget deliberately, in its own PR: rebuild, confirm the growth
 is expected from the dependency/route change, bump `BUDGET_CLIENT_JS_BYTES`
 with a comment citing the reason, and update the number in this paragraph.
 Never bump it just to make a red build green. Wasm/script size gates are out
-of scope here (tracked separately as Wasm enforcement).
+of scope here (tracked separately as Wasm enforcement). Before adding code
+that spends a visible share of the remaining headroom, follow the per-route
+splitting rules in [`docs/web-code-splitting-plan.md`](../../docs/web-code-splitting-plan.md).
+
+## Accessibility gate
+
+`tests/accessibility-axe.spec.ts` runs axe (`@axe-core/playwright`) over
+every route and fails on any serious or critical violation. It runs in CI
+as the `web-a11y` job and as part of the full Playwright suite; run it
+alone with `pnpm test:e2e:a11y`. Minor/moderate findings are attached to
+the test report as warnings, not failures.
 
 ## Deploy
 
