@@ -339,6 +339,49 @@ fn long_subject_folds_and_unfolds_losslessly() {
 }
 
 #[test]
+fn folded_repeated_spaces_unfold_losslessly() {
+    // A fold consumes exactly one separator space (the continuation's
+    // leading space replaces it); the rest of a space run must stay
+    // literal, so unfolding restores every space.
+    for subject in [
+        format!("{}  b", "a".repeat(70)),
+        "  leading spaces stay literal".to_string(),
+        "trailing spaces stay literal  ".to_string(),
+        format!("{}   {}", "c".repeat(70), "d"),
+    ] {
+        let headers = ArticleHeaders::new(
+            "poster@example.invalid",
+            &["example.test.alpha"],
+            &subject,
+            "Tue, 03 Nov 2026 12:00:00 +0000",
+            "post-id-004@example.invalid",
+        )
+        .expect("valid headers");
+        let block = headers.render().expect("render");
+        let text = std::str::from_utf8(&block).unwrap();
+        let subject_lines: Vec<&str> = text
+            .split("\r\n")
+            .skip_while(|l| !l.starts_with("Subject:"))
+            .take_while(|l| *l != "Date: Tue, 03 Nov 2026 12:00:00 +0000")
+            .collect();
+        // An overlong first word cannot fold: only that first line may
+        // exceed 78 (the 998-byte ceiling is enforced at render).
+        for (i, line) in subject_lines.iter().enumerate() {
+            assert!(line.len() <= 998, "folded line too long: {line:?}");
+            if i > 0 || subject.split(' ').next().is_some_and(|w| w.len() <= 69) {
+                assert!(line.len() <= 78, "folded line too long: {line:?}");
+            }
+        }
+        let parsed = parse_headers(&block);
+        let (_, unfolded) = parsed
+            .iter()
+            .find(|(n, _)| n == "Subject")
+            .expect("Subject present");
+        assert_eq!(unfolded, &subject, "round trip lost whitespace");
+    }
+}
+
+#[test]
 fn unfittable_single_token_fails_closed() {
     // No spaces to fold at and over 998 bytes: refuse rather than emit an
     // over-long line.

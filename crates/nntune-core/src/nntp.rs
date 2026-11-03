@@ -410,9 +410,11 @@ impl<T: Transport> NntpClient<T> {
         })?;
         let greeting = self.command("POST").await?;
         if greeting.code != 340 {
-            // A 435/441 to the bare POST means "already have it, do not
-            // send": confirm with STAT like a post-send duplicate.
-            return self.refusal_after_reply(greeting, message_id).await;
+            // Not yet in send-article state: map the bare-POST reply
+            // without the post-send 240 → Posted arm (no article byte has
+            // gone on the wire, so 240 here is a protocol error, not a
+            // posting).
+            return self.initial_refusal(greeting, message_id).await;
         }
         match self
             .transport
@@ -440,10 +442,25 @@ impl<T: Transport> NntpClient<T> {
         self.refusal_after_reply(reply, message_id).await
     }
 
-    /// Maps a `POST` reply — to the bare `POST` command or to the sent
-    /// article — onto an outcome. `240` posts; `435`/`441` confirm via
-    /// `STAT`; `440` is prohibited; everything else follows [`classify`]
-    /// (`480`/`481` stay stale-credential signals).
+    /// Maps the reply to the bare `POST` command — before any article byte
+    /// is sent — onto an outcome. `435`/`441` mean "already have it, do not
+    /// send" and confirm via `STAT` like a post-send duplicate; `440` is
+    /// prohibited; everything else follows [`classify`]. `240` is
+    /// deliberately not success here: the server answered before the article
+    /// went on the wire (RFC 3977 admits only 340/440 as the initial POST
+    /// reply), so reporting `Posted` would record an article that was never
+    /// sent.
+    async fn initial_refusal(&mut self, reply: Reply, message_id: &str) -> Result<PostOutcome> {
+        match reply.code {
+            435 | 441 => self.confirm_duplicate(reply, message_id).await,
+            440 => Err(Error::PostProhibited(reply.text)),
+            _ => Err(self.classify(&reply, message_id)),
+        }
+    }
+
+    /// Maps the reply after the sent article onto an outcome. `240` posts;
+    /// `435`/`441` confirm via `STAT`; `440` is prohibited; everything else
+    /// follows [`classify`] (`480`/`481` stay stale-credential signals).
     async fn refusal_after_reply(&mut self, reply: Reply, message_id: &str) -> Result<PostOutcome> {
         match reply.code {
             240 => Ok(PostOutcome::Posted),

@@ -384,6 +384,11 @@ fn check_body_framing(body: &[u8]) -> Result<()> {
 /// spaces (a long group name, the bracketed message-ID) cannot fold and is
 /// emitted whole; anything that still exceeds 998 bytes fails closed.
 ///
+/// A fold consumes exactly one separator space (the continuation's leading
+/// space replaces it on unfolding), so the extra spaces of a run stay
+/// literal: unfolding restores the value byte-for-byte, including repeated,
+/// leading and trailing spaces.
+///
 /// The returned bytes end with CRLF.
 fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
     if name.is_empty() || name.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7F) {
@@ -401,6 +406,19 @@ fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
         let words: Vec<&str> = value.split(' ').collect();
         let mut current = first_prefix.clone();
         for word in words {
+            if word.is_empty() {
+                // Extra space from a run of consecutive spaces: keep it
+                // literal on this line. Folding here would drop it (the
+                // continuation's leading space already accounts for one
+                // separator), so break first when the line is full and
+                // carry the space onto the new line.
+                if current.len() >= 78 {
+                    lines.push(current);
+                    current = String::from(" ");
+                }
+                current.push(' ');
+                continue;
+            }
             if current.len() + word.len() < 78 {
                 if !current.ends_with(' ') && !current.ends_with(": ") {
                     current.push(' ');

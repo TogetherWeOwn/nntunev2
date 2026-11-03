@@ -277,6 +277,37 @@ async fn initial_post_refusals_map_to_typed_errors() {
 }
 
 #[tokio::test]
+async fn bare_post_240_is_a_protocol_error_not_success() {
+    // A 240 to the bare POST answers before any article byte is sent:
+    // reporting Posted would record an article that never went on the
+    // wire (RFC 3977 admits only 340/440 as the initial POST reply).
+    // It must surface as a generic reply error with zero article bytes
+    // written, leaving the connection usable.
+    let script = Script::new(
+        &format!("{HANDSHAKE}240 premature ok\r\n223 1 <a@example.invalid>\r\n"),
+        &[
+            HANDSHAKE_WRITES,
+            &["POST\r\n", "STAT <a@example.invalid>\r\n"],
+        ]
+        .concat(),
+    );
+    let mut client = connected(script).await;
+    let err = client
+        .post_article("a@example.invalid", ARTICLE.as_bytes())
+        .await
+        .expect_err("bare-POST 240 must fail");
+    assert!(
+        matches!(err, Error::NntpReply { code: 240, .. }),
+        "got {err}"
+    );
+    assert!(!is_retryable_post_error(&err));
+    // Well-formed reply at a command boundary: still usable.
+    client.stat("a@example.invalid").await.unwrap();
+    let script = client.into_inner();
+    assert!(script.expect_writes.is_empty(), "all writes consumed");
+}
+
+#[tokio::test]
 async fn framing_refusals_write_nothing() {
     // Empty article, bare LF, and a delimiter-escaping Message-ID are all
     // refused before any POST byte reaches the wire.
