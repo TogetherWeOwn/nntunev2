@@ -132,3 +132,8 @@ sha256 = "b3668efdfd27bd81d9a9f86441c29925963943c30ed969303bd518af91f30b0c"
 file = "0027_track_sources_global.sql"
 target = "app"
 sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
+
+[[migration]]
+file = "0028_admin_foundation.sql"
+target = "app"
+sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"

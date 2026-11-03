@@ -13,6 +13,7 @@
 //! (`migrations/0023_subsonic_clients.sql`).
 
 pub mod account_deletion;
+pub mod admin;
 pub mod api_error;
 pub mod auth;
 pub mod b64;
