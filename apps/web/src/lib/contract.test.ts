@@ -34,6 +34,12 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	libraryStaleBadge: '../routes/library/+page.svelte',
 	audioPlayer: '../routes/library/+page.svelte',
 	usageMeter: '../routes/library/+page.svelte',
+	// Today the demo player carries these; the player-bar build (design
+	// spec v1) moves them to the persistent player bar and repoints this
+	// map in the same PR.
+	nowPlaying: '../routes/demo/player/+page.svelte',
+	playerNext: '../routes/demo/player/+page.svelte',
+	queuePanel: '../routes/demo/player/+page.svelte',
 	planLimitNotice: '../routes/library/+page.svelte'
 };
 

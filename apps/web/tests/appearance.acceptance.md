@@ -100,3 +100,25 @@ can read device storage. Record any real first-paint limitation; do not conceal 
 with an eventual-state-only assertion, unsafe-inline, or a relaxed security header.
 
 Skills used: paperclip, paperclip-superpowers-adapter, test-driven-development, verification-before-completion.
+
+## App-shell renegotiation note (test-author, design spec v1)
+
+The app-shell redesign changes no appearance pin in this contract; it
+records the control's new home so the shell build cannot drift it:
+
+- The Appearance native select stays a **single instance in the shell
+  top bar** (`data-testid="shell-topbar"`), in both the app shell and
+  the public header (login included). Options System/Light/Dark, raw
+  values, the device-local key `nntune:appearance:v1` and the nine
+  tokens are unchanged — every APP case keeps as written, including the
+  `openAppearance` helper, which already locates the one combobox.
+- One position pin moves: APP-A11Y-01's "shell has no earlier
+  interactive control" reads in the new shell as **Appearance sits
+  after the top-bar search field and before the account-menu button**.
+  That exact order is pinned by `[NAV-05 v2 1280px]` in
+  `app-shell-navigation.spec.ts` (activates with the app shell build),
+  which also re-pins the keyboard drive (Home/ArrowDown/Enter →
+  `light`). APP-A11Y-01 itself is location-agnostic and keeps.
+- The theme-color meta value remains owned here/tokens; the nav suite
+  pins only its presence and hex shape (`[NAV-16 v2]`), so a value
+  change is a tokens decision, not a nav renegotiation.
