@@ -51,10 +51,30 @@ class ComposeTests(unittest.TestCase):
         self.assertIn(apply_migration.ALREADY_SAME, sql)
         self.assertIn(apply_migration.ALREADY_DIFFERENT, sql)
         self.assertIn("CREATE TABLE t (id int);", sql)
-        self.assertIn(f"VALUES (\n    '0002_alpha.sql',\n    '{sha}',\n    now(),\n    'operator (test)'\n)", sql)
+        self.assertIn(f"VALUES (\n    '0002_alpha.sql',\n    '{sha}',\n    pg_catalog.now(),\n    'operator (test)'\n)", sql)
         # Plain insert: the in-transaction guard already refused any
         # recorded identity, so ON CONFLICT would only mask a race.
         self.assertNotIn("ON CONFLICT", sql)
+
+    def test_runner_infrastructure_uses_catalog_namespace(self):
+        self.fixture()
+        ddl = apply_migration.ddl_sql("nntune_apply_test")
+        for name in ("now", "aclexplode", "format", "pg_get_userbyid"):
+            with self.subTest(routine=name):
+                self.assertIn(f"pg_catalog.{name}(", ddl)
+                self.assertNotRegex(ddl, rf"(?<![\w.]){name}\s*\(")
+        for name in ("pg_class", "pg_namespace", "pg_attribute"):
+            with self.subTest(catalog=name):
+                self.assertIn(f"pg_catalog.{name}", ddl)
+                self.assertNotRegex(ddl, rf"(?:FROM|JOIN)\s+{name}\b")
+        for record_only in (False, True):
+            sql, *_ = self.compose(record_only=record_only)
+            for label, statement in (("A", ddl), ("B", sql)):
+                with self.subTest(path=label, record_only=record_only):
+                    for name in ("current_database", "pg_advisory_xact_lock"):
+                        self.assertIn(f"pg_catalog.{name}(", statement)
+                        self.assertNotRegex(statement, rf"(?<![\w.]){name}\s*\(")
+            self.assertIn("pg_catalog.now()", sql)
 
     def test_sha_mismatch_refuses(self):
         self.fixture(sha_override="0" * 64)

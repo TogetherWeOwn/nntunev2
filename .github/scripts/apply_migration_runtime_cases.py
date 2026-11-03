@@ -283,6 +283,15 @@ def assert_controlled(call, label):
         f"{label}: backend search_path {search_path!r}"
     assert timeouts == CONTROLLED_TIMEOUTS, f"{label}: backend timeouts {timeouts!r}"
     assert scs == "on", f"{label}: standard_conforming_strings {scs!r}"
+    # Audit the SQL sent to this observed child, not just composition or
+    # the parent environment. These fixtures have no migration routines.
+    sql = call["input"]
+    for name in ("current_database", "pg_advisory_xact_lock", "now"):
+        assert f"pg_catalog.{name}(" in sql, f"{label}: unqualified {name}"
+    if "CREATE TABLE IF NOT EXISTS public.schema_migrations" in sql:
+        for name in ("pg_class", "pg_namespace", "pg_attribute",
+                     "aclexplode", "format", "pg_get_userbyid"):
+            assert f"pg_catalog.{name}" in sql, f"{label}: unqualified {name}"
 
 
 def catalog_fingerprint(env):

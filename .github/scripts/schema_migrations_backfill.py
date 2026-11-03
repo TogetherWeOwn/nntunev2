@@ -21,6 +21,70 @@ import sys
 
 import apply_migration
 
+# The dated artifacts freeze their DDL too. Do not import the live
+# runner's DDL: later runner hardening must not rewrite historical SQL.
+FROZEN_DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
+    file       TEXT PRIMARY KEY,
+    sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    applied_by TEXT NOT NULL
+);
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON TABLE public.schema_migrations FROM PUBLIC;
+DO $privileges$
+DECLARE
+    grant_row record;
+BEGIN
+    FOR grant_row IN
+        SELECT DISTINCT a.grantee
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN aclexplode(c.relacl) a
+        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
+          AND a.privilege_type IN
+              ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+          AND a.grantee <> c.relowner
+    LOOP
+        IF grant_row.grantee = 0 THEN
+            EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                 || 'ON TABLE public.schema_migrations FROM PUBLIC';
+        ELSE
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                'ON TABLE public.schema_migrations FROM %I',
+                pg_get_userbyid(grant_row.grantee));
+        END IF;
+    END LOOP;
+    -- Column privileges live in pg_attribute.attacl, not relacl, so the
+    -- table-level pass above cannot see them; revoke per column. Only
+    -- INSERT, UPDATE and REFERENCES exist as column-level writes.
+    FOR grant_row IN
+        SELECT DISTINCT a.grantee, t.attname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute t ON t.attrelid = c.oid
+            AND t.attnum > 0 AND NOT t.attisdropped
+        CROSS JOIN aclexplode(t.attacl) a
+        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
+          AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
+          AND a.grantee <> c.relowner
+    LOOP
+        IF grant_row.grantee = 0 THEN
+            EXECUTE format(
+                'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
+                'ON TABLE public.schema_migrations FROM PUBLIC',
+                grant_row.attname, grant_row.attname, grant_row.attname);
+        ELSE
+            EXECUTE format(
+                'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
+                'ON TABLE public.schema_migrations FROM %I',
+                grant_row.attname, grant_row.attname, grant_row.attname,
+                pg_get_userbyid(grant_row.grantee));
+        END IF;
+    END LOOP;
+END
+$privileges$;"""
+
 BACKFILL_AT = "2026-11-03T00:00:00Z"
 BACKFILL_BY = "backfill-2026-11-03 (operator-verified)"
 
@@ -145,7 +209,7 @@ def render(target):
         f"-- {note}",
         "",
         "BEGIN;",
-        apply_migration.DDL,
+        FROZEN_DDL,
         "",
     ]
     for filename, sha256 in rows_for(target):

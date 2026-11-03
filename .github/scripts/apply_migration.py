@@ -44,8 +44,8 @@ import tomllib
 import urllib.parse
 
 # The tracking table's rows are deploy proof for the staging gate, so
-# its write privileges are pinned here, in the one DDL constant shared
-# by the migrator and the committed backfill files: no role other than
+# its write privileges are pinned here. The dated backfill generator
+# freezes its historical DDL separately. No role other than
 # the table owner (the migrator role that creates it) may hold a write
 # privilege — on the table (``pg_class.relacl``) or on any column
 # (``pg_attribute.attacl``; column-level INSERT alone can forge a
@@ -53,11 +53,12 @@ import urllib.parse
 # database's default privileges granted at CREATE time. The revoke
 # pass runs on every DDL execution, so a later stray GRANT is removed
 # by the next apply; the staging gate also fails closed while such a
-# grant exists. Read privileges are untouched.
+# grant exists. Read privileges are untouched. Qualify runner-owned
+# routines/catalogs: the migration namespace deliberately puts public first.
 DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
     file       TEXT PRIMARY KEY,
     sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
     applied_by TEXT NOT NULL
 );
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
@@ -68,9 +69,9 @@ DECLARE
 BEGIN
     FOR grant_row IN
         SELECT DISTINCT a.grantee
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        CROSS JOIN aclexplode(c.relacl) a
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN pg_catalog.aclexplode(c.relacl) a
         WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
           AND a.privilege_type IN
               ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
@@ -80,10 +81,10 @@ BEGIN
             EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
                  || 'ON TABLE public.schema_migrations FROM PUBLIC';
         ELSE
-            EXECUTE format(
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
                 'ON TABLE public.schema_migrations FROM %I',
-                pg_get_userbyid(grant_row.grantee));
+                pg_catalog.pg_get_userbyid(grant_row.grantee));
         END IF;
     END LOOP;
     -- Column privileges live in pg_attribute.attacl, not relacl, so the
@@ -91,26 +92,26 @@ BEGIN
     -- INSERT, UPDATE and REFERENCES exist as column-level writes.
     FOR grant_row IN
         SELECT DISTINCT a.grantee, t.attname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_attribute t ON t.attrelid = c.oid
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute t ON t.attrelid = c.oid
             AND t.attnum > 0 AND NOT t.attisdropped
-        CROSS JOIN aclexplode(t.attacl) a
+        CROSS JOIN pg_catalog.aclexplode(t.attacl) a
         WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
           AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
           AND a.grantee <> c.relowner
     LOOP
         IF grant_row.grantee = 0 THEN
-            EXECUTE format(
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
                 'ON TABLE public.schema_migrations FROM PUBLIC',
                 grant_row.attname, grant_row.attname, grant_row.attname);
         ELSE
-            EXECUTE format(
+            EXECUTE pg_catalog.format(
                 'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
                 'ON TABLE public.schema_migrations FROM %I',
                 grant_row.attname, grant_row.attname, grant_row.attname,
-                pg_get_userbyid(grant_row.grantee));
+                pg_catalog.pg_get_userbyid(grant_row.grantee));
         END IF;
     END LOOP;
 END
@@ -323,7 +324,7 @@ def insert_sql(filename, sha256, applied_by, applied_at=None, on_conflict=True):
     # One value per line: the committed backfill files use this too, and
     # a public checksum sharing a line with an auth-flavoured filename
     # false-positives secret scanners as a credential pair.
-    when = f"'{applied_at}'::timestamptz" if applied_at else "now()"
+    when = f"'{applied_at}'::timestamptz" if applied_at else "pg_catalog.now()"
     conflict = "\nON CONFLICT (file) DO NOTHING" if on_conflict else ""
     return (
         "INSERT INTO public.schema_migrations (file, sha256, applied_at, applied_by)\n"
@@ -344,7 +345,7 @@ def database_guard_sql(expected_database):
     """
     return f"""DO $dbguard$
 BEGIN
-    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() <> {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
 END
@@ -356,7 +357,7 @@ def ddl_sql(expected_database):
     # REVOKE can race on catalog tuples even when B is correctly locked.
     # A still commits independently and releases its lock before B.
     return (database_guard_sql(expected_database)
-            + f"\nSELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
+            + f"\nSELECT pg_catalog.pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
             + DDL + "\n")
 
 
@@ -379,10 +380,10 @@ def guard_sql(identity, expected_database, priors=()):
                WHERE (file, sha256) IN ({pairs_of(prior)})) THEN
         RAISE EXCEPTION '{MISSING_PRIOR}';
     END IF;""" for prior in priors)
-    return f"""SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
+    return f"""SELECT pg_catalog.pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
 DO $guard$
 BEGIN
-    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() <> {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
