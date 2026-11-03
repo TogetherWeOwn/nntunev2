@@ -1,4 +1,4 @@
--- NNTune v2 migration 0027: paid-invoice history (Stripe core slice).
+-- NNTune v2 migration 0028: paid-invoice history (Stripe core slice).
 --
 -- One row per confirmed paid service invoice, written by reconciliation
 -- (webhook and API/inline paths share the function) for every invoice

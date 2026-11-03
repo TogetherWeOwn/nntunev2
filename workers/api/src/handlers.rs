@@ -1014,7 +1014,7 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
-    // --- Stripe billing reconciliation (migrations 0021/0027) ------------------
+    // --- Stripe billing reconciliation (migrations 0021/0028) ------------------
     //
     // The webhook and the inline/API paths share one reconciliation
     // function (`billing_reconcile::reconcile_subscription`); these are

@@ -134,9 +134,9 @@ target = "app"
 sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
 
 [[migration]]
-file = "0027_paid_invoice_history.sql"
+file = "0028_paid_invoice_history.sql"
 target = "app"
-sha256 = "950dc9ce86aa9ee0f81a7b91481ec5d4d7f2842689b7589fbbabd00006314eac"
+sha256 = "73b281e0a80426f10ec5654fef8d7bde8f98c9a348b2eb53d8f7502d2f6e0a36"
 
 [[migration]]
 file = "0028_admin_foundation.sql"
