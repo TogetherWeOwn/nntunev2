@@ -58,6 +58,7 @@ pub mod repair;
 pub mod retry;
 pub mod track_writers;
 pub mod transcode;
+pub mod two_spool;
 pub mod verify;
 
 use api_error::ApiError;
