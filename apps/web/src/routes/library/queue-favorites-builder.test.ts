@@ -2,6 +2,7 @@ import { expect, test } from 'vitest';
 import ts from 'typescript';
 import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
@@ -47,6 +48,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
 		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}

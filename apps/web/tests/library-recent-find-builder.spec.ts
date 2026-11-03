@@ -52,9 +52,12 @@ async function expectRows(page: Page, ids: string[]) {
 }
 
 async function requireFind(page: Page): Promise<Locator> {
-	const field = page
+	// Scoped to the page main: the app-shell top bar carries its own
+	// global Search field, which must never satisfy this locator.
+	const main = page.getByRole('main');
+	const field = main
 		.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+		.or(main.getByRole('textbox', { name: /find|search/i }));
 	await expect(field).toBeVisible();
 	return field;
 }
@@ -187,11 +190,12 @@ test('[RF-B3] client-side navigation away records the applied query without a bl
 	await expectRows(page, ['rec-zulu']);
 	expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
 
-	await page.getByRole('link', { name: 'Select NZB locally' }).click();
+	await page.getByRole('button', { name: 'Create', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Import NZB file', exact: true }).click();
 	await expect(page).toHaveURL(/\/library\/import/);
 	expect(storedQueries(await readRecentRaw(page))[0]).toBe('zulu');
 
-	await page.getByRole('link', { name: 'Library', exact: true }).click();
+	await page.getByRole('link', { name: 'Your Library', exact: true }).click();
 	await expect(page).toHaveURL(/\/library$/);
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expectChips(page, ['zulu', 'beta']);

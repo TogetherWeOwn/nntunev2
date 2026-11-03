@@ -49,6 +49,7 @@
 		toggleSelected
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
+	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
 	import QueueExport from '#lib/player/QueueExport.svelte';
@@ -824,6 +825,18 @@
 		resetRestartOnSourceChange(before, after);
 		queue = next;
 		queueAnnouncement = '';
+		// The mobile mini-player mirrors the current selection from this
+		// shared hint (W10 app shell); an emptied queue clears it. Metadata
+		// only — display title/artist, never audio or playback state.
+		if (after) {
+			setMiniPlayerHint({
+				trackId: after.id,
+				title: displayTitle(after),
+				artist: displayArtist(after)
+			});
+		} else {
+			clearMiniPlayerHint();
+		}
 	}
 
 	function clearShareFeedback(): void {

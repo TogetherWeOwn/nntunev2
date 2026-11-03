@@ -1,10 +1,28 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
-	import { afterNavigate } from '$app/navigation';
+	import type { Snippet } from 'svelte';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
+	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { clearSignedInEmail } from '#lib/signed-in-email.js';
+	import { notifyLocalAuthTransition } from '#lib/auth-transition.js';
+	import {
+		clearMiniPlayerHint,
+		onMiniPlayerHint,
+		type MiniPlayerHint
+	} from '#lib/shell/mini-player.js';
+	import {
+		clearToasts,
+		dismissToast,
+		onToasts,
+		pushToast,
+		type Toast
+	} from '#lib/shell/toasts.js';
+	import { onRightPanel } from '#lib/shell/right-panel.js';
 	import '../app.css';
 	import type { LayoutProps } from './$types';
 
@@ -129,32 +147,193 @@
 		restoreFocus();
 	}
 
+	// App shell (roadmap W10): a top bar, a left rail and the main view on
+	// desktop; a compact top bar, the main view, a mini-player and a tab bar
+	// on narrow screens. Public routes (landing, auth, plans, demos) render
+	// a slim public header instead — never the Primary landmark. Static
+	// native links only: the shell never fetches, uploads or processes
+	// anything by itself; the only request it can ever send is the sign-out
+	// POST behind the account menu's Sign out control.
+	function matchesBoundary(pathname: string, base: string): boolean {
+		return pathname === base || pathname.startsWith(`${base}/`);
+	}
+
+	const PUBLIC_BASES = ['/login', '/signup', '/pricing', '/demo', '/auth'];
+
+	const isPublicRoute = $derived.by((): boolean => {
+		const pathname = page.url.pathname;
+		return pathname === '/' || PUBLIC_BASES.some((base) => matchesBoundary(pathname, base));
+	});
+
+	type PrimaryDestination = 'home' | 'search' | 'library';
+
+	// Longest base first so nested destinations win: exactly the
+	// most-specific boundary match carries aria-current. Entity routes,
+	// boundary look-alikes (/library2, /accountant) and everything outside
+	// the three destinations mark nothing.
+	const primaryDestination = $derived.by((): PrimaryDestination | null => {
+		const pathname = page.url.pathname;
+		if (matchesBoundary(pathname, '/home')) return 'home';
+		if (matchesBoundary(pathname, '/search')) return 'search';
+		if (matchesBoundary(pathname, '/library')) return 'library';
+		return null;
+	});
+
+	// Account and settings are not primary destinations: their marker lives
+	// on the opened account menu's entry, never on the rail or tab bar.
+	const accountEntryCurrent = $derived.by((): boolean =>
+		matchesBoundary(page.url.pathname, '/account')
+	);
+	const settingsEntryCurrent = $derived.by((): boolean =>
+		matchesBoundary(page.url.pathname, '/settings')
+	);
+
+	// At most one menu open at a time. Menus render only while open, so a
+	// closed menu contributes no tab stops and no accessible controls. The
+	// Create menu has one button per breakpoint (rail on desktop, top bar on
+	// mobile) but renders exactly one panel: the opener's. Two live panels
+	// would double every menuitem for assistive technology.
+	let openMenu = $state<'create' | 'account' | null>(null);
+	let createAnchor = $state<'rail' | 'topbar' | null>(null);
+	let menuOpener = $state<HTMLElement | null>(null);
+
+	function toggleMenu(kind: 'create' | 'account', event: MouseEvent): void {
+		const trigger = event.currentTarget as HTMLElement;
+		if (openMenu === kind) {
+			openMenu = null;
+			createAnchor = null;
+			menuOpener = null;
+		} else {
+			openMenu = kind;
+			createAnchor = kind === 'create'
+				? (trigger.dataset.createAnchor === 'topbar' ? 'topbar' : 'rail')
+				: null;
+			menuOpener = trigger;
+		}
+	}
+
+	function closeMenus(refocusOpener = false): void {
+		openMenu = null;
+		createAnchor = null;
+		if (refocusOpener && menuOpener?.isConnected) menuOpener.focus();
+		menuOpener = null;
+	}
+
+	function onMenuKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Escape') closeMenus(true);
+	}
+
+	function onMenuFocusOut(event: FocusEvent): void {
+		const root = event.currentTarget as HTMLElement;
+		const next = event.relatedTarget as Node | null;
+		// Focus left the menu root entirely (Tab out, pointer elsewhere):
+		// drop the menu rather than leaving a detached panel behind.
+		if (!next || !root.contains(next)) {
+			openMenu = null;
+			createAnchor = null;
+			menuOpener = null;
+		}
+	}
+
+	function onDocumentClick(event: MouseEvent): void {
+		if (!openMenu) return;
+		// Button toggles own their clicks; menu-item clicks navigate (which
+		// closes via afterNavigate). Anything else dismisses the menu.
+		if ((event.target as HTMLElement).closest('[data-menu-root]')) return;
+		openMenu = null;
+		createAnchor = null;
+		menuOpener = null;
+	}
+
 	// SvelteKit resets focus after link navigation; use the destination main
 	// when Upgrade unmounted the original control, not a detached opener.
+	// Any navigation also drops an open menu.
 	afterNavigate(() => {
+		openMenu = null;
+		createAnchor = null;
+		menuOpener = null;
 		if (!restoreAfterNavigation) return;
 		restoreAfterNavigation = false;
 		restoreFocus();
 	});
 
-	// App-shell navigation (roadmap NAV): Library, local NZB selection and
-	// Account, reachable from every page without typing URLs. Static native
-	// links only: the shell never fetches, uploads or processes anything.
-	type ShellDestination = 'library' | 'import' | 'account';
+	// Top-bar search: plain navigation to the Search page, never
+	// search-as-you-type. No request fires until the Search page itself
+	// loads its results from the library API.
+	let searchText = $state('');
 
-	function matchesBoundary(pathname: string, base: string): boolean {
-		return pathname === base || pathname.startsWith(`${base}/`);
+	function onSearchSubmit(event: SubmitEvent): void {
+		event.preventDefault();
+		const query = searchText.trim();
+		searchText = '';
+		goto(query ? `/search?q=${encodeURIComponent(query)}` : '/search');
 	}
 
-	// Longest base first so nested destinations win: exactly the
-	// most-specific boundary match carries aria-current.
-	const currentDestination = $derived.by((): ShellDestination | null => {
-		const pathname = page.url.pathname;
-		if (matchesBoundary(pathname, '/library/import')) return 'import';
-		if (matchesBoundary(pathname, '/library')) return 'library';
-		if (matchesBoundary(pathname, '/account')) return 'account';
-		return null;
+	// Shell display state, bridged from the shell stores into renderable
+	// $state. Subscriptions live for the layout's lifetime.
+	let toasts = $state<Toast[]>([]);
+	let miniHint = $state<MiniPlayerHint | null>(null);
+	let rightSnippet: Snippet | null = $state(null);
+
+	$effect(() => {
+		const offToasts = onToasts((list) => {
+			toasts = [...list];
+		});
+		const offHint = onMiniPlayerHint((hint) => {
+			miniHint = hint;
+		});
+		const offPanel = onRightPanel((panel) => {
+			rightSnippet = panel;
+		});
+		return () => {
+			offToasts();
+			offHint();
+			offPanel();
+		};
 	});
+
+	function onToastAction(toast: Toast): void {
+		toast.action?.run();
+		dismissToast(toast.id);
+	}
+
+	// Sign-out from the account menu. Same boundary crossing as the security
+	// page (drop this tab's library snapshots and identity label, broadcast
+	// the transition, then leave for /login); the API client stays out of
+	// the layout chunk via a dynamic import. A refused sign-out keeps the
+	// session and reports through a toast, never through chrome text.
+	let signingOut = $state(false);
+
+	async function signOut(): Promise<void> {
+		if (signingOut) return;
+		signingOut = true;
+		closeMenus();
+		try {
+			const { ApiClient, ApiError } = await import('#lib/api/client.js');
+			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+			try {
+				await client.logout();
+			} catch (error) {
+				if (!(error instanceof ApiError) || error.status !== 401) {
+					pushToast('Could not sign out. Please try again.');
+					return;
+				}
+				// A 401 means the session is already gone: cross the boundary
+				// exactly like a successful sign-out.
+			}
+		} catch {
+			pushToast('Could not sign out. Please try again.');
+			return;
+		} finally {
+			signingOut = false;
+		}
+		clearMiniPlayerHint();
+		clearToasts();
+		invalidateLibraryCache();
+		clearSignedInEmail();
+		notifyLocalAuthTransition();
+		window.location.href = '/login';
+	}
 
 	// Skip link: move keyboard focus to the page's own <main> (each route
 	// renders exactly one) without adding nested landmarks.
@@ -173,29 +352,185 @@
 	<meta name="theme-color" content="#0b0d12" />
 </svelte:head>
 
+<svelte:document onclick={onDocumentClick} />
+
 <a class="skip-link" href="#main-content" onclick={skipToContent}>Skip to content</a>
-<nav aria-label="Primary" class="nt-wrap shell-nav">
-	<a href="/library" aria-current={currentDestination === 'library' ? 'page' : undefined}>
-		Library
-	</a>
-	<a href="/library/import" aria-current={currentDestination === 'import' ? 'page' : undefined}>
-		Select NZB locally
-	</a>
-	<a href="/account/billing" aria-current={currentDestination === 'account' ? 'page' : undefined}>
-		Account
-	</a>
-</nav>
 
-<div class="nt-appearance nt-wrap">
-	<label for="nt-appearance-select">Appearance</label>
-	<select id="nt-appearance-select" value={appearance} onchange={onAppearanceChange}>
-		<option value="system">System</option>
-		<option value="light">Light</option>
-		<option value="dark">Dark</option>
-	</select>
-</div>
+{#if isPublicRoute}
+	<header class="nt-public nt-wrap" data-testid="shell-topbar">
+		<a class="nt-brand" href="/">NNTune</a>
+		<div class="nt-public-links">
+			<a href="/pricing">Pricing</a>
+			<a href="/login">Log in</a>
+		</div>
+		<!-- Same device-local control as the app top bar (one instance per
+			page: the shells never co-render). Signed-out routes keep the
+			theme switcher so the appearance journey stays intact. -->
+		<div class="nt-appearance">
+			<label for="nt-appearance-select">Appearance</label>
+			<select id="nt-appearance-select" value={appearance} onchange={onAppearanceChange}>
+				<option value="system">System</option>
+				<option value="light">Light</option>
+				<option value="dark">Dark</option>
+			</select>
+		</div>
+	</header>
+	{@render children()}
+{:else}
+	<div class="nt-topbar nt-wrap" data-testid="shell-topbar">
+		<a class="nt-brand" href="/home">NNTune</a>
+		<form class="nt-topbar-search" role="search" onsubmit={onSearchSubmit}>
+			<input
+				type="search"
+				name="q"
+				aria-label="Search"
+				placeholder="Search"
+				autocomplete="off"
+				bind:value={searchText}
+			/>
+		</form>
+		<div class="nt-appearance">
+			<label for="nt-appearance-select">Appearance</label>
+			<select id="nt-appearance-select" value={appearance} onchange={onAppearanceChange}>
+				<option value="system">System</option>
+				<option value="light">Light</option>
+				<option value="dark">Dark</option>
+			</select>
+		</div>
+		<div class="nt-menu-root nt-topbar-create" data-menu-root onfocusout={onMenuFocusOut}>
+			<button
+				type="button"
+				data-create-anchor="topbar"
+				aria-haspopup="menu"
+				aria-expanded={openMenu === 'create'}
+				aria-controls="nt-create-menu-topbar"
+				onclick={(event) => toggleMenu('create', event)}
+				onkeydown={onMenuKeydown}
+			>
+				Create
+			</button>
+			{#if openMenu === 'create' && createAnchor === 'topbar'}
+				<div class="nt-menu" role="menu" tabindex="-1" id="nt-create-menu-topbar" onkeydown={onMenuKeydown}>
+					<a role="menuitem" href="/library/import">Import NZB file</a>
+				</div>
+			{/if}
+		</div>
+		<div class="nt-menu-root" data-menu-root onfocusout={onMenuFocusOut}>
+			<button
+				type="button"
+				aria-label="Account menu"
+				aria-haspopup="menu"
+				aria-expanded={openMenu === 'account'}
+				aria-controls="nt-account-menu"
+				onclick={(event) => toggleMenu('account', event)}
+				onkeydown={onMenuKeydown}
+			>
+				Account
+			</button>
+			{#if openMenu === 'account'}
+				<div class="nt-menu" role="menu" tabindex="-1" id="nt-account-menu" onkeydown={onMenuKeydown}>
+					<a
+						role="menuitem"
+						href="/account/billing"
+						aria-current={accountEntryCurrent ? 'page' : undefined}
+					>
+						Account
+					</a>
+					<a
+						role="menuitem"
+						href="/settings"
+						aria-current={settingsEntryCurrent ? 'page' : undefined}
+					>
+						Settings
+					</a>
+					<button type="button" role="menuitem" onclick={signOut} disabled={signingOut}>
+						Sign out
+					</button>
+				</div>
+			{/if}
+		</div>
+	</div>
+	<div class="nt-body">
+		<div class="nt-rail" data-testid="shell-rail">
+			<div class="nt-menu-root" data-menu-root onfocusout={onMenuFocusOut}>
+				<button
+					type="button"
+					class="nt-create"
+					data-create-anchor="rail"
+					aria-haspopup="menu"
+					aria-expanded={openMenu === 'create'}
+					aria-controls="nt-create-menu-rail"
+					onclick={(event) => toggleMenu('create', event)}
+					onkeydown={onMenuKeydown}
+				>
+					Create
+				</button>
+				{#if openMenu === 'create' && createAnchor === 'rail'}
+					<div class="nt-menu" role="menu" tabindex="-1" id="nt-create-menu-rail" onkeydown={onMenuKeydown}>
+						<a role="menuitem" href="/library/import">Import NZB file</a>
+					</div>
+				{/if}
+			</div>
+			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
+				<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
+					Home
+				</a>
+				<a href="/search" aria-current={primaryDestination === 'search' ? 'page' : undefined}>
+					Search
+				</a>
+				<a href="/library" aria-current={primaryDestination === 'library' ? 'page' : undefined}>
+					Your Library
+				</a>
+			</nav>
+			<div class="nt-chips" role="group" aria-label="Library views">
+				<a href="/library">All</a>
+				<a href="/library/liked">Liked</a>
+				<a href="/library/recent">Recent</a>
+			</div>
+		</div>
+		{@render children()}
+	</div>
+	{#if rightSnippet}
+		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
+			{@render rightSnippet()}
+		</aside>
+	{/if}
+	{#if miniHint}
+		<div class="nt-miniplayer nt-wrap" data-testid="mini-player">
+			<a href="/library">
+				<span class="nt-miniplayer-title">{miniHint.title}</span>
+				{#if miniHint.artist}
+					<span class="nt-miniplayer-artist">{miniHint.artist}</span>
+				{/if}
+				<span class="nt-miniplayer-context">Your Library</span>
+			</a>
+		</div>
+	{/if}
+	<nav aria-label="Primary" data-testid="shell-tabbar" class="nt-destinations nt-tabbar">
+		<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
+			Home
+		</a>
+		<a href="/search" aria-current={primaryDestination === 'search' ? 'page' : undefined}>
+			Search
+		</a>
+		<a href="/library" aria-current={primaryDestination === 'library' ? 'page' : undefined}>
+			Your Library
+		</a>
+	</nav>
+{/if}
 
-{@render children()}
+{#if toasts.length > 0}
+	<div class="nt-toasts" role="status" aria-live="polite">
+		{#each toasts as toast (toast.id)}
+			<div class="nt-toast" data-testid="toast">
+				<span>{toast.message}</span>
+				{#if toast.action}
+					<button type="button" onclick={() => onToastAction(toast)}>{toast.action.label}</button>
+				{/if}
+			</div>
+		{/each}
+	</div>
+{/if}
 
 {#if paywall}
 	<PaywallModal model={paywall} onclose={dismissPaywall} />
@@ -218,25 +553,282 @@
 		transform: none;
 	}
 
-	.shell-nav {
+	.nt-brand {
+		color: var(--nt-fg);
+		font-weight: 700;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.nt-public {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
+		justify-content: space-between;
 		gap: var(--nt-space-2) var(--nt-space-4);
 		padding-block: var(--nt-space-2);
 		border-bottom: 1px solid var(--nt-border);
 	}
 
-	.shell-nav a {
+	.nt-public-links {
+		display: flex;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-3);
+	}
+
+	.nt-public-links a {
+		color: var(--nt-fg-muted);
+		text-decoration: none;
+	}
+
+	.nt-topbar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		padding-block: var(--nt-space-2);
+		border-bottom: 1px solid var(--nt-border);
+		background: var(--nt-bg);
+	}
+
+	.nt-topbar-search {
+		flex: 1 1 8rem;
+		min-width: 0;
+	}
+
+	.nt-topbar-search input {
+		width: 100%;
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+	}
+
+	.nt-appearance {
+		display: flex;
+		align-items: center;
+		gap: var(--nt-space-1);
+		color: var(--nt-fg-muted);
+	}
+
+	.nt-appearance select {
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+	}
+
+	.nt-body {
+		display: flex;
+		align-items: flex-start;
+	}
+
+	.nt-rail {
+		display: flex;
+		flex: 0 0 12rem;
+		flex-direction: column;
+		gap: var(--nt-space-3);
+		padding: var(--nt-space-3) var(--nt-space-2);
+		border-right: 1px solid var(--nt-border);
+	}
+
+	/* Design-token styling pin (NAV-18): this rule matches each Primary
+	 * nav itself while carrying a var(--nt-*) declaration. */
+	nav.nt-destinations {
+		background-color: var(--nt-bg);
+	}
+
+	.nt-rail-nav {
+		display: flex;
+		flex-direction: column;
+		gap: var(--nt-space-1);
+	}
+
+	.nt-rail-nav a {
 		padding: var(--nt-space-1) var(--nt-space-2);
 		border-radius: var(--nt-radius);
 		color: var(--nt-fg-muted);
 		text-decoration: none;
 	}
 
-	.shell-nav a[aria-current='page'] {
+	.nt-rail-nav a[aria-current='page'],
+	.nt-tabbar a[aria-current='page'] {
 		color: var(--nt-fg);
 		font-weight: 600;
 		text-decoration: underline;
+	}
+
+	.nt-menu-root {
+		position: relative;
+	}
+
+	.nt-menu-root > button {
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+	}
+
+	.nt-create {
+		width: 100%;
+	}
+
+	.nt-menu {
+		position: absolute;
+		top: calc(100% + var(--nt-space-1));
+		inset-inline-start: 0;
+		z-index: 20;
+		display: flex;
+		flex-direction: column;
+		min-width: 12rem;
+		padding: var(--nt-space-1);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+	}
+
+	.nt-menu [role='menuitem'] {
+		padding: var(--nt-space-2);
+		border: 0;
+		border-radius: var(--nt-radius);
+		background: transparent;
+		color: var(--nt-fg);
+		text-align: start;
+		text-decoration: none;
+		font: inherit;
+	}
+
+	.nt-menu [role='menuitem'][aria-current='page'] {
+		font-weight: 600;
+		text-decoration: underline;
+	}
+
+	.nt-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-1) var(--nt-space-2);
+	}
+
+	.nt-chips a {
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		color: var(--nt-fg-muted);
+		text-decoration: none;
+	}
+
+	.nt-topbar-create {
+		display: none;
+	}
+
+	.nt-tabbar {
+		display: none;
+	}
+
+	.nt-miniplayer {
+		display: none;
+	}
+
+	.nt-toasts {
+		position: fixed;
+		inset-inline-end: var(--nt-space-3);
+		bottom: var(--nt-space-3);
+		z-index: 30;
+		display: flex;
+		flex-direction: column;
+		gap: var(--nt-space-2);
+		max-width: min(24rem, calc(100vw - 2 * var(--nt-space-3)));
+	}
+
+	.nt-toast {
+		display: flex;
+		align-items: center;
+		gap: var(--nt-space-2) var(--nt-space-3);
+		padding: var(--nt-space-2) var(--nt-space-3);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg-raised);
+		color: var(--nt-fg);
+	}
+
+	.nt-toast button {
+		padding: var(--nt-space-1) var(--nt-space-2);
+		border: 1px solid var(--nt-border);
+		border-radius: var(--nt-radius);
+		background: var(--nt-bg);
+		color: var(--nt-fg);
+		white-space: nowrap;
+	}
+
+	.nt-right-panel {
+		border-top: 1px solid var(--nt-border);
+		padding-block: var(--nt-space-3);
+	}
+
+	.nt-miniplayer a {
+		display: flex;
+		align-items: baseline;
+		gap: var(--nt-space-1) var(--nt-space-2);
+		color: var(--nt-fg);
+		text-decoration: none;
+	}
+
+	.nt-miniplayer-title {
+		font-weight: 600;
+	}
+
+	.nt-miniplayer-artist,
+	.nt-miniplayer-context {
+		color: var(--nt-fg-muted);
+	}
+
+	@media (max-width: 799px) {
+		.nt-rail {
+			display: none;
+		}
+
+		.nt-topbar-create {
+			display: block;
+		}
+
+		.nt-body {
+			display: block;
+		}
+
+		.nt-miniplayer {
+			display: block;
+			padding: var(--nt-space-2) var(--nt-space-3);
+			border-top: 1px solid var(--nt-border);
+			background: var(--nt-bg-raised);
+		}
+
+		.nt-tabbar {
+			position: sticky;
+			bottom: 0;
+			display: flex;
+			align-items: stretch;
+			border-top: 1px solid var(--nt-border);
+			background: var(--nt-bg-raised);
+		}
+
+		.nt-tabbar a {
+			display: flex;
+			flex: 1 1 0;
+			align-items: center;
+			justify-content: center;
+			min-height: 48px;
+			padding: var(--nt-space-1);
+			color: var(--nt-fg-muted);
+			text-decoration: none;
+			text-align: center;
+		}
+
+		.nt-toasts {
+			bottom: calc(48px + var(--nt-space-3));
+		}
 	}
 </style>

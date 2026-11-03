@@ -173,18 +173,6 @@ function shellNav(page: Page): Locator {
 // deleted with those tests at activation. Kept tests use the
 // generation-aware helpers further down.
 
-function libraryLink(page: Page): Locator {
-	return shellNav(page).getByRole('link', { name: 'Library', exact: true });
-}
-
-function importLink(page: Page): Locator {
-	return shellNav(page).getByRole('link', { name: 'Select NZB locally', exact: true });
-}
-
-function accountLink(page: Page): Locator {
-	return shellNav(page).getByRole('link', { name: 'Account', exact: true });
-}
-
 function skipLink(page: Page): Locator {
 	return page.getByRole('link', { name: /skip to (main )?content/i });
 }
@@ -225,49 +213,6 @@ async function expectShellPresent(page: Page, where: string): Promise<void> {
 	).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
 }
 
-async function expectCurrent(
-	page: Page,
-	path: string,
-	expected: 'Library' | 'Select NZB locally' | 'Account' | null
-): Promise<void> {
-	const nav = shellNav(page);
-	if (expected === null) {
-		await expect(
-			currentMarkers(page),
-			`expected no aria-current marker in the shell nav on ${path}; ` +
-				`a marker leaked onto a non-destination. ` +
-				'Builder: match destinations by pathname boundary only.'
-		).toHaveCount(0, { timeout: PRESENCE_TIMEOUT });
-		return;
-	}
-	const link =
-		expected === 'Library'
-			? libraryLink(page)
-			: expected === 'Select NZB locally'
-				? importLink(page)
-				: accountLink(page);
-	await expect(
-		link,
-		`expected the ${expected} link (and only it) marked aria-current="page" on ${path}. ${BUILDER}`
-	).toHaveAttribute('aria-current', 'page', { timeout: PRESENCE_TIMEOUT });
-	await expect(
-		currentMarkers(page),
-		`expected exactly one aria-current marker in the shell nav on ${path}; ` +
-			`both Library and Select NZB locally (or another pair) lit up. ` +
-			'Builder: mark only the most-specific boundary match.'
-	).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
-	// The account subnav is a separate landmark: the shell must not steal its marker.
-	if (path.startsWith('/account/')) {
-		const subnav = page.getByRole('navigation', { name: 'Account', exact: true });
-		await expect(
-			subnav.locator('[aria-current="page"]'),
-			`expected the account subnav to keep its own current marker on ${path}. ` +
-				'Builder: leave the account subnav untouched.'
-		).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
-	}
-	void nav;
-}
-
 // ── Generation-aware helpers (kept cases + all v2 cases) ──────────────
 //
 // "v1" is today's horizontal three-link shell; "v2" is the app-shell
@@ -278,23 +223,12 @@ async function expectCurrent(
 // order, route allowlist) is pinned strictly by the v2 cases, never by
 // these tolerant helpers.
 
-async function shellGeneration(page: Page): Promise<'v1' | 'v2'> {
-	const topbar = await page.getByTestId('shell-topbar').count();
-	if (topbar > 0) return 'v2';
-	const home = await shellNav(page).locator('a[href="/home"]').count();
-	return home > 0 ? 'v2' : 'v1';
-}
-
 /** Some shell chrome (app shell or public header) is present. */
 async function expectShellChrome(page: Page, where: string): Promise<void> {
-	if ((await shellGeneration(page)) === 'v2') {
-		await expect(
-			page.getByTestId('shell-topbar'),
-			`expected the shell top bar on ${where}. ${SHELL_BUILDER}`
-		).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
-		return;
-	}
-	await expectShellPresent(page, where);
+	await expect(
+		page.getByTestId('shell-topbar'),
+		`expected the shell top bar on ${where}. ${SHELL_BUILDER}`
+	).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
 }
 
 /** The Library primary destination link ("Library" today, "Your Library" in v2). */
@@ -316,12 +250,7 @@ function accountMenuButton(page: Page): Locator {
 
 /** Navigate to the local NZB selection page through the shell, either generation. */
 async function goToImport(page: Page): Promise<void> {
-	const legacy = importLink(page);
-	if ((await legacy.count()) > 0) {
-		await legacy.click();
-		return;
-	}
-	// v2: import is a library task, reached from the rail Create menu.
+	// Import is a library task, reached from the rail Create menu.
 	await page.getByRole('button', { name: 'Create', exact: true }).click();
 	await page
 		.getByRole('menuitem', { name: /Import NZB file/ })
@@ -332,12 +261,7 @@ async function goToImport(page: Page): Promise<void> {
 
 /** Navigate to the account area through the shell, either generation. */
 async function goToAccount(page: Page): Promise<void> {
-	const legacy = accountLink(page);
-	if ((await legacy.count()) > 0) {
-		await legacy.click();
-		return;
-	}
-	// v2: account lives in the top-bar account menu.
+	// Account lives in the top-bar account menu.
 	await accountMenuButton(page).click();
 	await page
 		.getByRole('menuitem', { name: 'Account', exact: true })
@@ -358,25 +282,6 @@ async function expectCurrentDestination(
 	path: string,
 	expected: Destination | null
 ): Promise<void> {
-	const generation = await shellGeneration(page);
-	if (generation === 'v1') {
-		if (expected === 'Library') {
-			await expectCurrent(
-				page,
-				path,
-				path.startsWith('/library/import') ? 'Select NZB locally' : 'Library'
-			);
-		} else if (expected === 'Account') {
-			await expectCurrent(page, path, 'Account');
-		} else if (expected === null) {
-			await expectCurrent(page, path, null);
-		} else {
-			throw new Error(`destination ${expected} has no v1 shell shape (test bug)`);
-		}
-		return;
-	}
-
-	// v2 shapes.
 	if (expected === null) {
 		if ((await shellNav(page).count()) > 0) {
 			await expect(
@@ -440,17 +345,12 @@ async function expectShellDestinationsDiscoverable(page: Page, where: string): P
 		libraryDestinationLink(page),
 		`expected the Library destination link visible on ${where}. ${BUILDER}`
 	).toBeVisible({ timeout: PRESENCE_TIMEOUT });
-	if ((await shellGeneration(page)) === 'v1') {
-		await expect(importLink(page)).toBeVisible();
-		await expect(accountLink(page)).toBeVisible();
-	} else {
-		await expect(homeDestinationLink(page)).toBeVisible();
-		await expect(searchDestinationLink(page)).toBeVisible();
-		await expect(
-			accountMenuButton(page),
-			`expected the account-menu button visible on ${where}. ${SHELL_BUILDER}`
-		).toBeVisible({ timeout: PRESENCE_TIMEOUT });
-	}
+	await expect(homeDestinationLink(page)).toBeVisible();
+	await expect(searchDestinationLink(page)).toBeVisible();
+	await expect(
+		accountMenuButton(page),
+		`expected the account-menu button visible on ${where}. ${SHELL_BUILDER}`
+	).toBeVisible({ timeout: PRESENCE_TIMEOUT });
 }
 
 /** Tab forward until `target` holds focus (bounded); true when reached. */
@@ -533,116 +433,6 @@ async function paywallFocusState(page: Page): Promise<{
 		};
 	});
 }
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally and Account', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/library');
-	await expectShellPresent(page, '/library');
-
-	const nav = shellNav(page);
-	await expect(
-		nav,
-		`expected the shell nav to carry a non-empty accessible name so landmarks stay distinguishable. ${BUILDER}`
-	).toHaveAccessibleName(/.+/);
-	await expect(
-		nav,
-		'expected the shell nav name to differ from the account subnav ("Account"). ' +
-			'Builder: name the shell landmark Primary, Main, App or similar.'
-	).not.toHaveAccessibleName('Account');
-
-	for (const [label, link] of [
-		['Library', libraryLink(page)],
-		['Select NZB locally', importLink(page)],
-		['Account', accountLink(page)]
-	] as const) {
-		await expect(
-			link,
-			`expected a visible shell link named exactly "${label}". ${BUILDER}`
-		).toBeVisible({ timeout: PRESENCE_TIMEOUT });
-		const tag = await link.evaluate((element) => element.tagName);
-		expect(
-			tag,
-			`expected the "${label}" shell control to be a native link, got <${tag}>. ` +
-				'Builder: use plain <a href>, never a button or div.'
-		).toBe('A');
-	}
-	await expect(libraryLink(page)).toHaveAttribute('href', '/library');
-	await expect(importLink(page)).toHaveAttribute('href', '/library/import');
-	await expect(accountLink(page)).toHaveAttribute('href', /^\/account(\/|$)/);
-
-	// No hamburger, modal menu or nav-local buttons: every destination link is
-	// visible without opening anything.
-	await expect(
-		nav.getByRole('button'),
-		'expected zero buttons inside the shell nav (no hamburger or menu toggle). ' +
-			'Builder: render every destination as a wrapping link row.'
-	).toHaveCount(0);
-	await expect(
-		page.getByRole('dialog'),
-		'expected no dialog on a plain library load (no modal menu). ' +
-			'Builder: keep navigation a link row, not a modal.'
-	).toHaveCount(0);
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-02a] direct load marks Library vs Select NZB locally, never both', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/library');
-	await expectShellPresent(page, '/library');
-	await expectCurrent(page, '/library', 'Library');
-
-	await page.goto('/library/import');
-	await expectCurrent(page, '/library/import', 'Select NZB locally');
-	await expect(
-		libraryLink(page),
-		'expected the Library link NOT marked current on /library/import. ' +
-			'Builder: /library/import must win as the most-specific match.'
-	).not.toHaveAttribute('aria-current', 'page');
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-02b] direct load marks Account on nested account pages', async ({ page }) => {
-	await mockAccountApis(page);
-	for (const path of ['/account/billing', '/account/security', '/account/provider', '/account']) {
-		await page.goto(path);
-		await expectShellPresent(page, path);
-		await expectCurrent(page, path, 'Account');
-	}
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-02c] direct load marks nothing outside the three destinations', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await mockAccountApis(page);
-	for (const path of ['/', '/login', '/demo/player', '/library2', '/accountant']) {
-		await page.goto(path);
-		await expectShellPresent(page, path);
-		await expectCurrent(page, path, null);
-	}
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-02d] direct load matches nested paths by pathname boundary', async ({ page }) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/library/import/extra');
-	await expectShellPresent(page, '/library/import/extra');
-	await expectCurrent(page, '/library/import/extra', 'Select NZB locally');
-
-	await page.goto('/library/deep-link');
-	await expectCurrent(page, '/library/deep-link', 'Library');
-});
 
 test('[NAV-03] client-side navigation updates the marker without a reload', async ({ page }) => {
 	await mockLibrary(page, 200, []);
@@ -733,59 +523,6 @@ for (const width of [1280, 390]) {
 		}
 	});
 
-	// SUPERSEDED v1 — delete at app-shell activation; NAV-05 v2 below replaces it.
-	test(`[NAV-05 ${width}px] keyboard order is skip, nav links, Appearance, then content`, async ({
-		page
-	}) => {
-		await page.setViewportSize({ width, height: 800 });
-		await mockLibrary(page, 200, []);
-		await page.goto('/library');
-		await expectShellPresent(page, `/library at ${width}px`);
-
-		await page.keyboard.press('Tab');
-		await expect(skipLink(page)).toBeFocused();
-		for (const [label, link] of [
-			['Library', libraryLink(page)],
-			['Select NZB locally', importLink(page)],
-			['Account', accountLink(page)]
-		] as const) {
-			await page.keyboard.press('Tab');
-			await expect(
-				link,
-				`expected Tab order skip, Library, Select NZB locally, Account at ${width}px; ` +
-					`"${label}" was not next. Builder: keep nav links in DOM order after the skip link.`
-			).toBeFocused();
-		}
-		// The existing Appearance control remains in the shell's native tab order.
-		const appearance = page.getByRole('combobox', { name: 'Appearance', exact: true });
-		await page.keyboard.press('Tab');
-		await expect(
-			appearance,
-			`expected Appearance immediately after Account at ${width}px; ` +
-				'Builder: preserve the existing selector in the shell keyboard order.'
-		).toBeFocused();
-		expect(await appearance.evaluate((element) => element.tagName)).toBe('SELECT');
-		await page.keyboard.press('Home');
-		await page.keyboard.press('ArrowDown');
-		await page.keyboard.press('Enter');
-		await expect(appearance).toHaveValue('light');
-		// Dismiss any native option popup before testing forward traversal.
-		await page.keyboard.press('Escape');
-		await expect(appearance).toBeFocused();
-
-		// One more Tab must enter the actual page main, not any arbitrary target.
-		await page.keyboard.press('Tab');
-		const inMain = await page.evaluate(() => {
-			const main = document.querySelector('main');
-			return !!main?.contains(document.activeElement);
-		});
-		expect(
-			inMain,
-			`expected keyboard focus to move into the page main immediately after Appearance at ${width}px. ` +
-				'Builder: keep the shell before <main> in DOM order.'
-		).toBe(true);
-	});
-
 	test(`[NAV-06 ${width}px] shell links show a visible focus ring`, async ({
 		page
 	}, testInfo) => {
@@ -803,18 +540,11 @@ for (const width of [1280, 390]) {
 		// here each shell control is reached by tabbing forward, however
 		// many stops its generation puts in between, and only the ring on
 		// the focused control is asserted.
-		const controls: ReadonlyArray<readonly [string, Locator]> =
-			(await shellGeneration(page)) === 'v1'
-				? [
-						['Library', libraryLink(page)],
-						['Select NZB locally', importLink(page)],
-						['Account', accountLink(page)]
-					]
-				: [
-						['Home', homeDestinationLink(page)],
-						['Search', searchDestinationLink(page)],
-						['Your Library', libraryDestinationLink(page)]
-					];
+		const controls: ReadonlyArray<readonly [string, Locator]> = [
+			['Home', homeDestinationLink(page)],
+			['Search', searchDestinationLink(page)],
+			['Your Library', libraryDestinationLink(page)]
+		];
 		for (const [label, link] of controls) {
 			const reached = await tabUntilFocused(page, link, 40);
 			expect(
@@ -841,68 +571,6 @@ for (const width of [1280, 390]) {
 					`${ring.outlineStyle} ${ring.outlineWidth}. Builder: do not remove outlines.`
 			).not.toBe('none');
 			await page.screenshot({ path: testInfo.outputPath(`shell-focus-${label}-${width}.png`) });
-		}
-	});
-}
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-for (const width of [390, 360]) {
-	test(`[NAV-07 ${width}px] narrow width wraps with no overflow and no hamburger`, async ({
-		page
-	}, testInfo) => {
-		await mockLibrary(page, 200, []);
-		await mockAccountApis(page);
-		await page.setViewportSize({ width, height: 800 });
-		// Soft expects so one RED run reports every narrow destination; the
-		// short timeout keeps the failure fast (passes resolve instantly).
-		const SOFT_TIMEOUT = 1000;
-		for (const path of ['/library', '/library/import', '/account/billing', '/']) {
-			await page.goto(path);
-			await page.screenshot({ path: testInfo.outputPath(`shell-${width}-${path.replaceAll('/', '_')}.png`) });
-			const nav = shellNav(page);
-			await expect.soft(
-				nav,
-				`expected the shell nav on ${path} at ${width}px. ${BUILDER}`
-			).toHaveCount(1, { timeout: SOFT_TIMEOUT });
-			for (const [label, link] of [
-				['Library', libraryLink(page)],
-				['Select NZB locally', importLink(page)],
-				['Account', accountLink(page)]
-			] as const) {
-				// isVisible (no wait) keeps RED fast: boundingBox would retry
-				// until the test timeout on a missing link.
-				const visible = await link.isVisible();
-				expect.soft(
-					visible,
-					`expected the "${label}" link visible without opening anything on ${path} at ${width}px ` +
-						`(no hamburger). ${BUILDER}`
-				).toBe(true);
-				if (!visible) continue;
-				const box = await link.boundingBox();
-				expect.soft(
-					box,
-					`expected "${label}" to have a layout box on ${path} at ${width}px. ${BUILDER}`
-				).not.toBeNull();
-				if (box) {
-					expect.soft(
-						box.x >= -1 && box.x + box.width <= width + 1,
-						`expected "${label}" (x=${box.x}, w=${box.width}) to fit inside ${width}px on ${path}. ` +
-							'Builder: wrap the link row instead of overflowing.'
-					).toBe(true);
-				}
-			}
-			const overflow = await page.evaluate(() => ({
-				scrollWidth: document.documentElement.scrollWidth,
-				clientWidth: document.documentElement.clientWidth
-			}));
-			expect.soft(
-				overflow.scrollWidth <= overflow.clientWidth + 1,
-				`expected no horizontal overflow on ${path} at ${width}px ` +
-					`(scrollWidth ${overflow.scrollWidth} vs clientWidth ${overflow.clientWidth}). ` +
-					'Builder: use a wrapping layout.'
-			).toBe(true);
-			await expect.soft(nav.getByRole('button')).toHaveCount(0);
 		}
 	});
 }
@@ -1007,52 +675,6 @@ test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
 		`expected shell navigation to stay same-origin, saw: ${external.join('; ')}. ` +
 			'Builder: the shell calls no backend or third party by itself.'
 	).toEqual([]);
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-10] demo player links carry explicit demo labeling, no playback claims', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/');
-	await expectShellPresent(page, '/');
-	const links = await shellNav(page)
-		.getByRole('link')
-		.evaluateAll((elements) =>
-			elements.map((element) => ({
-				name: (element.textContent ?? '').replace(/\s+/g, ' ').trim(),
-				href: element.getAttribute('href') ?? ''
-			}))
-		);
-	for (const required of ['Library', 'Select NZB locally', 'Account']) {
-		expect(
-			links.some((link) => link.name === required),
-			`expected a shell link named exactly "${required}", saw: ${JSON.stringify(links)}. ${BUILDER}`
-		).toBe(true);
-	}
-	for (const link of links) {
-		if (link.href.startsWith('/demo')) {
-			expect(
-				link.name,
-				`expected the demo link (${link.href}) to say demo explicitly, got "${link.name}". ` +
-					'Builder: label any synthetic-player link with the word demo.'
-			).toMatch(/demo/i);
-		}
-		if (/play(ing|er)?|stream(ing)?/i.test(link.name)) {
-			expect(
-				link.name,
-				`expected no working-playback promise in the shell nav, got "${link.name}". ` +
-					'Builder: library playback is not wired; link the player only as an explicit demo.'
-			).toMatch(/demo/i);
-		}
-	}
-	const navText = await shellNav(page).innerText();
-	expect(
-		navText,
-		'expected the shell nav to promise no upload or processing. ' +
-			'Builder: selection stays local-only; keep those words out of the nav.'
-	).not.toMatch(/upload|process/i);
 });
 
 test('[NAV-11] shell navigation preserves the local-only import disclosure', async ({
@@ -1266,138 +888,6 @@ test('[NAV-15] existing player shortcuts keep working with the shell present', a
 	await expect(shortcuts).toBeHidden();
 });
 
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-16] PWA head, landing honesty and login stay intact across navigation', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/');
-	await expectShellPresent(page, '/');
-	await expect(
-		page.locator('link[rel="manifest"]'),
-		'expected the manifest link on /. Builder: keep the root-layout head entries.'
-	).toHaveAttribute('href', '/manifest.webmanifest');
-	await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute('content', '#0b0d12');
-	await expect(page.getByRole('main').locator('p').first()).toContainText(/not wired yet/i);
-	await expectCurrent(page, '/', null);
-
-	await libraryLink(page).click();
-	await expect(page).toHaveURL(/\/library$/);
-	await expect(
-		page.locator('link[rel="manifest"]'),
-		'expected the manifest link to survive client-side navigation. Builder: keep head in the layout.'
-	).toHaveAttribute('href', '/manifest.webmanifest');
-	await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute('content', '#0b0d12');
-	await expectCurrent(page, '/library (client nav)', 'Library');
-
-	// Login redirects and form stay as they were; the shell only adds links.
-	await page.goto('/login');
-	await expect(page).toHaveURL(/\/login$/);
-	await expect(page.getByLabel('Email', { exact: true })).toBeVisible();
-	await expect(page.getByRole('button', { name: 'Sign in with passkey' })).toBeVisible();
-	await expect(page.getByRole('button', { name: 'Email me a sign-in link' })).toBeVisible();
-	await expectShellPresent(page, '/login');
-	await expectCurrent(page, '/login', null);
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-17] navigation adds no authenticated state and keeps sign-in recovery', async ({
-	page
-}) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/');
-	await expectShellPresent(page, '/');
-	const navText = await shellNav(page).innerText();
-	expect(
-		navText,
-		'expected no sign-in/sign-out control inside the shell nav (no new auth state). ' +
-			'Builder: link Library, Select NZB locally and Account only.'
-	).not.toMatch(/sign[ -]?(in|out)/i);
-	expect(
-		navText,
-		'expected no user identity inside the shell nav. Builder: add no auth-dependent content.'
-	).not.toContain('@');
-
-	await mockLibrary(page, 401, { error: 'unauthorized' });
-	await page.goto('/library');
-	const signIn = page.getByRole('link', { name: 'Sign in', exact: true });
-	await expect(
-		signIn,
-		'expected the existing 401 sign-in recovery on /library. Builder: keep route auth behavior.'
-	).toBeVisible();
-	await expect(signIn).toHaveAttribute('href', '/login');
-	await expectShellPresent(page, 'signed-out /library');
-});
-
-// SUPERSEDED v1 — current-shell contract. Delete at app-shell activation;
-// the v2 replacement below (same case ID) is the new contract.
-test('[NAV-18] native links plus design-token styling, no new route', async ({ page }) => {
-	await mockLibrary(page, 200, []);
-	await page.goto('/library');
-	await expectShellPresent(page, '/library');
-
-	const hrefs = await shellNav(page)
-		.getByRole('link')
-		.evaluateAll((elements) =>
-			elements.map((element) => ({
-				tag: element.tagName,
-				href: element.getAttribute('href') ?? '',
-				target: element.getAttribute('target')
-			}))
-		);
-	expect(hrefs.length).toBeGreaterThanOrEqual(3);
-	for (const link of hrefs) {
-		expect(
-			link.tag,
-			`expected shell controls to be native links, got <${link.tag}>. Builder: use <a href>.`
-		).toBe('A');
-		expect(
-			link.target,
-			`expected shell link ${link.href} to navigate in place (no target). ` +
-				'Builder: same-tab native navigation only.'
-		).toBeNull();
-		expect(
-			link.href,
-			`expected shell link hrefs to reuse existing routes only, got "${link.href}". ` +
-				'Builder: no new route; link /library, /library/import, /account/* (and /demo/* labeled demo).'
-		).toMatch(/^\/(library(\/import)?|account(\/.*)?|demo(\/.*)?)?$/);
-	}
-
-	const tokenHit = await page.evaluate(() => {
-		const nav = document.querySelector('nav:has(a[href="/library/import"])');
-		if (!nav) return false;
-		for (const sheet of Array.from(document.styleSheets)) {
-			let rules: CSSRuleList | null = null;
-			try {
-				rules = sheet.cssRules;
-			} catch {
-				continue;
-			}
-			if (!rules) continue;
-			for (const rule of Array.from(rules)) {
-				const styleRule = rule as CSSStyleRule;
-				if (typeof styleRule.selectorText !== 'string') continue;
-				if (!styleRule.cssText.includes('var(--nt-')) continue;
-				try {
-					if (nav.matches(styleRule.selectorText)) return true;
-				} catch {
-					// Selector valid in CSS but not for matches(); ignore.
-				}
-			}
-		}
-		return [nav, ...Array.from(nav.querySelectorAll('a'))].some((element) =>
-			(element.getAttribute('style') ?? '').includes('var(--nt-')
-		);
-	});
-	expect(
-		tokenHit,
-		'expected the shell nav styling to reuse design tokens (a var(--nt-*) rule matching the nav). ' +
-			'Builder: style with the --nt-* tokens, not one-off values.'
-	).toBe(true);
-});
-
 // ════════════════════════════════════════════════════════════════════════
 // v2 contract — the app-shell redesign (design spec v1).
 //
@@ -1471,7 +961,7 @@ async function recordTabSequence(
 }
 
 // [gate: app shell]
-test.fixme('[NAV-01 v2] Primary landmark owns Home, Search and Your Library as native links', async ({
+test('[NAV-01 v2] Primary landmark owns Home, Search and Your Library as native links', async ({
 	page
 }) => {
 	await page.setViewportSize({ width: 1280, height: 800 });
@@ -1523,7 +1013,7 @@ test.fixme('[NAV-01 v2] Primary landmark owns Home, Search and Your Library as n
 });
 
 // [gate: app shell]
-test.fixme('[NAV-02a v2] direct load marks Home, Search and Your Library by route segment', async ({
+test('[NAV-02a v2] direct load marks Home, Search and Your Library by route segment', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -1545,7 +1035,7 @@ test.fixme('[NAV-02a v2] direct load marks Home, Search and Your Library by rout
 });
 
 // [gate: app shell]
-test.fixme('[NAV-02b v2] account and settings pages mark the account-menu entry, not the rail', async ({
+test('[NAV-02b v2] account and settings pages mark the account-menu entry, not the rail', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -1561,7 +1051,7 @@ test.fixme('[NAV-02b v2] account and settings pages mark the account-menu entry,
 });
 
 // [gate: app shell]
-test.fixme('[NAV-02c v2] entity and look-alike routes mark no primary destination', async ({
+test('[NAV-02c v2] entity and look-alike routes mark no primary destination', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -1581,7 +1071,7 @@ test.fixme('[NAV-02c v2] entity and look-alike routes mark no primary destinatio
 });
 
 // [gate: app shell]
-test.fixme('[NAV-02d v2] nested paths match by pathname boundary', async ({ page }) => {
+test('[NAV-02d v2] nested paths match by pathname boundary', async ({ page }) => {
 	await mockLibrary(page, 200, []);
 	await page.goto('/library/import/extra');
 	await expectShellPresent(page, '/library/import/extra');
@@ -1648,7 +1138,7 @@ test.fixme('[NAV-03b v2] playback state survives client-side navigation', async 
 
 // [gate: app shell]
 for (const width of [1280, 390]) {
-	test.fixme(`[NAV-04 v2 ${width}px] skip link moves keyboard focus to the page main`, async ({
+	test(`[NAV-04 v2 ${width}px] skip link moves keyboard focus to the page main`, async ({
 		page
 	}) => {
 		await page.setViewportSize({ width, height: 800 });
@@ -1680,7 +1170,7 @@ for (const width of [1280, 390]) {
 }
 
 // [gate: app shell]
-test.fixme('[NAV-05 v2 1280px] keyboard order is skip, top bar, rail, main, then player', async ({
+test('[NAV-05 v2 1280px] keyboard order is skip, top bar, rail, main, then player', async ({
 	page
 }) => {
 	await page.setViewportSize({ width: 1280, height: 800 });
@@ -1741,7 +1231,7 @@ test.fixme('[NAV-05 v2 1280px] keyboard order is skip, top bar, rail, main, then
 });
 
 // [gate: app shell]
-test.fixme('[NAV-05 v2 390px] keyboard order is skip, top bar, main, mini-player, tab bar', async ({
+test('[NAV-05 v2 390px] keyboard order is skip, top bar, main, mini-player, tab bar', async ({
 	page
 }) => {
 	await page.setViewportSize({ width: 390, height: 800 });
@@ -1780,7 +1270,7 @@ test.fixme('[NAV-05 v2 390px] keyboard order is skip, top bar, main, mini-player
 });
 
 // [gate: app shell]
-test.fixme('[NAV-06 v2 390px] tab-bar links show a visible focus ring', async ({ page }, testInfo) => {
+test('[NAV-06 v2 390px] tab-bar links show a visible focus ring', async ({ page }, testInfo) => {
 	await page.setViewportSize({ width: 390, height: 800 });
 	await mockLibrary(page, 200, []);
 	await page.goto('/library');
@@ -1816,7 +1306,7 @@ test.fixme('[NAV-06 v2 1280px] transport buttons show a visible focus ring', asy
 
 // [gate: app shell]
 for (const width of [390, 360]) {
-	test.fixme(`[NAV-07 v2 ${width}px] tab bar fits the viewport with no hamburger and no overflow`, async ({
+	test(`[NAV-07 v2 ${width}px] tab bar fits the viewport with no hamburger and no overflow`, async ({
 		page
 	}, testInfo) => {
 		await mockLibrary(page, 200, []);
@@ -1885,7 +1375,7 @@ for (const width of [390, 360]) {
 }
 
 // [gate: app shell]
-test.fixme('[NAV-10 v2] no demo links and no playback promises in either shell', async ({ page }) => {
+test('[NAV-10 v2] no demo links and no playback promises in either shell', async ({ page }) => {
 	await mockLibrary(page, 200, []);
 	await page.goto('/library');
 	await expectShellPresent(page, '/library');
@@ -1968,7 +1458,7 @@ test.fixme('[NAV-15 v2] player shortcuts work on the real player with the shell 
 });
 
 // [gate: app shell]
-test.fixme('[NAV-16 v2] PWA head and login stay intact; public routes use the public header', async ({
+test('[NAV-16 v2] PWA head and login stay intact; public routes use the public header', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -2001,7 +1491,7 @@ test.fixme('[NAV-16 v2] PWA head and login stay intact; public routes use the pu
 });
 
 // [gate: app shell]
-test.fixme('[NAV-17 v2] no identity in always-visible chrome and sign-in recovery keeps', async ({
+test('[NAV-17 v2] no identity in always-visible chrome and sign-in recovery keeps', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -2034,7 +1524,7 @@ test.fixme('[NAV-17 v2] no identity in always-visible chrome and sign-in recover
 });
 
 // [gate: app shell]
-test.fixme('[NAV-18 v2] native links plus design-token styling, design route-table allowlist', async ({
+test('[NAV-18 v2] native links plus design-token styling, design route-table allowlist', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);

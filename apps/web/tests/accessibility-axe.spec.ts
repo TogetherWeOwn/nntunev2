@@ -24,7 +24,12 @@ const ROUTES = [
 	'/account/billing',
 	'/account/provider',
 	'/demo/player',
+	'/home',
+	'/search',
+	'/settings',
 	'/library',
+	'/library/liked',
+	'/library/recent',
 	'/library/import',
 	'/onboarding/byop'
 ] as const;
