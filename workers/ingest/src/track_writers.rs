@@ -486,8 +486,8 @@ mod tests {
         let sql = upsert_track_sql();
         // The fence binds the publishing job ($6) even though tracks
         // carries no job column: the job gates the write without becoming
-        // one. Dropping the marker check, the lock, or the in-statement
-        // join fails here (ADR 0002 rule 3).
+        // one. Dropping the lock or the in-statement join fails here
+        // (ADR 0002 rule 3).
         assert!(
             sql.contains(
                 "SELECT $1::text::uuid, $2::text::uuid, $3, $4, $5 FROM (SELECT id FROM ingest_jobs WHERE id = $6 FOR SHARE) AS writer_fence"
