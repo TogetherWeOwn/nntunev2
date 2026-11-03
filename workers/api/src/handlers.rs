@@ -8756,12 +8756,14 @@ mod tests {
             // Mirrors the production upsert's monotonic coverage CASE: a
             // pass that folded an older snapshot commits without
             // regressing confirmed `paid_through_at` (or the plan and
-            // anchor tied to it). An equal-end pass carrying an anchor that
-            // differs from the anchor it read still relabels the plan and
-            // anchor (the defined equal-end plan-switch outcome); a keep
-            // re-pinning the anchor it read — or an anchor-less tie — keeps
-            // the stored ones, so a keep committing after a relabel cannot
-            // reverse the newer plan. The same staleness predicate guards
+            // anchor tied to it). An equal-end pass carrying an anchor
+            // relabels the plan and anchor (the defined equal-end
+            // plan-switch outcome) — but only when the stored row still
+            // matches what the pass read — so a keep committing after a
+            // relabel, or an older relabel committing after a newer one,
+            // keeps the stored ones instead of reversing the newer
+            // plan/anchor. An anchor-less tie keeps the stored ones too.
+            // The same staleness predicate guards
             // `status` and `grace_until`: strictly older money — or the
             // anchor-less equal-end shape only the stale fold emits — keeps
             // the stored verbatim fields instead of writing stale ones over
@@ -8783,11 +8785,16 @@ mod tests {
                             (outcome.row.paid_through_unix, existing.paid_through_unix),
                             (Some(end), Some(previous)) if end == previous
                         )
-                        // Mirrors `EXCLUDED.paid_invoice_id IS DISTINCT
-                        // FROM $13`: only new evidence relative to what the
-                        // pass read relabels (`None != None` is false, so an
-                        // anchor-less keep never relabels either).
-                        && outcome.row.paid_invoice_id != outcome.read_anchor;
+                        // Mirrors the tie arm (`subscriptions.plan_id =
+                        // $14 AND subscriptions.paid_invoice_id IS NOT
+                        // DISTINCT FROM $13`): only a pass whose read row
+                        // is still stored relabels — a late keep, or an
+                        // older relabel, committing after the row moved
+                        // keeps the stored plan/anchor. `None` read plan
+                        // never equals a stored plan, so an anchor-less
+                        // keep never relabels either.
+                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                        && existing.paid_invoice_id == outcome.read_anchor;
                     let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
                         (Some(end), Some(previous)) => {
                             end < previous
@@ -11116,6 +11123,7 @@ mod tests {
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
             // Inserts (no stored row yet), so the guard never reads this.
+            read_plan: None,
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
@@ -11125,6 +11133,7 @@ mod tests {
             fail_closed: None,
             // Read the fresh row: strictly-older money, so the stale arm
             // fires on the ends regardless.
+            read_plan: Some(PLAN_PLUS.to_string()),
             read_anchor: Some("in_test_2".to_string()),
         };
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
@@ -11210,6 +11219,7 @@ mod tests {
             fail_closed: None,
             // Seeds commit as inserts (no stored row yet), so the
             // equal-end adopt arm never reads this.
+            read_plan: None,
             read_anchor: None,
         }
     }
@@ -11233,18 +11243,32 @@ mod tests {
         .expect("seed stores");
         let switched = crate::billing_reconcile::RemoteSubscription {
             subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
-            invoices: vec![test_invoice(
-                "in_new",
-                "cus_test_1",
-                "sub_test_1",
-                PRICE_PRO,
-                BILLING_NOW,
-                end,
-                BILLING_NOW + 60,
-            )],
+            invoices: vec![
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
         };
+        // The pass reads the stored row (anchor `in_old`, present in the
+        // snapshot): a real pass always folds what it read, and the write
+        // only trusts a relabel whose read row is still stored.
         let outcome = crate::billing_reconcile::reconcile_subscription(
-            &fold_input(PLAN_PLUS, "active", Some(end), None, None),
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_old")),
             &switched,
             BILLING_NOW,
         );
@@ -11473,10 +11497,10 @@ mod tests {
         // keep pass K folds the pre-switch snapshot (plus/E/`in_plus`) and
         // re-pins the anchor it read; relabel pass R folds the switched
         // snapshot (pro item, both invoices, the switch paid later) over
-        // the same stored row. R commits first, K second — K's equal-end
-        // anchor no longer matches new evidence relative to what K read,
-        // so the write keeps the relabeled plan/anchor instead of flipping
-        // the row back to plus until the next reconcile.
+        // the same stored row. R commits first, K second — the stored row
+        // no longer matches what K read, so the write keeps the relabeled
+        // plan/anchor instead of flipping the row back to plus until the
+        // next reconcile.
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         let end = BILLING_NOW + BILLING_PERIOD;
@@ -11546,13 +11570,17 @@ mod tests {
             "the relabel anchors on the new evidence"
         );
         assert_eq!(
+            relabel_outcome.read_plan.as_deref(),
+            Some(PLAN_PLUS),
+            "the relabel records the plan it read"
+        );
+        assert_eq!(
             relabel_outcome.read_anchor.as_deref(),
             Some("in_plus"),
-            "the relabel records what it read"
+            "the relabel records the anchor it read"
         );
         // R commits first, K second.
-        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome))
-            .expect("relabel stores");
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
         block_on(h.store.store_reconcile_outcome("u1", &keep_outcome)).expect("keep stores");
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(live.paid_through_unix, Some(end), "no advance");
@@ -11566,6 +11594,185 @@ mod tests {
                 .as_deref(),
             Some("in_new"),
             "the anchor stays with the new evidence"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_shared_invoice_relabel_persists_through_store() {
+        // One paid invoice carrying qualifying lines for BOTH plans, same
+        // end: stored PLUS/E anchored on `in_shared`, the item now reports
+        // PRO. The fold relabels onto the shared invoice — emitted anchor
+        // equalling the read anchor — and the write must still persist it
+        // when nothing moved the row meanwhile: gating the adopt on
+        // emitted-vs-read difference would leave PLUS stuck forever (no
+        // later money can fix a same-invoice switch), so the arm compares
+        // stored-vs-read instead. Built from a REAL fold outcome.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_shared"), None),
+        ))
+        .expect("seed stores");
+        let mut shared = test_invoice(
+            "in_shared",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            end,
+            BILLING_NOW,
+        );
+        shared
+            .lines
+            .as_mut()
+            .expect("invoice lines")
+            .data
+            .push(crate::stripe::InvoiceLine {
+                id: "in_shared_line_2".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PRO.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(end),
+                }),
+            });
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![shared],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_shared")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the fold relabels onto the shared invoice"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_shared"),
+            "the shared invoice anchors both plans"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_shared"),
+            "emitted and read anchors coincide here by construction"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "a same-invoice relabel persists when the row never moved"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_shared"),
+            "the anchor stays on the shared invoice"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_older_relabel_committing_second_keeps_newer_switch() {
+        // Two paid switches, same end, reverse commit order — built from
+        // REAL fold outcomes: older pass O reads stored plus/E/`in_plus`
+        // and relabels onto its own newer-paid evidence `in_old`; newer
+        // pass N relabels onto `in_new` (paid later still) and commits
+        // first. O commits second with a different anchor than it read, so
+        // an emitted-vs-read gate would revert the row to the older
+        // switch; the stored-vs-read arm keeps the newer plan/anchor.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let older_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let older_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &older_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            older_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_old"),
+            "the older pass relabels onto its own evidence"
+        );
+        let newer_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 120,
+                ),
+            ],
+        };
+        let newer_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &newer_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            newer_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the newer pass relabels onto the later payment"
+        );
+        // Newer commits first, older second.
+        block_on(h.store.store_reconcile_outcome("u1", &newer_outcome)).expect("newer stores");
+        block_on(h.store.store_reconcile_outcome("u1", &older_outcome)).expect("older stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "an older relabel committing second never reverts a newer switch"
         );
         assert_eq!(live.status, "active");
     }

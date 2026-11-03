@@ -164,11 +164,12 @@ new plan (a plan switch landing exactly on the old period end), the fold
 relabels to the subscription item's current plan with unchanged coverage,
 anchored on the new evidence — but only onto equally-or-more-recently paid
 evidence (payment order as observed in the snapshot) — and the write persists
-that relabel only when the emitted anchor differs from the anchor the pass
-read, so a keep that read before the relabel committed cannot reverse the
-newer plan/anchor when it commits second (an equal-end pass carrying such
-new-evidence anchor adopts `plan_id` / `paid_invoice_id`), and the switch
-cannot stick on the old plan forever.
+that relabel only when the stored row still matches what the pass read (plan
+and anchor), so a keep that read before the relabel committed cannot reverse
+the newer plan/anchor when it commits second, an older relabel committing
+after a newer one cannot revert it either, and a relabel onto the same shared
+invoice still persists when the row never moved — and the switch cannot stick
+on the old plan forever.
 
 An existing open Checkout Session — or a single-flight loser converging onto
 one — is reused only when its recorded price matches the newly requested
