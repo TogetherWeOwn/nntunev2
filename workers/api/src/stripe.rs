@@ -270,12 +270,16 @@ pub fn list_invoice_lines_request(
 /// `GET /v1/invoices` filtered for reconciliation: by customer and/or
 /// subscription, optionally paid-only, newest first. At least one of
 /// `customer_id` / `subscription_id` must be `Some` — an unfiltered list
-/// is never issued (fail-closed builder: returns `None`).
+/// is never issued (fail-closed builder: returns `None`). `starting_after`
+/// continues a previous page; the transport follows `has_more` until the
+/// list is exhausted, so reconciliation never treats one page as the full
+/// invoice set.
 pub fn list_invoices_request(
     customer_id: Option<&str>,
     subscription_id: Option<&str>,
     paid_only: bool,
     limit: u8,
+    starting_after: Option<&str>,
 ) -> Option<StripeRequest> {
     if customer_id.is_none() && subscription_id.is_none() {
         return None;
@@ -290,6 +294,9 @@ pub fn list_invoices_request(
     }
     if paid_only {
         pairs.push(("status", "paid"));
+    }
+    if let Some(cursor) = starting_after {
+        pairs.push(("starting_after", cursor));
     }
     Some(StripeRequest {
         method: "GET",
@@ -468,6 +475,20 @@ impl Invoice {
     }
 }
 
+/// A `GET /v1/invoices` list envelope:
+/// `{"object":"list","data":[...],"has_more":...}`. The endpoint never
+/// returns a bare invoice array, so the transport deserializes this
+/// envelope (never `Vec<Invoice>` directly) and follows `has_more` with
+/// `starting_after` until the list is exhausted. Unknown envelope fields
+/// are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InvoiceList {
+    #[serde(default)]
+    pub data: Vec<Invoice>,
+    #[serde(default = "default_false")]
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct EventData {
     #[serde(default)]
@@ -589,12 +610,16 @@ pub struct CreateCheckoutSession {
 }
 
 /// Parameters for `GET /v1/invoices` (reconciliation listing).
+/// `starting_after` seeds the first page's cursor; the transport advances
+/// it across pages itself, so callers pass `None` and receive the full
+/// list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListInvoices {
     pub customer_id: Option<String>,
     pub subscription_id: Option<String>,
     pub paid_only: bool,
     pub limit: u8,
+    pub starting_after: Option<String>,
 }
 
 /// Stripe HTTPS transport. Implemented once in the Worker entry over
@@ -950,9 +975,9 @@ mod tests {
         let next = list_invoice_lines_request("in_123", Some("li_9"), 100);
         assert!(next.path.contains("starting_after=li_9"), "{}", next.path);
         // Filtered lists only: an unfiltered list is never issued.
-        assert!(list_invoices_request(None, None, true, 10).is_none());
+        assert!(list_invoices_request(None, None, true, 10, None).is_none());
         let filtered =
-            list_invoices_request(Some("cus_1"), Some("sub_1"), true, 10).expect("filtered");
+            list_invoices_request(Some("cus_1"), Some("sub_1"), true, 10, None).expect("filtered");
         assert!(
             filtered.path.contains("customer=cus_1"),
             "{}",
@@ -964,6 +989,71 @@ mod tests {
             filtered.path
         );
         assert!(filtered.path.contains("status=paid"), "{}", filtered.path);
+        assert!(
+            !filtered.path.contains("starting_after"),
+            "{}",
+            filtered.path
+        );
+        let next = list_invoices_request(Some("cus_1"), Some("sub_1"), true, 100, Some("in_9"))
+            .expect("next page");
+        assert!(next.path.contains("starting_after=in_9"), "{}", next.path);
+        assert!(next.path.contains("limit=100"), "{}", next.path);
+    }
+
+    #[test]
+    fn invoice_list_envelope_parses_the_real_list_shape() {
+        // `GET /v1/invoices` returns a list envelope, never a bare array:
+        // a `Vec<Invoice>` parse of this body fails, the envelope parses.
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "in_test_1",
+                    "object": "invoice",
+                    "customer": "cus_test_1",
+                    "subscription": "sub_test_1",
+                    "status": "paid",
+                    "amount_paid": 1000,
+                    "currency": "usd",
+                    "status_transitions": {"paid_at": 1_786_032_060},
+                    "lines": {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "in_test_1_line_1",
+                                "amount": 1000,
+                                "currency": "usd",
+                                "price": "price_plus_test",
+                                "period": {"start": 1_786_032_000, "end": 1_788_624_000},
+                            }
+                        ],
+                        "has_more": false,
+                        "total_count": 1,
+                        "url": "/v1/invoices/in_test_1/lines",
+                    },
+                    "livemode": false,
+                }
+            ],
+            "has_more": true,
+            "total_count": 2,
+            "url": "/v1/invoices",
+        });
+        assert!(
+            serde_json::from_value::<Vec<Invoice>>(body.clone()).is_err(),
+            "a bare-array parse must fail on the real envelope shape"
+        );
+        let list: InvoiceList =
+            serde_json::from_value(body).expect("envelope parses into invoices");
+        assert!(list.has_more, "the cursor must drive a second page");
+        assert_eq!(list.data.len(), 1);
+        let invoice = &list.data[0];
+        assert_eq!(invoice.id, "in_test_1");
+        assert_eq!(invoice.status, "paid");
+        assert_eq!(invoice.paid_at(), Some(1_786_032_060));
+        let lines = invoice.lines.as_ref().expect("lines expand inline");
+        assert_eq!(lines.data.len(), 1);
+        assert_eq!(lines.data[0].price.as_deref(), Some("price_plus_test"));
+        assert!(!lines.has_more);
     }
 
     #[test]

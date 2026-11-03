@@ -2429,6 +2429,29 @@ impl Store for PgStore {
         .await
     }
 
+    async fn release_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Best-effort release of a claim whose handling failed
+                // mid-reconcile: deleting the row lets the retried delivery
+                // reprocess instead of acking 200 on a consumed claim.
+                client
+                    .query_typed(
+                        crate::billing_reconcile::release_webhook_event_statement(),
+                        &[(&event_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.release_webhook_event")
+                    })?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn load_reconcile_input(
         &self,
         user_id: &str,
@@ -3521,15 +3544,35 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
         Box::pin(async move {
             // An unfiltered list is never issued: without a customer or a
             // subscription the builder refuses, and the transport fails
-            // closed instead of listing the account's invoices.
-            let request = crate::stripe::list_invoices_request(
-                req.customer_id.as_deref(),
-                req.subscription_id.as_deref(),
-                req.paid_only,
-                req.limit,
-            )
-            .ok_or_else(crate::stripe::StripeError::transport)?;
-            self.send(&request).await
+            // closed instead of listing the account's invoices. The
+            // endpoint returns a list envelope (`object: "list"`), never a
+            // bare array, and reconciliation needs every page: follow
+            // `has_more` with `starting_after` until exhausted.
+            let mut invoices = Vec::new();
+            let mut cursor: Option<String> = req.starting_after.clone();
+            loop {
+                let request = crate::stripe::list_invoices_request(
+                    req.customer_id.as_deref(),
+                    req.subscription_id.as_deref(),
+                    req.paid_only,
+                    req.limit,
+                    cursor.as_deref(),
+                )
+                .ok_or_else(crate::stripe::StripeError::transport)?;
+                let page: crate::stripe::InvoiceList = self.send(&request).await?;
+                let last = page.data.last().map(|invoice| invoice.id.clone());
+                invoices.extend(page.data);
+                if !page.has_more {
+                    break;
+                }
+                // A `has_more` page with no cursor to continue from cannot
+                // advance: fail closed rather than loop on the same page.
+                cursor = last;
+                if cursor.is_none() {
+                    return Err(crate::stripe::StripeError::transport());
+                }
+            }
+            Ok(invoices)
         })
     }
     fn cancel_subscription(
@@ -4118,7 +4161,7 @@ mod tests {
 
     /// Every names-only database failure event PgStore can emit beyond
     /// `api.db.connection_error`.
-    const DB_FAILURE_EVENTS: [&str; 16] = [
+    const DB_FAILURE_EVENTS: [&str; 17] = [
         "api.db.connect_failed.binding",
         "api.db.connect_failed.socket",
         "api.db.connect_failed.dial",
@@ -4128,6 +4171,7 @@ mod tests {
         "api.db.statement_failed.insert_user",
         "api.db.statement_failed.insert_session",
         "api.db.statement_failed.claim_webhook_event",
+        "api.db.statement_failed.release_webhook_event",
         "api.db.statement_failed.load_reconcile_input",
         "api.db.statement_failed.user_for_stripe_customer",
         "api.db.statement_failed.store_reconcile_outcome",
@@ -5348,6 +5392,41 @@ mod tests {
         assert!(
             body.contains("trim().is_empty()"),
             "config_from_env must reject whitespace-only QA bearer values"
+        );
+    }
+
+    #[test]
+    fn config_from_env_refuses_non_test_stripe_keys_at_load() {
+        // The bearer gate (`valid_secret_key`) is unit-tested pure, but the
+        // load path that enforces it needs a wasm Env — so pin the call
+        // site the same way the KEK/overlay tests pin theirs: slice ONLY
+        // the `config_from_env` body out of the pre-test source, so this
+        // test's own literals cannot satisfy the assertions. Dropping the
+        // gate (or reading the key without validating) fails here, and a
+        // staged `sk_live_` key would then reach traffic.
+        let source = include_str!("worker_entry.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("test module must exist")
+            .0;
+        let body = production
+            .split_once("fn config_from_env(")
+            .expect("config_from_env must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("a following fn must bound the body")
+            .0;
+        assert!(
+            body.contains("STRIPE_SECRET_KEY"),
+            "config_from_env must read the Stripe bearer secret"
+        );
+        assert!(
+            body.contains("valid_secret_key(key)"),
+            "config_from_env must validate the staged bearer through the test-mode gate"
+        );
+        assert!(
+            body.contains("return None"),
+            "config_from_env must refuse startup when the staged key fails validation"
         );
     }
 

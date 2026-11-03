@@ -191,8 +191,10 @@ fn is_held_status(status: &str) -> bool {
 }
 
 /// Terminal statuses: stored verbatim outside the live slot, grace
-/// cleared, coverage retained as history only.
-fn is_terminal_status(status: &str) -> bool {
+/// cleared, coverage retained as history only. Shared with the purchase
+/// path, which must confirm a held subscription terminal before a
+/// replacement checkout mints its session.
+pub(crate) fn is_terminal_status(status: &str) -> bool {
     matches!(status, "canceled" | "incomplete_expired")
 }
 
@@ -684,6 +686,15 @@ pub fn claim_webhook_event_statement() -> &'static str {
     "INSERT INTO billing_webhook_events (stripe_event_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING stripe_event_id"
 }
 
+/// Parameters: event_id. Releases a claim whose handling failed
+/// mid-reconcile (Stripe 5xx, store outage): the row is deleted so the
+/// retried delivery reprocesses instead of acking 200 on a consumed
+/// claim. Only called on the error path — successful handling keeps the
+/// row, and duplicates of a *processed* event still ack without change.
+pub fn release_webhook_event_statement() -> &'static str {
+    "DELETE FROM billing_webhook_events WHERE stripe_event_id = $1"
+}
+
 /// Parameters: user_id. The unresolved single-flight operation, if any
 /// (at most one: `uq_billing_operations_single_flight`).
 pub fn open_checkout_operation_select_statement() -> &'static str {
@@ -728,8 +739,14 @@ pub fn reconcile_lock_statement() -> &'static str {
 
 /// Parameters: the reconciled columns. Upsert by the remote subscription
 /// id: the row key IS the real Stripe subscription, so no entitlement
-/// exists before it. `paid_invoice_id` only moves forward with new money
-/// (COALESCE keeps the anchor);
+/// exists before it. Coverage (`paid_through_at`, and the `plan_id` /
+/// `paid_invoice_id` anchored to it) advances monotonically *in the
+/// write itself*: the inputs are folded before the per-user advisory
+/// lock is taken, so a pass that read an older remote snapshot can
+/// commit after a fresher pass — the CASE keeps the greatest confirmed
+/// coverage instead of regressing it. Status, item bindings,
+/// period end and grace still update verbatim (the pure fold owns the
+/// grace-set-once/clear-on-recovery rules against its snapshot).
 ///
 /// Full parameter order:
 /// $1 user_id · $2 stripe_subscription_id · $3 stripe_customer_id ·
@@ -738,7 +755,7 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
 /// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL.
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = EXCLUDED.plan_id, status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = EXCLUDED.paid_through_at, paid_invoice_id = COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id), grace_until = EXCLUDED.grace_until"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = EXCLUDED.grace_until"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
@@ -1306,6 +1323,16 @@ mod tests {
         assert!(
             reconcile_lock_statement().contains("pg_advisory_xact_lock(hashtext($1))"),
             "coverage advances under the per-user lock",
+        );
+        assert!(
+            store_reconciled_subscription_statement()
+                .contains("WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at"),
+            "coverage advances monotonically in the write itself: a pass folded from an older snapshot never regresses confirmed coverage",
+        );
+        assert!(
+            release_webhook_event_statement()
+                .contains("DELETE FROM billing_webhook_events WHERE stripe_event_id = $1"),
+            "a failed handling releases the claim so the retry reprocesses",
         );
     }
 }
