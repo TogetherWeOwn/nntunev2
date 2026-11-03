@@ -159,11 +159,16 @@ target = "app"
 sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
 
 [[migration]]
-file = "0033_posted_files.sql"
+file = "0033_invite_codes.sql"
 target = "app"
-sha256 = "a581a32971148ad0dd2b12c90e12898ecb3fcb55fb1d13daa8b35e2bbb88df01"
+sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
 
 [[migration]]
-file = "0034_posted_files_crypto.sql"
+file = "0034_posted_files.sql"
 target = "app"
-sha256 = "4fdbcf80e441afd5ef30f82ca378d19f32a71382793a9564d9388c8fa2d3f40f"
+sha256 = "ef8e99df7f0bed8bbbe5c6583f71cbcc3268651354e0a1ce7ef4638c3aeac565"
+
+[[migration]]
+file = "0035_posted_files_crypto.sql"
+target = "app"
+sha256 = "f9ed9bc2398fc19f56ab2688715c391606595c5b8296431e7f97b6594dcc9fd7"

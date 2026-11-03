@@ -12,7 +12,7 @@
 //! Storage shape (Engineering Lead build-time decision): the second copy
 //! is the same message-IDs posted via a posting account on the second
 //! backbone — no second NZB, no second ID set. The posted-file record
-//! ([`PostedFileRecord`], migration 0033) stores per-backbone
+//! ([`PostedFileRecord`], migration 0034) stores per-backbone
 //! presence/verification state per article set; accounts sharing a backbone
 //! count as one copy. Repair reads from either spool first, then PAR2
 //! (itself present on both spools); only if same-ID re-post fails does
@@ -241,7 +241,7 @@ pub enum SpoolCopyState {
 }
 
 /// The posted-file record: one row per tagged plaintext sha256 (migration
-/// 0033). Same message-IDs on both backbones — no second NZB, no second
+/// 0034). Same message-IDs on both backbones — no second NZB, no second
 /// ID set — so the row carries hashes and counts, never message-IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostedFileRecord {
@@ -628,7 +628,7 @@ pub fn validate_backbone_pair(post: &str, verify: &str) -> Result<(), &'static s
     Ok(())
 }
 
-// --- `posted_files` statements (migration 0033) ---------------------------
+// --- `posted_files` statements (migration 0034) ---------------------------
 // Pure statement owners for the `posted_files` table, mirroring the
 // `track_writers` pattern: this module pins the SQL text, the `$n`
 // parameter orders, and the zero-row classification. Execution lands
@@ -681,7 +681,7 @@ pub fn mark_repost_exhausted_sql() -> &'static str {
 }
 
 /// Check upsert values before they touch the database. Bounds mirror
-/// migration 0033 (`CHECK`s on the sha shapes, the label lengths, and
+/// migration 0034 (`CHECK`s on the sha shapes, the label lengths, and
 /// `article_count > 0`); the backbone pair must differ.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_posted_file_params(

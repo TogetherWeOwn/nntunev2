@@ -7,11 +7,13 @@
 //! runs every test below against its migrated, throwaway PostgreSQL service.
 
 use super::{
-    admin_set_app_setting_on, admin_set_user_role_on, complete_registration_on,
-    prune_expired_challenges_on, reap_unverified_users_on,
+    admin_issue_invite_on, admin_revoke_invite_on, admin_set_app_setting_on,
+    admin_set_user_role_on, complete_registration_on, prune_expired_challenges_on,
+    reap_unverified_users_on,
 };
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
-use crate::handlers::AdminWriteOutcome;
+use crate::handlers::{AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome};
+use crate::vault::{audit_event_extended, AuditEvent};
 use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -164,6 +166,7 @@ struct Fixture {
     challenge: PasskeyChallenge,
     magic: MagicLinkRecord,
     invite: InviteRecord,
+    invite_audit: AuditEvent,
     credential: PasskeyCredential,
 }
 
@@ -188,11 +191,29 @@ impl Fixture {
             expires_at: NOW + 300,
             used: false,
         };
-        let invite = InviteRecord {
-            code_hash: format!("{prefix}-invite-hash"),
-            used: false,
-            created_at: NOW - 10,
-        };
+        // The record mirrors what `prepare_invite_redemption` hands the
+        // enrollment transaction: spend stamps already written, the
+        // conditional claim binds them.
+        let mut invite = InviteRecord::new_issued(
+            format!("{prefix}-invite-hash"),
+            None,
+            crate::auth::INVITE_KIND_ADMIN,
+            None,
+            NOW - 10,
+            NOW + 604_800,
+        );
+        invite.used = true;
+        invite.redeemed_by = Some(user_id.clone());
+        invite.redeemed_at = Some(NOW);
+        let invite_audit = audit_event_extended(
+            "system",
+            crate::auth::INVITE_REDEEMED_AUDIT_ACTION,
+            true,
+            "127.0.0.1",
+            NOW,
+            Some(&user_id),
+            serde_json::json!({"invite_id": serde_json::Value::Null}),
+        );
         let credential = PasskeyCredential {
             cred_id_b64url: format!("{prefix}-credential"),
             user_id: user_id.clone(),
@@ -223,8 +244,12 @@ impl Fixture {
             .expect("seed emailed proof");
         client
             .execute(
-                "INSERT INTO invite_codes (code_hash, used, created_at) VALUES ($1, FALSE, $2)",
-                &[&invite.code_hash, &(invite.created_at as i64)],
+                "INSERT INTO invite_codes (code_hash, used, created_at, expires_at) VALUES ($1, FALSE, $2, $3)",
+                &[
+                    &invite.code_hash,
+                    &(invite.created_at as i64),
+                    &(invite.expires_at as i64),
+                ],
             )
             .await
             .expect("seed invite proof");
@@ -232,6 +257,7 @@ impl Fixture {
             challenge,
             magic,
             invite,
+            invite_audit,
             credential,
         }
     }
@@ -283,6 +309,7 @@ fn postgres_registration_commit_without_invite_is_single_use() {
             &fixture.challenge,
             &fixture.magic,
             None,
+            None,
             &fixture.credential,
             NOW,
         )
@@ -298,6 +325,7 @@ fn postgres_registration_commit_without_invite_is_single_use() {
                 &mut client,
                 &fixture.challenge,
                 &fixture.magic,
+                None,
                 None,
                 &replay_credential,
                 NOW,
@@ -321,6 +349,7 @@ fn postgres_registration_commit_consumes_optional_invite() {
             &fixture.challenge,
             &fixture.magic,
             Some(&fixture.invite),
+            Some(&fixture.invite_audit),
             &fixture.credential,
             NOW,
         )
@@ -348,6 +377,7 @@ fn postgres_registration_duplicate_rolls_back_and_same_proofs_retry() {
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &fixture.credential,
                 NOW,
             )
@@ -382,6 +412,7 @@ fn postgres_registration_duplicate_rolls_back_and_same_proofs_retry() {
             &fixture.challenge,
             &fixture.magic,
             Some(&fixture.invite),
+            Some(&fixture.invite_audit),
             &fixture.credential,
             NOW,
         )
@@ -414,6 +445,7 @@ fn postgres_registration_zero_row_magic_claim_rolls_back_earlier_challenge() {
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &fixture.credential,
                 NOW,
             )
@@ -446,6 +478,7 @@ fn postgres_registration_challenge_loser_spends_no_later_proof() {
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &fixture.credential,
                 NOW,
             )
@@ -476,6 +509,7 @@ fn postgres_registration_invite_loser_rolls_back_both_earlier_claims() {
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &fixture.credential,
                 NOW,
             )
@@ -502,6 +536,7 @@ fn postgres_registration_competing_transactions_enroll_exactly_one_credential() 
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &fixture.credential,
                 NOW,
             ),
@@ -510,6 +545,7 @@ fn postgres_registration_competing_transactions_enroll_exactly_one_credential() 
                 &fixture.challenge,
                 &fixture.magic,
                 Some(&fixture.invite),
+                Some(&fixture.invite_audit),
                 &other_credential,
                 NOW,
             ),
@@ -741,10 +777,11 @@ async fn blocked_enrollment() -> BlockedEnrollment {
         .await
         .expect("identify the enrollment backend")
         .get::<_, i32>(0);
-    let (challenge, magic, invite, credential) = (
+    let (challenge, magic, invite, invite_audit, credential) = (
         fixture.challenge.clone(),
         fixture.magic.clone(),
         fixture.invite.clone(),
+        fixture.invite_audit.clone(),
         fixture.credential.clone(),
     );
     let enrollment = tokio::spawn(async move {
@@ -753,6 +790,7 @@ async fn blocked_enrollment() -> BlockedEnrollment {
             &challenge,
             &magic,
             Some(&invite),
+            Some(&invite_audit),
             &credential,
             NOW,
         )
@@ -2039,5 +2077,290 @@ fn postgres_admin_simultaneous_opposing_demotions_keep_one_admin() {
         let audits = role_audit_chain(&client, &admin_a).await.len()
             + role_audit_chain(&client, &admin_b).await.len();
         assert_eq!(audits, 1, "only the applied demotion audits");
+    });
+}
+
+// The production issue/revoke transactions (migration 0033): each
+// commits with exactly one audit row that references the invite by
+// surrogate row id — never by code plaintext or hash — and a demoted
+// actor's re-check refuses both writes.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, subject) = seed_admin_test_users(&client).await;
+        let code_hash = format!("invite-bank-{:016x}", rand::random::<u64>());
+        let record = InviteRecord::new_issued(
+            code_hash.clone(),
+            Some(actor.clone()),
+            crate::auth::INVITE_KIND_ADMIN,
+            Some("invitee@example.com".to_string()),
+            NOW,
+            NOW + 604_800,
+        );
+
+        // A member actor is refused by the transaction's role re-check
+        // and writes nothing.
+        let refused = admin_issue_invite_on(&mut client, &subject, &record, "198.51.100.9", NOW)
+            .await
+            .expect("member issue attempt is a typed refusal");
+        assert_eq!(refused, AdminInviteIssueOutcome::ActorNotAdmin);
+
+        let invite_id =
+            match admin_issue_invite_on(&mut client, &actor, &record, "198.51.100.9", NOW)
+                .await
+                .expect("admin issue commits")
+            {
+                AdminInviteIssueOutcome::Issued(id) => id,
+                other => panic!("expected Issued, got {other:?}"),
+            };
+        let row = client
+            .query_one(
+                "SELECT issued_by, kind, email, expires_at, used FROM invite_codes WHERE id = $1",
+                &[&invite_id],
+            )
+            .await
+            .expect("read issued invite");
+        assert_eq!(row.get::<_, String>(0), actor);
+        assert_eq!(row.get::<_, String>(1), "admin");
+        assert_eq!(row.get::<_, String>(2), "invitee@example.com");
+        assert_eq!(row.get::<_, i64>(3), (NOW + 604_800) as i64);
+        assert!(!row.get::<_, bool>(4));
+
+        let audits = client
+            .query(
+                "SELECT action, user_id, details::text FROM audit_log \
+                 WHERE action IN ('invite.issued', 'invite.revoked') \
+                   AND details ->> 'invite_id' = $1 ORDER BY id",
+                &[&invite_id.to_string()],
+            )
+            .await
+            .expect("read invite audit rows");
+        assert_eq!(audits.len(), 1, "exactly the issue audit so far");
+        assert_eq!(audits[0].get::<_, String>(0), "invite.issued");
+        assert_eq!(audits[0].get::<_, String>(1), actor);
+        assert!(
+            !audits[0].get::<_, String>(2).contains(&code_hash),
+            "the issue audit must reference the row id, not the hash"
+        );
+
+        let revoked = admin_revoke_invite_on(&mut client, &actor, invite_id, "198.51.100.9", NOW)
+            .await
+            .expect("admin revoke commits");
+        assert_eq!(revoked, AdminInviteRevokeOutcome::Revoked);
+        let again = admin_revoke_invite_on(&mut client, &actor, invite_id, "198.51.100.9", NOW)
+            .await
+            .expect("re-revoke is a typed idempotent outcome");
+        assert_eq!(again, AdminInviteRevokeOutcome::AlreadyRevoked);
+        let audits = client
+            .query(
+                "SELECT action FROM audit_log \
+                 WHERE action IN ('invite.issued', 'invite.revoked') \
+                   AND details ->> 'invite_id' = $1 ORDER BY id",
+                &[&invite_id.to_string()],
+            )
+            .await
+            .expect("read invite audit rows after revoke");
+        assert_eq!(
+            audits
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>(),
+            vec!["invite.issued".to_string(), "invite.revoked".to_string()],
+            "issue and the first revoke audit once each"
+        );
+        let row = client
+            .query_one(
+                "SELECT revoked_at, revoked_by FROM invite_codes WHERE id = $1",
+                &[&invite_id],
+            )
+            .await
+            .expect("read revoked invite");
+        assert_eq!(row.get::<_, i64>(0), NOW as i64);
+        assert_eq!(row.get::<_, String>(1), actor);
+    });
+}
+
+// Revocation that commits after the signup snapshot was taken wins:
+// the enrollment's conditional claim matches zero rows and the whole
+// transaction rolls back, spending neither earlier proof.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_invite_revocation_wins_against_stale_redemption_snapshot() {
+    run_test(async {
+        let mut client = connect().await;
+        let fixture = Fixture::seed(&client).await;
+        client
+            .execute(
+                "UPDATE invite_codes SET revoked_at = $1 WHERE code_hash = $2",
+                &[&(NOW as i64), &fixture.invite.code_hash],
+            )
+            .await
+            .expect("a revocation commits after the snapshot");
+        assert!(
+            complete_registration_on(
+                &mut client,
+                &fixture.challenge,
+                &fixture.magic,
+                Some(&fixture.invite),
+                Some(&fixture.invite_audit),
+                &fixture.credential,
+                NOW,
+            )
+            .await
+            .is_err(),
+            "a revoked invite must lose at claim time, not at snapshot time only"
+        );
+        fixture
+            .assert_state(&client, (false, false, false, 0))
+            .await;
+        let redeemed = client
+            .query_one(
+                "SELECT count(*) FROM audit_log WHERE action = 'invite.redeemed' AND subject_user_id = $1",
+                &[&fixture.credential.user_id],
+            )
+            .await
+            .expect("count redemption audits")
+            .get::<_, i64>(0);
+        assert_eq!(redeemed, 0, "the rolled-back enrollment audits nothing");
+    });
+}
+
+// The winning enrollment stamps the spend (redeemed_by/at) and the
+// invite tree (users.invited_by) and writes the `invite.redeemed`
+// audit in the same commit; the audit carries no code material.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_registration_invite_claim_stamps_spend_and_invited_by() {
+    run_test(async {
+        let mut client = connect().await;
+        let (issuer, _subject) = seed_admin_test_users(&client).await;
+        let mut fixture = Fixture::seed(&client).await;
+        fixture.invite.issued_by = Some(issuer.clone());
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1 WHERE code_hash = $2",
+                &[&issuer, &fixture.invite.code_hash],
+            )
+            .await
+            .expect("attribute the seeded invite to its issuer");
+        complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await
+        .expect("registration with invite commits");
+        fixture.assert_state(&client, (true, true, true, 1)).await;
+
+        let row = client
+            .query_one(
+                "SELECT i.redeemed_by, i.redeemed_at, u.invited_by \
+                 FROM invite_codes i, users u \
+                 WHERE i.code_hash = $1 AND u.id = $2",
+                &[&fixture.invite.code_hash, &fixture.credential.user_id],
+            )
+            .await
+            .expect("read spend stamps and invite tree");
+        assert_eq!(
+            row.get::<_, String>(0),
+            fixture.credential.user_id,
+            "redeemed_by is the new account"
+        );
+        assert_eq!(row.get::<_, i64>(1), NOW as i64);
+        assert_eq!(
+            row.get::<_, String>(2),
+            issuer,
+            "users.invited_by is the invite's issuer"
+        );
+
+        let audits = client
+            .query(
+                "SELECT details::text FROM audit_log \
+                 WHERE action = 'invite.redeemed' AND subject_user_id = $1",
+                &[&fixture.credential.user_id],
+            )
+            .await
+            .expect("read redemption audit");
+        assert_eq!(audits.len(), 1, "exactly one redemption audit commits");
+        assert!(
+            !audits[0]
+                .get::<_, String>(0)
+                .contains(&fixture.invite.code_hash),
+            "the redemption audit must not carry the code hash"
+        );
+    });
+}
+
+// Regression (review round 1): deleting the issuer between the
+// `invite_by_hash` snapshot and the enrollment commit must not break
+// an otherwise valid invite. The issued_by FK nulls the stored row
+// (ON DELETE SET NULL), so the stamp derives `invited_by` from the
+// claimed row in-transaction and lands NULL; stamping the stale
+// snapshot id instead violated the `users.invited_by` FK and rolled
+// the enrollment back forever.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_registration_invite_claim_survives_issuer_deletion() {
+    run_test(async {
+        let mut client = connect().await;
+        let (issuer, _subject) = seed_admin_test_users(&client).await;
+        let mut fixture = Fixture::seed(&client).await;
+        fixture.invite.issued_by = Some(issuer.clone());
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1 WHERE code_hash = $2",
+                &[&issuer, &fixture.invite.code_hash],
+            )
+            .await
+            .expect("attribute the seeded invite to its issuer");
+        // The issuer disappears after the snapshot was taken; the
+        // fixture's invite record still carries the stale id.
+        client
+            .execute("DELETE FROM users WHERE id = $1", &[&issuer])
+            .await
+            .expect("delete the issuer between lookup and claim");
+        complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await
+        .expect("registration with an orphaned invite still commits");
+        fixture.assert_state(&client, (true, true, true, 1)).await;
+
+        let row = client
+            .query_one(
+                "SELECT i.redeemed_by, i.issued_by, u.invited_by \
+                 FROM invite_codes i, users u \
+                 WHERE i.code_hash = $1 AND u.id = $2",
+                &[&fixture.invite.code_hash, &fixture.credential.user_id],
+            )
+            .await
+            .expect("read spend stamps after issuer deletion");
+        assert_eq!(
+            row.get::<_, String>(0),
+            fixture.credential.user_id,
+            "the orphaned invite is still spent by the new account"
+        );
+        assert_eq!(
+            row.get::<_, Option<String>>(1),
+            None,
+            "the stored issuer was nulled by ON DELETE SET NULL"
+        );
+        assert_eq!(
+            row.get::<_, Option<String>>(2),
+            None,
+            "users.invited_by derives from the claimed row, not the stale snapshot"
+        );
     });
 }
