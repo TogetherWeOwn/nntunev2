@@ -1,18 +1,22 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * App-shell navigation acceptance (roadmap item NAV): reach Library, local NZB
- * selection and Account from a compact shell landmark without typing URLs.
+ * App-shell navigation acceptance (roadmap item NAV): reach Library and
+ * Account from a compact shell landmark without typing URLs.
+ * (User NZB import retired in TWO-1639: the Select NZB locally link and
+ * the /library/import route are gone; NAV-11 now pins the removal.)
  *
  * Protected Test Author handoff: the Builder continues on this branch and
  * never edits this file. Every failing `expect` below is the build contract;
  * change production code (the app shell), never these pins.
+ * (TWO-1639 is the sanctioned retirement exception: it repoints these pins
+ * off the deleted import surface per the BYOP removal plan.)
  *
  * Stable case IDs:
- *   NAV-01  shell landmark with Library / Select NZB locally / Account links
- *   NAV-02a direct load marks Library vs Select NZB locally (most specific)
+ *   NAV-01  shell landmark with Library / Account links
+ *   NAV-02a direct load marks Library; the retired /library/import still boundary-matches Library
  *   NAV-02b direct load marks Account on nested account pages
- *   NAV-02c direct load marks nothing outside the three destinations
+ *   NAV-02c direct load marks nothing outside the two destinations
  *   NAV-02d direct load matches nested paths by pathname boundary
  *   NAV-03  client-side navigation updates the marker without a reload
  *   NAV-04  skip link reveals on focus and moves keyboard focus to the page main (wide + narrow)
@@ -25,7 +29,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   NAV-08d links stay discoverable with a cached (stale) library
  *   NAV-09  navigating emits no mutating or off-origin requests
  *   NAV-10  demo player links carry explicit demo labeling, no playback claims
- *   NAV-11  shell navigation preserves the local-only import disclosure
+ *   NAV-11  retired import surface stays gone (no link, no route, no hooks)
  *   NAV-12  account subnav keeps working alongside the shell nav
  *   NAV-13  paywall close keeps focus restoration and modal isolation (Tab + Shift+Tab) with nav
  *   NAV-14  paywall upgrade navigation keeps the shell and a sane focus target
@@ -53,17 +57,13 @@ const LIBRARY_ITEMS = [
 const PRESENCE_TIMEOUT = 3000;
 const BUILDER = 'Builder: add the compact shell nav landmark to the root layout.';
 
-/** The shell nav, located by behavior (it owns the /library/import link), not by name. */
+/** The shell nav, located by its landmark name (never by a route link). */
 function shellNav(page: Page): Locator {
-	return page.locator('nav:has(a[href="/library/import"])');
+	return page.getByRole('navigation', { name: 'Primary' });
 }
 
 function libraryLink(page: Page): Locator {
 	return shellNav(page).getByRole('link', { name: 'Library', exact: true });
-}
-
-function importLink(page: Page): Locator {
-	return shellNav(page).getByRole('link', { name: 'Select NZB locally', exact: true });
 }
 
 function accountLink(page: Page): Locator {
@@ -105,7 +105,7 @@ async function mockAccountApis(page: Page): Promise<void> {
 async function expectShellPresent(page: Page, where: string): Promise<void> {
 	await expect(
 		shellNav(page),
-		`expected one app-shell nav owning the /library/import link on ${where}; ` +
+		`expected one app-shell nav (Primary landmark) on ${where}; ` +
 			`got none. ${BUILDER}`
 	).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
 }
@@ -113,7 +113,7 @@ async function expectShellPresent(page: Page, where: string): Promise<void> {
 async function expectCurrent(
 	page: Page,
 	path: string,
-	expected: 'Library' | 'Select NZB locally' | 'Account' | null
+	expected: 'Library' | 'Account' | null
 ): Promise<void> {
 	const nav = shellNav(page);
 	if (expected === null) {
@@ -125,12 +125,7 @@ async function expectCurrent(
 		).toHaveCount(0, { timeout: PRESENCE_TIMEOUT });
 		return;
 	}
-	const link =
-		expected === 'Library'
-			? libraryLink(page)
-			: expected === 'Select NZB locally'
-				? importLink(page)
-				: accountLink(page);
+	const link = expected === 'Library' ? libraryLink(page) : accountLink(page);
 	await expect(
 		link,
 		`expected the ${expected} link (and only it) marked aria-current="page" on ${path}. ${BUILDER}`
@@ -138,7 +133,7 @@ async function expectCurrent(
 	await expect(
 		currentMarkers(page),
 		`expected exactly one aria-current marker in the shell nav on ${path}; ` +
-			`both Library and Select NZB locally (or another pair) lit up. ` +
+			`both Library and Account lit up. ` +
 			'Builder: mark only the most-specific boundary match.'
 	).toHaveCount(1, { timeout: PRESENCE_TIMEOUT });
 	// The account subnav is a separate landmark: the shell must not steal its marker.
@@ -202,7 +197,7 @@ async function paywallFocusState(page: Page): Promise<{
 	});
 }
 
-test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally and Account', async ({
+test('[NAV-01] shell exposes a named landmark with Library and Account', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -222,7 +217,6 @@ test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally a
 
 	for (const [label, link] of [
 		['Library', libraryLink(page)],
-		['Select NZB locally', importLink(page)],
 		['Account', accountLink(page)]
 	] as const) {
 		await expect(
@@ -237,8 +231,9 @@ test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally a
 		).toBe('A');
 	}
 	await expect(libraryLink(page)).toHaveAttribute('href', '/library');
-	await expect(importLink(page)).toHaveAttribute('href', '/library/import');
 	await expect(accountLink(page)).toHaveAttribute('href', /^\/account(\/|$)/);
+	// Retired import surface (TWO-1639): no third shell link.
+	await expect(nav.getByRole('link')).toHaveCount(2);
 
 	// No hamburger, modal menu or nav-local buttons: every destination link is
 	// visible without opening anything.
@@ -254,7 +249,7 @@ test('[NAV-01] shell exposes a named landmark with Library, Select NZB locally a
 	).toHaveCount(0);
 });
 
-test('[NAV-02a] direct load marks Library vs Select NZB locally, never both', async ({
+test('[NAV-02a] direct load marks Library; the retired import route still boundary-matches Library', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -262,13 +257,14 @@ test('[NAV-02a] direct load marks Library vs Select NZB locally, never both', as
 	await expectShellPresent(page, '/library');
 	await expectCurrent(page, '/library', 'Library');
 
+	// TWO-1639: /library/import is gone (404s; NAV-11 pins the removal).
+	// The shell still renders on the error page, and the pathname still
+	// boundary-matches the Library prefix, so the Library link stays
+	// marked. That marker is prefix carryover on a dead path, not an
+	// import destination: no import link or hook may render (see NAV-11).
 	await page.goto('/library/import');
-	await expectCurrent(page, '/library/import', 'Select NZB locally');
-	await expect(
-		libraryLink(page),
-		'expected the Library link NOT marked current on /library/import. ' +
-			'Builder: /library/import must win as the most-specific match.'
-	).not.toHaveAttribute('aria-current', 'page');
+	await expectShellPresent(page, '/library/import (retired)');
+	await expectCurrent(page, '/library/import (retired)', 'Library');
 });
 
 test('[NAV-02b] direct load marks Account on nested account pages', async ({ page }) => {
@@ -280,7 +276,7 @@ test('[NAV-02b] direct load marks Account on nested account pages', async ({ pag
 	}
 });
 
-test('[NAV-02c] direct load marks nothing outside the three destinations', async ({
+test('[NAV-02c] direct load marks nothing outside the two destinations', async ({
 	page
 }) => {
 	await mockLibrary(page, 200, []);
@@ -294,11 +290,9 @@ test('[NAV-02c] direct load marks nothing outside the three destinations', async
 
 test('[NAV-02d] direct load matches nested paths by pathname boundary', async ({ page }) => {
 	await mockLibrary(page, 200, []);
-	await page.goto('/library/import/extra');
-	await expectShellPresent(page, '/library/import/extra');
-	await expectCurrent(page, '/library/import/extra', 'Select NZB locally');
 
 	await page.goto('/library/deep-link');
+	await expectShellPresent(page, '/library/deep-link');
 	await expectCurrent(page, '/library/deep-link', 'Library');
 });
 
@@ -315,10 +309,6 @@ test('[NAV-03] client-side navigation updates the marker without a reload', asyn
 	await libraryLink(page).click();
 	await expect(page).toHaveURL(/\/library$/);
 	await expectCurrent(page, '/library (client nav)', 'Library');
-
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
-	await expectCurrent(page, '/library/import (client nav)', 'Select NZB locally');
 
 	await accountLink(page).click();
 	await expect(page).toHaveURL(/\/account/);
@@ -351,7 +341,7 @@ for (const width of [1280, 390]) {
 		await page.setViewportSize({ width, height: 800 });
 		await mockLibrary(page, 200, []);
 		await mockAccountApis(page);
-		for (const path of ['/library', '/library/import', '/account/billing']) {
+		for (const path of ['/library', '/account/billing']) {
 			await page.goto(path);
 			await expect(
 				skipLink(page),
@@ -400,13 +390,12 @@ for (const width of [1280, 390]) {
 		await expect(skipLink(page)).toBeFocused();
 		for (const [label, link] of [
 			['Library', libraryLink(page)],
-			['Select NZB locally', importLink(page)],
 			['Account', accountLink(page)]
 		] as const) {
 			await page.keyboard.press('Tab');
 			await expect(
 				link,
-				`expected Tab order skip, Library, Select NZB locally, Account at ${width}px; ` +
+				`expected Tab order skip, Library, Account at ${width}px; ` +
 					`"${label}" was not next. Builder: keep nav links in DOM order after the skip link.`
 			).toBeFocused();
 		}
@@ -455,7 +444,6 @@ for (const width of [1280, 390]) {
 		await expectSkipLinkRevealed(page, `/library at ${width}px`);
 		for (const [label, link] of [
 			['Library', libraryLink(page)],
-			['Select NZB locally', importLink(page)],
 			['Account', accountLink(page)]
 		] as const) {
 			await page.keyboard.press('Tab');
@@ -493,7 +481,7 @@ for (const width of [390, 360]) {
 		// Soft expects so one RED run reports every narrow destination; the
 		// short timeout keeps the failure fast (passes resolve instantly).
 		const SOFT_TIMEOUT = 1000;
-		for (const path of ['/library', '/library/import', '/account/billing', '/']) {
+		for (const path of ['/library', '/account/billing', '/']) {
 			await page.goto(path);
 			await page.screenshot({ path: testInfo.outputPath(`shell-${width}-${path.replaceAll('/', '_')}.png`) });
 			const nav = shellNav(page);
@@ -503,7 +491,6 @@ for (const width of [390, 360]) {
 			).toHaveCount(1, { timeout: SOFT_TIMEOUT });
 			for (const [label, link] of [
 				['Library', libraryLink(page)],
-				['Select NZB locally', importLink(page)],
 				['Account', accountLink(page)]
 			] as const) {
 				// isVisible (no wait) keeps RED fast: boundingBox would retry
@@ -549,12 +536,12 @@ test('[NAV-08a] links stay discoverable with a populated library', async ({ page
 	await expect(page.getByTestId('library-list')).toBeVisible();
 	await expect(page.getByTestId('library-item')).toHaveCount(2);
 	await expectShellPresent(page, 'populated /library');
-	for (const link of [libraryLink(page), importLink(page), accountLink(page)]) {
+	for (const link of [libraryLink(page), accountLink(page)]) {
 		await expect(link).toBeVisible();
 	}
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
-	await expect(page.getByTestId('import-file')).toBeVisible();
+	await libraryLink(page).click();
+	await expect(page).toHaveURL(/\/library$/);
+	await expect(page.getByTestId('library-list')).toBeVisible();
 });
 
 test('[NAV-08b] links stay discoverable with an empty library', async ({ page }) => {
@@ -562,11 +549,11 @@ test('[NAV-08b] links stay discoverable with an empty library', async ({ page })
 	await page.goto('/library');
 	await expect(page.getByRole('main')).toContainText(/library is empty/i);
 	await expectShellPresent(page, 'empty /library');
-	for (const link of [libraryLink(page), importLink(page), accountLink(page)]) {
+	for (const link of [libraryLink(page), accountLink(page)]) {
 		await expect(link).toBeVisible();
 	}
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await accountLink(page).click();
+	await expect(page).toHaveURL(/\/account/);
 });
 
 test('[NAV-08c] links stay discoverable with an unavailable library', async ({ page }) => {
@@ -574,11 +561,11 @@ test('[NAV-08c] links stay discoverable with an unavailable library', async ({ p
 	await page.goto('/library');
 	await expect(page.getByRole('main')).toContainText(/not available yet/i);
 	await expectShellPresent(page, 'unavailable /library');
-	for (const link of [libraryLink(page), importLink(page), accountLink(page)]) {
+	for (const link of [libraryLink(page), accountLink(page)]) {
 		await expect(link).toBeVisible();
 	}
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await accountLink(page).click();
+	await expect(page).toHaveURL(/\/account/);
 });
 
 test('[NAV-08d] links stay discoverable with a cached (stale) library', async ({ page }) => {
@@ -599,11 +586,11 @@ test('[NAV-08d] links stay discoverable with a cached (stale) library', async ({
 	await expect(page.getByTestId('library-stale-badge')).toBeVisible();
 	await expect(page.getByTestId('library-list')).toBeVisible();
 	await expectShellPresent(page, 'cached /library');
-	for (const link of [libraryLink(page), importLink(page), accountLink(page)]) {
+	for (const link of [libraryLink(page), accountLink(page)]) {
 		await expect(link).toBeVisible();
 	}
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await libraryLink(page).click();
+	await expect(page).toHaveURL(/\/library$/);
 });
 
 test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
@@ -627,8 +614,6 @@ test('[NAV-09] navigating emits no mutating or off-origin requests', async ({
 		await expectShellPresent(page, '/');
 		await libraryLink(page).click();
 		await expect(page).toHaveURL(/\/library$/);
-		await importLink(page).click();
-		await expect(page).toHaveURL(/\/library\/import$/);
 		await accountLink(page).click();
 		await expect(page).toHaveURL(/\/account/);
 		await libraryLink(page).click();
@@ -665,7 +650,7 @@ test('[NAV-10] demo player links carry explicit demo labeling, no playback claim
 				href: element.getAttribute('href') ?? ''
 			}))
 		);
-	for (const required of ['Library', 'Select NZB locally', 'Account']) {
+	for (const required of ['Library', 'Account']) {
 		expect(
 			links.some((link) => link.name === required),
 			`expected a shell link named exactly "${required}", saw: ${JSON.stringify(links)}. ${BUILDER}`
@@ -695,37 +680,33 @@ test('[NAV-10] demo player links carry explicit demo labeling, no playback claim
 	).not.toMatch(/upload|process/i);
 });
 
-test('[NAV-11] shell navigation preserves the local-only import disclosure', async ({
+test('[NAV-11] retired import surface stays gone (no link, no route, no hooks)', async ({
 	page
 }) => {
-	await mockLibrary(page, 200, []);
+	// TWO-1639: user NZB import is retired. The shell carries no import
+	// link, the route 404s, and the import hooks render nowhere.
+	await mockLibrary(page, 200, LIBRARY_ITEMS);
 	await page.goto('/library');
 	await expectShellPresent(page, '/library');
-	await importLink(page).click();
-	await expect(page).toHaveURL(/\/library\/import$/);
+	await expect(
+		shellNav(page).getByRole('link', { name: /select nzb locally/i }),
+		'expected no Select NZB locally link in the shell nav. ' +
+			'Builder: the import destination is retired; keep it out of the shell.'
+	).toHaveCount(0);
 
-	const input = page.getByTestId('import-file');
-	await expect(input).toBeVisible();
-	await expect(input).toHaveAttribute('type', 'file');
-	await expect(input).toHaveAttribute('accept', '.nzb');
+	const gone = await page.goto('/library/import');
+	expect(gone?.status(), 'expected the retired /library/import route to 404').toBe(404);
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
 	await expect(page.getByTestId('import-status')).toHaveCount(0);
-	const copy = await page.getByRole('main').innerText();
-	expect(copy).toMatch(/\blocal(?:ly)?\b/i);
-	expect(
-		copy,
-		'expected the import page reached via the shell to keep its no-upload disclosure. ' +
-			'Builder: do not touch import copy or behavior.'
-	).toMatch(/does not upload/i);
 
-	await input.setInputFiles({
-		name: 'shell-nav-local.nzb',
-		mimeType: 'application/x-nzb',
-		buffer: Buffer.from('<?xml version="1.0"?><nzb></nzb>')
-	});
-	const status = page.getByTestId('import-status');
-	await expect(status).toBeVisible();
-	await expect(status).toHaveAttribute('role', 'status');
-	await expect(status).toContainText(/selected locally/i);
+	await page.goto('/library');
+	await expect(page.getByTestId('library-list')).toBeVisible();
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
+	await expect(page.getByTestId('import-status')).toHaveCount(0);
+	await expect(
+		page.getByRole('link', { name: /select nzb locally/i }),
+		'expected no Select NZB locally link anywhere on /library.'
+	).toHaveCount(0);
 });
 
 test('[NAV-12] account subnav keeps working alongside the shell nav', async ({ page }) => {
@@ -948,7 +929,7 @@ test('[NAV-17] navigation adds no authenticated state and keeps sign-in recovery
 	expect(
 		navText,
 		'expected no sign-in/sign-out control inside the shell nav (no new auth state). ' +
-			'Builder: link Library, Select NZB locally and Account only.'
+			'Builder: link Library and Account only.'
 	).not.toMatch(/sign[ -]?(in|out)/i);
 	expect(
 		navText,
@@ -980,7 +961,7 @@ test('[NAV-18] native links plus design-token styling, no new route', async ({ p
 				target: element.getAttribute('target')
 			}))
 		);
-	expect(hrefs.length).toBeGreaterThanOrEqual(3);
+	expect(hrefs.length).toBe(2);
 	for (const link of hrefs) {
 		expect(
 			link.tag,
@@ -994,12 +975,12 @@ test('[NAV-18] native links plus design-token styling, no new route', async ({ p
 		expect(
 			link.href,
 			`expected shell link hrefs to reuse existing routes only, got "${link.href}". ` +
-				'Builder: no new route; link /library, /library/import, /account/* (and /demo/* labeled demo).'
-		).toMatch(/^\/(library(\/import)?|account(\/.*)?|demo(\/.*)?)?$/);
+				'Builder: no new route; link /library, /account/* (and /demo/* labeled demo).'
+		).toMatch(/^\/(library|account(\/.*)?|demo(\/.*)?)?$/);
 	}
 
 	const tokenHit = await page.evaluate(() => {
-		const nav = document.querySelector('nav:has(a[href="/library/import"])');
+		const nav = document.querySelector('nav:has(a[href="/library"])');
 		if (!nav) return false;
 		for (const sheet of Array.from(document.styleSheets)) {
 			let rules: CSSRuleList | null = null;

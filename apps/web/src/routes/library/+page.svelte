@@ -1943,9 +1943,8 @@
 
 		{#if libraryUnavailable}
 			<p role="status">Library listing is not available yet.</p>
-			<p><a href="/library/import">Import an NZB</a></p>
 		{:else if items.length === 0}
-			<p role="status">Your library is empty. <a href="/library/import">Import an NZB</a> to get started.</p>
+			<p role="status">Your library is empty.</p>
 		{:else}
 			<p data-testid="library-track-count">{trackCountLabel(items.length)}</p>
 			<div class="nt-library-find">

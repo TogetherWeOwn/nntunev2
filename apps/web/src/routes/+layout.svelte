@@ -137,10 +137,10 @@
 		restoreFocus();
 	});
 
-	// App-shell navigation (roadmap NAV): Library, local NZB selection and
-	// Account, reachable from every page without typing URLs. Static native
-	// links only: the shell never fetches, uploads or processes anything.
-	type ShellDestination = 'library' | 'import' | 'account';
+	// App-shell navigation (roadmap NAV): Library and Account, reachable
+	// from every page without typing URLs. Static native links only: the
+	// shell never fetches, uploads or processes anything.
+	type ShellDestination = 'library' | 'account';
 
 	function matchesBoundary(pathname: string, base: string): boolean {
 		return pathname === base || pathname.startsWith(`${base}/`);
@@ -150,7 +150,6 @@
 	// most-specific boundary match carries aria-current.
 	const currentDestination = $derived.by((): ShellDestination | null => {
 		const pathname = page.url.pathname;
-		if (matchesBoundary(pathname, '/library/import')) return 'import';
 		if (matchesBoundary(pathname, '/library')) return 'library';
 		if (matchesBoundary(pathname, '/account')) return 'account';
 		return null;
@@ -177,9 +176,6 @@
 <nav aria-label="Primary" class="nt-wrap shell-nav">
 	<a href="/library" aria-current={currentDestination === 'library' ? 'page' : undefined}>
 		Library
-	</a>
-	<a href="/library/import" aria-current={currentDestination === 'import' ? 'page' : undefined}>
-		Select NZB locally
 	</a>
 	<a href="/account/billing" aria-current={currentDestination === 'account' ? 'page' : undefined}>
 		Account
