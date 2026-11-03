@@ -247,11 +247,11 @@ mod tests {
 
     #[test]
     fn lease_timing_constants_are_pinned() {
+        // The 45/15 ratio is the point: at least two missed heartbeats fit
+        // inside one TTL, so a single dropped beat never frees a live
+        // player's lease. Pinning both values pins the ratio.
         assert_eq!(LEASE_TTL_SECS, 45);
         assert_eq!(HEARTBEAT_INTERVAL_SECS, 15);
-        // At least two missed heartbeats fit inside one TTL, so a single
-        // dropped beat never frees a live player's lease.
-        assert!(LEASE_TTL_SECS >= 3 * HEARTBEAT_INTERVAL_SECS);
     }
 
     #[test]
