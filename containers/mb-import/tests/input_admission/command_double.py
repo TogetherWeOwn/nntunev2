@@ -50,12 +50,12 @@ def psql(root):
         append(root / "psql.jsonl", {"sql": sql, "copies": copies, "mutation": mutating})
         if "ON_ERROR_STOP=1" not in args:
             raise RuntimeError("importer dropped ON_ERROR_STOP")
-        table_match = re.search(r"table_name\s*=\s*'([a-z]+)'", sql)
+        table_match = re.search(r"table_name\s*=\s*'([a-z_]+)'", sql)
         dump_match = re.search(r"dump_id\s*=\s*'([0-9a-f]{64})'", sql)
         table = table_match[1] if table_match else None
         key = f"{table}:{dump_match[1]}" if dump_match else None
         if re.search(r"INSERT INTO mb_import_cursor", sql):
-            match = re.search(r"VALUES\s*\('([a-z]+)',\s*'([0-9a-f]{64})',\s*0\)", sql)
+            match = re.search(r"VALUES\s*\('([a-z_]+)',\s*'([0-9a-f]{64})',\s*0\)", sql)
             if not match:
                 raise RuntimeError("unsupported cursor INSERT")
             state["cursors"].setdefault(f"{match[1]}:{match[2]}", 0)

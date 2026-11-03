@@ -15,9 +15,24 @@ const TS: &str = "2024-02-29 12:34:56+00:00";
 fn row(table: Table) -> Vec<String> {
     let fields = match table {
         Table::Artist => vec![A, "Name", "Sort", "Person", "US", TS],
-        Table::Release => vec![R, A, "Title", "Album", "2024", "https://example.test/a", TS],
+        Table::ReleaseGroup => vec![R, "Group Name", A, "Album", TS],
+        Table::Release => vec![
+            R,
+            A,
+            "Title",
+            "Album",
+            "2024",
+            "https://example.test/a",
+            C,
+            TS,
+        ],
         Table::Recording => vec![C, R, "Title", "1", "1234", TS],
         Table::Track => vec![R, C, "1", "2", TS],
+        Table::Url => vec![C, "https://example.test/a", TS],
+        Table::ArtistUrl => vec![A, C, "youtube", TS],
+        Table::RecordingUrl => vec![C, R, "free streaming", "true", TS],
+        Table::RecordingMusicVideo => vec![C, R, TS],
+        Table::RecordingIsrc => vec![C, "USABC2400001", TS],
     };
     fields.into_iter().map(str::to_owned).collect()
 }
@@ -39,9 +54,15 @@ fn check_field(table: Table, index: usize, token: &str, expected: &str) {
 fn literal_normal_flow_controls() {
     for table in [
         Table::Artist,
+        Table::ReleaseGroup,
         Table::Release,
         Table::Recording,
         Table::Track,
+        Table::Url,
+        Table::ArtistUrl,
+        Table::RecordingUrl,
+        Table::RecordingMusicVideo,
+        Table::RecordingIsrc,
     ] {
         let fields = row(table);
         assert_eq!(
@@ -55,12 +76,23 @@ fn literal_normal_flow_controls() {
 fn octal_and_hex_uuid_aliases_emit_canonical_keys() {
     for (table, index, uuid) in [
         (Table::Artist, 0, A),
+        (Table::ReleaseGroup, 0, R),
+        (Table::ReleaseGroup, 2, A),
         (Table::Release, 0, R),
         (Table::Release, 1, A),
+        (Table::Release, 6, C),
         (Table::Recording, 0, C),
         (Table::Recording, 1, R),
         (Table::Track, 0, R),
         (Table::Track, 1, C),
+        (Table::Url, 0, C),
+        (Table::ArtistUrl, 0, A),
+        (Table::ArtistUrl, 1, C),
+        (Table::RecordingUrl, 0, C),
+        (Table::RecordingUrl, 1, R),
+        (Table::RecordingMusicVideo, 0, C),
+        (Table::RecordingMusicVideo, 1, R),
+        (Table::RecordingIsrc, 0, C),
     ] {
         for first in [r"\141", r"\x61"] {
             check_field(table, index, &format!("{first}{}", &uuid[1..]), uuid);
@@ -97,9 +129,15 @@ fn octal_and_hex_countries_use_decoded_character_count() {
 fn timestamps_validate_decoded_digits_and_spaces() {
     for table in [
         Table::Artist,
+        Table::ReleaseGroup,
         Table::Release,
         Table::Recording,
         Table::Track,
+        Table::Url,
+        Table::ArtistUrl,
+        Table::RecordingUrl,
+        Table::RecordingMusicVideo,
+        Table::RecordingIsrc,
     ] {
         let index = row(table).len() - 1;
         check_field(table, index, r"\062024-02-29\04012:34:56+00:00", TS);
@@ -126,6 +164,22 @@ fn semantic_failures_keep_the_literal_reason_taxonomy() {
         (Table::Track, 3, "32768", r"\0632768", "bad_int"),
         (Table::Artist, 4, "USA", r"\x55SA", "bad_country"),
         (Table::Artist, 4, "U", r"\125", "bad_country"),
+        (
+            Table::RecordingIsrc,
+            1,
+            "USABC24000",
+            r"\x55SABC24000",
+            "bad_isrc",
+        ),
+        (
+            Table::RecordingIsrc,
+            1,
+            "12ABC2400001",
+            r"\x312ABC2400001",
+            "bad_isrc",
+        ),
+        (Table::RecordingUrl, 3, "yes", r"\x79es", "bad_bool"),
+        (Table::RecordingUrl, 3, "TRUE", r"\x54RUE", "bad_bool"),
         (
             Table::Artist,
             5,
@@ -184,8 +238,14 @@ fn text_escapes_nullable_markers_and_empty_rules_are_preserved() {
     for (table, index) in [
         (Table::Artist, 3),
         (Table::Artist, 4),
+        (Table::ReleaseGroup, 2),
+        (Table::ReleaseGroup, 3),
         (Table::Release, 1),
+        (Table::Release, 3),
         (Table::Release, 4),
+        (Table::Release, 5),
+        (Table::Release, 6),
+        (Table::Recording, 1),
         (Table::Recording, 3),
         (Table::Recording, 4),
     ] {
