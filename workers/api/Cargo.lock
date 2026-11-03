@@ -955,6 +955,7 @@ dependencies = [
  "md5",
  "quick-xml",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
