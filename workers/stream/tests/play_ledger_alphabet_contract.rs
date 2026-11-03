@@ -450,8 +450,15 @@ fn valid_play_accounting_and_identity_binding_are_unchanged() {
         prepare_play_ledger_row(USER, TRACK, PLAY, 0, 0, AT),
         Err(LedgerError::Invalid)
     );
+    // Migration 0028 retired the nominal-rate equality: seconds are
+    // caller-derived (proportional derivation in the api ledger), so a
+    // value the old rate would have rounded differently now prepares,
+    // and only the decoupled per-row second cap still fails closed.
+    let decoupled = prepare_play_ledger_row(USER, TRACK, PLAY, BYTES, 1, AT)
+        .expect("seconds decoupled from the retired rate must prepare");
+    assert_eq!(decoupled.stream_seconds, 1);
     assert_eq!(
-        prepare_play_ledger_row(USER, TRACK, PLAY, BYTES, 1, AT),
+        prepare_play_ledger_row(USER, TRACK, PLAY, BYTES, 86_401, AT),
         Err(LedgerError::Invalid)
     );
 }
