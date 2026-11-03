@@ -302,9 +302,14 @@ runtime tests in this ADR.
 > `release_art.content_hash` references, under the same per-hash
 > serialization and serialized recheck (the publication/sweep race
 > rules, the art FK's RESTRICT, the advisory `ref_count` and retried
-> physical deletes all stand). Evicting a mapping frees the global
-> gauge only once the object itself is unreferenced and swept; it
-> frees no user's gauge and never deletes another listener's access or
+> physical deletes all stand). Evicting the last mapping for an
+> object frees the global gauge immediately — the gauge counts
+> `SUM(byte_size)` over audio objects *referenced by* `track_media`,
+> so at the cap fills resume once eviction frees space (ADR 0013) —
+> while the physical R2 object is deleted later by the orphan sweep,
+> once it is unreferenced under that recheck (art keeps its separate
+> idle window). Eviction frees no user's gauge and never deletes
+> another listener's access or
 > the curated source, so an evicted track can re-fill. In-flight reads
 > and the next play of a reclaimed object re-fetch through the backend
 > provider pool from the curated source (ADR 0013/0014), never through

@@ -41,11 +41,18 @@ which buckets a Worker may never consume.
   own-provider rule, superseded 2026-11-03 by ADR-0013; no per-user
   mapping, grant row, or namespaced key is part of the serve path. Edge
   `no-store` is prescribed but unwired: no `Cache-Control`
-  string exists in `workers/stream/src`; the fetch entry answers `404` via
-  `routes::decide_public_fetch` and `respond`/`respond_body` set only
-  `content-type` (plus `retry-after` when carried); the portable
-  `PlayResponse::cache_headers` emits only `Cache-Status` plus `Age`
-  telemetry (see prescribed-vs-wired evidence). Application freshness
+  string exists in `workers/stream/src`. On merged main the public fetch
+  serves `GET /play/{track_id}` (`routes::decide_public_route` dispatching
+  to the wasm `play_fetch`; the `routes::decide_public_fetch` `404` is
+  off-route only), and the `play_fetch` R2-hit path sets only
+  `content-type`, `accept-ranges` and `content-length` (plus
+  `content-range` on a partial response) — no `Cache-Control`. The
+  `respond`/`respond_body` pool replies likewise set only `content-type`
+  (plus `retry-after` when carried). The portable `play_route` serve
+  outcome extends its headers with `PlayResponse::cache_headers`, which
+  emits only `Cache-Status` plus `Age` telemetry — not `Cache-Control` —
+  and the wasm runtime path does not call it (see prescribed-vs-wired
+  evidence). Application freshness
   (distinct from R2 lifecycle): timed `track/<id>` entries serve fresh for
   `CACHE_FRESH_TTL_SECS = 300`, then stale for `CACHE_SWR_WINDOW_SECS =
   3_600` while owing background revalidation, then hard-miss past 3,900 s
@@ -205,7 +212,7 @@ wiring, expiry, GC, or refill behavior.
 
 | Bucket(s) | Prescribed edge `Cache-Control` | Wired behavior today | Evidence |
 |---|---|---|---|
-| `nntunev2-audio-staging`, `nntunev2-audio-prod` | `no-store` (this table above; deltas below) — authoritative for the real grant-gated play route | **Unwired on the Worker.** No `Cache-Control` string exists anywhere in `workers/stream/src`. On main the Worker fetch entry still answers `404` (`routes::decide_public_fetch`); the grant-gated play route that replaces it (verified track-bound grant, R2-hit + NNTP adapters, delivered-byte interval metering) is in review as PR #900, and this cell must be re-verified when it merges. The `respond`/`respond_body` adapters set only `content-type` (plus `retry-after` when carried). The portable play core emits only `Cache-Status` (`HIT`/`MISS`/`STALE`) + `Age` via `PlayResponse::cache_headers` — freshness telemetry, not a browser/CDN directive, and the deploy-config slice must not wire `cache_headers()` onto edge responses without resolving ADR-0013's retained no-hit-oracle rule (no hit/miss headers). **Separate synthetic demo (exempt):** the web helper `AUDIO_CACHE_CONTROL` (`private, max-age=60, must-revalidate`) is wired only on `/api/demo/audio` (no auth, no R2; pinned by `player-seek.spec.ts`), and is explicitly not the contract for the real play route. | `workers/stream/src/play.rs` (`PlayResponse::cache_headers`), `workers/stream/src/cache.rs` (`CacheStatus::header_value`), `workers/stream/src/routes.rs` (`PUBLIC_FETCH_STATUS`, `decide_public_fetch`), `workers/stream/src/runtime.rs` (`fetch`, `respond`, `respond_body`); demo-only: `apps/web/src/lib/player/cacheHeaders.ts` (`AUDIO_CACHE_CONTROL`), `apps/web/src/routes/api/demo/audio/+server.ts`, `apps/web/tests/player-seek.spec.ts`, `docs/adr/0013-shared-popularity-cache.md` (no hit oracles; telemetry-only `cached_hit` retained from `docs/adr/0003-cache-scope.md`) |
+| `nntunev2-audio-staging`, `nntunev2-audio-prod` | `no-store` (this table above; deltas below) — authoritative for the real grant-gated play route | **Unwired on the Worker.** No `Cache-Control` string exists anywhere in `workers/stream/src`. The grant-gated play route has merged (PR #900): on main the public fetch serves `GET /play/{track_id}` via `routes::decide_public_route` and the wasm `play_fetch` (verified v2 track-bound grant before any source contact, R2-hit serving, delivered-byte interval metering), while `routes::decide_public_fetch`'s `404` is off-route only. The wasm R2-hit path sets only `content-type`, `accept-ranges` and `content-length` (plus `content-range` on a partial response) — no `Cache-Control`; the `respond`/`respond_body` pool adapters likewise set only `content-type` (plus `retry-after` when carried). The portable `play_route` serve outcome extends its headers with `PlayResponse::cache_headers`, which emits only `Cache-Status` (`HIT`/`MISS`/`STALE`) + `Age` — freshness telemetry, not a browser/CDN directive — and the wasm runtime path does not call it; the deploy-config slice must not wire `cache_headers()` onto edge responses without resolving ADR-0013's retained no-hit-oracle rule (no hit/miss headers). **Separate synthetic demo (exempt):** the web helper `AUDIO_CACHE_CONTROL` (`private, max-age=60, must-revalidate`) is wired only on `/api/demo/audio` (no auth, no R2; pinned by `player-seek.spec.ts`), and is explicitly not the contract for the real play route. | `workers/stream/src/play.rs` (`PlayResponse::cache_headers`), `workers/stream/src/cache.rs` (`CacheStatus::header_value`), `workers/stream/src/routes.rs` (`decide_public_route`, `PUBLIC_FETCH_STATUS`, `decide_public_fetch`), `workers/stream/src/play_route.rs` (portable serve outcome extending `cache_headers()`), `workers/stream/src/runtime.rs` (`fetch`, `play_fetch`, `respond`, `respond_body`); demo-only: `apps/web/src/lib/player/cacheHeaders.ts` (`AUDIO_CACHE_CONTROL`), `apps/web/src/routes/api/demo/audio/+server.ts`, `apps/web/tests/player-seek.spec.ts`, `docs/adr/0013-shared-popularity-cache.md` (no hit oracles; telemetry-only `cached_hit` retained from `docs/adr/0003-cache-scope.md`) |
 | `nntunev2-art-staging`, `nntunev2-art-prod` (lookup/search JSON) | `public, max-age=86400` (lookup), `public, max-age=300` (search), failures `no-store` | **Wired — matches this table.** Success responses carry `Cache-Control: public, max-age=<ttl>` via `cache_control(ttl)`; failures (`cache_ttl: None`) render `no-store` in `json_headers` and are written to neither cache. | `workers/mb/src/lib.rs` (`cache_control`, `json_headers`, and the `cache_ttl == None` assertions such as `lookup_missing_is_404_and_not_cached`; the only literal `no-store` header assertion is the healthz test) |
 | `nntunev2-art-staging`, `nntunev2-art-prod` (art bytes) | `public, max-age=86400, immutable` wherever unauthenticated serving lands; gated art follows ADR-0003 (deltas below) | **Unwired on R2-backed art bytes.** No R2 image-body serving code path exists yet: the MusicBrainz Worker returns artwork URLs (e.g. `caa_url` on its entities) and never proxies full images inline, so there is nowhere to set the header on bucket-backed bytes. **Conflicting sources (both recorded, neither authoritative here):** ADR-0003 requires membership/entitlement-gated art to be served through the authenticated handler with `private`/`no-store`, not a public R2 URL — that rule wins for gated art. Separately, the synthetic web demo serves its placeholder via `ARTWORK_CACHE_CONTROL` (`public, max-age=31536000, immutable`) on `/api/demo/artwork` (no R2, no entitlement check; pinned by `cacheHeaders.test.ts` and `player-seek.spec.ts`), explicitly exempt from this prescription. | `workers/mb/src/lib.rs` (entities carry `caa_url`; no image-body response path), deltas below; `docs/adr/0003-cache-scope.md` (CAA/verified Bounds: authenticated handler, `private`/`no-store`); demo-only: `apps/web/src/lib/player/cacheHeaders.ts` (`ARTWORK_CACHE_CONTROL`), `apps/web/src/routes/api/demo/artwork/+server.ts` |
 | `nntunev2-archive-staging`, `nntunev2-archive-prod` | n/a (no reads) | **n/a — no reads, no binding.** No Worker in this repository may bind an archive bucket (CI-enforced); neither stream nor MusicBrainz manifests target one. | `.github/scripts/check_archive_bindings.py` plus `cache-policy` job in `.github/workflows/ci.yml` (required in `ci-ok`); `workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`, `workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml.example`, `apps/web/wrangler.toml` |
@@ -215,10 +222,11 @@ wiring, expiry, GC, or refill behavior.
 - MusicBrainz JSON headers match this table exactly (lookup 86400,
   search 300, errors `no-store`); no delta.
 - Stream audio edge `Cache-Control` is **prescribed but not yet wired**:
-  the Worker fetch entry point exists, but on main no play route exists
-  yet to set response headers (the grant-gated play route is in review as
-  PR #900; re-verify this bullet when it merges); the deploy-config slice
-  owns that implementation.
+  the grant-gated play route has merged on main (PR #900) and serves
+  `GET /play/{track_id}`, but its wasm R2-hit responses set no
+  `Cache-Control` (only `content-type`, `accept-ranges`,
+  `content-length`, plus `content-range` on partials); the deploy-config
+  slice owns wiring the prescribed header.
   Audio plays are authorized per play by a track-bound signed grant —
   minted at the API issuance gate after entitlement checks and verified
   by the stream Worker before any source contact — and metered by
