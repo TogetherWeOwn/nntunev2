@@ -1,4 +1,4 @@
--- Regression test for migration 0031 (admin-issued invites). Run
+-- Regression test for migration 0033 (admin-issued invites). Run
 -- after ALL migrations are applied — twice, since the runner replays
 -- every replay-safe migration (see ../run_migration_tests.sh) — so
 -- the shape assertions below also prove the replay was a clean

@@ -2080,7 +2080,7 @@ fn postgres_admin_simultaneous_opposing_demotions_keep_one_admin() {
     });
 }
 
-// The production issue/revoke transactions (migration 0031): each
+// The production issue/revoke transactions (migration 0033): each
 // commits with exactly one audit row that references the invite by
 // surrogate row id — never by code plaintext or hash — and a demoted
 // actor's re-check refuses both writes.

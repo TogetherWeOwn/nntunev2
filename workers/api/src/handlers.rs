@@ -499,7 +499,7 @@ pub enum AdminWriteOutcome {
     AccountDeleting,
 }
 
-/// Outcome of an admin invite issue (migration 0031): the insert and
+/// Outcome of an admin invite issue (migration 0033): the insert and
 /// its `invite.issued` audit row commit together under the same
 /// admin-write serialization as [`AdminWriteOutcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,7 +511,7 @@ pub enum AdminInviteIssueOutcome {
     ActorNotAdmin,
 }
 
-/// Outcome of an admin invite revoke (migration 0031). The revocation
+/// Outcome of an admin invite revoke (migration 0033). The revocation
 /// stamps and its `invite.revoked` audit row commit together, and the
 /// conditional write makes revocation win any race against a
 /// redemption claim executing concurrently.
@@ -4841,7 +4841,7 @@ where
     )
 }
 
-// --- Admin invites (migration 0031) --------------------------------------------------------
+// --- Admin invites (migration 0033) --------------------------------------------------------
 //
 // API-only in M1: issue (plaintext shown once in the response, hash
 // only at rest), list/search by issuer/status, revoke. Everything
@@ -5910,7 +5910,7 @@ where
         ("PUT", path) if path.starts_with("/v1/admin/users/") => {
             admin_user_role_put(ctx, req).await
         }
-        // Admin invites (migration 0031): issue, list (with the
+        // Admin invites (migration 0033): issue, list (with the
         // `/status/{s}` and `/issuer/{id}` segment filters), revoke.
         // Same non-enumerable posture as the rest of the namespace.
         ("POST", "/v1/admin/invites") => admin_invite_issue(ctx, req).await,
@@ -6040,9 +6040,9 @@ mod tests {
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         /// Next surrogate invite id to hand out (mirror of the
-        /// migration 0031 identity column).
+        /// migration 0033 identity column).
         next_invite_id: RefCell<i64>,
-        /// Mirror of `users.invited_by` (migration 0031), keyed by the
+        /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,

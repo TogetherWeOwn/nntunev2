@@ -500,7 +500,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/admin/settings" {
                 return SessionOnly;
             }
-            // Admin invite list (migration 0031): the bare path, or
+            // Admin invite list (migration 0033): the bare path, or
             // one filter pair (`status/{s}` / `issuer/{id}`). Deeper
             // shapes deny here, before any spend.
             if path == "/v1/admin/invites" {
@@ -563,7 +563,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     }
                 }
             }
-            // Admin invite writes (migration 0031): issue at the bare
+            // Admin invite writes (migration 0033): issue at the bare
             // path, revoke at `{id}/revoke`. Session-only, like the
             // rest of the admin surface.
             if path == "/v1/admin/invites" {
