@@ -299,7 +299,9 @@ pub fn reconcile_subscription(
                 stripe_customer_id: remote_customer,
                 stripe_item_id: item_id,
                 stripe_price_id: price_id,
-                plan_id: previous.map(|row| row.plan_id.clone()).unwrap_or("free".to_string()),
+                plan_id: previous
+                    .map(|row| row.plan_id.clone())
+                    .unwrap_or("free".to_string()),
                 status: status.to_string(),
                 current_period_end_unix: sub.current_period_end,
                 cancel_at_period_end: sub.cancel_at_period_end,
@@ -321,7 +323,9 @@ pub fn reconcile_subscription(
                 stripe_customer_id: remote_customer,
                 stripe_item_id: item_id,
                 stripe_price_id: price_id,
-                plan_id: previous.map(|row| row.plan_id.clone()).unwrap_or("free".to_string()),
+                plan_id: previous
+                    .map(|row| row.plan_id.clone())
+                    .unwrap_or("free".to_string()),
                 status: status.to_string(),
                 current_period_end_unix: sub.current_period_end,
                 cancel_at_period_end: sub.cancel_at_period_end,
@@ -375,7 +379,11 @@ pub fn reconcile_subscription(
         let Some(currency) = invoice.currency.clone() else {
             continue;
         };
-        let lines = invoice.lines.as_ref().map(|lines| lines.data.as_slice()).unwrap_or(&[]);
+        let lines = invoice
+            .lines
+            .as_ref()
+            .map(|lines| lines.data.as_slice())
+            .unwrap_or(&[]);
         let mut period_start: Option<i64> = None;
         let mut period_end: Option<i64> = None;
         for line in lines {
@@ -389,8 +397,13 @@ pub fn reconcile_subscription(
             let Some(line_end) = line_end else {
                 continue;
             };
-            let line_start = line.period.as_ref().and_then(|period| period.start).unwrap_or(line_end);
-            period_start = Some(period_start.map_or(line_start, |start: i64| start.min(line_start)));
+            let line_start = line
+                .period
+                .as_ref()
+                .and_then(|period| period.start)
+                .unwrap_or(line_end);
+            period_start =
+                Some(period_start.map_or(line_start, |start: i64| start.min(line_start)));
             period_end = Some(period_end.map_or(line_end, |end: i64| end.max(line_end)));
         }
         let (Some(start), Some(end)) = (period_start, period_end) else {
@@ -417,13 +430,14 @@ pub fn reconcile_subscription(
     // Monotonic coverage: duplicates and older invoices never regress a
     // later confirmed plan/period; the plan only changes on newly
     // reconciled money.
-    let recovered =
-        new_end.is_some_and(|end| previous_end.is_none_or(|prev| end > prev));
+    let recovered = new_end.is_some_and(|end| previous_end.is_none_or(|prev| end > prev));
     let (plan_id, paid_through_unix, paid_invoice_id) = if recovered {
         (item_plan, new_end, anchor_invoice)
     } else {
         (
-            previous.map(|row| row.plan_id.clone()).unwrap_or("free".to_string()),
+            previous
+                .map(|row| row.plan_id.clone())
+                .unwrap_or("free".to_string()),
             previous_end,
             None,
         )
@@ -479,16 +493,22 @@ fn fail_closed(
                 .or_else(|| previous.map(|row| row.stripe_customer_id.clone()))
                 .unwrap_or_default(),
             stripe_item_id: if item_id.is_empty() {
-                previous.map(|row| row.stripe_item_id.clone()).unwrap_or_default()
+                previous
+                    .map(|row| row.stripe_item_id.clone())
+                    .unwrap_or_default()
             } else {
                 item_id
             },
             stripe_price_id: if price_id.is_empty() {
-                previous.map(|row| row.stripe_price_id.clone()).unwrap_or_default()
+                previous
+                    .map(|row| row.stripe_price_id.clone())
+                    .unwrap_or_default()
             } else {
                 price_id
             },
-            plan_id: previous.map(|row| row.plan_id.clone()).unwrap_or("free".to_string()),
+            plan_id: previous
+                .map(|row| row.plan_id.clone())
+                .unwrap_or("free".to_string()),
             status: sub.status.clone(),
             current_period_end_unix: sub.current_period_end,
             cancel_at_period_end: sub.cancel_at_period_end,
@@ -732,7 +752,9 @@ pub fn insert_paid_invoice_history_statement() -> &'static str {
 mod tests {
     use super::*;
     use crate::billing::RENEWAL_SETTLEMENT_ALLOWANCE_SECS;
-    use crate::stripe::{InvoiceLine, InvoiceLines, InvoiceStatusTransitions, SubscriptionItem, SubscriptionItems};
+    use crate::stripe::{
+        InvoiceLine, InvoiceLines, InvoiceStatusTransitions, SubscriptionItem, SubscriptionItems,
+    };
 
     const NOW: i64 = 1_786_032_000;
     const PRICE_PLUS: &str = "price_plus_test";
@@ -838,7 +860,13 @@ mod tests {
     fn first_paid_invoice_advances_plan_and_coverage_with_history() {
         let remote = RemoteSubscription {
             subscription: subscription("active", PRICE_PLUS),
-            invoices: vec![paid_invoice("in_1", PRICE_PLUS, NOW - 30 * 86_400, NOW + 30 * 86_400, NOW)],
+            invoices: vec![paid_invoice(
+                "in_1",
+                PRICE_PLUS,
+                NOW - 30 * 86_400,
+                NOW + 30 * 86_400,
+                NOW,
+            )],
         };
         let outcome = reconcile_subscription(&fresh(), &remote, NOW);
         assert_eq!(outcome.fail_closed, None);
@@ -867,9 +895,21 @@ mod tests {
             subscription: subscription("active", PRICE_PRO),
             invoices: vec![
                 // Duplicate of the confirming invoice.
-                paid_invoice("in_9", PRICE_PRO, NOW - 30 * 86_400, NOW + 60 * 86_400, NOW - 100),
+                paid_invoice(
+                    "in_9",
+                    PRICE_PRO,
+                    NOW - 30 * 86_400,
+                    NOW + 60 * 86_400,
+                    NOW - 100,
+                ),
                 // Older invoice for the previous plan.
-                paid_invoice("in_1", PRICE_PLUS, NOW - 90 * 86_400, NOW - 30 * 86_400, NOW - 200),
+                paid_invoice(
+                    "in_1",
+                    PRICE_PLUS,
+                    NOW - 90 * 86_400,
+                    NOW - 30 * 86_400,
+                    NOW - 200,
+                ),
             ],
         };
         let mut remote = remote;
@@ -893,7 +933,13 @@ mod tests {
 
     #[test]
     fn unrelated_one_off_and_credit_lines_confer_nothing() {
-        let mut invoice = paid_invoice("in_2", PRICE_PLUS, NOW - 30 * 86_400, NOW + 30 * 86_400, NOW);
+        let mut invoice = paid_invoice(
+            "in_2",
+            PRICE_PLUS,
+            NOW - 30 * 86_400,
+            NOW + 30 * 86_400,
+            NOW,
+        );
         let lines = invoice.lines.as_mut().expect("lines");
         // One-off (unknown price), credit (negative), and free-price lines.
         lines.data.push(InvoiceLine {
@@ -931,7 +977,10 @@ mod tests {
             invoices: vec![invoice],
         };
         let outcome = reconcile_subscription(&fresh(), &remote, NOW);
-        assert_eq!(outcome.fail_closed, None, "skipped lines never fail the pass");
+        assert_eq!(
+            outcome.fail_closed, None,
+            "skipped lines never fail the pass"
+        );
         // Coverage comes from the service line only — not the one-off end.
         assert_eq!(outcome.row.paid_through_unix, Some(NOW + 30 * 86_400));
         assert_eq!(outcome.history.len(), 1);
@@ -939,7 +988,13 @@ mod tests {
 
     #[test]
     fn paid_but_unanchored_invoice_is_skipped() {
-        let mut invoice = paid_invoice("in_3", PRICE_PLUS, NOW - 30 * 86_400, NOW + 30 * 86_400, NOW);
+        let mut invoice = paid_invoice(
+            "in_3",
+            PRICE_PLUS,
+            NOW - 30 * 86_400,
+            NOW + 30 * 86_400,
+            NOW,
+        );
         invoice.status_transitions = Some(InvoiceStatusTransitions { paid_at: None });
         let remote = RemoteSubscription {
             subscription: subscription("active", PRICE_PLUS),
@@ -947,7 +1002,10 @@ mod tests {
         };
         let outcome = reconcile_subscription(&fresh(), &remote, NOW);
         assert_eq!(outcome.fail_closed, None);
-        assert_eq!(outcome.row.paid_through_unix, None, "no anchor, no coverage");
+        assert_eq!(
+            outcome.row.paid_through_unix, None,
+            "no anchor, no coverage"
+        );
         assert!(outcome.history.is_empty(), "no anchor, no history row");
     }
 
@@ -962,7 +1020,10 @@ mod tests {
         let outcome = reconcile_subscription(&fresh(), &remote, NOW);
         assert_eq!(outcome.fail_closed, Some(FailClosedReason::UnknownPrice));
         assert!(outcome.disable_new_purchases());
-        assert_eq!(outcome.row.status, "active", "observed state recorded verbatim");
+        assert_eq!(
+            outcome.row.status, "active",
+            "observed state recorded verbatim"
+        );
         assert_eq!(outcome.row.paid_through_unix, None, "no advance");
         assert_eq!(outcome.row.plan_id, "free");
         assert!(outcome.history.is_empty());
@@ -976,7 +1037,8 @@ mod tests {
                 invoices: vec![],
             };
             // Even with local coverage: retained, never advanced.
-            let outcome = reconcile_subscription(&local("plus", Some(NOW + 100), None), &remote, NOW);
+            let outcome =
+                reconcile_subscription(&local("plus", Some(NOW + 100), None), &remote, NOW);
             assert_eq!(
                 outcome.fail_closed,
                 Some(FailClosedReason::UnknownStatus),
@@ -1009,7 +1071,10 @@ mod tests {
         remote.subscription.livemode = false;
         remote.subscription.customer = Some("cus_other".to_string());
         let outcome = reconcile_subscription(&fresh(), &remote, NOW);
-        assert_eq!(outcome.fail_closed, Some(FailClosedReason::CustomerMismatch));
+        assert_eq!(
+            outcome.fail_closed,
+            Some(FailClosedReason::CustomerMismatch)
+        );
 
         // Multi-item subscriptions never resolve by picking one.
         let mut remote = RemoteSubscription {
@@ -1122,7 +1187,13 @@ mod tests {
         input.live.as_mut().expect("live").status = "past_due".to_string();
         let recovered = RemoteSubscription {
             subscription: subscription("active", PRICE_PLUS),
-            invoices: vec![paid_invoice("in_2", PRICE_PLUS, end, NOW + 30 * 86_400, NOW)],
+            invoices: vec![paid_invoice(
+                "in_2",
+                PRICE_PLUS,
+                end,
+                NOW + 30 * 86_400,
+                NOW,
+            )],
         };
         let outcome = reconcile_subscription(&input, &recovered, NOW);
         assert_eq!(outcome.row.paid_through_unix, Some(NOW + 30 * 86_400));
@@ -1205,10 +1276,7 @@ mod tests {
             (Some(PRICE_PLUS.to_string()), None)
         );
         // Corrupt payloads degrade to no reuse, never to a blocked flight.
-        assert_eq!(
-            parse_checkout_operation_payload("not json"),
-            (None, None)
-        );
+        assert_eq!(parse_checkout_operation_payload("not json"), (None, None));
         assert_eq!(
             parse_checkout_operation_payload(r#"{"price_id": 7}"#),
             (None, None)
@@ -1220,12 +1288,15 @@ mod tests {
     #[test]
     fn statements_bind_positionally_and_stay_pinned() {
         assert!(
-            reconcile_live_select_statement().contains("status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')"),
+            reconcile_live_select_statement().contains(
+                "status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')"
+            ),
             "live slot matches the read path predicate",
         );
         assert!(
-            create_checkout_operation_statement()
-                .contains("ON CONFLICT (user_id) WHERE state IN ('pending', 'submitted', 'needs_reconcile')"),
+            create_checkout_operation_statement().contains(
+                "ON CONFLICT (user_id) WHERE state IN ('pending', 'submitted', 'needs_reconcile')"
+            ),
             "insert converges on the single-flight index",
         );
         assert!(

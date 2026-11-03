@@ -817,7 +817,8 @@ pub fn verify_webhook_signature(
 /// Parse a verified webhook body into its event envelope. Rejects bodies
 /// without a string `id`, `type`, or object `data.object`.
 fn parse_event(raw_body: &[u8]) -> Result<StripeEvent, WebhookError> {
-    let raw: RawEvent = serde_json::from_slice(raw_body).map_err(|_| WebhookError::MalformedEvent)?;
+    let raw: RawEvent =
+        serde_json::from_slice(raw_body).map_err(|_| WebhookError::MalformedEvent)?;
     let (Some(id), Some(event_type), Some(data)) = (raw.id, raw.event_type, raw.data) else {
         return Err(WebhookError::MalformedEvent);
     };
@@ -936,9 +937,7 @@ mod tests {
             retrieve_subscription_request("sub_123").path,
             "/v1/subscriptions/sub_123"
         );
-        assert_eq!(
-            cancel_subscription_request("sub_123").method, "DELETE",
-        );
+        assert_eq!(cancel_subscription_request("sub_123").method, "DELETE",);
     }
 
     #[test]
@@ -954,7 +953,11 @@ mod tests {
         assert!(list_invoices_request(None, None, true, 10).is_none());
         let filtered =
             list_invoices_request(Some("cus_1"), Some("sub_1"), true, 10).expect("filtered");
-        assert!(filtered.path.contains("customer=cus_1"), "{}", filtered.path);
+        assert!(
+            filtered.path.contains("customer=cus_1"),
+            "{}",
+            filtered.path
+        );
         assert!(
             filtered.path.contains("subscription=sub_1"),
             "{}",
@@ -967,7 +970,10 @@ mod tests {
     fn idempotency_keys_derive_from_operation_with_distinct_prefixes() {
         assert_eq!(checkout_idempotency_key("op-1"), "checkout-session:op-1");
         assert_eq!(customer_idempotency_key("op-1"), "customer:op-1");
-        assert_ne!(checkout_idempotency_key("op-1"), customer_idempotency_key("op-1"));
+        assert_ne!(
+            checkout_idempotency_key("op-1"),
+            customer_idempotency_key("op-1")
+        );
     }
 
     #[test]
@@ -1053,7 +1059,10 @@ mod tests {
         }))
         .expect("tolerant open invoice parse");
         assert_eq!(unpaid.paid_at(), None, "open invoice has no paid_at");
-        assert_eq!(unpaid.customer, None, "missing refs are None, never guessed");
+        assert_eq!(
+            unpaid.customer, None,
+            "missing refs are None, never guessed"
+        );
     }
 
     // --- Webhook verification ----------------------------------------------------

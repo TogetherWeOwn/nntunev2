@@ -2435,9 +2435,8 @@ impl Store for PgStore {
     ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
         Self::bounded(
             async {
-                let failed = || {
-                    self.statement_failed("api.db.statement_failed.load_reconcile_input")
-                };
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.load_reconcile_input");
                 let client = self.connect().await?;
                 let account_rows = client
                     .query_typed(
@@ -2505,9 +2504,7 @@ impl Store for PgStore {
                     .iter()
                     .map(|row| {
                         Ok::<_, StoreError>(crate::billing_reconcile::PriceBinding {
-                            price_id: row
-                                .try_get("stripe_price_id")
-                                .map_err(|_| StoreError)?,
+                            price_id: row.try_get("stripe_price_id").map_err(|_| StoreError)?,
                             plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
                             selectable: row.try_get("selectable").map_err(|_| StoreError)?,
                             livemode: row.try_get("livemode").map_err(|_| StoreError)?,
@@ -2562,9 +2559,8 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         Self::bounded(
             async {
-                let failed = || {
-                    self.statement_failed("api.db.statement_failed.store_reconcile_outcome")
-                };
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
                 let mut client = self.connect().await?;
                 let transaction = client.transaction().await.map_err(|_| failed())?;
                 // One transaction under the per-user advisory lock: coverage
@@ -2663,9 +2659,8 @@ impl Store for PgStore {
     ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
         Self::bounded(
             async {
-                let failed = || {
-                    self.statement_failed("api.db.statement_failed.create_checkout_operation")
-                };
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.create_checkout_operation");
                 let client = self.connect().await?;
                 // The operation id is its own request key (fresh UUID per
                 // attempt, never reused across attempts); the partial
@@ -2696,18 +2691,16 @@ impl Store for PgStore {
                             .await
                             .map_err(|_| failed())?;
                     }
-                    return Ok(
-                        crate::billing_reconcile::CreateOpOutcome::Created(
-                            crate::billing_reconcile::StoredCheckoutOp {
-                                id: op_id.to_string(),
-                                user_id: user_id.to_string(),
-                                state: "pending".to_string(),
-                                price_id: Some(price_id.to_string()),
-                                session_id: None,
-                                subscription_id: None,
-                            },
-                        ),
-                    );
+                    return Ok(crate::billing_reconcile::CreateOpOutcome::Created(
+                        crate::billing_reconcile::StoredCheckoutOp {
+                            id: op_id.to_string(),
+                            user_id: user_id.to_string(),
+                            state: "pending".to_string(),
+                            price_id: Some(price_id.to_string()),
+                            session_id: None,
+                            subscription_id: None,
+                        },
+                    ));
                 }
                 // Loser: converge on the winner's row (same operation id,
                 // hence the same Stripe idempotency key) instead of
@@ -3414,14 +3407,16 @@ impl WorkerStripeTransport {
         if req.method == "POST" {
             init.with_body(Some(req.body.clone().into()));
         }
-        let request =
-            Request::new_with_init(&url, &init).map_err(|_| StripeError::transport())?;
+        let request = Request::new_with_init(&url, &init).map_err(|_| StripeError::transport())?;
         let mut response = Fetch::Request(request)
             .send()
             .await
             .map_err(|_| StripeError::transport())?;
         let status = response.status_code();
-        let body = response.text().await.map_err(|_| StripeError::transport())?;
+        let body = response
+            .text()
+            .await
+            .map_err(|_| StripeError::transport())?;
         if (200..300).contains(&status) {
             serde_json::from_str(&body).map_err(|_| StripeError::transport())
         } else {
@@ -3470,8 +3465,10 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
         Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
     > {
         Box::pin(async move {
-            self.send(&crate::stripe::retrieve_checkout_session_request(&session_id))
-                .await
+            self.send(&crate::stripe::retrieve_checkout_session_request(
+                &session_id,
+            ))
+            .await
         })
     }
     fn retrieve_subscription(
@@ -3481,8 +3478,10 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
         Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
     > {
         Box::pin(async move {
-            self.send(&crate::stripe::retrieve_subscription_request(&subscription_id))
-                .await
+            self.send(&crate::stripe::retrieve_subscription_request(
+                &subscription_id,
+            ))
+            .await
         })
     }
     fn retrieve_invoice(
@@ -3540,8 +3539,10 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
         Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
     > {
         Box::pin(async move {
-            self.send(&crate::stripe::cancel_subscription_request(&subscription_id))
-                .await
+            self.send(&crate::stripe::cancel_subscription_request(
+                &subscription_id,
+            ))
+            .await
         })
     }
 }
