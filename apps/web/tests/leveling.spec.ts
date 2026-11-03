@@ -104,7 +104,7 @@ test('toggle is keyboard reachable with its state announced', async ({ page }) =
 	await waitForLevelingProbe(page);
 
 	const toggle = page.getByTestId('leveling-toggle');
-	await expect(toggle).toHaveAccessibleName('Loudness leveling');
+	await expect(toggle).toHaveAccessibleName('Loudness leveling: On');
 
 	await toggle.focus();
 	await page.keyboard.press('Space');

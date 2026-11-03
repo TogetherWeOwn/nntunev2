@@ -18,8 +18,8 @@
 	type="button"
 	data-testid="leveling-toggle"
 	aria-pressed={enabled}
-	aria-label="Loudness leveling"
+	aria-label="Loudness leveling: {enabled ? 'On' : 'Off'}"
 	onclick={() => onchange?.(!enabled)}
 >
-	Leveling: {enabled ? 'On' : 'Off'}
+	Loudness leveling: {enabled ? 'On' : 'Off'}
 </button>
