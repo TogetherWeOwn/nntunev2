@@ -232,7 +232,7 @@ test('signup: retry after dismissal finishes with the same code and challenge', 
 	await expect(page.getByRole('alert')).toContainText(DISMISSAL);
 
 	await page.getByRole('button', { name: /finish creating account/i }).click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 
 	expect(traffic.startPosts).toBe(1);
 	expect(traffic.finishPosts).toBe(1);
@@ -250,10 +250,9 @@ test('login: retry after dismissal signs in', async ({ page }) => {
 	await expect(page.getByRole('alert')).toContainText(DISMISSAL);
 
 	await page.getByRole('button', { name: /sign in with passkey/i }).click();
-	// Sign-in navigates to /onboarding/provider, whose GET 307-redirects
-	// to /onboarding/byop (see routes/onboarding/provider/+server.ts), so
-	// the settled URL — like every other sign-in spec — is /onboarding/byop.
-	await page.waitForURL('/onboarding/byop');
+	// Sign-in navigates to /library, so the settled URL — like every
+	// other sign-in spec — is /library.
+	await page.waitForURL('/library');
 
 	expect(traffic.finishPosts).toBe(1);
 });
