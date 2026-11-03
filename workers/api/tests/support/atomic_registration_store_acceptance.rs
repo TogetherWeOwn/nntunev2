@@ -7,9 +7,13 @@
 //! runs every test below against its migrated, throwaway PostgreSQL service.
 
 use super::{
-    admin_issue_invite_on, admin_revoke_invite_on, admin_set_app_setting_on,
-    admin_set_user_role_on, complete_registration_on, prune_expired_challenges_on,
-    reap_unverified_users_on,
+    admin_ingest_delete_on, admin_ingest_upload_on, admin_issue_invite_on, admin_revoke_invite_on,
+    admin_set_app_setting_on, admin_set_user_role_on, complete_registration_on,
+    prune_expired_challenges_on, reap_unverified_users_on,
+};
+use crate::admin_ingest::{
+    AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome, FailureReason,
+    IngestOriginalEnvelope, INGEST_UPLOAD_AUDIT_ACTION,
 };
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
 use crate::handlers::{AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome};
@@ -2361,6 +2365,501 @@ fn postgres_registration_invite_claim_survives_issuer_deletion() {
             row.get::<_, Option<String>>(2),
             None,
             "users.invited_by derives from the claimed row, not the stale snapshot"
+        );
+    });
+}
+
+// --- Admin ingest execution coverage (migration 0034) -----------------------
+//
+// The route suite and the FakeStore prove behavior; the statement-contract
+// test pins the query shapes. The tests below execute the real
+// `admin_ingest_*` production transactions against migrated disposable
+// PostgreSQL, so a wrong column, bind type, decoder width or transaction
+// step fails here instead of in production.
+
+// Synthetic admin-ingest envelope: obviously synthetic placeholder bytes
+// (never NZB content, file names, subjects or message IDs), sized to
+// satisfy the migration 0034 envelope CHECKs (12-byte nonces, 48-byte
+// wrapped DEK).
+fn synthetic_ingest_envelope() -> IngestOriginalEnvelope {
+    IngestOriginalEnvelope {
+        dek_wrapped_nonce: [0x9e; crate::admin_ingest::NONCE_LEN],
+        dek_wrapped: vec![0x5a; 48],
+        payload_nonce: [0x3c; crate::admin_ingest::NONCE_LEN],
+        ciphertext: vec![0x77; 64],
+    }
+}
+
+// One accepted-upload attempt for `actor`. `tag` namespaces the
+// content-derived ids of a single test (charset-clean, well under the
+// 64-character id bound); the content hash is fresh randomness in the
+// required 64-hex shape.
+fn accepted_ingest_attempt(actor: &str, tag: &str, now: u64) -> AdminIngestAttempt {
+    let sha = format!("{:064x}", rand::random::<u128>());
+    AdminIngestAttempt {
+        actor_user_id: actor.to_string(),
+        job_id: format!("adm_ai_{tag}_{:016x}", rand::random::<u64>()),
+        idempotency_key: format!("admin-ingest:{sha}:upload"),
+        content_sha256_hex: sha,
+        nzb_bytes: 1_048_576,
+        file_count: Some(12),
+        segment_count: Some(480),
+        failure: None,
+        original: Some(synthetic_ingest_envelope()),
+        kek_version: 1,
+        source_ip: "198.51.100.9".to_string(),
+        now,
+    }
+}
+
+async fn ingest_row_counts(client: &Client, job_id: &str) -> (i64, i64) {
+    let jobs: i64 = client
+        .query_one("SELECT count(*) FROM ingest_jobs WHERE id = $1", &[&job_id])
+        .await
+        .expect("count job rows")
+        .get(0);
+    let originals: i64 = client
+        .query_one(
+            "SELECT count(*) FROM ingest_originals WHERE job_id = $1",
+            &[&job_id],
+        )
+        .await
+        .expect("count original rows")
+        .get(0);
+    (jobs, originals)
+}
+
+// Every upload audit for one job: (actor, outcome, reason) in commit
+// order-independent form, each with a null subject and ok TRUE.
+async fn ingest_audit_chain(
+    client: &Client,
+    job_id: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let mut chain: Vec<(String, String, Option<String>)> = client
+        .query(
+            "SELECT user_id, details ->> 'outcome', details ->> 'reason_code', \
+             subject_user_id, ok FROM audit_log \
+             WHERE action = $1 AND details ->> 'job_id' = $2",
+            &[&INGEST_UPLOAD_AUDIT_ACTION, &job_id],
+        )
+        .await
+        .expect("read ingest audit chain")
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                row.get::<_, Option<String>>(3),
+                None,
+                "ingest audits never name a subject user"
+            );
+            assert!(row.get::<_, bool>(4), "ingest audits record ok");
+            (row.get(0), row.get(1), row.get(2))
+        })
+        .collect();
+    chain.sort();
+    chain
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_ingest_upload_accept_then_duplicate_converges() {
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, _) = seed_admin_test_users(&client).await;
+        let (admin2, _) = seed_admin_test_users(&client).await;
+        let attempt = accepted_ingest_attempt(&admin, "accept", NOW);
+        let job_id = attempt.job_id.clone();
+
+        // Fresh acceptance executes the whole transaction: job row,
+        // original row and accepted audit, decoded back redacted.
+        let outcome = admin_ingest_upload_on(&mut client, &attempt)
+            .await
+            .expect("accept upload executes");
+        let AdminIngestUploadOutcome::Stored { job, deduplicated } = outcome else {
+            panic!("fresh upload must store, got {outcome:?}");
+        };
+        assert!(!deduplicated, "first upload is not a duplicate");
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(job.db_status, "queued");
+        assert_eq!(job.accepted_at, NOW);
+        assert_eq!(job.nzb_bytes, 1_048_576);
+        assert_eq!(job.file_count, Some(12));
+        assert_eq!(job.segment_count, Some(480));
+        assert_eq!(job.failure_reason, None);
+        assert!(job.has_original, "accepted upload stores the original");
+        assert_eq!(job.uploader_user_id, admin);
+        assert_eq!(ingest_row_counts(&client, &job_id).await, (1, 1));
+        let source: String = client
+            .query_one("SELECT source FROM ingest_jobs WHERE id = $1", &[&job_id])
+            .await
+            .expect("read job source")
+            .get(0);
+        assert_eq!(source, "admin");
+        assert_eq!(
+            ingest_audit_chain(&client, &job_id).await,
+            vec![(admin.clone(), "accepted".to_string(), None)],
+            "acceptance audits once with no reason code"
+        );
+
+        // Same bytes again: the locked re-select converges — same job,
+        // no new rows, only a duplicate audit.
+        let replay = admin_ingest_upload_on(&mut client, &attempt)
+            .await
+            .expect("duplicate upload executes");
+        let AdminIngestUploadOutcome::Stored { job, deduplicated } = replay else {
+            panic!("replay must converge, got {replay:?}");
+        };
+        assert!(deduplicated, "replay reports deduplicated");
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(ingest_row_counts(&client, &job_id).await, (1, 1));
+        let mut converged = vec![
+            (admin.clone(), "accepted".to_string(), None),
+            (admin.clone(), "duplicate".to_string(), None),
+        ];
+        converged.sort();
+        assert_eq!(
+            ingest_audit_chain(&client, &job_id).await,
+            converged,
+            "replay converges without new job/original rows"
+        );
+
+        // A second admin uploading the same bytes converges on the
+        // same job: job identity is content-derived, never uploader.
+        // The first writer keeps the uploader slot; the replay only
+        // audits its own duplicate.
+        let second = AdminIngestAttempt {
+            actor_user_id: admin2.clone(),
+            job_id: attempt.job_id.clone(),
+            idempotency_key: attempt.idempotency_key.clone(),
+            content_sha256_hex: attempt.content_sha256_hex.clone(),
+            nzb_bytes: attempt.nzb_bytes,
+            file_count: attempt.file_count,
+            segment_count: attempt.segment_count,
+            failure: attempt.failure,
+            original: Some(synthetic_ingest_envelope()),
+            kek_version: attempt.kek_version,
+            source_ip: attempt.source_ip.clone(),
+            now: attempt.now,
+        };
+        let cross = admin_ingest_upload_on(&mut client, &second)
+            .await
+            .expect("second-admin upload executes");
+        let AdminIngestUploadOutcome::Stored { job, deduplicated } = cross else {
+            panic!("second admin must converge, got {cross:?}");
+        };
+        assert!(deduplicated, "second admin converges as duplicate");
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(
+            job.uploader_user_id, admin,
+            "the first writer keeps the uploader slot"
+        );
+        assert_eq!(ingest_row_counts(&client, &job_id).await, (1, 1));
+        let mut both = vec![
+            (admin.clone(), "accepted".to_string(), None),
+            (admin.clone(), "duplicate".to_string(), None),
+            (admin2.clone(), "duplicate".to_string(), None),
+        ];
+        both.sort();
+        assert_eq!(
+            ingest_audit_chain(&client, &job_id).await,
+            both,
+            "each replay audits exactly its own duplicate"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_ingest_rejected_upload_stores_failed_without_original() {
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, member) = seed_admin_test_users(&client).await;
+        let sha = format!("{:064x}", rand::random::<u128>());
+        let job_id = format!("adm_ai_reject_{:016x}", rand::random::<u64>());
+        let rejected = AdminIngestAttempt {
+            actor_user_id: admin.clone(),
+            job_id: job_id.clone(),
+            idempotency_key: format!("admin-ingest:{sha}:upload"),
+            content_sha256_hex: sha,
+            nzb_bytes: 9_000_000,
+            file_count: None,
+            segment_count: None,
+            failure: Some(FailureReason::TooLarge),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+
+        // A rejected upload still executes its transaction: a failed
+        // job row with the fixed-vocabulary reason, no original, and
+        // a rejected audit carrying the reason code.
+        let outcome = admin_ingest_upload_on(&mut client, &rejected)
+            .await
+            .expect("rejected upload executes");
+        let AdminIngestUploadOutcome::Stored { job, deduplicated } = outcome else {
+            panic!("rejection must store a failed row, got {outcome:?}");
+        };
+        assert!(!deduplicated, "first rejection is not a duplicate");
+        assert_eq!(job.db_status, "failed");
+        assert_eq!(job.failure_reason, Some("too_large".to_string()));
+        assert!(!job.has_original, "rejections store no original");
+        assert_eq!(ingest_row_counts(&client, &job_id).await, (1, 0));
+        assert_eq!(
+            ingest_audit_chain(&client, &job_id).await,
+            vec![(
+                admin.clone(),
+                "rejected".to_string(),
+                Some("too_large".to_string()),
+            )],
+            "rejection audits once with its reason code"
+        );
+
+        // A non-admin actor is refused before any write: no job row,
+        // no original, no audit.
+        let other_sha = format!("{:064x}", rand::random::<u128>());
+        let other_id = format!("adm_ai_reject_{:016x}", rand::random::<u64>());
+        let stranger = AdminIngestAttempt {
+            actor_user_id: member.clone(),
+            job_id: other_id.clone(),
+            idempotency_key: format!("admin-ingest:{other_sha}:upload"),
+            content_sha256_hex: other_sha,
+            nzb_bytes: 1_048_576,
+            file_count: Some(12),
+            segment_count: Some(480),
+            failure: None,
+            original: Some(synthetic_ingest_envelope()),
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            admin_ingest_upload_on(&mut client, &stranger)
+                .await
+                .expect("member upload is a typed refusal, not an error"),
+            AdminIngestUploadOutcome::ActorNotAdmin
+        );
+        assert_eq!(ingest_row_counts(&client, &other_id).await, (0, 0));
+        assert!(
+            ingest_audit_chain(&client, &other_id).await.is_empty(),
+            "a refused upload audits nothing"
+        );
+
+        // A demoted-mid-request actor is refused the same way: the
+        // write transaction re-reads the role under its locks.
+        client
+            .execute("UPDATE users SET role = 'member' WHERE id = $1", &[&admin])
+            .await
+            .expect("demote the actor mid-flight");
+        let demoted_sha = format!("{:064x}", rand::random::<u128>());
+        let demoted_id = format!("adm_ai_reject_{:016x}", rand::random::<u64>());
+        let demoted = AdminIngestAttempt {
+            actor_user_id: admin.clone(),
+            job_id: demoted_id.clone(),
+            idempotency_key: format!("admin-ingest:{demoted_sha}:upload"),
+            content_sha256_hex: demoted_sha,
+            nzb_bytes: 1_048_576,
+            file_count: Some(12),
+            segment_count: Some(480),
+            failure: None,
+            original: Some(synthetic_ingest_envelope()),
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            admin_ingest_upload_on(&mut client, &demoted)
+                .await
+                .expect("demoted upload is a typed refusal, not an error"),
+            AdminIngestUploadOutcome::ActorNotAdmin
+        );
+        assert_eq!(ingest_row_counts(&client, &demoted_id).await, (0, 0));
+        assert!(
+            ingest_audit_chain(&client, &demoted_id).await.is_empty(),
+            "a demoted actor's upload audits nothing"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_ingest_delete_then_reupload_is_fresh() {
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, member) = seed_admin_test_users(&client).await;
+        let first = accepted_ingest_attempt(&admin, "del", NOW);
+        let first_id = first.job_id.clone();
+        let second = accepted_ingest_attempt(&admin, "keep", NOW);
+        let second_id = second.job_id.clone();
+        for attempt in [&first, &second] {
+            admin_ingest_upload_on(&mut client, attempt)
+                .await
+                .expect("seed upload executes");
+        }
+
+        // The delete primitive removes the original and the job in
+        // one transaction; the other job is untouched.
+        assert_eq!(
+            admin_ingest_delete_on(&mut client, &admin, &first_id)
+                .await
+                .expect("delete executes"),
+            AdminIngestDeleteOutcome::Deleted
+        );
+        assert_eq!(ingest_row_counts(&client, &first_id).await, (0, 0));
+        assert_eq!(
+            ingest_row_counts(&client, &second_id).await,
+            (1, 1),
+            "deleting one job leaves the other job and original alone"
+        );
+
+        // A second delete of the same id reports Missing; deleting
+        // an id that never existed does too.
+        assert_eq!(
+            admin_ingest_delete_on(&mut client, &admin, &first_id)
+                .await
+                .expect("repeat delete executes"),
+            AdminIngestDeleteOutcome::Missing
+        );
+        let absent = format!("adm_ai_absent_{:016x}", rand::random::<u64>());
+        assert_eq!(
+            admin_ingest_delete_on(&mut client, &admin, &absent)
+                .await
+                .expect("absent delete executes"),
+            AdminIngestDeleteOutcome::Missing
+        );
+
+        // A non-admin delete is refused and removes nothing.
+        assert_eq!(
+            admin_ingest_delete_on(&mut client, &member, &second_id)
+                .await
+                .expect("member delete is a typed refusal, not an error"),
+            AdminIngestDeleteOutcome::ActorNotAdmin
+        );
+        assert_eq!(
+            ingest_row_counts(&client, &second_id).await,
+            (1, 1),
+            "a refused delete removes nothing"
+        );
+
+        // Re-uploading the deleted bytes lands a fresh job: the dedupe
+        // entry went away with the delete, so this is a new acceptance.
+        let fresh = admin_ingest_upload_on(&mut client, &first)
+            .await
+            .expect("re-upload executes");
+        let AdminIngestUploadOutcome::Stored { job, deduplicated } = fresh else {
+            panic!("re-upload after delete must store fresh, got {fresh:?}");
+        };
+        assert!(
+            !deduplicated,
+            "re-upload after delete is a fresh acceptance"
+        );
+        assert_eq!(job.job_id, first_id);
+        assert_eq!(ingest_row_counts(&client, &first_id).await, (1, 1));
+        assert_eq!(
+            ingest_row_counts(&client, &second_id).await,
+            (1, 1),
+            "the fresh upload leaves the other job alone"
+        );
+    });
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_ingest_list_and_get_read_redacted_jobs() {
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, _) = seed_admin_test_users(&client).await;
+        let tag = format!("lst{:016x}", rand::random::<u64>());
+        let old = accepted_ingest_attempt(&admin, &format!("{tag}old"), NOW);
+        let mut new = accepted_ingest_attempt(&admin, &format!("{tag}new"), NOW + 30);
+        new.failure = Some(FailureReason::NotNzb);
+        new.nzb_bytes = 64;
+        new.file_count = None;
+        new.segment_count = None;
+        new.original = None;
+        for attempt in [&old, &new] {
+            admin_ingest_upload_on(&mut client, attempt)
+                .await
+                .expect("seed upload executes");
+        }
+
+        // The readers run through the real store with an injected
+        // disposable client: no copied SQL, the production decoder.
+        // The injected client is single-use (the seam `take()`s it on
+        // connect), so each store call below gets a fresh connection.
+        let page = crate::handlers::Store::admin_ingest_list(
+            &super::session_retry_store_for_postgres_test(connect().await),
+            None,
+            100,
+            0,
+        )
+        .await
+        .expect("list executes");
+        let mine: Vec<&crate::admin_ingest::StoredAdminIngestJob> = page
+            .iter()
+            .filter(|job| job.job_id.starts_with(&format!("adm_ai_{tag}")))
+            .collect();
+        assert_eq!(
+            mine.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![new.job_id.as_str(), old.job_id.as_str()],
+            "list is newest-first across this test's jobs"
+        );
+        assert_eq!(mine[0].db_status, "failed");
+        assert_eq!(
+            mine[0].failure_reason,
+            Some("not_nzb".to_string()),
+            "the failed job carries its fixed-vocabulary reason"
+        );
+        assert!(!mine[0].has_original, "the failed job has no original");
+        assert_eq!(mine[1].db_status, "queued");
+        assert!(mine[1].has_original, "the accepted job has its original");
+        for job in &mine {
+            assert_eq!(
+                job.uploader_user_id, admin,
+                "readers echo the uploading admin and nothing else"
+            );
+        }
+
+        // The status filter narrows to the failed job only.
+        let failed = crate::handlers::Store::admin_ingest_list(
+            &super::session_retry_store_for_postgres_test(connect().await),
+            Some("failed"),
+            100,
+            0,
+        )
+        .await
+        .expect("filtered list executes");
+        let failed_mine: Vec<&str> = failed
+            .iter()
+            .filter(|job| job.job_id.starts_with(&format!("adm_ai_{tag}")))
+            .map(|job| job.job_id.as_str())
+            .collect();
+        assert_eq!(failed_mine, vec![new.job_id.as_str()]);
+
+        // Single reads are redacted by construction: ids, counts and
+        // the failure reason only — the struct has no field for the
+        // content hash, bytes or segment data.
+        let got = crate::handlers::Store::admin_ingest_get(
+            &super::session_retry_store_for_postgres_test(connect().await),
+            &new.job_id,
+        )
+        .await
+        .expect("get executes")
+        .expect("stored job reads back");
+        assert_eq!(got.job_id, new.job_id);
+        assert_eq!(got.nzb_bytes, 64);
+        assert_eq!(got.failure_reason, Some("not_nzb".to_string()));
+        assert!(!got.has_original);
+        assert_eq!(
+            crate::handlers::Store::admin_ingest_get(
+                &super::session_retry_store_for_postgres_test(connect().await),
+                &format!("adm_ai_{tag}_absent"),
+            )
+            .await
+            .expect("absent get executes"),
+            None
         );
     });
 }
