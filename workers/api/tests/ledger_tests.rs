@@ -491,20 +491,20 @@ fn migration_pins_rate_retirement_and_persisted_caps() {
         DERIVATION.contains("CREATE TABLE IF NOT EXISTS playback_leases ("),
         "0029 must create the playback lease table"
     );
-    // 0029 restores the floor the retired rate CHECK implied: the
+    // 0030 restores the floor the retired rate CHECK implied: the
     // schema must refuse the zero-second rows `prepare_ledger_row`
     // refuses, or a non-prepare writer could persist unbilled plays.
-    const FLOOR: &str = include_str!("../../../migrations/0029_ledger_seconds_floor.sql");
+    const FLOOR: &str = include_str!("../../../migrations/0030_ledger_seconds_floor.sql");
     assert!(
         FLOOR.contains("'%stream_seconds >= 0%'"),
-        "0029 must find the zero-allowing range CHECK by its definition"
+        "0030 must find the zero-allowing range CHECK by its definition"
     );
     assert!(
         FLOOR.contains(&format!(
             "CHECK (stream_seconds >= 1 AND stream_seconds <= {})",
             ledger::MAX_STREAM_SECONDS_PER_ROW
         )),
-        "0029 must bound stream_seconds to [1, MAX_STREAM_SECONDS_PER_ROW]"
+        "0030 must bound stream_seconds to [1, MAX_STREAM_SECONDS_PER_ROW]"
     );
     // Literal pin: the fallback rate re-bills history, so drift is
     // deliberate only.
