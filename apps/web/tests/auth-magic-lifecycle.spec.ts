@@ -220,7 +220,7 @@ test('live redeem still clears old library state, labels the account and navigat
 	await waitForRequest(page);
 	await releaseRequest(page);
 
-	await expect(page).toHaveURL(/\/onboarding\/byop$/);
+	await expect(page).toHaveURL(/\/library$/);
 	await expect(page.getByText(/signed in as/i)).toContainText('redeemed@example.test');
 	expect(await page.evaluate((key) => sessionStorage.getItem(key), LABEL_KEY)).toBe('redeemed@example.test');
 	for (const row of await storedAccount(page)) expect(row.slice(1)).toEqual([null, null, null]);

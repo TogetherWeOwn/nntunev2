@@ -427,5 +427,5 @@ test('blocked storage does not turn a successful magic-link sign-in into a failu
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
 
 	// Cleanup after a successful redemption must not land in the error branch.
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 });
