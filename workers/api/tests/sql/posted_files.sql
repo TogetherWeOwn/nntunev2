@@ -1,4 +1,4 @@
--- Regression test for the posted-file record (migrations 0028 + 0029,
+-- Regression test for the posted-file record (migrations 0030 + 0031,
 -- workers/ingest/src/posted_files.rs). Run after ALL migrations are applied
 -- (see ../run_migration_tests.sh). Everything happens inside one transaction
 -- that is rolled back, so it leaves no rows; any broken expectation RAISEs
@@ -6,8 +6,8 @@
 --
 -- This test executes the writer insert in its exact shape (literals stand in
 -- for the $n parameters): the content-global row converging on the tagged
--- plaintext sha256 with the two-spool copy state (0028) plus the
--- encrypt-on-write crypto envelope and geometry (0029) — plus the
+-- plaintext sha256 with the two-spool copy state (0030) plus the
+-- encrypt-on-write crypto envelope and geometry (0031) — plus the
 -- sha re-select the writer uses to separate a benign replay from a lost
 -- write, the verify/retention timestamp touches, and the negatives
 -- (sha/backbone/state/count CHECKs, envelope length + version + format

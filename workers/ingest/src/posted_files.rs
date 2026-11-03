@@ -1,4 +1,4 @@
-//! `posted_files` writer: pure statements (migrations 0028 + 0029).
+//! `posted_files` writer: pure statements (migrations 0030 + 0031).
 //!
 //! Pipeline position: the post flow writes one content-global row per
 //! tagged plaintext sha256 after the poster seals the file (encrypt with
@@ -10,12 +10,12 @@
 //! classification the wire-up uses. Zero execution here — the
 //! writers-wiring follow-up owns the DB calls.
 //!
-//! Table split: migration 0028 (TWO-1768 two-spool ledger) owns copy state
-//! — the backbone pair, counts, spool states — and migration 0029
+//! Table split: migration 0030 (TWO-1768 two-spool ledger) owns copy state
+//! — the backbone pair, counts, spool states — and migration 0031
 //! (TWO-1761) owns key custody and geometry — sizes, header nonce, the two
 //! envelopes, verify/retention timestamps. One table, one writer module:
 //! the insert below binds the FULL row (both halves), because every new
-//! column is `NOT NULL`-complete for poster-written rows (the 0029
+//! column is `NOT NULL`-complete for poster-written rows (the 0031
 //! `posted_files_crypto_complete` guard). The state machine on top
 //! (`SpoolCopyState`, dedupe reuse) stays in [`crate::two_spool`]; reuse
 //! logic lands on the verify card, not here.
@@ -73,15 +73,15 @@ use crate::track_writers::{ENVELOPE_NONCE_BYTES, ENVELOPE_WRAPPED_DEK_BYTES};
 use crate::two_spool::{validate_backbone_label, validate_plaintext_sha256, SpoolCopyState};
 
 /// Public rclone header nonce length (bytes). Posted in article 0 in the
-/// clear; mirrors the 0029 `CHECK` (`octet_length(header_nonce) = 24`).
+/// clear; mirrors the 0031 `CHECK` (`octet_length(header_nonce) = 24`).
 pub const HEADER_NONCE_BYTES: usize = 24;
 
 /// `file_key_*` payload format: the raw 32-byte per-file key. Card-fixed
-/// (0029 `CHECK`s `= 1`); the mint assigns nothing else here.
+/// (0031 `CHECK`s `= 1`); the mint assigns nothing else here.
 pub const FILE_KEY_PAYLOAD_FORMAT: i16 = 1;
 
 /// `manifest_*` payload format: the `posted_manifest_v1` JSON document
-/// described above. Card-fixed (0029 `CHECK`s `= 1`).
+/// described above. Card-fixed (0031 `CHECK`s `= 1`).
 pub const MANIFEST_PAYLOAD_FORMAT: i16 = 1;
 
 /// Envelope v2 AAD domain for both posted-file envelopes (ADR 0002).
@@ -106,13 +106,13 @@ pub const ENVELOPE_AAD_OWNER_SCOPE: &str = "global:posted_files";
 /// document), so only the file-key side pins its body length here.
 pub const FILE_KEY_ENVELOPE_BODY_BYTES: usize = 48;
 
-/// Latest representable epoch second (0022/0028 ceiling, year 9999).
+/// Latest representable epoch second (0022/0030 ceiling, year 9999).
 pub const MAX_EPOCH: i64 = 253402300799;
 
-/// Largest article set one row tracks (0028 `CHECK`, `<= 1000000`).
+/// Largest article set one row tracks (0030 `CHECK`, `<= 1000000`).
 pub const MAX_ARTICLE_COUNT: i32 = 1_000_000;
 
-/// Database wire string for a spool copy state: the 0028 `IN` list, which
+/// Database wire string for a spool copy state: the 0030 `IN` list, which
 /// is also the `snake_case` serde alphabet of [`SpoolCopyState`].
 pub fn spool_copy_state_db_str(state: SpoolCopyState) -> &'static str {
     match state {
@@ -136,7 +136,7 @@ pub fn parse_spool_copy_state(raw: &str) -> Result<SpoolCopyState, &'static str>
     }
 }
 
-/// One full posted-file row: every bound column of the 0028 + 0029 insert.
+/// One full posted-file row: every bound column of the 0030 + 0031 insert.
 /// `id` and `created_at` are DB-owned and never bound;
 /// `post_verified_at`/`last_retention_check` start NULL and are stamped by
 /// the touch statements below.
@@ -263,7 +263,7 @@ fn validate_envelope_side(
     Ok(())
 }
 
-/// Validates every bound value against the 0028 + 0029 `CHECK`s before the
+/// Validates every bound value against the 0030 + 0031 `CHECK`s before the
 /// wire-up binds it. Static messages: safe to surface, nothing secret.
 pub fn validate_posted_file_params(params: &PostedFileParams) -> Result<(), &'static str> {
     if !validate_plaintext_sha256(params.plaintext_sha256) {
