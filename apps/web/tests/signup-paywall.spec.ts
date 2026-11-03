@@ -93,7 +93,7 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 	await dialog.getByRole('button', { name: 'Not now' }).click();
 	await expect(dialog).toBeHidden();
 	await page.getByRole('button', { name: /finish creating account/i }).click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(2);
 	expect(finishBodies[1]).toEqual(finishBodies[0]);
 	expect(finishBodies[1]).toMatchObject({

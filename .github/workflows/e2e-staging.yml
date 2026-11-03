@@ -200,10 +200,10 @@ jobs:
         run: |
           set -euo pipefail
           # Playwright 1.55 writes test-results/**/error-context.md on any failed
-          # page test — an ARIA snapshot rendering filled input values, including
-          # the BYOP password — and the junit reporter embeds failure messages
-          # (e.g. toHaveValue Received strings) that can carry the same filled
-          # secrets. Belt-and-braces: delete error-context.md AND the whole
+          # page test — an ARIA snapshot rendering filled input values — and
+          # the junit reporter embeds failure messages (e.g. toHaveValue
+          # Received strings) that can carry the same filled secrets.
+          # Belt-and-braces: delete error-context.md AND the whole
           # playwright-report/ dir, then scrub secret values from every remaining
           # file under test-results/ (junit.xml) so the uploaded artifact can
           # never carry secrets. Only test-results/ (junit) is uploaded below.
@@ -289,7 +289,7 @@ jobs:
   # through the deploy.yml caller, a skipped/failed deploy — from
   # producing a full-journey PASS.
   e2e:
-    name: full journey (signup → byop → ingest → meter → limits)
+    name: full journey (signup → library → meter → limits)
     needs: [synthetic]
     if: ${{ inputs.post_deploy }}
     runs-on: ubuntu-latest
@@ -392,13 +392,12 @@ jobs:
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
           # Runtime real-NZB fixture staged by the prepare step above
           # (RUNNER_TEMP path only, never content). Live legs are signup,
-          # the BYOP wizard (test-connection included), the provider 430
-          # control and the intake-level ingest-refusal leg; the RAR set
-          # can feed no completable ingest (no RAR read in the pipeline),
-          # so ingest-completion, reload and decoded-audio legs skip by
-          # name (see e2e/README.md). The prepare step fails closed when
-          # the halves are unset, so an empty path here is a red run,
-          # never a silent pass.
+          # library arrival, returning-user login, the provider 430 control
+          # and the stream plan-limit refusal leg; the user-NZB legs (ingest,
+          # reload, Range, meter, playback, seek, Media Session, queue order)
+          # skip by name under TWO-1635 (see e2e/README.md). The prepare step
+          # fails closed when the halves are unset, so an empty path here is
+          # a red run, never a silent pass.
           TEST_NZB_PATH: ${{ steps.real-nzb.outputs.path }}
           REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}
           # Per-run provider connection budget (shared account with
@@ -417,16 +416,17 @@ jobs:
         # always(): publishes ran/skipped/failed counts even when the journey
         # failed, and turns an all-skipped green run red. Unconfigured
         # staging never reaches here: the preflight fails the job. The skip
-        # budget covers only the remaining recording_mbids test.fixme;
-        # every other skip (including queue order) fails the job — except in
-        # real-NZB mode, where the gate budgets its fixed extended allow-list
-        # of RAR-set skips instead (REAL_NZB_MODE from the prepare step).
+        # budget covers the recording_mbids test.fixme plus the nine parked
+        # user-NZB legs (TWO-1635); every other skip fails the job — except
+        # in real-NZB mode, where the gate budgets its fixed extended
+        # allow-list of RAR-set skips instead (REAL_NZB_MODE from the prepare
+        # step).
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
         if: always() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
-          MAX_ALLOWED_SKIPS: '1'
+          MAX_ALLOWED_SKIPS: '10'
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
           REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}

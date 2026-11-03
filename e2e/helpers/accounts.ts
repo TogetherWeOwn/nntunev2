@@ -13,10 +13,8 @@ import {
   isAuthStartRequest,
   isStagingOrigin,
   qaAuthHeader,
-  syntheticNntpEndpoint,
   type WallProbe,
 } from './access.js';
-import { readProviderBudget } from './provider-budget.js';
 
 export interface TestAccount {
   email: string;
@@ -573,99 +571,6 @@ export async function waitForHydration(page: Page, context: string): Promise<voi
   ).toBeAttached({ timeout: 30_000 });
 }
 
-/**
- * Complete the BYOP wizard for the current page identity: point it at the
- * synthetic NNTP endpoint and save. Every identity that ingests runs this
- * first — the ingest worker probes through the user's authenticated provider
- * connection, so an account that never ran the wizard cannot ingest. Fails
- * closed when SYNTHETIC_NNTP_PASS is missing (no default, never logged).
- */
-export async function completeByopWizard(page: Page, baseURL: string): Promise<void> {
-  const endpoint = syntheticNntpEndpoint();
-  const password = process.env.SYNTHETIC_NNTP_PASS;
-  if (!password) {
-    throw new Error(
-      '[byop] SYNTHETIC_NNTP_PASS is not set. The wizard must point at the hosted ' +
-        'synthetic endpoint or test provider — refusing to submit an empty credential. ' +
-        'See e2e/README.md.',
-    );
-  }
-  await page.goto(`${baseURL}/onboarding/byop`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30_000,
-  });
-  await waitForHydration(page, 'byop');
-  await expect(page.getByTestId(TESTIDS.byopHost)).toBeVisible({ timeout: 15_000 });
-  await page.getByTestId(TESTIDS.byopHost).fill(endpoint.host);
-  await page.getByTestId(TESTIDS.byopPort).selectOption(String(endpoint.port));
-  await page.getByTestId(TESTIDS.byopUser).fill(endpoint.user);
-  await page.getByTestId(TESTIDS.byopPass).fill(password);
-  // Provider connection budget (owner rule — the provider account is shared
-  // with production): the account must save no more than the run-wide cap,
-  // or ingest's pool would exceed it. Set AND verify, like the TLS toggle
-  // below: a missing or un-settable connections control fails before any
-  // test/save submission. Names only in diagnostics, never values.
-  const budget = readProviderBudget(process.env).maxConnections;
-  const connections = page.getByTestId(TESTIDS.byopConnections);
-  try {
-    await expect(connections).toHaveCount(1);
-    await connections.fill(String(budget));
-    await expect(connections).toHaveValue(String(budget));
-  } catch {
-    throw new Error(
-      '[byop] could not set and verify the BYOP connections control to the ' +
-        'provider budget: refusing to test or save with an uncapped connection ' +
-        'count (names only — no values logged).',
-    );
-  }
-  // Fail closed on transport fidelity: explicitly set AND verify the TLS
-  // checkbox's requested state. A missing, unusable or un-settable control
-  // must stop the wizard here — never submit test/save with whatever
-  // transport the page happened to default to.
-  const tlsToggle = page.getByTestId(TESTIDS.byopTls);
-  const tlsMatches = await tlsToggle.count();
-  if (tlsMatches !== 1) {
-    throw new Error(
-      `[byop] expected exactly one TLS checkbox (${TESTIDS.byopTls}) on the BYOP page, ` +
-        `found ${tlsMatches}: cannot verify the requested transport — refusing to test ` +
-        'or save. The page contract may have drifted (names only — no values logged).',
-    );
-  }
-  const tlsType = await tlsToggle.getAttribute('type').catch(() => null);
-  if (tlsType?.toLowerCase() !== 'checkbox') {
-    throw new Error(
-      '[byop] the BYOP TLS control is not a checkbox — cannot set or verify the ' +
-        'requested TLS state; refusing to test or save (names only — no values logged).',
-    );
-  }
-  // endpoint.tls is always true (TLS-off is rejected in syntheticNntpEndpoint),
-  // so the requested state is unconditionally checked.
-  try {
-    await tlsToggle.check();
-    await expect(tlsToggle).toBeChecked();
-  } catch {
-    // The underlying Playwright error can carry page detail; replace it with
-    // a names-only diagnostic instead of letting it propagate.
-    throw new Error(
-      '[byop] could not set and verify the BYOP TLS checkbox to checked: ' +
-        'refusing to test or save with an unverified transport (names only — no values logged).',
-    );
-  }
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await page.getByTestId(TESTIDS.byopTest).click();
-  const status = page.getByTestId(TESTIDS.byopStatus);
-  await expect(status, 'BYOP test-connection gave no status').toBeVisible({ timeout: 60_000 });
-  await expect(status, 'BYOP test-connection to the synthetic endpoint failed').toContainText(
-    /success|connected|ok/i,
-    { timeout: 60_000 },
-  );
-  await page.getByTestId(TESTIDS.byopSave).click();
-  await expect(page, 'BYOP save did not reach the library').toHaveURL(/\/library/, {
-    timeout: 30_000,
-  });
-}
-
 /** Path the signup form posts to first (`registerStart` in the web client). */
 const REGISTER_START_PATH = '/v1/auth/passkey/register/start';
 
@@ -739,10 +644,11 @@ export async function awaitSignupOutcome(
  * the reachable first step of the real two-step flow: submit starts
  * registration (`registerStart`) and the page renders the emailed-code form
  * (`input[name="magic_code"]`, "Finish creating account"). Navigation to the
- * BYOP wizard happens only after the emailed code plus a passkey finish
+ * library happens only after the emailed code plus a passkey finish
  * (`registerFinish`), which needs a staging-only code-retrieval seam and a
- * WebAuthn virtual authenticator that do not exist yet — so this helper
- * must NOT assert the wizard, or every configured run goes red. It never
+ * WebAuthn virtual authenticator (covered separately by
+ * `submitPublicUiSignupToLibrary`) — so this helper must NOT assert library
+ * arrival, or every configured run goes red. It never
  * touches the test-account seam, so it proves public UI form submission even
  * when the seam is configured. Callers authenticate the page first (a null
  * identity via applyAccountToPage gives the anonymous, Access-only starting
@@ -877,15 +783,15 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
 
 /**
  * Submit the public `/signup` form as a fresh synthetic identity and carry
- * the real two-step flow all the way to the BYOP wizard: submit starts
+ * the real two-step flow all the way to the library: submit starts
  * registration (`registerStart`), the emailed-code step is filled with the
  * code from the staging-only retrieval seam (`retrieveStagedSignupCode`),
  * and the passkey finish (`registerFinish`) runs against a WebAuthn virtual
  * authenticator (`enableVirtualAuthenticator`), after which the page
- * navigates to `/onboarding/byop`.
+ * navigates to `/library`.
  *
  * Unlike `submitPublicUiSignup` (which stops at the `magic_code` step so
- * every configured run stays green), this helper asserts wizard arrival and
+ * every configured run stays green), this helper asserts library arrival and
  * therefore requires the seam: without it the code-retrieval POST fails with
  * the documented `[code-seam]` signature. It never touches the test-account
  * mint seam, so the account it creates comes only from the public form. Call
@@ -894,7 +800,7 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
  * identity; it and the code value are never interpolated into an assertion
  * message or diagnostic here.
  */
-export async function submitPublicUiSignupToByopWizard(
+export async function submitPublicUiSignupToLibrary(
   page: Page,
   request: APIRequestContext,
   baseURL: string,
@@ -917,11 +823,11 @@ export async function submitPublicUiSignupToByopWizard(
   });
   // Staging-only seam: the issued code for this synthetic mailbox, without
   // minting. Absent seam (or absent QA_AUTH_TOKEN) fails here by name —
-  // never by asserting the wizard on a code that was never issued.
+  // never by asserting the library on a code that was never issued.
   const code = await retrieveStagedSignupCode(request, baseURL, email);
   if (!code) {
     throw new Error(
-      '[code-seam] no staged signup code: this wizard-arrival step requires QA_AUTH_TOKEN ' +
+      '[code-seam] no staged signup code: this library-arrival step requires QA_AUTH_TOKEN ' +
         'plus the staging code-retrieval seam for example.test mailboxes ' +
         '(names only — no values logged). See e2e/README.md.',
     );
@@ -931,20 +837,18 @@ export async function submitPublicUiSignupToByopWizard(
   await enableVirtualAuthenticator(page);
   await codeField.fill(code);
   await page.getByRole('button', { name: 'Finish creating account' }).click();
-  // The page navigates to the BYOP wizard only after the emailed code plus
+  // The page navigates to the library only after the emailed code plus
   // the passkey finish succeed server-side. The regex waits for the
   // navigation; the plain-string read below names the arrival path verbatim
   // (kept as a pinnable contract string, never a value).
-  await expect(page, 'public UI signup did not reach the BYOP wizard').toHaveURL(
-    /\/onboarding\/byop/,
-    { timeout: 30_000 },
-  );
-  expect(page.url(), 'public UI signup did not land on the BYOP wizard').toContain(
-    '/onboarding/byop',
-  );
+  await expect(page, 'public UI signup did not reach the library').toHaveURL(/\/library/, {
+    timeout: 30_000,
+  });
+  expect(page.url(), 'public UI signup did not land on the library').toContain('/library');
+  await waitForHydration(page, 'signup-arrival');
   await expect(
-    page.getByTestId(TESTIDS.byopHost),
-    'BYOP wizard not reachable after public UI signup',
-  ).toBeVisible({ timeout: 15_000 });
+    page.getByRole('heading', { level: 1 }),
+    'library heading not visible after public UI signup',
+  ).toContainText('Library', { timeout: 15_000 });
   return { email, viaApi: false };
 }

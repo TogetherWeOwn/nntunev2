@@ -3,12 +3,11 @@ import { expect, test } from '@playwright/test';
 /**
  * Login-CSRF gate pin (PR #30 review): the `/auth/magic` landing must never
  * redeem on load — the emailed token is spent only on an explicit confirm
- * click — and the provider wizard must name the signed-in account before
- * any provider credential is typed.
+ * click — and a successful redeem lands on the library.
  *
  * Restoring `redeem()` on mount fails the pre-click assertion (one POST
- * already sent, confirm button gone); dropping the wizard identity label
- * fails the final assertion.
+ * already sent, confirm button gone); dropping the library arrival
+ * assertion fails the final navigation check.
  */
 test('magic-link landing waits for confirm, redeems once, then names the account', async ({
 	page
@@ -31,14 +30,11 @@ test('magic-link landing waits for confirm, redeems once, then names the account
 	expect(finishPosts).toBe(0);
 
 	await confirm.click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(1);
 
-	// The wizard names the account before any credential field.
-	await expect(page.getByRole('heading', { level: 1 })).toContainText(
-		'Connect your provider'
-	);
-	await expect(page.getByText(/signed in as/i)).toContainText('ada@example.com');
+	// The library names itself on arrival after a successful redeem.
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('Library');
 });
 
 /**
@@ -101,9 +97,9 @@ test('swap-guarded link offers sign-out with no label and redeems after sign-out
 	const retry = page.getByRole('button', { name: /sign in with this link/i });
 	await expect(retry).toBeVisible();
 	await retry.click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(2);
-	await expect(page.getByText(/signed in as/i)).toContainText('bob@example.com');
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('Library');
 });
 
 /**
@@ -184,7 +180,7 @@ test('magic-link paywall preserves the token for a successful retry', async ({ p
 	await dialog.getByRole('button', { name: 'Not now' }).click();
 	await expect(dialog).toBeHidden();
 	await page.getByRole('button', { name: /sign in with this link/i }).click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(2);
 });
 
