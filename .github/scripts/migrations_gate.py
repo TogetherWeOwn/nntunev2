@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate migration numbering, manifest metadata, checksums, and drift."""
+"""Validate migration numbering, manifest metadata, checksums, drift, and headers."""
 
 import argparse
 import hashlib
@@ -16,6 +16,11 @@ MIGRATIONS = Path("migrations")
 NUMBERED_SQL = re.compile(r"^(\d{4})_.+\.sql$")
 NUMBER_PREFIX = re.compile(r"^(\d{4})_")
 VALID_TARGETS = {"app", "mirror"}
+# Migrations numbered at or below this predate the search_path convention
+# (migrations/README.md) and are manifest-pinned without a header; every
+# new migration above it must open with SEARCH_PATH_HEADER.
+SEARCH_PATH_CUTOFF = 30
+SEARCH_PATH_HEADER = "SET search_path = public, pg_catalog;"
 
 
 class GateError(Exception):
@@ -40,6 +45,54 @@ def git(root, *args, text=True):
 
 def report(code, filename, detail):
     print(f"migrations-gate: {code}: {filename}: {detail}")
+
+
+def strip_leading_trivia(text):
+    """Remove leading blank lines, `--` line comments and `/* … */` blocks.
+
+    PostgreSQL block comments nest, so depth is tracked: scanning stops at
+    the `*/` that closes the outermost block, not the first one seen.
+    """
+    pos = 0
+    length = len(text)
+    while pos < length:
+        if text[pos] in " \t\r\n\v\f":
+            pos += 1
+        elif text.startswith("--", pos):
+            end = text.find("\n", pos)
+            pos = length if end == -1 else end + 1
+        elif text.startswith("/*", pos):
+            depth = 1
+            i = pos + 2
+            while i < length and depth > 0:
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth > 0:
+                return ""
+            pos = i
+        else:
+            break
+    return text[pos:]
+
+
+def has_search_path_header(data):
+    """Whether raw migration bytes open with the exact SET header statement.
+
+    Leading comments and blank lines may precede the header; nothing
+    executable may. The match is byte-exact by decision (TWO-1923): the
+    header is one canonical string, not a pattern.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return strip_leading_trivia(text.lstrip("\ufeff")).startswith(SEARCH_PATH_HEADER)
 
 
 def load_manifest(root):
@@ -193,6 +246,21 @@ def check_drift(root, base_ref):
             report("out-of-order", filename, f"new migration number must be {expected:04d}")
             violations += 1
 
+    migrations_dir = root / MIGRATIONS
+    for number, filename in new_numbers:
+        if number <= SEARCH_PATH_CUTOFF:
+            continue
+        path = migrations_dir / filename
+        if path.is_symlink():
+            continue
+        try:
+            contents = path.read_bytes()
+        except OSError:
+            continue
+        if not has_search_path_header(contents):
+            report("missing-search-path", filename, f"new migration must open with {SEARCH_PATH_HEADER}")
+            violations += 1
+
     for path in sorted(base_sql):
         filename = Path(path).name
         current = root / path
@@ -231,7 +299,12 @@ def check_drift(root, base_ref):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--base-ref")
+    parser.add_argument(
+        "--base-ref",
+        help="base ref to diff against; enables the drift, applied-history, "
+        "and search_path header checks, which only cover files new against "
+        "this ref (without it, only the manifest check runs)",
+    )
     try:
         args = parser.parse_args(argv)
         root = args.root.resolve()
