@@ -255,29 +255,29 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
         0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF,
     ];
 
-    let regroup = v128_load(REGROUP.as_ptr());
-    let keep_lo = v128_load(KEEP_LO.as_ptr());
-    let keep_hi = v128_load(KEEP_HI.as_ptr());
-    let fold_hi_down = v128_load(FOLD_HI_DOWN.as_ptr());
-    let spread = v128_load(SPREAD.as_ptr());
-    let keep_even = v128_load(KEEP_EVEN.as_ptr());
-    let keep_odd = v128_load(KEEP_ODD.as_ptr());
+    let regroup = v128_load(REGROUP.as_ptr() as *const v128);
+    let keep_lo = v128_load(KEEP_LO.as_ptr() as *const v128);
+    let keep_hi = v128_load(KEEP_HI.as_ptr() as *const v128);
+    let fold_hi_down = v128_load(FOLD_HI_DOWN.as_ptr() as *const v128);
+    let spread = v128_load(SPREAD.as_ptr() as *const v128);
+    let keep_even = v128_load(KEEP_EVEN.as_ptr() as *const v128);
+    let keep_odd = v128_load(KEEP_ODD.as_ptr() as *const v128);
     let nibble_mask = i8x16_splat(0x0F);
 
-    let t0lo = v128_load(t.lo[0].as_ptr());
-    let t1lo = v128_load(t.lo[1].as_ptr());
-    let t2lo = v128_load(t.lo[2].as_ptr());
-    let t3lo = v128_load(t.lo[3].as_ptr());
-    let t0hi = v128_load(t.hi[0].as_ptr());
-    let t1hi = v128_load(t.hi[1].as_ptr());
-    let t2hi = v128_load(t.hi[2].as_ptr());
-    let t3hi = v128_load(t.hi[3].as_ptr());
+    let t0lo = v128_load(t.lo[0].as_ptr() as *const v128);
+    let t1lo = v128_load(t.lo[1].as_ptr() as *const v128);
+    let t2lo = v128_load(t.lo[2].as_ptr() as *const v128);
+    let t3lo = v128_load(t.lo[3].as_ptr() as *const v128);
+    let t0hi = v128_load(t.hi[0].as_ptr() as *const v128);
+    let t1hi = v128_load(t.hi[1].as_ptr() as *const v128);
+    let t2hi = v128_load(t.hi[2].as_ptr() as *const v128);
+    let t3hi = v128_load(t.hi[3].as_ptr() as *const v128);
 
     let chunks = words / 8;
     for c in 0..chunks {
         // SAFETY: `c` addresses a whole 8-word chunk inside the caller's
         // range; loads/stores are unaligned-safe.
-        let s = v128_load((src as *const u8).add(c * 16));
+        let s = v128_load((src as *const u8).add(c * 16) as *const v128);
         let lo_idx = v128_and(s, nibble_mask);
         let shifted = u16x8_shr(s, 4);
         let hi_idx = v128_and(shifted, nibble_mask);
@@ -320,8 +320,8 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
             v128_and(i8x16_swizzle(hi_folded, spread), keep_odd),
         );
 
-        let d = v128_load((dst as *const u8).add(c * 16));
-        v128_store((dst as *mut u8).add(c * 16), v128_xor(d, emit));
+        let d = v128_load((dst as *const u8).add(c * 16) as *const v128);
+        v128_store((dst as *mut u8).add(c * 16) as *mut v128, v128_xor(d, emit));
     }
 }
 
