@@ -167,7 +167,10 @@ impl MemoryMeter {
     }
 }
 
-fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
+/// The persisted-ledger field rule, shared with grant verification and the
+/// delivered-interval envelope so an id accepted at the play route is
+/// exactly an id the ledger key can carry.
+pub(crate) fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
         && field
