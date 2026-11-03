@@ -120,6 +120,34 @@ pub struct BundleWriter {
     staged: Vec<String>,
 }
 
+/// Reject bundle-relative paths that could escape the bundle root.
+/// `Path::components` parses per-platform (on Unix `C:\x` is an
+/// ordinary file name), so check both the parsed components (prefix,
+/// root, parent) and the Windows spellings explicitly: backslash
+/// separators and drive-letter/`:` spellings are never valid in a
+/// bundle path, and the bundle must verify identically on every
+/// platform the tool builds on.
+fn is_unsafe_bundle_path(rel: &str) -> bool {
+    if rel.is_empty() {
+        return true;
+    }
+    if rel.contains('\\') || rel.contains(':') {
+        return true;
+    }
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return true;
+    }
+    path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    })
+}
+
 impl BundleWriter {
     pub fn new(dir: &Path, env: &str, tool: &str, created_at_unix: i64) -> Self {
         BundleWriter {
@@ -134,9 +162,11 @@ impl BundleWriter {
     }
 
     /// Stage one file (relative path inside the bundle). Parent
-    /// directories are created. Refuses absolute paths and `..`.
+    /// directories are created. Refuses absolute, prefixed, rooted
+    /// and parent paths, including Windows spellings (see
+    /// [`is_unsafe_bundle_path`]).
     pub fn stage_file(&mut self, rel: &str, bytes: &[u8]) -> Result<(), BundleError> {
-        if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|p| p == "..") {
+        if is_unsafe_bundle_path(rel) {
             return Err(BundleError::Io(format!("unsafe bundle path: {rel}")));
         }
         let full = self.dir.join(rel);
@@ -221,7 +251,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
 pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
     let manifest = read_manifest(dir)?;
     for f in &manifest.files {
-        if f.path.is_empty() || f.path.starts_with('/') || f.path.split('/').any(|p| p == "..") {
+        if is_unsafe_bundle_path(&f.path) {
             return Err(BundleError::Io(format!("unsafe bundle path: {}", f.path)));
         }
         let full = dir.join(&f.path);
@@ -357,6 +387,56 @@ mod tests {
         let mut w = writer_in(&dir);
         assert!(w.stage_file("../evil", b"x").is_err());
         assert!(w.stage_file("/abs", b"x").is_err());
+        assert!(w.stage_file("a/../../evil", b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_spellings_refused() {
+        // Drive-qualified, backslash and `:` spellings must refuse at
+        // stage time and at verify time alike: on Windows
+        // `dir.join("C:/evil")` escapes the bundle root even though the
+        // Unix `starts_with('/')`/`..` check would pass them.
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 6));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        for rel in [
+            "C:/evil/x.bin",
+            "C:\\evil\\x.bin",
+            "blobs\\x.bin",
+            "\\\\server\\share\\x.bin",
+            "a:b",
+        ] {
+            assert!(w.stage_file(rel, b"x").is_err(), "staged {rel}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Verify-time: a crafted manifest listing a drive-qualified
+        // path refuses before any read, not after joining.
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 7));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = Manifest {
+            format_version: BUNDLE_FORMAT_VERSION,
+            env: "synthetic".to_string(),
+            created_at_unix: 1_700_000_000,
+            tool: "test".to_string(),
+            tables: vec![],
+            keyring: KeyringCoverage { versions: vec![] },
+            files: vec![BundleFile {
+                path: "C:/evil/x.bin".to_string(),
+                sha256_hex: sha256_hex(b"x"),
+                bytes: 1,
+            }],
+        };
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
