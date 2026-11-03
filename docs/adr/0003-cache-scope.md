@@ -1,6 +1,11 @@
 # ADR 0003: Cache Scope + R2 Layout
 
-- **Status:** Accepted design; implementation and independent review gates remain.
+- **Status:** Partially superseded by ADR 0013 (2026-11-03): the per-user
+  grant layer (`user_cache_grants`, own-provider byte proof, per-user
+  budgets/retention/priority) is retired with the BYOP model. Shared
+  content-addressed storage, the R2 bucket map and the publication/sweep
+  race rules below remain in force as restated in ADR 0013.
+- **Status (original):** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — explicit byte/retention budgets, live gauge,
   FK-safe reclamation and renewal-settlement-aware effective-plan lookup.
