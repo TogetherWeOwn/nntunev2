@@ -342,9 +342,18 @@ out-of-band **before** merge, by the migrator role, after board approval for
 the DDL. Applies go through `.github/scripts/apply_migration.py`, which
 verifies the file bytes against `migrations/manifest.toml` and writes a
 `public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
-the same transaction** as the migration; a file carrying its own
-`BEGIN`/`COMMIT` is applied by hand and then recorded with
-`--record-only`. Every invocation requires `--expect-database <name>`
+the same transaction** as the migration effects. A single exact outer
+`BEGIN; ... COMMIT;` envelope is validated lexically and removed only
+in memory: its boundary commands are never executed, and the receipt
+still hashes the complete original file. Strings, quoted identifiers,
+nested comments and dollar-quoted bodies are distinguished from SQL
+boundaries. Nested/multiple/early boundaries, other transaction forms
+(including savepoints, rollback and chaining), psql commands, malformed
+quotes/comments and unsupported lexical forms refuse before connecting.
+`--record-only` does not bypass this check and is **not** a workaround
+for unsupported files or a way to certify unexecuted DDL; it remains
+only for separately verified, authorized historical backfill.
+Every invocation requires `--expect-database <name>`
 (matching the `DATABASE_URL` database and checked again inside the
 transaction against `current_database()` — a URL pointed at the wrong
 database creates and records nothing), and the apply refuses while an
@@ -359,6 +368,35 @@ on a missing, unlisted, sha-mismatched or double-applied migration. That
 comparison, not PR text, is the source of truth for what staging has:
 merging a migration that staging lacks turns `staging-api` red until it
 is applied and recorded.
+
+Every actual runner database child session overrides caller `PGOPTIONS`
+with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
+90-second statement/idle-in-transaction and 10-second lock timeouts.
+Both sessions use `--no-psqlrc`, verified TLS off localhost and the
+expected-database guard inside their transaction. The order is:
+
+1. **Transaction A:** guarded, advisory-locked tracking-table bootstrap
+   and table/column ACL enforcement; commits independently, including on an already-recorded
+   invocation. These ACL writes are intentional, not a read-only no-op.
+2. **Transaction B:** advisory lock, database/history/checksum guards,
+   migration effects and append-only receipt, committed atomically per file.
+
+Failure in B does not undo A, nor does a later file undo any successful
+prefix of earlier files. The advisory lock covers one file transaction,
+**not the whole migration window**. Operators must still arrange the
+separately authorized exclusive window and quiesce writers/importers;
+this runner does not provide that coordination. SQL effects that are not
+transactional in PostgreSQL (for example sequence advancement or external
+function side effects) are not made transactional by the runner. No
+history deletion, automatic destructive rollback or all-files atomicity
+is provided. If a timeout or disconnect leaves commit outcome unknown,
+reconcile the exact original-file checksum receipt and expected catalog/
+effects using the authorized evidence path before a retry; do not infer
+rollback from a missing client acknowledgement or use record-only to
+repair it. `--dry-run` proves composition only, never successful apply.
+A code merge alone authorizes no live operation. A successor runner needs
+fresh exact-source and deployment-evidence review; older runner evidence
+is not transferable.
 
 Rows keep the name a migration was **applied under**. When a PR branch
 renumbers a file that staging already has, the rename must be

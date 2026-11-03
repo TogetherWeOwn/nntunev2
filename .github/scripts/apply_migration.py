@@ -24,11 +24,14 @@ and ``--record-only`` alike — a migrator URL pointed at the wrong
 database must never create the tracking table, run migration DDL, or
 record false history there.
 
-Files carrying their own top-level transaction control (or psql
-meta-commands, which can escape the transaction) cannot join the
-tracking transaction; apply those by hand, then re-run with
-``--record-only``. ``--dry-run`` prints the composed SQL without
-touching a database.
+A single exact outer ``BEGIN; ... COMMIT;`` envelope is lexically
+validated and removed in memory, never executed. Effects and the
+original-file checksum receipt then join the runner's transaction.
+Other transaction control and psql meta-commands refuse, including in
+``--record-only`` mode; that flag is for independently verified historic
+backfill, not an unsupported-SQL workaround. Tracking bootstrap/ACL
+transaction A commits independently before effects/receipt transaction B.
+``--dry-run`` prints composition only, not successful apply evidence.
 """
 import argparse
 import hashlib
@@ -122,57 +125,145 @@ MISSING_PRIOR = "schema-migrations: earlier migration not recorded"
 
 FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
 DATABASE_RE = re.compile(r"^[A-Za-z0-9_]+$")
-TXN_CONTROL_RE = re.compile(
-    r"\b(BEGIN|COMMIT|ROLLBACK)(\s+(WORK|TRANSACTION))?\s*;|\bSTART\s+TRANSACTION\b",
-    re.I,
-)
-PSQL_META_RE = re.compile(r"^\s*\\[A-Za-z!]", re.M)
 DOLLAR_QUOTE_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9$]*")
+TRANSACTION_WORDS = {
+    "BEGIN", "START", "COMMIT", "END", "ABORT", "ROLLBACK", "SAVEPOINT", "RELEASE",
+}
+# Replace, never append to, caller PGOPTIONS. psql() also pins these for
+# callers that supply a child environment directly (both transactions).
+SESSION_OPTIONS = (
+    "-c search_path=public,pg_catalog -c standard_conforming_strings=on "
+    "-c statement_timeout=90000 -c lock_timeout=10000 "
+    "-c idle_in_transaction_session_timeout=90000"
+)
 
 
 class ApplyError(Exception):
     pass
 
 
-def strip_hidden_sql(text):
-    """Blank dollar-quoted bodies, strings and comments.
+def sql_statements(text):
+    """Lex a bounded SQL subset into statements of (token, start, end).
 
-    What remains is top-level SQL, so transaction control can be told
-    apart from PL/pgSQL blocks (``BEGIN`` inside ``$$ ... $$``) and from
-    words mentioned in comments or literals.
+    Literals/quoted identifiers are opaque tokens; comments are trivia.
+    Spans let us remove only validated boundary statements, not rewrite
+    the migration. Nested block comments, doubled quotes, E strings and
+    tagged dollar quotes follow PostgreSQL rules. Unicode escape forms,
+    unquoted non-ASCII SQL, implicit string continuation and SQL-standard
+    unquoted routine bodies are deliberately unsupported.
+    No tokenization error may turn the rest of a file into hidden text.
     """
-    out, i, n = [], 0, len(text)
+    if any(ord(ch) < 32 and ch not in "\t\n\r\f" for ch in text):
+        raise ApplyError("unsupported control character in migration")
+    statements, tokens, i, n = [], [], 0, len(text)
     while i < n:
+        start = i
+        if ord(text[i]) > 127:
+            raise ApplyError("non-ASCII SQL must be quoted")
+        if text[i] in " \t\n\r\f":
+            i += 1
+            continue
         if text.startswith("--", i):
-            end = text.find("\n", i)
-            i = n if end == -1 else end
-        elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-        elif text[i] == "'":
+            end = re.search(r"[\r\n]", text[i:])
+            i = n if end is None else i + end.start()
+            continue
+        if text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise ApplyError("unterminated block comment in migration")
+            continue
+        if text[i] == "\\":
+            raise ApplyError("psql meta-commands are not supported")
+        if text[i:i + 2].upper() == "U&":
+            raise ApplyError("Unicode escape syntax is not supported")
+        escaped = text[i:i + 2].upper() == "E'"
+        if text[i] in "'\"" or escaped:
+            if escaped:
+                i += 1
+            quote = text[i]
             i += 1
             while i < n:
-                if text[i] == "'":
-                    if text.startswith("''", i):
-                        i += 2
-                        continue
+                if escaped and text[i] == "\\":
+                    i += 2
+                elif text[i] == quote:
                     i += 1
-                    break
-                i += 1
-            out.append("''")
+                    if i < n and text[i] == quote:
+                        i += 1
+                    else:
+                        break
+                else:
+                    i += 1
+            else:
+                raise ApplyError("unterminated quoted token in migration")
+            token = "<identifier>" if quote == '"' else "<string>"
+            # Newline-separated string constants inherit E-string escape
+            # rules across the boundary in PostgreSQL. Refuse this rare
+            # form rather than lex its continuation with different rules.
+            if token == "<string>" and tokens and tokens[-1][0] == "<string>":
+                raise ApplyError("implicit string continuation is not supported")
         elif match := DOLLAR_QUOTE_RE.match(text, i):
             end = text.find(match.group(0), match.end())
-            i = n if end == -1 else end + len(match.group(0))
-            out.append("$$ $$")
+            if end == -1:
+                raise ApplyError("unterminated dollar quote in migration")
+            i = end + len(match.group(0))
+            token = "<quoted>"
+        elif match := WORD_RE.match(text, i):
+            i = match.end()
+            token = match.group(0).upper()
         else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
+            token, i = text[i], i + 1
+        if token == ";":
+            if tokens:
+                statements.append((tokens, i))
+                tokens = []
+        else:
+            tokens.append((token, start, i))
+    if tokens:
+        raise ApplyError("migration statements must end with a semicolon")
+    return statements
 
 
-def has_toplevel_txn_control(body):
-    stripped = strip_hidden_sql(body)
-    return bool(TXN_CONTROL_RE.search(stripped) or PSQL_META_RE.search(stripped))
+def transaction_body(body):
+    """Accept plain SQL or one exact outer BEGIN; ... COMMIT; envelope.
+
+    This is a lexical boundary validator, not a general SQL parser. SQL
+    validity and transactional restrictions still belong to PostgreSQL.
+    Never execute a file-level COMMIT or use record-only to skip refusal.
+    """
+    statements = sql_statements(body)
+    if not statements:
+        raise ApplyError("migration has no SQL statements")
+    words = [[token for token, _, _ in tokens] for tokens, _ in statements]
+    wrapped = words[0] == ["BEGIN"] and words[-1] == ["COMMIT"]
+    inner = words[1:-1] if wrapped else words
+    if not inner:
+        raise ApplyError("transaction envelope must contain SQL")
+    for statement in inner:
+        # Fail closed on all transaction variants, including END/ABORT,
+        # two-phase commit and SQL-standard BEGIN ATOMIC routine bodies.
+        if (statement[0] in TRANSACTION_WORDS
+                or statement[:2] == ["PREPARE", "TRANSACTION"]
+                or "BEGIN" in statement
+                or statement[0] in {"RESET", "DISCARD", "COPY"}):
+            raise ApplyError("unsupported transaction control or SQL form")
+        if statement[0] == "SET" and statement != [
+                "SET", "SEARCH_PATH", "=", "PUBLIC", ",", "PG_CATALOG"]:
+            raise ApplyError("only the pinned search_path SET is supported")
+    if wrapped:
+        # Remove boundary tokens + their semicolons, preserving every
+        # effect statement and all surrounding comments/literal bytes.
+        opening, closing = statements[0], statements[-1]
+        return (body[:opening[0][0][1]] + body[opening[1]:closing[0][0][1]]
+                + body[closing[1]:])
+    return body
 
 
 def load_manifest(manifest_path):
@@ -261,7 +352,12 @@ $dbguard$;"""
 
 
 def ddl_sql(expected_database):
-    return database_guard_sql(expected_database) + "\n" + DDL + "\n"
+    # Bootstrap/ACL writes need serialization too: concurrent CREATE or
+    # REVOKE can race on catalog tuples even when B is correctly locked.
+    # A still commits independently and releases its lock before B.
+    return (database_guard_sql(expected_database)
+            + f"\nSELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
+            + DDL + "\n")
 
 
 def guard_sql(identity, expected_database, priors=()):
@@ -316,12 +412,10 @@ def compose(file_path, manifest_path, applied_by, record_only=False,
     sha256 = hashlib.sha256(contents).hexdigest()
     target, identity, priors = resolve_entry(
         load_manifest(manifest_path), filename, sha256)
-    body = contents.decode("utf-8")
-    if not record_only and has_toplevel_txn_control(body):
-        raise ApplyError(
-            f"{filename} carries top-level transaction control or psql "
-            "meta-commands; apply it by hand, then re-run with --record-only"
-        )
+    try:
+        body = transaction_body(contents.decode("utf-8"))
+    except UnicodeError as exc:
+        raise ApplyError("migration must be valid UTF-8") from exc
     parts = [guard_sql(identity, expect_database, priors)]
     if not record_only:
         parts.append(body.rstrip() + "\n")
@@ -356,6 +450,7 @@ def connection_env(database_url):
         "PGDATABASE": database,
         "PGUSER": urllib.parse.unquote(url.username),
         "PGCONNECT_TIMEOUT": "10",
+        "PGOPTIONS": SESSION_OPTIONS,
     })
     if url.password:
         child["PGPASSWORD"] = urllib.parse.unquote(url.password)
@@ -370,8 +465,16 @@ def psql(child, sql, single_transaction=False):
             "--no-align", "--set", "ON_ERROR_STOP=1"]
     if single_transaction:
         args.append("--single-transaction")
-    result = subprocess.run(args, input=sql, text=True, capture_output=True,
-                            timeout=120, env=child)
+    try:
+        result = subprocess.run(
+            args, input=sql, text=True, capture_output=True, timeout=120,
+            env={**child, "PGOPTIONS": SESSION_OPTIONS})
+    except subprocess.TimeoutExpired:
+        raise ApplyError(
+            "psql timed out; commit outcome may be unknown; reconcile the "
+            "original checksum receipt and effects before retrying") from None
+    except OSError:
+        raise ApplyError("cannot start psql; connection details redacted") from None
     if result.returncode != 0:
         if ALREADY_SAME in result.stderr:
             raise _AlreadyRecorded(same=True)

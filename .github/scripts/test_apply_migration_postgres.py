@@ -252,6 +252,9 @@ def main():
                 run_psql(test_env, "DROP OWNED BY apply_column_sneak;\n"
                                    "DROP ROLE apply_column_sneak;")
             print("apply-migration-postgres: passed column-write-privileges-pinned")
+
+        import apply_migration_runtime_cases
+        apply_migration_runtime_cases.run(env, test_env)
     finally:
         run_psql(env, f"DROP DATABASE {TEST_DB};")
 

@@ -79,13 +79,101 @@ class ComposeTests(unittest.TestCase):
         # The guard checks the whole identity, new name included.
         self.assertIn("'0002_alpha.sql'", sql)
 
-    def test_own_transaction_control_requires_record_only(self):
-        self.fixture(body="BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\n")
-        with self.assertRaises(apply_migration.ApplyError):
-            self.compose()
+    def test_safe_outer_envelope_preserves_original_receipt(self):
+        body = "/* outer */ BEGIN;\nCREATE TABLE t (id int);\nCOMMIT; -- end\n"
+        self.fixture(body=body)
+        sql, _, sha, _ = self.compose()
+        self.assertEqual(sha, hashlib.sha256(body.encode()).hexdigest())
+        self.assertIn("CREATE TABLE t (id int);", sql)
+        self.assertNotIn("/* outer */ BEGIN;", sql)
+        self.assertNotIn("COMMIT; -- end", sql)
+        self.assertIn(f"'{sha}'", sql)
         sql, *_ = self.compose(record_only=True)
         self.assertNotIn("CREATE TABLE t", sql)
-        self.assertIn("INSERT INTO public.schema_migrations", sql)
+
+    def test_unsafe_or_unsupported_envelopes_refuse_even_record_only(self):
+        bodies = (
+            "COMMIT; SELECT 1;", "BEGIN; SELECT 1;", "SELECT 1; COMMIT;",
+            "BEGIN; BEGIN; SELECT 1; COMMIT; COMMIT;",
+            "BEGIN; SELECT 1; COMMIT; SELECT 2;",
+            "BEGIN; SELECT 1; COMMIT; BEGIN; SELECT 2; COMMIT;",
+            "START TRANSACTION; SELECT 1; COMMIT;",
+            "BEGIN WORK; SELECT 1; COMMIT;",
+            "BEGIN; SELECT 1; END;", "BEGIN; SELECT 1; ABORT;",
+            "BEGIN; SELECT 1; COMMIT AND CHAIN;",
+            "BEGIN; SAVEPOINT s; SELECT 1; COMMIT;",
+            "BEGIN; RELEASE SAVEPOINT s; COMMIT;",
+            "BEGIN; ROLLBACK TO SAVEPOINT s; COMMIT;",
+            "PREPARE TRANSACTION 'x';", "COMMIT PREPARED 'x';",
+            "SET TRANSACTION READ ONLY;", "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;",
+            "SELECT 1 \\gexec", "SELECT 1; \\q", "\\i other.sql",
+            "SELECT 'unterminated", 'SELECT "unterminated',
+            "DO $body$ BEGIN NULL; END;", "SELECT 1; /* unterminated",
+            "SELECT 1; /* nested /* comment */", "SELECT 1",
+            "SET standard_conforming_strings = off; SELECT 1;",
+            "RESET ALL;", "DISCARD ALL;", "COPY t FROM STDIN;\n1\n\\.\n",
+            "SELECT U&'unsupported';", "SELECT 1;\x00COMMIT;",
+            "BEGIN; SELECT 1; -- comment\rCOMMIT; SELECT 2;",
+            "SELECT E'one'\n'continued';",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END;",
+            "SELECT unquoted_é;", "SELECT \U0001f642E'unsupported';",
+            "BEGIN ; SELECT 1; COMMIT;",
+        )
+        for body in bodies:
+            for record_only in (False, True):
+                with self.subTest(body=body, record_only=record_only):
+                    self.fixture(body=body)
+                    with self.assertRaises(apply_migration.ApplyError):
+                        self.compose(record_only=record_only)
+
+    def test_lexical_contexts_do_not_create_boundaries(self):
+        bodies = (
+            'BEGIN; CREATE TABLE "COMMIT;" ("BEGIN" text); COMMIT;',
+            "BEGIN; SELECT 'COMMIT; BEGIN; \\q', 'it''s ROLLBACK;'; COMMIT;",
+            "BEGIN; SELECT E'it\\'s COMMIT; \\\\q'; COMMIT;",
+            "/* nested /* COMMIT; */ BEGIN; */ BEGIN; SELECT 1; COMMIT;",
+            "BEGIN; DO $tag$ BEGIN PERFORM 'COMMIT;'; END $tag$; COMMIT;",
+            "-- COMMIT;\nBEGIN /* opening */; SELECT 1; COMMIT /* closing */; -- BEGIN;",
+            'SELECT "BEGIN", "COMMIT", "ROLLBACK" FROM "START TRANSACTION";',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                self.fixture(body=body)
+                self.compose()
+
+    def test_frozen_mirror_files_compose_without_changing_bytes(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        entries = apply_migration.load_manifest(root / "migrations/manifest.toml")
+        for entry in entries:
+            if entry["target"] != "mirror":
+                continue
+            path = root / "migrations" / entry["file"]
+            before = path.read_bytes()
+            with self.subTest(file=entry["file"]):
+                _, _, sha, target = apply_migration.compose(
+                    path, root / "migrations/manifest.toml", "test",
+                    expect_database="nntune_apply_test")
+                self.assertEqual((sha, target), (entry["sha256"], "mirror"))
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_controlled_child_options_replace_hostile_caller_options(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PGOPTIONS": "-c search_path=hostile -c standard_conforming_strings=off"}):
+            child = apply_migration.connection_env("postgresql://u:p@localhost/app")
+        self.assertIn("search_path=public,pg_catalog", child["PGOPTIONS"])
+        self.assertNotIn("hostile", child["PGOPTIONS"])
+        self.assertIn("standard_conforming_strings=on", child["PGOPTIONS"])
+        self.assertIn("statement_timeout=", child["PGOPTIONS"])
+        self.assertIn("lock_timeout=", child["PGOPTIONS"])
+
+    def test_timeout_error_is_redacted_and_requires_reconciliation(self):
+        from unittest.mock import patch
+        import subprocess
+        with patch.object(apply_migration.subprocess, "run", side_effect=
+                          subprocess.TimeoutExpired("secret-url", 120, stderr="secret-password")):
+            with self.assertRaisesRegex(apply_migration.ApplyError, "reconcile") as caught:
+                apply_migration.psql({}, "SELECT 1;", single_transaction=True)
+        self.assertNotIn("secret", str(caught.exception))
 
     def test_mid_line_transaction_control_is_detected(self):
         self.fixture(body="CREATE TABLE t (id int); COMMIT;\n")
@@ -168,6 +256,10 @@ class ComposeTests(unittest.TestCase):
         # The database check precedes CREATE TABLE so a wrong-database
         # run leaves no tracking table behind.
         self.assertLess(ddl.index(apply_migration.WRONG_DATABASE),
+                        ddl.index("CREATE TABLE"))
+        # A uses the same per-transaction lock before bootstrap/ACL writes
+        # to avoid concurrent CREATE/REVOKE catalog-update races.
+        self.assertLess(ddl.index("pg_advisory_xact_lock"),
                         ddl.index("CREATE TABLE"))
 
     def test_main_refuses_url_database_mismatch_before_connecting(self):
