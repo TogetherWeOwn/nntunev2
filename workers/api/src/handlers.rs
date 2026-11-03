@@ -906,6 +906,53 @@ pub trait Store {
         async { Ok(false) }
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
+    /// The stored `users.role` for the admin guard, read fresh per
+    /// request (migration 0026). Fail-closed default is absent — and
+    /// absent is never admin — so an unprovisioned store grants nothing;
+    /// production and the test fake override it.
+    fn user_role(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Set a user's role and write the extended `user.role_changed`
+    /// audit row (actor, subject, old-to-new) in one transaction:
+    /// the role must never change without its audit row. Returns the
+    /// previous role, or `None` when the subject does not exist.
+    /// Fail-closed default; production and the test fake override it.
+    fn admin_set_user_role(
+        &self,
+        _actor_user_id: &str,
+        _subject_user_id: &str,
+        _new_role: &str,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every `app_settings` row as `(key, value)` pairs (migration
+    /// 0026). Fail-closed default is empty — the typed accessors then
+    /// resolve their built-in defaults; production and the test fake
+    /// override it.
+    fn app_settings(&self) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Upsert one `app_settings` row and write the extended
+    /// `settings.changed` audit row (actor, old-to-new) in one
+    /// transaction. Returns the previous stored value, or `None` when no
+    /// row existed. Fail-closed default; production and the test fake
+    /// override it.
+    fn admin_set_app_setting(
+        &self,
+        _actor_user_id: &str,
+        _key: &str,
+        _new_value: &str,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
     /// never report a mint it did not durably record; production and the
@@ -1570,6 +1617,53 @@ where
         let claims = session::verify_stored_session(&keys, token, self.now, &record)
             .map_err(session_error_response)?;
         Ok((claims, token.to_string()))
+    }
+
+    /// The admin guard (migration 0026): a cookie session whose
+    /// `users.role` — read fresh from the store on every call, never a
+    /// session claim — is exactly `admin`. Mutations additionally
+    /// require the fresh-session step-up, like credential minting.
+    ///
+    /// A presented `Authorization` header is refused outright with 403
+    /// before any session work: admin routes are `SessionOnly` in the
+    /// scope map, and native/API-key credentials can never call them —
+    /// not even alongside a valid admin cookie. An authenticated
+    /// non-admin gets the same 403; an unauthenticated caller keeps the
+    /// generic 401 every other session route gives.
+    ///
+    /// Role is checked before freshness: a non-admin must hear 403,
+    /// never a step-up prompt that reauthenticating could not satisfy.
+    /// Only a caller already known to be an admin can be asked to
+    /// reauthenticate for a mutation.
+    async fn authenticate_admin(
+        &self,
+        req: &Request,
+        mutation: bool,
+    ) -> Result<SessionClaims, Response> {
+        if req.authorization.is_some() {
+            return Err(admin_forbidden());
+        }
+        let (claims, token) = self.authenticate(req, mutation).await?;
+        let role = self
+            .store
+            .user_role(&claims.user_id)
+            .await
+            .map_err(|_| internal())?;
+        if !crate::admin::is_admin_role(role.as_deref()) {
+            return Err(admin_forbidden());
+        }
+        if mutation {
+            let record = self
+                .store
+                .session_by_id(&claims.session_id)
+                .await
+                .map_err(|_| internal())?
+                .ok_or_else(generic_auth)?;
+            let keys = self.cfg.session_keys();
+            session::require_fresh_session(&keys, &token, self.now, &record)
+                .map_err(session_error_response)?;
+        }
+        Ok(claims)
     }
 
     /// Per-IP admission shared by register, login and magic start routes.
@@ -3363,6 +3457,20 @@ fn scope_forbidden() -> Response {
     }
 }
 
+fn admin_forbidden() -> Response {
+    // Names the outcome only: this surface needs an admin session. The
+    // same body answers a non-admin session and a presented bearer
+    // credential, so neither learns anything about the other's path.
+    let error = crate::api_error::ApiError::by_code("forbidden", "admin session required");
+    Response {
+        status: error.status,
+        body: error.body_json(),
+        set_cookie: None,
+        retry_after: None,
+        extra_headers: Vec::new(),
+    }
+}
+
 fn not_found() -> Response {
     let error = crate::api_error::ApiError::not_found("not found");
     Response {
@@ -3930,6 +4038,180 @@ where
     }
 }
 
+// --- Admin surface (migration 0026) ---------------------------------------------------------
+//
+// Session-only and role-gated by `authenticate_admin`: the scope map
+// marks every path below `SessionOnly`, so bearer credentials never
+// reach these handlers through the gate, and the guard refuses a
+// presented `Authorization` header outright. Role and settings writes
+// land together with their extended audit rows in one store transaction.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminRoleBody {
+    role: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminSettingBody {
+    value: u32,
+}
+
+/// `GET /v1/admin/settings` — every typed setting at its effective
+/// value (stored row, or the built-in default when no row exists). A
+/// stored row that no longer parses fails closed with the generic 500
+/// instead of silently reporting the default.
+async fn admin_settings_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Err(resp) = ctx.authenticate_admin(req, false).await {
+        return resp;
+    }
+    let rows = match ctx.store.app_settings().await {
+        Ok(rows) => rows,
+        Err(_) => return internal(),
+    };
+    let mut settings = serde_json::Map::new();
+    for key in crate::admin::ALL_SETTING_KEYS {
+        let stored = rows
+            .iter()
+            .find(|(name, _)| name == key.as_str())
+            .map(|(_, value)| value.as_str());
+        match key.resolve(stored) {
+            Some(value) => {
+                settings.insert(key.as_str().to_string(), serde_json::json!(value));
+            }
+            None => return internal(),
+        }
+    }
+    json_response(200, serde_json::json!({"settings": settings}))
+}
+
+/// `PUT /v1/admin/settings/{key}` — write one typed setting. The key
+/// must be one of the closed `SettingKey` set and the value must
+/// satisfy its bounds; anything else writes nothing.
+async fn admin_setting_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(raw_key) = req.path.strip_prefix("/v1/admin/settings/") else {
+        return not_found();
+    };
+    if raw_key.is_empty() || raw_key.contains('/') {
+        return not_found();
+    }
+    let Some(key) = crate::admin::SettingKey::parse(raw_key) else {
+        return not_found();
+    };
+    let Some(body) = parse_body::<AdminSettingBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(value) = key.validate(body.value) else {
+        return validation_failed("setting value out of range");
+    };
+    let rendered = crate::admin::SettingKey::render(value);
+    let previous = match ctx
+        .store
+        .admin_set_app_setting(
+            &claims.user_id,
+            key.as_str(),
+            &rendered,
+            &ctx.source_ip,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(previous) => previous,
+        Err(_) => return internal(),
+    };
+    // The previous value is reported at its effective resolution: no
+    // prior row means the default was in force, and a prior row that
+    // no longer parses reports as null rather than echoing corrupt
+    // stored text back.
+    let previous_value = match previous.as_deref() {
+        Some(raw) => key.parse_stored(raw).map(|v| serde_json::json!(v)),
+        None => Some(serde_json::json!(key.default_value())),
+    };
+    json_response(
+        200,
+        serde_json::json!({
+            "key": key.as_str(),
+            "value": value,
+            "previous_value": previous_value,
+        }),
+    )
+}
+
+/// `PUT /v1/admin/users/{id}/role` — promote or demote one user. An
+/// admin can never change their own role through the API: the first
+/// admin comes from the reviewed operator step (docs/ops.md), and
+/// self-demotion is the one-click path to locking every admin out.
+async fn admin_user_role_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(rest) = req.path.strip_prefix("/v1/admin/users/") else {
+        return not_found();
+    };
+    let Some((subject_id, "role")) = rest.split_once('/') else {
+        return not_found();
+    };
+    if subject_id.is_empty() || subject_id.contains('/') {
+        return not_found();
+    }
+    let Some(body) = parse_body::<AdminRoleBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(new_role) = crate::admin::parse_role(&body.role) else {
+        return validation_failed("unknown role");
+    };
+    if subject_id == claims.user_id {
+        return validation_failed("admins cannot change their own role");
+    }
+    let previous = match ctx
+        .store
+        .admin_set_user_role(
+            &claims.user_id,
+            subject_id,
+            new_role,
+            &ctx.source_ip,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(Some(previous)) => previous,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    json_response(
+        200,
+        serde_json::json!({
+            "user_id": subject_id,
+            "role": new_role,
+            "previous_role": previous,
+        }),
+    )
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
@@ -3963,6 +4245,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
             | "/v1/credentials"
+            | "/v1/admin/settings"
     )
 }
 
@@ -4084,6 +4367,17 @@ where
         // cannot name them).
         ("DELETE", path) if path.starts_with("/v1/credentials/") => {
             credentials_revoke(ctx, req).await
+        }
+        ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
+        // Single-segment setting keys and `{id}/role` only; deeper or
+        // malformed shapes 404 inside the handlers. The scope map marks
+        // both `SessionOnly`, so `options_preflight_served` covers their
+        // preflights without an `is_known_path` entry.
+        ("PUT", path) if path.starts_with("/v1/admin/settings/") => {
+            admin_setting_put(ctx, req).await
+        }
+        ("PUT", path) if path.starts_with("/v1/admin/users/") => {
+            admin_user_role_put(ctx, req).await
         }
         // Preflight answers exactly the served paths (exact dispatch
         // paths, the single-segment revoke id, and the scope-map-served
@@ -4219,6 +4513,12 @@ mod tests {
         /// outage without writing anything.
         fail_vault_saves: RefCell<bool>,
         audits: RefCell<Vec<AuditEvent>>,
+        /// Mirror of `users.role` (migration 0026): an absent entry is
+        /// the column default (`member`) for an existing user.
+        user_roles: RefCell<HashMap<String, String>>,
+        /// Mirror of `app_settings` (migration 0026), keyed by setting
+        /// key with the raw stored text.
+        app_settings_rows: RefCell<HashMap<String, String>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
         delete_user_before_next_challenge: RefCell<Option<String>>,
@@ -5007,6 +5307,80 @@ mod tests {
         async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
             self.audits.borrow_mut().push(event.clone());
             Ok(())
+        }
+        async fn user_role(&self, user_id: &str) -> Result<Option<String>, StoreError> {
+            if !self.users.borrow().contains_key(user_id) {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.user_roles
+                    .borrow()
+                    .get(user_id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::admin::ROLE_MEMBER.to_string()),
+            ))
+        }
+        async fn admin_set_user_role(
+            &self,
+            actor_user_id: &str,
+            subject_user_id: &str,
+            new_role: &str,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<Option<String>, StoreError> {
+            if !self.users.borrow().contains_key(subject_user_id) {
+                return Ok(None);
+            }
+            let previous = self
+                .user_roles
+                .borrow()
+                .get(subject_user_id)
+                .cloned()
+                .unwrap_or_else(|| crate::admin::ROLE_MEMBER.to_string());
+            self.user_roles
+                .borrow_mut()
+                .insert(subject_user_id.to_string(), new_role.to_string());
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                crate::admin::ROLE_CHANGED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                Some(subject_user_id),
+                serde_json::json!({"old": previous, "new": new_role}),
+            ));
+            Ok(Some(previous))
+        }
+        async fn app_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
+            Ok(self
+                .app_settings_rows
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        async fn admin_set_app_setting(
+            &self,
+            actor_user_id: &str,
+            key: &str,
+            new_value: &str,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<Option<String>, StoreError> {
+            let previous = self
+                .app_settings_rows
+                .borrow_mut()
+                .insert(key.to_string(), new_value.to_string());
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                crate::admin::SETTINGS_CHANGED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({"key": key, "old": previous, "new": new_value}),
+            ));
+            Ok(previous)
         }
     }
 
@@ -7653,6 +8027,285 @@ mod tests {
         // The victim row is untouched by the foreign probe.
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows[0].record.revoked_at, None);
+    }
+
+    fn seed_admin(h: &Harness, id: &str, email: &str) -> String {
+        seed_user(h, id, email);
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert(id.to_string(), crate::admin::ROLE_ADMIN.to_string());
+        magic_login(h, email)
+    }
+
+    #[test]
+    fn admin_settings_requires_admin_session_and_serves_defaults() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // No session: the generic 401 every session route gives.
+        let anon = h.call_full("GET", "/v1/admin/settings", None, None, None);
+        assert_eq!(anon.status, 401, "{}", anon.body);
+
+        // Authenticated but not admin: 403, and no settings leak.
+        let denied = h.call_full("GET", "/v1/admin/settings", None, Some(member_cookie), None);
+        assert_eq!(denied.status, 403, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"forbidden","message":"admin session required","retryable":false}"#
+        );
+
+        // Admin: every typed key at its built-in default while no rows
+        // exist (the pre-seed posture).
+        let ok = h.call_full("GET", "/v1/admin/settings", None, Some(admin_cookie), None);
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        let body: serde_json::Value = serde_json::from_str(&ok.body).unwrap();
+        assert_eq!(body["settings"]["invite_default_expiry_days"], 7);
+        assert_eq!(body["settings"]["invite_member_min_paid_months"], 3);
+        assert_eq!(body["settings"]["invite_member_per_window"], 2);
+    }
+
+    #[test]
+    fn stale_sessions_hear_403_for_members_and_step_up_only_for_admins() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_put = |cookie: &str| {
+            let req = Request {
+                method: "PUT".to_string(),
+                path: "/v1/admin/settings/invite_default_expiry_days".to_string(),
+                cookie: Some(cookie.to_string()),
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                body: serde_json::json!({"value": 14}).to_string().into_bytes(),
+            };
+            block_on(handle(&stale_ctx, &req))
+        };
+
+        // A stale MEMBER session gets 403, not the step-up prompt:
+        // reauthenticating could never authorize them.
+        let member = stale_put(&member_cookie);
+        assert_eq!(member.status, 403, "{}", member.body);
+
+        // A stale ADMIN session gets the step-up for a mutation...
+        let admin = stale_put(&admin_cookie);
+        assert_eq!(admin.status, 401, "{}", admin.body);
+        assert_eq!(
+            admin.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        // ...and neither stale write stored anything.
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+
+        // Reads never step up: the stale admin session still lists.
+        let get_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/admin/settings".to_string(),
+            cookie: Some(admin_cookie),
+            origin: None,
+            authorization: None,
+            body: Vec::new(),
+        };
+        let list = block_on(handle(&stale_ctx, &get_req));
+        assert_eq!(list.status, 200, "{}", list.body);
+    }
+
+    #[test]
+    fn admin_routes_refuse_presented_bearer_credentials_with_403() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // Bearer only, no cookie: 403 (never the bearer gate's 404).
+        let bearer_only = h.call_bearer(
+            "GET",
+            "/v1/admin/settings",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_only.status, 403, "{}", bearer_only.body);
+
+        // A valid admin cookie does not rescue a presented bearer header.
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/admin/settings".to_string(),
+            cookie: Some(admin_cookie),
+            origin: None,
+            authorization: Some("Bearer ntk_synthetic".to_string()),
+            body: Vec::new(),
+        };
+        let both = block_on(handle(&h.ctx(), &req));
+        assert_eq!(both.status, 403, "{}", both.body);
+    }
+
+    #[test]
+    fn admin_setting_write_is_typed_bounded_and_audited() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let path = "/v1/admin/settings/invite_default_expiry_days";
+
+        // A member write is refused before anything is stored or audited.
+        let denied = h.call_full(
+            "PUT",
+            path,
+            Some(serde_json::json!({"value": 14}).to_string()),
+            Some(member_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(denied.status, 403, "{}", denied.body);
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin::SETTINGS_CHANGED_AUDIT_ACTION));
+
+        // First admin write: the default was in force.
+        let put = |cookie: &str, p: &str, v: serde_json::Value| {
+            h.call_full(
+                "PUT",
+                p,
+                Some(v.to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+        let first = put(&admin_cookie, path, serde_json::json!({"value": 14}));
+        assert_eq!(first.status, 200, "{}", first.body);
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["value"], 14);
+        assert_eq!(body["previous_value"], 7);
+
+        // The audit row names the actor and the old-to-new values, with
+        // no subject (a settings write acts on no user).
+        let audits = h.store.audits.borrow();
+        let row = audits
+            .iter()
+            .find(|a| a.action == crate::admin::SETTINGS_CHANGED_AUDIT_ACTION)
+            .expect("settings.changed audit row");
+        assert_eq!(row.user_id, "admin1");
+        assert_eq!(row.subject_user_id, None);
+        let details: serde_json::Value =
+            serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["key"], "invite_default_expiry_days");
+        assert_eq!(details["old"], serde_json::Value::Null);
+        assert_eq!(details["new"], "14");
+        drop(audits);
+
+        // A second write reports the stored previous value.
+        let second = put(&admin_cookie, path, serde_json::json!({"value": 30}));
+        assert_eq!(second.status, 200, "{}", second.body);
+        let body: serde_json::Value = serde_json::from_str(&second.body).unwrap();
+        assert_eq!(body["previous_value"], 14);
+
+        // Out-of-bounds and unknown keys write nothing.
+        let audit_count = h.store.audits.borrow().len();
+        let too_big = put(&admin_cookie, path, serde_json::json!({"value": 31}));
+        assert_eq!(too_big.status, 422, "{}", too_big.body);
+        let unknown = put(
+            &admin_cookie,
+            "/v1/admin/settings/not_a_setting",
+            serde_json::json!({"value": 1}),
+        );
+        assert_eq!(unknown.status, 404, "{}", unknown.body);
+        assert_eq!(
+            h.store
+                .app_settings_rows
+                .borrow()
+                .get("invite_default_expiry_days")
+                .map(String::as_str),
+            Some("30")
+        );
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+    }
+
+    #[test]
+    fn admin_role_change_is_audited_and_never_self_served() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let put_role = |cookie: &str, subject: &str, role: &str| {
+            h.call_full(
+                "PUT",
+                &format!("/v1/admin/users/{subject}/role"),
+                Some(serde_json::json!({"role": role}).to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+
+        // Self-promotion by a member never reaches the store.
+        let self_serve = put_role(&member_cookie, "member1", "admin");
+        assert_eq!(self_serve.status, 403, "{}", self_serve.body);
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+
+        // An admin promotes the member; the audit row carries actor,
+        // subject and the old-to-new roles.
+        let promoted = put_role(&admin_cookie, "member1", "admin");
+        assert_eq!(promoted.status, 200, "{}", promoted.body);
+        let body: serde_json::Value = serde_json::from_str(&promoted.body).unwrap();
+        assert_eq!(body["previous_role"], "member");
+        assert_eq!(body["role"], "admin");
+        let audits = h.store.audits.borrow();
+        let row = audits
+            .iter()
+            .find(|a| a.action == crate::admin::ROLE_CHANGED_AUDIT_ACTION)
+            .expect("user.role_changed audit row");
+        assert_eq!(row.user_id, "admin1");
+        assert_eq!(row.subject_user_id.as_deref(), Some("member1"));
+        let details: serde_json::Value =
+            serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["old"], "member");
+        assert_eq!(details["new"], "admin");
+        drop(audits);
+
+        // The role is read fresh per request: the member's existing
+        // cookie is an admin session from the next call on.
+        let now_admin = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(now_admin.status, 200, "{}", now_admin.body);
+
+        // Self-demotion is refused, unknown roles 422, unknown subjects 404.
+        let audit_count = h.store.audits.borrow().len();
+        let self_demote = put_role(&admin_cookie, "admin1", "member");
+        assert_eq!(self_demote.status, 422, "{}", self_demote.body);
+        let bogus = put_role(&admin_cookie, "member1", "owner");
+        assert_eq!(bogus.status, 422, "{}", bogus.body);
+        let ghost = put_role(&admin_cookie, "no-such-user", "member");
+        assert_eq!(ghost.status, 404, "{}", ghost.body);
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+        assert_eq!(
+            block_on(h.store.user_role("admin1")).unwrap().as_deref(),
+            Some("admin")
+        );
+
+        // Demotion by another admin takes effect on the very next call.
+        let demoted = put_role(&admin_cookie, "member1", "member");
+        assert_eq!(demoted.status, 200, "{}", demoted.body);
+        let no_longer = h.call_full("GET", "/v1/admin/settings", None, Some(member_cookie), None);
+        assert_eq!(no_longer.status, 403, "{}", no_longer.body);
     }
 
     #[test]

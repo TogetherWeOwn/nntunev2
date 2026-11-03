@@ -34,6 +34,9 @@ EXPECTED = {
         "postgres_reap_preserves_explicit_protected_user_and_dependents",
         "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
         "postgres_reap_holds_selected_parent_lock_through_delete",
+        "postgres_admin_role_change_audits_each_replaced_value",
+        "postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value",
+        "postgres_admin_setting_writes_serialize_per_key",
     )
 }
 EXPECTED_CONFIG = {

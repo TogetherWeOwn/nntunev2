@@ -490,6 +490,11 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/operations/", path) {
                 return SessionOnly;
             }
+            // Admin surface (migration 0026): session + fresh DB role,
+            // never bearer.
+            if path == "/v1/admin/settings" {
+                return SessionOnly;
+            }
             Deny
         }
         // HEAD revalidates exactly the GET-readable catalog roots: a
@@ -548,6 +553,18 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             if path == "/v1/me" || path == "/v1/vault" {
                 return SessionOnly;
+            }
+            // Admin writes (migration 0026): one setting key, or one
+            // user's role. Deeper shapes deny here, before any spend.
+            if one_segment_after("/v1/admin/settings/", path) {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/users/") {
+                if let Some((id, tail)) = rest.split_once('/') {
+                    if !id.is_empty() && tail == "role" {
+                        return SessionOnly;
+                    }
+                }
             }
             Deny
         }

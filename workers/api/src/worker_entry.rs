@@ -1010,6 +1010,141 @@ async fn prune_expired_challenges_on(
     Ok(())
 }
 
+/// Admin role write (migration 0026): lock the subject row, then the
+/// UPDATE and its extended audit row commit together or not at all.
+/// The lock is what makes the audited old value the value actually
+/// replaced: a concurrent writer either committed before the lock (and
+/// the locked read sees its value) or waits behind it. A missing
+/// subject writes and audits nothing.
+async fn admin_set_user_role_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    subject_user_id: &str,
+    new_role: &str,
+    source_ip: &str,
+    now: u64,
+) -> Result<Option<String>, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    let locked = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&subject_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(previous) = locked
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    transaction
+        .query_typed(
+            "UPDATE users SET role = $2 WHERE id = $1",
+            &[(&subject_user_id, Type::TEXT), (&new_role, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, $5, jsonb_build_object('old', $6, 'new', $7))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::admin::ROLE_CHANGED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&subject_user_id, Type::TEXT),
+                (&previous, Type::TEXT),
+                (&new_role, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(Some(previous))
+}
+
+/// Admin settings write (migration 0026): one transaction, like the
+/// role write. The per-key advisory lock serializes writers of the same
+/// key — including concurrent first writes of an absent key, where
+/// there is no row for `FOR UPDATE` to serialize on — so the subsequent
+/// locked read returns the value this write actually replaces
+/// (including a just-committed one) for the audit row and the response.
+async fn admin_set_app_setting_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    key: &str,
+    new_value: &str,
+    source_ip: &str,
+    now: u64,
+) -> Result<Option<String>, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('app_settings:' || $1))",
+            &[(&key, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let locked = transaction
+        .query_typed(
+            "SELECT value FROM app_settings WHERE key = $1 FOR UPDATE",
+            &[(&key, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let previous: Option<String> = locked
+        .first()
+        .map(|row| row.try_get::<_, String>("value").map_err(|_| StoreError))
+        .transpose()?;
+    transaction
+        .query_typed(
+            "INSERT INTO app_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, \
+               updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by",
+            &[
+                (&key, Type::TEXT),
+                (&new_value, Type::TEXT),
+                (&i64_of(now)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('key', $5, 'old', $6, 'new', $7))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::admin::SETTINGS_CHANGED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&key, Type::TEXT),
+                (&previous, Type::TEXT),
+                (&new_value, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(previous)
+}
+
 impl Store for PgStore {
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
@@ -2151,19 +2286,111 @@ impl Store for PgStore {
         let client = self.connect().await?;
         client
             .query_typed(
-                "INSERT INTO audit_log (user_id, action, ok, source_ip, at) VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
                 &[
                     (&event.user_id, Type::TEXT),
                     (&event.action, Type::TEXT),
                     (&event.ok, Type::BOOL),
                     (&event.source_ip, Type::TEXT),
                     (&i64_of(event.at)?, Type::INT8),
+                    (&event.subject_user_id, Type::TEXT),
+                    (&event.details, Type::TEXT),
                 ],
             )
             .await
             .map_err(|_| StoreError)?;
         Ok(())
         }, TOTAL_TIMEOUT_MS).await
+    }
+
+    async fn user_role(&self, user_id: &str) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT role FROM users WHERE id = $1",
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.user_role"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                rows.first()
+                    .map(|row| row.try_get("role").map_err(|_| StoreError))
+                    .transpose()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_set_user_role(
+        &self,
+        actor_user_id: &str,
+        subject_user_id: &str,
+        new_role: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_set_user_role_on(
+                    &mut client,
+                    actor_user_id,
+                    subject_user_id,
+                    new_role,
+                    source_ip,
+                    now,
+                )
+                .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn app_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed("SELECT key, value FROM app_settings", &[])
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.app_settings"))?;
+                rows.iter()
+                    .map(|row| {
+                        Ok((
+                            row.try_get("key").map_err(|_| StoreError)?,
+                            row.try_get("value").map_err(|_| StoreError)?,
+                        ))
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_set_app_setting(
+        &self,
+        actor_user_id: &str,
+        key: &str,
+        new_value: &str,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<Option<String>, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_set_app_setting_on(&mut client, actor_user_id, key, new_value, source_ip, now)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn reserve_rate_limit(

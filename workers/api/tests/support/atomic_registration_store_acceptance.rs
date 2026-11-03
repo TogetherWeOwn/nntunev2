@@ -1,11 +1,15 @@
-//! Executed acceptance tests for the production PostgreSQL enrollment seams.
+//! Executed acceptance tests for the production PostgreSQL enrollment seams
+//! and the admin-foundation write transactions (migration 0026).
 //!
 //! Loaded as a child module of worker_entry so private production functions,
 //! not copied SQL or a second store implementation, are exercised. The ordinary
 //! native suite lists these as ignored; api-migrations explicitly requires and
 //! runs every test below against its migrated, throwaway PostgreSQL service.
 
-use super::{complete_registration_on, prune_expired_challenges_on, reap_unverified_users_on};
+use super::{
+    admin_set_app_setting_on, admin_set_user_role_on, complete_registration_on,
+    prune_expired_challenges_on, reap_unverified_users_on,
+};
 use crate::auth::{InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential};
 use std::future::Future;
 use std::time::Duration;
@@ -1455,5 +1459,293 @@ fn postgres_reap_holds_selected_parent_lock_through_delete() {
             0,
             "the real reaper must finish deletion and cascading cleanup after resume"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Admin foundation (migration 0026): the production role/settings write
+// transactions, including their behaviour behind a contending lock holder.
+// The SQL-level shapes are also pinned by tests/sql/admin_foundation.sql;
+// these tests prove the Rust transaction orchestration (locked read, write
+// and extended audit committing together) and that the recorded old value
+// is the value actually replaced, never a stale snapshot read.
+
+async fn seed_admin_test_users(client: &Client) -> (String, String) {
+    let prefix = format!("admin-foundation-{:016x}", rand::random::<u64>());
+    let actor_id = format!("{prefix}-actor");
+    let subject_id = format!("{prefix}-subject");
+    for (id, email) in [
+        (actor_id.as_str(), format!("{prefix}-actor@example.com")),
+        (subject_id.as_str(), format!("{prefix}-subject@example.com")),
+    ] {
+        client
+            .execute(
+                "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
+                &[&id, &email, &(NOW as i64)],
+            )
+            .await
+            .expect("seed admin acceptance user");
+    }
+    (actor_id, subject_id)
+}
+
+async fn role_of(client: &Client, user_id: &str) -> String {
+    client
+        .query_one("SELECT role FROM users WHERE id = $1", &[&user_id])
+        .await
+        .expect("read seeded user role")
+        .get(0)
+}
+
+/// (actor, old, new) for every role-change audit row on the subject, in
+/// commit order (`audit_log.id` is a sequence assigned at insert).
+async fn role_audit_chain(client: &Client, subject_id: &str) -> Vec<(String, String, String)> {
+    client
+        .query(
+            "SELECT user_id, details ->> 'old', details ->> 'new' FROM audit_log \
+             WHERE action = 'user.role_changed' AND subject_user_id = $1 ORDER BY id",
+            &[&subject_id],
+        )
+        .await
+        .expect("read role audit chain")
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_role_change_audits_each_replaced_value() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, subject) = seed_admin_test_users(&client).await;
+
+        let previous =
+            admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
+                .await
+                .expect("promote subject");
+        assert_eq!(previous.as_deref(), Some("member"));
+        assert_eq!(role_of(&client, &subject).await, "admin");
+
+        let previous =
+            admin_set_user_role_on(&mut client, &actor, &subject, "member", "198.51.100.9", NOW)
+                .await
+                .expect("demote subject");
+        assert_eq!(previous.as_deref(), Some("admin"));
+        assert_eq!(role_of(&client, &subject).await, "member");
+
+        assert_eq!(
+            role_audit_chain(&client, &subject).await,
+            vec![
+                (actor.clone(), "member".to_string(), "admin".to_string()),
+                (actor.clone(), "admin".to_string(), "member".to_string()),
+            ],
+            "audit chain must carry the actor and each replaced value"
+        );
+
+        // A missing subject writes and audits nothing, and is not an error.
+        let missing = format!("{subject}-missing");
+        let previous =
+            admin_set_user_role_on(&mut client, &actor, &missing, "admin", "198.51.100.9", NOW)
+                .await
+                .expect("missing subject is not a store error");
+        assert_eq!(previous, None);
+        assert!(role_audit_chain(&client, &missing).await.is_empty());
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value() {
+    run_test(async {
+        let holder = connect().await;
+        let (actor, subject) = seed_admin_test_users(&holder).await;
+
+        // Hold the subject row lock behind an uncommitted promotion. A
+        // snapshot read would keep seeing 'member'; the production
+        // FOR UPDATE read must wait for the commit and then see 'admin'.
+        holder.batch_execute("BEGIN").await.expect("begin holder");
+        holder
+            .execute("UPDATE users SET role = 'admin' WHERE id = $1", &[&subject])
+            .await
+            .expect("holder takes the row lock with its update");
+
+        let (actor_task, subject_task) = (actor.clone(), subject.clone());
+        let contender = tokio::spawn(async move {
+            let mut client = connect().await;
+            admin_set_user_role_on(
+                &mut client,
+                &actor_task,
+                &subject_task,
+                "member",
+                "198.51.100.9",
+                NOW,
+            )
+            .await
+        });
+
+        // While the holder's transaction is open the contender cannot
+        // finish (its lock wait is bounded at 3s by connect(), and the
+        // holder commits long before that), so this cannot be a flake.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !contender.is_finished(),
+            "role change must block behind the holder's row lock"
+        );
+
+        holder.batch_execute("COMMIT").await.expect("commit holder");
+        let previous = contender
+            .await
+            .expect("contender task")
+            .expect("contender write after lock release");
+        assert_eq!(
+            previous.as_deref(),
+            Some("admin"),
+            "the returned/audited old value must be the committed value replaced"
+        );
+        assert_eq!(role_of(&holder, &subject).await, "member");
+        assert_eq!(
+            role_audit_chain(&holder, &subject).await,
+            vec![(actor.clone(), "admin".to_string(), "member".to_string())]
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_setting_writes_serialize_per_key() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, _) = seed_admin_test_users(&client).await;
+        const KEY: &str = "invite_default_expiry_days";
+
+        // The disposable database is migrated fresh for the job, so the
+        // row holds the migration seed. Restore both touched seeds at the
+        // end so a local rerun starts from the same state.
+        let seeded: String = client
+            .query_one("SELECT value FROM app_settings WHERE key = $1", &[&KEY])
+            .await
+            .expect("seeded setting present")
+            .get(0);
+        assert_eq!(seeded, "7");
+
+        let previous =
+            admin_set_app_setting_on(&mut client, &actor, KEY, "14", "198.51.100.9", NOW)
+                .await
+                .expect("first setting write");
+        assert_eq!(previous.as_deref(), Some("7"));
+        let previous =
+            admin_set_app_setting_on(&mut client, &actor, KEY, "30", "198.51.100.9", NOW)
+                .await
+                .expect("second setting write");
+        assert_eq!(previous.as_deref(), Some("14"));
+
+        // Hold the per-key advisory lock behind an uncommitted rewrite to
+        // 9; the contender must wait and then replace 9, not the stale 30
+        // a snapshot read would see.
+        let holder = connect().await;
+        holder.batch_execute("BEGIN").await.expect("begin holder");
+        holder
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext('app_settings:' || $1))",
+                &[&KEY],
+            )
+            .await
+            .expect("holder takes the advisory lock");
+        holder
+            .execute(
+                "UPDATE app_settings SET value = '9' WHERE key = $1",
+                &[&KEY],
+            )
+            .await
+            .expect("holder rewrites the value");
+
+        let actor_task = actor.clone();
+        let contender = tokio::spawn(async move {
+            let mut client = connect().await;
+            admin_set_app_setting_on(&mut client, &actor_task, KEY, "21", "198.51.100.9", NOW).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !contender.is_finished(),
+            "setting write must block behind the per-key advisory lock"
+        );
+        holder.batch_execute("COMMIT").await.expect("commit holder");
+        let previous = contender
+            .await
+            .expect("contender task")
+            .expect("contender write after lock release");
+        assert_eq!(previous.as_deref(), Some("9"));
+
+        let chain: Vec<(Option<String>, String)> = client
+            .query(
+                "SELECT details ->> 'old', details ->> 'new' FROM audit_log \
+                 WHERE action = 'settings.changed' AND details ->> 'key' = $1 \
+                   AND user_id = $2 ORDER BY id",
+                &[&KEY, &actor],
+            )
+            .await
+            .expect("read settings audit chain")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            chain,
+            vec![
+                (Some("7".to_string()), "14".to_string()),
+                (Some("14".to_string()), "30".to_string()),
+                (Some("9".to_string()), "21".to_string()),
+            ],
+            "audit chain must record each value actually replaced"
+        );
+
+        // First write of an absent key reports no previous value; the
+        // audit row records JSON null for old.
+        client
+            .execute(
+                "DELETE FROM app_settings WHERE key = 'invite_member_per_window'",
+                &[],
+            )
+            .await
+            .expect("clear reserved key");
+        let previous = admin_set_app_setting_on(
+            &mut client,
+            &actor,
+            "invite_member_per_window",
+            "5",
+            "198.51.100.9",
+            NOW,
+        )
+        .await
+        .expect("first write of absent key");
+        assert_eq!(previous, None);
+        let old_is_json_null: bool = client
+            .query_one(
+                "SELECT details -> 'old' = 'null'::jsonb FROM audit_log \
+                 WHERE action = 'settings.changed' \
+                   AND details ->> 'key' = 'invite_member_per_window' AND user_id = $1",
+                &[&actor],
+            )
+            .await
+            .expect("read first-write audit row")
+            .get(0);
+        assert!(
+            old_is_json_null,
+            "absent previous value audits as JSON null"
+        );
+
+        admin_set_app_setting_on(&mut client, &actor, KEY, "7", "198.51.100.9", NOW)
+            .await
+            .expect("restore seeded expiry");
+        admin_set_app_setting_on(
+            &mut client,
+            &actor,
+            "invite_member_per_window",
+            "2",
+            "198.51.100.9",
+            NOW,
+        )
+        .await
+        .expect("restore seeded per-window value");
     });
 }

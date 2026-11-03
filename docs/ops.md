@@ -342,6 +342,43 @@ must say so in its body, and the `migrations-staging` check fails until it does:
 waiting on approval. A pending PR must not merge until the line is updated to
 `applied`; merging it anyway turns `staging-api` red.
 
+### Admin bootstrap (owner promotion)
+
+Migration 0026 adds `users.role` (`member` default). The admin API can
+change roles only for an existing admin, and an admin can never change
+their own role through it — so the **first** admin in each environment is
+promoted by this reviewed operator step, run by the migrator role, never
+self-serve:
+
+**Ordering (do not reorder):** the owner account must exist and be
+promoted **before** `INVITES_REQUIRED` is flipped on in that
+environment. Once invites are required, signup needs a code, codes are
+issued by an admin, and with no admin promoted yet nobody — including the
+owner — can sign up. The flip is a separate operator env action taken
+last, on the invite-management work, after a first invite can be issued.
+
+Run in one transaction (replace the email; epoch seconds for `at`):
+
+```sql
+BEGIN;
+-- Precondition: exactly one row, currently a member.
+SELECT id, role FROM users WHERE email = '<owner-email>';
+UPDATE users SET role = 'admin'
+WHERE email = '<owner-email>' AND role = 'member';
+-- Exactly one row must have updated; otherwise ROLLBACK and investigate.
+INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details)
+SELECT id, 'user.role_changed', TRUE, 'ops-bootstrap', <epoch-seconds>, id,
+       jsonb_build_object('old', 'member', 'new', 'admin', 'via', 'ops-bootstrap')
+FROM users WHERE email = '<owner-email>';
+COMMIT;
+```
+
+(`user_id` is the promoted account: for this one operator-run change
+there is no acting user, and `details.via` records that it was the
+bootstrap rather than an admin-API write.) After promotion, the owner
+signs in normally and every further role change goes through
+`PUT /v1/admin/users/{id}/role`, which writes its own audit row.
+
 ### Hyperdrive bindings
 
 | Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |
