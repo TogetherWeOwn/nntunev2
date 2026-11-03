@@ -326,10 +326,21 @@ BEGIN
           AND accepted_at / 86400 = (1893456000 + 86400) / 86400) <> 0 THEN
         RAISE EXCEPTION 'epoch-day boundary leaked into the next day';
     END IF;
+    -- A job accepted at 23:59:59 belongs to that UTC day; one accepted at
+    -- the next midnight does not (rows carry the boundary, not just the
+    -- query instant).
+    INSERT INTO ingest_jobs (user_id, idempotency_key, accepted_at, status)
+    VALUES ('user-bil-2', 'qa-seed:late', 1893456000 + 86399, 'done'),
+           ('user-bil-2', 'qa-seed:nextday', 1893456000 + 86400, 'done');
     IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
         WHERE user_id = 'user-bil-2'
-          AND accepted_at / 86400 = (1893456000 + 86399) / 86400) <> 5 THEN
-        RAISE EXCEPTION 'last second of the UTC day must still count';
+          AND accepted_at / 86400 = (1893456000 + 86399) / 86400) <> 6 THEN
+        RAISE EXCEPTION 'job accepted at 23:59:59 must count in its UTC day';
+    END IF;
+    IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
+        WHERE user_id = 'user-bil-2'
+          AND accepted_at / 86400 = (1893456000 + 86400) / 86400) <> 1 THEN
+        RAISE EXCEPTION 'job accepted at next midnight must count only in the next day';
     END IF;
 END
 $$;
