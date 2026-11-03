@@ -88,7 +88,7 @@ async function fixtures(page: Page, action: Action, allowExternal = false) {
 		const body = path === '/v1/plans' ? { plans: PLANS }
 			: path === '/v1/me/subscription' ? { planId: 'free', status: 'trialing', currentPeriodEnd: null, trialEndsAt: '2030-01-01T00:00:00.000Z' }
 			: path === '/v1/me/usage' ? { period: '2026-10', streamSecondsMonth: 0, concurrentNow: 0, libraryTracks: 0, ingestToday: 0 }
-			: path === '/v1/vault' ? {}
+			: path === '/v1/credentials' ? { credentials: [] }
 			: { code: 'unexpected_fixture_request', message: path };
 		await route.fulfill({ status: path === action.endpoint ? 500 : 200, json: body });
 	});

@@ -2,8 +2,8 @@ import { defineEnvVars } from '@sveltejs/kit/env';
 
 /**
  * Public runtime environment for the web frontend. Declared here (SvelteKit 3
- * `defineEnvVars`) so `$app/env/public` is typed; consumed by the auth and
- * BYOP pages through {@link ApiClient}.
+ * `defineEnvVars`) so `$app/env/public` is typed; consumed by the app
+ * through {@link ApiClient}.
  *
  * `PUBLIC_API_BASE_URL` is empty by default, which makes the client use
  * same-origin relative URLs (e.g. `/v1/auth/magic/start`). Set it to the

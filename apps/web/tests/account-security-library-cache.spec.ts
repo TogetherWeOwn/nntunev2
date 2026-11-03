@@ -110,8 +110,8 @@ async function expectLibraryTabUntouched(page: Page): Promise<void> {
 /** Open the account-security tab with the session probe mocked reachable. */
 async function openSecurityTab(libraryTab: Page): Promise<Page> {
 	const securityTab = await libraryTab.context().newPage();
-	await securityTab.route('**/v1/vault', (route) =>
-		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
+	await securityTab.route('**/v1/credentials', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ credentials: [] }) })
 	);
 	return securityTab;
 }
@@ -275,8 +275,8 @@ test('blocked storage does not turn a successful logout into a failure', async (
 			});
 		}
 	});
-	await page.route('**/v1/vault', (route) =>
-		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({}) })
+	await page.route('**/v1/credentials', (route) =>
+		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ credentials: [] }) })
 	);
 	const logoutPosts = await mockSessionEndpoint(page, 'logout', 200);
 

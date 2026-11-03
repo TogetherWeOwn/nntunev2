@@ -249,11 +249,11 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   `apps/web/tests/pwa-manifest.spec.ts` unit pin is not staging evidence),
   `e2e/tests/served-routes.spec.ts:67` "GET /api/demo/artwork serves
   image/svg+xml with immutable caching",
-  `e2e/tests/served-routes.spec.ts:108` "GET /onboarding/provider redirects
-  to /onboarding/byop (307)" (the 307 observed plus wizard arrival — the
-  no-follow wrapper throws on 3xx without naming the target, so the target
-  is asserted through the browser), and
-  `e2e/tests/served-routes.spec.ts:161` "GET /pricing serves the plans page".
+  `e2e/tests/served-routes.spec.ts:108` "GET /onboarding/provider and
+  /onboarding/byop resolve to not-found (404)" (user provider setup is
+  retired — the legacy redirect entry point and the wizard both resolve to
+  the app 404, never a credential form), and
+  `e2e/tests/served-routes.spec.ts:149` "GET /pricing serves the plans page".
   All four probes carry the Access pair only (never an account session) with
   names-only diagnostics, and the paths live in `e2e/helpers/contract.ts`
   (`manifest`, `demoArtwork`, `onboardingProvider`, `pricing`), so a rename

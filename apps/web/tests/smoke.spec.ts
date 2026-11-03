@@ -75,24 +75,23 @@ test('security.txt is served at the canonical RFC 9116 path', async ({ request }
 });
 
 /**
- * E2E contract-hook coverage (TESTIDS in e2e/helpers/contract.ts, 20 hooks).
+ * E2E contract-hook coverage (TESTIDS in e2e/helpers/contract.ts).
  * The static companion (apps/web/src/lib/contract.test.ts) pins that each
- * hook string appears in its route markup; these specs pin that the app
- * actually renders it, seeding the states that reveal the conditional ones.
- * All API states below are Playwright route mocks — no live provider call.
+ * hook the web app still renders appears in its route markup; these specs
+ * pin that the app actually renders it, seeding the states that reveal the
+ * conditional ones. All API states below are Playwright route mocks.
  *
  * Always-rendered (plain navigation): app-root, signup-email, signup-submit,
- * byop-host, byop-port, byop-user, byop-pass, byop-tls, usage-meter.
- * (User NZB import retired in TWO-1639: no import-file/import-status hooks.)
+ * usage-meter.
+ * (User provider setup retired: no byop-* hooks. User NZB import retired in
+ * TWO-1639: no import-file/import-status hooks.)
  *
  * Conditional (seeded states): signup-error (mocked 500 register/start),
- * byop-test-connection (wizard advanced to step 3), byop-save + byop-status
- * (mocked vault/test ok, plus the failed variant for byop-status — the
- * reauth prompt shares the same hook), library-list + library-item (mocked
- * /api/library items), library-stale-badge (mocked success then a failed
- * refresh), plan-limit-notice (mocked 402 paywall — the PaywallModal
- * instance; the library inline instance is gated behind the overLimit=false
- * placeholder and cannot render yet).
+ * library-list + library-item (mocked /api/library items),
+ * library-stale-badge (mocked success then a failed refresh),
+ * plan-limit-notice (mocked 402 paywall — the PaywallModal instance; the
+ * library inline instance is gated behind the overLimit=false placeholder
+ * and cannot render yet).
  *
  * Audio-player: no library item carries a stream URL yet, so selecting a
  * row must render no <audio> element at all (never one with an empty src);
@@ -100,7 +99,7 @@ test('security.txt is served at the canonical RFC 9116 path', async ({ request }
  * bottom of this file.
  */
 test('contract routes resolve and render their e2e hooks', async ({ page, request }) => {
-	for (const href of ['/signup', '/onboarding/byop', '/library']) {
+	for (const href of ['/signup', '/library']) {
 		const response = await request.get(href);
 		expect(response.status(), `${href} should not 404`).not.toBe(404);
 		expect(response.ok()).toBe(true);
@@ -109,25 +108,6 @@ test('contract routes resolve and render their e2e hooks', async ({ page, reques
 	await page.goto('/signup');
 	await expect(page.getByTestId('signup-email')).toBeVisible();
 	await expect(page.getByTestId('signup-submit')).toBeVisible();
-
-	await page.goto('/onboarding/byop');
-	for (const testid of [
-		'byop-host',
-		'byop-port',
-		'byop-user',
-		'byop-pass',
-		'byop-tls'
-	]) {
-		await expect(page.getByTestId(testid)).toBeVisible();
-	}
-	// Conditional step-3 hook: advance the wizard (no API call yet — the
-	// test button only appears on the Test step).
-	await page.locator('input[name="host"]').fill('news.example.com');
-	await page.locator('input[name="username"]').fill('alice');
-	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await page.getByRole('button', { name: 'Continue' }).click();
-	await expect(page.getByTestId('byop-test-connection')).toBeVisible();
 
 	await page.goto('/library');
 	await expect(page.getByTestId('usage-meter')).toBeVisible();
@@ -155,43 +135,6 @@ test('contract signup error hook renders when account start fails', async ({ pag
 	await expect(page.getByTestId('signup-error')).toContainText('Something went wrong');
 	// A 500 is not a plan limit: the inline hook owns it, not the paywall.
 	await expect(page.getByRole('dialog')).toHaveCount(0);
-});
-
-test('contract byop result hooks render after a mocked connection test', async ({ page }) => {
-	let result: Record<string, unknown> = { ok: true, latencyMs: 12 };
-	await page.route('**/v1/vault/test', (route) =>
-		route.fulfill({
-			status: 200,
-			contentType: 'application/json',
-			body: JSON.stringify(result)
-		})
-	);
-
-	async function reachTestStep(): Promise<void> {
-		await page.goto('/onboarding/byop');
-		await page.getByLabel('Hostname').fill('news.example.test');
-		await page.getByLabel('Username').fill('reader');
-		await page.getByLabel('Password').fill('fixture-password');
-		await page.getByRole('button', { name: 'Continue' }).click();
-		await page.getByRole('button', { name: 'Continue' }).click();
-	}
-
-	await reachTestStep();
-	await page.getByTestId('byop-test-connection').click();
-	const passed = page.getByTestId('byop-status');
-	await expect(passed).toBeVisible();
-	await expect(passed).toHaveAttribute('role', 'status');
-	await expect(page.getByTestId('byop-save')).toBeVisible();
-
-	// Failed variant: same status hook, no save (save stays gated on a pass).
-	result = { ok: false };
-	await reachTestStep();
-	await page.getByTestId('byop-test-connection').click();
-	const failed = page.getByTestId('byop-status');
-	await expect(failed).toBeVisible();
-	await expect(failed).toHaveAttribute('role', 'alert');
-	await expect(failed).toContainText('could not reach');
-	await expect(page.getByTestId('byop-save')).toHaveCount(0);
 });
 
 test('contract library hooks render with seeded items and a stale retry', async ({ page }) => {
@@ -285,63 +228,22 @@ test('magic-link landing route exists and fails generically without a token', as
 	);
 });
 
-test('provider wizard walks provider, indexer and test steps', async ({ page, request }) => {
-	for (const href of ['/login', '/signup', '/onboarding/provider']) {
+test('retired provider routes resolve to not-found, never a credential form', async ({
+	page,
+	request
+}) => {
+	// User provider setup is retired: the wizard, its legacy redirect and
+	// the account provider page are gone, and no route renders a
+	// provider-credential form.
+	for (const href of ['/onboarding/byop', '/onboarding/provider', '/account/provider']) {
 		const response = await request.get(href);
-		expect(response.status(), `${href} should not 404`).not.toBe(404);
-		expect(response.ok()).toBe(true);
+		expect(response.status(), `${href} should 404`).toBe(404);
 	}
 
-	await page.goto('/onboarding/provider');
-	await expect(page.getByRole('heading', { level: 1 })).toContainText('Connect your provider');
-
-	await page.locator('input[name="host"]').fill('news.example.com');
-	await page.locator('input[name="username"]').fill('alice');
-	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-
-	await expect(page.getByText(/indexer improves search/i)).toBeVisible();
-	await page.getByRole('button', { name: 'Continue' }).click();
-
-	await expect(page.getByRole('heading', { level: 2 })).toContainText('Test the connection');
-	await expect(
-		page.getByRole('button', { name: /test connection/i })
-	).toBeVisible();
-});
-
-test('wizard offers only the NNTP allowlist ports 119 and 563', async ({ page }) => {
-	await page.goto('/onboarding/provider');
-
-	const values = await page.locator('select[name="port"] option').evaluateAll((options) =>
-		options.map((option) => option.getAttribute('value'))
-	);
-	expect(values).toEqual(['119', '563']);
-});
-
-test('wizard requires a plaintext acknowledgement when TLS is off', async ({ page }) => {
-	await page.goto('/onboarding/provider');
-
-	await page.locator('input[name="tls"]').uncheck();
-
-	await expect(page.getByText(/password is sent in cleartext/i)).toBeVisible();
-	await expect(page.locator('input[name="allowInsecurePlaintext"]')).toBeVisible();
-});
-
-test('wizard hides save until a connection test passes', async ({ page }) => {
-	await page.goto('/onboarding/provider');
-
-	await page.locator('input[name="host"]').fill('news.example.com');
-	await page.locator('input[name="username"]').fill('alice');
-	await page.locator('input[name="password"]').fill('s3cret');
-	await page.getByRole('button', { name: 'Continue' }).click();
-
-	await expect(page.getByText(/indexer improves search/i)).toBeVisible();
-	await page.getByRole('button', { name: 'Continue' }).click();
-
-	await expect(page.getByRole('heading', { level: 2 })).toContainText('Test the connection');
-	// Save stays hidden until the live test passes, so the wizard can never
-	// store credentials that were not just tested.
-	await expect(page.getByRole('button', { name: /save provider/i })).toHaveCount(0);
+	await page.goto('/onboarding/byop');
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('404');
+	await expect(page.getByLabel(/hostname/i)).toHaveCount(0);
+	await expect(page.getByLabel(/password/i)).toHaveCount(0);
 });
 
 /**

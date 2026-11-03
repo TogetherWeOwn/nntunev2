@@ -86,15 +86,11 @@ async function mockLibrary(page: Page, status: number, body: unknown): Promise<v
 
 /** Account pages without backend or paywall interference (no 402/429 here). */
 async function mockAccountApis(page: Page): Promise<void> {
-	await page.route('**/v1/vault', (route) =>
+	await page.route('**/v1/credentials', (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: 'application/json',
-			body: JSON.stringify({
-				provider_configured: false,
-				indexer_configured: false,
-				updated_at: 0
-			})
+			body: JSON.stringify({ credentials: [] })
 		})
 	);
 	await page.route('**/v1/me/*', (route) =>
@@ -269,7 +265,7 @@ test('[NAV-02a] direct load marks Library; the retired import route still bounda
 
 test('[NAV-02b] direct load marks Account on nested account pages', async ({ page }) => {
 	await mockAccountApis(page);
-	for (const path of ['/account/billing', '/account/security', '/account/provider', '/account']) {
+	for (const path of ['/account/billing', '/account/security', '/account']) {
 		await page.goto(path);
 		await expectShellPresent(page, path);
 		await expectCurrent(page, path, 'Account');
