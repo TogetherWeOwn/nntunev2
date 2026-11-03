@@ -265,6 +265,15 @@ pub struct Config {
     /// fails closed per-request (generic 500) before signature verification
     /// — an unverifiable webhook is never parsed, never acked.
     pub stripe_webhook_secret: Option<String>,
+    /// Play-grant HMAC secret shared with the stream Worker
+    /// (`PLAY_GRANT_SECRET`, [`crate::play_grant`]): the RAW string
+    /// bytes, never base64-decoded — the stream side keys its verifier
+    /// with the secret string's bytes, so both sides must agree byte
+    /// for byte. `None` until the operator provisions it; unprovisioned
+    /// (or under the 32-byte minimum, enforced at mint time) the play
+    /// routes fail closed per-request with a generic 500 while every
+    /// other route keeps serving.
+    pub play_grant_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -334,6 +343,7 @@ impl Config {
             native_rest_pepper_version: 0,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
+            play_grant_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -407,6 +417,16 @@ impl Config {
     ) -> Self {
         self.stripe_secret_key = secret_key;
         self.stripe_webhook_secret = webhook_secret;
+        self
+    }
+
+    /// Provision the play-grant HMAC secret (raw bytes of the
+    /// `PLAY_GRANT_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by the minter per request (fail closed), so this
+    /// setter accepts whatever the entry staged; native tests pass
+    /// synthetic secrets directly.
+    pub fn with_play_grant_secret(mut self, secret: Vec<u8>) -> Self {
+        self.play_grant_secret = Some(secret);
         self
     }
 
@@ -805,6 +825,20 @@ pub trait Store {
             Err(StoreError)
         }
     }
+    /// The live-slot subscription row (`billing::subscription_live_
+    /// select_statement`) feeding `resolve_effective_plan` at the
+    /// playback gate. Default `Err` fails closed: a store that cannot
+    /// read subscriptions must refuse grant issuance (generic 500),
+    /// never invent entitlement. Production and the test fake override.
+    fn live_subscription(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::SubscriptionRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
     /// Stream seconds metered for `(user_id, period_month)` — the monthly
     /// `SUM` over `stream_play_ledger`
     /// (`ledger::ledger_monthly_total_statement`), 0 when no plays are
@@ -817,6 +851,97 @@ pub trait Store {
     ) -> impl Future<Output = Result<u64, StoreError>> {
         async move {
             let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// Whether any subscription row ever reached paid coverage
+    /// (`billing::subscription_ever_paid_statement`): the
+    /// `lapsed` vs `never_subscribed` discriminator. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
+    fn ever_subscribed(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Runtime caps from the `plans` row
+    /// (`plan_limits::plan_caps_select_statement`): `None` when the id
+    /// has no row (the gate fails closed to the reserved `free` caps).
+    /// Default `Err` fails closed like [`Store::live_subscription`].
+    fn plan_caps(
+        &self,
+        plan_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::plan_limits::PlanCaps>, StoreError>> {
+        async move {
+            let _ = plan_id;
+            Err(StoreError)
+        }
+    }
+    /// Billed stream seconds for (`user_id`, `period_month`) — the
+    /// single monthly-usage authority
+    /// (`ledger::ledger_monthly_total_statement`). Default `Err` fails
+    /// closed: an unreadable meter refuses new playback rather than
+    /// reading as zero usage.
+    fn monthly_stream_seconds(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// The user's `playback_leases` row, if any. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn playback_lease(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::LeaseRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Atomically acquire/replace the user's lease for a NEW play
+    /// (`playback::playback_lease_acquire_statement`): succeeds when
+    /// no row exists, the stored lease has expired at `now`, the same
+    /// client session re-acquires, or `takeover` is set; the epoch
+    /// increments in the store, never from a caller value. Otherwise
+    /// `Held` with the live lease's remaining TTL. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn acquire_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> impl Future<Output = Result<crate::playback::LeaseAcquire, StoreError>> {
+        async move {
+            let _ = (
+                user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            );
+            Err(StoreError)
+        }
+    }
+    /// Extend the exact holder's lease (`playback::playback_lease_
+    /// touch_statement`): true iff the (`session_id`, `play_id`,
+    /// `epoch`) triple still names the stored row. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn touch_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (user_id, session_id, play_id, epoch, now, expires_at);
             Err(StoreError)
         }
     }
@@ -4593,17 +4718,23 @@ where
 /// Render a plan-limit denial on the wire (`docs/api-errors.md` 402 /
 /// 429 rows): status, names-only body, and the limit + reset headers (plus
 /// `retry-after` on 429) the client needs to render the upgrade path.
-/// Note: both `retry_after` and `Denial::headers()` render `retry-after`
-/// on a 429, so the first 429-shaped denial on a path using this helper
-/// must dedupe one of them. Every denial on the ingest path today is a
-/// 402 (no `retry-after`), so no duplication exists yet.
+/// `Response.retry_after` is rendered by the entry as the wire
+/// `retry-after` header, so the copy inside `Denial::headers()` is
+/// dropped when the field is set — a 429 never carries the header twice.
 fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
+    let extra_headers = denial
+        .headers()
+        .into_iter()
+        .filter(|(name, _)| {
+            denial.retry_after_secs.is_none() || name != crate::plan_limits::RETRY_AFTER_HEADER
+        })
+        .collect();
     Response {
         status: denial.status,
         body: denial.body_json(),
         set_cookie: None,
         retry_after: denial.retry_after_secs,
-        extra_headers: denial.headers(),
+        extra_headers,
     }
 }
 
@@ -5066,6 +5197,394 @@ where
         }
         Err(_) => internal(),
     }
+}
+
+// --- Play grant issuance -----------------------------------------------------------------
+//
+// `POST /v1/plays` is THE enforcement point: the stream Worker has no DB
+// binding, so subscription, the monthly hour cap, and the
+// one-concurrent-stream lease are all evaluated here before a grant is
+// minted (`crate::playback` documents the gate order and lease rules).
+// Cookie-session only for now: the scope map keeps `Bearer(PlaysWrite)`
+// on this path, so a presented native-rest bearer is gate-checked in
+// `handle()` (invalid keys plain-404 before dispatch, never rescued by a
+// cookie) but cannot mint until native bearer dispatch lands; the
+// heartbeat path is `Deny` in the scope map and never enters the gate.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayIssueBody {
+    track_id: String,
+    /// Client-generated playback session id (per tab/device): the lease
+    /// holder name. Distinct from the account session cookie — two
+    /// signed-in devices share one account but hold different holders.
+    session_id: String,
+    /// Continuation key only: present when refreshing a grant for the
+    /// caller's own current play. Never accepted as a fresh play id —
+    /// new starts always mint one server-side, so a replay cannot be
+    /// under-metered by reusing an old id.
+    play_id: Option<String>,
+    /// Explicit "play here instead": take the lease from the other
+    /// session now rather than waiting out its TTL.
+    #[serde(default)]
+    takeover: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayHeartbeatBody {
+    session_id: String,
+    play_id: String,
+    lease_epoch: u64,
+}
+
+/// Client session ids name the lease holder: bounded by the
+/// `playback_leases` length CHECK (1..=128), compared for equality only.
+/// The byte cap is at least as strict as the column's character cap.
+fn valid_client_session_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128
+}
+
+/// `402 subscription_required` with the paywall `reason` discriminator
+/// plus the upgrade pointer (`docs/api-errors.md`): the registered
+/// envelope extended by names-only fields, like the plan-limit body.
+fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Response {
+    let error = crate::api_error::ApiError::subscription_required("subscription required");
+    Response {
+        status: error.status,
+        body: serde_json::json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "reason": refusal.reason(),
+            (crate::plan_limits::UPGRADE_KEY): crate::plan_limits::UPGRADE_URL,
+        })
+        .to_string(),
+        set_cookie: None,
+        retry_after: None,
+        extra_headers: Vec::new(),
+    }
+}
+
+/// Mint the grant for an already-acquired lease hold and render the
+/// issuance body. The minter re-checks the identity field rule, so an
+/// unmeterable identity still cannot mint even though the handler
+/// validated earlier; `NotConfigured` is unreachable after the
+/// up-front secret check but stays a fail-closed 500, never a token.
+fn play_grant_response(
+    secret: &[u8],
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    epoch: u64,
+    now: u64,
+    lease_expires_at: u64,
+) -> Response {
+    match crate::play_grant::issue_v2_at(
+        user_id,
+        track_id,
+        play_id,
+        epoch,
+        now,
+        crate::play_grant::MAX_GRANT_TTL,
+        Some(secret),
+    ) {
+        Ok(issued) => json_response(
+            200,
+            serde_json::json!({
+                "grant": issued.token,
+                "play_id": play_id,
+                "lease_epoch": epoch,
+                "expires_at": issued.exp_unix,
+                "lease_expires_at": lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        ),
+        Err(crate::play_grant::MintError::NotConfigured) => internal(),
+        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+    }
+}
+
+async fn play_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
+    // answer the typed 409 up front rather than a lease 429/500 after
+    // the fence refuses the write.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // An unprovisioned (or too-short) secret fails closed before any
+    // lease write: an unmintable grant must never burn a lease epoch or
+    // displace the current holder.
+    let Some(secret) = ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+    else {
+        return internal();
+    };
+    let Some(body) = parse_body::<PlayIssueBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    // The track id must be meterable before any lease write: the
+    // ledger field rule is the single authority (probed with a
+    // placeholder play id — the same probe the minter runs with the
+    // real one). User ids are server-generated; an unmeterable one
+    // fails this same check rather than minting an unbillable grant.
+    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
+    {
+        return validation_failed("invalid track_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    // Continuation: the same client session refreshing the grant for
+    // its own current play (seek/resume/refresh ahead of grant
+    // expiry). Skips the subscription and cap gates — the track that
+    // crosses the cap, or whose subscription lapses mid-play,
+    // finishes; only the next NEW start is refused. The conditional
+    // touch either re-extends the same epoch or reports the caller
+    // lost the lease between the read and now, in which case this is
+    // simply a new start through the gates below.
+    if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
+                .is_err()
+            {
+                return validation_failed("invalid play_id");
+            }
+            let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+            match ctx
+                .store
+                .touch_playback_lease(
+                    &claims.user_id,
+                    &body.session_id,
+                    play_id,
+                    row.epoch,
+                    ctx.now,
+                    lease_expires_at,
+                )
+                .await
+            {
+                Ok(true) => {
+                    return play_grant_response(
+                        secret,
+                        &claims.user_id,
+                        &body.track_id,
+                        play_id,
+                        row.epoch,
+                        ctx.now,
+                        lease_expires_at,
+                    );
+                }
+                Ok(false) => {}
+                Err(_) => return internal(),
+            }
+        }
+    }
+    // New start, gate 1: subscription. `now` saturates into i64 rather
+    // than wrapping — an absurd clock reads as far-future (closed),
+    // never as the distant past (entitled forever).
+    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let effective = crate::billing::resolve_effective_plan(
+        subscription.as_ref().map(|row| row.as_view()),
+        i64::try_from(ctx.now).unwrap_or(i64::MAX),
+    );
+    if !effective.entitled {
+        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+            Ok(ever) => ever,
+            Err(_) => return internal(),
+        };
+        let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
+            .expect("an unentitled effective plan always refuses");
+        return subscription_refusal(refusal);
+    }
+    // Caps are plan DATA from the `plans` row; a missing row fails
+    // closed to the reserved `free` caps (0 h) — the 402 below, never
+    // a silently uncapped grant.
+    let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
+        Ok(Some(caps)) => caps,
+        Ok(None) => crate::plan_limits::PlanId::Free.caps(),
+        Err(_) => return internal(),
+    };
+    // Gate 2: the monthly hour cap. An unreadable meter refuses the
+    // new start (store default `Err`) rather than reading as zero.
+    let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
+    let used_seconds = match ctx
+        .store
+        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .await
+    {
+        Ok(seconds) => seconds,
+        Err(_) => return internal(),
+    };
+    if let Some(denial) =
+        crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
+    {
+        return plan_limit_refusal(denial);
+    }
+    // A zero concurrency allowance refuses with the lease 429 wire and
+    // the static retry: no lease exists to wait on. Allowances above
+    // one are still enforced as one — the lease table holds a single
+    // row per user by design (every seeded plan allows exactly one).
+    if caps.max_concurrent_streams == 0 {
+        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+            &caps,
+            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        ));
+    }
+    // Gate 3: the lease. The play id is minted here, never taken from
+    // the client (a client-chosen fresh id could replay an old play
+    // and under-meter). The atomic acquire bumps the epoch in the
+    // store; `Held` is the other-session 429 with the live TTL.
+    let play_id = match random_id::<16>() {
+        Ok(id) => id,
+        Err(_) => return unavailable(),
+    };
+    let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+    match ctx
+        .store
+        .acquire_playback_lease(
+            &claims.user_id,
+            &body.session_id,
+            &body.track_id,
+            &play_id,
+            ctx.now,
+            lease_expires_at,
+            body.takeover,
+        )
+        .await
+    {
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+            secret,
+            &claims.user_id,
+            &body.track_id,
+            &play_id,
+            epoch,
+            ctx.now,
+            lease_expires_at,
+        ),
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
+            // Zero rows back can also mean the deletion fence closed
+            // after the up-front check (the marker landed mid-request):
+            // re-read it so that race answers the typed 409, not a
+            // concurrent-streams 429.
+            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                account_deleting_response()
+            } else {
+                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+                    &caps,
+                    retry_after_secs,
+                ))
+            }
+        }
+        Err(_) => internal(),
+    }
+}
+
+/// Heartbeat: the holder's keepalive and the takeover signal in one.
+/// Always 200 for lease state (`active` extends, `superseded` tells the
+/// displaced player to pause, `expired` means no row) — lease state is
+/// an answer, not an error. No subscription or cap gates: a current
+/// play finishes even when a new start would be refused.
+async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Same fence as issuance (ADR 0002 rule 3): a deleting account's
+    // heartbeat is the typed 409, never an `active` extension.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // Same fail-closed secret gate as issuance: a misconfigured
+    // deployment must not let heartbeats keep a lease alive that no
+    // new grant could be minted against.
+    if ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+        .is_none()
+    {
+        return internal();
+    }
+    let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let epoch = lease.as_ref().map_or(body.lease_epoch, |row| row.epoch);
+    let state = crate::playback::LeaseHeartbeat::classify(
+        lease.as_ref(),
+        &body.session_id,
+        &body.play_id,
+        body.lease_epoch,
+    );
+    let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+        match ctx
+            .store
+            .touch_playback_lease(
+                &claims.user_id,
+                &body.session_id,
+                &body.play_id,
+                body.lease_epoch,
+                ctx.now,
+                expires,
+            )
+            .await
+        {
+            Ok(true) => (state, Some(expires)),
+            // Zero rows: a raced takeover landed between the read and
+            // the touch, or the deletion fence closed after the
+            // up-front check. Re-read deletion so the fence race
+            // answers the typed 409; otherwise report the truth, do
+            // not extend a lost lease.
+            Ok(false) => {
+                if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                    return account_deleting_response();
+                }
+                (crate::playback::LeaseHeartbeat::Superseded, None)
+            }
+            Err(_) => return internal(),
+        }
+    } else {
+        (state, None)
+    };
+    let mut body_json = serde_json::json!({"lease": state.as_str(), "lease_epoch": epoch});
+    if let Some(expires) = lease_expires_at {
+        body_json["lease_expires_at"] = serde_json::json!(expires);
+    }
+    json_response(200, body_json)
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
@@ -5716,6 +6235,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | "/v1/plays"
+            | "/v1/plays/heartbeat"
             | "/v1/credentials"
             | "/v1/plans"
             | "/v1/me/usage"
@@ -5824,9 +6345,13 @@ pub(crate) fn preflight_response() -> Response {
 /// a presented credential); a request with NO `Authorization` header skips
 /// the bearer gate and falls through to the dispatch below, so session
 /// cookie holders see no behavior change (ADR 0010). Data routes for the
-/// bearer scopes do not exist yet, so both an authorized bearer and a
+/// bearer scopes mostly do not exist yet, so an authorized bearer and a
 /// cookie-only caller land on the 404 below — default-deny holds until
-/// those routes land with their session-or-bearer dispatch.
+/// those routes land with their session-or-bearer dispatch. `POST
+/// /v1/plays` is the first exception: it landed as a cookie-session
+/// route behind the same gate, so a cookie-only caller is served by the
+/// handler while a gate-passing bearer still needs the session (native
+/// bearer issuance is a later slice).
 pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -5884,6 +6409,13 @@ where
         // map denies this path to bearer credentials, so the gate above
         // skips it and the guard owns session authentication.
         ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
+        // Play grant issuance + lease heartbeat: cookie-session handlers
+        // (see the section above). A presented native-rest bearer on
+        // `/v1/plays` is gate-checked above (invalid keys plain-404)
+        // but does not authenticate here; the heartbeat path is `Deny`
+        // in the scope map, so it never enters the gate.
+        ("POST", "/v1/plays") => play_issue(ctx, req).await,
+        ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -6137,6 +6669,23 @@ mod tests {
         /// Billing-read outage pin: the three display reads fail like a
         /// production query error (generic 500, never invented data).
         fail_billing_reads: RefCell<bool>,
+        /// Live-slot subscription rows by user (the playback gate's
+        /// `resolve_effective_plan` input).
+        playback_subscriptions: RefCell<HashMap<String, crate::playback::SubscriptionRow>>,
+        /// Users whose history holds any paid coverage
+        /// (`ever_subscribed` → the `lapsed` discriminator).
+        ever_paid_users: RefCell<HashSet<String>>,
+        /// `plans` caps rows by plan id; an absent id is the
+        /// missing-row case the handler fails closed to free caps.
+        plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
+        /// One `playback_leases` row per user.
+        playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Deletion-marker race pin: when set, the next lease write
+        /// (`acquire_playback_lease` / `touch_playback_lease`) first
+        /// lands the named user in `deleting_users`, mirroring a marker
+        /// that arrives after the handler's up-front `account_deleting`
+        /// probe but before the statement's writer fence evaluates.
+        mark_deleting_before_next_lease_write: RefCell<Option<String>>,
     }
 
     impl Store for FakeStore {
@@ -6390,6 +6939,123 @@ mod tests {
                 .get(&(user_id.to_string(), period_month.to_string()))
                 .copied()
                 .unwrap_or(0))
+        }
+        async fn live_subscription(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
+            Ok(self.playback_subscriptions.borrow().get(user_id).cloned())
+        }
+        async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.ever_paid_users.borrow().contains(user_id))
+        }
+        async fn plan_caps(
+            &self,
+            plan_id: &str,
+        ) -> Result<Option<crate::plan_limits::PlanCaps>, StoreError> {
+            Ok(self.plan_caps_rows.borrow().get(plan_id).copied())
+        }
+        async fn monthly_stream_seconds(
+            &self,
+            user_id: &str,
+            period_month: &str,
+        ) -> Result<u64, StoreError> {
+            Ok(self
+                .stream_seconds
+                .borrow()
+                .get(&(user_id.to_string(), period_month.to_string()))
+                .copied()
+                .unwrap_or(0))
+        }
+        async fn playback_lease(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+            Ok(self.playback_leases.borrow().get(user_id).cloned())
+        }
+        async fn acquire_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            track_id: &str,
+            play_id: &str,
+            now: u64,
+            expires_at: u64,
+            takeover: bool,
+        ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+            // Mirror the conditional upsert: insert at epoch 1, or
+            // replace at epoch+1 when expired, same-session, or
+            // takeover — else Held with the remaining TTL. The
+            // statement's deletion fence writes nothing (zero rows,
+            // which the Pg glue reads back as Held), no epoch burned.
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(crate::playback::LeaseAcquire::Held {
+                    retry_after_secs: self
+                        .playback_leases
+                        .borrow()
+                        .get(user_id)
+                        .map_or(0, |row| row.retry_after_secs(now)),
+                });
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get(user_id) {
+                Some(existing)
+                    if existing.is_live(now) && existing.session_id != session_id && !takeover =>
+                {
+                    Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: existing.retry_after_secs(now),
+                    })
+                }
+                existing => {
+                    let epoch = existing.map_or(1, |row| row.epoch + 1);
+                    leases.insert(
+                        user_id.to_string(),
+                        crate::playback::LeaseRow {
+                            session_id: session_id.to_string(),
+                            track_id: track_id.to_string(),
+                            play_id: play_id.to_string(),
+                            epoch,
+                            expires_at,
+                        },
+                    );
+                    Ok(crate::playback::LeaseAcquire::Acquired { epoch })
+                }
+            }
+        }
+        async fn touch_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            play_id: &str,
+            epoch: u64,
+            _now: u64,
+            expires_at: u64,
+        ) -> Result<bool, StoreError> {
+            // Mirror the conditional UPDATE: only the exact
+            // (session, play, epoch) holder extends, monotonically
+            // (an out-of-order older deadline never shortens), and
+            // never for a deleting account (in-statement fence).
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get_mut(user_id) {
+                Some(row)
+                    if row.session_id == session_id
+                        && row.play_id == play_id
+                        && row.epoch == epoch =>
+                {
+                    row.expires_at = row.expires_at.max(expires_at);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
         async fn reserve_rate_limit(
             &self,
@@ -9579,6 +10245,600 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         cookie_of(&resp)
+    }
+
+    const PLAY_SECRET: &[u8] = b"test-play-grant-secret-32-bytes-long!";
+
+    /// Harness with the play-grant secret provisioned (the default
+    /// `cfg()` leaves it unset — the fail-closed case below).
+    fn play_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(PLAY_SECRET.to_vec());
+        h
+    }
+
+    /// Seed a live entitled subscription for `user_id` on `plan_id`
+    /// plus its `plans`-row caps (hours converted like production).
+    fn seed_entitled(h: &Harness, user_id: &str, plan_id: &str, hours: u64) {
+        h.store.playback_subscriptions.borrow_mut().insert(
+            user_id.to_string(),
+            crate::playback::SubscriptionRow {
+                plan_id: plan_id.to_string(),
+                status: "active".to_string(),
+                cancel_at_period_end: false,
+                paid_through_at_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+                grace_until_unix: None,
+                current_period_end_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+            },
+        );
+        h.store.plan_caps_rows.borrow_mut().insert(
+            plan_id.to_string(),
+            crate::plan_limits::caps_from_plan_row(hours, 1),
+        );
+    }
+
+    fn play_call(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn play_user(h: &Harness) -> String {
+        seed_user(h, "user-plays-1", "plays@example.com");
+        magic_login(h, "plays@example.com")
+    }
+
+    #[test]
+    fn play_issue_mints_a_grant_for_an_entitled_user() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let play_id = body["play_id"].as_str().expect("server-minted play id");
+        assert!(!play_id.is_empty());
+        // The handler bound exactly (user, track, play, epoch 1) at NOW:
+        // re-minting through the vector-pinned minter reproduces it.
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            play_id,
+            1,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .expect("minter reproduces the handler grant");
+        assert_eq!(body["grant"], expected.token);
+        assert_eq!(body["lease_epoch"], 1);
+        assert_eq!(body["expires_at"], NOW + 900);
+        assert_eq!(body["lease_expires_at"], NOW + 45);
+        assert_eq!(body["heartbeat_interval_secs"], 15);
+        let lease = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(lease.session_id, "tab-a");
+        assert_eq!(lease.track_id, "track-9");
+        assert_eq!(lease.play_id, play_id);
+    }
+
+    #[test]
+    fn play_issue_refuses_unsubscribed_with_reasons_and_no_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "subscription_required");
+        assert_eq!(body["reason"], "never_subscribed");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["upgrade_url"], "/pricing");
+        // Once-paid history flips only the reason, never the refusal.
+        h.store
+            .ever_paid_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["reason"], "lapsed");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a refused start must not burn a lease epoch"
+        );
+    }
+
+    #[test]
+    fn play_issue_cap_refuses_new_starts_but_continuation_finishes() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        let started = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: serde_json::Value = serde_json::from_str(&started.body).unwrap();
+        let play_id = started["play_id"].as_str().unwrap().to_string();
+        // The play crosses the cap mid-track (3600 s = the 1 h cap).
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("user-plays-1".to_string(), period), 3600);
+        // Continuation (same session + play + track) still mints, and
+        // reuses the same play at the same epoch.
+        let resumed = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "play_id": play_id,
+            }),
+        );
+        assert_eq!(resumed.status, 200, "{}", resumed.body);
+        let resumed: serde_json::Value = serde_json::from_str(&resumed.body).unwrap();
+        assert_eq!(resumed["play_id"], play_id);
+        assert_eq!(resumed["lease_epoch"], 1);
+        // The NEXT new start (queue advance / repeat-one shape) is the
+        // one refused, with the plan-limit headers.
+        let next = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(next.status, 402, "{}", next.body);
+        let body: serde_json::Value = serde_json::from_str(&next.body).unwrap();
+        assert_eq!(body["code"], "plan_limit_exceeded");
+        assert!(next.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "stream_hours_month=1".to_string()
+        )));
+        assert!(next
+            .extra_headers
+            .contains(&("x-plan-reset".to_string(), "next-utc-month".to_string())));
+    }
+
+    #[test]
+    fn play_issue_lease_429_same_session_replace_and_takeover() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        let first: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        let first_play = first["play_id"].as_str().unwrap().to_string();
+        // A second client session is refused 429 with the live TTL, and
+        // `retry-after` appears exactly once (the rendered field), never
+        // duplicated inside extra_headers.
+        let held = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-b"}),
+        );
+        assert_eq!(held.status, 429, "{}", held.body);
+        assert_eq!(held.retry_after, Some(45));
+        assert!(
+            !held
+                .extra_headers
+                .iter()
+                .any(|(name, _)| name == "retry-after"),
+            "retry-after must not be duplicated: {:?}",
+            held.extra_headers
+        );
+        assert!(held.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "concurrent_streams=1".to_string()
+        )));
+        let body: serde_json::Value = serde_json::from_str(&held.body).unwrap();
+        assert_eq!(body["code"], "rate_limited");
+        // The holding session itself is never self-refused: a new track
+        // replaces the play and bumps the epoch.
+        let replaced = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(replaced.status, 200, "{}", replaced.body);
+        let replaced: serde_json::Value = serde_json::from_str(&replaced.body).unwrap();
+        assert_eq!(replaced["lease_epoch"], 2);
+        assert_ne!(replaced["play_id"], first_play);
+        // Explicit takeover: epoch bumps again; the displaced holder's
+        // heartbeat now reports superseded (it self-pauses), the new
+        // holder's reports active and extends.
+        let taken = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-11",
+                "session_id": "tab-b",
+                "takeover": true,
+            }),
+        );
+        assert_eq!(taken.status, 200, "{}", taken.body);
+        let taken: serde_json::Value = serde_json::from_str(&taken.body).unwrap();
+        assert_eq!(taken["lease_epoch"], 3);
+        let beat = |session: &str, play: &serde_json::Value, epoch: u64| {
+            h.call_full(
+                "POST",
+                "/v1/plays/heartbeat",
+                Some(
+                    serde_json::json!({
+                        "session_id": session,
+                        "play_id": play,
+                        "lease_epoch": epoch,
+                    })
+                    .to_string(),
+                ),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        let displaced = beat("tab-a", &replaced["play_id"], 2);
+        assert_eq!(displaced.status, 200, "{}", displaced.body);
+        let displaced: serde_json::Value = serde_json::from_str(&displaced.body).unwrap();
+        assert_eq!(displaced["lease"], "superseded");
+        let holder = beat("tab-b", &taken["play_id"], 3);
+        assert_eq!(holder.status, 200, "{}", holder.body);
+        let holder: serde_json::Value = serde_json::from_str(&holder.body).unwrap();
+        assert_eq!(holder["lease"], "active");
+        assert_eq!(holder["lease_expires_at"], NOW + 45);
+    }
+
+    #[test]
+    fn play_heartbeat_without_a_lease_reports_expired() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-none",
+                    "lease_epoch": 1,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["lease"], "expired");
+    }
+
+    #[test]
+    fn play_routes_answer_account_deleting_for_a_deleting_account() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        // Issuance: the typed 409, no lease written, no grant minted.
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a deleting account must not acquire a lease"
+        );
+        // Heartbeat: same 409, even for a lease row seeded directly —
+        // the touch must never extend a deleting account's lease.
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a deleting account's lease must not extend"
+        );
+        // The FakeStore mirrors the statement fences directly, so a
+        // handler regression that skipped the pre-check still could
+        // not write (acquire reads Held, touch reads false).
+        let acquired = block_on(h.store.acquire_playback_lease(
+            "user-plays-1",
+            "tab-b",
+            "track-9",
+            "play-x",
+            NOW,
+            NOW + 45,
+            true,
+        ))
+        .expect("store call succeeds");
+        assert!(matches!(
+            acquired,
+            crate::playback::LeaseAcquire::Held { .. }
+        ));
+        let touched = block_on(h.store.touch_playback_lease(
+            "user-plays-1",
+            "tab-a",
+            "play-seeded",
+            7,
+            NOW,
+            NOW + 45,
+        ))
+        .expect("store call succeeds");
+        assert!(!touched);
+    }
+
+    #[test]
+    fn play_issue_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        // The marker lands after the up-front probe, inside the lease
+        // write: the fenced acquire reads Held, and the post-write
+        // re-read — not the concurrency 429 — classifies the refusal.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "the fenced acquire writes nothing"
+        );
+    }
+
+    #[test]
+    fn play_heartbeat_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        // Same race on the touch: zero rows after the fence closes
+        // mid-request answers the typed 409, not `superseded`.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "the fenced touch must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_issue_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all.
+        let h = harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("v2."), "no token on a refused mint");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "an unmintable grant must not acquire the lease"
+        );
+        // A too-short secret is the same fail-closed 500.
+        let mut short = play_harness();
+        short.config = cfg().with_play_grant_secret(b"short".to_vec());
+        let cookie = play_user(&short);
+        seed_entitled(&short, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &short,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+    }
+
+    #[test]
+    fn play_heartbeat_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all. The heartbeat is
+        // gated like issuance, so a misconfigured deployment cannot
+        // keep extending a lease no grant could be minted against.
+        let h = harness();
+        let cookie = play_user(&h);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a refused heartbeat must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_routes_require_a_session_and_valid_identities() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let body = serde_json::json!({"track_id": "track-9", "session_id": "tab-a"});
+        // No cookie: generic 401 on both routes.
+        let anon = h.call("POST", "/v1/plays", body.clone());
+        assert_eq!(anon.status, 401);
+        let anon_beat = h.call(
+            "POST",
+            "/v1/plays/heartbeat",
+            serde_json::json!({"session_id": "tab-a", "play_id": "p", "lease_epoch": 1}),
+        );
+        assert_eq!(anon_beat.status, 401);
+        // Wrong origin: the mutation CSRF pin refuses before the handler.
+        let cross = h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.clone()),
+            Some("https://evil.example"),
+        );
+        assert_eq!(cross.status, 401);
+        // An unmeterable track id is a validation refusal and writes nothing.
+        let bad_track = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track.v1", "session_id": "tab-a"}),
+        );
+        assert_eq!(bad_track.status, 422, "{}", bad_track.body);
+        // Unknown fields and an empty client session id are refused too.
+        let unknown = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "epoch": 99,
+            }),
+        );
+        assert_eq!(unknown.status, 422);
+        let no_session = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": ""}),
+        );
+        assert_eq!(no_session.status, 422);
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_issue_presented_invalid_bearer_still_plain_404() {
+        // The bearer gate runs before dispatch on this path: a junk key
+        // (even alongside a valid session cookie) gets the plain 404 —
+        // the landed session route must not resurrect route disclosure
+        // or cookie rescue for presented credentials.
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/plays".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some(
+                "Bearer ntk_syntheticUnknownKey0000000000000000000000000".to_string(),
+            ),
+            stripe_signature: None,
+            body: serde_json::json!({"track_id": "track-9", "session_id": "tab-a"})
+                .to_string()
+                .into_bytes(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_paths_preflight_as_served_routes() {
+        let h = play_harness();
+        for path in ["/v1/plays", "/v1/plays/heartbeat"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "OPTIONS {path}");
+            assert!(resp.body.is_empty());
+        }
+        assert!(is_known_path("/v1/plays"));
+        assert!(is_known_path("/v1/plays/heartbeat"));
     }
 
     const QA_TOKEN: &str = "test-qa-bearer-token";

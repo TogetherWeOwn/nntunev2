@@ -283,6 +283,14 @@ fn config_from_env(env: &Env) -> Option<Config> {
     }
     let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
     let config = config.with_stripe(stripe_secret, stripe_webhook);
+    // Play-grant signing secret, shared with the stream Worker: raw
+    // string bytes, never base64-decoded (see the helper). Absent (or
+    // the minter's minimum length not met at issue time) fails the
+    // play routes closed per-request; every other route keeps serving.
+    let config = match play_grant_secret_from_lookup(|name| env_string(env, name)) {
+        Some(secret) => config.with_play_grant_secret(secret),
+        None => config,
+    };
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -297,6 +305,16 @@ const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
     "VAULT_TEST_RATE_LIMIT_WINDOW_SECS",
     "VAULT_TEST_IP_RATE_LIMIT_MAX",
 ];
+
+/// Play-grant secret overlay: the RAW STRING BYTES of the env value.
+/// This is the one secret never base64-decoded here — the stream
+/// Worker keys its HMAC with the raw bytes of the same string, so
+/// decoding would silently desynchronize the two sides and refuse
+/// every grant stream-side. Pure over a lookup so the no-decode rule
+/// is unit-pinned below.
+fn play_grant_secret_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
+    get(crate::play_grant::PLAY_GRANT_SECRET_VAR).map(String::into_bytes)
+}
 
 /// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
 /// the lookup resolves and hand them to `from_vars`, which fails safe
@@ -435,6 +453,36 @@ fn u64_of(v: i64) -> Result<u64, StoreError> {
 
 fn u32_of(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError)
+}
+
+/// The user's `playback_leases` row, if any: shared by the lease read
+/// and the acquire-refusal path (which reads the surviving holder for
+/// the 429's `Retry-After`). More than one row is impossible (user PK)
+/// and errors rather than picking one.
+async fn query_playback_lease_row(
+    client: &impl GenericClient,
+    user_id: &str,
+) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+    let rows = client
+        .query_typed(
+            crate::playback::playback_lease_select_statement(),
+            &[(&user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    match rows.first() {
+        None => Ok(None),
+        Some(row) => Ok(Some(crate::playback::LeaseRow {
+            session_id: row.try_get("session_id").map_err(|_| StoreError)?,
+            track_id: row.try_get("track_id").map_err(|_| StoreError)?,
+            play_id: row.try_get("play_id").map_err(|_| StoreError)?,
+            epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+            expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+        })),
+    }
 }
 
 /// Durable-slot budgets are bounded: a zero limit/window admits
@@ -2002,6 +2050,112 @@ impl Store for PgStore {
         .await
     }
 
+    async fn live_subscription(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The live-slot partial unique guarantees at most one
+                // row; more is a schema violation, never "pick one".
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    None => Ok(None),
+                    Some(row) => Ok(Some(crate::playback::SubscriptionRow {
+                        plan_id: row.try_get("plan_id").map_err(|_| StoreError)?,
+                        status: row.try_get("status").map_err(|_| StoreError)?,
+                        cancel_at_period_end: row
+                            .try_get("cancel_at_period_end")
+                            .map_err(|_| StoreError)?,
+                        paid_through_at_unix: row
+                            .try_get("paid_through_at_unix")
+                            .map_err(|_| StoreError)?,
+                        grace_until_unix: row
+                            .try_get("grace_until_unix")
+                            .map_err(|_| StoreError)?,
+                        current_period_end_unix: row
+                            .try_get("current_period_end_unix")
+                            .map_err(|_| StoreError)?,
+                    })),
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_ever_paid_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("ever_paid").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn plan_caps(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<crate::plan_limits::PlanCaps>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::plan_limits::plan_caps_select_statement(),
+                        &[(&plan_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    None => Ok(None),
+                    Some(row) => {
+                        let hours = u64::try_from(
+                            row.try_get::<_, i32>("stream_hours_month")
+                                .map_err(|_| StoreError)?,
+                        )
+                        .map_err(|_| StoreError)?;
+                        let concurrent = u32::try_from(
+                            row.try_get::<_, i32>("max_concurrent_streams")
+                                .map_err(|_| StoreError)?,
+                        )
+                        .map_err(|_| StoreError)?;
+                        Ok(Some(crate::plan_limits::caps_from_plan_row(
+                            hours, concurrent,
+                        )))
+                    }
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn stream_seconds_month(
         &self,
         user_id: &str,
@@ -2022,6 +2176,137 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 u64_of(rows[0].try_get("stream_seconds").map_err(|_| StoreError)?)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn monthly_stream_seconds(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_monthly_total_statement(),
+                        &[(&user_id, Type::TEXT), (&period_month, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The aggregate always yields exactly one row (COALESCE 0).
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                u64_of(rows[0].try_get("stream_seconds").map_err(|_| StoreError)?)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn playback_lease(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let row = query_playback_lease_row(&client, user_id).await?;
+                Ok(row)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn acquire_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::playback::playback_lease_acquire_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&track_id, Type::TEXT),
+                            (&play_id, Type::TEXT),
+                            (&i64_of(expires_at)?, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                            (&takeover, Type::BOOL),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    Some(row) => Ok(crate::playback::LeaseAcquire::Acquired {
+                        epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
+                    }),
+                    // Zero rows: another session holds a live lease.
+                    // Read it (same connection, same budget) so the
+                    // 429 carries its real remaining TTL. A vanished
+                    // row (deleted mid-race) reads as retry-now.
+                    None => {
+                        let retry_after_secs =
+                            match query_playback_lease_row(&client, user_id).await? {
+                                Some(row) => row.retry_after_secs(now),
+                                None => 0,
+                            };
+                        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs })
+                    }
+                }
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn touch_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::playback::playback_lease_touch_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&session_id, Type::TEXT),
+                            (&play_id, Type::TEXT),
+                            (&i64_of(epoch)?, Type::INT8),
+                            (&i64_of(expires_at)?, Type::INT8),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                Ok(rows.len() == 1)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5698,6 +5983,25 @@ mod tests {
             assert!(cors_headers(200, origin, cfg).is_empty(), "{origin:?}");
             assert!(cors_headers(204, origin, cfg).is_empty(), "{origin:?}");
         }
+    }
+
+    #[test]
+    fn play_grant_secret_overlay_keeps_the_raw_string_bytes() {
+        // Absent stays absent (the play routes fail closed per-request).
+        assert_eq!(play_grant_secret_from_lookup(|_| None), None);
+        // The probe value IS valid base64 of different bytes: if the
+        // overlay ever grows a decode (copying the other secrets), the
+        // output changes and every grant would fail stream-side
+        // verification. Raw bytes must come back byte-identical.
+        let probe = crate::b64::encode(b"synthetic-secret-material-012345");
+        assert!(
+            crate::b64::decode(&probe).is_ok(),
+            "probe must be valid base64"
+        );
+        let got = play_grant_secret_from_lookup(|key| {
+            (key == crate::play_grant::PLAY_GRANT_SECRET_VAR).then(|| probe.clone())
+        });
+        assert_eq!(got.as_deref(), Some(probe.as_bytes()));
     }
 
     #[test]
