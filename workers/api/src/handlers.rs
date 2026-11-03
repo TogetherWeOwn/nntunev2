@@ -6680,6 +6680,12 @@ mod tests {
         plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
         /// One `playback_leases` row per user.
         playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Deletion-marker race pin: when set, the next lease write
+        /// (`acquire_playback_lease` / `touch_playback_lease`) first
+        /// lands the named user in `deleting_users`, mirroring a marker
+        /// that arrives after the handler's up-front `account_deleting`
+        /// probe but before the statement's writer fence evaluates.
+        mark_deleting_before_next_lease_write: RefCell<Option<String>>,
     }
 
     impl Store for FakeStore {
@@ -6982,6 +6988,9 @@ mod tests {
             // takeover — else Held with the remaining TTL. The
             // statement's deletion fence writes nothing (zero rows,
             // which the Pg glue reads back as Held), no epoch burned.
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
             if self.deleting_users.borrow().contains(user_id) {
                 return Ok(crate::playback::LeaseAcquire::Held {
                     retry_after_secs: self
@@ -7029,6 +7038,9 @@ mod tests {
             // (session, play, epoch) holder extends, monotonically
             // (an out-of-order older deadline never shortens), and
             // never for a deleting account (in-statement fence).
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
             if self.deleting_users.borrow().contains(user_id) {
                 return Ok(false);
             }
@@ -10600,6 +10612,73 @@ mod tests {
         ))
         .expect("store call succeeds");
         assert!(!touched);
+    }
+
+    #[test]
+    fn play_issue_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        // The marker lands after the up-front probe, inside the lease
+        // write: the fenced acquire reads Held, and the post-write
+        // re-read — not the concurrency 429 — classifies the refusal.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "the fenced acquire writes nothing"
+        );
+    }
+
+    #[test]
+    fn play_heartbeat_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        // Same race on the touch: zero rows after the fence closes
+        // mid-request answers the typed 409, not `superseded`.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "the fenced touch must not extend the lease"
+        );
     }
 
     #[test]
