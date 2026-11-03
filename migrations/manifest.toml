@@ -147,3 +147,8 @@ sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
 file = "0030_mb_mirror_w6b.sql"
 target = "mirror"
 sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
+
+[[migration]]
+file = "0031_videolinks_curation.sql"
+target = "app"
+sha256 = "a165402c1c1868571d36b2d1d9f5d013996a37b3b05de2b6af2b8ce86efdffbf"
