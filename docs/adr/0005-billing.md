@@ -147,23 +147,36 @@ stored pass: coverage (`paid_through_at`, and the `plan_id`/`paid_invoice_id`
 tied to it) advances monotonically, and the same staleness predicate — the new
 evidence ends strictly before the stored paid end — guards stored `status` and
 `grace_until` instead of writing stale verbatim fields over a fresher pass.
+The stale fold carries its evidence end into the write (not the stored end),
+so the predicate still fires when the stale-reading pass commits second.
 Empty-money observations are not stale (a first-failure `past_due` still sets
 the renewal grace); equal-money status order is unknowable across passes, so
 equal-end folds converge on the next hourly reconcile. When an equal paid end
 carries a new plan (a plan switch landing exactly on the old period end), the
 fold adopts the subscription item's current plan with unchanged coverage,
-anchored on the new evidence.
+anchored on the new evidence — and the write persists that relabel (an
+equal-end pass carrying a new-evidence anchor adopts `plan_id` /
+`paid_invoice_id`), so the switch cannot stick on the old plan forever.
 
 An existing open Checkout Session — or a single-flight loser converging onto
 one — is reused only when its recorded price matches the newly requested
 price. A second attempt naming a different plan never inherits the first
 attempt's session: the open session is expired first, the flight is
 superseded, and a fresh operation mints under a fresh Stripe idempotency key.
-Repairing a confirmed-expired or Stripe-404-missing session replaces the same
-way (no expiry call: Stripe already converged the state), so a repair can
-never replay a dead session inside Stripe's retention window. An unconfirmed
-retrieve (any non-404 failure) fails retryable instead of minting beside
-unknown state.
+A session-less flight (never created, or its mark was lost) with a mismatched
+price is resolved under its ORIGINAL operation id and recorded price before
+anything supersedes it — the same-key replay recovers the session (never
+duplicates), which then retires per its retrieved state — because a missing
+mark does not mean Stripe has no session, and superseding blind would orphan
+a payable one. Repairing a confirmed-expired or Stripe-404-missing session
+replaces the same way (no expiry call: Stripe already converged the state),
+so a repair can never replay a dead session inside Stripe's retention window.
+Only `expired` deliberately replaces among the closed states: a `complete`
+session that is not paid (`unpaid` async processing, `no_payment_required`
+subscription already created) can still succeed, so the flight stays open for
+the real completion and the retry fails retryable without minting a second
+checkout beside it. An unconfirmed retrieve (any non-404 failure) fails
+retryable instead of minting beside unknown state.
 
 Paid-invoice history keeps one row per confirmed paid invoice under its own
 lines' plan — including invoices from an earlier plan after a plan change —

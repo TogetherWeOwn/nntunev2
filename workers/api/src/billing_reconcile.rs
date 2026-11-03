@@ -469,6 +469,15 @@ pub fn reconcile_subscription(
     // `past_due` with no new invoice, and that observation must set the
     // grace below. Terminal and held paths branch before any money
     // comparison, so only the advancing statuses can take this arm.
+    //
+    // The row carries the stale *evidence* end (`new_end`), not the
+    // stored end: the write guard keys its staleness predicate off
+    // `EXCLUDED.paid_through_at`, so a stale-reading pass that commits
+    // second still compares strictly older and keeps the stored
+    // status/grace instead of overwriting them with older verbatim
+    // fields. Coverage itself stays monotonic in the write (the guard
+    // keeps the greatest confirmed end), and the retained plan/anchor
+    // are kept with it there.
     let stale = matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev);
     if stale {
         let kept = previous.expect("stale requires stored coverage");
@@ -482,7 +491,7 @@ pub fn reconcile_subscription(
                 status: kept.status.clone(),
                 current_period_end_unix: sub.current_period_end,
                 cancel_at_period_end: sub.cancel_at_period_end,
-                paid_through_unix: kept.paid_through_unix,
+                paid_through_unix: new_end,
                 paid_invoice_id: None,
                 grace_until_unix: kept.grace_until_unix,
             },
@@ -831,16 +840,22 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// write itself*: the inputs are folded before the per-user advisory
 /// lock is taken, so a pass that read an older remote snapshot can
 /// commit after a fresher pass — the CASE keeps the greatest confirmed
-/// coverage instead of regressing it. The same staleness guard covers
-/// `status` and `grace_until`: a pass whose money ends strictly before
-/// the stored coverage keeps the stored status/grace instead of writing
-/// stale verbatim fields over a fresher pass (the pure fold already
-/// retains them; this guard closes the commit race where a stale-reading
-/// pass commits second). Item bindings, period end and cancel still
-/// update verbatim.
+/// coverage instead of regressing it. An equal-end pass carrying new
+/// evidence (a non-NULL anchor) still relabels `plan_id` /
+/// `paid_invoice_id`: that is the defined equal-end plan-switch outcome,
+/// and only such passes carry an anchor at equal coverage. The same
+/// staleness guard covers `status` and `grace_until`: a pass whose money
+/// ends strictly before the stored coverage keeps the stored status/grace
+/// instead of writing stale verbatim fields over a fresher pass (the
+/// stale fold carries its evidence end precisely so this predicate fires
+/// even when the stale-reading pass commits second). Item bindings,
+/// period end and cancel still update verbatim.
 /// Full staleness predicate (mirrored in both CASEs): EXCLUDED money is
 /// non-NULL, stored money is non-NULL, and EXCLUDED ends strictly before
-/// stored.
+/// stored. Full advance-or-relabel predicate (mirrored in the plan and
+/// anchor CASEs): EXCLUDED money is non-NULL and stored money is NULL, or
+/// EXCLUDED ends strictly after stored, or EXCLUDED ties stored while
+/// carrying a new-evidence anchor.
 ///
 /// Full parameter order:
 /// $1 user_id · $2 stripe_subscription_id · $3 stripe_customer_id ·
@@ -849,7 +864,7 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
 /// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL.
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
@@ -1078,7 +1093,11 @@ mod tests {
         let outcome = reconcile_subscription(&stored, &stale, NOW);
         assert_eq!(outcome.fail_closed, None, "stale is clean, not fail-closed");
         assert_eq!(outcome.row.plan_id, "plus", "stored plan retained");
-        assert_eq!(outcome.row.paid_through_unix, Some(fresh_end));
+        assert_eq!(
+            outcome.row.paid_through_unix,
+            Some(stale_end),
+            "stale carries its evidence end so the write guard's staleness predicate fires"
+        );
         assert_eq!(outcome.row.status, "active", "stored status retained");
         assert_eq!(outcome.row.grace_until_unix, None, "no grace resurrected");
         assert_eq!(outcome.row.stripe_price_id, PRICE_PLUS);
@@ -1106,7 +1125,11 @@ mod tests {
         let outcome = reconcile_subscription(&stored, &stale, NOW);
         assert_eq!(outcome.row.status, "past_due");
         assert_eq!(outcome.row.grace_until_unix, Some(grace));
-        assert_eq!(outcome.row.paid_through_unix, Some(fresh_end));
+        assert_eq!(
+            outcome.row.paid_through_unix,
+            Some(stale_end),
+            "stale carries its evidence end; the write keeps stored coverage"
+        );
 
         // No item-plan money at all is NOT stale on that basis alone: a
         // first failed renewal observes `past_due` with no new invoice,
@@ -1214,7 +1237,11 @@ mod tests {
         let outcome = reconcile_subscription(&stored, &older, NOW);
         assert_eq!(outcome.row.status, "active");
         assert_eq!(outcome.row.grace_until_unix, None);
-        assert_eq!(outcome.row.paid_through_unix, Some(end));
+        assert_eq!(
+            outcome.row.paid_through_unix,
+            Some(end - 30 * 86_400),
+            "stale carries its evidence end; the write keeps stored coverage"
+        );
     }
 
     #[test]
@@ -1628,6 +1655,19 @@ mod tests {
             assert!(
                 store_reconciled_subscription_statement().contains(guarded),
                 "stale-fold guard missing: {guarded}",
+            );
+        }
+        // The equal-end relabel: a pass tying stored coverage while
+        // carrying a new-evidence anchor adopts the relabeled plan and
+        // anchor (the defined equal-end plan-switch outcome); anchor-less
+        // ties keep the stored ones.
+        for guarded in [
+            "plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END",
+            "paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END",
+        ] {
+            assert!(
+                store_reconciled_subscription_statement().contains(guarded),
+                "equal-end relabel missing: {guarded}",
             );
         }
         assert!(
