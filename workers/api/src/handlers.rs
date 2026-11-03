@@ -499,6 +499,39 @@ pub enum AdminWriteOutcome {
     AccountDeleting,
 }
 
+/// Outcome of an admin invite issue (migration 0030): the insert and
+/// its `invite.issued` audit row commit together under the same
+/// admin-write serialization as [`AdminWriteOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminInviteIssueOutcome {
+    /// Issued; carries the surrogate row id the audit row references.
+    Issued(i64),
+    /// The actor was no longer an admin at write time; nothing was
+    /// written or audited. The handler answers the plain 404.
+    ActorNotAdmin,
+}
+
+/// Outcome of an admin invite revoke (migration 0030). The revocation
+/// stamps and its `invite.revoked` audit row commit together, and the
+/// conditional write makes revocation win any race against a
+/// redemption claim executing concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminInviteRevokeOutcome {
+    /// This call revoked the invite.
+    Revoked,
+    /// The invite was already revoked; nothing changed and no second
+    /// audit row was written (idempotent retry).
+    AlreadyRevoked,
+    /// The invite was already redeemed; revocation never reaches back
+    /// into a created account.
+    AlreadyRedeemed,
+    /// No invite with that id exists.
+    Missing,
+    /// The actor was no longer an admin at write time; nothing was
+    /// written or audited. The handler answers the plain 404.
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -639,18 +672,26 @@ pub trait Store {
     /// Every claim must return exactly one row using `SingleUseClaim` SQL.
     /// Rejection, storage failure, or cancellation must never leave partial
     /// writes. Return success only after commit; no sequential fallback.
+    ///
+    /// When an invite is claimed, `invite_audit` is its `invite.redeemed`
+    /// row and MUST commit in the same transaction (an audit failure
+    /// leaves the invite unspent and the signup retryable); the store
+    /// also stamps `users.invited_by` / `users.invite_code_hash` from
+    /// the claimed invite in that transaction. `invite` and
+    /// `invite_audit` are always both present or both absent.
     fn complete_registration(
         &self,
         challenge: &PasskeyChallenge,
         magic: &MagicLinkRecord,
         invite: Option<&InviteRecord>,
+        invite_audit: Option<&AuditEvent>,
         credential: &PasskeyCredential,
         now: u64,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move {
             // Stores without a transactional implementation must refuse
             // enrollment, never fall back to separately committed claims.
-            let _ = (challenge, magic, invite, credential, now);
+            let _ = (challenge, magic, invite, invite_audit, credential, now);
             Err(StoreError)
         }
     }
@@ -1177,6 +1218,50 @@ pub trait Store {
         _session_id: Option<&str>,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move { Err(StoreError) }
+    }
+    /// Issue one invite and write its `invite.issued` audit row in one
+    /// transaction, revalidating the actor's role under the write
+    /// serialization lock (see [`AdminInviteIssueOutcome`]). The audit
+    /// row references the invite by the returned row id only — the
+    /// code and its hash never appear in it. Fail-closed default;
+    /// production and the test fake override it.
+    fn admin_issue_invite(
+        &self,
+        _actor_user_id: &str,
+        _record: &InviteRecord,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every invite row, newest first, for the admin list. `issuer`
+    /// filters by exact `issued_by`; `status` filters by the derived
+    /// [`InviteRecord::status`] at `now` (`active`, `expired`,
+    /// `redeemed`, `revoked`); both may combine. The store caps the
+    /// result; pagination is post-M1. Fail-closed default is empty;
+    /// production and the test fake override it.
+    fn admin_list_invites(
+        &self,
+        _issuer: Option<&str>,
+        _status: Option<&str>,
+        _now: u64,
+        _limit: usize,
+    ) -> impl Future<Output = Result<Vec<InviteRecord>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Revoke one unredeemed invite and write its `invite.revoked`
+    /// audit row in one transaction, revalidating the actor's role
+    /// under the write serialization lock (see
+    /// [`AdminInviteRevokeOutcome`]). Fail-closed default; production
+    /// and the test fake override it.
+    fn admin_revoke_invite(
+        &self,
+        _actor_user_id: &str,
+        _invite_id: i64,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
+        async { Err(StoreError) }
     }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
@@ -2063,6 +2148,17 @@ struct EmailBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RegisterStartBody {
+    email: String,
+    /// Optional invite pre-check: when presented, the code is
+    /// validated (never consumed) before any signup row is minted, so
+    /// a bad code fails at the code step. Consumption happens only
+    /// inside `complete_registration`.
+    invite_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterFinishBody {
     challenge: String,
     credential_id: String,
@@ -2113,12 +2209,70 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let Some(body) = parse_body::<EmailBody>(req) else {
+    let Some(body) = parse_body::<RegisterStartBody>(req) else {
         return generic_auth();
     };
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    // Invite pre-check (spec §6.3): when the signup page presents a
+    // code, validate it — never consume it — before any signup row is
+    // minted, so a bad code fails at the code step with the one
+    // generic error and leaves no account behind. The per-client and
+    // per-email redemption budgets are spent here exactly as at
+    // finish, so this check is no cheaper an oracle than finishing.
+    // Consumption still happens only inside `complete_registration`;
+    // a valid pre-check leaves the code redeemable.
+    if let Some(code) = &body.invite_code {
+        let attempt_key = format!("invite:{}:start", rate_limit_ip_key(&ctx.source_ip));
+        let email_key = email_rate_limit_key(ctx.cfg, &email);
+        let allowed = matches!(
+            ctx.store
+                .reserve_rate_limit_pair(
+                    RateLimitBudget {
+                        scope_key: &attempt_key,
+                        action: "auth.invite_redeem",
+                        limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
+                    },
+                    RateLimitBudget {
+                        scope_key: &email_key,
+                        action: "auth.invite_redeem_email",
+                        limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
+                    },
+                    ctx.now,
+                )
+                .await,
+            Ok(PairAdmission::Allowed)
+        );
+        if !allowed {
+            return generic_auth();
+        }
+        let invite = match ctx
+            .store
+            .invite_by_hash(&auth::hash_invite_code(code))
+            .await
+        {
+            Ok(Some(invite)) => invite,
+            Ok(None) => return generic_auth(),
+            Err(_) => return internal(),
+        };
+        // No user row exists yet: validate against a sentinel id that
+        // can never equal an issuer, so the hash/spend/revoked/expiry/
+        // email-bind/self-invite (by email) predicates all run; the
+        // prepared record is discarded.
+        let issuer_email = invite.issuer_email.clone();
+        let redemption = auth::InviteRedemption {
+            user_id: "",
+            email: &email,
+            issuer_email: issuer_email.as_deref(),
+            now: ctx.now,
+        };
+        if auth::prepare_invite_redemption(invite, code, &redemption).is_err() {
+            return generic_auth();
+        }
+    }
     // Identical 200 shape for every admitted outcome below (new email,
     // abandoned signup, already-registered account): this route must not be
     // an account-existence oracle. A taken email gets an unbound challenge
@@ -2410,23 +2564,36 @@ where
     // token intact for a corrected retry (the signup page stays on the
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
-    let invite_to_consume = if ctx.cfg.invites_required || body.invite_code.is_some() {
-        // Atomic per-client redemption budget BEFORE the lookup: parallel
-        // guesses share one reservation (no check-then-act race), and the
-        // denial is the generic error (no throttle oracle). Keyed by
-        // client prefix and account, per `auth::invite_attempt_allowed`.
+    let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
+        // Atomic redemption budgets BEFORE the lookup, claimed as one
+        // all-or-none pair: the per-client key (10/300s, keyed by client
+        // prefix and account, per `auth::invite_attempt_allowed`) and
+        // the per-email key (5/hour), so rotating IPs or pre-created
+        // rows cannot multiply guesses against one invited address.
+        // Denial is the generic error — it never reveals which limit
+        // fired (no throttle oracle).
         let attempt_key = format!("invite:{}:{}", rate_limit_ip_key(&ctx.source_ip), user_id);
-        let allowed = ctx
-            .store
-            .reserve_rate_limit(
-                &attempt_key,
-                "auth.invite_redeem",
-                u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
-                ctx.now,
-                auth::INVITE_REDEMPTION_WINDOW_SECS,
-            )
-            .await
-            .unwrap_or(false);
+        let email_key = email_rate_limit_key(ctx.cfg, &magic.email);
+        let allowed = matches!(
+            ctx.store
+                .reserve_rate_limit_pair(
+                    RateLimitBudget {
+                        scope_key: &attempt_key,
+                        action: "auth.invite_redeem",
+                        limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
+                    },
+                    RateLimitBudget {
+                        scope_key: &email_key,
+                        action: "auth.invite_redeem_email",
+                        limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
+                    },
+                    ctx.now,
+                )
+                .await,
+            Ok(PairAdmission::Allowed)
+        );
         if !allowed {
             return generic_auth();
         }
@@ -2442,12 +2609,47 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
-        if auth::consume_invite(invite.clone(), &code).is_err() {
-            return generic_auth();
-        }
-        Some(invite)
+        // The snapshot prepare validates every refusal class with the
+        // one generic error (unknown/expired/revoked/email-mismatch/
+        // self-invite are indistinguishable) and stamps the spend the
+        // conditional claim will bind. It grants nothing on its own.
+        let issuer_email = invite.issuer_email.clone();
+        let redemption = auth::InviteRedemption {
+            user_id: &user_id,
+            email: &magic.email,
+            issuer_email: issuer_email.as_deref(),
+            now: ctx.now,
+        };
+        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+            Ok(prepared) => prepared,
+            Err(_) => return generic_auth(),
+        };
+        // The `invite.redeemed` audit rides the enrollment transaction
+        // inside `complete_registration`, so it can never be separated
+        // from the claim it records. It references the invite by row
+        // id only — no code or hash material.
+        let audit = vault::audit_event_extended(
+            prepared.issued_by.as_deref().unwrap_or("system"),
+            auth::INVITE_REDEEMED_AUDIT_ACTION,
+            true,
+            &ctx.source_ip,
+            ctx.now,
+            Some(&user_id),
+            serde_json::json!({
+                "invite_id": if prepared.id > 0 {
+                    serde_json::json!(prepared.id)
+                } else {
+                    serde_json::Value::Null
+                },
+            }),
+        );
+        Some((prepared, audit))
     } else {
         None
+    };
+    let (invite_to_consume, invite_audit) = match invite_redemption.as_ref() {
+        Some((invite, audit)) => (Some(invite), Some(audit)),
+        None => (None, None),
     };
     // Preserve the RP/origin/expiry snapshot validation; the transaction
     // below must still win every conditional claim before enrollment.
@@ -2474,7 +2676,8 @@ where
         .complete_registration(
             &challenge,
             &magic,
-            invite_to_consume.as_ref(),
+            invite_to_consume,
+            invite_audit,
             &stored,
             ctx.now,
         )
@@ -2975,6 +3178,20 @@ where
             // transient lookup error silently replace that session.
             Err(resp) if resp.status >= 500 => return resp,
             Err(_) => {}
+        }
+    }
+    // Invite-required posture: a credential-less account is a signup
+    // in progress, and its emailed token (sent by register/start as
+    // the inbox proof) must not mint a session on this route — that
+    // would complete a signup with no invite consumed. Refuse
+    // generically WITHOUT spending the token, so the legitimate
+    // enrollment at register/finish can still use it. Credentialed
+    // accounts keep the ordinary magic sign-in.
+    if ctx.cfg.invites_required {
+        match ctx.store.credentials_for_user(&record.user_id).await {
+            Ok(creds) if creds.is_empty() => return generic_auth(),
+            Ok(_) => {}
+            Err(_) => return internal(),
         }
     }
     // Pure validation is not authentication: prepare everything that can fail
@@ -4599,6 +4816,233 @@ where
     )
 }
 
+// --- Admin invites (migration 0030) --------------------------------------------------------
+//
+// API-only in M1: issue (plaintext shown once in the response, hash
+// only at rest), list/search by issuer/status, revoke. Everything
+// here rides the same non-enumerable `authenticate_admin` guard as
+// the 0028 surface, and every write commits with its audit row in
+// one transaction that re-reads the actor's role under its locks.
+
+/// Cap on one admin invite list response; pagination is post-M1.
+const ADMIN_INVITE_LIST_LIMIT: usize = 200;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminInviteIssueBody {
+    /// When set, redemption requires signup with this exact email.
+    email: Option<String>,
+    /// Per-invite expiry in days (1–30); absent means the
+    /// `invite_default_expiry_days` setting.
+    expires_in_days: Option<u32>,
+}
+
+/// One invite as the admin API reports it: lifecycle fields only —
+/// the code and its hash are never in any response.
+fn invite_admin_json(record: &InviteRecord, now: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.id,
+        "status": record.status(now),
+        "kind": record.kind,
+        "email": record.email,
+        "issued_by": record.issued_by,
+        "created_at": record.created_at,
+        "expires_at": record.expires_at,
+        "redeemed_by": record.redeemed_by,
+        "redeemed_at": record.redeemed_at,
+        "revoked_at": record.revoked_at,
+        "revoked_by": record.revoked_by,
+    })
+}
+
+/// `POST /v1/admin/invites` — issue one admin invite. The plaintext
+/// code is returned exactly once, in this response; only its hash is
+/// stored, and neither is ever logged or audited (the audit row
+/// references the new row id).
+async fn admin_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<AdminInviteIssueBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let email = match body.email.as_deref() {
+        Some(raw) => match normalize_email(raw) {
+            Some(email) => Some(email),
+            None => return validation_failed("invalid email"),
+        },
+        None => None,
+    };
+    let expiry_key = crate::admin::SettingKey::InviteDefaultExpiryDays;
+    let expires_in_days = match body.expires_in_days {
+        Some(days) => match expiry_key.validate(days) {
+            Some(days) => days,
+            None => return validation_failed("invite expiry out of range"),
+        },
+        None => {
+            let rows = match ctx.store.app_settings().await {
+                Ok(rows) => rows,
+                Err(_) => return internal(),
+            };
+            let stored = rows
+                .iter()
+                .find(|(name, _)| name == expiry_key.as_str())
+                .map(|(_, value)| value.as_str());
+            match expiry_key.resolve(stored) {
+                Some(days) => days,
+                None => return internal(),
+            }
+        }
+    };
+    let code = match auth::generate_invite_code() {
+        Ok(code) => code,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+        Err(_) => return internal(),
+    };
+    let record = InviteRecord::new_issued(
+        auth::hash_invite_code(&code),
+        Some(claims.user_id.clone()),
+        auth::INVITE_KIND_ADMIN,
+        email,
+        ctx.now,
+        ctx.now
+            .saturating_add(u64::from(expires_in_days).saturating_mul(86_400)),
+    );
+    let invite_id = match ctx
+        .store
+        .admin_issue_invite(&claims.user_id, &record, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(AdminInviteIssueOutcome::Issued(id)) => id,
+        // The actor lost admin between the guard and the write
+        // transaction's re-check: answer as any non-admin is answered.
+        Ok(AdminInviteIssueOutcome::ActorNotAdmin) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let mut issued = record;
+    issued.id = invite_id;
+    json_response(
+        201,
+        serde_json::json!({
+            "invite": invite_admin_json(&issued, ctx.now),
+            // Shown once: the issuer copies it now. It is not stored,
+            // not logged, and cannot be read back.
+            "code": code,
+        }),
+    )
+}
+
+/// `GET /v1/admin/invites` — every invite (newest first, capped),
+/// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
+/// Filters ride path segments: `Request` carries no query string and
+/// the M1 surface is API-only.
+async fn admin_invite_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Err(resp) = ctx.authenticate_admin(req, false).await {
+        return resp;
+    }
+    let (issuer, status) = if req.path == "/v1/admin/invites" {
+        (None, None)
+    } else if let Some(rest) = req.path.strip_prefix("/v1/admin/invites/") {
+        let Some((kind, value)) = rest.split_once('/') else {
+            return not_found();
+        };
+        if value.is_empty() || value.contains('/') {
+            return not_found();
+        }
+        match kind {
+            "status" => match value {
+                "active" | "expired" | "redeemed" | "revoked" => (None, Some(value)),
+                _ => return not_found(),
+            },
+            "issuer" => (Some(value), None),
+            _ => return not_found(),
+        }
+    } else {
+        return not_found();
+    };
+    let rows = match ctx
+        .store
+        .admin_list_invites(issuer, status, ctx.now, ADMIN_INVITE_LIST_LIMIT)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return internal(),
+    };
+    let invites: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|record| invite_admin_json(record, ctx.now))
+        .collect();
+    json_response(200, serde_json::json!({"invites": invites}))
+}
+
+/// `POST /v1/admin/invites/{id}/revoke` — revoke one unredeemed
+/// invite. Revocation wins redemption races (the store's conditional
+/// write); an already-revoked invite is an idempotent success, an
+/// already-redeemed one is a conflict — revocation never reaches
+/// back into a created account.
+async fn admin_invite_revoke<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(rest) = req.path.strip_prefix("/v1/admin/invites/") else {
+        return not_found();
+    };
+    let Some((raw_id, "revoke")) = rest.split_once('/') else {
+        return not_found();
+    };
+    // Strict decimal id: no sign, no whitespace, no leading zeros.
+    let invite_id: i64 = if raw_id.is_empty()
+        || !raw_id.bytes().all(|b| b.is_ascii_digit())
+        || (raw_id.len() > 1 && raw_id.starts_with('0'))
+    {
+        return not_found();
+    } else {
+        match raw_id.parse() {
+            Ok(id) => id,
+            Err(_) => return not_found(),
+        }
+    };
+    match ctx
+        .store
+        .admin_revoke_invite(&claims.user_id, invite_id, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(AdminInviteRevokeOutcome::Revoked | AdminInviteRevokeOutcome::AlreadyRevoked) => {
+            json_response(
+                200,
+                serde_json::json!({"id": invite_id, "status": "revoked"}),
+            )
+        }
+        Ok(AdminInviteRevokeOutcome::AlreadyRedeemed) => {
+            validation_failed("invite already redeemed")
+        }
+        Ok(AdminInviteRevokeOutcome::Missing | AdminInviteRevokeOutcome::ActorNotAdmin) => {
+            not_found()
+        }
+        Err(_) => internal(),
+    }
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// `u64` handler time as Stripe-epoch `i64` (saturates only past the year
@@ -5441,6 +5885,17 @@ where
         ("PUT", path) if path.starts_with("/v1/admin/users/") => {
             admin_user_role_put(ctx, req).await
         }
+        // Admin invites (migration 0030): issue, list (with the
+        // `/status/{s}` and `/issuer/{id}` segment filters), revoke.
+        // Same non-enumerable posture as the rest of the namespace.
+        ("POST", "/v1/admin/invites") => admin_invite_issue(ctx, req).await,
+        ("GET", "/v1/admin/invites") => admin_invite_list(ctx, req).await,
+        ("GET", path) if path.starts_with("/v1/admin/invites/") => {
+            admin_invite_list(ctx, req).await
+        }
+        ("POST", path) if path.starts_with("/v1/admin/invites/") => {
+            admin_invite_revoke(ctx, req).await
+        }
         // Preflight answers exactly the served paths (exact dispatch
         // paths, the single-segment revoke id, and the scope-map-served
         // native paths); unserved shapes stay 404 on preflight too.
@@ -5559,6 +6014,12 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        /// Next surrogate invite id to hand out (mirror of the
+        /// migration 0030 identity column).
+        next_invite_id: RefCell<i64>,
+        /// Mirror of `users.invited_by` (migration 0030), keyed by the
+        /// invited user's id.
+        invited_by: RefCell<HashMap<String, Option<String>>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
@@ -5729,6 +6190,7 @@ mod tests {
             challenge: &PasskeyChallenge,
             magic: &MagicLinkRecord,
             invite: Option<&InviteRecord>,
+            invite_audit: Option<&AuditEvent>,
             credential: &PasskeyCredential,
             now: u64,
         ) -> Result<(), StoreError> {
@@ -5737,6 +6199,8 @@ mod tests {
             let challenges_before = self.challenges.borrow().clone();
             let magic_before = self.magic.borrow().clone();
             let invites_before = self.invites.borrow().clone();
+            let audits_before = self.audits.borrow().len();
+            let invited_by_before = self.invited_by.borrow().clone();
             let result = async {
                 let mut claims = vec![
                     auth::SingleUseClaim::Challenge {
@@ -5753,6 +6217,14 @@ mod tests {
                         return Err(StoreError);
                     }
                 }
+                if let Some(record) = invite {
+                    // Mirror the production stamps + in-transaction audit.
+                    self.invited_by
+                        .borrow_mut()
+                        .insert(credential.user_id.clone(), record.issued_by.clone());
+                    let audit = invite_audit.ok_or(StoreError)?;
+                    self.audits.borrow_mut().push(audit.clone());
+                }
                 self.insert_credential(credential).await
             }
             .await;
@@ -5760,6 +6232,8 @@ mod tests {
                 *self.challenges.borrow_mut() = challenges_before;
                 *self.magic.borrow_mut() = magic_before;
                 *self.invites.borrow_mut() = invites_before;
+                self.audits.borrow_mut().truncate(audits_before);
+                *self.invited_by.borrow_mut() = invited_by_before;
             }
             result
         }
@@ -6085,7 +6559,17 @@ mod tests {
             &self,
             code_hash: &str,
         ) -> Result<Option<InviteRecord>, StoreError> {
-            Ok(self.invites.borrow().get(code_hash).cloned())
+            // Mirror the production join: the issuer's current email
+            // rides the record so the pure prepare can refuse
+            // self-invites.
+            let mut record = self.invites.borrow().get(code_hash).cloned();
+            if let Some(record) = &mut record {
+                record.issuer_email = record
+                    .issued_by
+                    .as_deref()
+                    .and_then(|id| self.users.borrow().get(id).map(|u| u.email.clone()));
+            }
+            Ok(record)
         }
         async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
             if *self.fail_session_insert.borrow() {
@@ -6739,6 +7223,104 @@ mod tests {
             }
             Ok(())
         }
+        async fn admin_issue_invite(
+            &self,
+            actor_user_id: &str,
+            record: &InviteRecord,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminInviteIssueOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminInviteIssueOutcome::ActorNotAdmin),
+            }
+            let id = {
+                let mut next = self.next_invite_id.borrow_mut();
+                *next += 1;
+                *next
+            };
+            let mut stored = record.clone();
+            stored.id = id;
+            if self
+                .invites
+                .borrow_mut()
+                .insert(stored.code_hash.clone(), stored)
+                .is_some()
+            {
+                return Err(StoreError);
+            }
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                auth::INVITE_ISSUED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({
+                    "invite_id": id,
+                    "kind": record.kind,
+                    "email_bound": record.email.is_some(),
+                    "expires_at": record.expires_at,
+                }),
+            ));
+            Ok(AdminInviteIssueOutcome::Issued(id))
+        }
+        async fn admin_list_invites(
+            &self,
+            issuer: Option<&str>,
+            status: Option<&str>,
+            now: u64,
+            limit: usize,
+        ) -> Result<Vec<InviteRecord>, StoreError> {
+            let mut rows: Vec<InviteRecord> = self
+                .invites
+                .borrow()
+                .values()
+                .filter(|row| issuer.is_none_or(|id| row.issued_by.as_deref() == Some(id)))
+                .filter(|row| status.is_none_or(|wanted| row.status(now) == wanted))
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| b.id.cmp(&a.id).then(b.created_at.cmp(&a.created_at)));
+            rows.truncate(limit);
+            Ok(rows)
+        }
+        async fn admin_revoke_invite(
+            &self,
+            actor_user_id: &str,
+            invite_id: i64,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminInviteRevokeOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminInviteRevokeOutcome::ActorNotAdmin),
+            }
+            let mut invites = self.invites.borrow_mut();
+            let Some(row) = invites.values_mut().find(|row| row.id == invite_id) else {
+                return Ok(AdminInviteRevokeOutcome::Missing);
+            };
+            if row.redeemed_at.is_some() || row.used {
+                return Ok(AdminInviteRevokeOutcome::AlreadyRedeemed);
+            }
+            if row.revoked_at.is_some() {
+                return Ok(AdminInviteRevokeOutcome::AlreadyRevoked);
+            }
+            row.revoked_at = Some(now);
+            row.revoked_by = Some(actor_user_id.to_string());
+            drop(invites);
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                auth::INVITE_REVOKED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({"invite_id": invite_id}),
+            ));
+            Ok(AdminInviteRevokeOutcome::Revoked)
+        }
     }
 
     /// Mirrors the conditional UPDATE/RETURNING semantics: one winner.
@@ -6778,10 +7360,41 @@ mod tests {
                     }
                 }
                 auth::SingleUseClaim::Invite { record } => {
+                    // Mirror the production conditional UPDATE: every
+                    // spend predicate is re-proven against the stored
+                    // row (and the redeemer's user row) at claim time.
+                    let redeemed_at = record.redeemed_at.unwrap_or(0);
+                    let redeemer_id = record.redeemed_by.clone().unwrap_or_default();
+                    let users = self.users.borrow();
+                    let redeemer_email = users.get(&redeemer_id).map(|u| u.email.clone());
                     let mut invites = self.invites.borrow_mut();
                     match invites.get_mut(&record.code_hash) {
-                        Some(row) if !row.used => {
+                        Some(row)
+                            if !row.used
+                                && row.redeemed_at.is_none()
+                                && row.revoked_at.is_none()
+                                && row.expires_at > redeemed_at
+                                && row.email.as_ref().is_none_or(|bound| {
+                                    redeemer_email
+                                        .as_ref()
+                                        .is_some_and(|email| email.eq_ignore_ascii_case(bound))
+                                })
+                                && !{
+                                    let issuer_email = row
+                                        .issued_by
+                                        .as_deref()
+                                        .and_then(|id| users.get(id))
+                                        .map(|u| u.email.clone());
+                                    matches!(
+                                        (&issuer_email, &redeemer_email),
+                                        (Some(issuer), Some(redeemer))
+                                            if issuer.eq_ignore_ascii_case(redeemer)
+                                    )
+                                } =>
+                        {
                             row.used = true;
+                            row.redeemed_by = record.redeemed_by.clone();
+                            row.redeemed_at = record.redeemed_at;
                             Ok(1)
                         }
                         _ => Ok(0),
@@ -11919,6 +12532,552 @@ mod tests {
         assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
+    /// One full passkey signup (start + finish) presenting `invite_code`
+    /// at finish only, mirroring the signup page's code step. Returns
+    /// the finish response and the user id minted at start.
+    fn signup_with_invite(
+        h: &Harness,
+        email: &str,
+        cred_id: &[u8],
+        cose_seed: u8,
+        invite_code: Option<&str>,
+    ) -> (Response, String) {
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": email}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let user_id = start["user_id"].as_str().unwrap().to_string();
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(cose_seed));
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": invite_code,
+            }),
+        );
+        (resp, user_id)
+    }
+
+    fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {
+        h.store
+            .audits
+            .borrow()
+            .iter()
+            .filter(|event| event.action == action)
+            .cloned()
+            .collect()
+    }
+
+    /// No audit row may ever carry invite code material, plaintext or
+    /// hash — rows reference invites by surrogate id only.
+    fn assert_no_code_material_in_audits(h: &Harness, code: &str, code_hash: &str) {
+        for event in h.store.audits.borrow().iter() {
+            let details = event.details.clone().unwrap_or_default();
+            assert!(
+                !details.contains(code) && !details.contains(code_hash),
+                "audit {} leaked code material: {details}",
+                event.action
+            );
+        }
+    }
+
+    #[test]
+    fn admin_invite_issue_list_revoke_round_trip_without_code_material() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // Non-admin probes of every invite route hear the plain 404 and
+        // store nothing (AC-I3).
+        for (method, path, cookie) in [
+            ("POST", "/v1/admin/invites", Some(member_cookie.clone())),
+            ("POST", "/v1/admin/invites", None),
+            ("GET", "/v1/admin/invites", Some(member_cookie.clone())),
+            (
+                "POST",
+                "/v1/admin/invites/1/revoke",
+                Some(member_cookie.clone()),
+            ),
+        ] {
+            let resp = h.call_full(
+                method,
+                path,
+                Some(serde_json::json!({}).to_string()),
+                cookie,
+                Some(ORIGIN),
+            );
+            assert_eq!(resp.status, 404, "{method} {path}: {}", resp.body);
+        }
+        let bearer = h.call_bearer(
+            "GET",
+            "/v1/admin/invites",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer.status, 404, "{}", bearer.body);
+        assert!(h.store.invites.borrow().is_empty());
+
+        // Issue: the plaintext code is in this response exactly once.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(
+                serde_json::json!({"email": "Invited@Example.com", "expires_in_days": 3})
+                    .to_string(),
+            ),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.body);
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        assert!(!code.is_empty());
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        assert_eq!(body["invite"]["status"], "active");
+        assert_eq!(body["invite"]["kind"], "admin");
+        assert_eq!(body["invite"]["email"], "invited@example.com");
+        assert_eq!(body["invite"]["issued_by"], "admin1");
+        assert_eq!(
+            body["invite"]["expires_at"].as_u64().unwrap(),
+            NOW + 3 * 86_400
+        );
+        // The hash is never in the response that carries the plaintext.
+        let code_hash = auth::hash_invite_code(&code);
+        assert!(!issued.body.contains(&code_hash));
+        assert!(h.store.invites.borrow().contains_key(&code_hash));
+
+        // The issue audit references the row id only.
+        let issued_audits = audits_with_action(&h, auth::INVITE_ISSUED_AUDIT_ACTION);
+        assert_eq!(issued_audits.len(), 1);
+        assert_eq!(issued_audits[0].user_id, "admin1");
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+
+        // Out-of-range per-invite expiry is refused and stores nothing.
+        let refused = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({"expires_in_days": 31}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(refused.status, 422, "{}", refused.body);
+        assert_eq!(h.store.invites.borrow().len(), 1);
+
+        // List + filters: lifecycle fields only, never code material.
+        for (path, expected) in [
+            ("/v1/admin/invites".to_string(), 1),
+            ("/v1/admin/invites/status/active".to_string(), 1),
+            ("/v1/admin/invites/status/revoked".to_string(), 0),
+            ("/v1/admin/invites/issuer/admin1".to_string(), 1),
+            ("/v1/admin/invites/issuer/nobody".to_string(), 0),
+        ] {
+            let resp = h.call_full("GET", &path, None, Some(admin_cookie.clone()), None);
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(
+                body["invites"].as_array().unwrap().len(),
+                expected,
+                "{path}"
+            );
+            assert!(!resp.body.contains(&code), "{path} leaked the code");
+            assert!(!resp.body.contains(&code_hash), "{path} leaked the hash");
+        }
+        let bogus = h.call_full(
+            "GET",
+            "/v1/admin/invites/status/bogus",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(bogus.status, 404, "{}", bogus.body);
+
+        // Revoke: audited, idempotent, and unknown ids are a plain 404.
+        let revoke_path = format!("/v1/admin/invites/{invite_id}/revoke");
+        let revoked = h.call_full(
+            "POST",
+            &revoke_path,
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(revoked.status, 200, "{}", revoked.body);
+        let again = h.call_full(
+            "POST",
+            &revoke_path,
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(again.status, 200, "{}", again.body);
+        assert_eq!(
+            audits_with_action(&h, auth::INVITE_REVOKED_AUDIT_ACTION).len(),
+            1,
+            "the idempotent re-revoke must not audit twice"
+        );
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+        let missing = h.call_full(
+            "POST",
+            "/v1/admin/invites/999/revoke",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(missing.status, 404, "{}", missing.body);
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/invites/status/revoked",
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["invites"].as_array().unwrap().len(), 1);
+        assert_eq!(body["invites"][0]["revoked_by"], "admin1");
+    }
+
+    #[test]
+    fn invite_redemption_enrolls_once_and_stamps_invited_by() {
+        let mut h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.config.invites_required = true;
+
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({"email": "new@example.com"}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.body);
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        // No per-invite expiry: the typed default (7 days) applies.
+        assert_eq!(
+            body["invite"]["expires_at"].as_u64().unwrap(),
+            NOW + 7 * 86_400
+        );
+
+        let (resp, user_id) =
+            signup_with_invite(&h, "new@example.com", b"invited-cred-1", 81, Some(&code));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+
+        let code_hash = auth::hash_invite_code(&code);
+        {
+            let invites = h.store.invites.borrow();
+            let row = &invites[&code_hash];
+            assert!(row.used);
+            assert_eq!(row.redeemed_by.as_deref(), Some(user_id.as_str()));
+            assert_eq!(row.redeemed_at, Some(NOW));
+        }
+        assert_eq!(
+            h.store.invited_by.borrow().get(&user_id),
+            Some(&Some("admin1".to_string()))
+        );
+        let redeemed = audits_with_action(&h, auth::INVITE_REDEEMED_AUDIT_ACTION);
+        assert_eq!(redeemed.len(), 1);
+        assert_eq!(
+            redeemed[0].subject_user_id.as_deref(),
+            Some(user_id.as_str())
+        );
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+
+        // A redeemed invite cannot be revoked after the fact.
+        let conflict = h.call_full(
+            "POST",
+            &format!("/v1/admin/invites/{invite_id}/revoke"),
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(conflict.status, 422, "{}", conflict.body);
+
+        // Exactly once: a second signup with a spent (unbound) code
+        // enrolls nothing and audits no second redemption.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let shared = body["code"].as_str().unwrap().to_string();
+        let (first, _) = signup_with_invite(
+            &h,
+            "first@example.com",
+            b"invited-cred-2",
+            82,
+            Some(&shared),
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        let (second, second_user) = signup_with_invite(
+            &h,
+            "second@example.com",
+            b"invited-cred-3",
+            83,
+            Some(&shared),
+        );
+        assert_eq!(second.status, 401, "{}", second.body);
+        assert!(second.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user(&second_user))
+                .unwrap()
+                .is_empty(),
+            "the losing signup must not enroll a credential"
+        );
+        assert_eq!(
+            audits_with_action(&h, auth::INVITE_REDEEMED_AUDIT_ACTION).len(),
+            2,
+            "one redemption audit per successful signup, no more"
+        );
+    }
+
+    #[test]
+    fn invite_invalid_classes_share_one_generic_error_at_signup_start() {
+        let mut h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.config.invites_required = true;
+
+        // One stored invite per invalid class (AC-I1).
+        let seed_code = |code: &str, mutate: &dyn Fn(&mut InviteRecord)| {
+            let hash = auth::hash_invite_code(code);
+            let mut record = InviteRecord::new_issued(
+                hash.clone(),
+                Some("admin1".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW - 1_000,
+                NOW + 604_800,
+            );
+            mutate(&mut record);
+            h.store.invites.borrow_mut().insert(hash, record);
+        };
+        seed_code("expired-code", &|r| r.expires_at = NOW - 1);
+        seed_code("revoked-code", &|r| r.revoked_at = Some(NOW - 10));
+        seed_code("spent-code", &|r| {
+            r.used = true;
+            r.redeemed_at = Some(NOW - 10);
+        });
+        seed_code("bound-code", &|r| {
+            r.email = Some("someone-else@example.com".to_string())
+        });
+        seed_code("self-code", &|_| {});
+
+        let mail_before = h.mailer.sent.borrow().len();
+        let mut bodies = Vec::new();
+        for (index, code) in [
+            "unknown-code",
+            "expired-code",
+            "revoked-code",
+            "spent-code",
+            "bound-code",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({
+                    "email": format!("probe-{index}@example.com"),
+                    "invite_code": code,
+                }),
+            );
+            assert_eq!(resp.status, 401, "{code}: {}", resp.body);
+            assert!(resp.set_cookie.is_none());
+            bodies.push(resp.body);
+        }
+        // Self-invite: the issuer's own email is refused the same way.
+        let self_resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "admin@example.com", "invite_code": "self-code"}),
+        );
+        assert_eq!(self_resp.status, 401, "{}", self_resp.body);
+        bodies.push(self_resp.body);
+        assert!(
+            bodies.iter().all(|body| body == &bodies[0]),
+            "every invalid class must be byte-identical: {bodies:?}"
+        );
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            mail_before,
+            "a refused pre-check mints no signup and sends no mail"
+        );
+
+        // A valid code passes the pre-check WITHOUT being consumed:
+        // abandoning this signup leaves it redeemable, and finishing a
+        // later signup with it succeeds. Revoking it in between a start
+        // and its finish makes that finish fail generically instead.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "racer@example.com", "invite_code": code}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start_body: serde_json::Value = serde_json::from_str(&start.body).unwrap();
+        let challenge = start_body["challenge"].as_str().unwrap().to_string();
+        let racer_id = start_body["user_id"].as_str().unwrap().to_string();
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let code_hash = auth::hash_invite_code(&code);
+        assert!(
+            !h.store.invites.borrow()[&code_hash].used,
+            "the pre-check must never consume the code"
+        );
+        let revoked = h.call_full(
+            "POST",
+            &format!("/v1/admin/invites/{invite_id}/revoke"),
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(revoked.status, 200, "{}", revoked.body);
+        let att = fx_none_attestation(b"racer-cred", &fx_es256_cose(84));
+        let finish = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(b"racer-cred"),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": code,
+            }),
+        );
+        assert_eq!(finish.status, 401, "{}", finish.body);
+        assert_eq!(finish.body, bodies[0]);
+        assert!(block_on(h.store.credentials_for_user(&racer_id))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn invite_per_email_budget_denies_sixth_attempt_generically() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let good_hash = auth::hash_invite_code("email-budget-code");
+        h.store.invites.borrow_mut().insert(
+            good_hash.clone(),
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
+        );
+        let finish_with_code = |code: &str| {
+            let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+            let challenge_id = challenge.id.clone();
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+            )
+            .unwrap();
+            let (token, record) =
+                auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
+            block_on(h.store.insert_magic(&record)).unwrap();
+            let att = fx_none_attestation(b"email-budget-cred", &fx_es256_cose(85));
+            h.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                serde_json::json!({
+                    "challenge": challenge_id,
+                    "credential_id": b64url_encode(b"email-budget-cred"),
+                    "attestation_object": b64url_encode(&att),
+                    "client_data_json": b64url_encode(
+                        fx_client_json("webauthn.create", &challenge_id).as_bytes()
+                    ),
+                    "magic_token": token,
+                    "invite_code": code,
+                }),
+            )
+        };
+        // Five wrong guesses spend the per-email budget (5/hour) while
+        // the per-client budget (10/300s) still has room...
+        for _ in 0..auth::INVITE_EMAIL_MAX_ATTEMPTS {
+            assert_eq!(finish_with_code("wrong-code").status, 401);
+        }
+        // ...so the sixth attempt is denied generically even with the
+        // correct code, and the code stays unspent.
+        let denied = finish_with_code("email-budget-code");
+        assert_eq!(denied.status, 401, "{}", denied.body);
+        assert!(denied.set_cookie.is_none());
+        assert!(!h.store.invites.borrow()[&good_hash].used);
+        assert!(block_on(h.store.credentials_for_user("u1"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn magic_finish_cannot_bypass_invite_gate_for_credentialless_account() {
+        let mut h = harness();
+        h.config.invites_required = true;
+        seed_user(&h, "u-nocred", "nocred@example.com");
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "nocred@example.com"}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let token_hash = auth::hash_magic_token(&token);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.magic.borrow()[&token_hash].used,
+            "the refused finish must not spend the token"
+        );
+        assert!(h.store.sessions.borrow().is_empty());
+
+        // An established member (has a credential) is unaffected: the
+        // gate is on account creation, not on sign-in.
+        seed_user(&h, "u-member", "member2@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"member2-cred"),
+            user_id: "u-member".to_string(),
+            public_key: fx_es256_cose(86),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let cookie = magic_login(&h, "member2@example.com");
+        assert!(!cookie.is_empty());
+    }
+
     #[test]
     fn bearer_gate_enforces_scope_without_session_fallback() {
         let h = peppered_harness();
@@ -13155,11 +14314,14 @@ mod tests {
         let invite_hash = auth::hash_invite_code("retry-invite");
         h.store.invites.borrow_mut().insert(
             invite_hash.clone(),
-            InviteRecord {
-                code_hash: invite_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                invite_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let start = h.call(
             "POST",
@@ -13236,11 +14398,14 @@ mod tests {
         let good_hash = auth::hash_invite_code("right-invite");
         h.store.invites.borrow_mut().insert(
             good_hash.clone(),
-            InviteRecord {
-                code_hash: good_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let resp = h.call(
             "POST",
@@ -15251,11 +16416,14 @@ mod tests {
         let good_hash = auth::hash_invite_code("correct-code-1");
         h.store.invites.borrow_mut().insert(
             good_hash.clone(),
-            InviteRecord {
-                code_hash: good_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         // Ten wrong guesses: admitted by the throttle, denied on the code.
         for _ in 0..auth::INVITE_REDEMPTION_MAX_ATTEMPTS {
@@ -15282,11 +16450,14 @@ mod tests {
         let good_hash_2 = auth::hash_invite_code("correct-code-2");
         h.store.invites.borrow_mut().insert(
             good_hash_2.clone(),
-            InviteRecord {
-                code_hash: good_hash_2,
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash_2,
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
         assert_eq!(resp.status, 200, "{}", resp.body);

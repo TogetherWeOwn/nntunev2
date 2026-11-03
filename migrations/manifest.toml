@@ -157,3 +157,8 @@ sha256 = "0073041714e1a43d69f9dcb42483a3cc12baf6945326b8b20bac94047c85611a"
 file = "0032_ledger_seconds_floor.sql"
 target = "app"
 sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
+
+[[migration]]
+file = "0030_invite_codes.sql"
+target = "app"
+sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"

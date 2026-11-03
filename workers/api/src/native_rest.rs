@@ -500,6 +500,22 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/admin/settings" {
                 return SessionOnly;
             }
+            // Admin invite list (migration 0030): the bare path, or
+            // one filter pair (`status/{s}` / `issuer/{id}`). Deeper
+            // shapes deny here, before any spend.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((filter, value)) = rest.split_once('/') {
+                    if matches!(filter, "status" | "issuer")
+                        && !value.is_empty()
+                        && !value.contains('/')
+                    {
+                        return SessionOnly;
+                    }
+                }
+            }
             Deny
         }
         // HEAD revalidates exactly the GET-readable catalog roots: a
@@ -543,6 +559,19 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if let Some(rest) = path.strip_prefix("/v1/libraries/") {
                 if let Some((id, tail)) = rest.split_once('/') {
                     if !id.is_empty() && tail == "members" {
+                        return SessionOnly;
+                    }
+                }
+            }
+            // Admin invite writes (migration 0030): issue at the bare
+            // path, revoke at `{id}/revoke`. Session-only, like the
+            // rest of the admin surface.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((id, tail)) = rest.split_once('/') {
+                    if !id.is_empty() && tail == "revoke" {
                         return SessionOnly;
                     }
                 }

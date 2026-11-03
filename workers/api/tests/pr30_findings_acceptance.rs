@@ -125,11 +125,14 @@ impl FakeStore {
     fn seed_invite(&self, code: &str) {
         self.invites.borrow_mut().insert(
             auth::hash_invite_code(code),
-            auth::InviteRecord {
-                code_hash: auth::hash_invite_code(code),
-                used: false,
-                created_at: NOW,
-            },
+            auth::InviteRecord::new_issued(
+                auth::hash_invite_code(code),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
     }
 
@@ -213,6 +216,7 @@ impl handlers::Store for FakeStore {
         challenge: &auth::PasskeyChallenge,
         magic: &auth::MagicLinkRecord,
         invite: Option<&auth::InviteRecord>,
+        invite_audit: Option<&vault::AuditEvent>,
         credential: &auth::PasskeyCredential,
         now: u64,
     ) -> Result<(), handlers::StoreError> {
@@ -221,6 +225,7 @@ impl handlers::Store for FakeStore {
         let challenges_before = self.challenges.borrow().clone();
         let magic_before = self.magic.borrow().clone();
         let invites_before = self.invites.borrow().clone();
+        let audits_before = self.audits.borrow().len();
         let result = async {
             let mut claims = vec![
                 auth::SingleUseClaim::Challenge {
@@ -241,6 +246,12 @@ impl handlers::Store for FakeStore {
                     return Err(handlers::StoreError);
                 }
             }
+            // The redemption audit rides the enrollment transaction:
+            // an invite without its audit fails the whole commit.
+            if invite.is_some() {
+                let audit = invite_audit.ok_or(handlers::StoreError)?;
+                self.audits.borrow_mut().push(audit.clone());
+            }
             self.insert_credential(credential).await
         }
         .await;
@@ -248,6 +259,7 @@ impl handlers::Store for FakeStore {
             *self.challenges.borrow_mut() = challenges_before;
             *self.magic.borrow_mut() = magic_before;
             *self.invites.borrow_mut() = invites_before;
+            self.audits.borrow_mut().truncate(audits_before);
         }
         result
     }

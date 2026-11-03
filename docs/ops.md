@@ -390,6 +390,30 @@ bootstrap rather than an admin-API write.) After promotion, the owner
 signs in normally and every further role change goes through
 `PUT /v1/admin/users/{id}/role`, which writes its own audit row.
 
+### Admin-issued invites
+
+Migration 0029 extends `invite_codes` (surrogate row id, issuer, kind,
+optional email binding, required expiry, redemption and revocation
+stamps) and adds `users.invited_by`. Signed-in admins manage invites
+through the role-gated admin API: `POST /v1/admin/invites` issues one
+invite (optionally bound to an email; per-invite expiry 1–30 days, or
+the `invite_default_expiry_days` setting), `GET /v1/admin/invites`
+(with `/status/{active|expired|redeemed|revoked}` and
+`/issuer/{user_id}` filters) lists lifecycle state, and
+`POST /v1/admin/invites/{id}/revoke` revokes an unredeemed invite.
+The plaintext code is returned exactly once, in the issue response;
+only its hash is stored, and audit rows (`invite.issued`,
+`invite.redeemed`, `invite.revoked`) reference the invite by row id —
+code material is never stored, logged, or audited. A code is consumed
+atomically inside signup completion only, so an abandoned signup
+leaves it redeemable, a committed revocation beats an in-flight
+redemption, and deleting the redeemed account never frees the code.
+Every invalid code — unknown, expired, revoked, spent, email-mismatch
+or the issuer's own email — gets the same generic signup error.
+Flipping `INVITES_REQUIRED` on stays the last operator step, after
+the bootstrap above and after a first invite has been issued and
+redeemed end-to-end in that environment.
+
 ### Hyperdrive bindings
 
 | Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |
