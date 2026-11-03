@@ -1,6 +1,6 @@
 //! Playback enforcement core: the pure decisions behind grant issuance
 //! (subscription gate, hour cap, one-concurrent-stream lease) plus the
-//! `playback_leases` statements (migration 0030).
+//! `playback_leases` statements (migration 0031).
 //!
 //! Pure Rust, native + wasm32, NO Worker runtime imports — same
 //! constraint as `billing` / `plan_limits` / `ledger`. Time arrives only
@@ -205,7 +205,7 @@ impl LeaseHeartbeat {
 // --- Statements: parameterized lease access ---------------------------------
 //
 // The Worker binds fields positionally and never interpolates. Epoch and
-// timestamps are BIGINT Unix seconds (migration 0030 domain). Both
+// timestamps are BIGINT Unix seconds (migration 0031 domain). Both
 // writers carry the account-deletion fence in its locking form (ADR
 // 0002 rule 3): the eligible `users` row is read `FOR SHARE` inside the
 // write (`writer_fence`, the same shape the ledger uses), so the
