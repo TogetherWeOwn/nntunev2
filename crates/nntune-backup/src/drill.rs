@@ -269,14 +269,14 @@ pub fn restore_and_decrypt(
         serde_json::from_slice(row_raw.split(|b| *b == b'\n').next().unwrap_or(&row_raw))
             .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
 
-    let kek = keyring.get(row.kek_version)?;
+    let mut kek = keyring.get(row.kek_version)?;
     let env = Envelope {
         dek_wrapped_nonce: b64_nonce(&row.dek_wrapped_nonce_b64)?,
         dek_wrapped: b64_bytes(&row.dek_wrapped_b64, 48)?,
         payload_nonce: b64_nonce(&row.payload_nonce_b64)?,
         ciphertext: b64_bytes(&row.ciphertext_b64, 0)?,
     };
-    let media_key = envelope::open_media_key(
+    let mut media_key = match envelope::open_media_key(
         &kek,
         &row.user_id,
         &row.row_key,
@@ -284,12 +284,21 @@ pub fn restore_and_decrypt(
         row.payload_format,
         row.kek_version,
         &env,
-    )?;
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            kek.zeroize();
+            return Err(DrillError::Envelope(e));
+        }
+    };
+    kek.zeroize();
     if media_key.len() != 32 {
+        media_key.zeroize();
         return Err(DrillError::Crypto("media key length".to_string()));
     }
     let mut derived = [0u8; DERIVED_LEN];
     derived[..32].copy_from_slice(&media_key);
+    media_key.zeroize();
 
     let blob = std::fs::read(restore_dir.join("blobs/drill-track-1.bin"))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("blob read: {e}"))))?;
@@ -303,7 +312,10 @@ pub fn restore_and_decrypt(
     let plaintext_size = plaintext_size_from_blob(blob.len() as u64);
     let mut first = vec![0u8; plaintext_size.min(FIRST_READ_LEN) as usize];
     let n1 = nntune_core::decrypt::rclone::read_at(&blob, &derived, plaintext_size, &mut first, 0)
-        .map_err(|e| DrillError::Crypto(e.to_string()))?;
+        .map_err(|e| {
+            derived.zeroize();
+            DrillError::Crypto(e.to_string())
+        })?;
     first.truncate(n1);
     let mut rest = vec![0u8; plaintext_size.saturating_sub(n1 as u64) as usize];
     let n2 = nntune_core::decrypt::rclone::read_at(
@@ -313,12 +325,19 @@ pub fn restore_and_decrypt(
         &mut rest,
         n1 as u64,
     )
-    .map_err(|e| DrillError::Crypto(e.to_string()))?;
+    .map_err(|e| {
+        derived.zeroize();
+        DrillError::Crypto(e.to_string())
+    })?;
     rest.truncate(n2);
+    derived.zeroize();
     let mut restored = first;
     restored.extend_from_slice(&rest);
 
-    let manifest_raw = std::fs::read(bundle_dir.join(bundle::MANIFEST_FILE))
+    // The evidence hash covers the manifest as restored into the
+    // isolated environment — the same copy every other read above
+    // came from — never the backup-store original.
+    let manifest_raw = std::fs::read(restore_dir.join(bundle::MANIFEST_FILE))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("manifest read: {e}"))))?;
     let finished = now_unix();
     Ok(DrillEvidence {

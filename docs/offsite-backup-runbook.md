@@ -124,14 +124,19 @@ serialization cannot leak one.
    umask 077
    SCRATCH="$(mktemp -d)"
    trap 'shred -u "$SCRATCH/rows.jsonl" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
-   psql "$RESTORE_DSN" -c "COPY (SELECT 'global' AS user_id, track_id::text AS row_key, \
+   # One JSON object per line via row_to_json: the verifier parses
+   # JSONL, not the tab-delimited text a bare COPY (SELECT …) emits
+   # (every such row would fail closed as Shape). Key names must match
+   # the verifier's row shape exactly.
+   psql "$RESTORE_DSN" -t -A -c "COPY (SELECT row_to_json(t) FROM (SELECT 'global' AS user_id, \
+     track_id::text AS row_key, \
      nzb_ref_envelope_version AS envelope_version, \
      nzb_ref_payload_format AS payload_format, nzb_ref_kek_version AS kek_version, \
      encode(nzb_ref_dek_wrapped_nonce,'hex') AS dek_wrapped_nonce_hex, \
      encode(nzb_ref_dek_wrapped,'hex') AS dek_wrapped_hex, \
      encode(nzb_ref_payload_nonce,'hex') AS payload_nonce_hex, \
      encode(nzb_ref_encrypted,'hex') AS ciphertext_hex \
-     FROM track_sources) TO STDOUT" > "$SCRATCH/rows.jsonl"
+     FROM track_sources) t) TO STDOUT" > "$SCRATCH/rows.jsonl"
    BACKUP_DRILL_KEK_V1="$(op read …)" BACKUP_DRILL_KEK_V2="$(op read …)" \
      ./target/debug/backup-drill verify --rows "$SCRATCH/rows.jsonl" > "$SCRATCH/verify-report.json"
    ```

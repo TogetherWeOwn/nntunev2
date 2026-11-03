@@ -29,12 +29,21 @@ fn usage() -> ! {
 /// stdout.
 fn keyring_from_env() -> Result<Keyring, String> {
     let mut keys: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
+    // The process exits immediately after any error here, but KEK
+    // bytes parsed before the bad variable must still not linger:
+    // clear them before returning the error.
     for (name, value) in std::env::vars() {
         if let Some(v) = name.strip_prefix("BACKUP_DRILL_KEK_V") {
-            let version: u32 = v.parse().map_err(|_| format!("bad KEK var: {name}"))?;
-            let raw = verify::decode_hex(value.trim()).ok_or_else(|| format!("{name}: bad hex"))?;
+            let version: u32 = match v.parse() {
+                Ok(v) => v,
+                Err(_) => return clear_and_fail(&mut keys, format!("bad KEK var: {name}")),
+            };
+            let raw = match verify::decode_hex(value.trim()) {
+                Some(raw) => raw,
+                None => return clear_and_fail(&mut keys, format!("{name}: bad hex")),
+            };
             if raw.len() != 32 {
-                return Err(format!("{name}: want 64 hex chars"));
+                return clear_and_fail(&mut keys, format!("{name}: want 64 hex chars"));
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&raw);
@@ -45,6 +54,20 @@ fn keyring_from_env() -> Result<Keyring, String> {
         return Err("no BACKUP_DRILL_KEK_V<version> in environment".to_string());
     }
     Ok(Keyring::new(keys))
+}
+
+/// Zeroize already-parsed KEK bytes, then report the parse failure.
+/// Split out (rather than a closure) so the error sites can keep
+/// borrowing `keys` mutably for subsequent inserts.
+fn clear_and_fail(
+    keys: &mut std::collections::BTreeMap<u32, [u8; 32]>,
+    msg: String,
+) -> Result<Keyring, String> {
+    use zeroize::Zeroize;
+    for k in keys.values_mut() {
+        k.zeroize();
+    }
+    Err(msg)
 }
 
 fn main() {

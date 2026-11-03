@@ -2,9 +2,11 @@
 //! only) and count.
 //!
 //! The operator exports production-shaped rows with BYTEA columns
-//! hex-encoded (`encode(col, 'hex')`) — see
-//! `docs/offsite-backup-runbook.md` §4b — and supplies the KEKs for
-//! exactly the backup's versions. This module never prints plaintext,
+//! hex-encoded (`encode(col, 'hex')`), one JSON object per line via
+//! `row_to_json` — see `docs/offsite-backup-runbook.md` §4b — and
+//! supplies the KEKs for exactly the backup's versions. Anything that
+//! is not one JSON row object per line (a bare tab-delimited COPY
+//! included) fails closed as `Shape`. This module never prints plaintext,
 //! keys, or ciphertext; the [`VerifyReport`] carries counts and version
 //! numbers only. Unknown envelope versions and missing KEK versions are
 //! failures, not skips: the keyring backup is incomplete.
@@ -250,6 +252,18 @@ mod tests {
     #[test]
     fn bad_hex_fails_closed() {
         let rep = verify_rows("{\"oops\": true}\n", &keyring(&[7]), "test");
+        assert_eq!((rep.rows, rep.ok, rep.failed), (1, 0, 1));
+    }
+
+    #[test]
+    fn tab_delimited_copy_fails_closed() {
+        // A bare `COPY (SELECT …) TO STDOUT` emits tab-delimited text,
+        // not JSON: the verifier must count it failed, never open.
+        let rep = verify_rows(
+            "global\tu:t\t2\t1\t7\t00\t00\t00\t00\n",
+            &keyring(&[7]),
+            "test",
+        );
         assert_eq!((rep.rows, rep.ok, rep.failed), (1, 0, 1));
     }
 }

@@ -3,8 +3,11 @@
 //! A bundle is a directory — the unit the operator copies to R2
 //! (`offsite/<env>/...`, see `docs/offsite-backup-runbook.md`). Every
 //! file except the manifest itself is content-addressed by SHA-256 in
-//! the manifest, so `verify_bundle` detects truncation or tampering
-//! before any restore. The bundle carries ciphertext and wrapped keys
+//! the manifest, so `verify_bundle` detects truncation or corruption
+//! before any restore. The manifest itself is unauthenticated, so it
+//! is not tamper evidence on its own: tampering that rewrites both a
+//! file and its manifest entry is caught downstream by the AEAD row
+//! verification (`verify_rows`), which fails closed. The bundle carries ciphertext and wrapped keys
 //! only: KEK values never appear here (keyring entries are version
 //! numbers only, never material; date ranges live in the operator
 //! manifest, not the bundle).
@@ -210,9 +213,11 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
 }
 
 /// Verify every manifest-listed file exists with the recorded hash.
-/// Returns the manifest on success. Symlinks are refused: `fs::read`
-/// follows them, so without this check a crafted bundle could verify
-/// bytes from outside the bundle boundary.
+/// Returns the manifest on success. Symlinks are refused at every
+/// level: `fs::read` follows them, so without this check a crafted
+/// bundle could verify bytes from outside the bundle boundary — either
+/// via a symlinked file or via a symlinked intermediate directory
+/// (e.g. `blobs/` pointing elsewhere).
 pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
     let manifest = read_manifest(dir)?;
     for f in &manifest.files {
@@ -220,11 +225,26 @@ pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
             return Err(BundleError::Io(format!("unsafe bundle path: {}", f.path)));
         }
         let full = dir.join(&f.path);
-        let meta = std::fs::symlink_metadata(&full).map_err(|_| BundleError::MissingFile {
-            path: f.path.clone(),
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(BundleError::Io(format!("refuses symlink: {}", f.path)));
+        // Walk the file and every ancestor directory down to (but
+        // excluding) the bundle root: any symlink in the chain could
+        // redirect reads outside the bundle. `full` is
+        // `dir.join(rel)` with `rel` relative and `..`-free, so the
+        // ancestor chain always reaches `dir`.
+        let mut cur: &Path = &full;
+        loop {
+            let meta = std::fs::symlink_metadata(cur).map_err(|_| BundleError::MissingFile {
+                path: f.path.clone(),
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(BundleError::Io(format!("refuses symlink: {}", f.path)));
+            }
+            if cur == dir {
+                break;
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
         }
         let bytes = std::fs::read(&full).map_err(|_| BundleError::MissingFile {
             path: f.path.clone(),
@@ -299,6 +319,34 @@ mod tests {
         assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_parent_dir_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 5));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        w.stage_file("blobs/x.bin", b"secretbox-bytes").unwrap();
+        w.finish().unwrap();
+        // Swap the intermediate directory for a symlink to a
+        // lookalike tree outside the bundle: verification must refuse,
+        // not follow it — even though the final file name resolves.
+        let outside = std::env::temp_dir().join(format!(
+            "nntune-backup-test-{}-outside-dir",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.bin"), b"secretbox-bytes").unwrap();
+        std::fs::remove_dir_all(dir.join("blobs")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("blobs")).unwrap();
+        #[cfg(unix)]
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
