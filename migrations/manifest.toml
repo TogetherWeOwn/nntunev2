@@ -129,6 +129,11 @@ target = "app"
 sha256 = "b3668efdfd27bd81d9a9f86441c29925963943c30ed969303bd518af91f30b0c"
 
 [[migration]]
-file = "0027_mb_mirror_w6b.sql"
+file = "0027_track_sources_global.sql"
+target = "app"
+sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
+
+[[migration]]
+file = "0028_mb_mirror_w6b.sql"
 target = "mirror"
-sha256 = "c865ef527cc5688c6d3c884be883d918219f1f9ad217f627620bcfe563851a5f"
+sha256 = "6f8b2476193ac534351188f69c35c90781ebea7cb449ee2f0da725f57ab93224"

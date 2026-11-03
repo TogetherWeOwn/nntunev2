@@ -1240,7 +1240,7 @@ fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
 }
 
 /// An ISRC code has the mirror shape (see `mb_recording_isrc` in
-/// migration 0027): 12 characters, 2 uppercase letters (country) + 3
+/// migration 0028): 12 characters, 2 uppercase letters (country) + 3
 /// uppercase-alphanumeric (registrant) + 7 digits (year/designation).
 /// Hand-rolled (no regex dependency): the mirror `CHECK` guarantees fresh
 /// rows match, so a cached entry that does not is poisoned, never fresh.

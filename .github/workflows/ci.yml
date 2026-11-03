@@ -269,6 +269,17 @@ jobs:
         run: python3 .github/scripts/clean_room_lint.py
       - name: Unit-test the clean-room lint
         run: python3 .github/scripts/test_clean_room_lint.py
+      # Fixture licence guard (docs/fixture-audio-licences.md): no
+      # tracked audio/NZB outside a CC0-manifest path, every fixture
+      # manifest carries an allow-listed licence, code references
+      # only manifest-listed R2 keys. Needs no credentials; the
+      # fetch-by-key helper's own suite is offline too.
+      - name: Check fixture audio licences
+        run: python3 .github/scripts/check_fixture_licences.py
+      - name: Unit-test the fixture licence guard
+        run: python3 .github/scripts/test_check_fixture_licences.py
+      - name: Unit-test the CC0 fixture fetcher
+        run: python3 fixtures/cc0/test_fetch_fixture.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
@@ -849,10 +860,10 @@ jobs:
         run: set -o pipefail; docker run --rm mb-import:ci | grep -q '^Usage:'
       # Apply only the mirror-target migrations (base 0001 + importer 0014
       # + track membership 0016 + replication ledger 0017 + W6b slice
-      # 0027); app migrations need the full app schema
+      # 0028); app migrations need the full app schema
       # and run in api-migrations.
       - name: Apply mirror migrations
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0027_mb_mirror_w6b.sql
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0028_mb_mirror_w6b.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
       - name: Run import integration suite in the shipped image

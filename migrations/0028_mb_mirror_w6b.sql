@@ -1,4 +1,4 @@
--- 0027_mb_mirror_w6b: release groups, URL relationships, music videos, ISRCs.
+-- 0028_mb_mirror_w6b: release groups, URL relationships, music videos, ISRCs.
 BEGIN;
 --
 -- W6b slice of the CC0-only mirror (ADR 0007): release groups (with the
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS mb_release_group (
 );
 
 -- The release -> group link. NULL until the release is (re-)imported
--- from a dump carrying the group column: pre-0027 rows keep serving
+-- from a dump carrying the group column: pre-0028 rows keep serving
 -- without a group rather than failing the migration.
 ALTER TABLE mb_release ADD COLUMN IF NOT EXISTS release_group_mbid
     UUID REFERENCES mb_release_group (mbid) ON DELETE SET NULL;

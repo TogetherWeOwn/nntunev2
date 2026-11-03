@@ -5,7 +5,7 @@ database (via Hyperdrive). Schema: `migrations/0001_mb_mirror.sql`
 (mirror tables plus the single-row `mb_import_state` snapshot),
 `0016_mb_track.sql` (`mb_track` listing source),
 `0017_mb_replication_packet_ledger.sql` (per-packet SLO ledger) and
-`0027_mb_mirror_w6b.sql` (release groups, curated URL relationships,
+`0028_mb_mirror_w6b.sql` (release groups, curated URL relationships,
 music-video pairs and ISRCs).
 Decision: `docs/adr/0007-mb-mirror.md`.
 
