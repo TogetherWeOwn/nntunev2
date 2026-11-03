@@ -14,6 +14,7 @@
 | 0009 | [Serverless Cloudflare stack](0009-stack.md) |
 | 0010 | [Scoped native REST credentials](0010-native-rest-credentials.md) |
 | 0011 | [Deployed-build identity separation](0011-deployed-build-identity.md) |
+| 0012 | [Compliant YouTube video and Brainz data](0012-compliant-youtube-video-and-brainz-data.md) |
 
 ## Numbering and precedence
 
