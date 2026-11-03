@@ -47,6 +47,92 @@ Pool facts:
   under-budget lease with a dead Cargo process group is recovered on
   the next acquire, anything else stays for Operator inspection.
 
+## Clean-room, YouTube and MetaBrainz guardrails
+
+These are acceptance criteria for every UI, playback and catalogue
+change. Cite this section from the change description when a change
+touches any of them. The mechanically checkable half is enforced by
+`.github/scripts/clean_room_lint.py` in CI; the rest is review
+discipline, and a reviewer may block on any line below.
+
+### Clean room (competitor-inspired UI work)
+
+Analysis of existing products is an input to *written specs* — layout,
+measurements, spacing, motion, states and features described in our
+own words. NNTune code, styles and copy are then written fresh from
+those specs.
+
+- Never bring into this repo, a commit, a PR or any public text:
+  competitor code or CSS, class names, CSS custom-property names,
+  icons, images, logos or wordmarks, UI copy text, or proprietary
+  fonts. For Spotify specifically that includes the name (outside
+  prohibition statements like this one), the greens `#1DB954` and
+  `#1ED760`, and the typefaces Spotify Mix and Circular.
+- Analysis evidence (extracts, bundles, traces, screenshots) stays
+  outside every repo and worktree. Never commit it, and never write
+  its host path or directory names into the repo — a reference is a
+  leak of what was analysed and where it sits.
+- Specs may state measurements and behaviour; they must not quote
+  competitor source, string tables or asset names.
+- Use our own brand throughout: our accent colour, an openly licensed
+  font (for example Figtree or `system-ui`), and openly licensed icons
+  (for example Lucide or Phosphor). No "-ify"-style naming.
+- Never sign in to Spotify, Deezer, Tidal or Apple Music with anyone's
+  account for analysis or testing.
+
+### YouTube (embed-only)
+
+YouTube playback is the official IFrame embed, presented as a video
+feature — never as an audio source.
+
+- Visible official IFrame player only, at least 200×200 (480×270
+  recommended), never covered or overlaid; YouTube's controls, ads
+  and branding stay untouched.
+- At most one autoplaying player, and only while more than half of it
+  is in view. Playback pauses when the page or player is hidden.
+- No audio-only playback, no background, hidden, minimised or
+  lock-screen playback.
+- No stream extraction and no direct media URLs (`googlevideo`,
+  `/youtubei/`, yt-dlp and equivalents are banned by
+  `clean_room_lint.py`).
+- No caching or offline copies of YouTube content.
+- The embed must work on the free plan; never charge for watching it.
+- Never call `search.list` at play time. Resolve video IDs ahead of
+  time and validate them in `videos.list` batches. Storing video IDs
+  is fine; any other stored API metadata is refreshed or deleted
+  within 30 days.
+- The product links the YouTube Terms of Service and the Google
+  Privacy Policy wherever the embed is offered.
+
+The pre-existing extraction spike under `workers/youtube/` predates
+these rules and is awaiting retirement. The CI gate allow-lists that
+path (and its design note) for the extraction rule only, temporarily.
+Do not extend the spike, and do not copy its approach into new code.
+
+### MetaBrainz licences (MusicBrainz, ListenBrainz, CritiqueBrainz, cover art)
+
+- MusicBrainz **core data is CC0** — including URL relationships —
+  and may be mirrored and shipped, commercial use included.
+- **Supplementary data is CC BY-NC-SA**: tags/genres, ratings,
+  annotations, and the hourly Live Data Feed replication packets.
+  NC-licensed data never ships in this paid product and must not be
+  ingested into the product mirror; keep the mirror CC0-only unless
+  a licence decision says otherwise.
+- CritiqueBrainz: use only **CC BY-SA** reviews, with attribution.
+  Skip any review under an NC variant.
+- **MLHD+ is never used** — not in the product, not in tooling.
+- Cover art (Cover Art Archive and similar) carries third-party
+  rights that the archive does not clear. Treat every cover-art use
+  as rights-flagged: reference or proxy art deliberately, never
+  assume a licence to redistribute, and surface new cover-art caching
+  for review before it ships.
+- ListenBrainz dumps are CC0 and may be used on the same terms as
+  MusicBrainz core data.
+- Respect the MusicBrainz API etiquette for any live calls: at most
+  1 request/second per IP and a descriptive `User-Agent` of the form
+  `nntune/<version> ( <contact> )`. Serve product reads from the
+  mirror, not the live API.
+
 ## Contributing
 
 PRs follow the org contract in `TogetherWeOwn/.github` CONTRIBUTING + this repo's overrides; use this repo's PR template, which replaces the org template; its Attestation section is mandatory.

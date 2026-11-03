@@ -249,7 +249,11 @@ jobs:
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
-  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02).
+  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02). The
+  # clean-room lint enforces the AGENTS.md guardrails the same way:
+  # no extraction shapes, competitor brand/font/colour references, or
+  # host evidence paths (the pre-existing youtube extraction spike is
+  # allow-listed in the script until it is retired).
   public-text:
     name: public-text
     runs-on: ubuntu-latest
@@ -261,6 +265,10 @@ jobs:
           persist-credentials: false
       - name: Lint public text for internal identifiers
         run: python3 .github/scripts/public_text_lint.py
+      - name: Lint tracked files for clean-room guardrail shapes
+        run: python3 .github/scripts/clean_room_lint.py
+      - name: Unit-test the clean-room lint
+        run: python3 .github/scripts/test_clean_room_lint.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
