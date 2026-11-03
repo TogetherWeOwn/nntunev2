@@ -46,6 +46,10 @@ test('real CC0 FLAC decodes, plays, and seeks mid-track and near the end', async
 	const body = readFileSync((fixture as { path: string }).path);
 	expect(body.length, 'fetched fixture size must match the manifest').toBe(track.bytes);
 
+	// Ranged streaming is the behavior under test: count the 206 responses so
+	// a silent fall-back to one full download cannot pass this spec.
+	let partialResponses = 0;
+
 	await page.route('**/api/demo/audio**', async (route) => {
 		const range = route.request().headers()['range'];
 		if (!range) {
@@ -68,6 +72,7 @@ test('real CC0 FLAC decodes, plays, and seeks mid-track and near the end', async
 			});
 			return;
 		}
+		partialResponses += 1;
 		await route.fulfill({
 			status: 206,
 			contentType: 'audio/flac',
@@ -132,12 +137,14 @@ test('real CC0 FLAC decodes, plays, and seeks mid-track and near the end', async
 		expect(landed.errorCode).toBeNull();
 		expect(Math.abs(landed.currentTime - target)).toBeLessThanOrEqual(2);
 
-		if (target === 60) {
-			const after = landed.currentTime;
-			await expect
-				.poll(async () => (await snapshot(audio)).currentTime, { timeout: 30_000 })
-				.toBeGreaterThan(after + 0.3);
-			expect((await snapshot(audio)).errorCode).toBeNull();
-		}
+		// Playback must keep advancing after every seek, near-end included:
+		// a stall would leave currentTime parked inside the ±2 s window above.
+		const after = landed.currentTime;
+		await expect
+			.poll(async () => (await snapshot(audio)).currentTime, { timeout: 30_000 })
+			.toBeGreaterThan(after + 0.3);
+		expect((await snapshot(audio)).errorCode).toBeNull();
 	}
+
+	expect(partialResponses, 'the player must issue at least one ranged request').toBeGreaterThan(0);
 });

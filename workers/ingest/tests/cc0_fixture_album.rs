@@ -171,6 +171,15 @@ fn is_lower_hex(v: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Canonical MusicBrainz UUID shape: lowercase hex with hyphens at 8/13/18/23.
+fn is_mbid(v: &str) -> bool {
+    v.len() == 36
+        && v.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
+
 #[test]
 fn manifest_dedupe_keys_are_well_formed_and_distinct() {
     let m = manifest();
@@ -186,8 +195,11 @@ fn manifest_dedupe_keys_are_well_formed_and_distinct() {
     assert!(shas.iter().all(|v| is_lower_hex(v, 64)), "{shas:?}");
     assert!(all_distinct(&md5s));
     assert!(all_distinct(&shas));
-    assert!(all_distinct(&col("recording_mbid")));
-    assert!(all_distinct(&col("track_mbid")));
+    for key in ["recording_mbid", "track_mbid"] {
+        let values = col(key);
+        assert!(values.iter().all(|v| is_mbid(v)), "{key}: {values:?}");
+        assert!(all_distinct(&values), "{key}");
+    }
 
     for t in &ts {
         assert_eq!(t["sample_rate"], 48000);
