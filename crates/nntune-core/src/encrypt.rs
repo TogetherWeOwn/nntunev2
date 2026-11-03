@@ -29,6 +29,7 @@ use crate::decrypt::rclone::{
     self, CIPHER_BLOCK_SIZE, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE,
 };
 use crate::{Error, Result};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Builds the 32-byte stream header for `header_nonce`.
 ///
@@ -125,6 +126,10 @@ pub fn plan_articles(plaintext_len: u64, blocks_per_article: u64) -> Option<Vec<
 /// Streaming seal: feed plaintext with [`Encryptor::push`], collect the
 /// [`Encryptor::finish`] tail, and prepend [`header`] before the first
 /// sealed block.
+///
+/// Holds the per-file key, so it zeroizes on drop (same discipline as the
+/// API-side `Dek` holders): no key copy survives the seal.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Encryptor {
     key: [u8; 32],
     header_nonce: [u8; 24],
@@ -204,13 +209,17 @@ impl Encryptor {
         let mut derived = [0u8; 80];
         derived[..32].copy_from_slice(&self.key);
         let mut sealed = vec![0u8; plaintext.len() + CIPHER_OVERHEAD as usize];
-        rclone::seal_block(
+        let res = rclone::seal_block(
             &derived,
             &self.header_nonce,
             self.block_number,
             plaintext,
             &mut sealed,
-        )?;
+        );
+        // The derived block key lives only for this seal; clear it on both
+        // paths before the caller sees the result.
+        derived.zeroize();
+        res?;
         self.block_number = self.block_number.checked_add(1).ok_or(Error::Bounds {
             bound: "encrypt block counter",
             limit: i64::MAX,

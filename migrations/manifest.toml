@@ -134,14 +134,14 @@ target = "app"
 sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
 
 [[migration]]
-file = "0027_posted_files.sql"
+file = "0028_posted_files.sql"
 target = "app"
-sha256 = "0cc1e99a7cb35858257b2eb41e4ca43984b39e72948d4ccc4d228691c583239a"
+sha256 = "a1ca5c41409f82a7869bf59deea5b03dc1244336238089128e3fe06708209044"
 
 [[migration]]
-file = "0028_posted_files_crypto.sql"
+file = "0029_posted_files_crypto.sql"
 target = "app"
-sha256 = "6aa34a789e4fbe024dbb33e92fc8d79e9546e2142b83f286251917deed08bd4d"
+sha256 = "7c8f49ebfbde1daf61d4fd8e63a8b8ade090aa953e08c4adfbadbe1033b2287a"
 
 [[migration]]
 file = "0028_admin_foundation.sql"
