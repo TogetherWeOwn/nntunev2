@@ -274,6 +274,14 @@ pub struct Config {
     /// routes fail closed per-request with a generic 500 while every
     /// other route keeps serving.
     pub play_grant_secret: Option<Vec<u8>>,
+    /// Meter-sink HMAC secret shared with the stream Worker
+    /// (`METER_SINK_SECRET`, [`crate::meter_sink`]): the RAW string
+    /// bytes, never base64-decoded, for the same reason as the
+    /// play-grant secret. `None` until provisioned; unprovisioned
+    /// (or under the 32-byte minimum) the internal sink route fails
+    /// closed per-request with a generic 500 while every other
+    /// route keeps serving.
+    pub meter_sink_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -344,6 +352,7 @@ impl Config {
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             play_grant_secret: None,
+            meter_sink_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -427,6 +436,15 @@ impl Config {
     /// synthetic secrets directly.
     pub fn with_play_grant_secret(mut self, secret: Vec<u8>) -> Self {
         self.play_grant_secret = Some(secret);
+        self
+    }
+
+    /// Provision the meter-sink HMAC secret (raw bytes of the
+    /// `METER_SINK_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by [`crate::meter_sink::verify`] per request (fail
+    /// closed), so this setter accepts whatever the entry staged.
+    pub fn with_meter_sink_secret(mut self, secret: Vec<u8>) -> Self {
+        self.meter_sink_secret = Some(secret);
         self
     }
 
@@ -942,6 +960,36 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async move {
             let _ = (user_id, session_id, play_id, epoch, now, expires_at);
+            Err(StoreError)
+        }
+    }
+    /// Derivation metadata for one (user, track) pair
+    /// (`meter_sink::track_meter_meta_statement`); unknown or
+    /// non-UUID tracks resolve to the all-`None` meta (the fallback
+    /// rung), never an error — only a store failure errors. Default
+    /// `Err` fails closed like [`Store::live_subscription`] (the sink
+    /// answers 500 and the DO retries; nothing meters on a guess).
+    fn track_meter_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        async move {
+            let _ = (user_id, track_id);
+            Err(StoreError)
+        }
+    }
+    /// Write one cumulative play window through the monotonic upsert
+    /// (`ledger::ledger_play_window_upsert_statement`): which
+    /// disposition the write converged to is reported for the sink
+    /// ack. Default `Err` fails closed like
+    /// [`Store::live_subscription`].
+    fn record_play_window(
+        &self,
+        window: &crate::ledger::PlayWindow,
+    ) -> impl Future<Output = Result<crate::meter_sink::PlayWindowOutcome, StoreError>> {
+        async move {
+            let _ = window;
             Err(StoreError)
         }
     }
@@ -5587,6 +5635,114 @@ where
     json_response(200, body_json)
 }
 
+// --- Meter sink (internal) ---------------------------------------------------
+//
+// `POST /internal/v1/play-windows` is not a user route: only the
+// stream Worker's per-user Durable Objects call it, over their `API`
+// service binding, authenticating with the dedicated meter-sink HMAC
+// (crate::meter_sink). It takes no session, no bearer, and no origin
+// pin (there is no browser), and it is deliberately not in
+// `is_known_path` — preflights stay 404 and the browser surface never
+// learns it exists. Each accepted window derives its seconds
+// server-side from the delivered union and writes through the
+// monotonic ledger upsert; the ack dispositions tell the DO which
+// windows are terminal (crate::meter_sink module docs).
+
+/// Ingest one signed batch of cumulative play windows.
+async fn meter_sink_ingest<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::meter_sink::{PlayWindowOutcome, SinkError};
+    match crate::meter_sink::verify(
+        ctx.cfg.meter_sink_secret.as_deref(),
+        req.authorization.as_deref(),
+        &req.body,
+        ctx.now,
+    ) {
+        Ok(()) => {}
+        // Unprovisioned is a server misconfiguration, not a caller
+        // fault; the DO retries on its alarm either way.
+        Err(SinkError::NotConfigured) => return internal(),
+        Err(SinkError::Unauthorized) => {
+            let error = crate::api_error::ApiError::unauthorized("unauthorized");
+            return Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+                retry_after: None,
+                extra_headers: Vec::new(),
+            };
+        }
+        Err(SinkError::Malformed) => return internal(),
+    }
+    let windows = match crate::meter_sink::parse_batch(&req.body) {
+        Ok(windows) => windows,
+        Err(_) => return validation_failed("invalid request"),
+    };
+    let mut accepted = Vec::new();
+    let mut fenced = Vec::new();
+    let mut rejected = Vec::new();
+    // Sequential on purpose: a batch is one user's plays, and the DO
+    // retries the whole batch on a 500 — the upsert's monotonicity
+    // makes partially-applied retries converge.
+    for window in &windows {
+        let meta = match ctx
+            .store
+            .track_meter_meta(&window.user_id, &window.track_id)
+            .await
+        {
+            Ok(meta) => meta,
+            Err(_) => return internal(),
+        };
+        // The stream-reported blob length is the confirmed size of
+        // what was actually served; the cache row is the backup.
+        let file_bytes = window.file_bytes.or(meta.file_bytes).filter(|b| *b > 0);
+        let duration_ms = crate::ledger::resolve_duration_ms(
+            meta.track_duration_ms,
+            meta.mb_duration_ms,
+            meta.bitrate_kbps,
+            file_bytes,
+        );
+        let prepared = crate::ledger::prepare_play_window(
+            &window.user_id,
+            &window.track_id,
+            &window.play_id,
+            window.union_bytes,
+            file_bytes,
+            duration_ms,
+            window.started_at,
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            // Unpreparable windows never converge on retry: name them
+            // terminal so the DO drops them instead of alarming forever.
+            Err(_) => {
+                rejected.push(window.play_id.clone());
+                continue;
+            }
+        };
+        match ctx.store.record_play_window(&prepared).await {
+            Ok(PlayWindowOutcome::Written | PlayWindowOutcome::Covered) => {
+                accepted.push(window.play_id.clone());
+            }
+            Ok(PlayWindowOutcome::Fenced) => fenced.push(window.play_id.clone()),
+            Err(_) => return internal(),
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "accepted": accepted,
+            "fenced": fenced,
+            "rejected": rejected,
+        }),
+    )
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
 
 /// `u64` handler time as Stripe-epoch `i64` (saturates only past the year
@@ -6416,6 +6572,12 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        // Internal meter sink: HMAC-authenticated inside the handler
+        // (crate::meter_sink), no session/bearer surface. The scope
+        // map denies this path to bearer credentials, so the gate
+        // above never sees its Authorization header; it is absent
+        // from `is_known_path` on purpose (no browser preflight).
+        ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -6686,6 +6848,13 @@ mod tests {
         /// that arrives after the handler's up-front `account_deleting`
         /// probe but before the statement's writer fence evaluates.
         mark_deleting_before_next_lease_write: RefCell<Option<String>>,
+        /// Derivation metadata keyed by `(user_id, track_id)`; absent
+        /// pairs resolve to the all-`None` meta (the fallback rung),
+        /// mirroring the production zero-row answer.
+        meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
+        /// Stored play windows by idempotency key, mirroring the
+        /// monotonic upsert (see `record_play_window`).
+        play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
     }
 
     impl Store for FakeStore {
@@ -7056,6 +7225,53 @@ mod tests {
                 }
                 _ => Ok(false),
             }
+        }
+        async fn track_meter_meta(
+            &self,
+            user_id: &str,
+            track_id: &str,
+        ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            Ok(self
+                .meter_meta
+                .borrow()
+                .get(&(user_id.to_string(), track_id.to_string()))
+                .copied()
+                .unwrap_or_default())
+        }
+        async fn record_play_window(
+            &self,
+            window: &crate::ledger::PlayWindow,
+        ) -> Result<crate::meter_sink::PlayWindowOutcome, StoreError> {
+            use crate::meter_sink::PlayWindowOutcome;
+            // Mirror the production writer fence: the upsert's guard
+            // SELECT finds no row for a deleting or nonexistent user,
+            // so nothing writes and the sink acks `fenced`.
+            if self.deleting_users.borrow().contains(&window.user_id)
+                || !self.users.borrow().contains_key(&window.user_id)
+            {
+                return Ok(PlayWindowOutcome::Fenced);
+            }
+            // Mirror the monotonic upsert: a stored row already
+            // covering this union wins; otherwise the new snapshot
+            // replaces it and the monthly total moves by the delta.
+            let mut windows = self.play_windows.borrow_mut();
+            let previous = windows.get(&window.idempotency_key);
+            if let Some(existing) = previous {
+                if existing.bytes_served >= window.bytes_served {
+                    return Ok(PlayWindowOutcome::Covered);
+                }
+            }
+            let previous_seconds = previous.map_or(0, |w| w.stream_seconds);
+            windows.insert(window.idempotency_key.clone(), window.clone());
+            drop(windows);
+            let mut seconds = self.stream_seconds.borrow_mut();
+            let entry = seconds
+                .entry((window.user_id.clone(), window.period_month.clone()))
+                .or_insert(0);
+            *entry = entry
+                .saturating_sub(previous_seconds)
+                .saturating_add(window.stream_seconds);
+            Ok(PlayWindowOutcome::Written)
         }
         async fn reserve_rate_limit(
             &self,
@@ -10839,6 +11055,244 @@ mod tests {
         }
         assert!(is_known_path("/v1/plays"));
         assert!(is_known_path("/v1/plays/heartbeat"));
+    }
+
+    const SINK_SECRET: &[u8] = b"test-meter-sink-secret-32-bytes-long!!";
+    const SINK_USER: &str = "u-meter";
+    const SINK_TRACK: &str = "track-meter-1";
+
+    /// Harness with the meter-sink secret provisioned and the sink
+    /// user seeded (the writer fence refuses unknown users).
+    fn sink_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_meter_sink_secret(SINK_SECRET.to_vec());
+        seed_user(&h, SINK_USER, "meter@example.com");
+        h
+    }
+
+    fn sink_window(play_id: &str, union_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "user_id": SINK_USER,
+            "track_id": SINK_TRACK,
+            "play_id": play_id,
+            "union_bytes": union_bytes,
+            "file_bytes": 7_200_000u64,
+            "started_at": NOW,
+        })
+    }
+
+    /// POST a raw sink body with an optional precomputed header; `None`
+    /// signs with the harness secret at NOW (the happy path).
+    fn call_sink(h: &Harness, body: &str, authorization: Option<String>) -> Response {
+        let authorization = authorization.or_else(|| {
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+        });
+        let req = Request {
+            method: "POST".to_string(),
+            path: crate::meter_sink::SINK_PATH.to_string(),
+            cookie: None,
+            origin: None,
+            authorization,
+            stripe_signature: None,
+            body: body.as_bytes().to_vec(),
+        };
+        block_on(handle(&h.ctx(), &req))
+    }
+
+    fn ack_lists(resp: &Response) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let list = |key: &str| {
+            body[key]
+                .as_array()
+                .expect("ack list")
+                .iter()
+                .map(|v| v.as_str().expect("play id").to_string())
+                .collect()
+        };
+        (list("accepted"), list("fenced"), list("rejected"))
+    }
+
+    #[test]
+    fn meter_sink_writes_windows_and_acks_dispositions() {
+        let h = sink_harness();
+        // 180 s track; a half-file union derives 90 s proportionally.
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 90);
+        assert_eq!(window.bytes_served, 3_600_000);
+        assert_eq!(window.file_bytes, Some(7_200_000));
+        assert_eq!(window.duration_ms, Some(180_000));
+        assert!(!window.rate_fallback);
+        drop(stored);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_duplicate_and_stale_flushes_add_zero() {
+        let h = sink_harness();
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        assert_eq!(call_sink(&h, &body, None).status, 200);
+        // Exact redelivery: still accepted (converged), total unmoved.
+        let resp = call_sink(&h, &body, None);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        // A stale (smaller-union) flush likewise converges to zero.
+        let stale = serde_json::json!({"windows": [sink_window("play-1", 1_800_000)]}).to_string();
+        assert_eq!(call_sink(&h, &stale, None).status, 200);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_refuses_unsigned_and_forged_requests() {
+        let h = sink_harness();
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        // Empty Authorization header (the unit tests pin absent too).
+        let resp = call_sink(&h, &body, Some(String::new()));
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        // Signed with the wrong key.
+        let forged = crate::meter_sink::authorization_header(
+            Some(b"forged-meter-sink-secret-32-bytes!!"),
+            NOW,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(forged)).status, 401);
+        // Correctly signed but stale (replay into another window).
+        let stale = crate::meter_sink::authorization_header(
+            Some(SINK_SECRET),
+            NOW - crate::meter_sink::MAX_TIMESTAMP_SKEW_SECS - 1,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(stale)).status, 401);
+        // Correctly signed header, tampered body.
+        let good = crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+            .expect("signs");
+        let tampered = body.replace("3600000", "7200000");
+        assert_eq!(call_sink(&h, &tampered, Some(good)).status, 401);
+        assert!(
+            h.store.play_windows.borrow().is_empty(),
+            "refused requests write nothing"
+        );
+    }
+
+    #[test]
+    fn meter_sink_fails_closed_without_a_provisioned_secret() {
+        let h = harness(); // default cfg(): no sink secret.
+        seed_user(&h, SINK_USER, "meter@example.com");
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let header =
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+                .expect("signs");
+        let resp = call_sink(&h, &body, Some(header));
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_signed_but_malformed_batch_is_422() {
+        let h = sink_harness();
+        let resp = call_sink(&h, "not json", None);
+        assert_eq!(resp.status, 422, "{}", resp.body);
+        // A window shape the wire forbids (unknown field) refuses whole.
+        let extra = r#"{"windows":[{"user_id":"u-meter","track_id":"track-meter-1","play_id":"play-1","union_bytes":1,"file_bytes":null,"started_at":7,"seconds":9}]}"#;
+        assert_eq!(call_sink(&h, extra, None).status, 422);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_fenced_and_rejected_dispositions() {
+        let h = sink_harness();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert(SINK_USER.to_string());
+        let mut ghost = sink_window("play-ghost", 3_600_000);
+        ghost["user_id"] = serde_json::json!("u-ghost");
+        let body = serde_json::json!({"windows": [
+            sink_window("play-fenced", 3_600_000),
+            sink_window("play-zero", 0),
+            // Identity characters outside [A-Za-z0-9_-] never prepare.
+            sink_window("play bad", 3_600_000),
+            ghost,
+        ]})
+        .to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert!(accepted.is_empty());
+        // Deleting account and unknown user both fence (terminal).
+        assert_eq!(fenced, vec!["play-fenced", "play-ghost"]);
+        // Zero union and bad identity can never prepare (terminal).
+        assert_eq!(rejected, vec!["play-zero", "play bad"]);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_unknown_track_meters_on_the_fallback_rung() {
+        let h = sink_harness();
+        // No meta seeded and no file size on the wire: nominal-rate
+        // fallback derives ceil(96_000 / 48_000) = 2 s, snapshots NULL.
+        let mut window = sink_window("play-fallback", 96_000);
+        window["file_bytes"] = serde_json::Value::Null;
+        let body = serde_json::json!({"windows": [window]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 2);
+        assert!(window.rate_fallback);
+        assert_eq!(window.file_bytes, None);
+        assert_eq!(window.duration_ms, None);
+    }
+
+    #[test]
+    fn meter_sink_path_has_no_browser_surface() {
+        let h = sink_harness();
+        let resp = h.call_full(
+            "OPTIONS",
+            crate::meter_sink::SINK_PATH,
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 404, "no preflight maps the internal route");
+        assert!(!is_known_path(crate::meter_sink::SINK_PATH));
+        // No browser credential authenticates here either: without the
+        // sink HMAC the handler answers 401 and writes nothing.
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]});
+        let resp = h.call("POST", crate::meter_sink::SINK_PATH, body);
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
     }
 
     const QA_TOKEN: &str = "test-qa-bearer-token";

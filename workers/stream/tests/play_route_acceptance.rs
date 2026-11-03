@@ -301,6 +301,7 @@ fn interval(play_id: &str, start: u64, end: u64) -> DeliveredInterval {
         track_id: TRACK_ID.to_string(),
         start,
         end,
+        file_bytes: None,
     }
 }
 

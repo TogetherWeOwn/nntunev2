@@ -291,6 +291,15 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Some(secret) => config.with_play_grant_secret(secret),
         None => config,
     };
+    // Meter-sink HMAC key, shared with the stream Worker the same
+    // raw-bytes way (see the helper). Absent (or under the sink's
+    // minimum length at verify time) fails the internal endpoint
+    // closed per-request; the stream DO keeps windows pending and
+    // retries on its alarm.
+    let config = match meter_sink_secret_from_lookup(|name| env_string(env, name)) {
+        Some(secret) => config.with_meter_sink_secret(secret),
+        None => config,
+    };
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -314,6 +323,15 @@ const RATE_LIMIT_VAR_NAMES: [&str; 5] = [
 /// is unit-pinned below.
 fn play_grant_secret_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
     get(crate::play_grant::PLAY_GRANT_SECRET_VAR).map(String::into_bytes)
+}
+
+/// Meter-sink secret overlay: same raw-string-bytes rule as the
+/// play-grant secret — the stream Worker's sink signer keys its HMAC
+/// with the raw bytes of the same env string, so decoding here would
+/// silently refuse every flush. Unit-pinned below alongside the
+/// play-grant probe.
+fn meter_sink_secret_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
+    get(crate::meter_sink::METER_SINK_SECRET_VAR).map(String::into_bytes)
 }
 
 /// Pure [vars] overlay: collect whichever of [`RATE_LIMIT_VAR_NAMES`]
@@ -2307,6 +2325,119 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 Ok(rows.len() == 1)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn track_meter_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+    ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+        // A non-UUID track has no `tracks` row to read (and the cast
+        // would fail the query besides): meter it on the fallback
+        // rung via the all-None meta, without a database round trip.
+        if !crate::meter_sink::is_uuid_shaped(track_id) {
+            return Ok(crate::meter_sink::TrackMeterMeta::default());
+        }
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::meter_sink::track_meter_meta_statement(),
+                        &[(&track_id, Type::TEXT), (&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let Some(row) = rows.first() else {
+                    return Ok(crate::meter_sink::TrackMeterMeta::default());
+                };
+                let u64_of_i32 = |v: Option<i32>| v.and_then(|v| u64::try_from(v).ok());
+                let u64_of_i64 = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+                Ok(crate::meter_sink::TrackMeterMeta {
+                    track_duration_ms: u64_of_i32(
+                        row.try_get("track_duration_ms").map_err(|_| StoreError)?,
+                    ),
+                    mb_duration_ms: u64_of_i32(
+                        row.try_get("mb_duration_ms").map_err(|_| StoreError)?,
+                    ),
+                    bitrate_kbps: u64_of_i32(row.try_get("bitrate_kbps").map_err(|_| StoreError)?),
+                    file_bytes: u64_of_i64(row.try_get("file_bytes").map_err(|_| StoreError)?),
+                })
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn record_play_window(
+        &self,
+        window: &crate::ledger::PlayWindow,
+    ) -> Result<crate::meter_sink::PlayWindowOutcome, StoreError> {
+        use crate::meter_sink::PlayWindowOutcome;
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let file_bytes = window.file_bytes.map(i64_of).transpose()?;
+                let duration_ms = window.duration_ms.map(i64_of).transpose()?;
+                let affected = client
+                    .execute(
+                        crate::ledger::ledger_play_window_upsert_statement(),
+                        &[
+                            &window.idempotency_key,
+                            &window.user_id,
+                            &window.track_id,
+                            &window.period_month,
+                            &i64_of(window.stream_seconds)?,
+                            &i64_of(window.bytes_served)?,
+                            &i64_of(window.recorded_at)?,
+                            &file_bytes,
+                            &duration_ms,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if affected == 1 {
+                    return Ok(PlayWindowOutcome::Written);
+                }
+                if affected > 1 {
+                    return Err(StoreError);
+                }
+                // Zero rows is ambiguous by design (statement docs):
+                // a stored row already covering this union is a
+                // convergent duplicate; anything else means the writer
+                // fence refused the write (deleting/nonexistent user)
+                // — terminal for the sink, never retried behind a
+                // deletion. Disambiguate with the select-by-key probe
+                // the statement contract prescribes.
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_select_by_key_statement(),
+                        &[(&window.idempotency_key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                match rows.first() {
+                    Some(row) => {
+                        let stored_bytes: i64 =
+                            row.try_get("bytes_served").map_err(|_| StoreError)?;
+                        if u64_of(stored_bytes)? >= window.bytes_served {
+                            Ok(PlayWindowOutcome::Covered)
+                        } else {
+                            Ok(PlayWindowOutcome::Fenced)
+                        }
+                    }
+                    None => Ok(PlayWindowOutcome::Fenced),
+                }
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -6000,6 +6131,25 @@ mod tests {
         );
         let got = play_grant_secret_from_lookup(|key| {
             (key == crate::play_grant::PLAY_GRANT_SECRET_VAR).then(|| probe.clone())
+        });
+        assert_eq!(got.as_deref(), Some(probe.as_bytes()));
+    }
+
+    #[test]
+    fn meter_sink_secret_overlay_keeps_the_raw_string_bytes() {
+        // Absent stays absent (the sink fails closed per-request and
+        // the stream DO retries behind its alarm).
+        assert_eq!(meter_sink_secret_from_lookup(|_| None), None);
+        // Valid-base64 probe, same as the play-grant test: a decode in
+        // this overlay would refuse every stream flush. Raw bytes
+        // must come back byte-identical.
+        let probe = crate::b64::encode(b"synthetic-meter-sink-material-01");
+        assert!(
+            crate::b64::decode(&probe).is_ok(),
+            "probe must be valid base64"
+        );
+        let got = meter_sink_secret_from_lookup(|key| {
+            (key == crate::meter_sink::METER_SINK_SECRET_VAR).then(|| probe.clone())
         });
         assert_eq!(got.as_deref(), Some(probe.as_bytes()));
     }
