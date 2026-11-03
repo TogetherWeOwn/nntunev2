@@ -139,6 +139,11 @@ target = "app"
 sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"
 
 [[migration]]
-file = "0029_mb_mirror_w6b.sql"
+file = "0029_paid_invoice_history.sql"
+target = "app"
+sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
+
+[[migration]]
+file = "0030_mb_mirror_w6b.sql"
 target = "mirror"
-sha256 = "d6225885bf3179c54d106c6c590dea0bf4362aa9e54478cb746e52311c29e199"
+sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"

@@ -64,7 +64,12 @@ FIELD_COUNTS = {
     "l_artist_url": 9,
     "l_recording_url": 9,
     "l_recording_recording": 9,
-    "isrc": 5,
+    # Upstream isrc is (id, recording, isrc, source, edits_pending,
+    # created): six columns. The curated projection only keeps the
+    # (recording, isrc) pair (positions 2, 3), but the row validator must
+    # accept the full upstream width or the first real ISRC row aborts
+    # the ETL.
+    "isrc": 6,
 }
 
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz
@@ -75,7 +80,12 @@ FIELD_COUNTS = {
 # which live in tag/genre/rating/annotation tables the ETL never reads)
 # is ignored.
 ARTIST_URL_YOUTUBE_GID = "6a540e5b-58c6-4192-b6ba-dbc71ec8fcf0"
-ARTIST_URL_YOUTUBE_MUSIC_GID = "631712a0-7525-42ba-b7a3-605aa7238c4"
+# Verified against the live MusicBrainz web service (artist url-rels):
+# the "youtube music" relationship type is
+# 631712a0-7525-42ba-b7a3-605aa7a238c4. Every pinned GID above is a valid
+# UUID shape (8-4-4-4-12); a malformed pin can never match a real link_type
+# row and fails the ETL closed, so keep them exact.
+ARTIST_URL_YOUTUBE_MUSIC_GID = "631712a0-7525-42ba-b7a3-605aa7a238c4"
 ARTIST_URL_FREE_STREAMING_GID = "769085a1-c2f7-4c24-a532-2375a77693bd"
 ARTIST_URL_STREAMING_GID = "63cc5d1f-f096-4c94-a43f-ecb32ea94161"
 RECORDING_URL_FREE_STREAMING_GID = "7e41ef12-a124-4324-afdb-fdbae687a89c"
@@ -425,6 +435,17 @@ def main() -> int:
                 bad_l_recording = db.execute("SELECT l.recording FROM l_recording_url l LEFT JOIN recording r ON r.id=l.recording WHERE r.id IS NULL LIMIT 1").fetchone()
                 if bad_l_recording:
                     raise ValueError(f"recording-url link references missing recording {bad_l_recording[0]}")
+                # Dangling URL targets fail closed like every other orphan
+                # above: the url load only keeps IDs referenced by kept
+                # links, so a kept edge whose URL row is absent from the
+                # dump would otherwise be silently dropped by the inner
+                # joins in the projection queries below.
+                bad_l_artist_url = db.execute("SELECT l.url FROM l_artist_url l LEFT JOIN url u ON u.id=l.url WHERE u.id IS NULL LIMIT 1").fetchone()
+                if bad_l_artist_url:
+                    raise ValueError(f"artist-url link references missing url {bad_l_artist_url[0]}")
+                bad_l_recording_url = db.execute("SELECT l.url FROM l_recording_url l LEFT JOIN url u ON u.id=l.url WHERE u.id IS NULL LIMIT 1").fetchone()
+                if bad_l_recording_url:
+                    raise ValueError(f"recording-url link references missing url {bad_l_recording_url[0]}")
                 bad_l_rr = db.execute("SELECT l.e0,l.e1 FROM l_recording_recording l LEFT JOIN recording r0 ON r0.id=l.e0 LEFT JOIN recording r1 ON r1.id=l.e1 WHERE r0.id IS NULL OR r1.id IS NULL LIMIT 1").fetchone()
                 if bad_l_rr:
                     raise ValueError(f"music-video link references missing recording ({bad_l_rr[0]}, {bad_l_rr[1]})")

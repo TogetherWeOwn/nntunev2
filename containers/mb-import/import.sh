@@ -12,11 +12,13 @@
 # dump while a newer dump starts at line 0. The upsert carries a
 # forward-only updated_at guard (older dumps never roll a row back).
 # Contract: every row of a dump file carries that dump's single
-# updated_at (the ETL stamps one DUMP_TS); the track prune compares
-# per-release maxima and relies on that uniformity. The prune runs
-# only in the track dump's final chunk transaction, atomically with
-# the cursor advancing to the end of the dump, so an interrupted
-# import leaves rows at worst stale, never truncated.
+# updated_at (the ETL stamps one DUMP_TS); the newest-dump prunes compare
+# per-parent maxima (per release for tracks, per artist/recording for the
+# relationship tables, per either endpoint for music-video pairs) and rely
+# on that uniformity. Each prune runs only in its own table dump's final
+# chunk transaction, atomically with the cursor advancing to the end of
+# the dump, so an interrupted import leaves rows at worst stale, never
+# truncated.
 
 # Poison rows never abort the import: the mb-validate pre-pass checks every
 # line against the typed upsert contract (uuid/int/timestamp/bool/ISRC
@@ -194,21 +196,40 @@ for table in artist release_group release recording track url artist_url recordi
       columns="artist_mbid, url_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(artist_mbid, url_mbid, link_name)"
+      # Same per-parent newest-dump prune as tracks below, but the parent
+      # is the artist: a newer dump that drops one of this artist's links
+      # leaves the old row behind without this, and catalogue reads have
+      # no timestamp filter to hide it.
+      final_prune_sql="DELETE FROM mb_artist_url old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_url x WHERE x.artist_mbid = old.artist_mbid);"
       ;;
     recording_url)
       columns="recording_mbid, url_mbid, link_name, is_video, updated_at"
       upsert="is_video = EXCLUDED.is_video, updated_at = EXCLUDED.updated_at"
       conflict="(recording_mbid, url_mbid, link_name)"
+      # Per-recording newest-dump prune (see artist_url above): a newer
+      # dump that drops one of this recording's links would otherwise
+      # keep serving the deleted URL.
+      final_prune_sql="DELETE FROM mb_recording_url old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_url x WHERE x.recording_mbid = old.recording_mbid);"
       ;;
     recording_music_video)
       columns="recording_a_mbid, recording_b_mbid, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(recording_a_mbid, recording_b_mbid)"
+      # Per-endpoint newest-dump prune: pairs are undirected, so an old
+      # pair dies once either endpoint has a newer pair row. A recording
+      # whose pairs all vanished from the newer dump keeps no newer row
+      # for either endpoint, so its old rows survive exactly like a
+      # release absent from a track dump (stale but untouched).
+      final_prune_sql="DELETE FROM mb_recording_music_video old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_music_video x WHERE x.recording_a_mbid IN (old.recording_a_mbid, old.recording_b_mbid) OR x.recording_b_mbid IN (old.recording_a_mbid, old.recording_b_mbid));"
       ;;
     recording_isrc)
       columns="recording_mbid, isrc, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(recording_mbid, isrc)"
+      # Per-recording newest-dump prune (see artist_url above): a newer
+      # dump that drops one of this recording's codes would otherwise
+      # keep serving the deleted ISRC.
+      final_prune_sql="DELETE FROM mb_recording_isrc old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_isrc x WHERE x.recording_mbid = old.recording_mbid);"
       ;;
     track)
       columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
@@ -628,8 +649,9 @@ EOF
     # -q keeps stdout to just the RETURNING value: without it every command
     # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
-    # The track prune runs only in the part that ends at the dump's last
-    # line, so it commits atomically with the cursor completing the dump.
+    # Each table's newest-dump prune ($final_prune_sql) runs only in the
+    # part that ends at the dump's last line, so it commits atomically
+    # with the cursor completing the dump.
     prune_sql=""
     if (( 10#$end == 10#$total )); then
       prune_sql="$final_prune_sql"

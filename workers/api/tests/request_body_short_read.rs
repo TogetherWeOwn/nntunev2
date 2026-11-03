@@ -122,6 +122,7 @@ fn short_read_dispatches_nothing_through_the_gate() {
             cookie: None,
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: b"template".to_vec(),
         },
         move |_request| async move {

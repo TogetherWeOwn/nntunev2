@@ -269,6 +269,7 @@ async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response
         dns: &NoExternalIo,
         now: clock(&f.db).await as u64,
         source_ip: "127.0.0.1".into(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
     };
     handlers::handle(
         &ctx,
@@ -278,6 +279,7 @@ async fn handler_refresh(f: &Fixture, cookie: &str, retry_key: &str) -> Response
             cookie: Some(cookie.into()),
             origin: Some(cfg.origin.clone()),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"retry_key": retry_key})
                 .to_string()
                 .into_bytes(),

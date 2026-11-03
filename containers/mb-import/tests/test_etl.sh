@@ -60,6 +60,19 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/bad" 2>"$temp
 fi
 grep -q 'expected 19 fields, got 1' "$temp_dir/bad.err"
 
+# A kept relationship edge whose URL row is absent from the dump fails
+# closed: the projection joins would otherwise drop the edge silently
+# while the nonempty-output guard still passes. URL id 91 backs the
+# artist-url edge to "free streaming" in the fixture.
+cp -R "$fixtures/mbdump" "$temp_dir/dangling-url"
+grep -v '^91	' "$temp_dir/dangling-url/url" > "$temp_dir/dangling-url/url.tmp"
+mv "$temp_dir/dangling-url/url.tmp" "$temp_dir/dangling-url/url"
+if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/dangling-url" 2>"$temp_dir/dangling-url.err"; then
+  echo 'expected dangling-url failure' >&2
+  exit 1
+fi
+grep -q 'artist-url link references missing url' "$temp_dir/dangling-url.err"
+
 if DUMP_TS= "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
   echo 'expected missing timestamp failure' >&2
   exit 1

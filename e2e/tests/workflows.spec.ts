@@ -2760,13 +2760,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '10'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '11'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
-    // Real-NZB mode reaches the gate from the prepare step's output, so the
-    // fixed extended RAR-set allow-list budgets the run instead of the
-    // standard ten-skip budget (fixme plus nine parked legs).
-    expect(stepBlock).toContain('REAL_NZB_MODE:');
-    expect(stepBlock).toContain('steps.real-nzb.outputs.ready');
+    // The secret-held real-NZB staging leg is retired (CC0-only fixture
+    // rule): no prepare step feeds the gate a mode anymore. The standard
+    // eleven-skip budget (fixme, nine parked legs, capped stream leg)
+    // budgets every staging run.
+    expect(stepBlock).not.toContain('REAL_NZB_MODE');
+    expect(stepBlock).not.toContain('steps.real-nzb');
   });
 
   test('all-skipped evidence fails and reports empty counts', () => {
@@ -2807,13 +2808,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.summary).toContain('PASS');
   });
 
-  // Real-NZB mode (REAL_NZB_MODE=true — the only journey mode since the
-  // checked-in NZBs were deleted): the secret-held RAR set feeds no
-  // completable ingest (no RAR read in the pipeline) and hence no
-  // streamable track until RAR read lands, so ingest completion, reload and
-  // the decoded-audio legs skip by name under a fixed extended allow-list
-  // that budgets the run instead of MAX_ALLOWED_SKIPS. The provider 430
-  // control is never allow-listed: it must run. The nine user-NZB legs are
+  // Real-NZB mode (REAL_NZB_MODE=true): dormant since the secret-held
+  // real-NZB staging leg retired under the CC0-only fixture rule — no
+  // workflow sets it. When live, the secret-held RAR set fed no completable
+  // ingest (no RAR read in the pipeline) and hence no streamable track
+  // until RAR read lands, so ingest completion, reload and the
+  // decoded-audio legs skipped by name under a fixed extended allow-list
+  // that budgeted the run instead of MAX_ALLOWED_SKIPS. The provider 430
+  // control is never allow-listed: it must run. The user-NZB legs are
   // parked in standard mode too (TWO-1635) — the RAR-set entries below
   // double as their mode-specific reason while the standard entries carry
   // the retirement reason.
@@ -2844,15 +2846,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     );
   }
 
-  // TWO-1635 parked legs (user NZB ingest retired): the nine standard-mode
-  // allow-list entries — the RAR-set list above minus the capped-stream leg,
-  // which runs live in standard mode and skips only in real-NZB mode.
-  const PARKED_SKIP_CASES: Array<[string, string]> = REAL_NZB_SKIP_CASES.filter(
-    ([, name]) => name !== 'over-limit staging account is refused with a plan-limit status',
-  );
+  // TWO-1635 parked legs (user NZB ingest retired): the ten standard-mode
+  // allow-list entries — the same titles as the RAR-set list above, since
+  // the capped-stream leg parks in standard mode too now that the
+  // secret-held real-NZB staging leg is retired (CC0-only fixture rule).
+  const PARKED_SKIP_CASES: Array<[string, string]> = [...REAL_NZB_SKIP_CASES];
 
-  // The nine parked skips plus one duplicate: ten attributed skips and one
-  // consume-once overflow, for the over-budget proofs below.
+  // The ten parked skips plus one duplicate: eleven attributed skips and
+  // one consume-once overflow, for the over-budget proofs below.
   function parkedSkipsXml(): string {
     const parked = PARKED_SKIP_CASES.map(
       ([file, name]) =>
@@ -2873,10 +2874,23 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.summary).toContain('PASS');
   });
 
-  test('the same RAR-set skips fail in standard mode', () => {
+  test('the same RAR-set skips fail in standard mode at a ten-skip budget', () => {
+    // Every title is standard-allow-listed since the capped leg parked,
+    // so only the count budget (harness default 10 < 11 skips) fails it.
     const result = runGateScript(realNzbXml());
     expect(result.status).not.toBe(0);
-    expect(result.output).toMatch(/above the allow-list budget|outside the allow-list/);
+    expect(result.output).toContain('above the allow-list budget');
+  });
+
+  test('standard mode passes the parked-leg evidence at the workflow budget of 11', () => {
+    // The retired-real-NZB staging shape: one live journey, the fixme and
+    // the ten parked legs (nine user-track legs plus the capped stream
+    // leg), budgeted by the workflow's MAX_ALLOWED_SKIPS '11'.
+    const result = runGateScript(realNzbXml(), { MAX_ALLOWED_SKIPS: '11' });
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 12 | 1 | 11 | 0 |');
+    expect(result.summary).toContain('standard mode');
+    expect(result.summary).toContain('PASS');
   });
 
   test('real-NZB mode still fails an unknown skip', () => {
@@ -2915,16 +2929,23 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('outside the allow-list');
   });
 
-  test('the script default budget is ten when MAX_ALLOWED_SKIPS is unset', () => {
-    const xml = suiteXml(
-      PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + parkedSkipsXml(),
-    );
-    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('above the allow-list budget of 10');
+  test('the script default budget is eleven when MAX_ALLOWED_SKIPS is unset', () => {
+    // The full standard evidence (fixme plus the ten parked legs) passes
+    // at the script default, and the same evidence fails the budget when
+    // the caller pins it to ten — pinning the default at eleven.
+    const parkedOnly = PARKED_SKIP_CASES.map(
+      ([file, name]) =>
+        `<testcase classname="${file}" name="${name}"><skipped message="parked (user NZB ingest retired)"/></testcase>`,
+    ).join('');
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + parkedOnly);
+    const atDefault = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
+    expect(atDefault.status).toBe(0);
+    const atTen = runGateScript(xml, { MAX_ALLOWED_SKIPS: '10' });
+    expect(atTen.status).not.toBe(0);
+    expect(atTen.output).toContain('above the allow-list budget of 10');
   });
 
-  test('an eleventh skip still fails above the budget', () => {
+  test('skips above the budget still fail', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') + FIXME_MBIDS + parkedSkipsXml(),
     );
@@ -3098,58 +3119,32 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
 });
 
-test.describe('staging real-NZB prepare step (static pin)', () => {
-  // There are no checked-in NZB fixtures (TWO-1169 deleted them all), so the
-  // e2e job rebuilds the secret-held real NZB into RUNNER_TEMP and truncates
-  // it to one whole data file before the journey — unset halves fail the job
-  // red instead of minting synthetic evidence. Owner rule (public repo): no
-  // NZB bytes, message-IDs, subjects, file names or segment lists in the
-  // repo or public logs — the halves travel as env only, the full NZB never
-  // leaves RUNNER_TEMP, and the step prints only counts and names. These pins
-  // keep the wiring (and the silence) honest offline.
+test.describe('staging real-NZB leg retired (static pin)', () => {
+  // There are no checked-in NZB fixtures (TWO-1169 deleted them all), and
+  // the secret-held real-NZB staging leg is retired under the CC0-only
+  // fixture rule (docs/fixture-audio-licences.md): no workflow rebuilds,
+  // stages or ingests an NZB, and no workflow references the retired NZB
+  // secrets, so deleting those secrets cannot fail a check. The parked
+  // legs skip by name under TWO-1635 until admin ingest can seed a
+  // curated track on staging. These pins keep the retirement honest
+  // offline: re-adding the leg (or either secret) reds here first.
   const section = jobSection(stagingWorkflow, 'e2e');
-  const marker = '      - name: Prepare staging real-NZB fixture';
-  const prepareStart = section.indexOf(marker);
-  const prepareEnd = section.indexOf('\n      - name:', prepareStart + marker.length);
-  const prepareBlock = section.slice(prepareStart, prepareEnd === -1 ? undefined : prepareEnd);
-  const runAt = section.indexOf('run: npm run e2e:staging');
 
-  test('prepare step rebuilds the halves into RUNNER_TEMP with an integrity prefix check', () => {
-    expect(prepareStart, 'e2e job must carry the real-NZB prepare step').toBeGreaterThan(-1);
-    expect(prepareStart, 'prepare must run before the full journey').toBeLessThan(runAt);
-    expect(prepareBlock).toContain('id: real-nzb');
-    expect(prepareBlock).toContain(`if: steps.staging.outputs.configured == 'true'`);
-    expect(prepareBlock).toContain(
-      'NNTUNE_TEST_NZB_XZ_B64_1: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_1 }}',
-    );
-    expect(prepareBlock).toContain(
-      'NNTUNE_TEST_NZB_XZ_B64_2: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_2 }}',
-    );
-    expect(prepareBlock).toContain('base64 -d');
-    expect(prepareBlock).toContain('xz -d');
-    expect(prepareBlock).toContain('RUNNER_TEMP');
-    expect(prepareBlock).toContain('sha256sum');
-    expect(prepareBlock).toContain('f37c136a6b3eface');
-    expect(prepareBlock).toContain('prepare-real-nzb.mjs');
-    expect(prepareBlock).toContain('ready=true');
-    expect(prepareBlock).not.toContain('ready=false');
-    expect(prepareBlock).toContain('GITHUB_OUTPUT');
-    // Absent halves fail closed — no synthetic fallback exists anymore.
-    expect(prepareBlock).toContain('no synthetic fallback');
-    // The full NZB is deleted after truncation: only the staged subset
-    // survives the step.
-    expect(prepareBlock).toContain('rm -f');
+  test('the e2e job stages no NZB and reads no NZB secrets', () => {
+    expect(section).not.toContain('Prepare staging real-NZB fixture');
+    expect(section).not.toContain('id: real-nzb');
+    expect(section).not.toContain('NNTUNE_TEST_NZB_XZ_B64');
+    expect(section).not.toContain('prepare-real-nzb.mjs');
+    expect(section).not.toContain('TEST_NZB_PATH');
+    expect(section).not.toContain('steps.real-nzb');
   });
 
-  test('prepare step prints names only, never secret values', () => {
-    // The halves enter only through the env block and the single rebuild
-    // pipe: no echo/cat/printf-to-stdout of either half is allowed.
-    expect(prepareBlock).not.toMatch(/echo[^\n]*NNTUNE_TEST_NZB/);
+  test('the called workflow declares no NZB secrets', () => {
+    expect(stagingWorkflow).not.toContain('secrets.NNTUNE_TEST_NZB_XZ_B64');
   });
 
-  test('journey and gate read the staged path, mode and provider budget from the prepare step', () => {
-    expect(section).toContain('TEST_NZB_PATH: ${{ steps.real-nzb.outputs.path }}');
-    expect(section).toContain('REAL_NZB_MODE: ${{ steps.real-nzb.outputs.ready }}');
+  test('journey keeps the provider budget without the staged path or mode', () => {
+    expect(section).not.toContain('REAL_NZB_MODE:');
     // Shared account with production: the run-wide provider connection cap
     // (default 2, hard max 10 — see e2e/helpers/provider-budget.ts).
     expect(section).toContain(`E2E_NNTP_MAX_CONNECTIONS: '2'`);
@@ -3170,14 +3165,10 @@ test.describe('staging real-NZB prepare step (static pin)', () => {
     expect(control).toContain('E2E_NNTP_MAX_CONNECTIONS');
   });
 
-  test('deploy passes both halves explicitly under their own names', () => {
+  test('deploy passes no NZB secrets to the called workflow', () => {
     const deploySection = jobSection(deployWorkflow, 'post-deploy-e2e');
-    expect(deploySection).toContain(
-      'NNTUNE_TEST_NZB_XZ_B64_1: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_1 }}',
-    );
-    expect(deploySection).toContain(
-      'NNTUNE_TEST_NZB_XZ_B64_2: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_2 }}',
-    );
+    expect(deploySection).not.toContain('NNTUNE_TEST_NZB_XZ_B64');
+    expect(deployWorkflow).not.toContain('secrets.NNTUNE_TEST_NZB_XZ_B64');
   });
 
   test('ci carries the tracked-NZB guard and gates ci-ok on it', () => {

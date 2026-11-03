@@ -1,4 +1,4 @@
--- 0029_mb_mirror_w6b: release groups, URL relationships, music videos, ISRCs.
+-- 0030_mb_mirror_w6b: release groups, URL relationships, music videos, ISRCs.
 BEGIN;
 --
 -- W6b slice of the CC0-only mirror (ADR 0007): release groups (with the

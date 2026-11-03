@@ -254,6 +254,17 @@ pub struct Config {
     /// looked up by exact version (composite `UNIQUE (pepper_version,
     /// key_hmac)`, migration 0019).
     pub native_rest_pepper_version: u32,
+    /// Stripe bearer secret (`STRIPE_SECRET_KEY` Worker secret), test mode
+    /// only. `None` until the operator provisions it (see the Worker entry
+    /// and `wrangler.toml.example`); unprovisioned, every Stripe-touching
+    /// path fails closed per-request (generic 500, so Stripe retries the
+    /// webhook) while every other route keeps serving. Never hardcoded.
+    pub stripe_secret_key: Option<String>,
+    /// Stripe webhook signing secret (`STRIPE_WEBHOOK_SECRET` Worker
+    /// secret). `None` until provisioned; unprovisioned, the webhook route
+    /// fails closed per-request (generic 500) before signature verification
+    /// — an unverifiable webhook is never parsed, never acked.
+    pub stripe_webhook_secret: Option<String>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -321,6 +332,8 @@ impl Config {
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -378,6 +391,22 @@ impl Config {
     pub fn with_native_rest_pepper(mut self, pepper: Vec<u8>, version: u32) -> Self {
         self.native_rest_pepper = Some(pepper);
         self.native_rest_pepper_version = version;
+        self
+    }
+
+    /// Provision the Stripe secrets. The Worker entry calls this only
+    /// after strict validation (the bearer must be a test-mode key —
+    /// `sk_live_` refuses the whole startup — and neither value may be
+    /// blank); unprovisioned (`None`) paths fail closed per-request, so
+    /// this setter never sees bad input in production. Native tests stage
+    /// synthetic secrets directly.
+    pub fn with_stripe(
+        mut self,
+        secret_key: Option<String>,
+        webhook_secret: Option<String>,
+    ) -> Self {
+        self.stripe_secret_key = secret_key;
+        self.stripe_webhook_secret = webhook_secret;
         self
     }
 
@@ -986,6 +1015,109 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    // --- Stripe billing reconciliation (migrations 0021/0029) ------------------
+    //
+    // The webhook and the inline/API paths share one reconciliation
+    // function (`billing_reconcile::reconcile_subscription`); these are
+    // its store seams. Reads fail closed (`Err`, except where noted) so
+    // an unprovisioned store can never mint or extend entitlement; the
+    // reconcile write runs as one transaction under the per-user advisory
+    // lock (see the statements in `billing_reconcile`). Production
+    // (`PgStore`) and the test fake override all of them.
+    /// First claim of a verified webhook event id wins (`true`);
+    /// duplicates report `false` so retried deliveries ack 200 with no
+    /// state change. Default `Ok(true)` keeps out-of-tree `Store` impls
+    /// compiling (their webhooks reprocess, never double-advance: the
+    /// reconcile write itself is idempotent on the invoice id).
+    fn claim_webhook_event(
+        &self,
+        _event_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move { Ok(true) }
+    }
+    /// Release a claim whose handling failed mid-reconcile (Stripe 5xx,
+    /// store outage): the next delivery reprocesses instead of acking 200
+    /// on a consumed claim. Default no-op keeps out-of-tree `Store` impls
+    /// compiling; production and the test fake override it.
+    fn release_webhook_event(
+        &self,
+        _event_id: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move { Ok(()) }
+    }
+    /// The reconciliation input for one user: bound Stripe customer, live
+    /// subscription row, and the full `plan_prices` map. Default `Err`
+    /// (fail closed): without local state nothing advances.
+    fn load_reconcile_input(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<crate::billing_reconcile::ReconcileInput, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// Reverse lookup for webhooks that carry no operation binding:
+    /// the user bound to a Stripe customer id, if any. Default `Ok(None)`
+    /// (unknown customer: ack without state).
+    fn user_for_stripe_customer(
+        &self,
+        _customer_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async move { Ok(None) }
+    }
+    /// Persist one reconcile pass: the subscription row upsert plus the
+    /// idempotent history inserts, as a single transaction under the
+    /// per-user advisory lock. Default `Err` (fail closed): unconfirmed
+    /// state is never half-written.
+    fn store_reconcile_outcome(
+        &self,
+        _user_id: &str,
+        _outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// The user's unresolved single-flight checkout operation, if any (at
+    /// most one: `uq_billing_operations_single_flight`). Default `Ok(None)`
+    /// (no flight: the create path inserts, failing closed on `Err`).
+    fn open_checkout_operation(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError>>
+    {
+        async move { Ok(None) }
+    }
+    /// Single-flight checkout-operation insert: concurrent first attempts
+    /// converge (the partial unique admits exactly one; the loser reads
+    /// the winner's row). Binds the Stripe customer to the account, but
+    /// only when unbound — an existing binding is never overwritten by a
+    /// racing second customer create. Default `Err` (fail closed).
+    fn create_checkout_operation(
+        &self,
+        _op_id: &str,
+        _user_id: &str,
+        _price_id: &str,
+        _customer_id: Option<&str>,
+    ) -> impl Future<Output = Result<crate::billing_reconcile::CreateOpOutcome, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// Operation lookup by id (the webhook's `client_reference_id`
+    /// binding). Default `Ok(None)` (unknown operation: ack without state).
+    fn checkout_operation_by_id(
+        &self,
+        _op_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError>>
+    {
+        async move { Ok(None) }
+    }
+    /// Record the created session (and later terminal marks) on the
+    /// operation row. Default `Err` (fail closed).
+    fn update_checkout_operation(
+        &self,
+        _op_id: &str,
+        _state: &str,
+        _price_id: &str,
+        _session_id: Option<&str>,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move { Err(StoreError) }
+    }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
     /// never report a mint it did not durably record; production and the
@@ -1167,6 +1299,11 @@ pub struct Request {
     /// cookie, except the NZB intake route, which takes the session as a
     /// Bearer (the programmatic ingest caller holds no cookie jar).
     pub authorization: Option<String>,
+    /// Raw `Stripe-Signature` header value, if any. Carried only for the
+    /// billing webhook route (the signature is that route's authentication;
+    /// every other route ignores it). The entry lowercases header names, so
+    /// this arrives normalized.
+    pub stripe_signature: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -1354,6 +1491,12 @@ where
     pub mailer: &'a M,
     pub dialer: &'a D,
     pub dns: &'a N,
+    /// Stripe HTTPS transport (Worker `Fetch` in production, fixture fakes
+    /// in tests). A shared reference — not a fifth generic — so the ~40
+    /// existing `Ctx` signatures keep their shape; billing handlers are the
+    /// only readers. Unprovisioned postures supply
+    /// [`crate::stripe::NoStripeTransport`], whose every call fails closed.
+    pub stripe: &'a dyn crate::stripe::StripeTransport,
     pub now: u64,
     pub source_ip: String,
 }
@@ -4274,6 +4417,619 @@ where
 
 // --- Dispatch ------------------------------------------------------------------------------
 
+/// `u64` handler time as Stripe-epoch `i64` (saturates only past the year
+/// 292 billion; production values always fit).
+fn billing_now_i64(now: u64) -> i64 {
+    i64::try_from(now).unwrap_or(i64::MAX)
+}
+
+/// Best-effort billing alert: recorded, never fatal. Audit write failure
+/// must not turn a stored reconcile pass into a 500 (which Stripe would
+/// retry into a duplicate-safe but noisy replay).
+async fn billing_alert<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, user_id: &str, action: &str)
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let _ = ctx
+        .store
+        .insert_audit(&crate::vault::audit_event(
+            user_id,
+            action,
+            false,
+            &ctx.source_ip,
+            ctx.now,
+        ))
+        .await;
+}
+
+/// Shared reconcile driver for one Stripe subscription: retrieve the
+/// remote subscription plus its paid invoices (every invoice read FULLY —
+/// line pagination is followed until exhausted, a first page is never
+/// the full invoice) and fold them into the store through the pure
+/// `billing_reconcile::reconcile_subscription`. `Err(())` is a Stripe or
+/// store failure (the caller 500s so the delivery retries); fail-closed
+/// passes still persist their observed row and return `Ok` with the
+/// marker set, so the caller can alert and disable.
+async fn reconcile_remote_subscription<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<crate::billing_reconcile::ReconcileOutcome, ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let subscription = ctx
+        .stripe
+        .retrieve_subscription(subscription_id.to_string())
+        .await
+        .map_err(|_| ())?;
+    let input = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| ())?;
+    let listed = ctx
+        .stripe
+        .list_invoices(crate::stripe::ListInvoices {
+            customer_id: subscription.customer.clone(),
+            subscription_id: Some(subscription.id.clone()),
+            paid_only: true,
+            limit: 100,
+            // The real transport pages the list envelope itself to
+            // exhaustion; the fakes answer the full filtered set.
+            starting_after: None,
+        })
+        .await
+        .map_err(|_| ())?;
+    let mut invoices = Vec::with_capacity(listed.len());
+    for mut invoice in listed {
+        loop {
+            let has_more = invoice
+                .lines
+                .as_ref()
+                .map(|lines| lines.has_more)
+                .unwrap_or(false);
+            if !has_more {
+                break;
+            }
+            let cursor = invoice
+                .lines
+                .as_ref()
+                .and_then(|lines| lines.data.last())
+                .map(|line| line.id.clone());
+            let page = ctx
+                .stripe
+                .list_invoice_lines(invoice.id.clone(), cursor, 100)
+                .await
+                .map_err(|_| ())?;
+            match invoice.lines.as_mut() {
+                Some(lines) => {
+                    lines.data.extend(page.data);
+                    lines.has_more = page.has_more;
+                }
+                None => {
+                    invoice.lines = Some(crate::stripe::InvoiceLines {
+                        data: page.data,
+                        has_more: page.has_more,
+                    });
+                }
+            }
+        }
+        invoices.push(invoice);
+    }
+    let outcome = crate::billing_reconcile::reconcile_subscription(
+        &input,
+        &crate::billing_reconcile::RemoteSubscription {
+            subscription,
+            invoices,
+        },
+        billing_now_i64(ctx.now),
+    );
+    ctx.store
+        .store_reconcile_outcome(user_id, &outcome)
+        .await
+        .map_err(|_| ())?;
+    Ok(outcome)
+}
+
+/// Reconcile one completed Checkout Session (the webhook's handoff):
+/// resolve the user — the session's operation binding first (`op id`
+/// from `client_reference_id`), the customer binding second — then fold
+/// the remote subscription into the store. Unknown users ack 200 with an
+/// alert and no state change. An unconfirmed or open session mints
+/// nothing: no subscription id, no store touch.
+async fn reconcile_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    session_id: &str,
+) -> Result<(), ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = ctx
+        .stripe
+        .retrieve_checkout_session(session_id.to_string())
+        .await
+        .map_err(|_| ())?;
+    if session.status.as_deref() != Some("complete")
+        || session.payment_status.as_deref() != Some("paid")
+    {
+        return Ok(());
+    }
+    let Some(subscription_id) = session.subscription.clone() else {
+        return Ok(());
+    };
+    let mut user_id: Option<String> = None;
+    let mut op: Option<crate::billing_reconcile::StoredCheckoutOp> = None;
+    if let Some(client_reference) = session.client_reference_id.as_deref() {
+        match ctx.store.checkout_operation_by_id(client_reference).await {
+            Ok(Some(found)) => {
+                user_id = Some(found.user_id.clone());
+                op = Some(found);
+            }
+            Ok(None) => {}
+            Err(_) => return Err(()),
+        }
+    }
+    if user_id.is_none() {
+        if let Some(customer) = session.customer.as_deref() {
+            user_id = ctx
+                .store
+                .user_for_stripe_customer(customer)
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    let Some(user_id) = user_id else {
+        billing_alert(
+            ctx,
+            "stripe:unknown-customer",
+            BILLING_UNKNOWN_CUSTOMER_ACTION,
+        )
+        .await;
+        return Ok(());
+    };
+    let outcome = reconcile_remote_subscription(ctx, &user_id, &subscription_id).await?;
+    // The operation that sourced this session resolves with it: clean
+    // passes succeed it, fail-closed passes park it for the hourly job.
+    // Best-effort (the reconcile itself already stored): a lost mark only
+    // leaves the flight open, never double-bills.
+    if let Some(op) = op {
+        let state = if outcome.disable_new_purchases() {
+            "needs_reconcile"
+        } else {
+            "succeeded"
+        };
+        let price_id = op.price_id.clone().unwrap_or_default();
+        let _ = ctx
+            .store
+            .update_checkout_operation(&op.id, state, &price_id, Some(session_id))
+            .await;
+    }
+    if outcome.disable_new_purchases() {
+        billing_alert(ctx, &user_id, BILLING_FAIL_CLOSED_ACTION).await;
+    }
+    Ok(())
+}
+
+async fn billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Unprovisioned secrets fail closed before any parse: Stripe retries
+    // the generic 500; an unverifiable webhook is never acked as
+    // received. The bearer key gates the Stripe calls below (the
+    // transport fails closed without it, same 500).
+    if ctx.cfg.stripe_secret_key.is_none() || ctx.cfg.stripe_webhook_secret.is_none() {
+        return internal();
+    }
+    let webhook_secret = ctx.cfg.stripe_webhook_secret.as_deref().unwrap_or_default();
+    // The signature is verified over the RAW body before any JSON
+    // parsing: every failure shares one sealed 400 (no verification
+    // oracle), and no state is touched on any failure.
+    let header = match req.stripe_signature.as_deref() {
+        Some(header) => header,
+        None => return invalid_request(),
+    };
+    let event = match crate::stripe::verify_webhook_signature(
+        &req.body,
+        header,
+        webhook_secret,
+        billing_now_i64(ctx.now),
+    ) {
+        Ok(event) => event,
+        Err(_) => return invalid_request(),
+    };
+    // First claim wins. Duplicates of a verified non-checkout event (or a
+    // live-mode event) still ack 200 with no state change — those paths
+    // never write state, so nothing can be lost. A duplicate
+    // `checkout.session.completed`, however, is REPROCESSED idempotently
+    // instead of acked: the release below is a same-DB DELETE, so a store
+    // outage that fails the release — or a worker death after the claim —
+    // would otherwise leave the paid event consumed and unprocessed.
+    // Reconciliation converges (monotonic upsert under the per-user lock,
+    // history idempotent on the invoice id, operation mark idempotent), so
+    // reprocessing a duplicate lands the same stored state, and a still-
+    // failing pass 500s so Stripe retries anyway. A store failure on the
+    // claim itself 500s so Stripe retries the delivery.
+    let _first_claim = match ctx.store.claim_webhook_event(&event.id).await {
+        Ok(first) => first,
+        Err(_) => return internal(),
+    };
+    if event.event_type != "checkout.session.completed" {
+        // Verified but not ours: ack, no state change. Live-mode events
+        // land here too — never Stripe-called, never stored.
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
+    if event.livemode {
+        // A live-mode event on a test-mode worker is misconfiguration or
+        // a probe: alert, ack, and never call Stripe or touch state.
+        billing_alert(
+            ctx,
+            &format!("stripe:{}", event.id),
+            BILLING_UNKNOWN_CUSTOMER_ACTION,
+        )
+        .await;
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
+    // The session object is verified JSON now; a missing id is a sender
+    // bug (400), not a retryable failure.
+    let session_id = match event.object.get("id").and_then(|id| id.as_str()) {
+        Some(id) => id.to_string(),
+        None => return invalid_request(),
+    };
+    match reconcile_checkout_session(ctx, &session_id).await {
+        Ok(()) => json_response(200, serde_json::json!({"ok": true})),
+        Err(()) => {
+            // The claim is released so the retried delivery reprocesses
+            // instead of acking 200 on a consumed claim. Best-effort: a
+            // failed release still 500s, so Stripe retries anyway — and a
+            // redelivery that finds the stale claim reprocesses it above
+            // rather than dropping the payment.
+            let _ = ctx.store.release_webhook_event(&event.id).await;
+            internal()
+        }
+    }
+}
+
+/// Fresh single-flight operation id: UUID v4 text (the store casts the
+/// id column). Secure-randomness failure fails the purchase closed —
+/// never with a predictable id.
+fn new_operation_id() -> Result<String, crate::random::CryptoError> {
+    let bytes = crate::random::secure_random_bytes::<16>()?;
+    let mut hex = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        let mut byte = *byte;
+        if index == 6 {
+            byte = (byte & 0x0f) | 0x40;
+        }
+        if index == 8 {
+            byte = (byte & 0x3f) | 0x80;
+        }
+        if matches!(index, 4 | 6 | 8 | 10) {
+            hex.push('-');
+        }
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
+}
+
+/// Free a held live slot (`incomplete` / `unpaid` / `paused`) before a
+/// replacement checkout mints its session. The held subscription is
+/// re-read from Stripe and the decision branches on the REMOTE status —
+/// the stored row may be stale (only `checkout.session.completed`
+/// webhooks reconcile, so a payment recovered since the last reconcile
+/// still reads `unpaid` locally). Terminal remote reconciles straight
+/// into the released slot; still-held remote cancels first and then
+/// reconciles. Only once the slot is free may the caller proceed —
+/// otherwise the replacement's reconcile would collide with the
+/// still-held row and fail a paid subscription closed. A remote that
+/// recovered to `active` / `past_due` reconciles (coverage and history
+/// land) but refuses the purchase: canceling it would destroy the newly
+/// paid subscription, and minting a second one double-bills. An unknown
+/// remote status fails closed with an alert: no cancel, no reconcile, no
+/// session — the held row stays reserved so later attempts keep failing
+/// closed the same way. `Failed` is retryable (Stripe or store failure);
+/// nothing is minted on any path but the freed slot.
+async fn release_held_subscription_slot<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let subscription = ctx
+        .stripe
+        .retrieve_subscription(subscription_id.to_string())
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    match subscription.status.as_str() {
+        // Still held: cancel first, then reconcile the terminal state out
+        // of the slot.
+        "incomplete" | "unpaid" | "paused" => {
+            ctx.stripe
+                .cancel_subscription(subscription_id.to_string())
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Already terminal remotely: nothing to cancel, reconcile it out
+        // of the slot.
+        status if crate::billing_reconcile::is_terminal_status(status) => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Recovered since the last reconcile: store the paid state, then
+        // refuse — the account is already subscribed, so no cancel and no
+        // second session.
+        "active" | "past_due" => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Err(EnsureCheckoutError::Unavailable)
+        }
+        // Unknown provider state: fail closed. No cancel (never destroy
+        // what we cannot classify), no reconcile (the stale held row stays
+        // reserved), no session — just the alert.
+        _ => {
+            billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+            Err(EnsureCheckoutError::Unavailable)
+        }
+    }
+}
+
+/// The customer id a converged purchase attempt must create its session
+/// under: the account binding re-read *after* the single-flight insert,
+/// never the snapshot taken before this caller's own customer create.
+/// Two racers that both start unbound each mint a Stripe customer; the
+/// insert converges them on the winner's operation, and the winner's bind
+/// owns the account. The op INSERT and the bind are separate statements,
+/// so a loser can converge before the winner's bind lands: with no bound
+/// customer yet the attempt fails retryable (the retry reads the winner's
+/// binding) instead of falling back to its orphan. A converged attempt
+/// never sessions on a customer that is not the account-bound one.
+async fn converged_session_customer<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    _snapshot_customer: Option<String>,
+    _created_customer: String,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let fresh = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+        .stripe_customer_id;
+    // No fallback to the snapshot or the freshly minted orphan: in the
+    // pre-bind window (op visible, winner bind not yet landed) there is no
+    // bound customer, so the attempt fails retryable and the retry reads
+    // the winner's binding. A converged attempt never sessions on a
+    // customer that is not the account-bound one.
+    fresh.ok_or(EnsureCheckoutError::Failed)
+}
+
+/// Create the Checkout Session under one operation id and record it, so
+/// the next attempt reuses instead of recreating. The Stripe idempotency
+/// key derives from the operation id, so even a lost `update` replays
+/// into the same session on retry.
+async fn create_session_under<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    operation_id: &str,
+    customer_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = ctx
+        .stripe
+        .create_checkout_session(crate::stripe::CreateCheckoutSession {
+            operation_id: operation_id.to_string(),
+            customer_id: customer_id.to_string(),
+            price_id: price_id.to_string(),
+            success_url: success_url.to_string(),
+            cancel_url: cancel_url.to_string(),
+        })
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    // Best-effort mark: the session already exists under our idempotency
+    // key, so a lost mark only costs a retrieve on the next attempt.
+    let _ = ctx
+        .store
+        .update_checkout_operation(operation_id, "submitted", price_id, Some(&session.id))
+        .await;
+    session.url.ok_or(EnsureCheckoutError::Failed)
+}
+
+/// Serialized purchase attempt (single flight): reuse the open Checkout
+/// Session while open, else create under the converged operation id. No
+/// user-facing route in this slice — the wiring card's routes call this.
+/// `test_clock` is the staging-proof seam (customer creation only, never
+/// a clock the worker manages).
+///
+/// `Unavailable` means the price is not a selectable test-mode mapping
+/// (or the binding is otherwise inconsistent), the account already holds
+/// a live subscription, or the stored row is an unknown provider state
+/// failing closed: no Stripe call is made, and new purchases stay
+/// disabled. An alert is raised except for the already-subscribed case.
+/// `Failed` means a Stripe or store failure (retryable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureCheckoutError {
+    Unavailable,
+    Failed,
+}
+
+pub async fn ensure_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let input = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    // Plan ids come only from `plan_prices`: an unmapped, unselectable,
+    // or live-mode price disables the purchase (alert, no Stripe call),
+    // it never mints a guess.
+    let selectable = input
+        .bindings
+        .iter()
+        .any(|binding| !binding.livemode && binding.selectable && binding.price_id == price_id);
+    if !selectable {
+        billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+        return Err(EnsureCheckoutError::Unavailable);
+    }
+    // No second subscription while the live slot is held: an
+    // active/past_due row means the account is subscribed (the
+    // webhook-before-response race lands here — the purchase is refused
+    // instead of minting a stray session), and any other stored status
+    // except the known held ones is an unknown provider state failing
+    // closed, which keeps new purchases disabled. Held (`incomplete`,
+    // `unpaid`, `paused`) rows reserve the slot but confer nothing, so a
+    // retry may still proceed below. Terminal rows sit outside the slot
+    // (`live` is `None`) and never reach this guard.
+    if let Some(live) = input.live.as_ref() {
+        if !matches!(live.status.as_str(), "incomplete" | "unpaid" | "paused") {
+            if !matches!(live.status.as_str(), "active" | "past_due") {
+                billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+            }
+            return Err(EnsureCheckoutError::Unavailable);
+        }
+        // Held (`incomplete` / `unpaid` / `paused`) rows reserve the slot
+        // but confer nothing: confirm the held subscription terminal (or
+        // cancel it) and reconcile it out of the slot before minting the
+        // replacement, so the replacement's reconcile never collides with
+        // the still-held row. A retryable failure mints nothing.
+        release_held_subscription_slot(ctx, user_id, &live.stripe_subscription_id).await?;
+    }
+    let open = ctx
+        .store
+        .open_checkout_operation(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if let Some(op) = open {
+        // An open session is verified fresh: still-open reuses its fresh
+        // URL (lost responses and concurrent attempts converge here —
+        // no second session is minted). A closed, expired, or vanished
+        // session repairs under the SAME operation id (same idempotency
+        // key replays, never duplicates).
+        if let Some(session_id) = op.session_id.clone() {
+            if let Ok(session) = ctx
+                .stripe
+                .retrieve_checkout_session(session_id.clone())
+                .await
+            {
+                if session.status.as_deref() == Some("open") {
+                    if let Some(url) = session.url {
+                        return Ok(url);
+                    }
+                } else if session.status.as_deref() == Some("complete")
+                    && session.payment_status.as_deref() == Some("paid")
+                {
+                    // The purchase completed but its webhook was lost (or
+                    // lands after this retry): reconcile the paid session
+                    // through the shared driver instead of minting a second
+                    // payable session under the same idempotency key. A
+                    // failed or still-absent retrieve falls through to the
+                    // repair below; only a confirmed-expired session or a
+                    // missing one repairs.
+                    reconcile_checkout_session(ctx, &session_id)
+                        .await
+                        .map_err(|_| EnsureCheckoutError::Failed)?;
+                    return Err(EnsureCheckoutError::Unavailable);
+                }
+            }
+        }
+        let Some(customer_id) = input.stripe_customer_id.clone() else {
+            billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+            return Err(EnsureCheckoutError::Unavailable);
+        };
+        return create_session_under(ctx, &op.id, &customer_id, price_id, success_url, cancel_url)
+            .await;
+    }
+    // No flight: mint the operation id, ensure the customer (with the
+    // test-clock seam), then insert single-flight — a racer converges on
+    // the winner's row below instead of minting a second subscription.
+    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
+    let customer_id = match input.stripe_customer_id.clone() {
+        Some(customer_id) => customer_id,
+        None => {
+            ctx.stripe
+                .create_customer(crate::stripe::CreateCustomer {
+                    operation_id: operation_id.clone(),
+                    user_id: Some(user_id.to_string()),
+                    test_clock: test_clock.map(str::to_string),
+                })
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?
+                .id
+        }
+    };
+    let outcome = ctx
+        .store
+        .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    let converged = outcome.op();
+    // Converge on the winner-bound customer: a racing loser that started
+    // unbound minted its own orphan customer before the insert, and the
+    // pre-insert snapshot still names nothing. Re-read the binding — the
+    // payable session must sit on the bound customer.
+    let customer_id =
+        converged_session_customer(ctx, user_id, input.stripe_customer_id.clone(), customer_id)
+            .await?;
+    create_session_under(
+        ctx,
+        &converged.id,
+        &customer_id,
+        price_id,
+        success_url,
+        cancel_url,
+    )
+    .await
+}
+
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
 /// these paths — plus the single-segment dynamic revoke id and the
 /// scope-map-served native paths (see `options_preflight_served`) — with
@@ -4356,6 +5112,41 @@ fn options_preflight_served(path: &str) -> bool {
         })
 }
 
+// --- Stripe billing: webhook + single-flight checkout -------------------------------
+//
+// Checkout shape only, test mode only (ADR 0005). The webhook route is a
+// signature carve-out: `Stripe-Signature` HMAC-SHA256 over the raw body
+// is the authentication, so no session cookie, bearer, or Access gate
+// applies here — and the scope map keeps the path `Deny` so bearer
+// credentials can never enter it. Staging Cloudflare Access bypass is
+// the wiring card's job, not this slice's. There is deliberately no
+// user-facing checkout/portal route here either: `ensure_checkout_session`
+// is the serialized purchase attempt those routes will call.
+//
+// Both the webhook and the inline/API paths reconcile through ONE
+// function (`reconcile_remote_subscription` below, pure core in
+// `billing_reconcile::reconcile_subscription`), so the same remote state
+// always lands the same stored state whichever path runs first
+// (webhook-before-response and lost-response races included).
+
+/// Stripe webhook route. Unauthenticated by design (the signature is the
+/// auth); stays out of `is_known_path` so browser preflight stays 404 and
+/// the served log line keeps the `unknown` template like other unlisted
+/// paths. Stripe retries non-2xx, so every failure here is either a 400
+/// (sender's fault: fix and resend) or a 500 (ours: retried).
+pub const BILLING_WEBHOOK_PATH: &str = "/v1/billing/webhook";
+
+/// Audit action for a fail-closed reconcile pass: observed state stored,
+/// nothing advanced, new purchases disabled.
+const BILLING_FAIL_CLOSED_ACTION: &str = "billing.reconcile_fail_closed";
+/// Audit action for a verified webhook that binds to no user (unknown or
+/// tombstoned customer): acked 200 without state change; live
+/// cancel-and-alert belongs to the account-deletion slice.
+const BILLING_UNKNOWN_CUSTOMER_ACTION: &str = "billing.webhook_unknown_customer";
+/// Audit action when a purchase cannot proceed (price unmapped or
+/// unselectable, binding inconsistent): no Stripe call made.
+const BILLING_PURCHASE_UNAVAILABLE_ACTION: &str = "billing.purchase_unavailable";
+
 /// Empty 204 for a preflight against a known path. Carries no ACA headers
 /// itself: the entry appends them exactly when the request `Origin` equals
 /// the configured origin (never reflected, never `*`). `pub(crate)` so the
@@ -4436,6 +5227,12 @@ where
         ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
+        // Stripe webhook carve-out: unauthenticated by design (the
+        // `Stripe-Signature` HMAC over the raw body is the auth), so it
+        // bypasses the bearer gate above like the cookie/session paths do
+        // — and the scope map keeps the path `Deny` so bearer credentials
+        // can never enter it. Deliberately outside `is_known_path`.
+        ("POST", BILLING_WEBHOOK_PATH) => billing_webhook(ctx, req).await,
         // Single-segment credential ids only; deeper shapes 404 inside
         // the handler. `options_preflight_served` keeps browser preflights
         // working for these dynamic paths (exact-path `is_known_path`
@@ -4630,6 +5427,29 @@ mod tests {
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
         usage: RefCell<HashMap<(String, u64), u64>>,
+        /// Stripe billing mirror: bound customer per user, the stored
+        /// subscription row per user, and the full `plan_prices` map the
+        /// reconcile input loads whole.
+        billing_customers: RefCell<HashMap<String, String>>,
+        billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
+        /// Claimed webhook event ids (first claim wins, mirroring
+        /// `billing_webhook_events`).
+        webhook_events: RefCell<HashSet<String>>,
+        /// Single-flight checkout operations by id.
+        checkout_ops: RefCell<HashMap<String, crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Pre-bind window pin: when set, `create_checkout_operation`
+        /// inserts the winner's row WITHOUT binding the customer, mirroring
+        /// production where the op INSERT and the bind are separate
+        /// statements. A loser converging while the flag is set sees the op
+        /// but no binding.
+        defer_customer_bind: RefCell<bool>,
+        /// Paid-invoice history by Stripe invoice id (idempotent on the id,
+        /// mirroring `paid_invoice_history`).
+        invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
+        /// Billing store-outage pin: when set, every billing method fails
+        /// like a production query outage instead of touching state.
+        fail_billing: RefCell<bool>,
     }
 
     impl Store for FakeStore {
@@ -5487,6 +6307,204 @@ mod tests {
             ));
             Ok(AdminWriteOutcome::Applied(previous))
         }
+        async fn claim_webhook_event(&self, event_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .webhook_events
+                .borrow_mut()
+                .insert(event_id.to_string()))
+        }
+        async fn release_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            self.webhook_events.borrow_mut().remove(event_id);
+            Ok(())
+        }
+        async fn load_reconcile_input(
+            &self,
+            user_id: &str,
+        ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            let live = self.billing_rows.borrow().get(user_id).map(|row| {
+                crate::billing_reconcile::LiveRow {
+                    stripe_subscription_id: row.stripe_subscription_id.clone(),
+                    stripe_customer_id: row.stripe_customer_id.clone(),
+                    stripe_item_id: row.stripe_item_id.clone(),
+                    stripe_price_id: row.stripe_price_id.clone(),
+                    plan_id: row.plan_id.clone(),
+                    status: row.status.clone(),
+                    paid_through_unix: row.paid_through_unix,
+                    grace_until_unix: row.grace_until_unix,
+                }
+            });
+            // A `trialing` or terminal row sits outside the live slot: the
+            // production predicate excludes it, so the fake does too.
+            let live = live.filter(|row| {
+                matches!(
+                    row.status.as_str(),
+                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                )
+            });
+            Ok(crate::billing_reconcile::ReconcileInput {
+                stripe_customer_id: self.billing_customers.borrow().get(user_id).cloned(),
+                live,
+                bindings: self.billing_bindings.borrow().clone(),
+            })
+        }
+        async fn user_for_stripe_customer(
+            &self,
+            customer_id: &str,
+        ) -> Result<Option<String>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .billing_customers
+                .borrow()
+                .iter()
+                .find(|(_, customer)| customer.as_str() == customer_id)
+                .map(|(user, _)| user.clone()))
+        }
+        async fn store_reconcile_outcome(
+            &self,
+            user_id: &str,
+            outcome: &crate::billing_reconcile::ReconcileOutcome,
+        ) -> Result<(), StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            // Mirrors the production upsert's monotonic coverage CASE: a
+            // pass that folded an older snapshot commits without
+            // regressing confirmed `paid_through_at` (or the plan and
+            // anchor tied to it). Status and bindings still update
+            // verbatim; history still converges on the invoice id.
+            let mut rows = self.billing_rows.borrow_mut();
+            let merged = match rows.get(user_id) {
+                Some(existing)
+                    if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
+                {
+                    let advances = outcome.row.paid_through_unix.is_some_and(|end| {
+                        existing
+                            .paid_through_unix
+                            .is_none_or(|previous| end > previous)
+                    });
+                    let mut row = outcome.row.clone();
+                    if !advances {
+                        row.paid_through_unix = existing.paid_through_unix;
+                        row.plan_id = existing.plan_id.clone();
+                        row.paid_invoice_id = existing.paid_invoice_id.clone();
+                    }
+                    row
+                }
+                _ => outcome.row.clone(),
+            };
+            rows.insert(user_id.to_string(), merged);
+            let mut history = self.invoice_history.borrow_mut();
+            for row in &outcome.history {
+                history
+                    .entry(row.stripe_invoice_id.clone())
+                    .or_insert_with(|| row.clone());
+            }
+            Ok(())
+        }
+        async fn open_checkout_operation(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .checkout_ops
+                .borrow()
+                .values()
+                .find(|op| {
+                    op.user_id == user_id
+                        && crate::billing_reconcile::is_single_flight_state(&op.state)
+                })
+                .cloned())
+        }
+        async fn create_checkout_operation(
+            &self,
+            op_id: &str,
+            user_id: &str,
+            price_id: &str,
+            customer_id: Option<&str>,
+        ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            let mut ops = self.checkout_ops.borrow_mut();
+            // The partial unique admits at most one open flight per user:
+            // a racer converges on the winner's row below instead of
+            // minting a second subscription.
+            if let Some(winner) = ops.values().find(|op| {
+                op.user_id == user_id && crate::billing_reconcile::is_single_flight_state(&op.state)
+            }) {
+                return Ok(crate::billing_reconcile::CreateOpOutcome::Existing(
+                    winner.clone(),
+                ));
+            }
+            // Bind the Stripe customer to the account, but only when
+            // unbound — an existing binding is never overwritten by a
+            // racing second customer create. Skipped while the test holds
+            // the pre-bind window open (production binds in a separate
+            // statement after the op INSERT).
+            if let Some(customer) = customer_id {
+                // Skipped while the test holds the pre-bind window open
+                // (production binds in a separate statement after the op
+                // INSERT).
+                if !*self.defer_customer_bind.borrow() {
+                    self.billing_customers
+                        .borrow_mut()
+                        .entry(user_id.to_string())
+                        .or_insert_with(|| customer.to_string());
+                }
+            }
+            let op = crate::billing_reconcile::StoredCheckoutOp {
+                id: op_id.to_string(),
+                user_id: user_id.to_string(),
+                state: "pending".to_string(),
+                price_id: Some(price_id.to_string()),
+                session_id: None,
+                subscription_id: None,
+            };
+            ops.insert(op_id.to_string(), op.clone());
+            Ok(crate::billing_reconcile::CreateOpOutcome::Created(op))
+        }
+        async fn checkout_operation_by_id(
+            &self,
+            op_id: &str,
+        ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.checkout_ops.borrow().get(op_id).cloned())
+        }
+        async fn update_checkout_operation(
+            &self,
+            op_id: &str,
+            state: &str,
+            price_id: &str,
+            session_id: Option<&str>,
+        ) -> Result<(), StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            // Best-effort mark like production: a missing row (already
+            // resolved elsewhere) still answers `Ok`.
+            if let Some(op) = self.checkout_ops.borrow_mut().get_mut(op_id) {
+                op.state = state.to_string();
+                op.price_id = Some(price_id.to_string());
+                op.session_id = session_id.map(str::to_string);
+            }
+            Ok(())
+        }
     }
 
     /// Mirrors the conditional UPDATE/RETURNING semantics: one winner.
@@ -5577,12 +6595,247 @@ mod tests {
         }
     }
 
+    /// Scripted Stripe fixture: sessions, subscriptions, and full invoices
+    /// by id, a customer-create log for the test-clock seam assert, and a
+    /// per-method failure pin for Stripe-outage paths. No network, no
+    /// secrets: every id is synthetic (`cs_test_*`, `sub_test_*`, ...).
+    #[derive(Default)]
+    struct FakeStripe {
+        sessions: RefCell<HashMap<String, crate::stripe::CheckoutSession>>,
+        subscriptions: RefCell<HashMap<String, crate::stripe::Subscription>>,
+        invoices: RefCell<HashMap<String, crate::stripe::Invoice>>,
+        /// Remainder line pages per invoice: `list_invoice_lines` answers
+        /// the next page from here, so tests pin the full-read follow-up
+        /// instead of trusting the first page.
+        line_pages: RefCell<HashMap<String, Vec<crate::stripe::InvoiceLine>>>,
+        /// Customer-create log `(user_id, test_clock)` for the seam assert.
+        customers_created: RefCell<Vec<(Option<String>, Option<String>)>>,
+        /// Checkout sessions minted through `create_checkout_session`.
+        sessions_created: RefCell<usize>,
+        /// Customers the minted sessions were bound to (proves a
+        /// converged attempt sessions on the winner-bound customer,
+        /// never a racing loser's orphan).
+        session_customers: RefCell<Vec<String>>,
+        /// Subscription ids passed to `cancel_subscription` (proves a
+        /// recovered or unknown remote is never canceled).
+        canceled: RefCell<Vec<String>>,
+        /// Method names that fail like a Stripe outage.
+        fail: RefCell<HashSet<String>>,
+        /// Next customer id minted by `create_customer`.
+        next_customer: RefCell<Option<String>>,
+    }
+
+    impl FakeStripe {
+        fn fail(&self, method: &str) -> bool {
+            self.fail.borrow().contains(method)
+        }
+
+        fn err<T>(&self) -> crate::stripe::StripeResult<T> {
+            Err(crate::stripe::StripeError::transport())
+        }
+    }
+
+    impl crate::stripe::StripeTransport for FakeStripe {
+        fn create_customer(
+            &self,
+            req: crate::stripe::CreateCustomer,
+        ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Customer>> + '_>>
+        {
+            Box::pin(async move {
+                if self.fail("create_customer") {
+                    return self.err();
+                }
+                self.customers_created
+                    .borrow_mut()
+                    .push((req.user_id.clone(), req.test_clock.clone()));
+                let id = self
+                    .next_customer
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "cus_test_1".to_string());
+                Ok(crate::stripe::Customer {
+                    id,
+                    livemode: false,
+                    test_clock: req.test_clock,
+                    email: None,
+                })
+            })
+        }
+        fn create_checkout_session(
+            &self,
+            req: crate::stripe::CreateCheckoutSession,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("create_checkout_session") {
+                    return self.err();
+                }
+                let mut created = self.sessions_created.borrow_mut();
+                *created += 1;
+                self.session_customers
+                    .borrow_mut()
+                    .push(req.customer_id.clone());
+                let id = format!("cs_test_{created}");
+                let url = format!("https://checkout.stripe.com/pay/{id}");
+                Ok(crate::stripe::CheckoutSession {
+                    id,
+                    status: Some("open".to_string()),
+                    payment_status: Some("unpaid".to_string()),
+                    customer: Some(req.customer_id),
+                    subscription: None,
+                    url: Some(url),
+                    client_reference_id: Some(req.operation_id),
+                    livemode: false,
+                })
+            })
+        }
+        fn retrieve_checkout_session(
+            &self,
+            session_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("retrieve_checkout_session") {
+                    return self.err();
+                }
+                self.sessions
+                    .borrow()
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn retrieve_subscription(
+            &self,
+            subscription_id: String,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("retrieve_subscription") {
+                    return self.err();
+                }
+                self.subscriptions
+                    .borrow()
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn retrieve_invoice(
+            &self,
+            invoice_id: String,
+        ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>>
+        {
+            Box::pin(async move {
+                if self.fail("retrieve_invoice") {
+                    return self.err();
+                }
+                self.invoices
+                    .borrow()
+                    .get(&invoice_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn list_invoice_lines(
+            &self,
+            invoice_id: String,
+            _starting_after: Option<String>,
+            _limit: u8,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("list_invoice_lines") {
+                    return self.err();
+                }
+                let data = self
+                    .line_pages
+                    .borrow_mut()
+                    .remove(&invoice_id)
+                    .unwrap_or_default();
+                Ok(crate::stripe::InvoiceLines {
+                    data,
+                    has_more: false,
+                })
+            })
+        }
+        fn list_invoices(
+            &self,
+            req: crate::stripe::ListInvoices,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("list_invoices") {
+                    return self.err();
+                }
+                Ok(self
+                    .invoices
+                    .borrow()
+                    .values()
+                    .filter(|invoice| {
+                        if let Some(customer) = req.customer_id.as_deref() {
+                            if invoice.customer.as_deref() != Some(customer) {
+                                return false;
+                            }
+                        }
+                        if let Some(subscription) = req.subscription_id.as_deref() {
+                            if invoice.subscription.as_deref() != Some(subscription) {
+                                return false;
+                            }
+                        }
+                        if req.paid_only && invoice.status != "paid" {
+                            return false;
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+        fn cancel_subscription(
+            &self,
+            subscription_id: String,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("cancel_subscription") {
+                    return self.err();
+                }
+                // Like the real `DELETE /v1/subscriptions/{id}`: the call
+                // transitions the subscription and returns the canceled
+                // object, so a follow-up retrieve observes terminal state.
+                self.canceled.borrow_mut().push(subscription_id.clone());
+                let mut subscriptions = self.subscriptions.borrow_mut();
+                let mut subscription = subscriptions
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)?;
+                subscription.status = "canceled".to_string();
+                subscriptions.insert(subscription_id, subscription.clone());
+                Ok(subscription)
+            })
+        }
+    }
+
     struct Harness {
         config: Config,
         store: FakeStore,
         mailer: FakeMailer,
         dialer: FakeDialer,
         dns: FakeDns,
+        stripe: FakeStripe,
     }
 
     fn harness() -> Harness {
@@ -5600,7 +6853,20 @@ mod tests {
                     vec!["93.184.216.34".parse().unwrap()],
                 )]),
             },
+            stripe: FakeStripe::default(),
         }
+    }
+
+    fn stripe_harness() -> Harness {
+        // Webhook/ensure tests provision the Stripe secrets the handlers
+        // gate on (synthetic values — the transport is the fake, so no
+        // secret ever leaves the test).
+        let mut h = harness();
+        h.config = cfg().with_stripe(
+            Some("sk_test_synthetic".to_string()),
+            Some("whsec_synthetic".to_string()),
+        );
+        h
     }
 
     impl Harness {
@@ -5611,6 +6877,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: "198.51.100.9".to_string(),
             }
@@ -5633,6 +6900,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: source_ip.to_string(),
             };
@@ -5642,6 +6910,7 @@ mod tests {
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
                 authorization: None,
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&ctx, &req))
@@ -5661,6 +6930,7 @@ mod tests {
                 cookie,
                 origin: origin.map(str::to_string),
                 authorization: None,
+                stripe_signature: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5681,6 +6951,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: source_ip.to_string(),
             };
@@ -5690,6 +6961,7 @@ mod tests {
                 cookie,
                 origin: origin.map(str::to_string),
                 authorization: None,
+                stripe_signature: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&ctx, &req))
@@ -5706,10 +6978,1672 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             block_on(handle(&self.ctx(), &req))
         }
+
+        /// Stripe webhook delivery: raw body bytes plus the
+        /// `Stripe-Signature` value, exactly as the Worker entry forwards
+        /// them (the signature covers the RAW body, never re-encoded JSON).
+        fn call_webhook(&self, raw_body: &[u8], signature: Option<String>) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: BILLING_WEBHOOK_PATH.to_string(),
+                cookie: None,
+                origin: None,
+                authorization: None,
+                stripe_signature: signature,
+                body: raw_body.to_vec(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    // --- Stripe billing fixtures -----------------------------------------------------
+    //
+    // Synthetic ids only (`*_test_*`); no secret material anywhere. Times
+    // are Stripe-epoch `i64` around `NOW`.
+
+    const BILLING_NOW: i64 = NOW as i64;
+    const PRICE_PLUS: &str = "price_plus_test";
+    const PRICE_PRO: &str = "price_pro_test";
+    const PLAN_PLUS: &str = "plus";
+    const PLAN_PRO: &str = "pro";
+    const BILLING_PERIOD: i64 = 30 * 24 * 3_600;
+
+    fn test_bindings() -> Vec<crate::billing_reconcile::PriceBinding> {
+        vec![
+            crate::billing_reconcile::PriceBinding {
+                price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                selectable: true,
+                livemode: false,
+            },
+            crate::billing_reconcile::PriceBinding {
+                price_id: PRICE_PRO.to_string(),
+                plan_id: PLAN_PRO.to_string(),
+                selectable: true,
+                livemode: false,
+            },
+        ]
+    }
+
+    fn seed_billing_user(h: &Harness, user_id: &str) {
+        seed_user(h, user_id, &format!("{user_id}@example.com"));
+        h.store
+            .billing_bindings
+            .borrow_mut()
+            .extend(test_bindings());
+    }
+
+    fn test_session(
+        id: &str,
+        status: &str,
+        payment_status: &str,
+        customer: Option<&str>,
+        subscription: Option<&str>,
+        client_reference: Option<&str>,
+    ) -> crate::stripe::CheckoutSession {
+        crate::stripe::CheckoutSession {
+            id: id.to_string(),
+            status: Some(status.to_string()),
+            payment_status: Some(payment_status.to_string()),
+            customer: customer.map(str::to_string),
+            subscription: subscription.map(str::to_string),
+            url: Some(format!("https://checkout.stripe.com/pay/{id}")),
+            client_reference_id: client_reference.map(str::to_string),
+            livemode: false,
+        }
+    }
+
+    fn test_subscription(
+        id: &str,
+        customer: &str,
+        status: &str,
+        price: &str,
+    ) -> crate::stripe::Subscription {
+        crate::stripe::Subscription {
+            id: id.to_string(),
+            customer: Some(customer.to_string()),
+            status: status.to_string(),
+            cancel_at_period_end: false,
+            current_period_end: Some(BILLING_NOW + BILLING_PERIOD),
+            items: Some(crate::stripe::SubscriptionItems {
+                data: vec![crate::stripe::SubscriptionItem {
+                    id: "si_test_1".to_string(),
+                    price: Some(price.to_string()),
+                }],
+            }),
+            livemode: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_invoice(
+        id: &str,
+        customer: &str,
+        subscription: &str,
+        price: &str,
+        period_start: i64,
+        period_end: i64,
+        paid_at: i64,
+    ) -> crate::stripe::Invoice {
+        crate::stripe::Invoice {
+            id: id.to_string(),
+            customer: Some(customer.to_string()),
+            subscription: Some(subscription.to_string()),
+            status: "paid".to_string(),
+            amount_paid: 1_000,
+            currency: Some("usd".to_string()),
+            status_transitions: Some(crate::stripe::InvoiceStatusTransitions {
+                paid_at: Some(paid_at),
+            }),
+            lines: Some(crate::stripe::InvoiceLines {
+                data: vec![crate::stripe::InvoiceLine {
+                    id: format!("{id}_line_1"),
+                    amount: 1_000,
+                    currency: Some("usd".to_string()),
+                    price: Some(price.to_string()),
+                    period: Some(crate::stripe::InvoiceLinePeriod {
+                        start: Some(period_start),
+                        end: Some(period_end),
+                    }),
+                }],
+                has_more: false,
+            }),
+            livemode: false,
+        }
+    }
+
+    /// Raw `checkout.session.completed` body: the session id rides
+    /// `data.object.id`, exactly the shape the webhook parses.
+    fn checkout_completed_body(event_id: &str, session_id: &str, livemode: bool) -> Vec<u8> {
+        serde_json::json!({
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "livemode": livemode,
+            "data": {"object": {"id": session_id}},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn other_event_body(event_id: &str, event_type: &str) -> Vec<u8> {
+        serde_json::json!({
+            "id": event_id,
+            "type": event_type,
+            "livemode": false,
+            "data": {"object": {"id": "in_test_9"}},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sign(body: &[u8], t: i64) -> String {
+        crate::stripe::test_signature_header(body, t, "whsec_synthetic")
+    }
+
+    fn webhook_ok(resp: &Response) {
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+    }
+
+    fn audits_with(h: &Harness, action: &str) -> usize {
+        h.store
+            .audits
+            .borrow()
+            .iter()
+            .filter(|event| event.action == action)
+            .count()
+    }
+
+    fn live_for(h: &Harness, user_id: &str) -> Option<crate::billing_reconcile::LiveRow> {
+        block_on(h.store.load_reconcile_input(user_id))
+            .ok()
+            .and_then(|input| input.live)
+    }
+
+    /// Paid first period through the webhook: op-bound session, active
+    /// subscription, one qualifying invoice. Returns the event body for
+    /// redelivery tests.
+    fn deliver_first_period(h: &Harness, event_id: &str) -> Vec<u8> {
+        let period_start = BILLING_NOW;
+        let period_end = BILLING_NOW + BILLING_PERIOD;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                period_start,
+                period_end,
+                period_start + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body(event_id, "cs_test_1", false);
+        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+        webhook_ok(&resp);
+        body
+    }
+
+    #[test]
+    fn billing_webhook_valid_advances_and_records_history() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_test_1");
+        // Coverage advanced from the confirmed paid invoice only.
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(live.grace_until_unix, None);
+        // Exactly one history row, idempotent on the invoice id.
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        let row = &history["in_test_1"];
+        assert_eq!(row.stripe_subscription_id, "sub_test_1");
+        assert_eq!(row.plan_id, PLAN_PLUS);
+        assert_eq!(row.period_start_unix, BILLING_NOW);
+        assert_eq!(row.period_end_unix, BILLING_NOW + BILLING_PERIOD);
+        assert_eq!(row.amount_cents, 1_000);
+        assert_eq!(row.currency, "usd");
+        assert_eq!(row.paid_at_unix, BILLING_NOW + 60);
+        // The sourcing operation resolved with the subscription.
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, "succeeded");
+        assert_eq!(op.session_id.as_deref(), Some("cs_test_1"));
+        // No alerts on the clean path.
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 0);
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 0);
+    }
+
+    #[test]
+    fn billing_direct_retrieval_matches_webhook_state() {
+        // Reconcile WITHOUT any webhook delivery reaches the same stored
+        // state as the webhook path: the same fake remote subscription +
+        // paid invoices through `reconcile_remote_subscription` (the hourly
+        // `billing-reconcile` job's entry point) must converge on the
+        // identical live row and history. No session, no event, no
+        // operation exists on this harness — retrieval alone drives it.
+        let period_start = BILLING_NOW;
+        let period_end = BILLING_NOW + BILLING_PERIOD;
+        let direct = stripe_harness();
+        seed_billing_user(&direct, "u1");
+        direct.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        direct.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                period_start,
+                period_end,
+                period_start + 60,
+            ),
+        );
+        let outcome = block_on(reconcile_remote_subscription(
+            &direct.ctx(),
+            "u1",
+            "sub_test_1",
+        ))
+        .expect("direct retrieval reconciles");
+        assert!(outcome.fail_closed.is_none());
+        let direct_live = live_for(&direct, "u1").expect("direct live row stored");
+        assert_eq!(direct_live.status, "active");
+        assert_eq!(direct_live.plan_id, PLAN_PLUS);
+        assert_eq!(direct_live.paid_through_unix, Some(period_end));
+        assert_eq!(direct_live.grace_until_unix, None);
+
+        // The webhook path over the identical remote state, for comparison.
+        let webhook = stripe_harness();
+        seed_billing_user(&webhook, "u1");
+        deliver_first_period(&webhook, "evt_test_1");
+        let webhook_live = live_for(&webhook, "u1").expect("webhook live row stored");
+        assert_eq!(direct_live, webhook_live);
+        assert_eq!(
+            direct.store.invoice_history.borrow().clone(),
+            webhook.store.invoice_history.borrow().clone(),
+            "direct retrieval must record the same history as the webhook path"
+        );
+        assert_eq!(direct.store.invoice_history.borrow().len(), 1);
+        // No alerts on either clean path.
+        assert_eq!(audits_with(&direct, BILLING_FAIL_CLOSED_ACTION), 0);
+        assert_eq!(audits_with(&direct, BILLING_UNKNOWN_CUSTOMER_ACTION), 0);
+    }
+
+    #[test]
+    fn billing_webhook_rejects_tampered_bad_signature_and_stale() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                None,
+            ),
+        );
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        let good = sign(&body, BILLING_NOW);
+        // Tampered body under the good signature.
+        let mut tampered = body.clone();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'}' { b']' } else { b'}' };
+        assert_eq!(h.call_webhook(&tampered, Some(good.clone())).status, 400);
+        // Wrong-secret signature over the intact body.
+        let bad = crate::stripe::test_signature_header(&body, BILLING_NOW, "whsec_wrong");
+        assert_eq!(h.call_webhook(&body, Some(bad)).status, 400);
+        // Missing signature.
+        assert_eq!(h.call_webhook(&body, None).status, 400);
+        // Stale timestamp (past the 5-minute tolerance).
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW - 600)))
+                .status,
+            400
+        );
+        // Future timestamp past the same symmetric tolerance.
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW + 600)))
+                .status,
+            400
+        );
+        // No failure touched state or raised an alert.
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert!(h.store.webhook_events.borrow().is_empty());
+        assert!(h.store.audits.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_webhook_duplicate_checkout_reprocesses_idempotently() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let body = deliver_first_period(&h, "evt_test_1");
+        // Redelivery of the same event id reprocesses idempotently and
+        // still acks 200: coverage and history converge on the same stored
+        // state instead of dropping the payment on a consumed claim (this
+        // is what lets a claim orphaned by a store outage or a dead worker
+        // land on redelivery).
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+    }
+
+    #[test]
+    fn billing_webhook_out_of_order_invoices_never_regress() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // Two paid periods; the later one reconciles first.
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        for (id, start) in [
+            ("in_test_1", BILLING_NOW),
+            ("in_test_2", BILLING_NOW + BILLING_PERIOD),
+        ] {
+            h.stripe.invoices.borrow_mut().insert(
+                id.to_string(),
+                test_invoice(
+                    id,
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    start,
+                    start + BILLING_PERIOD,
+                    start + 60,
+                ),
+            );
+        }
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // Newer period first, then the older redelivery under a fresh id.
+        let first = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&first, Some(sign(&first, BILLING_NOW))));
+        let second = checkout_completed_body("evt_test_2", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&second, Some(sign(&second, BILLING_NOW))));
+        // Coverage sits at the later period; each invoice left exactly one
+        // history row; the duplicate pass regressed nothing.
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+        let third = checkout_completed_body("evt_test_3", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&third, Some(sign(&third, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+    }
+
+    #[test]
+    fn billing_webhook_transient_failure_redelivers_and_stores() {
+        // A transient failure AFTER the webhook claim must not consume the
+        // event: the first delivery races a Stripe 5xx mid-reconcile, the
+        // handler 500s (so Stripe retries) and releases the claim, and
+        // redelivery of the same event id processes and stores.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        h.stripe
+            .fail
+            .borrow_mut()
+            .insert("retrieve_subscription".to_string());
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "the failed pass stores nothing"
+        );
+        // The same event id redelivered: the released claim lets it
+        // reprocess instead of acking 200 on a consumed claim.
+        h.stripe.fail.borrow_mut().clear();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("redelivery stores");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_claimed_but_unprocessed_redelivers_and_stores() {
+        // A claim orphaned by a store outage (the same-DB release failed)
+        // or a worker death after the claim must not consume the event:
+        // redelivery of the same id finds the stale claim and reprocesses
+        // idempotently instead of acking 200 with nothing stored.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The worker died after the claim, before any Stripe call.
+        assert!(block_on(h.store.claim_webhook_event("evt_test_1")).expect("claim first wins"));
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("redelivery stores");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_non_checkout_and_livemode_ack_without_state() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // A verified non-checkout event acks 200 with no state change.
+        let other = other_event_body("evt_test_9", "invoice.payment_succeeded");
+        webhook_ok(&h.call_webhook(&other, Some(sign(&other, BILLING_NOW))));
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        // A live-mode event on this test-mode worker acks 200, alerts, and
+        // never calls Stripe or stores anything — even for a completed
+        // checkout shape.
+        let live_body = checkout_completed_body("evt_test_live", "cs_live_1", true);
+        webhook_ok(&h.call_webhook(&live_body, Some(sign(&live_body, BILLING_NOW))));
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 1);
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_webhook_unprovisioned_secrets_fail_closed() {
+        // No Stripe secrets provisioned: the same generic 500 as any store
+        // outage, so Stripe retries the delivery instead of losing it.
+        let h = harness();
+        seed_billing_user(&h, "u1");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_webhook_unknown_customer_acks_with_alert() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // No operation binding and no customer binding: the verified event
+        // acks 200 with an alert and no state change. (Live
+        // cancel-and-alert belongs to the account-deletion slice.)
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_ghost_1".to_string(),
+            test_session(
+                "cs_ghost_1",
+                "complete",
+                "paid",
+                Some("cus_ghost_1"),
+                Some("sub_ghost_1"),
+                None,
+            ),
+        );
+        let body = checkout_completed_body("evt_ghost_1", "cs_ghost_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 1);
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_webhook_unconfirmed_session_mints_nothing() {
+        for (session_status, payment_status) in [
+            ("open", "unpaid"),
+            ("open", "no_payment_required"),
+            ("complete", "unpaid"),
+        ] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            h.stripe.sessions.borrow_mut().insert(
+                "cs_test_1".to_string(),
+                test_session(
+                    "cs_test_1",
+                    session_status,
+                    payment_status,
+                    Some("cus_test_1"),
+                    None,
+                    Some("op_test_1"),
+                ),
+            );
+            block_on(h.store.create_checkout_operation(
+                "op_test_1",
+                "u1",
+                PRICE_PLUS,
+                Some("cus_test_1"),
+            ))
+            .expect("op insert");
+            let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+            // No subscription id (unconfirmed or open): acked, no store
+            // touch, the flight stays open for the real completion.
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            assert!(live_for(&h, "u1").is_none());
+            assert!(h.store.invoice_history.borrow().is_empty());
+            let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+                .expect("op lookup")
+                .expect("op stored");
+            assert_eq!(op.state, "pending");
+        }
+    }
+
+    #[test]
+    fn billing_webhook_store_outage_retries() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.store.fail_billing.borrow_mut() = true;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                None,
+            ),
+        );
+        // Claim itself fails: 500, so Stripe retries the delivery.
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+    }
+
+    #[test]
+    fn billing_fail_closed_unknown_price_trialing_and_unknown_status() {
+        // Unknown price: the applied item price has no test-mode mapping.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        let mut sub = test_subscription("sub_test_1", "cus_test_1", "active", "price_unknown");
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), sub.clone());
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                "price_unknown",
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // Observed state recorded verbatim, nothing advanced, purchases
+        // disabled, alert raised, flight parked for the hourly job.
+        let live = live_for(&h, "u1").expect("verbatim row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, None);
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, "needs_reconcile");
+        assert!(h.store.invoice_history.borrow().is_empty());
+        // A retry while fail-closed refuses the purchase (no Stripe call).
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+
+        // Trialing: an unknown provider state on the Checkout shape, same
+        // fail-closed landing.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        sub.status = "trialing".to_string();
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), sub);
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_2", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // `trialing` sits outside the live slot by design (the same
+        // five-status predicate as the read path), but the verbatim row
+        // is still recorded: fail-closed, alerted, nothing advanced.
+        let stored = h.store.billing_rows.borrow();
+        let row = stored.get("u1").expect("verbatim row stored");
+        assert_eq!(row.status, "trialing");
+        assert_eq!(row.paid_through_unix, None);
+        drop(stored);
+        assert!(live_for(&h, "u1").is_none(), "trialing holds no live slot");
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+
+        // Unknown status string: recorded verbatim, same fail-closed
+        // landing.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let mut weird =
+            test_subscription("sub_test_1", "cus_test_1", "weird_status_xyz", PRICE_PLUS);
+        weird.livemode = false;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), weird);
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_3", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // Unknown statuses sit outside the live slot by design (the same
+        // five-status predicate as the read path), but the verbatim row is
+        // still recorded: fail-closed, alerted, nothing advanced.
+        let stored = h.store.billing_rows.borrow();
+        assert_eq!(
+            stored.get("u1").map(|row| row.status.as_str()),
+            Some("weird_status_xyz")
+        );
+        drop(stored);
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_renewal_grace_set_once_kept_and_cleared() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_test_1");
+        let paid_end = BILLING_NOW + BILLING_PERIOD;
+        // First failed renewal: the subscription reads `past_due` with no
+        // new money, so the pass sets a fixed 7-day grace from the paid
+        // end. Delivered as a later completed session for the same
+        // subscription (the renewal attempt's own checkout).
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_2".to_string(),
+            test_session(
+                "cs_test_2",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_2"),
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_2",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_2", "cs_test_2", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "past_due");
+        assert_eq!(live.paid_through_unix, Some(paid_end));
+        assert_eq!(
+            live.grace_until_unix,
+            Some(paid_end + crate::billing_reconcile::RENEWAL_GRACE_SECS)
+        );
+        // A duplicate failed-renewal pass never extends the stored grace.
+        let body = checkout_completed_body("evt_test_3", "cs_test_2", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.grace_until_unix,
+            Some(paid_end + crate::billing_reconcile::RENEWAL_GRACE_SECS)
+        );
+        // Recovery: new money reconciled clears the grace and advances.
+        let recovered_end = paid_end + BILLING_PERIOD;
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_2".to_string(),
+            test_invoice(
+                "in_test_2",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                paid_end,
+                recovered_end,
+                paid_end + 60,
+            ),
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_3".to_string(),
+            test_session(
+                "cs_test_3",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_3"),
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_3",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_4", "cs_test_3", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, Some(recovered_end));
+        assert_eq!(live.grace_until_unix, None);
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+    }
+
+    #[test]
+    fn billing_concurrent_attempts_converge_on_one_session() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // Two attempts with no flight: the second converges on the
+        // winner's operation id (same idempotency key), so Stripe mints
+        // exactly one session and both callers share its URL.
+        let ctx = h.ctx();
+        let url_a = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("first attempt");
+        // Script the created session as still-open for the reuse check.
+        let created_id = url_a
+            .rsplit('/')
+            .next()
+            .expect("session url ends with the id");
+        h.stripe.sessions.borrow_mut().insert(
+            created_id.to_string(),
+            crate::stripe::CheckoutSession {
+                id: created_id.to_string(),
+                status: Some("open".to_string()),
+                payment_status: Some("unpaid".to_string()),
+                customer: Some("cus_test_1".to_string()),
+                subscription: None,
+                url: Some(url_a.clone()),
+                client_reference_id: None,
+                livemode: false,
+            },
+        );
+        // Point the winner's op at the created session (the mark the
+        // create path records).
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight open");
+        block_on(h.store.update_checkout_operation(
+            &open.id,
+            "submitted",
+            PRICE_PLUS,
+            Some(created_id),
+        ))
+        .expect("mark submitted");
+        let url_b = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("second attempt");
+        // Lost-response replay: same URL, one Stripe session, one flight.
+        assert_eq!(url_a, url_b);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        // The customer bound once (no overwrite by the racer).
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_converged_attempt_uses_winner_bound_customer() {
+        // Two first-purchase racers both start unbound, so each mints its
+        // own Stripe customer before the single-flight insert converges
+        // them on the winner's operation. The payable session must sit on
+        // the winner-bound customer, never the loser's orphan (which
+        // reconciliation would fail closed on customer mismatch for a user
+        // who paid). The session customer re-reads the binding after
+        // convergence instead of trusting the pre-insert snapshot.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_winner".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("winner attempt");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        // The loser already minted its orphan before converging on the
+        // winner's row (sequential stand-in for the interleave: its own
+        // snapshot still names no customer).
+        let outcome = block_on(h.store.create_checkout_operation(
+            "op_loser",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_orphan"),
+        ))
+        .expect("converge");
+        assert!(matches!(
+            outcome,
+            crate::billing_reconcile::CreateOpOutcome::Existing(_)
+        ));
+        let resolved = block_on(converged_session_customer(
+            &ctx,
+            "u1",
+            None,
+            "cus_orphan".to_string(),
+        ))
+        .expect("resolve");
+        assert_eq!(resolved, "cus_winner");
+        // The winner's own session sat on the bound customer too, and the
+        // orphan never touched the account binding.
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_winner".to_string()].as_slice()
+        );
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_winner".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_converged_attempt_before_bind_fails_retryable() {
+        // The pre-bind window: the winner's op INSERT is visible but its
+        // customer bind has not landed yet (production publishes them as
+        // separate statements; the fake holds the bind back on request). A
+        // loser converging here must fail retryable — never resolve to its
+        // own orphan — so the retry reads the winner's binding and the
+        // payable session never sits on an unbound customer.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.store.defer_customer_bind.borrow_mut() = true;
+        block_on(h.store.create_checkout_operation(
+            "op_winner",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_winner"),
+        ))
+        .expect("winner op visible, bind deferred");
+        *h.store.defer_customer_bind.borrow_mut() = false;
+        // The loser minted its orphan before converging on the winner's
+        // row; its own id never binds the account.
+        let outcome = block_on(h.store.create_checkout_operation(
+            "op_loser",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_orphan"),
+        ))
+        .expect("converge");
+        assert!(matches!(
+            outcome,
+            crate::billing_reconcile::CreateOpOutcome::Existing(_)
+        ));
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(converged_session_customer(
+                &ctx,
+                "u1",
+                None,
+                "cus_orphan".to_string(),
+            )),
+            Err(EnsureCheckoutError::Failed),
+            "no bound customer yet: retry, never the orphan"
+        );
+        assert!(
+            h.store.billing_customers.borrow().get("u1").is_none(),
+            "the orphan never binds the account"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session minted without a bound customer"
+        );
+    }
+
+    #[test]
+    fn billing_held_subscription_releases_before_replacement() {
+        // A held (`incomplete`) row reserves the live slot but confers
+        // nothing. A retry must confirm the held subscription terminal
+        // (canceling it here) and reconcile it out of the slot before
+        // minting the replacement — otherwise the replacement's
+        // reconcile would collide with the still-held row and fail a paid
+        // subscription closed.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "incomplete", PRICE_PLUS),
+        );
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("replacement proceeds");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        // The held subscription was canceled and reconciled terminal — the
+        // stored row sits outside the live slot, so the slot is free.
+        assert_eq!(
+            h.stripe.subscriptions.borrow()["sub_old"].status,
+            "canceled"
+        );
+        assert_eq!(h.store.billing_rows.borrow()["u1"].status, "canceled");
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "terminal row sits outside the live slot"
+        );
+    }
+
+    #[test]
+    fn billing_held_slot_with_recovered_remote_reconciles_and_refuses() {
+        // Stale-local/recovered-remote: the stored row is still
+        // `incomplete` but Stripe already shows `active` with a paid
+        // invoice (only checkout completions reconcile, so the local row
+        // can lag a recovered payment). The retry must NOT cancel the
+        // newly paid subscription: it reconciles the paid state in place
+        // (coverage + history land) and refuses the purchase as
+        // already-subscribed — no cancel call, no new session.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_old",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "a recovered subscription must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement session for an already-subscribed account"
+        );
+        let live = live_for(&h, "u1").expect("recovered coverage stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_held_slot_with_unknown_remote_fails_closed_without_cancel() {
+        // Unknown remote status: fail closed — alert, no cancel, no
+        // reconcile, no session. The stale held row stays reserved so later
+        // attempts keep failing closed instead of minting a second
+        // subscription against a state we cannot classify.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "past_due_unmapped", PRICE_PLUS),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "an unclassifiable remote must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session against an unknown remote state"
+        );
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let live = live_for(&h, "u1").expect("held row stays reserved");
+        assert_eq!(live.status, "incomplete");
+        assert!(live.paid_through_unix.is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_reconcile_outcome_never_regresses_coverage() {
+        // Two passes commit out of order: the fresher pass first, then a
+        // pass folded from an older snapshot. Coverage (`paid_through_at`
+        // and the plan/anchor tied to it) stays at the fresher values —
+        // the production upsert's monotonic CASE, mirrored by the fake —
+        // while status still updates verbatim and both paid invoices keep
+        // their history rows.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str| {
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: status.to_string(),
+                current_period_end_unix: Some(BILLING_NOW + BILLING_PERIOD),
+                cancel_at_period_end: false,
+                paid_through_unix: paid,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: None,
+            }
+        };
+        let history_row = |id: &str, end: i64| crate::billing_reconcile::PaidInvoiceRow {
+            stripe_invoice_id: id.to_string(),
+            stripe_subscription_id: "sub_test_1".to_string(),
+            plan_id: PLAN_PLUS.to_string(),
+            period_start_unix: BILLING_NOW,
+            period_end_unix: end,
+            amount_cents: 1_000,
+            currency: "usd".to_string(),
+            paid_at_unix: BILLING_NOW + 60,
+        };
+        let fresh = crate::billing_reconcile::ReconcileOutcome {
+            row: row(
+                Some(BILLING_NOW + BILLING_PERIOD),
+                Some("in_test_2"),
+                "active",
+            ),
+            history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
+            fail_closed: None,
+        };
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
+        let stale = crate::billing_reconcile::ReconcileOutcome {
+            row: row(Some(BILLING_NOW), Some("in_test_1"), "past_due"),
+            history: vec![history_row("in_test_1", BILLING_NOW)],
+            fail_closed: None,
+        };
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + BILLING_PERIOD),
+            "an older snapshot never regresses coverage"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_test_2"),
+            "the anchor stays with the advancing money"
+        );
+        assert_eq!(live.status, "past_due", "status still updates verbatim");
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "both paid invoices keep their history rows"
+        );
+    }
+
+    #[test]
+    fn billing_completed_session_under_open_op_reconciles_without_recreating() {
+        // The purchase completed but its webhook was lost: a retry finds
+        // the completed paid session under the still-open operation. It
+        // must reconcile through the shared driver — not mint a second
+        // payable session under the same idempotency key. Only a
+        // confirmed-expired or missing session repairs.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second session minted"
+        );
+        let live = live_for(&h, "u1").expect("reconciled");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_before_response_keeps_one_subscription() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // The purchase attempt mints the session; the completion webhook
+        // lands before the caller retries (lost response).
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("attempt");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let created_id = url
+            .rsplit('/')
+            .next()
+            .expect("session url ends with the id");
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight open");
+        // The user completes `created_id`; the webhook resolves it.
+        h.stripe.sessions.borrow_mut().insert(
+            created_id.to_string(),
+            test_session(
+                created_id,
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some(&open.id),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let body = checkout_completed_body("evt_test_1", created_id, false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // The retried purchase refuses instead of minting a second
+        // subscription; the stored state is the webhook's single advance.
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_ensure_passes_through_test_clock_and_refuses_unmapped() {
+        // Fresh account with a staging test clock: the customer create
+        // carries the clock, and the session URL is returned.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_clock_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            Some("test_clock_1"),
+        ))
+        .expect("clocked attempt");
+        assert!(url.starts_with("https://checkout.stripe.com/pay/"));
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_clock_1".to_string())
+        );
+        // The clock rode the customer create, never anywhere else.
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            &[(Some("u1".to_string()), Some("test_clock_1".to_string()))]
+        );
+        // Unmapped price: alert, no Stripe call, no customer minted.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            "price_unknown",
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(audits_with(&h, BILLING_PURCHASE_UNAVAILABLE_ACTION), 1);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        assert!(h.store.billing_customers.borrow().get("u1").is_none());
+        // Unselectable (non-purchase) mapping: same refusal.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_bindings
+            .borrow_mut()
+            .push(crate::billing_reconcile::PriceBinding {
+                price_id: "price_legacy".to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                selectable: false,
+                livemode: false,
+            });
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            "price_legacy",
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_invoice_line_pagination_reads_every_page() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // First page carries no lines but `has_more`; the remainder
+        // arrives through the lines listing, and coverage still advances.
+        let mut first = test_invoice(
+            "in_test_1",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            BILLING_NOW + BILLING_PERIOD,
+            BILLING_NOW + 60,
+        );
+        first.lines = Some(crate::stripe::InvoiceLines {
+            data: Vec::new(),
+            has_more: true,
+        });
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert("in_test_1".to_string(), first);
+        h.stripe.line_pages.borrow_mut().insert(
+            "in_test_1".to_string(),
+            vec![crate::stripe::InvoiceLine {
+                id: "in_test_1_line_1".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PLUS.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(BILLING_NOW + BILLING_PERIOD),
+                }),
+            }],
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }
 
     fn cookie_of(resp: &Response) -> String {
@@ -5759,6 +8693,7 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization: bearer.map(|token| format!("Bearer {token}")),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5777,6 +8712,7 @@ mod tests {
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
                 authorization: authorization.map(str::to_string),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5884,6 +8820,7 @@ mod tests {
             cookie: None,
             origin: None,
             authorization: Some(format!("Token {QA_TOKEN}")),
+            stripe_signature: None,
             body: serde_json::json!({"email": "a@example.test"})
                 .to_string()
                 .into_bytes(),
@@ -6028,6 +8965,7 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization: bearer.map(|token| format!("Bearer {token}")),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -6115,6 +9053,7 @@ mod tests {
                 cookie: Some(format!("{}={session}", session::COOKIE_NAME)),
                 origin: None,
                 authorization: None,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             let (claims, _) = block_on(h.ctx().authenticate(&req, false)).expect("authenticated");
@@ -6706,6 +9645,7 @@ mod tests {
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
@@ -6845,6 +9785,7 @@ mod tests {
             cookie: Some(cookie.into()),
             origin: origin.map(str::to_string),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"retry_key": key})
                 .to_string()
                 .into_bytes(),
@@ -6867,6 +9808,7 @@ mod tests {
             cookie: Some(cookie.into()),
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         block_on(crate::worker_entry::dispatch_collected(
@@ -7335,6 +10277,7 @@ mod tests {
             dns: &h2_dns,
             now: NOW,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: "PUT".to_string(),
@@ -7342,6 +10285,7 @@ mod tests {
             cookie: Some(cookie_a.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: put_body.to_string().into_bytes(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -7789,6 +10733,7 @@ mod tests {
             dns: &h.dns,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let stale_put_req = Request {
             method: "PUT".to_string(),
@@ -7796,6 +10741,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: put_body.to_string().into_bytes(),
         };
         let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
@@ -7811,6 +10757,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
@@ -7822,6 +10769,7 @@ mod tests {
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
@@ -7960,6 +10908,7 @@ mod tests {
             dns: &h.dns,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
 
         // Fresh issuance works (pins the 201 for the stale contrast below).
@@ -7980,6 +10929,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
                 .to_string()
                 .into_bytes(),
@@ -8001,6 +10951,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_revoke = block_on(handle(&stale_ctx, &stale_revoke_req));
@@ -8015,6 +10966,7 @@ mod tests {
             cookie: Some(cookie),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_list = block_on(handle(&stale_ctx, &stale_list_req));
@@ -8213,6 +11165,7 @@ mod tests {
             mailer: &h.mailer,
             dialer: &h.dialer,
             dns: &h.dns,
+            stripe: &h.stripe,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
         };
@@ -8223,6 +11176,7 @@ mod tests {
                 cookie: Some(cookie.to_string()),
                 origin: Some(ORIGIN.to_string()),
                 authorization: None,
+                stripe_signature: None,
                 body: serde_json::json!({"value": 14}).to_string().into_bytes(),
             };
             block_on(handle(&stale_ctx, &req))
@@ -8250,6 +11204,7 @@ mod tests {
             cookie: Some(admin_cookie),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let list = block_on(handle(&stale_ctx, &get_req));
@@ -8281,6 +11236,7 @@ mod tests {
             cookie: Some(admin_cookie),
             origin: None,
             authorization: Some("Bearer ntk_synthetic".to_string()),
+            stripe_signature: None,
             body: Vec::new(),
         };
         let both = block_on(handle(&h.ctx(), &req));
@@ -8647,6 +11603,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: Some("Bearer ntk_definitely-not-a-key".to_string()),
+            stripe_signature: None,
             body: Vec::new(),
         };
         let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
@@ -8659,6 +11616,7 @@ mod tests {
             cookie: None,
             origin: Some(ORIGIN.to_string()),
             authorization: Some(format!("Bearer {library_secret}")),
+            stripe_signature: None,
             body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
                 .to_string()
                 .into_bytes(),
@@ -10002,6 +12960,7 @@ mod tests {
             dns: &h.dns,
             now,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: method.to_string(),
@@ -10009,6 +12968,7 @@ mod tests {
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         block_on(handle(&ctx, &req))
@@ -11759,6 +14719,7 @@ mod tests {
                 dns: &h.dns,
                 now: NOW,
                 source_ip: "198.51.100.9".to_string(),
+                stripe: &h.stripe,
             };
             let req = Request {
                 method: "GET".to_string(),
@@ -11766,6 +14727,7 @@ mod tests {
                 cookie: Some(cookie.clone()),
                 origin: None,
                 authorization: None,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             block_on(handle(&ctx, &req))
@@ -11781,6 +14743,7 @@ mod tests {
             dns: &h.dns,
             now: NOW,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: "POST".to_string(),
@@ -11788,6 +14751,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let resp = block_on(handle(&ctx, &req));

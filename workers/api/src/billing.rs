@@ -378,6 +378,45 @@ mod tests {
     }
 
     #[test]
+    fn settlement_boundary_is_exact_to_the_second() {
+        // ADR 0005 renewal settlement: the paid plan is retained while
+        // `now < paid_through + 3h` and denied at and after the bound.
+        // One second inside still entitles.
+        let inside = sub(
+            "plus",
+            "active",
+            false,
+            Some(NOW - (RENEWAL_SETTLEMENT_ALLOWANCE_SECS - 1)),
+            None,
+        );
+        assert_eq!(
+            resolve_effective_plan(Some(inside), NOW),
+            EffectivePlan {
+                plan: PlanId::Plus,
+                entitled: true,
+            }
+        );
+        // Exactly at `paid_through + 3h` cuts (strict `<`, never sliding).
+        let at_bound = sub(
+            "plus",
+            "active",
+            false,
+            Some(NOW - RENEWAL_SETTLEMENT_ALLOWANCE_SECS),
+            None,
+        );
+        assert_eq!(resolve_effective_plan(Some(at_bound), NOW), closed());
+        // One second past the bound stays closed.
+        let past_bound = sub(
+            "plus",
+            "active",
+            false,
+            Some(NOW - (RENEWAL_SETTLEMENT_ALLOWANCE_SECS + 1)),
+            None,
+        );
+        assert_eq!(resolve_effective_plan(Some(past_bound), NOW), closed());
+    }
+
+    #[test]
     fn past_due_holds_paid_then_renewal_grace_only() {
         // Still inside confirmed coverage (failed mid-period upgrade keeps
         // the paid tier, never grants the unpaid higher one).

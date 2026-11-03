@@ -256,14 +256,22 @@ const ARTIST_URLS_SQL: &str =
 /// 404-vs-empty distinction.
 const RECORDING_EXISTS_SQL: &str = "SELECT 1 FROM mb_recording WHERE mbid = $1::text::uuid";
 
-/// Music videos of one recording, each with its stream URL: the curated
+/// Music videos of one recording, each with its stream URL, from two legs
+/// (ADR 0012 section 2 accepts both): the recording's own direct
+/// video-marked (`is_video`) `mb_recording_url` rows, plus the curated
 /// `mb_recording_music_video` pair (either side — the read join treats
 /// both directions symmetrically) followed to the *other* recording's
-/// video-marked (`is_video`) `mb_recording_url` rows and their `mb_url`
-/// targets. Ordered deterministically (video recording, URL, link name)
-/// with a hard limit.
+/// video-marked rows and their `mb_url` targets. A recording with a
+/// direct video URL but no music-video pair still returns that video.
+/// Ordered deterministically (video recording, URL, link name) with a
+/// hard limit over the union.
 const RECORDING_VIDEOS_SQL: &str =
-    "SELECT CASE WHEN mv.recording_a_mbid = $1::text::uuid THEN mv.recording_b_mbid::text \
+    "SELECT recording_mbid, url, link_name FROM ( \
+     SELECT ru.recording_mbid::text AS recording_mbid, u.url AS url, ru.link_name AS link_name \
+     FROM mb_recording_url ru JOIN mb_url u ON u.mbid = ru.url_mbid \
+     WHERE ru.recording_mbid = $1::text::uuid AND ru.is_video \
+     UNION \
+     SELECT CASE WHEN mv.recording_a_mbid = $1::text::uuid THEN mv.recording_b_mbid::text \
      ELSE mv.recording_a_mbid::text END AS recording_mbid, \
      u.url AS url, ru.link_name AS link_name \
      FROM mb_recording_music_video mv \
@@ -271,7 +279,7 @@ const RECORDING_VIDEOS_SQL: &str =
      THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END \
      JOIN mb_url u ON u.mbid = ru.url_mbid \
      WHERE (mv.recording_a_mbid = $1::text::uuid OR mv.recording_b_mbid = $1::text::uuid) \
-     AND ru.is_video \
+     AND ru.is_video) AS videos \
      ORDER BY recording_mbid ASC, url ASC, link_name ASC LIMIT 500";
 
 /// ISRCs of one recording, in code order with a hard limit.
@@ -1240,7 +1248,7 @@ fn is_valid_cached_recordings(body: &str, release_mbid: &str) -> bool {
 }
 
 /// An ISRC code has the mirror shape (see `mb_recording_isrc` in
-/// migration 0029): 12 characters, 2 uppercase letters (country) + 3
+/// migration 0030): 12 characters, 2 uppercase letters (country) + 3
 /// uppercase-alphanumeric (registrant) + 7 digits (year/designation).
 /// Hand-rolled (no regex dependency): the mirror `CHECK` guarantees fresh
 /// rows match, so a cached entry that does not is poisoned, never fresh.

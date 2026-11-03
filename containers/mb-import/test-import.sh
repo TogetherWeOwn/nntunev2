@@ -660,7 +660,136 @@ check "split: track 1 repointed after resume" "$(python3 -c 'import uuid; print(
 check "split: final positions" "1,2,3,4,5,6,7,8,9" \
   "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS"
+echo "=== 13. dropped relationships are pruned; direct video URLs resolve ==="
+# The four relationship tables prune per-parent newest-dump rows in the
+# final chunk (same pattern as the track prune in 11/12): a newer dump
+# that drops a link, pair or ISRC must stop serving it. Recording 200003
+# carries a direct video-marked URL but no music-video pair, so it also
+# proves the read join's direct leg (workers/mb RECORDING_VIDEOS_SQL):
+# the query below mirrors that statement's union of direct video-marked
+# recording URLs and pair-reached video URLs.
+reset_db
+REL="$FIX-rel"
+rm -rf "$REL" "$REL-newer" "$REL-old"
+mkdir -p "$REL"
+python3 - "$REL" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/vid\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(500002)}\thttps://example.test/stale\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(500002)}\tfree streaming\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200003)}\t{eid(500002)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\tUSABC2400002\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tGBXYZ9900012\t2024-05-02T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL" >/dev/null
+check "rel: artist urls before" "2" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: recording urls before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "rel: music videos before" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: isrcs before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+cp -R "$REL" "$REL-newer"
+python3 - "$REL-newer" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+# Artist drops its free-streaming link; recording 200002 drops its only
+# URL row; pair (200001, 200002) is replaced by (200002, 200003), which
+# prunes the old pair through endpoint 200002; recording 200001 drops
+# its second ISRC. A third URL arrives for 200002's new direct video row.
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/vid\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(500002)}\thttps://example.test/stale\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(500003)}\thttps://example.test/vid2\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(500003)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200003)}\t{eid(500002)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200002)}\t{eid(200003)}\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tGBXYZ9900012\t2025-05-02T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL-newer" >/dev/null
+check "rel: dropped artist link pruned" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: surviving artist link kept" "youtube" "$(db -c "SELECT link_name FROM mb_artist_url WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=1))')';")"
+check "rel: dropped recording url pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_url WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')' AND url_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=500001))')';")"
+check "rel: superseded pair pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_music_video WHERE recording_a_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+check "rel: replacement pair kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: dropped isrc pruned" "1" "$(db -c "SELECT count(*) FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+check "rel: surviving isrc kept" "USABC2400001" "$(db -c "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+# The videos read union (direct video-marked URLs plus pair-reached
+# video URLs): recording 200001 keeps only its direct video, 200002
+# resolves both its direct video and 200003's through the new pair, and
+# 200003 (never in a pair with a video-marked other side in the old
+# dump) resolves its direct video.
+videos_for() {
+  db -c "SELECT recording_mbid::text || '|' || url || '|' || link_name FROM (
+    SELECT ru.recording_mbid AS recording_mbid, u.url AS url, ru.link_name AS link_name
+    FROM mb_recording_url ru JOIN mb_url u ON u.mbid = ru.url_mbid
+    WHERE ru.recording_mbid = '$1' AND ru.is_video
+    UNION
+    SELECT CASE WHEN mv.recording_a_mbid = '$1' THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END, u.url, ru.link_name
+    FROM mb_recording_music_video mv
+    JOIN mb_recording_url ru ON ru.recording_mbid = CASE WHEN mv.recording_a_mbid = '$1' THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END
+    JOIN mb_url u ON u.mbid = ru.url_mbid
+    WHERE (mv.recording_a_mbid = '$1' OR mv.recording_b_mbid = '$1') AND ru.is_video) AS videos
+  ORDER BY 1;"
+}
+R1="$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')"
+R2="$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')"
+R3="$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')"
+U1="https://example.test/vid"
+U2="https://example.test/stale"
+U3="https://example.test/vid2"
+check "rel: 200001 videos (direct only)" "$R1|$U1|free streaming" "$(videos_for "$R1")"
+check "rel: 200002 videos (direct plus pair)" "$R2|$U3|free streaming,$R3|$U2|free streaming" "$(videos_for "$R2" | paste -sd ',' -)"
+check "rel: 200003 videos (direct plus pair)" "$R2|$U3|free streaming,$R3|$U2|free streaming" "$(videos_for "$R3" | paste -sd ',' -)"
+# An older dump (new bytes, older timestamps) must neither roll rows back
+# nor resurrect pruned relationships: the forward-only upsert guard and
+# the per-parent prunes both refuse to move backwards.
+cp -R "$REL" "$REL-old"
+python3 - "$REL-old" <<'EOF'
+import sys
+from pathlib import Path
+d = Path(sys.argv[1])
+for name in ("mbdump-artist_url.tsv", "mbdump-recording_url.tsv",
+             "mbdump-recording_music_video.tsv", "mbdump-recording_isrc.tsv"):
+    p = d / name
+    p.write_text(p.read_text().replace("2024-05-02T00:00:00Z", "2024-06-02T00:00:00Z"))
+EOF
+bash "$SELF_DIR/import.sh" "$REL-old" >/dev/null
+check "rel: older dump leaves artist urls alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: older dump leaves recording urls alone" "3" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "rel: older dump leaves pairs alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: older dump leaves isrcs alone" "2" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1

@@ -350,6 +350,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: "198.51.100.9".into(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
     fn request(&self, method: &str, path: &str, body: serde_json::Value) -> handlers::Request {
@@ -359,6 +360,7 @@ impl Harness {
             cookie: Some(self.cookie.clone()),
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: if body.is_null() {
                 vec![]
             } else {
