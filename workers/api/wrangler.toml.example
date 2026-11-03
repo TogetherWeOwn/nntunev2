@@ -106,6 +106,14 @@ SESSION_TTL_SECS = "86400"
 # pattern = "staging.nntune.com/healthz"
 # zone_name = "nntune.com"
 
+# Hourly billing-reconcile cron (ADR 0005). The `staging-api` deploy lane
+# generates this block too; mirror it here for hand staging deploys. The
+# Worker's `scheduled` entry runs ONLY this exact cron value
+# (`BILLING_RECONCILE_CRON` in src/worker_entry.rs) and fails closed while
+# the Stripe test secrets below are unprovisioned.
+# [env.staging.triggers]
+# crons = ["0 * * * *"]
+
 # Secrets (set with `wrangler secret put`, never here). All *BASE64 values
 # are unpadded base64url (43 chars for 32 bytes; generate with
 # `openssl rand 32 | basenc --base64url | tr -d '='`, decode with

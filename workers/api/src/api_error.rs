@@ -63,6 +63,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "conflict",
+        status: 409,
+        retryable: false,
+    },
+    CodeSpec {
         code: "validation_failed",
         status: 422,
         retryable: false,
@@ -159,6 +164,9 @@ impl ApiError {
     }
     pub fn account_deleting(message: impl Into<String>) -> Self {
         Self::by_code("account_deleting", message)
+    }
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::by_code("conflict", message)
     }
     pub fn validation_failed(message: impl Into<String>) -> Self {
         Self::by_code("validation_failed", message)

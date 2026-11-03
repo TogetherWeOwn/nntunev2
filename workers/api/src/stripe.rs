@@ -194,6 +194,23 @@ pub fn create_checkout_session_request(
     }
 }
 
+/// `POST /v1/billing_portal/sessions`. The portal is where cancel
+/// (at period end) and plan changes happen (ADR 0005): this call only
+/// mints the short-lived hosted URL — it carries no configuration id,
+/// so Stripe serves the account's default portal configuration (an
+/// operator-provisioned dashboard setting, never request input). No
+/// idempotency key: minting a portal session changes no billing state,
+/// so a lost response just mints another on retry.
+pub fn create_billing_portal_session_request(customer_id: &str, return_url: &str) -> StripeRequest {
+    let pairs = [("customer", customer_id), ("return_url", return_url)];
+    StripeRequest {
+        method: "POST",
+        path: "/v1/billing_portal/sessions".to_string(),
+        idempotency_key: None,
+        body: form_encode(&pairs),
+    }
+}
+
 /// `GET /v1/checkout/sessions/{id}`.
 pub fn retrieve_checkout_session_request(session_id: &str) -> StripeRequest {
     StripeRequest {
@@ -365,6 +382,18 @@ pub struct CheckoutSession {
     /// binding from a completed session back to its single-flight row.
     #[serde(default)]
     pub client_reference_id: Option<String>,
+    #[serde(default)]
+    pub livemode: bool,
+}
+
+/// One billing-portal session (`object: "billing_portal.session"`).
+/// The `url` is single-use and short-lived; it is handed to the
+/// signed-in user once and never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BillingPortalSession {
+    pub id: String,
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub livemode: bool,
 }
@@ -609,6 +638,16 @@ pub struct CreateCheckoutSession {
     pub cancel_url: String,
 }
 
+/// Parameters for `POST /v1/billing_portal/sessions`.
+/// `return_url` is caller-supplied (the user-facing route owns it, like
+/// the Checkout URLs above); the portal configuration itself is the
+/// account default, never request input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateBillingPortalSession {
+    pub customer_id: String,
+    pub return_url: String,
+}
+
 /// Parameters for `GET /v1/invoices` (reconciliation listing).
 /// `starting_after` seeds the first page's cursor; the transport advances
 /// it across pages itself, so callers pass `None` and receive the full
@@ -662,6 +701,10 @@ pub trait StripeTransport {
         &self,
         subscription_id: String,
     ) -> Pin<Box<dyn Future<Output = StripeResult<Subscription>> + '_>>;
+    fn create_billing_portal_session(
+        &self,
+        req: CreateBillingPortalSession,
+    ) -> Pin<Box<dyn Future<Output = StripeResult<BillingPortalSession>> + '_>>;
 }
 
 /// No-op transport: every call is a transport failure. Used wherever a
@@ -718,6 +761,12 @@ impl StripeTransport for NoStripeTransport {
         &self,
         _subscription_id: String,
     ) -> Pin<Box<dyn Future<Output = StripeResult<Subscription>> + '_>> {
+        Box::pin(async { Err(StripeError::transport()) })
+    }
+    fn create_billing_portal_session(
+        &self,
+        _req: CreateBillingPortalSession,
+    ) -> Pin<Box<dyn Future<Output = StripeResult<BillingPortalSession>> + '_>> {
         Box::pin(async { Err(StripeError::transport()) })
     }
 }
@@ -950,6 +999,30 @@ mod tests {
         ] {
             assert!(req.body.contains(pinned), "missing {pinned}: {}", req.body);
         }
+    }
+
+    #[test]
+    fn billing_portal_session_create_is_customer_and_return_url_only() {
+        let req =
+            create_billing_portal_session_request("cus_123", "https://example.com/account/billing");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/billing_portal/sessions");
+        // No configuration id (the account default serves) and no
+        // idempotency key (minting changes no billing state).
+        assert_eq!(req.idempotency_key, None);
+        assert_eq!(
+            req.body,
+            "customer=cus_123&return_url=https%3A%2F%2Fexample.com%2Faccount%2Fbilling"
+        );
+        let session: BillingPortalSession = serde_json::from_str(
+            r#"{"id":"bps_123","object":"billing_portal.session","url":"https://billing.stripe.com/p/session/test_123","livemode":false}"#,
+        )
+        .expect("portal session fixture parses");
+        assert_eq!(
+            session.url.as_deref(),
+            Some("https://billing.stripe.com/p/session/test_123")
+        );
+        assert!(!session.livemode);
     }
 
     #[test]
