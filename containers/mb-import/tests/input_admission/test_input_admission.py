@@ -19,7 +19,9 @@ import uuid
 
 HERE = Path(__file__).resolve().parent
 IMPORTER = HERE.parents[1] / "import.sh"
-TABLES = ("artist", "release", "recording", "track")
+TABLES = ("artist", "release_group", "release", "recording", "track",
+          "url", "artist_url", "recording_url", "recording_music_video",
+          "recording_isrc")
 
 
 def read_events(path):
@@ -31,16 +33,31 @@ def make_dump(path, label="A", count=2):
     stamp = "2025-01-01T00:00:00Z" if label == "A" else "2025-02-01T00:00:00Z"
     def uid(n):
         return str(uuid.UUID(int=n))
+    link_names = ("youtube", "youtube music", "streaming")
     for table in TABLES:
         rows = []
         for i in range(1, count + 1):
             fields = {
                 "artist": [uid(i), f"{label} artist {i}", f"{label} sort {i}", "Group", "US", stamp],
-                "release": [uid(100 + i), uid(i), f"{label} release {i}", "Album", "2025", r"\N", stamp],
+                "release_group": [uid(300 + i), f"{label} group {i}", uid(i), "Album", stamp],
+                "release": [uid(100 + i), uid(i), f"{label} release {i}", "Album", "2025", r"\N",
+                            uid(300 + i), stamp],
                 "recording": [uid(200 + i), uid(100 + i), f"{label} recording {i}", "1", "180000", stamp],
                 "track": [uid(100 + i), uid(200 + i), "1", "1", stamp],
-            }[table]
-            rows.append("\t".join(fields) + "\n")
+                "url": [uid(400 + i), f"https://example.test/{label}/{i}", stamp],
+                "artist_url": [uid(i), uid(400 + i), link_names[(i - 1) % len(link_names)], stamp],
+                "recording_url": [uid(200 + i), uid(400 + i), "free streaming",
+                                  "true" if i % 2 else "false", stamp],
+                "recording_isrc": [uid(200 + i), f"USABC25{i:05d}", stamp],
+            }[table] if table != "recording_music_video" else None
+            if fields is not None:
+                rows.append("\t".join(fields) + "\n")
+        if table == "recording_music_video":
+            # One row per unordered recording pair, canonically ordered.
+            recs = [uid(200 + j) for j in range(1, count + 1)]
+            for a in range(len(recs)):
+                for b in range(a + 1, len(recs)):
+                    rows.append("\t".join([recs[a], recs[b], stamp]) + "\n")
         (path / f"mbdump-{table}.tsv").write_text("".join(rows))
 
 
@@ -188,7 +205,7 @@ class InputAdmission(unittest.TestCase):
         self.assert_success(self.run_import(directory=self.b))
         newer = self.events("chunks")[len(first):]
         self.assert_loaded_publication(newer, self.b)
-        self.assertEqual(len(self.state()["cursors"]), 8)
+        self.assertEqual(len(self.state()["cursors"]), 2 * len(TABLES))
         # Contract emitted to PostgreSQL, not a claim of emulated DB semantics.
         for chunk in newer:
             self.assertIn(f"WHERE mb_{chunk['table']}.updated_at < EXCLUDED.updated_at", chunk["sql"])
@@ -228,7 +245,13 @@ class InputAdmission(unittest.TestCase):
         self.config.clear()
         self.assert_success(self.run_import(sequence="100", directory=self.b))
         resumed = self.events("chunks")[len(first):]
-        self.assertEqual([(c["table"], c["offset"], c["end"]) for c in resumed], [("track", 2, 3)])
+        # Track sits mid-order, so the resume replays its tail chunk first,
+        # then the tables the interrupted run never reached (3 rows each).
+        expected = [("track", 2, 3)]
+        for table in ("url", "artist_url", "recording_url",
+                      "recording_music_video", "recording_isrc"):
+            expected += [(table, 0, 2), (table, 2, 3)]
+        self.assertEqual([(c["table"], c["offset"], c["end"]) for c in resumed], expected)
         self.assertIn("DELETE FROM mb_track", resumed[0]["sql"], "completed track tail never pruned")
         self.assert_loaded_publication(first + resumed, self.b)
         self.assertEqual(self.state()["last_packet"], 100)

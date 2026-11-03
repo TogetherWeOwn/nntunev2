@@ -3,7 +3,9 @@
 # rerun, newer-dump upsert, DLQ query, and refusal guards. Needs psql,
 # python3 and mb-validate
 # on PATH (or MB_VALIDATE_BIN), plus DATABASE_URL to a SCRATCH database.
-# DESTRUCTIVE: truncates mb_artist/mb_release/mb_recording/mb_track/mb_import_dlq and
+# DESTRUCTIVE: truncates mb_artist/mb_release_group/mb_release/mb_recording/
+# mb_track/mb_url/mb_artist_url/mb_recording_url/mb_recording_music_video/
+# mb_recording_isrc/mb_import_dlq and
 # resets mb_import_cursor/mb_import_state, so it refuses to run unless
 # ALLOW_TEST_TRUNCATE=1 is set. Never point it at staging or production.
 set -euo pipefail
@@ -43,7 +45,7 @@ check() {
 }
 
 reset_db() {
-  db -c "TRUNCATE mb_track, mb_recording, mb_release, mb_artist, mb_import_dlq;" \
+  db -c "TRUNCATE mb_track, mb_recording_isrc, mb_recording_music_video, mb_recording_url, mb_artist_url, mb_recording, mb_release, mb_url, mb_release_group, mb_artist, mb_import_dlq;" \
      -c "UPDATE mb_import_cursor SET lines_done = 0;" \
      -c "UPDATE mb_import_state SET last_packet = 0, last_applied_at = NULL, lag_seconds = NULL;" >/dev/null
 }
@@ -55,17 +57,21 @@ python3 - "$FIX" <<'EOF'
 import sys, uuid
 d = sys.argv[1]
 def eid(n): return str(uuid.UUID(int=n))
-N_ART, N_REL, N_REC = 120, 60, 60
+N_ART, N_GRP, N_REL, N_REC, N_URL = 120, 30, 60, 60, 10
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     for i in range(1, N_ART + 1):
         f.write(f'{eid(i)}\tBand {i}\t{i}, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
     f.write('not-a-uuid\tBad\tBad\tGroup\tUS\t2024-05-01T12:00:00Z\n')
     f.write(f'{eid(9001)}\tBad TS\tBad TS\tGroup\tUS\tnot-a-date\n')
     f.write(f'{eid(9002)}\tShort\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    for i in range(1, N_GRP + 1):
+        f.write(f'{eid(400000+i)}\tGroup {i}\t{eid((i % N_ART) + 1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+    f.write('not-a-group\tBad\t\\N\tAlbum\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-release.tsv', 'w') as f:
     for i in range(1, N_REL + 1):
-        f.write(f'{eid(100000+i)}\t{eid((i % N_ART) + 1)}\tAlbum {i}\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
-    f.write('also-bad\t\\N\tBad\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+        f.write(f'{eid(100000+i)}\t{eid((i % N_ART) + 1)}\tAlbum {i}\tAlbum\t2024\t\\N\t{eid(400000 + (i % N_GRP) + 1)}\t2024-05-02T00:00:00Z\n')
+    f.write('also-bad\t\\N\tBad\tAlbum\t2024\t\\N\t\\N\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, N_REC + 1):
         f.write(f'{eid(200000+i)}\t{eid(100000 + (i % N_REL) + 1)}\tTrack {i}\t{(i % 12) + 1}\t180000\t2024-05-03T00:00:00Z\n')
@@ -75,6 +81,29 @@ with open(f'{d}/mbdump-track.tsv', 'w') as f:
     # One recording also appears on a second release (medium 2): the
     # membership file, unlike the canonical recording row, keeps both.
     f.write(f'{eid(100001)}\t{eid(200001)}\t2\t1\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    for i in range(1, N_URL + 1):
+        f.write(f'{eid(500000+i)}\thttps://example.test/u{i}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(599999)}\tBad URL\tnot-a-date\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    for i in range(1, N_ART + 1):
+        f.write(f'{eid(i)}\t{eid(500000 + (i % N_URL) + 1)}\tyoutube\t2024-05-02T00:00:00Z\n')
+    f.write(f'not-an-artist\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    for i in range(1, N_REC + 1):
+        video = 'true' if i % 2 == 0 else 'false'
+        f.write(f'{eid(200000+i)}\t{eid(500000 + (i % N_URL) + 1)}\tfree streaming\t{video}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\tyes\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    for i in range(1, N_REC // 2 + 1):
+        f.write(f'{eid(200000+i)}\t{eid(200000 + N_REC // 2 + i)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\tShort\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    for i in range(1, N_REC + 1):
+        # Lowercase on purpose: the validator canonicalizes to the
+        # uppercase mirror form, which the suite asserts below.
+        f.write(f'{eid(200000+i)}\tusabc{i:07d}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\tBOGUS\t2024-05-02T00:00:00Z\n')
 EOF
 
 echo "--- target: $(db -c "SELECT current_database() || chr(47) || current_user || '@' || coalesce(inet_server_addr()::text, 'socket');")"
@@ -83,32 +112,48 @@ echo "=== 1. full import: counts, cursor, DLQ ==="
 reset_db
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
 check "artists loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "release groups loaded" "30" "$(db -c 'SELECT count(*) FROM mb_release_group;')"
 check "releases loaded" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
+check "releases carry group" "60" "$(db -c 'SELECT count(*) FROM mb_release WHERE release_group_mbid IS NOT NULL;')"
 check "recordings loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording;')"
 check "tracks loaded" "61" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "urls loaded" "10" "$(db -c 'SELECT count(*) FROM mb_url;')"
+check "artist urls loaded" "120" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "recording urls loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "music videos loaded" "30" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "isrcs loaded" "60" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+check "isrcs stored uppercase" "USABC0000001" "$(db -c "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
 check "shared recording keeps both memberships" "2" \
   "$(db -c "SELECT count(*) FROM mb_track WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
 check "artist cursor" "123" "$(cursor artist "$FIX/mbdump-artist.tsv")"
+check "release group cursor" "31" "$(cursor release_group "$FIX/mbdump-release_group.tsv")"
 check "release cursor" "61" "$(cursor release "$FIX/mbdump-release.tsv")"
 check "recording cursor" "60" "$(cursor recording "$FIX/mbdump-recording.tsv")"
 check "track cursor" "61" "$(cursor track "$FIX/mbdump-track.tsv")"
-check "dlq rows" "4" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
-check "dlq reasons" "bad_uuid,bad_timestamp,column_count,bad_uuid" \
+check "url cursor" "11" "$(cursor url "$FIX/mbdump-url.tsv")"
+check "artist url cursor" "121" "$(cursor artist_url "$FIX/mbdump-artist_url.tsv")"
+check "recording url cursor" "61" "$(cursor recording_url "$FIX/mbdump-recording_url.tsv")"
+check "music video cursor" "31" "$(cursor recording_music_video "$FIX/mbdump-recording_music_video.tsv")"
+check "isrc cursor" "61" "$(cursor recording_isrc "$FIX/mbdump-recording_isrc.tsv")"
+check "dlq rows" "10" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "dlq reasons" "bad_uuid,bad_timestamp,column_count,bad_uuid,bad_isrc,column_count,bad_bool,bad_uuid,bad_uuid,bad_timestamp" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
-check "dlq line_nos" "121,122,123,61" \
+check "dlq line_nos" "121,122,123,121,61,31,61,61,31,11" \
   "$(db -c "SELECT string_agg(line_no::text, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
 check "dlq raw round-trips raw key" "not-a-uuid" \
   "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='bad_uuid' AND table_name='artist';")"
 check "artist dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_artist GROUP BY mbid HAVING count(*)>1) d;')"
+check "artist url triples unique" "0" "$(db -c 'SELECT count(*) FROM (SELECT artist_mbid, url_mbid, link_name FROM mb_artist_url GROUP BY 1, 2, 3 HAVING count(*)>1) d;')"
+check "isrc pairs unique" "0" "$(db -c 'SELECT count(*) FROM (SELECT recording_mbid, isrc FROM mb_recording_isrc GROUP BY 1, 2 HAVING count(*)>1) d;')"
 check "artist line range" "1|120|120" \
   "$(db -c 'SELECT min(line_no) || CHR(124) || max(line_no) || CHR(124) || count(*) FROM mb_artist;')"
 check "operator DLQ query works" "1" \
   "$(db -c "SELECT count(*) FROM mb_import_dlq WHERE table_name='artist' AND reason='bad_uuid';")"
 
 echo "=== 2. rerun over same dump: zero dupes, zero movement ==="
-before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+before="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 bash "$SELF_DIR/import.sh" "$FIX" >/dev/null
-after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
+after="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc), (SELECT count(*) FROM mb_import_dlq), (SELECT sum(lines_done) FROM mb_import_cursor);')"
 check "rerun changes nothing" "$before" "$after"
 
 echo "=== 3. same-sized newer dump upserts rows and isolates cursor/DLQ ==="
@@ -129,9 +174,9 @@ EOF
 [[ "$(wc -c <"$FIX/mbdump-artist.tsv")" == "$(wc -c <"$NEWER/mbdump-artist.tsv")" ]]
 bash "$SELF_DIR/import.sh" "$NEWER" >/dev/null
 check "new dump updates existing artist" "Band 9|2025-05-01 12:00:00+00"   "$(db -c "SELECT name || '|' || updated_at FROM mb_artist WHERE mbid='00000000-0000-0000-0000-000000000001';")"
-check "new dump preserves table row counts" "120|60|60|61"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording) || chr(124) || (SELECT count(*) FROM mb_track);')"
+check "new dump preserves table row counts" "120|30|60|60|61|10|120|60|30|60"   "$(db -c 'SELECT (SELECT count(*) FROM mb_artist) || chr(124) || (SELECT count(*) FROM mb_release_group) || chr(124) || (SELECT count(*) FROM mb_release) || chr(124) || (SELECT count(*) FROM mb_recording) || chr(124) || (SELECT count(*) FROM mb_track) || chr(124) || (SELECT count(*) FROM mb_url) || chr(124) || (SELECT count(*) FROM mb_artist_url) || chr(124) || (SELECT count(*) FROM mb_recording_url) || chr(124) || (SELECT count(*) FROM mb_recording_music_video) || chr(124) || (SELECT count(*) FROM mb_recording_isrc);')"
 check "new dump starts an independent cursor" "123" "$(cursor artist "$NEWER/mbdump-artist.tsv")"
-check "DLQ retains poison from both dumps" "7" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "DLQ retains poison from both dumps" "13" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
 check "same line poison is keyed by dump" "2" \
   "$(db -c "SELECT count(DISTINCT dump_id) FROM mb_import_dlq WHERE table_name='artist' AND line_no=121;")"
 
@@ -179,7 +224,13 @@ else
   rel_at="$(cursor release "$FIX/mbdump-release.tsv")"
   rec_at="$(cursor recording "$FIX/mbdump-recording.tsv")"
   trk_at="$(cursor track "$FIX/mbdump-track.tsv")"
-  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" && "$trk_at" == "61" ]]; then
+  rg_at="$(cursor release_group "$FIX/mbdump-release_group.tsv")"
+  url_at="$(cursor url "$FIX/mbdump-url.tsv")"
+  aurl_at="$(cursor artist_url "$FIX/mbdump-artist_url.tsv")"
+  rurl_at="$(cursor recording_url "$FIX/mbdump-recording_url.tsv")"
+  mv_at="$(cursor recording_music_video "$FIX/mbdump-recording_music_video.tsv")"
+  isrc_at="$(cursor recording_isrc "$FIX/mbdump-recording_isrc.tsv")"
+  if [[ "$killed_at" == "123" && "$rel_at" == "61" && "$rec_at" == "60" && "$trk_at" == "61" && "$rg_at" == "31" && "$url_at" == "11" && "$aurl_at" == "121" && "$rurl_at" == "61" && "$mv_at" == "31" && "$isrc_at" == "61" ]]; then
     echo "FAIL: import completed before kill -9 (nothing to resume)" >&2
     kill -- "-$imp" 2>/dev/null || true
     wait "$imp" 2>/dev/null || true
@@ -198,8 +249,8 @@ else
       fail=1
     else
       echo "killed mid-flight at cursor artist=$killed_at release=$rel_at recording=$rec_at track=$trk_at (signal, wait=$kstatus); resuming"
-      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track);')"
-      if [[ "$partial" == "120|60|60|61" ]]; then
+      partial="$(db -c 'SELECT (SELECT count(*) FROM mb_artist), (SELECT count(*) FROM mb_release), (SELECT count(*) FROM mb_recording), (SELECT count(*) FROM mb_track), (SELECT count(*) FROM mb_release_group), (SELECT count(*) FROM mb_url), (SELECT count(*) FROM mb_artist_url), (SELECT count(*) FROM mb_recording_url), (SELECT count(*) FROM mb_recording_music_video), (SELECT count(*) FROM mb_recording_isrc);')"
+      if [[ "$partial" == "120|60|60|61|30|10|120|60|30|60" ]]; then
         echo "FAIL: kill left nothing to resume ($partial already fully loaded)" >&2
         fail=1
       else
@@ -208,7 +259,13 @@ else
         check "resume: releases" "60" "$(db -c 'SELECT count(*) FROM mb_release;')"
         check "resume: recordings" "60" "$(db -c 'SELECT count(*) FROM mb_recording;')"
         check "resume: tracks" "61" "$(db -c 'SELECT count(*) FROM mb_track;')"
-        check "resume: dlq" "4" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+        check "resume: release groups" "30" "$(db -c 'SELECT count(*) FROM mb_release_group;')"
+        check "resume: urls" "10" "$(db -c 'SELECT count(*) FROM mb_url;')"
+        check "resume: artist urls" "120" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+        check "resume: recording urls" "60" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+        check "resume: music videos" "30" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+        check "resume: isrcs" "60" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+        check "resume: dlq" "10" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
         check "resume: artist dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_artist GROUP BY mbid HAVING count(*)>1) d;')"
         check "resume: release dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_release GROUP BY mbid HAVING count(*)>1) d;')"
         check "resume: recording dupes" "0" "$(db -c 'SELECT count(*) FROM (SELECT mbid FROM mb_recording GROUP BY mbid HAVING count(*)>1) d;')"
@@ -223,7 +280,7 @@ reset_db
 DUPE="$FIX-dupe"
 rm -rf "$DUPE"
 mkdir -p "$DUPE"
-cp "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$FIX/mbdump-track.tsv" "$DUPE/"
+cp "$FIX/mbdump-release_group.tsv" "$FIX/mbdump-release.tsv" "$FIX/mbdump-recording.tsv" "$FIX/mbdump-track.tsv" "$FIX/mbdump-url.tsv" "$FIX/mbdump-artist_url.tsv" "$FIX/mbdump-recording_url.tsv" "$FIX/mbdump-recording_music_video.tsv" "$FIX/mbdump-recording_isrc.tsv" "$DUPE/"
 python3 - "$DUPE" <<'EOF'
 import sys, uuid
 d = sys.argv[1]
@@ -273,17 +330,37 @@ def eid(n): return str(uuid.UUID(int=n))
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
     f.write('not-a-uuid\tBad\tBad\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGood Group\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(400002)}\tOrphan Group\t{eid(434343)}\tAlbum\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-release.tsv', 'w') as f:
-    f.write(f'{eid(100001)}\t{eid(1)}\tGood Album\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
-    f.write(f'{eid(100002)}\t{eid(424242)}\tOrphan Album\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
-    f.write(f'{eid(100003)}\t{eid(1)}\tSecond Album\tEP\t2023\t\\N\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(1)}\tGood Album\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(424242)}\tOrphan Album\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100003)}\t{eid(1)}\tSecond Album\tEP\t2023\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100004)}\t{eid(1)}\tGroup Orphan Album\tAlbum\t2024\t\\N\t{eid(434343)}\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     f.write(f'{eid(200001)}\t{eid(100001)}\tGood Track\t1\t180000\t2024-05-03T00:00:00Z\n')
     f.write(f'{eid(200002)}\t{eid(100002)}\tOrphan Track\t1\t180000\t2024-05-03T00:00:00Z\n')
+    f.write(f'{eid(200003)}\t{eid(100003)}\tSecond Track\t1\t180000\t2024-05-03T00:00:00Z\n')
 with open(f'{d}/mbdump-track.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t{eid(200001)}\t1\t1\t2024-05-03T00:00:00Z\n')
     f.write(f'{eid(100002)}\t{eid(200001)}\t1\t1\t2024-05-03T00:00:00Z\n')
     f.write(f'{eid(100001)}\t{eid(200002)}\t1\t2\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/good\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(500002)}\thttps://example.test/spare\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(535353)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(545454)}\t{eid(500001)}\tfree streaming\tfalse\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200003)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\t{eid(565656)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(575757)}\tUSABC2400002\t2024-05-02T00:00:00Z\n')
 EOF
 # Old behavior: the orphan's REFERENCES violation rolled back the whole
 # chunk, the cursor never advanced, and the row was never DLQ'd. Now the
@@ -295,18 +372,32 @@ else
   echo "ok: import completed with FK orphans present"
 fi
 check "fk: artists loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist;')"
+check "fk: release groups loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_group;')"
+# Four release rows: 100001 + 100003 load; 100002 is DLQ'd
+# (fk_missing_artist) and 100004 is DLQ'd (fk_missing_release_group).
 check "fk: releases loaded" "2" "$(db -c 'SELECT count(*) FROM mb_release;')"
-check "fk: recordings loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording;')"
+check "fk: recordings loaded" "2" "$(db -c 'SELECT count(*) FROM mb_recording;')"
 check "fk: tracks loaded" "1" "$(db -c 'SELECT count(*) FROM mb_track;')"
+check "fk: urls loaded" "2" "$(db -c 'SELECT count(*) FROM mb_url;')"
+check "fk: artist urls loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "fk: recording urls loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "fk: music videos loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "fk: isrcs loaded" "1" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
 check "fk: artist cursor" "2" "$(cursor artist "$FKDIR/mbdump-artist.tsv")"
-check "fk: release cursor" "3" "$(cursor release "$FKDIR/mbdump-release.tsv")"
-check "fk: recording cursor" "2" "$(cursor recording "$FKDIR/mbdump-recording.tsv")"
+check "fk: release group cursor" "2" "$(cursor release_group "$FKDIR/mbdump-release_group.tsv")"
+check "fk: release cursor" "4" "$(cursor release "$FKDIR/mbdump-release.tsv")"
+check "fk: recording cursor" "3" "$(cursor recording "$FKDIR/mbdump-recording.tsv")"
 check "fk: track cursor" "3" "$(cursor track "$FKDIR/mbdump-track.tsv")"
-check "fk: dlq rows" "5" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
-check "fk: dlq reasons" "bad_uuid,fk_missing_release,fk_missing_artist,fk_missing_release,fk_missing_recording" \
+check "fk: url cursor" "2" "$(cursor url "$FKDIR/mbdump-url.tsv")"
+check "fk: artist url cursor" "2" "$(cursor artist_url "$FKDIR/mbdump-artist_url.tsv")"
+check "fk: recording url cursor" "2" "$(cursor recording_url "$FKDIR/mbdump-recording_url.tsv")"
+check "fk: music video cursor" "2" "$(cursor recording_music_video "$FKDIR/mbdump-recording_music_video.tsv")"
+check "fk: isrc cursor" "2" "$(cursor recording_isrc "$FKDIR/mbdump-recording_isrc.tsv")"
+check "fk: dlq rows" "11" "$(db -c 'SELECT count(*) FROM mb_import_dlq;')"
+check "fk: dlq reasons" "bad_uuid,fk_missing_url,fk_missing_release,fk_missing_recording,fk_missing_recording,fk_missing_recording,fk_missing_artist,fk_missing_release_group,fk_missing_artist,fk_missing_release,fk_missing_recording" \
   "$(db -c "SELECT string_agg(reason, ',' ORDER BY table_name, line_no) FROM mb_import_dlq;")"
 check "fk: orphan raw keeps dump key" "$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')" \
-  "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='fk_missing_artist';")"
+  "$(db -c "SELECT split_part(raw_line, chr(9), 1) FROM mb_import_dlq WHERE reason='fk_missing_artist' AND table_name='release';")"
 
 echo "=== 9. validator write failure exits non-zero ==="
 # A short valid.tsv with a 0 exit would advance the cursor past rows that
@@ -356,6 +447,27 @@ with open(f'{d}/mbdump-recording.tsv', 'w') as f:
 with open(f'{d}/mbdump-track.tsv', 'w') as f:
     for i in range(1, 4):
         f.write(f'{eid(300000+i)}\t{eid(400000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+# The dump is refused at the artist table (all poison) before any
+# downstream table runs, so these files only satisfy admission: they are
+# plausible valid rows a run that got this far would load.
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'{eid(600000+i)}\tGroup {i}\t\\N\tAlbum\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'{eid(700000+i)}\thttps://example.test/p{i}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'\\N\t{eid(700000+i)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'\\N\t{eid(700000+i)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'{eid(800000+i)}\t{eid(800000+i+10)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    for i in range(1, 3):
+        f.write(f'{eid(800000+i)}\tUSABC240{i:04d}\t2024-05-02T00:00:00Z\n')
 EOF
 if DUMP_SEQ=500 bash "$SELF_DIR/import.sh" "$POISON" >/dev/null 2>&1; then
   echo "FAIL: all-poison dump imported without error" >&2
@@ -373,7 +485,7 @@ else
   echo "ok: all-poison rerun refused on already-complete path"
 fi
 check "poison rerun: still no rows" "0" "$(db -c 'SELECT count(*) FROM mb_artist;')"
-check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track);')"
+check "poison rerun: downstream tables never loaded" "0" "$(db -c 'SELECT (SELECT count(*) FROM mb_release_group) + (SELECT count(*) FROM mb_release) + (SELECT count(*) FROM mb_recording) + (SELECT count(*) FROM mb_track) + (SELECT count(*) FROM mb_url) + (SELECT count(*) FROM mb_artist_url) + (SELECT count(*) FROM mb_recording_url) + (SELECT count(*) FROM mb_recording_music_video) + (SELECT count(*) FROM mb_recording_isrc);')"
 check "poison rerun: replication state still untouched" "0" "$(db -c 'SELECT last_packet FROM mb_import_state WHERE id = 1;')"
 
 echo "=== 11. changed tracks: repoint replaces, dropped position is pruned ==="
@@ -391,14 +503,26 @@ d = sys.argv[1]
 def eid(n): return str(uuid.UUID(int=n))
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-release.tsv', 'w') as f:
-    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, 4):
         f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
 with open(f'{d}/mbdump-track.tsv', 'w') as f:
     for i in range(1, 4):
         f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/good\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
 EOF
 bash "$SELF_DIR/import.sh" "$CHG" >/dev/null
 check "changed: tracks before" "3" "$(db -c 'SELECT count(*) FROM mb_track;')"
@@ -462,14 +586,26 @@ d = sys.argv[1]
 def eid(n): return str(uuid.UUID(int=n))
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-release.tsv', 'w') as f:
-    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, 11):
         f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
 with open(f'{d}/mbdump-track.tsv', 'w') as f:
     for i in range(1, 11):
         f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/good\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
 EOF
 bash "$SELF_DIR/import.sh" "$SPLIT" >/dev/null
 check "split: tracks before" "10" "$(db -c 'SELECT count(*) FROM mb_track;')"
@@ -524,7 +660,138 @@ check "split: track 1 repointed after resume" "$(python3 -c 'import uuid; print(
 check "split: final positions" "1,2,3,4,5,6,7,8,9" \
   "$(db -c 'SELECT string_agg(track_no::text, chr(44) ORDER BY track_no) FROM mb_track;')"
 
-rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS"
+echo "=== 13. dropped relationships are pruned; direct video URLs resolve ==="
+# The four relationship tables prune per-parent newest-dump rows in the
+# final chunk (same pattern as the track prune in 11/12): a newer dump
+# that drops a link, pair or ISRC must stop serving it. Recording 200003
+# carries a direct video-marked URL but no music-video pair, so it also
+# proves the read join's direct leg (workers/mb RECORDING_VIDEOS_SQL):
+# the query below mirrors that statement's union of direct video-marked
+# recording URLs and pair-reached video URLs.
+reset_db
+REL="$FIX-rel"
+rm -rf "$REL" "$REL-newer" "$REL-old"
+mkdir -p "$REL"
+python3 - "$REL" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+with open(f'{d}/mbdump-artist.tsv', 'w') as f:
+    f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-release.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-track.tsv', 'w') as f:
+    for i in range(1, 4):
+        f.write(f'{eid(100001)}\t{eid(200000+i)}\t1\t{i}\t2024-05-03T00:00:00Z\n')
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/vid\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(500002)}\thttps://example.test/stale\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(1)}\t{eid(500002)}\tfree streaming\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(500001)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200003)}\t{eid(500002)}\tfree streaming\ttrue\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(200002)}\t2024-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200001)}\tUSABC2400002\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tGBXYZ9900012\t2024-05-02T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL" >/dev/null
+check "rel: artist urls before" "2" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: recording urls before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "rel: music videos before" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: isrcs before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+cp -R "$REL" "$REL-newer"
+python3 - "$REL-newer" <<'EOF'
+import sys, uuid
+d = sys.argv[1]
+def eid(n): return str(uuid.UUID(int=n))
+# Artist drops its free-streaming link; recording 200002 drops its only
+# URL row; pair (200001, 200002) is replaced by (200002, 200003), which
+# prunes the old pair through endpoint 200002; recording 200001 drops
+# its second ISRC. A third URL arrives for 200002's new direct video row.
+with open(f'{d}/mbdump-url.tsv', 'w') as f:
+    f.write(f'{eid(500001)}\thttps://example.test/vid\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(500002)}\thttps://example.test/stale\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(500003)}\thttps://example.test/vid2\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_url.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(500001)}\tyoutube\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_url.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(500001)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(500003)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200003)}\t{eid(500002)}\tfree streaming\ttrue\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_music_video.tsv', 'w') as f:
+    f.write(f'{eid(200002)}\t{eid(200003)}\t2025-05-02T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tUSABC2400001\t2025-05-02T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tGBXYZ9900012\t2025-05-02T00:00:00Z\n')
+EOF
+bash "$SELF_DIR/import.sh" "$REL-newer" >/dev/null
+check "rel: dropped artist link pruned" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: surviving artist link kept" "youtube" "$(db -c "SELECT link_name FROM mb_artist_url WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=1))')';")"
+check "rel: dropped recording url pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_url WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')' AND url_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=500001))')';")"
+check "rel: superseded pair pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_music_video WHERE recording_a_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+check "rel: replacement pair kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: dropped isrc pruned" "1" "$(db -c "SELECT count(*) FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+check "rel: surviving isrc kept" "USABC2400001" "$(db -c "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
+# The videos read union mirrors the production RECORDING_VIDEOS_SQL in
+# workers/mb/src/lib.rs (direct video-marked URLs plus pair-reached
+# video URLs; the worker's w6b_sql pin asserts the UNION and both legs
+# so a reverted direct leg fails that suite): recording 200001 keeps
+# only its direct video, 200002 resolves both its direct video and
+# 200003's through the new pair, and 200003 (never in a pair with a
+# video-marked other side in the old dump) resolves its direct video.
+videos_for() {
+  db -c "SELECT recording_mbid::text || '|' || url || '|' || link_name FROM (
+    SELECT ru.recording_mbid AS recording_mbid, u.url AS url, ru.link_name AS link_name
+    FROM mb_recording_url ru JOIN mb_url u ON u.mbid = ru.url_mbid
+    WHERE ru.recording_mbid = '$1' AND ru.is_video
+    UNION
+    SELECT CASE WHEN mv.recording_a_mbid = '$1' THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END, u.url, ru.link_name
+    FROM mb_recording_music_video mv
+    JOIN mb_recording_url ru ON ru.recording_mbid = CASE WHEN mv.recording_a_mbid = '$1' THEN mv.recording_b_mbid ELSE mv.recording_a_mbid END
+    JOIN mb_url u ON u.mbid = ru.url_mbid
+    WHERE (mv.recording_a_mbid = '$1' OR mv.recording_b_mbid = '$1') AND ru.is_video) AS videos
+  ORDER BY 1;"
+}
+R1="$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')"
+R2="$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')"
+R3="$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')"
+U1="https://example.test/vid"
+U2="https://example.test/stale"
+U3="https://example.test/vid2"
+check "rel: 200001 videos (direct only)" "$R1|$U1|free streaming" "$(videos_for "$R1")"
+check "rel: 200002 videos (direct plus pair)" "$R2|$U3|free streaming,$R3|$U2|free streaming" "$(videos_for "$R2" | paste -sd ',' -)"
+check "rel: 200003 videos (direct plus pair)" "$R2|$U3|free streaming,$R3|$U2|free streaming" "$(videos_for "$R3" | paste -sd ',' -)"
+# An older dump (new bytes, older timestamps) must neither roll rows back
+# nor resurrect pruned relationships: the forward-only upsert guard and
+# the per-parent prunes both refuse to move backwards.
+cp -R "$REL" "$REL-old"
+python3 - "$REL-old" <<'EOF'
+import sys
+from pathlib import Path
+d = Path(sys.argv[1])
+for name in ("mbdump-artist_url.tsv", "mbdump-recording_url.tsv",
+             "mbdump-recording_music_video.tsv", "mbdump-recording_isrc.tsv"):
+    p = d / name
+    p.write_text(p.read_text().replace("2024-05-02T00:00:00Z", "2024-06-02T00:00:00Z"))
+EOF
+bash "$SELF_DIR/import.sh" "$REL-old" >/dev/null
+check "rel: older dump leaves artist urls alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_url;')"
+check "rel: older dump leaves recording urls alone" "3" "$(db -c 'SELECT count(*) FROM mb_recording_url;')"
+check "rel: older dump leaves pairs alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
+check "rel: older dump leaves isrcs alone" "2" "$(db -c 'SELECT count(*) FROM mb_recording_isrc;')"
+
+rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old"
 if (( fail != 0 )); then
   echo "test-import: FAILED" >&2
   exit 1
