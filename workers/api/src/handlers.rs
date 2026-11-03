@@ -10225,6 +10225,7 @@ mod tests {
                 cancel_at_period_end: false,
                 paid_through_at_unix: Some(i64::try_from(NOW).unwrap() + 3600),
                 grace_until_unix: None,
+                current_period_end_unix: Some(i64::try_from(NOW).unwrap() + 3600),
             },
         );
         h.store.plan_caps_rows.borrow_mut().insert(

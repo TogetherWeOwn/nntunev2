@@ -2083,6 +2083,9 @@ impl Store for PgStore {
                         grace_until_unix: row
                             .try_get("grace_until_unix")
                             .map_err(|_| StoreError)?,
+                        current_period_end_unix: row
+                            .try_get("current_period_end_unix")
+                            .map_err(|_| StoreError)?,
                     })),
                 }
             },
