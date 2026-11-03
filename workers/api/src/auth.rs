@@ -265,9 +265,9 @@ pub struct PasskeyCredential {
     pub registered_at: u64,
 }
 
-// --- Invite codes (admin-issued, migration 0030) -------------------------------
+// --- Invite codes (admin-issued, migration 0031) -------------------------------
 
-/// Invite kinds (`invite_codes.kind` CHECK in migration 0030). Member
+/// Invite kinds (`invite_codes.kind` CHECK in migration 0031). Member
 /// invites obey windows/quotas (post-M1); admin invites do not.
 pub const INVITE_KIND_ADMIN: &str = "admin";
 pub const INVITE_KIND_MEMBER: &str = "member";
@@ -285,7 +285,7 @@ fn default_invite_kind() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRecord {
-    /// Surrogate row id (migration 0030); 0 before the row is stored.
+    /// Surrogate row id (migration 0031); 0 before the row is stored.
     /// Audit rows reference invites by this id, never by code material.
     #[serde(default)]
     pub id: i64,

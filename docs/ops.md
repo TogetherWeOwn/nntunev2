@@ -392,7 +392,7 @@ signs in normally and every further role change goes through
 
 ### Admin-issued invites
 
-Migration 0030 extends `invite_codes` (surrogate row id, issuer, kind,
+Migration 0031 extends `invite_codes` (surrogate row id, issuer, kind,
 optional email binding, required expiry, redemption and revocation
 stamps) and adds `users.invited_by`. Signed-in admins manage invites
 through the role-gated admin API: `POST /v1/admin/invites` issues one

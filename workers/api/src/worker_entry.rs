@@ -819,7 +819,7 @@ fn user_from_row(row: &tokio_postgres::Row) -> Result<UserRecord, StoreError> {
     })
 }
 
-/// One `invite_codes` row (migration 0030). Expects the extended
+/// One `invite_codes` row (migration 0031). Expects the extended
 /// column set; `issuer_email` is present only in the by-hash lookup's
 /// join, so a missing column mappers to `None` there.
 fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError> {
@@ -1379,7 +1379,7 @@ async fn admin_actor_locked(
     Ok(crate::admin::is_admin_role(actor_role.as_deref()))
 }
 
-/// Admin invite issue (migration 0030): the INSERT and its
+/// Admin invite issue (migration 0031): the INSERT and its
 /// `invite.issued` audit row commit together under the shared
 /// admin-write locks. The audit row references the invite by the
 /// returned row id only — code plaintext and hash never appear in it.
@@ -1438,7 +1438,7 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
-/// Admin invite revoke (migration 0030): the conditional UPDATE and
+/// Admin invite revoke (migration 0031): the conditional UPDATE and
 /// its `invite.revoked` audit row commit together. The invite row is
 /// locked first, so a redemption claim executing concurrently either
 /// committed first (and the locked read sees the spend) or waits and
