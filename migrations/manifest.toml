@@ -147,3 +147,8 @@ sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
 file = "0030_mb_mirror_w6b.sql"
 target = "mirror"
 sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
+
+[[migration]]
+file = "0031_mb_mirror_phase2_relations.sql"
+target = "mirror"
+sha256 = "af91df547dd324a3f576f673fea0f848e9f51f25f57ac36a1f19557949ae0266"

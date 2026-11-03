@@ -18,6 +18,21 @@
 //! - recording_url:         recording_mbid, url_mbid, link_name, is_video, updated_at
 //! - recording_music_video: recording_a_mbid, recording_b_mbid, updated_at
 //! - recording_isrc:        recording_mbid, isrc, updated_at
+//! - work:                  mbid, name, work_type, updated_at
+//! - label:                 mbid, name, label_code, label_type, updated_at
+//! - artist_recording:      artist_mbid, recording_mbid, link_name, updated_at
+//! - artist_release:        artist_mbid, release_mbid, link_name, updated_at
+//! - artist_work:           artist_mbid, work_mbid, link_name, updated_at
+//! - recording_work:        recording_mbid, work_mbid, link_name, updated_at
+//! - recording_recording:   recording_a_mbid, recording_b_mbid, link_name, updated_at
+//! - release_credit:        release_mbid, position, artist_mbid, name, join_phrase, updated_at
+//! - artist_alias:          artist_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - release_alias:         release_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - recording_alias:       recording_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - release_group_alias:   release_group_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - work_alias:            work_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - label_alias:           label_mbid, name, locale, sort_name, primary_for_locale, updated_at
+//! - release_label:         release_mbid, label_mbid, catalog_number, updated_at
 //!
 //! Normalization: empty nullable fields are rewritten to the `COPY` null
 //! marker `\N`; typed columns are validated on their COPY-decoded value
@@ -42,6 +57,21 @@ pub enum Table {
     RecordingUrl,
     RecordingMusicVideo,
     RecordingIsrc,
+    Work,
+    Label,
+    ArtistRecording,
+    ArtistRelease,
+    ArtistWork,
+    RecordingWork,
+    RecordingRecording,
+    ReleaseCredit,
+    ArtistAlias,
+    ReleaseAlias,
+    RecordingAlias,
+    ReleaseGroupAlias,
+    WorkAlias,
+    LabelAlias,
+    ReleaseLabel,
 }
 
 impl Table {
@@ -58,6 +88,21 @@ impl Table {
             "recording_url" => Some(Table::RecordingUrl),
             "recording_music_video" => Some(Table::RecordingMusicVideo),
             "recording_isrc" => Some(Table::RecordingIsrc),
+            "work" => Some(Table::Work),
+            "label" => Some(Table::Label),
+            "artist_recording" => Some(Table::ArtistRecording),
+            "artist_release" => Some(Table::ArtistRelease),
+            "artist_work" => Some(Table::ArtistWork),
+            "recording_work" => Some(Table::RecordingWork),
+            "recording_recording" => Some(Table::RecordingRecording),
+            "release_credit" => Some(Table::ReleaseCredit),
+            "artist_alias" => Some(Table::ArtistAlias),
+            "release_alias" => Some(Table::ReleaseAlias),
+            "recording_alias" => Some(Table::RecordingAlias),
+            "release_group_alias" => Some(Table::ReleaseGroupAlias),
+            "work_alias" => Some(Table::WorkAlias),
+            "label_alias" => Some(Table::LabelAlias),
+            "release_label" => Some(Table::ReleaseLabel),
             _ => None,
         }
     }
@@ -75,6 +120,21 @@ impl Table {
             Table::RecordingUrl => 5,
             Table::RecordingMusicVideo => 3,
             Table::RecordingIsrc => 3,
+            Table::Work => 4,
+            Table::Label => 5,
+            Table::ArtistRecording => 4,
+            Table::ArtistRelease => 4,
+            Table::ArtistWork => 4,
+            Table::RecordingWork => 4,
+            Table::RecordingRecording => 4,
+            Table::ReleaseCredit => 6,
+            Table::ArtistAlias => 6,
+            Table::ReleaseAlias => 6,
+            Table::RecordingAlias => 6,
+            Table::ReleaseGroupAlias => 6,
+            Table::WorkAlias => 6,
+            Table::LabelAlias => 6,
+            Table::ReleaseLabel => 4,
         }
     }
 
@@ -91,6 +151,21 @@ impl Table {
             Table::RecordingUrl => "recording_url",
             Table::RecordingMusicVideo => "recording_music_video",
             Table::RecordingIsrc => "recording_isrc",
+            Table::Work => "work",
+            Table::Label => "label",
+            Table::ArtistRecording => "artist_recording",
+            Table::ArtistRelease => "artist_release",
+            Table::ArtistWork => "artist_work",
+            Table::RecordingWork => "recording_work",
+            Table::RecordingRecording => "recording_recording",
+            Table::ReleaseCredit => "release_credit",
+            Table::ArtistAlias => "artist_alias",
+            Table::ReleaseAlias => "release_alias",
+            Table::RecordingAlias => "recording_alias",
+            Table::ReleaseGroupAlias => "release_group_alias",
+            Table::WorkAlias => "work_alias",
+            Table::LabelAlias => "label_alias",
+            Table::ReleaseLabel => "release_label",
         }
     }
 }
@@ -200,6 +275,56 @@ pub fn validate_line(table: Table, line_no: u64, raw: &str) -> Result<String, (&
             (FieldKind::Isrc, true),
             (FieldKind::Timestamp, true),
         ],
+        Table::Work => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Text, false),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::Label => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Integer, false),
+            (FieldKind::Text, false),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::ArtistRecording
+        | Table::ArtistRelease
+        | Table::ArtistWork
+        | Table::RecordingWork
+        | Table::RecordingRecording => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::ReleaseCredit => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Position, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Text, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::ArtistAlias
+        | Table::ReleaseAlias
+        | Table::RecordingAlias
+        | Table::ReleaseGroupAlias
+        | Table::WorkAlias
+        | Table::LabelAlias => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Text, true),
+            (FieldKind::Text, true),
+            (FieldKind::Bool, true),
+            (FieldKind::Timestamp, true),
+        ],
+        Table::ReleaseLabel => &[
+            (FieldKind::Uuid, true),
+            (FieldKind::Uuid, true),
+            (FieldKind::Text, true),
+            (FieldKind::Timestamp, true),
+        ],
     };
     for (value, (kind, not_null)) in fields.iter().zip(spec.iter()) {
         match kind.check(value, *not_null) {
@@ -255,6 +380,7 @@ pub fn plan_chunks(completed: u64, total: u64, size: u64) -> Vec<(u64, u64)> {
 enum FieldKind {
     Uuid,
     Smallint,
+    Integer,
     Timestamp,
     Country,
     Duration,
@@ -300,9 +426,10 @@ impl FieldKind {
                     FieldKind::Uuid => Err(reason::BAD_UUID),
                     // An empty NOT NULL numeric would COPY as "" and abort
                     // the chunk transaction; poison it like a bad value.
-                    FieldKind::Smallint | FieldKind::Duration | FieldKind::Position => {
-                        Err(reason::BAD_INT)
-                    }
+                    FieldKind::Smallint
+                    | FieldKind::Integer
+                    | FieldKind::Duration
+                    | FieldKind::Position => Err(reason::BAD_INT),
                     // An empty NOT NULL bool or ISRC has no empty meaning:
                     // poison with the kind's own code.
                     FieldKind::Bool => Err(reason::BAD_BOOL),
@@ -326,6 +453,12 @@ impl FieldKind {
                 }
             }
             FieldKind::Smallint => match decoded.parse::<i16>() {
+                Ok(n) => Ok(n.to_string()),
+                Err(_) => Err(reason::BAD_INT),
+            },
+            // Label codes: plain INTEGER in the schema (catalogue systems
+            // number past the SMALLINT range), any sign the dump holds.
+            FieldKind::Integer => match decoded.parse::<i32>() {
                 Ok(n) => Ok(n.to_string()),
                 Err(_) => Err(reason::BAD_INT),
             },
@@ -740,6 +873,107 @@ mod tests {
             (Table::RecordingUrl, "recording_url"),
             (Table::RecordingMusicVideo, "recording_music_video"),
             (Table::RecordingIsrc, "recording_isrc"),
+        ] {
+            assert_eq!(Table::parse(str), Some(table));
+            assert_eq!(table.as_str(), str);
+        }
+    }
+
+    #[test]
+    fn valid_phase2_table_shapes() {
+        let work = format!("{}\tA Song\tSong\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::Work, 1, &work),
+            Ok(format!("{work}\t1"))
+        );
+        // A NULL work type loads as NULL.
+        let work_null = format!("{}\tUntyped\t\t{}", MBID, TS);
+        let work_null_want = format!("{}\tUntyped\t\\N\t{}\t1", MBID, TS);
+        assert_eq!(
+            validate_line(Table::Work, 1, &work_null),
+            Ok(work_null_want)
+        );
+        // Label codes are plain INTEGERs (past the SMALLINT range is fine);
+        // NULL code and type load as NULL.
+        let label = format!("{}\tA Label\t1903\tProduction\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::Label, 2, &label),
+            Ok(format!("{label}\t2"))
+        );
+        let label_big = format!("{}\tBig\t40000\t\t{}", MBID, TS);
+        let label_big_want = format!("{}\tBig\t40000\t\\N\t{}\t2", MBID, TS);
+        assert_eq!(
+            validate_line(Table::Label, 2, &label_big),
+            Ok(label_big_want)
+        );
+        let label_bad = format!("{}\tBad\tnot-an-int\t\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::Label, 2, &label_bad),
+            Err((reason::BAD_INT, 2))
+        );
+        // Relations: entity pair plus link name.
+        let rel = format!("{}\t{}\tcomposer\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ArtistRecording, 3, &rel),
+            Ok(format!("{rel}\t3"))
+        );
+        // Song relations are directed rows: both listing directions are
+        // valid lines (no canonical ordering at the validator layer; the
+        // ETL emits both).
+        let fwd = format!("{}\t{}\tcover\t{}", MBID, MBID2, TS);
+        let bwd = format!("{}\t{}\tcover\t{}", MBID2, MBID, TS);
+        assert_eq!(
+            validate_line(Table::RecordingRecording, 4, &fwd),
+            Ok(format!("{fwd}\t4"))
+        );
+        assert_eq!(
+            validate_line(Table::RecordingRecording, 5, &bwd),
+            Ok(format!("{bwd}\t5"))
+        );
+        // Release credits carry position, artist, printed name and join phrase.
+        let credit = format!("{}\t0\t{}\tThe Band\t & \t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ReleaseCredit, 6, &credit),
+            Ok(format!("{credit}\t6"))
+        );
+        let credit_bad = format!("{}\t-1\t{}\tThe Band\t\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ReleaseCredit, 6, &credit_bad),
+            Err((reason::NEGATIVE_POSITION, 6))
+        );
+        // Aliases carry name, locale, sort name and the primary flag.
+        let alias = format!("{}\tThe Bandz\ten\tBandz, The\ttrue\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::ArtistAlias, 7, &alias),
+            Ok(format!("{alias}\t7"))
+        );
+        let alias_bad = format!("{}\tThe Bandz\ten\tBandz, The\tyes\t{}", MBID, TS);
+        assert_eq!(
+            validate_line(Table::ArtistAlias, 7, &alias_bad),
+            Err((reason::BAD_BOOL, 7))
+        );
+        // Release labels pair a release with a label and catalogue number.
+        let rl = format!("{}\t{}\tCAT-001\t{}", MBID, MBID2, TS);
+        assert_eq!(
+            validate_line(Table::ReleaseLabel, 8, &rl),
+            Ok(format!("{rl}\t8"))
+        );
+        for (table, str) in [
+            (Table::Work, "work"),
+            (Table::Label, "label"),
+            (Table::ArtistRecording, "artist_recording"),
+            (Table::ArtistRelease, "artist_release"),
+            (Table::ArtistWork, "artist_work"),
+            (Table::RecordingWork, "recording_work"),
+            (Table::RecordingRecording, "recording_recording"),
+            (Table::ReleaseCredit, "release_credit"),
+            (Table::ArtistAlias, "artist_alias"),
+            (Table::ReleaseAlias, "release_alias"),
+            (Table::RecordingAlias, "recording_alias"),
+            (Table::ReleaseGroupAlias, "release_group_alias"),
+            (Table::WorkAlias, "work_alias"),
+            (Table::LabelAlias, "label_alias"),
+            (Table::ReleaseLabel, "release_label"),
         ] {
             assert_eq!(Table::parse(str), Some(table));
             assert_eq!(table.as_str(), str);

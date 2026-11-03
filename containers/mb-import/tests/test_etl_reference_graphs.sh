@@ -4,11 +4,12 @@
 # containers/mb-import/etl.py refuses correctly shaped rows whose joins
 # dangle (missing lookup/credit/track/medium references); test_etl.sh only
 # covers malformed file/argument shape and snapshot publication/survival, so
-# this companion suite pins four broken-reference refusal diagnostics
+# this companion suite pins eight broken-reference refusal diagnostics
 # (missing artist_type, release credit-name rows, track recording, medium
-# release) with independent synthetic fixture copies; every mutation rewrites
-# a single TSV field with awk (tab counts unchanged) and the field-count
-# guard below proves the run
+# release, phase-2 relation artist, work alias parent, release-label
+# release, label type) with independent synthetic fixture copies; every
+# mutation rewrites a single TSV field with awk (tab counts unchanged) and
+# the field-count guard below proves the run
 # reached the join check instead of failing on shape. Each broken case must
 # exit nonzero with its existing diagnostic before any curated snapshot is
 # published. Uses local tiny fixture copies only; no network, no database.
@@ -99,5 +100,53 @@ if DUMP_TS=2025-02-04T04:05:10Z "$container_dir/etl.sh" "$temp_dir/missing-relea
 fi
 assert_refused "$temp_dir/missing-release" "$temp_dir/missing-release.err" \
   'medium 60 references a missing release'
+
+# Case 5: a phase-2 song-relation edge references a missing artist.
+cp -R "$fixtures/mbdump" "$temp_dir/missing-relation-artist"
+awk -F'\t' 'BEGIN { OFS="\t" } $1 == 330 { $3 = 9999 } { print }' \
+  "$temp_dir/missing-relation-artist/l_artist_recording" > "$temp_dir/l_artist_recording.tmp"
+mv "$temp_dir/l_artist_recording.tmp" "$temp_dir/missing-relation-artist/l_artist_recording"
+assert_field_count "$temp_dir/missing-relation-artist/l_artist_recording" 9
+if DUMP_TS=2025-02-04T04:05:11Z "$container_dir/etl.sh" "$temp_dir/missing-relation-artist" 2>"$temp_dir/missing-relation-artist.err"; then
+  fail 'expected missing-relation-artist refusal'
+fi
+assert_refused "$temp_dir/missing-relation-artist" "$temp_dir/missing-relation-artist.err" \
+  'l_artist_recording references missing artist or recording (9999, 50)'
+
+# Case 6: a phase-2 work alias references a missing work.
+cp -R "$fixtures/mbdump" "$temp_dir/missing-alias-work"
+awk -F'\t' 'BEGIN { OFS="\t" } $1 == 740 { $2 = 9999 } { print }' \
+  "$temp_dir/missing-alias-work/work_alias" > "$temp_dir/work_alias.tmp"
+mv "$temp_dir/work_alias.tmp" "$temp_dir/missing-alias-work/work_alias"
+assert_field_count "$temp_dir/missing-alias-work/work_alias" 16
+if DUMP_TS=2025-02-04T04:05:12Z "$container_dir/etl.sh" "$temp_dir/missing-alias-work" 2>"$temp_dir/missing-alias-work.err"; then
+  fail 'expected missing-alias-work refusal'
+fi
+assert_refused "$temp_dir/missing-alias-work" "$temp_dir/missing-alias-work.err" \
+  'work_alias references missing work 9999'
+
+# Case 7: a phase-2 release-label edge references a missing release.
+cp -R "$fixtures/mbdump" "$temp_dir/missing-label-release"
+awk -F'\t' 'BEGIN { OFS="\t" } $1 == 80 { $2 = 9999 } { print }' \
+  "$temp_dir/missing-label-release/release_label" > "$temp_dir/release_label.tmp"
+mv "$temp_dir/release_label.tmp" "$temp_dir/missing-label-release/release_label"
+assert_field_count "$temp_dir/missing-label-release/release_label" 5
+if DUMP_TS=2025-02-04T04:05:13Z "$container_dir/etl.sh" "$temp_dir/missing-label-release" 2>"$temp_dir/missing-label-release.err"; then
+  fail 'expected missing-label-release refusal'
+fi
+assert_refused "$temp_dir/missing-label-release" "$temp_dir/missing-label-release.err" \
+  'release_label references missing release 9999'
+
+# Case 8: a phase-2 label references a missing label type.
+cp -R "$fixtures/mbdump" "$temp_dir/missing-label-type"
+awk -F'\t' 'BEGIN { OFS="\t" } $1 == 70 { $11 = 99 } { print }' \
+  "$temp_dir/missing-label-type/label" > "$temp_dir/label.tmp"
+mv "$temp_dir/label.tmp" "$temp_dir/missing-label-type/label"
+assert_field_count "$temp_dir/missing-label-type/label" 16
+if DUMP_TS=2025-02-04T04:05:14Z "$container_dir/etl.sh" "$temp_dir/missing-label-type" 2>"$temp_dir/missing-label-type.err"; then
+  fail 'expected missing-label-type refusal'
+fi
+assert_refused "$temp_dir/missing-label-type" "$temp_dir/missing-label-type.err" \
+  'label 70 references missing label_type 99'
 
 echo 'mb-import ETL reference-graph tests: PASS'

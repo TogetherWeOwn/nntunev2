@@ -17,7 +17,7 @@ Container image for the two batch jobs behind `nntunev2-mb`
 
 | Job | Trigger | Script | SLO |
 |---|---|---|---|
-| Initial import | manual Container run | `import.sh <curated-dir>` (ten `mbdump-<table>.tsv` files — `artist`, `release_group`, `release`, `recording`, `track`, `url`, `artist_url`, `recording_url`, `recording_music_video`, `recording_isrc`; missing input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity and `url` tables, the `(artist, url, link)` / `(recording, url, link)` triples on the URL-relationship tables, the unordered recording pair on `recording_music_video`, the `(recording, isrc)` pair on `recording_isrc`, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same key in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers, literal bools, uppercase ISRCs, the music-video pair sorted like the canonical ETL ordering), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) so per-packet lag accounting has a baseline. (Sources: `import.sh:95` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:111-134` (all-file and sequence admission); `:249-250` (SHA-256 `dump_id` + cursor insert); `:251-429` (alias-aware whole-file dupe refusal); `:429-445` (cursor read/ahead/complete); `:501-523` (per-chunk dupe check); `:637-652` (one-transaction chunk); `:674-687` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
+| Initial import | manual Container run | `import.sh <curated-dir>` (twenty-five `mbdump-<table>.tsv` files — the ten base tables (`artist`, `release_group`, `release`, `recording`, `track`, `url`, `artist_url`, `recording_url`, `recording_music_video`, `recording_isrc`) plus the fifteen phase-2 tables (`work`, `label`, `artist_recording`, `artist_release`, `artist_work`, `recording_work`, `recording_recording`, `release_credit`, `artist_alias`, `release_alias`, `recording_alias`, `release_group_alias`, `work_alias`, `label_alias`, `release_label`), required as a group only when any one of them is present; missing base input is fatal; optional `DUMP_SEQ=<n>` seeds `mb_import_state.last_packet` forward-only; `MB_IMPORT_CHUNK_LINES=<n>` sizes chunks, default 2000) | kill-safe and idempotent: each file is keyed by its SHA-256 in `mb_import_cursor`, then applied in one-transaction chunks (validate via `mb-validate` -> `COPY` -> typed upsert -> cursor advance). The same dump resumes after its last committed chunk; a changed dump gets a fresh cursor even if it has the same or fewer lines. Poison rows land in `mb_import_dlq` per dump with reason + raw line instead of aborting the run. Duplicate valid keys within one dump — MBIDs on the entity, `url`, `work` and `label` tables, the `(artist, url, link)` / `(recording, url, link)` triples on the URL-relationship tables, the unordered recording pair on `recording_music_video`, the `(recording, isrc)` pair on `recording_isrc`, the `(a, b, link)` triple on the directed relation tables, the `(release, position)` key on `release_credit`, the `(entity, name, locale)` triple on the alias tables, the `(release, label, catalogue)` triple on `release_label`, the `(release, medium, track)` position on `mbdump-track.tsv` — or a cursor ahead of that dump are fatal; the same key in a later dump is allowed and uses the forward-only upsert (`WHERE updated_at < EXCLUDED.updated_at`). Duplicate checks COPY-decode and canonicalize keys the way the validator normalizes them (lowercase UUIDs, plain integers, literal bools, uppercase ISRCs, the music-video pair sorted like the canonical ETL ordering), so an octal/hex-escaped alias for an already-listed key is refused, not loaded beside it. `DUMP_SEQ` seeds `last_packet` only when it advances the cursor, never touches `last_applied_at`/`lag_seconds`, so an older dump never rolls back newer rows or rewinds replication. Seed `last_packet` via `DUMP_SEQ` (or manually) so per-packet lag accounting has a baseline. (Sources: `import.sh:95` (`MB_IMPORT_CHUNK_LINES`, default 2000); `:111-134` (all-file and sequence admission); `:249-250` (SHA-256 `dump_id` + cursor insert); `:251-429` (alias-aware whole-file dupe refusal); `:429-445` (cursor read/ahead/complete); `:501-523` (per-chunk dupe check); `:637-652` (one-transaction chunk); `:674-687` (`DUMP_SEQ` forward-only seed); `Dockerfile:48-49` (scheduler overrides default CMD).) |
 | Replication | retired (no schedule) | `replicate.sh` refuses every invocation | Hourly Live Data Feed packets carry the NC licence variant and never enter the CC0-only mirror; product reads come from the twice-weekly CC0 core dumps via the initial-import job above. The retired script exits 2 **before** reading secrets, touching the network, or writing any state, preserving the old pending-apply refusal signal for callers that branch on it. The per-packet SLO contract in ADR 0007 (each applied packet within 2 h of publication, evidence in `mb_replication_packet.lag_secs`) stands for whenever packet application returns under a CC0-compatible feed. (Sources: `replicate.sh:1-11` (retirement, exit 2, no state); `docs/adr/0007-mb-mirror.md:24-26` (SLO); `migrations/0017_mb_replication_packet_ledger.sql`; `migrations/0001_mb_mirror.sql:57-65` (state columns).) |
 
 ## Initial dump ETL
@@ -29,16 +29,22 @@ with `artist_type`/`area`/`iso_3166_1` lookups, `release` with
 `artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
 `recording` with `medium`/`track`) plus the relationship files (`url`,
 `link_type`, `link`, `link_attribute_type`, `link_attribute`,
-`l_artist_url`, `l_recording_url`, `l_recording_recording`, `isrc`) listed in
-`etl.py`. The ETL writes the ten curated `mbdump-<table>.tsv` files into an
+`l_artist_url`, `l_recording_url`, `l_recording_recording`, `isrc`,
+`l_artist_recording`, `l_artist_release`, `l_artist_work`,
+`l_recording_work`, the six alias tables, `label`/`label_type`,
+`release_label`, `work`/`work_type`, `link` (full load; the
+URL/music-video slice keeps its allowlisted subset) and
+`artist_credit_name`) listed in `etl.py`. The ETL writes the
+twenty-five curated `mbdump-<table>.tsv` files into an
 immutable snapshot and atomically swaps `<mbdump-dir>/curated` to point to it;
 previous snapshots are retained. It uses the image's Python 3 and a temporary,
 disk-backed SQLite projection (no external database). Run the fixture checks
 with `bash containers/mb-import/tests/test_etl.sh` and
 `bash containers/mb-import/tests/test_etl_reference_graphs.sh` (from the
-repository root — the latter pins four broken-reference refusal diagnostics:
-missing artist_type, release credit-name rows, track recording, medium
-release);
+repository root — the latter pins eight broken-reference refusal
+diagnostics: missing artist_type, release credit-name rows, track
+recording, medium release, phase-2 relation artist, work-alias parent,
+release-label release, label type);
 the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py:197-206` (`DUMP_TS` validation), `:223-228` (temp SQLite projection), `:319-335` (immutable
@@ -55,10 +61,14 @@ next run. Ordinary directories (including paths with spaces) also work.
 Keep the selected directory and its files immutable and retained until the
 run finishes; this does not protect against in-place edits or deletion.
 
-Before any database mutation (including cursor creation), all ten TSVs must
-be regular, readable and nonempty (`import.sh:111-119`). A missing, unreadable
-or empty later file therefore leaves entities, cursors, DLQ and replication
-state untouched. This is admission, **not whole-import atomicity**: subsequent
+Before any database mutation (including cursor creation), all ten base
+TSVs must be regular, readable and nonempty (`import.sh:111-119`). A
+missing, unreadable or empty later file therefore leaves entities,
+cursors, DLQ and replication state untouched. The fifteen phase-2 TSVs
+are optional as a group: a snapshot predating phase 2 (none of the
+fifteen present) imports its base tables unchanged, while any snapshot
+carrying at least one phase-2 file must carry all fifteen, regular,
+readable and nonempty. This is admission, **not whole-import atomicity**: subsequent
 row validation, duplicate detection or runtime failures can still leave earlier
 chunks committed, with existing resume/DLQ and final-track-prune semantics.
 
@@ -137,7 +147,10 @@ field order; use an extract from the matching schema revision. Derivations:
   snapshots curated before the W6b slice lack the six newer files: re-run
   the ETL for such a dump instead of pointing the new `import.sh` at it
   (the import refuses the incomplete curated set before any database write).
-  (Sources: `import.sh:111-119` (all ten files preflighted).)
+  Snapshots curated before phase 2 carry none of the fifteen phase-2
+  files and still import their base tables; a snapshot carrying any
+  phase-2 file must carry all fifteen.
+  (Sources: `import.sh:111-119` (base-ten plus phase-2-group preflight).)
 
 ## Operator queries
 
@@ -197,10 +210,12 @@ control. CI runs both (`.github/workflows/ci.yml`, `mb-import-etl` and `mb-impor
 `test-import.sh` runs the integration suite (chunked import, kill-resume,
 same-dump rerun, newer-dump upsert, DLQ, FK orphans, all-poison and
 dupe/cursor-ahead refusals, track repoint/prune, interrupted multi-chunk
-resume — suites 1-12 cover all ten tables, including the relationship/ISRC
-generators and the newer/older-changed-dump and split-fixture suites) against
+resume, relationship/alias/credit/label-edge prune — suites 1-14 cover
+all twenty-five tables, including the phase-2 generators, the FK-orphan
+routing across every parent, and the newer/older-changed-dump and
+split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
-guard), `:111-665` (suites 1-12);
+guard), `:suites 1-14`;
 `.github/workflows/ci.yml:746-790`.)
 
 Run it in the shipped image, as CI does (the image carries `mb-validate`):
@@ -213,7 +228,7 @@ docker run --rm --network host \
   mb-import:ci bash /job/test-import.sh
 ```
 
-The suite truncates all ten mirror tables, so `ALLOW_TEST_TRUNCATE=1` is
+The suite truncates all twenty-five mirror tables, so `ALLOW_TEST_TRUNCATE=1` is
 mandatory and the target must be scratch — never staging or production.
 (Sources: `test-import.sh:11-15` (refusal guard), `:47-51` (truncate + state
 reset).) Unit tests for the validator run with the workspace: `cargo test`.

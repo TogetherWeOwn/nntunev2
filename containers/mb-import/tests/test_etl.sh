@@ -24,12 +24,27 @@ diff -u "$expected/mbdump-recording_isrc.tsv" "$temp_dir/mbdump/curated/mbdump-r
 # (release, medium, track) order, not just the canonical one the
 # recording file carries.
 diff -u "$expected/mbdump-track.tsv" "$temp_dir/mbdump/curated/mbdump-track.tsv"
+diff -u "$expected/mbdump-work.tsv" "$temp_dir/mbdump/curated/mbdump-work.tsv"
+diff -u "$expected/mbdump-label.tsv" "$temp_dir/mbdump/curated/mbdump-label.tsv"
+diff -u "$expected/mbdump-artist_recording.tsv" "$temp_dir/mbdump/curated/mbdump-artist_recording.tsv"
+diff -u "$expected/mbdump-artist_release.tsv" "$temp_dir/mbdump/curated/mbdump-artist_release.tsv"
+diff -u "$expected/mbdump-artist_work.tsv" "$temp_dir/mbdump/curated/mbdump-artist_work.tsv"
+diff -u "$expected/mbdump-recording_work.tsv" "$temp_dir/mbdump/curated/mbdump-recording_work.tsv"
+diff -u "$expected/mbdump-recording_recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording_recording.tsv"
+diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/mbdump/curated/mbdump-release_credit.tsv"
+diff -u "$expected/mbdump-artist_alias.tsv" "$temp_dir/mbdump/curated/mbdump-artist_alias.tsv"
+diff -u "$expected/mbdump-release_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_alias.tsv"
+diff -u "$expected/mbdump-recording_alias.tsv" "$temp_dir/mbdump/curated/mbdump-recording_alias.tsv"
+diff -u "$expected/mbdump-release_group_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_group_alias.tsv"
+diff -u "$expected/mbdump-work_alias.tsv" "$temp_dir/mbdump/curated/mbdump-work_alias.tsv"
+diff -u "$expected/mbdump-label_alias.tsv" "$temp_dir/mbdump/curated/mbdump-label_alias.tsv"
+diff -u "$expected/mbdump-release_label.tsv" "$temp_dir/mbdump/curated/mbdump-release_label.tsv"
 
 first_snapshot="$(readlink "$temp_dir/mbdump/curated")"
 DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 second_snapshot="$(readlink "$temp_dir/mbdump/curated")"
 [[ "$first_snapshot" != "$second_snapshot" ]]
-for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
+for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc work label artist_recording artist_release artist_work recording_work recording_recording release_credit artist_alias release_alias recording_alias release_group_alias work_alias label_alias release_label; do
   grep -q '2025-02-03T04:05:07Z$' "$temp_dir/mbdump/curated/mbdump-$table.tsv"
 done
 
@@ -89,10 +104,10 @@ grep -q 'missing input file: .*release_unknown_country' "$temp_dir/unknown-count
 
 # Publication survival: identical same-DUMP_TS reruns reuse the published
 # snapshot byte-for-byte; changed or failed reruns must leave the published
-# snapshot, its symlink target and all ten TSV hashes untouched.
+# snapshot, its symlink target and all twenty-five TSV hashes untouched.
 published_target="$(readlink "$temp_dir/mbdump/curated")"
 published_hashes="$temp_dir/published.sha256"
-( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-artist.tsv mbdump-release_group.tsv mbdump-release.tsv mbdump-recording.tsv mbdump-track.tsv mbdump-url.tsv mbdump-artist_url.tsv mbdump-recording_url.tsv mbdump-recording_music_video.tsv mbdump-recording_isrc.tsv > "$published_hashes" )
+( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-artist.tsv mbdump-release_group.tsv mbdump-release.tsv mbdump-recording.tsv mbdump-track.tsv mbdump-url.tsv mbdump-artist_url.tsv mbdump-recording_url.tsv mbdump-recording_music_video.tsv mbdump-recording_isrc.tsv mbdump-work.tsv mbdump-label.tsv mbdump-artist_recording.tsv mbdump-artist_release.tsv mbdump-artist_work.tsv mbdump-recording_work.tsv mbdump-recording_recording.tsv mbdump-release_credit.tsv mbdump-artist_alias.tsv mbdump-release_alias.tsv mbdump-recording_alias.tsv mbdump-release_group_alias.tsv mbdump-work_alias.tsv mbdump-label_alias.tsv mbdump-release_label.tsv > "$published_hashes" )
 
 # Identical input at the same DUMP_TS reuses the existing snapshot.
 DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"
@@ -126,7 +141,7 @@ cp "$temp_dir/artist.bak" "$temp_dir/mbdump/artist"
 DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 new_target="$(readlink "$temp_dir/mbdump/curated")"
 [[ "$new_target" != "$published_target" ]]
-for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
+for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc work label artist_recording artist_release artist_work recording_work recording_recording release_credit artist_alias release_alias recording_alias release_group_alias work_alias label_alias release_label; do
   grep -q '2025-02-03T04:05:08Z$' "$temp_dir/mbdump/curated/mbdump-$table.tsv"
 done
 

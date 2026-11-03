@@ -29,14 +29,17 @@
 # chunk rolls back, cursor pinned, row never DLQ'd), so orphan rows are
 # detected up front and filed under fk_missing_artist /
 # fk_missing_release_group / fk_missing_release / fk_missing_recording /
-# fk_missing_url.
+# fk_missing_url / fk_missing_work / fk_missing_label.
 # Duplicate valid keys within a dump are rejected before import; the same
 # key across distinct dumps is expected and is handled by the forward-only
 # upsert. FK order is artist -> release_group -> release -> recording ->
 # track -> url -> artist_url -> recording_url -> recording_music_video ->
-# recording_isrc: every chunk of a later table only references rows an
-# earlier table already committed, and immediate FK checks never see a
-# half-chunk (a failed chunk rolls back whole).
+# recording_isrc -> work -> label -> artist_recording -> artist_release ->
+# artist_work -> recording_work -> recording_recording -> release_credit ->
+# artist_alias -> release_alias -> recording_alias -> release_group_alias ->
+# work_alias -> label_alias -> release_label: every chunk of a later table
+# only references rows an earlier table already committed, and immediate
+# FK checks never see a half-chunk (a failed chunk rolls back whole).
 #
 # DUMP_SEQ (optional): replication sequence the dump corresponds to. When
 # set, mb_import_state.last_packet is seeded forward-only (only when
@@ -47,7 +50,11 @@
 # and an older dump never rewinds the cursor. When unset, state is left
 # untouched (see README).
 #
-# Input contract (curated TSVs, NOT raw MusicBrainz dumps):
+# Input contract (curated TSVs, NOT raw MusicBrainz dumps). The base ten
+# files are always required; the fifteen phase-2 files (works, labels,
+# relations, credits, aliases) are optional as a group — a snapshot
+# predating phase 2 carries none of them and still imports, while a
+# phase-2 snapshot must carry all fifteen (a partial group is refused).
 #   <dump-dir>/mbdump-artist.tsv               mb_artist                 (mbid, name, sort_name, type, country, updated_at)
 #   <dump-dir>/mbdump-release_group.tsv        mb_release_group          (mbid, name, artist_mbid, group_type, updated_at)
 #   <dump-dir>/mbdump-release.tsv              mb_release                (mbid, artist_mbid, title, release_type, year, caa_url, release_group_mbid, updated_at)
@@ -58,6 +65,21 @@
 #   <dump-dir>/mbdump-recording_url.tsv        mb_recording_url          (recording_mbid, url_mbid, link_name, is_video, updated_at)
 #   <dump-dir>/mbdump-recording_music_video.tsv mb_recording_music_video (recording_a_mbid, recording_b_mbid, updated_at)
 #   <dump-dir>/mbdump-recording_isrc.tsv       mb_recording_isrc         (recording_mbid, isrc, updated_at)
+#   <dump-dir>/mbdump-work.tsv                 mb_work                   (mbid, name, work_type, updated_at)
+#   <dump-dir>/mbdump-label.tsv                mb_label                  (mbid, name, label_code, label_type, updated_at)
+#   <dump-dir>/mbdump-artist_recording.tsv     mb_artist_recording       (artist_mbid, recording_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-artist_release.tsv       mb_artist_release         (artist_mbid, release_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-artist_work.tsv          mb_artist_work            (artist_mbid, work_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-recording_work.tsv       mb_recording_work         (recording_mbid, work_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-recording_recording.tsv  mb_recording_recording    (recording_a_mbid, recording_b_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-release_credit.tsv       mb_release_credit         (release_mbid, position, artist_mbid, name, join_phrase, updated_at)
+#   <dump-dir>/mbdump-artist_alias.tsv         mb_artist_alias           (artist_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-release_alias.tsv        mb_release_alias          (release_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-recording_alias.tsv      mb_recording_alias        (recording_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-release_group_alias.tsv  mb_release_group_alias    (release_group_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-work_alias.tsv           mb_work_alias             (work_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-label_alias.tsv          mb_label_alias            (label_mbid, name, locale, sort_name, primary_for_locale, updated_at)
+#   <dump-dir>/mbdump-release_label.tsv        mb_release_label          (release_mbid, label_mbid, catalog_number, updated_at)
 # Produce them from an official mbdump/ extract with the full upstream column
 # layout by projecting the curated columns in dump order, e.g. with the ETL
 # step in etl.py that SELECTs the columns above and writes tab-separated
@@ -74,7 +96,11 @@ Usage: DATABASE_URL=<postgres-url> ./import.sh <dump-dir>
 
 Imports curated mbdump TSV dumps (artist, release_group, release, recording,
 track, url, artist_url, recording_url, recording_music_video,
-recording_isrc) in kill-safe chunks: validate -> COPY -> typed upsert ->
+recording_isrc, plus the optional phase-2 group: work, label,
+artist_recording, artist_release, artist_work, recording_work,
+recording_recording, release_credit, artist_alias, release_alias,
+recording_alias, release_group_alias, work_alias, label_alias,
+release_label) in kill-safe chunks: validate -> COPY -> typed upsert ->
 cursor advance, one transaction per chunk, poison rows to mb_import_dlq.
 A rerun resumes from mb_import_cursor and inserts zero dupes. See the
 header comment for the curated TSV contract and how to project it from
@@ -113,13 +139,35 @@ command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan 
 
 # Admission precedes every database mutation, including cursor creation.
 # Do not reject row-level poison here: validation and FK routing stay per chunk.
-for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
+base_tables="artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc"
+# Phase-2 tables are optional as a group, in FK order after the base ten:
+# a snapshot predating phase 2 carries none of them and still imports,
+# while a phase-2 snapshot must carry all fifteen (a partial group is an
+# incomplete snapshot and is refused). Later tables stay last so the
+# interrupted-resume order of the base ten never changes.
+phase2_tables="work label artist_recording artist_release artist_work recording_work recording_recording release_credit artist_alias release_alias recording_alias release_group_alias work_alias label_alias release_label"
+for table in $base_tables; do
   tsv="$dump_dir/mbdump-$table.tsv"
   if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
     echo "import: refusing $tsv (required curated TSV must be present, readable and nonempty)" >&2
     exit 1
   fi
 done
+phase2_present=""
+for table in $phase2_tables; do
+  if [[ -f "$dump_dir/mbdump-$table.tsv" ]]; then
+    phase2_present="$phase2_present $table"
+  fi
+done
+if [[ -n "$phase2_present" ]]; then
+  for table in $phase2_tables; do
+    tsv="$dump_dir/mbdump-$table.tsv"
+    if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
+      echo "import: refusing $tsv (phase-2 tables import as a group: present, readable and nonempty required)" >&2
+      exit 1
+    fi
+  done
+fi
 
 if [[ -n "${DUMP_SEQ:-}" ]]; then
   if [[ ! "$DUMP_SEQ" =~ ^[0-9]+$ ]]; then
@@ -162,7 +210,8 @@ refuse_all_poison_dump() {
   fi
 }
 
-for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
+# shellcheck disable=SC2086 -- intentional word-splitting of the table lists.
+for table in $base_tables$phase2_present; do
   tsv="$dump_dir/mbdump-$table.tsv"
   prune_sql=""
   final_prune_sql=""
@@ -230,6 +279,107 @@ for table in artist release_group release recording track url artist_url recordi
       # dump that drops one of this recording's codes would otherwise
       # keep serving the deleted ISRC.
       final_prune_sql="DELETE FROM mb_recording_isrc old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_isrc x WHERE x.recording_mbid = old.recording_mbid);"
+      ;;
+    # Phase-2 tables below, in FK order: entity tables first (work, label),
+    # then relations, credits, aliases, and release_label last. Entity
+    # tables carry no prune (same as artist/url): rows are keyed by MBID.
+    work)
+      columns="mbid, name, work_type, updated_at"
+      upsert="name = EXCLUDED.name, work_type = EXCLUDED.work_type, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
+      ;;
+    label)
+      columns="mbid, name, label_code, label_type, updated_at"
+      upsert="name = EXCLUDED.name, label_code = EXCLUDED.label_code, label_type = EXCLUDED.label_type, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
+      ;;
+    artist_recording)
+      columns="artist_mbid, recording_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(artist_mbid, recording_mbid, link_name)"
+      # Per-artist newest-dump prune (see artist_url above): a newer dump
+      # that drops one of this artist's relation links would otherwise keep
+      # serving the deleted relation.
+      final_prune_sql="DELETE FROM mb_artist_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_recording x WHERE x.artist_mbid = old.artist_mbid);"
+      ;;
+    artist_release)
+      columns="artist_mbid, release_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(artist_mbid, release_mbid, link_name)"
+      final_prune_sql="DELETE FROM mb_artist_release old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_release x WHERE x.artist_mbid = old.artist_mbid);"
+      ;;
+    artist_work)
+      columns="artist_mbid, work_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(artist_mbid, work_mbid, link_name)"
+      final_prune_sql="DELETE FROM mb_artist_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_work x WHERE x.artist_mbid = old.artist_mbid);"
+      ;;
+    recording_work)
+      columns="recording_mbid, work_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(recording_mbid, work_mbid, link_name)"
+      final_prune_sql="DELETE FROM mb_recording_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_work x WHERE x.recording_mbid = old.recording_mbid);"
+      ;;
+    recording_recording)
+      columns="recording_a_mbid, recording_b_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(recording_a_mbid, recording_b_mbid, link_name)"
+      # Per-endpoint newest-dump prune (see recording_music_video above):
+      # song relations are directed rows, so an old row dies once either
+      # endpoint has a newer row under any link name.
+      final_prune_sql="DELETE FROM mb_recording_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_recording x WHERE x.recording_a_mbid IN (old.recording_a_mbid, old.recording_b_mbid) OR x.recording_b_mbid IN (old.recording_a_mbid, old.recording_b_mbid));"
+      ;;
+    release_credit)
+      columns="release_mbid, position, artist_mbid, name, join_phrase, updated_at"
+      upsert="artist_mbid = EXCLUDED.artist_mbid, name = EXCLUDED.name, join_phrase = EXCLUDED.join_phrase, updated_at = EXCLUDED.updated_at"
+      conflict="(release_mbid, position)"
+      # Per-release newest-dump prune (see track above, without the
+      # straddling caveat: one credit row is one row): a newer dump that
+      # drops or reorders this release's credits would otherwise keep
+      # serving the deleted positions.
+      final_prune_sql="DELETE FROM mb_release_credit old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_credit x WHERE x.release_mbid = old.release_mbid);"
+      ;;
+    artist_alias)
+      columns="artist_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(artist_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_artist_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_alias x WHERE x.artist_mbid = old.artist_mbid);"
+      ;;
+    release_alias)
+      columns="release_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(release_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_release_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_alias x WHERE x.release_mbid = old.release_mbid);"
+      ;;
+    recording_alias)
+      columns="recording_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(recording_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_recording_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_alias x WHERE x.recording_mbid = old.recording_mbid);"
+      ;;
+    release_group_alias)
+      columns="release_group_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(release_group_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_release_group_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_group_alias x WHERE x.release_group_mbid = old.release_group_mbid);"
+      ;;
+    work_alias)
+      columns="work_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(work_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_work_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_work_alias x WHERE x.work_mbid = old.work_mbid);"
+      ;;
+    label_alias)
+      columns="label_mbid, name, locale, sort_name, primary_for_locale, updated_at"
+      upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
+      conflict="(label_mbid, name, locale)"
+      final_prune_sql="DELETE FROM mb_label_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_label_alias x WHERE x.label_mbid = old.label_mbid);"
+      ;;
+    release_label)
+      columns="release_mbid, label_mbid, catalog_number, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(release_mbid, label_mbid, catalog_number)"
+      final_prune_sql="DELETE FROM mb_release_label old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_label x WHERE x.release_mbid = old.release_mbid);"
       ;;
     track)
       columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
@@ -397,6 +547,21 @@ KEYS = {
     "recording_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
     "recording_music_video": [(0, "uuid"), (1, "uuid")],
     "recording_isrc": [(0, "uuid"), (1, "isrc")],
+    "work": [(0, "uuid")],
+    "label": [(0, "uuid")],
+    "artist_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "artist_release": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "artist_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_work": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_recording": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "release_credit": [(0, "uuid"), (1, "pos")],
+    "artist_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "recording_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_group_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "work_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "label_alias": [(0, "uuid"), (1, "text"), (2, "text")],
+    "release_label": [(0, "uuid"), (1, "uuid"), (2, "text")],
 }
 batch = []
 def flush():
@@ -525,8 +690,14 @@ EOF
       track)
         dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
         ;;
-      artist_url|recording_url)
+      artist_url|recording_url|artist_recording|artist_release|artist_work|recording_work|recording_recording|release_label)
         dupes="$(awk -F'\t' '{ print tolower($1) "/" tolower($2) "/" $3 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      release_credit)
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" ($2+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      artist_alias|release_alias|recording_alias|release_group_alias|work_alias|label_alias)
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" $2 "/" $3 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
         ;;
       recording_music_video)
         dupes="$(awk -F'\t' '{ a = tolower($1); b = tolower($2); print (a < b ? a "/" b : b "/" a) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
@@ -549,13 +720,14 @@ EOF
     # and the row never DLQ'd. Detect those rows up front against the
     # already-committed parent table and file them under fk_missing_artist
     # / fk_missing_release_group / fk_missing_release / fk_missing_recording
-    # / fk_missing_url with their exact dump bytes.
-    # (artist and url have no parent; every other table's parents commit
-    # before any of its chunks runs — the loop order above guarantees it —
-    # so a missing parent is poison, never chunk ordering. Multi-parent
-    # tables split once per parent; a row moved by the first split is
-    # already out of valid.tsv for the second.)
-    if (( 10#$valid_n > 0 )) && [[ "$table" != "artist" && "$table" != "url" ]]; then
+    # / fk_missing_url / fk_missing_work / fk_missing_label with their
+    # exact dump bytes.
+    # (artist, url, work and label have no parent; every other table's
+    # parents commit before any of its chunks runs — the loop order above
+    # guarantees it — so a missing parent is poison, never chunk ordering.
+    # Multi-parent tables split once per parent; a row moved by the first
+    # split is already out of valid.tsv for the second.)
+    if (( 10#$valid_n > 0 )) && [[ "$table" != "artist" && "$table" != "url" && "$table" != "work" && "$table" != "label" ]]; then
       case "$table" in
         release_group) fk_specs=("3 mb_artist fk_missing_artist") ;;
         release) fk_specs=("2 mb_artist fk_missing_artist" "7 mb_release_group fk_missing_release_group") ;;
@@ -565,6 +737,19 @@ EOF
         recording_url) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_url fk_missing_url") ;;
         recording_music_video) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_recording fk_missing_recording") ;;
         recording_isrc) fk_specs=("1 mb_recording fk_missing_recording") ;;
+        artist_recording) fk_specs=("1 mb_artist fk_missing_artist" "2 mb_recording fk_missing_recording") ;;
+        artist_release) fk_specs=("1 mb_artist fk_missing_artist" "2 mb_release fk_missing_release") ;;
+        artist_work) fk_specs=("1 mb_artist fk_missing_artist" "2 mb_work fk_missing_work") ;;
+        recording_work) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_work fk_missing_work") ;;
+        recording_recording) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_recording fk_missing_recording") ;;
+        release_credit) fk_specs=("1 mb_release fk_missing_release" "3 mb_artist fk_missing_artist") ;;
+        artist_alias) fk_specs=("1 mb_artist fk_missing_artist") ;;
+        release_alias) fk_specs=("1 mb_release fk_missing_release") ;;
+        recording_alias) fk_specs=("1 mb_recording fk_missing_recording") ;;
+        release_group_alias) fk_specs=("1 mb_release_group fk_missing_release_group") ;;
+        work_alias) fk_specs=("1 mb_work fk_missing_work") ;;
+        label_alias) fk_specs=("1 mb_label fk_missing_label") ;;
+        release_label) fk_specs=("1 mb_release fk_missing_release" "2 mb_label fk_missing_label") ;;
       esac
       for fk_spec in "${fk_specs[@]}"; do
       read -r fk_col parent_table fk_reason <<<"$fk_spec"
