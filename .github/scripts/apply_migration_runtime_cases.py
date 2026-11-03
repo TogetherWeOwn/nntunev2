@@ -298,6 +298,15 @@ def catalog_fingerprint(env):
     return _base().scalar(env, FINGERPRINT_SQL)
 
 
+def mirror_seed(env):
+    # updated_at is generated at apply time, not deterministic between
+    # independent databases. Compare every other seed column in ID order.
+    return _base().scalar(env, """
+        SELECT coalesce(jsonb_agg(jsonb_build_array(
+            id, last_packet, last_applied_at, lag_seconds) ORDER BY id)::text, '[]')
+        FROM public.mb_import_state;""")
+
+
 def raw_apply(env, path):
     result = subprocess.run(
         list(_base().ARGS), input=pathlib.Path(path).read_text(encoding="utf-8"),
@@ -323,7 +332,9 @@ def case_mirror_five(env):
         for name, _sha in MIRROR_FILES:
             raw_apply(ref_env, REPO_ROOT / "migrations" / name)
         reference = catalog_fingerprint(ref_env)
+        reference_seed = mirror_seed(ref_env)
     assert reference.rsplit(":", 1)[1] != "0", "empty reference catalog"
+    assert reference_seed == '[[1, 0, null, null]]', "unexpected reference seed"
 
     with fresh_database(env, "nntune_rt_mirror") as (menv, url):
         database = "nntune_rt_mirror"
@@ -337,6 +348,7 @@ def case_mirror_five(env):
             expected = ",".join(f"{n}:{s}" for n, s in MIRROR_FILES[:index])
             assert receipts(menv) == expected, f"ledger prefix after {name}"
             assert count(menv, "public.schema_migrations") == str(index)
+            assert mirror_seed(menv) == reference_seed, f"seed parity after {name}"
             # Stop/fail at every successful prefix boundary. B's failure
             # must not erase earlier files or leave the attempted effect.
             prefix_catalog = catalog_fingerprint(menv)
@@ -355,6 +367,8 @@ def case_mirror_five(env):
             "managed catalog differs from raw reference apply"
         before_rows = receipt_rows(menv)
         before_fp = catalog_fingerprint(menv)
+        before_seed = _base().scalar(menv,
+            "SELECT row_to_json(s)::text FROM public.mb_import_state s ORDER BY id;")
         for name, _sha in MIRROR_FILES:
             proc = cli(url, ["--file", str(REPO_ROOT / "migrations" / name),
                              "--manifest", str(REAL_MANIFEST),
@@ -364,6 +378,10 @@ def case_mirror_five(env):
         assert receipt_rows(menv) == before_rows, "re-run changed the ledger"
         assert count(menv, "public.schema_migrations") == "5"
         assert catalog_fingerprint(menv) == before_fp == reference
+        assert mirror_seed(menv) == reference_seed, "re-run changed deterministic seed"
+        assert _base().scalar(menv,
+            "SELECT row_to_json(s)::text FROM public.mb_import_state s ORDER BY id;") \
+            == before_seed, "re-run changed seed rows (including generated timestamp)"
     log("mirror-five-ordered-and-idempotent")
 
 

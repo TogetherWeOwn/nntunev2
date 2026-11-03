@@ -398,6 +398,17 @@ A code merge alone authorizes no live operation. A successor runner needs
 fresh exact-source and deployment-evidence review; older runner evidence
 is not transferable.
 
+**Trust boundary.** The runner consumes trusted, reviewed migration bytes
+bound to a manifest entry; it does not make untrusted SQL safe. The lexical
+outer-envelope validator is neither an arbitrary-SQL sandbox nor proof that
+session settings stay unchanged: the startup pin of the session settings
+above is controlled for the A/B transactions, but opaque routine bodies
+(for example function or `DO` bodies) are not generally inspected, so SQL
+inside them can still run and alter session state. Approving manifest bytes
+therefore means reviewing the SQL's actual behavior, including any session
+changes, not just its envelope. PostgreSQL non-transactional effects stay
+non-transactional, as described above.
+
 Rows keep the name a migration was **applied under**. When a PR branch
 renumbers a file that staging already has, the rename must be
 **byte-identical** — change the filename only, not even the header

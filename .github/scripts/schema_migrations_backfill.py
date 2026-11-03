@@ -213,8 +213,16 @@ def render(target):
         "",
     ]
     for filename, sha256 in rows_for(target):
-        lines.append(apply_migration.insert_sql(
-            filename, sha256, BACKFILL_BY, applied_at=BACKFILL_AT) + "\n")
+        # Freeze the historical insert as well as DDL: changes to the live
+        # runner's type qualification must not rewrite dated artifacts.
+        lines.append(
+            "INSERT INTO public.schema_migrations (file, sha256, applied_at, applied_by)\n"
+            "VALUES (\n"
+            f"    {apply_migration.quote_literal(filename)},\n"
+            f"    '{sha256}',\n"
+            f"    '{BACKFILL_AT}'::timestamptz,\n"
+            f"    {apply_migration.quote_literal(BACKFILL_BY)}\n"
+            ")\nON CONFLICT (file) DO NOTHING;\n")
     lines.append("COMMIT;")
     return "\n".join(lines) + "\n"
 

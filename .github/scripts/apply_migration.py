@@ -54,32 +54,34 @@ import urllib.parse
 # pass runs on every DDL execution, so a later stray GRANT is removed
 # by the next apply; the staging gate also fails closed while such a
 # grant exists. Read privileges are untouched. Qualify runner-owned
-# routines/catalogs: the migration namespace deliberately puts public first.
+# routines, catalogs, types and operators: migrations deliberately put public first.
 DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
-    file       TEXT PRIMARY KEY,
-    sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
-    applied_by TEXT NOT NULL
+    file       pg_catalog.text PRIMARY KEY,
+    sha256     pg_catalog.text NOT NULL
+               CHECK (sha256 OPERATOR(pg_catalog.~) '^[0-9a-f]{64}$'),
+    applied_at pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now(),
+    applied_by pg_catalog.text NOT NULL
 );
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
     ON TABLE public.schema_migrations FROM PUBLIC;
 DO $privileges$
 DECLARE
-    grant_row record;
+    grant_row pg_catalog.record;
 BEGIN
     FOR grant_row IN
         SELECT DISTINCT a.grantee
         FROM pg_catalog.pg_class c
-        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
         CROSS JOIN pg_catalog.aclexplode(c.relacl) a
-        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
-          AND a.privilege_type IN
-              ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
-          AND a.grantee <> c.relowner
+        WHERE n.nspname OPERATOR(pg_catalog.=) 'public'
+          AND c.relname OPERATOR(pg_catalog.=) 'schema_migrations'
+          AND a.privilege_type OPERATOR(pg_catalog.=) ANY
+              (ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'])
+          AND a.grantee OPERATOR(pg_catalog.<>) c.relowner
     LOOP
-        IF grant_row.grantee = 0 THEN
+        IF grant_row.grantee OPERATOR(pg_catalog.=) 0 THEN
             EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
-                 || 'ON TABLE public.schema_migrations FROM PUBLIC';
+                 OPERATOR(pg_catalog.||) 'ON TABLE public.schema_migrations FROM PUBLIC';
         ELSE
             EXECUTE pg_catalog.format(
                 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
@@ -93,15 +95,17 @@ BEGIN
     FOR grant_row IN
         SELECT DISTINCT a.grantee, t.attname
         FROM pg_catalog.pg_class c
-        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_catalog.pg_attribute t ON t.attrelid = c.oid
-            AND t.attnum > 0 AND NOT t.attisdropped
+        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+        JOIN pg_catalog.pg_attribute t ON t.attrelid OPERATOR(pg_catalog.=) c.oid
+            AND t.attnum OPERATOR(pg_catalog.>) 0 AND NOT t.attisdropped
         CROSS JOIN pg_catalog.aclexplode(t.attacl) a
-        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
-          AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
-          AND a.grantee <> c.relowner
+        WHERE n.nspname OPERATOR(pg_catalog.=) 'public'
+          AND c.relname OPERATOR(pg_catalog.=) 'schema_migrations'
+          AND a.privilege_type OPERATOR(pg_catalog.=) ANY
+              (ARRAY['INSERT', 'UPDATE', 'REFERENCES'])
+          AND a.grantee OPERATOR(pg_catalog.<>) c.relowner
     LOOP
-        IF grant_row.grantee = 0 THEN
+        IF grant_row.grantee OPERATOR(pg_catalog.=) 0 THEN
             EXECUTE pg_catalog.format(
                 'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
                 'ON TABLE public.schema_migrations FROM PUBLIC',
@@ -321,10 +325,10 @@ def validate_expected_database(expected_database):
 
 
 def insert_sql(filename, sha256, applied_by, applied_at=None, on_conflict=True):
-    # One value per line: the committed backfill files use this too, and
-    # a public checksum sharing a line with an auth-flavoured filename
+    # One value per line, matching the historical backfill layout: a
+    # public checksum sharing a line with an auth-flavoured filename
     # false-positives secret scanners as a credential pair.
-    when = f"'{applied_at}'::timestamptz" if applied_at else "pg_catalog.now()"
+    when = f"'{applied_at}'::pg_catalog.timestamptz" if applied_at else "pg_catalog.now()"
     conflict = "\nON CONFLICT (file) DO NOTHING" if on_conflict else ""
     return (
         "INSERT INTO public.schema_migrations (file, sha256, applied_at, applied_by)\n"
@@ -345,7 +349,7 @@ def database_guard_sql(expected_database):
     """
     return f"""DO $dbguard$
 BEGIN
-    IF pg_catalog.current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() OPERATOR(pg_catalog.<>) {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
 END
@@ -371,27 +375,29 @@ def guard_sql(identity, expected_database, priors=()):
     before this migration may apply.
     """
     def pairs_of(pairs):
-        return ", ".join(
-            f"({quote_literal(name)}, '{sha}')" for name, sha in pairs)
+        return " OR ".join(
+            f"(file OPERATOR(pg_catalog.=) {quote_literal(name)} "
+            f"AND sha256 OPERATOR(pg_catalog.=) '{sha}')" for name, sha in pairs)
 
-    names = ", ".join(quote_literal(name) for name, _sha in identity)
+    names = " OR ".join(
+        f"file OPERATOR(pg_catalog.=) {quote_literal(name)}" for name, _sha in identity)
     prior_checks = "".join(f"""
     IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE (file, sha256) IN ({pairs_of(prior)})) THEN
+               WHERE {pairs_of(prior)}) THEN
         RAISE EXCEPTION '{MISSING_PRIOR}';
     END IF;""" for prior in priors)
     return f"""SELECT pg_catalog.pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
 DO $guard$
 BEGIN
-    IF pg_catalog.current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+    IF pg_catalog.current_database() OPERATOR(pg_catalog.<>) {quote_literal(expected_database, "expect-database")} THEN
         RAISE EXCEPTION '{WRONG_DATABASE}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE (file, sha256) IN ({pairs_of(identity)})) THEN
+               WHERE {pairs_of(identity)}) THEN
         RAISE EXCEPTION '{ALREADY_SAME}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE file IN ({names})) THEN
+               WHERE {names}) THEN
         RAISE EXCEPTION '{ALREADY_DIFFERENT}';
     END IF;{prior_checks}
 END
@@ -488,7 +494,12 @@ def psql(child, sql, single_transaction=False):
             raise ApplyError(
                 "an earlier same-target migration is not recorded; "
                 "apply migrations in manifest order")
-        raise ApplyError("psql failed; see the operator-side psql output")
+        raise ApplyError(
+            f"psql failed (exit code {result.returncode}); database output redacted; "
+            "possible causes include SQL or connection failure and server-side timeout; "
+            "commit outcome may be unknown; reconcile the original checksum receipt "
+            "and effects before retrying; consult access-controlled server logs "
+            "through the approved operator process")
     return result.stdout
 
 

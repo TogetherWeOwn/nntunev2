@@ -46,7 +46,7 @@ class ComposeTests(unittest.TestCase):
         # the advisory lock + already-recorded guard, then body + insert.
         self.assertIn("pg_advisory_xact_lock", sql)
         # The expected database is pinned inside the transaction.
-        self.assertIn("current_database() <> 'nntune_apply_test'", sql)
+        self.assertIn("current_database() OPERATOR(pg_catalog.<>) 'nntune_apply_test'", sql)
         self.assertIn(apply_migration.WRONG_DATABASE, sql)
         self.assertIn(apply_migration.ALREADY_SAME, sql)
         self.assertIn(apply_migration.ALREADY_DIFFERENT, sql)
@@ -76,6 +76,25 @@ class ComposeTests(unittest.TestCase):
                         self.assertNotRegex(statement, rf"(?<![\w.]){name}\s*\(")
             self.assertIn("pg_catalog.now()", sql)
 
+    def test_runner_types_and_comparisons_use_catalog_namespace(self):
+        ddl = apply_migration.ddl_sql("nntune_apply_test")
+        self.assertIn("file       pg_catalog.text PRIMARY KEY", ddl)
+        self.assertIn("applied_at pg_catalog.timestamptz", ddl)
+        self.assertIn("grant_row pg_catalog.record", ddl)
+        self.assertIn("sha256 OPERATOR(pg_catalog.~)", ddl)
+        self.assertIn("a.grantee OPERATOR(pg_catalog.<>) c.relowner", ddl)
+        self.assertIn("t.attnum OPERATOR(pg_catalog.>) 0", ddl)
+        self.assertIn("a.privilege_type OPERATOR(pg_catalog.=) ANY", ddl)
+        self.assertIn("OPERATOR(pg_catalog.||)", ddl)
+        identity = [("0002_alpha.sql", "a" * 64), ("0001_old.sql", "a" * 64)]
+        sql = apply_migration.guard_sql(identity, "nntune_apply_test", [identity])
+        self.assertIn("pg_catalog.current_database() OPERATOR(pg_catalog.<>)", sql)
+        self.assertEqual(sql.count("sha256 OPERATOR(pg_catalog.=)"), 4)
+        self.assertEqual(sql.count("file OPERATOR(pg_catalog.=)"), 6)
+        self.assertNotIn(" IN (", sql)
+        self.assertIn("::pg_catalog.timestamptz", apply_migration.insert_sql(
+            "0002_alpha.sql", "a" * 64, "test", applied_at="2026-11-03T00:00:00Z"))
+
     def test_sha_mismatch_refuses(self):
         self.fixture(sha_override="0" * 64)
         with self.assertRaises(apply_migration.ApplyError):
@@ -100,11 +119,16 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("'0002_alpha.sql'", sql)
 
     def test_safe_outer_envelope_preserves_original_receipt(self):
-        body = "/* outer */ BEGIN;\nCREATE TABLE t (id int);\nCOMMIT; -- end\n"
+        interior = ("\nCREATE TABLE t (note text);\n"
+                    "INSERT INTO t VALUES ('keep   repeated  whitespace; COMMIT;');\n"
+                    "/* keep  comment  spacing */\n")
+        body = "/* outer */ BEGIN;" + interior + "COMMIT; -- end\n"
         self.fixture(body=body)
         sql, _, sha, _ = self.compose()
         self.assertEqual(sha, hashlib.sha256(body.encode()).hexdigest())
-        self.assertIn("CREATE TABLE t (id int);", sql)
+        self.assertEqual(apply_migration.transaction_body(body),
+                         "/* outer */ " + interior + " -- end\n")
+        self.assertIn(interior, sql)
         self.assertNotIn("/* outer */ BEGIN;", sql)
         self.assertNotIn("COMMIT; -- end", sql)
         self.assertIn(f"'{sha}'", sql)
@@ -195,6 +219,22 @@ class ComposeTests(unittest.TestCase):
                 apply_migration.psql({}, "SELECT 1;", single_transaction=True)
         self.assertNotIn("secret", str(caught.exception))
 
+    def test_nonzero_exit_guidance_is_useful_and_redacted(self):
+        from unittest.mock import patch
+        import subprocess
+        private = "private-password private-db-statement private-server-address"
+        result = subprocess.CompletedProcess(["psql"], 3, stdout=private, stderr=private)
+        with patch.object(apply_migration.subprocess, "run", return_value=result):
+            with self.assertRaises(apply_migration.ApplyError) as caught:
+                apply_migration.psql({}, "SELECT 1;", single_transaction=True)
+        message = str(caught.exception)
+        self.assertIn("exit code 3", message)
+        self.assertIn("server-side timeout", message)
+        self.assertIn("redacted", message)
+        self.assertIn("reconcile", message)
+        self.assertNotIn("see the operator-side psql output", message)
+        self.assertNotIn("private-", message)
+
     def test_mid_line_transaction_control_is_detected(self):
         self.fixture(body="CREATE TABLE t (id int); COMMIT;\n")
         with self.assertRaises(apply_migration.ApplyError):
@@ -238,7 +278,7 @@ class ComposeTests(unittest.TestCase):
     def test_record_only_also_pins_database(self):
         self.fixture(body="BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\n")
         sql, *_ = self.compose(record_only=True)
-        self.assertIn("current_database() <> 'nntune_apply_test'", sql)
+        self.assertIn("current_database() OPERATOR(pg_catalog.<>) 'nntune_apply_test'", sql)
 
     def test_guard_requires_earlier_same_target_entries(self):
         bodies = {
@@ -271,7 +311,7 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("aclexplode(t.attacl)", apply_migration.DDL)
         self.assertIn("REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I)",
                       apply_migration.DDL)
-        self.assertIn("a.grantee <> c.relowner", apply_migration.DDL)
+        self.assertIn("a.grantee OPERATOR(pg_catalog.<>) c.relowner", apply_migration.DDL)
         ddl = apply_migration.ddl_sql("nntune_apply_test")
         # The database check precedes CREATE TABLE so a wrong-database
         # run leaves no tracking table behind.
