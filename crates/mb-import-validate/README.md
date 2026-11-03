@@ -47,23 +47,23 @@ gate, COPY-escape decode, empty-value rule, then the per-kind shape check
 on the decoded value (`src/lib.rs:197-297`).
 
 - **Shape:** wrong field count is `column_count`; an empty line is
-  `empty_line` (`src/lib.rs:125-126`). Typed columns validate their
+  `empty_line` (`src/lib.rs:200-201`). Typed columns validate their
   COPY-decoded value: UUIDs must decode to lowercase-or-uppercase hex
   `8-4-4-4-12` with no braces or `urn:` (`bad_uuid`; see
   `src/lib.rs:405-416`). Smallints must decode to an `i16` (`bad_int`,
-  `src/lib.rs:329-330`); durations to a non-negative `i32`
-  (`negative_duration`, `src/lib.rs:373-376`); medium/track positions to a
-  non-negative `i16` (`negative_position`, `src/lib.rs:382-384`).
+  `src/lib.rs:456-457`); durations to a non-negative `i32`
+  (`negative_duration`, `src/lib.rs:506-509`); medium/track positions to a
+  non-negative `i16` (`negative_position`, `src/lib.rs:515-517`).
   Timestamps must decode to `YYYY-MM-DD`, optionally followed by `T` or
   space plus `HH:MM:SS[.f{1,6}]`; `Z`/`z` may follow either form, while a
   `±hh`, `±hhmm` or `±hh:mm` offset (hours ≤ 15, minutes ≤ 59) is accepted
   only after a time — `HH:MM` without seconds, a date-only value with a
   numeric offset, and >6 fractional digits are `bad_timestamp`. Impossible
   months/days and leap-day on non-leap years are also rejected
-  (`is_timestamp`, `src/lib.rs:532-552`; seconds required
+  (`is_timestamp`, `src/lib.rs:665-685`; seconds required
   `src/lib.rs:630-633`; numeric zone only after a time
   `src/lib.rs:566-571`). Country must decode to
-  exactly 2 chars (`bad_country`, `src/lib.rs:349-352`): `\x55S` is `US`,
+  exactly 2 chars (`bad_country`, `src/lib.rs:482-485`): `\x55S` is `US`,
   while the two-byte spelling `\t` is one character and poison.
 - **Escapes:** one bounded decoder validates and decodes every field:
   only the documented COPY text escapes may follow a backslash (`\\`,
@@ -71,7 +71,7 @@ on the decoded value (`src/lib.rs:197-297`).
   digits); anything else — including `\q`, `\o`, `\u`, a bare `\x`,
   `\8`/`\9`, out-of-range `\400`, NUL-producing and non-UTF8-decoding
   sequences, or a raw CR — is `bad_escape`
-  (`src/lib.rs:414-474`). Deliberately stricter than COPY, which would load
+  (`src/lib.rs:547-607`). Deliberately stricter than COPY, which would load
   unknown escapes mangled instead of refusing them.
 - **NULL discipline:** a literal `\N` in a NOT NULL column is
   `null_in_not_null` poison (it would load as NULL and violate the
@@ -112,7 +112,7 @@ by this crate (`containers/mb-import/import.sh:431-506`).
   (`src/lib.rs:257-265`); countries emit their decoded value re-escaped
   for COPY (`\x55S` emits `US`, a decoded tab emits `\t`, a decoded
   backslash-N emits `\\N` and never becomes NULL;
-  `src/lib.rs:349-352`, escaper `src/lib.rs:482-497`).
+  `src/lib.rs:482-485`, escaper `src/lib.rs:482-497`).
 - **Text pass-through:** text columns keep the original token
   byte-equal (`src/lib.rs:295`); Postgres decodes COPY text escapes on
   import, so the stored value is the decoded meaning of the dump's
@@ -120,7 +120,7 @@ by this crate (`containers/mb-import/import.sh:431-506`).
   original dump bytes, never normalized values.
 - **`line_no` append:** the 1-based line number in the whole dump file —
   chunk offset added by the caller — is appended as the final column, and
-  the loader COPYs it into `line_no` (`src/lib.rs:27,123,210`).
+  the loader COPYs it into `line_no` (`src/lib.rs:42,198,335`).
   The binary computes it as `--line-offset + index + 1`
   (`src/main.rs:117-118`).
 
