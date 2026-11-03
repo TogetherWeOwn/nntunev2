@@ -122,3 +122,8 @@ sha256 = "d4fc42468d1260df227c5b4b0b4721165429fb51c13a0265d4fadcb9931dc47e"
 file = "0025_session_refresh_claim_clock.sql"
 target = "app"
 sha256 = "120a35f3515e0c48e1df882f1eed17bb5eed425d9d91bf5da8ec86ec1f9318af"
+
+[[migration]]
+file = "0026_mb_mirror_w6b.sql"
+target = "mirror"
+sha256 = "edf01ddb7ba77da7996cbe9d385be22498eebf5dee26e58d04f8175bbdd35427"
