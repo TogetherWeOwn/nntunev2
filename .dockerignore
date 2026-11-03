@@ -16,6 +16,7 @@ crates/*/
 !crates/nntune-logging/
 !crates/nntune-ssrf-guard/
 !crates/nntune-subsonic/
+!crates/nntune-test-fixtures/
 !crates/nntune-test-nntp/
 workers/*
 !workers/stream/

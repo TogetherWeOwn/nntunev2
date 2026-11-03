@@ -10,7 +10,7 @@ import {
 
 // Returning-user login leg: proves the real `/login` magic-link form signs
 // an existing account in, redeeming the staged code on the `/auth/magic`
-// confirm page and landing on provider setup. The account under test comes
+// confirm page and landing on the library. The account under test comes
 // from the test-account seam (`POST /api/test-accounts`), and the code from
 // the staging-only retrieval seam (`POST /api/test-codes`, paired
 // staging-seam build slice) — the page form stays the only sign-in path
@@ -43,7 +43,7 @@ function requireSeamToken(context: string): void {
   test.skip(true, reason);
 }
 
-test('returning user signs in with an emailed magic link and lands on provider setup', async ({
+test('returning user signs in with an emailed magic link and lands on the library', async ({
   page,
   request,
 }) => {
@@ -101,23 +101,18 @@ test('returning user signs in with an emailed magic link and lands on provider s
   const confirm = page.getByRole('button', { name: /sign in with this link/i });
   await expect(confirm, 'magic-link confirm not offered').toBeVisible({ timeout: 15_000 });
   await confirm.click();
-  // The app serves provider setup at `/onboarding/byop` (`+server.ts` on
-  // `/onboarding/provider` unconditionally 307-redirects there): the page
-  // navigates there only after the finish succeeds server-side and mints the
-  // session cookie, so the landing URL plus the wizard heading together are
-  // the session proof (a failed finish stays on `/auth/magic` with the
-  // generic error).
-  await expect(page, 'magic-link redeem did not land on provider setup').toHaveURL(
-    /\/onboarding\/byop/,
-    { timeout: 30_000 },
-  );
-  expect(page.url(), 'magic-link redeem did not land on provider setup').toContain(
-    '/onboarding/byop',
-  );
+  // The page navigates to `/library` only after the finish succeeds
+  // server-side and mints the session cookie, so the landing URL plus the
+  // library heading together are the session proof (a failed finish stays on
+  // `/auth/magic` with the generic error).
+  await expect(page, 'magic-link redeem did not land on the library').toHaveURL(/\/library/, {
+    timeout: 30_000,
+  });
+  expect(page.url(), 'magic-link redeem did not land on the library').toContain('/library');
   await expect(
     page.getByRole('heading', { level: 1 }),
-    'provider setup not visible after magic-link sign-in',
-  ).toContainText(/connect your provider/i, { timeout: 15_000 });
+    'library heading not visible after magic-link sign-in',
+  ).toContainText('Library', { timeout: 15_000 });
 });
 
 test('login shows the same generic sent state for an unknown address', async ({ page }) => {

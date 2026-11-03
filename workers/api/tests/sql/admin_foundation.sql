@@ -1,4 +1,4 @@
--- Regression test for migration 0027 (admin foundation). Run after
+-- Regression test for migration 0028 (admin foundation). Run after
 -- ALL migrations are applied — twice, since the runner replays every
 -- replay-safe migration (see ../run_migration_tests.sh) — so the seed
 -- assertions below also prove the replay did not reset or duplicate
@@ -97,7 +97,7 @@ BEGIN
     END IF;
 
     -- Legacy audit rows (no extension columns) still insert cleanly:
-    -- pre-0027 writers keep working against the extended table.
+    -- pre-0028 writers keep working against the extended table.
     INSERT INTO audit_log (user_id, action, ok, source_ip, at)
     VALUES ('user-admin-1', 'auth.login', TRUE, '198.51.100.9', 1700000000);
     IF (SELECT count(*) FROM audit_log

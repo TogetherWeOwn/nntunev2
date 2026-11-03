@@ -173,8 +173,8 @@ test.describe('credential scope (static pins)', () => {
     for (const name of [
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
-      'signup-byop.spec.ts',
-      'signup-wizard-arrival.spec.ts',
+      'signup.spec.ts',
+      'signup-arrival.spec.ts',
       'login-magic-link.spec.ts',
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
@@ -255,7 +255,7 @@ test.describe('public UI signup coverage (static pin)', () => {
   // added to either segment (the bypass this coverage exists to prevent)
   // fails here even though other tests in the file legitimately mint.
   test('dedicated UI-signup case submits the form with no account-seam mint', () => {
-    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const spec = readFileSync(new URL('../tests/signup.spec.ts', import.meta.url), 'utf8');
     const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
     const start = spec.indexOf(marker);
     expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
@@ -280,8 +280,8 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).toContain('TESTIDS.signupSubmit');
     expect(helper).toContain('TESTIDS.signupError');
     // The real page is two-step: the helper asserts the emailed-code step
-    // (magic_code form), never wizard arrival — asserting the wizard without
-    // the code-retrieval seam reds every configured run.
+    // (magic_code form), never library arrival — asserting the library
+    // without the code-retrieval seam reds every configured run.
     expect(helper).toContain('magic_code');
     expect(helper).not.toContain('TESTIDS.byopHost');
     expect(helper).not.toContain("'/onboarding/byop'");
@@ -290,28 +290,28 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).not.toContain('qaAuthHeader');
   });
 
-  // Wizard-arrival leg: the new spec proves the real form reaches
-  // `/onboarding/byop` via the virtual authenticator + the staging-only code
-  // seam. These pins keep it honest offline: still no mint, still skip-green
-  // pre-deploy, still names-only diagnostics — while the wizard assertion
+  // Library-arrival leg: the new spec proves the real form reaches
+  // `/library` via the virtual authenticator + the staging-only code seam.
+  // These pins keep it honest offline: still no mint, still skip-green
+  // pre-deploy, still names-only diagnostics — while the arrival assertion
   // lives in the NEW helper (the shared helper above must keep asserting the
-  // `magic_code` step only, never the wizard).
-  test('wizard-arrival case reaches the wizard with no account-seam mint', () => {
-    const spec = readFileSync(new URL('../tests/signup-wizard-arrival.spec.ts', import.meta.url), 'utf8');
-    const marker = "test('public UI signup with virtual authenticator reaches the BYOP wizard'";
+  // `magic_code` step only, never the library).
+  test('library-arrival case reaches the library with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-arrival.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup with virtual authenticator reaches the library'";
     const start = spec.indexOf(marker);
-    expect(start, 'wizard-arrival case is missing').toBeGreaterThan(-1);
+    expect(start, 'library-arrival case is missing').toBeGreaterThan(-1);
     const rest = spec.slice(start + marker.length);
     const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
     const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
     // Null identity = Access pair only: the page starts unauthenticated, so
     // the form is the only account-creation path even with QA_AUTH_TOKEN set.
     expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
-    expect(dedicated).toContain('submitPublicUiSignupToByopWizard(page, request, baseURL)');
-    // Arrival asserted at the spec level too (landed URL + wizard field).
-    expect(dedicated).toContain("'/onboarding/byop'");
+    expect(dedicated).toContain('submitPublicUiSignupToLibrary(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + library heading).
+    expect(dedicated).toContain("'/library'");
     expect(dedicated).toContain('page.url()');
-    expect(dedicated).toContain('TESTIDS.byopHost');
+    expect(dedicated).toContain("toContainText('Library'");
     // Never the mint seam: arrival must come from the public form.
     expect(dedicated).not.toContain('tryMintTestAccount');
     expect(dedicated).not.toContain('API.testAccounts');
@@ -323,13 +323,13 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(dedicated).toContain('annotateSignupPath');
   });
 
-  test('wizard-arrival helper completes the form via the code seam and virtual authenticator', () => {
+  test('library-arrival helper completes the form via the code seam and virtual authenticator', () => {
     const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
-    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToByopWizard');
-    expect(helperStart, 'wizard-arrival helper is missing').toBeGreaterThan(-1);
-    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToByopWizard'.length);
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToLibrary');
+    expect(helperStart, 'library-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToLibrary'.length);
     const nextExport = helperRest.search(/\nexport /);
-    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToByopWizard'.length + nextExport);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToLibrary'.length + nextExport);
     // Real form, both steps: email submit then the emailed-code field.
     expect(helper).toContain('`${baseURL}/signup`');
     expect(helper).toContain('TESTIDS.signupEmail');
@@ -342,10 +342,10 @@ test.describe('public UI signup coverage (static pin)', () => {
     // Passkey finish runs against a virtual authenticator, not hardware
     // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
     expect(helper).toContain('enableVirtualAuthenticator');
-    // Wizard arrival asserted here (unlike the shared helper above).
-    expect(helper).toContain("'/onboarding/byop'");
+    // Library arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/library'");
     expect(helper).toContain('page.url()');
-    expect(helper).toContain('TESTIDS.byopHost');
+    expect(helper).toContain("toContainText('Library'");
     // Never the mint seam in the arrival path.
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
@@ -403,7 +403,7 @@ test.describe('returning-user login coverage (static pin)', () => {
   // runtime in the spec, not as source text here.
   test('login live case mints the returning account and redeems via the code seam', () => {
     const spec = readFileSync(new URL('../tests/login-magic-link.spec.ts', import.meta.url), 'utf8');
-    const marker = "test('returning user signs in with an emailed magic link and lands on provider setup'";
+    const marker = "test('returning user signs in with an emailed magic link and lands on the library'";
     const start = spec.indexOf(marker);
     expect(start, 'returning-user login case is missing').toBeGreaterThan(-1);
     const rest = spec.slice(start + marker.length);
@@ -418,14 +418,14 @@ test.describe('returning-user login coverage (static pin)', () => {
     // the form is the only sign-in path even with QA_AUTH_TOKEN set.
     expect(live).toContain('applyAccountToPage(page, null, baseURL)');
     // Real form plus the explicit-confirm landing: email submit, generic
-    // sent state, confirm redeem, provider-setup arrival as the session
-    // proof (a failed finish stays on `/auth/magic`).
+    // sent state, confirm redeem, library arrival as the session proof (a
+    // failed finish stays on `/auth/magic`).
     expect(live).toContain('`${baseURL}/login`');
     expect(live).toContain('input[name="email"]');
     expect(live).toContain('check your inbox');
     expect(live).toContain('`${baseURL}/auth/magic?token=');
     expect(live).toContain('sign in with this link');
-    expect(live).toContain("'/onboarding/byop'");
+    expect(live).toContain("'/library'");
     // Skip-green pre-deploy (file-level + in-test guards); the seam-token
     // guard skips locally and fails closed on CI.
     expect(spec).toContain('STAGING_BASE_URL');
@@ -480,7 +480,7 @@ test.describe('returning-user login coverage (static pin)', () => {
 
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
-// values, including the BYOP password) and the junit reporter embeds failure
+// values) and the junit reporter embeds failure
 // messages (e.g. toHaveValue Received strings) carrying the same filled
 // secrets. CI uses the junit reporter only and uploads test-results/ alone;
 // the sanitize step deletes error-context.md plus the whole
@@ -2424,7 +2424,7 @@ function runGateScript(
       env: {
         PATH: process.env.PATH,
         JUNIT_PATH: 'test-results/junit.xml',
-        MAX_ALLOWED_SKIPS: '1',
+        MAX_ALLOWED_SKIPS: '10',
         REQUIRE_QA_AUTH_TOKEN: 'false',
         GITHUB_STEP_SUMMARY: summaryFile,
         ...env,
@@ -2444,8 +2444,8 @@ function runGateScript(
   }
 }
 
-const FIXME_QUEUE =
-  '<testcase classname="player-queue-order.spec.ts" name="player queue advances in library-selection order"><skipped message="fixme"/></testcase>';
+const PARKED_QUEUE =
+  '<testcase classname="player-queue-order.spec.ts" name="player queue advances in library-selection order"><skipped message="parked (user NZB ingest retired)"/></testcase>';
 const FIXME_MBIDS =
   '<testcase classname="ingest-play-meter.spec.ts" name="ingested track carries recording_mbids"><skipped message="fixme"/></testcase>';
 const PASSING = (file: string, name: string) =>
@@ -2478,11 +2478,11 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '1'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '10'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
     // Real-NZB mode reaches the gate from the prepare step's output, so the
     // fixed extended RAR-set allow-list budgets the run instead of the
-    // standard single-fixme budget.
+    // standard ten-skip budget (fixme plus nine parked legs).
     expect(stepBlock).toContain('REAL_NZB_MODE:');
     expect(stepBlock).toContain('steps.real-nzb.outputs.ready');
   });
@@ -2507,7 +2507,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
   test('only the recording_mbids fixme passes within budget with counts', () => {
     const xml = suiteXml(
-      PASSING('signup-byop.spec.ts', 'signup creates an account') +
+      PASSING('signup.spec.ts', 'signup creates an account') +
         PASSING('player-queue-order.spec.ts', 'player queue advances in library-selection order') +
         FIXME_MBIDS,
     );
@@ -2517,12 +2517,12 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.summary).toContain('PASS');
   });
 
-  test('a queue-order skip is no longer allowed, even within budget', () => {
-    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_QUEUE);
+  test('a parked queue-order skip passes within budget', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + PARKED_QUEUE);
     const result = runGateScript(xml);
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('outside the allow-list');
-    expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 2 | 1 | 1 | 0 |');
+    expect(result.summary).toContain('PASS');
   });
 
   // Real-NZB mode (REAL_NZB_MODE=true — the only journey mode since the
@@ -2531,8 +2531,10 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   // streamable track until RAR read lands, so ingest completion, reload and
   // the decoded-audio legs skip by name under a fixed extended allow-list
   // that budgets the run instead of MAX_ALLOWED_SKIPS. The provider 430
-  // control is never allow-listed: it must run. Standard mode is
-  // unchanged — the queue-order negative above still holds there.
+  // control is never allow-listed: it must run. The nine user-NZB legs are
+  // parked in standard mode too (TWO-1635) — the RAR-set entries below
+  // double as their mode-specific reason while the standard entries carry
+  // the retirement reason.
   const REAL_NZB_SKIP_CASES: Array<[string, string]> = [
     ['ingest-play-meter.spec.ts', 'NZB fixture ingests and appears in the library'],
     ['ingest-play-meter.spec.ts', 'ingested library persists across reload without re-import'],
@@ -2551,12 +2553,33 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
   function realNzbXml(): string {
     return suiteXml(
-      PASSING('signup-byop.spec.ts', 'signup creates an account') +
+      PASSING('signup.spec.ts', 'signup creates an account') +
         FIXME_MBIDS +
         REAL_NZB_SKIP_CASES.map(
           ([file, name]) =>
             `<testcase classname="${file}" name="${name}"><skipped message="real-NZB RAR set"/></testcase>`,
         ).join(''),
+    );
+  }
+
+  // TWO-1635 parked legs (user NZB ingest retired): the nine standard-mode
+  // allow-list entries — the RAR-set list above minus the capped-stream leg,
+  // which runs live in standard mode and skips only in real-NZB mode.
+  const PARKED_SKIP_CASES: Array<[string, string]> = REAL_NZB_SKIP_CASES.filter(
+    ([, name]) => name !== 'over-limit staging account is refused with a plan-limit status',
+  );
+
+  // The nine parked skips plus one duplicate: ten attributed skips and one
+  // consume-once overflow, for the over-budget proofs below.
+  function parkedSkipsXml(): string {
+    const parked = PARKED_SKIP_CASES.map(
+      ([file, name]) =>
+        `<testcase classname="${file}" name="${name}"><skipped message="parked (user NZB ingest retired)"/></testcase>`,
+    ).join('');
+    const [dupFile, dupName] = PARKED_SKIP_CASES[0]!;
+    return (
+      parked +
+      `<testcase classname="${dupFile}" name="${dupName}"><skipped message="parked (user NZB ingest retired)"/></testcase>`
     );
   }
 
@@ -2610,19 +2633,18 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('outside the allow-list');
   });
 
-  test('the script default budget is one when MAX_ALLOWED_SKIPS is unset', () => {
-    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + FIXME_MBIDS);
+  test('the script default budget is ten when MAX_ALLOWED_SKIPS is unset', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + parkedSkipsXml(),
+    );
     const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
     expect(result.status).not.toBe(0);
-    expect(result.output).toContain('above the allow-list budget of 1');
+    expect(result.output).toContain('above the allow-list budget of 10');
   });
 
-  test('a third skip still fails above the budget', () => {
+  test('an eleventh skip still fails above the budget', () => {
     const xml = suiteXml(
-      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
-        FIXME_MBIDS +
-        FIXME_QUEUE.replace('player-queue-order.spec.ts', 'other.spec.ts'),
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') + FIXME_MBIDS + parkedSkipsXml(),
     );
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);

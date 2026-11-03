@@ -108,7 +108,7 @@
 			if (attempt.signal.aborted) return;
 			stashSignedInEmail(attemptedEmail);
 			invalidateLibraryCache();
-			window.location.href = '/onboarding/provider';
+			window.location.href = '/library';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {

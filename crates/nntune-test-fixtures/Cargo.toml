@@ -1,0 +1,16 @@
+[package]
+name = "nntune-test-fixtures"
+version = "0.1.0"
+edition = "2021"
+description = "CC0 test-audio fixture access for NNTune v2 tests: fetch-by-key from R2 via fixtures/cc0/fetch_fixture.py, with skip semantics when R2 read access is not configured"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/nntunev2"
+
+[lib]
+name = "nntune_test_fixtures"
+path = "src/lib.rs"
+
+# Deliberately dependency-free: this crate only drives the repo's
+# stdlib-only Python fetcher, so any workspace test can use it without
+# growing the audited dependency set.
+[dependencies]

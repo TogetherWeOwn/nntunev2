@@ -1,5 +1,5 @@
 //! Executed acceptance tests for the production PostgreSQL enrollment seams
-//! and the admin-foundation write transactions (migration 0027).
+//! and the admin-foundation write transactions (migration 0028).
 //!
 //! Loaded as a child module of worker_entry so private production functions,
 //! not copied SQL or a second store implementation, are exercised. The ordinary
@@ -1464,7 +1464,7 @@ fn postgres_reap_holds_selected_parent_lock_through_delete() {
 }
 
 // ---------------------------------------------------------------------------
-// Admin foundation (migration 0027): the production role/settings write
+// Admin foundation (migration 0028): the production role/settings write
 // transactions, including their behaviour behind a contending lock holder.
 // The SQL-level shapes are also pinned by tests/sql/admin_foundation.sql;
 // these tests prove the Rust transaction orchestration (locked read, write
