@@ -29,6 +29,16 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 								resetsAt: '2026-11-01T00:00:00Z'
 							} });
 						}
+						// Valid plan rows at the mirror caps, so the page's
+						// /v1/plans hydration runs without moving the meter.
+						if (path === '/v1/plans') {
+							return route.fulfill({ json: { plans: [
+								{ id: 'free', priceCents: 0, streamHoursMonth: 0, maxConcurrentStreams: 1, selectable: false },
+								{ id: 'plus', priceCents: 800, streamHoursMonth: 100, maxConcurrentStreams: 1, selectable: true },
+								{ id: 'pro', priceCents: 1500, streamHoursMonth: 300, maxConcurrentStreams: 1, selectable: true },
+								{ id: 'max', priceCents: 2500, streamHoursMonth: 750, maxConcurrentStreams: 1, selectable: true }
+							] } });
+						}
 						// Keep every API request local, including an unexpected checkout.
 						return route.fulfill({ status: 503, json: { message: 'Fixture portal unavailable' } });
 					});
@@ -55,9 +65,13 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					});
 					await expect(manage).toBeEnabled();
 					await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+					// The page hydrates caps from /v1/plans after the loader's
+					// two reads; wait for that third call before the exact list.
+					await expect.poll(() => calls.length).toBe(3);
 					expect(calls).toEqual([
 						{ path: '/v1/me/subscription', method: 'GET' },
-						{ path: '/v1/me/usage', method: 'GET' }
+						{ path: '/v1/me/usage', method: 'GET' },
+						{ path: '/v1/plans', method: 'GET' }
 					]);
 
 					await manage.click();
@@ -66,6 +80,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					expect(calls).toEqual([
 						{ path: '/v1/me/subscription', method: 'GET' },
 						{ path: '/v1/me/usage', method: 'GET' },
+						{ path: '/v1/plans', method: 'GET' },
 						{ path: '/v1/billing/portal', method: 'POST' }
 					]);
 				});

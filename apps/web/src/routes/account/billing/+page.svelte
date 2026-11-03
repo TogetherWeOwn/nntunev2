@@ -18,11 +18,17 @@
 	// release. The static row stays as the fallback while the read is in
 	// flight or when it fails — display only either way, enforcement is
 	// the server's. A stale hydration from an earlier load never applies
-	// to a different plan after a reload swaps `data.planId`.
+	// to a different plan after a reload swaps `data.planId`, and the
+	// `loadSeq` read below re-runs this effect on *every* loader run —
+	// including a Retry `invalidateAll()` with an unchanged planId — so a
+	// cap changed server-side since the last load is always refetched
+	// before the warning check may score (and permanently mark) against it.
 	let hydratedPlan = $state<Plan | null>(null);
 	let planHydrationDone = $state(false);
 	$effect(() => {
+		void data.loadSeq;
 		const planId = data.planId;
+		planHydrationDone = false;
 		let cancelled = false;
 		(async () => {
 			try {

@@ -70,6 +70,15 @@ async function loadOne<T>(read: () => Promise<T>): Promise<LoadOutcome<T>> {
  */
 export const ssr = false;
 
+/**
+ * Monotonic per-session loader generation, returned as `loadSeq`. The
+ * page's plan hydration keys off it so every loader run — including a
+ * Retry `invalidateAll()` that returns the same `planId` — refetches
+ * `GET /v1/plans` instead of keeping caps hydrated by an earlier load.
+ * Client-only (`ssr = false`), so the counter lives for the session.
+ */
+let loadSequence = 0;
+
 export const load: PageLoad = async ({ fetch }) => {
 	// Independent reads share one deadline window; loadOne keeps failures isolated.
 	const [sub, use] = await Promise.all([
@@ -142,6 +151,7 @@ export const load: PageLoad = async ({ fetch }) => {
 	const billingPlan =
 		manageBillingOnly && subscription?.planId ? getPlan(subscription.planId) : undefined;
 	return {
+		loadSeq: ++loadSequence,
 		planId: billingPlan?.id ?? plan.id,
 		planUnknown,
 		signedOut,
