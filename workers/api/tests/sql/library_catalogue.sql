@@ -253,7 +253,7 @@ BEGIN
     -- member MBIDs as raw stored text (no `::uuid` cast — the store
     -- normalizes in Rust, so uppercase and poisoned values flow through
     -- here and are dropped only at probe-bind time).
-    SELECT array_agg(release_mbid ORDER BY release_mbid) INTO actual FROM (
+    SELECT array_agg(release_mbid ORDER BY release_mbid COLLATE "C") INTO actual FROM (
         SELECT DISTINCT release_mbid FROM library
         WHERE user_id = 'user-lib-1' AND release_mbid IS NOT NULL
         ORDER BY release_mbid ASC LIMIT 50
@@ -265,7 +265,7 @@ BEGIN
                        'not-a-uuid'] THEN
         RAISE EXCEPTION 'member releases wrong: %', actual;
     END IF;
-    SELECT array_agg(pair ORDER BY pair) INTO actual FROM (
+    SELECT array_agg(pair ORDER BY pair COLLATE "C") INTO actual FROM (
         SELECT DISTINCT l.release_mbid AS release_mbid, u.recording_mbid AS recording_mbid,
                l.release_mbid || ':' || u.recording_mbid AS pair
         FROM library l
