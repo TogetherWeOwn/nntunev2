@@ -22,6 +22,10 @@ use worker::{
     Result as WorkerResult,
 };
 
+use crate::admin_ingest::{
+    self, AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome,
+    StoredAdminIngestJob,
+};
 use crate::auth::{
     self, InviteRecord, MagicLinkRecord, PasskeyChallenge, PasskeyCredential, SingleUseClaim,
     SingleUseStore,
@@ -1259,6 +1263,326 @@ async fn admin_set_app_setting_on(
         .map_err(|_| StoreError)?;
     transaction.commit().await.map_err(|_| StoreError)?;
     Ok(AdminWriteOutcome::Applied(previous))
+}
+
+/// Read one stored admin job row (migration 0030) from a locked SELECT:
+/// `None` for unknown ids and pipeline rows (the readers fence on
+/// `source = 'admin'`, so the pipeline ledger never leaks through).
+fn stored_admin_ingest_job_from(
+    row: &tokio_postgres::Row,
+    has_original: bool,
+) -> Result<StoredAdminIngestJob, StoreError> {
+    let file_count: Option<i64> = row.try_get("file_count").map_err(|_| StoreError)?;
+    let segment_count: Option<i64> = row.try_get("segment_count").map_err(|_| StoreError)?;
+    Ok(StoredAdminIngestJob {
+        job_id: row.try_get("id").map_err(|_| StoreError)?,
+        db_status: row.try_get("status").map_err(|_| StoreError)?,
+        accepted_at: u64_of(row.try_get("accepted_at").map_err(|_| StoreError)?)?,
+        nzb_bytes: u64_of(row.try_get("nzb_bytes").map_err(|_| StoreError)?)?,
+        file_count: file_count.map(u64_of).transpose()?,
+        segment_count: segment_count.map(u64_of).transpose()?,
+        failure_reason: row.try_get("failure_reason").map_err(|_| StoreError)?,
+        has_original,
+        uploader_user_id: row.try_get("user_id").map_err(|_| StoreError)?,
+    })
+}
+
+/// Admin ingest upload (migration 0030): one transaction, like the role
+/// and settings writes, under the same fixed lock order — the shared
+/// `admin_writes` serialization lock first (so a demotion committed
+/// before this upload holds the lock is visible to the actor re-check,
+/// and concurrent same-content uploads serialize instead of racing),
+/// then the actor row. The content-derived id converges duplicates:
+/// the locked re-select finds the pre-existing row, so the replay
+/// writes nothing new except its own audit row; only the first attempt
+/// inserts the job, the original and the accepted audit shape.
+async fn admin_ingest_upload_on(
+    client: &mut tokio_postgres::Client,
+    attempt: &AdminIngestAttempt,
+) -> Result<AdminIngestUploadOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&attempt.actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminIngestUploadOutcome::ActorNotAdmin);
+    }
+    let existing = transaction
+        .query_typed(
+            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+             failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            &[(&attempt.job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if existing.len() > 1 {
+        return Err(StoreError);
+    }
+    // The audit outcome for this attempt: fresh acceptances and
+    // rejections name themselves, replays converge. A duplicate of a
+    // rejected upload re-attaches the stored reason below.
+    let outcome: &str = match (&attempt.failure, existing.first()) {
+        (None, None) => "accepted",
+        (Some(_), None) => "rejected",
+        (_, Some(_)) => "duplicate",
+    };
+    if let Some(row) = existing.first() {
+        let has_original = transaction
+            .query_typed(
+                "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                &[(&attempt.job_id, Type::TEXT)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        let job = stored_admin_ingest_job_from(row, !has_original.is_empty())?;
+        let reason_code = job.failure_reason.as_deref();
+        if let Some(reason) = reason_code {
+            transaction
+                .query_typed(
+                    "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                     VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6, 'reason_code', $7))",
+                    &[
+                        (&attempt.actor_user_id, Type::TEXT),
+                        (
+                            &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                            Type::TEXT,
+                        ),
+                        (
+                            &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                            Type::TEXT,
+                        ),
+                        (&i64_of(attempt.now)?, Type::INT8),
+                        (&attempt.job_id, Type::TEXT),
+                        (&outcome, Type::TEXT),
+                        (&reason, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        } else {
+            transaction
+                .query_typed(
+                    "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                     VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6))",
+                    &[
+                        (&attempt.actor_user_id, Type::TEXT),
+                        (
+                            &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                            Type::TEXT,
+                        ),
+                        (
+                            &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                            Type::TEXT,
+                        ),
+                        (&i64_of(attempt.now)?, Type::INT8),
+                        (&attempt.job_id, Type::TEXT),
+                        (&outcome, Type::TEXT),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        }
+        transaction.commit().await.map_err(|_| StoreError)?;
+        return Ok(AdminIngestUploadOutcome::Stored {
+            job,
+            deduplicated: true,
+        });
+    }
+    let db_status = if attempt.failure.is_some() {
+        "failed"
+    } else {
+        "queued"
+    };
+    let file_count = attempt.file_count.map(i64_of).transpose()?;
+    let segment_count = attempt.segment_count.map(i64_of).transpose()?;
+    let failure_reason = attempt.failure.map(|reason| reason.as_str().to_string());
+    transaction
+        .query_typed(
+            "INSERT INTO ingest_jobs (id, user_id, idempotency_key, accepted_at, status, \
+             source, content_sha256, nzb_bytes, file_count, segment_count, failure_reason) \
+             VALUES ($1, $2, $3, $4, $5, 'admin', $6, $7, $8, $9, $10)",
+            &[
+                (&attempt.job_id, Type::TEXT),
+                (&attempt.actor_user_id, Type::TEXT),
+                (&attempt.idempotency_key, Type::TEXT),
+                (&i64_of(attempt.now)?, Type::INT8),
+                (&db_status, Type::TEXT),
+                (&attempt.content_sha256_hex, Type::TEXT),
+                (&i64_of(attempt.nzb_bytes)?, Type::INT8),
+                (&file_count, Type::INT8),
+                (&segment_count, Type::INT8),
+                (&failure_reason, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if let Some(envelope) = &attempt.original {
+        transaction
+            .query_typed(
+                "INSERT INTO ingest_originals (job_id, content_sha256, nzb_bytes, \
+                 nzb_ref_encrypted, nzb_ref_envelope_version, nzb_ref_kek_version, \
+                 nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped, nzb_ref_payload_nonce, \
+                 nzb_ref_payload_format, created_at) \
+                 VALUES ($1, $2, $3, $4, 2, $5, $6, $7, $8, 1, $9)",
+                &[
+                    (&attempt.job_id, Type::TEXT),
+                    (&attempt.content_sha256_hex, Type::TEXT),
+                    (&i64_of(attempt.nzb_bytes)?, Type::INT8),
+                    (&envelope.ciphertext.as_slice(), Type::BYTEA),
+                    (
+                        &i32::try_from(attempt.kek_version).map_err(|_| StoreError)?,
+                        Type::INT4,
+                    ),
+                    (&envelope.dek_wrapped_nonce.as_slice(), Type::BYTEA),
+                    (&envelope.dek_wrapped.as_slice(), Type::BYTEA),
+                    (&envelope.payload_nonce.as_slice(), Type::BYTEA),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
+    if let Some(reason) = failure_reason.as_deref() {
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6, 'reason_code', $7))",
+                &[
+                    (&attempt.actor_user_id, Type::TEXT),
+                    (
+                        &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                        Type::TEXT,
+                    ),
+                    (
+                        &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                        Type::TEXT,
+                    ),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                    (&attempt.job_id, Type::TEXT),
+                    (&outcome, Type::TEXT),
+                    (&reason, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    } else {
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('job_id', $5, 'outcome', $6))",
+                &[
+                    (&attempt.actor_user_id, Type::TEXT),
+                    (
+                        &crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                        Type::TEXT,
+                    ),
+                    (
+                        &crate::vault::sanitize_source_ip(Some(&attempt.source_ip)),
+                        Type::TEXT,
+                    ),
+                    (&i64_of(attempt.now)?, Type::INT8),
+                    (&attempt.job_id, Type::TEXT),
+                    (&outcome, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+    }
+    let stored = transaction
+        .query_typed(
+            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+             failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            &[(&attempt.job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if stored.len() != 1 {
+        return Err(StoreError);
+    }
+    let job = stored_admin_ingest_job_from(&stored[0], attempt.original.is_some())?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminIngestUploadOutcome::Stored {
+        job,
+        deduplicated: false,
+    })
+}
+
+/// Store-level admin ingest delete (migration 0030, no route serves
+/// it): the original goes first, then the job, under the actor
+/// re-check — the `RESTRICT` order. A second delete of the same id
+/// reports `Missing`; a re-upload afterwards lands a fresh row. No
+/// audit row: deletion writes no new observable state.
+async fn admin_ingest_delete_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    job_id: &str,
+) -> Result<AdminIngestDeleteOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    if !crate::admin::is_admin_role(actor_role.as_deref()) {
+        return Ok(AdminIngestDeleteOutcome::ActorNotAdmin);
+    }
+    transaction
+        .query_typed(
+            "DELETE FROM ingest_originals WHERE job_id IN \
+             (SELECT id FROM ingest_jobs WHERE id = $1 AND source = 'admin')",
+            &[(&job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let deleted = transaction
+        .query_typed(
+            "DELETE FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+            &[(&job_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if deleted.len() > 1 {
+        return Err(StoreError);
+    }
+    transaction.commit().await.map_err(|_| StoreError)?;
+    if deleted.is_empty() {
+        return Ok(AdminIngestDeleteOutcome::Missing);
+    }
+    Ok(AdminIngestDeleteOutcome::Deleted)
 }
 
 impl Store for PgStore {
@@ -3046,6 +3370,135 @@ impl Store for PgStore {
         .await
     }
 
+    async fn admin_ingest_upload(
+        &self,
+        attempt: &AdminIngestAttempt,
+    ) -> Result<AdminIngestUploadOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_ingest_upload_on(&mut client, attempt).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_get(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredAdminIngestJob>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                         failure_reason, user_id FROM ingest_jobs WHERE id = $1 AND source = 'admin'",
+                        &[(&job_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.admin_ingest_get"))?;
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let Some(row) = rows.first() else {
+                    return Ok(None);
+                };
+                let originals = client
+                    .query_typed(
+                        "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                        &[(&job_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.admin_ingest_get"))?;
+                stored_admin_ingest_job_from(row, !originals.is_empty()).map(Some)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_list(
+        &self,
+        status: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<StoredAdminIngestJob>, StoreError> {
+        // The handler bounds the window; the store re-clamps
+        // defensively so a direct caller cannot page unboundedly.
+        let limit = limit.clamp(1, admin_ingest::LIST_MAX_LIMIT);
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = match status {
+                    None => client
+                        .query_typed(
+                            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                             failure_reason, user_id FROM ingest_jobs WHERE source = 'admin' \
+                             ORDER BY accepted_at DESC, id ASC LIMIT $1 OFFSET $2",
+                            &[
+                                (&i64_of(limit)?, Type::INT8),
+                                (&i64_of(offset)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?,
+                    Some(status) => client
+                        .query_typed(
+                            "SELECT id, status, accepted_at, nzb_bytes, file_count, segment_count, \
+                             failure_reason, user_id FROM ingest_jobs \
+                             WHERE source = 'admin' AND status = $1 \
+                             ORDER BY accepted_at DESC, id ASC LIMIT $2 OFFSET $3",
+                            &[
+                                (&status, Type::TEXT),
+                                (&i64_of(limit)?, Type::INT8),
+                                (&i64_of(offset)?, Type::INT8),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?,
+                };
+                let mut jobs = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let job_id: String = row.try_get("id").map_err(|_| StoreError)?;
+                    let originals = client
+                        .query_typed(
+                            "SELECT 1 FROM ingest_originals WHERE job_id = $1",
+                            &[(&job_id, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| {
+                            self.statement_failed("api.db.statement_failed.admin_ingest_list")
+                        })?;
+                    jobs.push(stored_admin_ingest_job_from(row, !originals.is_empty())?);
+                }
+                Ok(jobs)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_ingest_delete(
+        &self,
+        actor_user_id: &str,
+        job_id: &str,
+    ) -> Result<AdminIngestDeleteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_ingest_delete_on(&mut client, actor_user_id, job_id).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn reserve_rate_limit(
         &self,
         scope_key: &str,
@@ -3939,9 +4392,11 @@ pub async fn collect_body_with_cap<S: BodyChunkStream>(
 /// uniform pre-routing rejection (`handlers::invalid_request`: status
 /// 400, body `{"code":"invalid_request","message":"invalid request",
 /// "retryable":false}`, no `set_cookie`), so the
-/// gate can never drift from it. The Worker entry passes a handler that
-/// calls `handlers::handle`, so a rejected body can cause no store,
-/// mailer, DNS, or dialer side effect.
+/// gate can never drift from it — except an oversized admin NZB
+/// upload, which answers the route's own 413 (`admin_ingest_oversized`)
+/// so the collection seam and the in-handler pre-gate agree. The Worker
+/// entry passes a handler that calls `handlers::handle`, so a rejected
+/// body can cause no store, mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
     collected: CollectedBody,
     mut request: handlers::Request,
@@ -3955,6 +4410,11 @@ where
         CollectedBody::Complete(bytes) => {
             request.body = bytes;
             handler(request).await
+        }
+        CollectedBody::Oversized
+            if request.method == "POST" && request.path == "/v1/admin/ingest" =>
+        {
+            handlers::admin_ingest_oversized()
         }
         CollectedBody::Oversized | CollectedBody::TransportFailure => handlers::invalid_request(),
     }
@@ -4159,9 +4619,27 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
+    // The runtime path strips the query string everywhere; the admin
+    // ingest list route needs its `?status=&limit=&offset=` filters in
+    // production, so the entry reattaches the raw query for exactly
+    // `GET /v1/admin/ingest` (non-empty query only). Every other route
+    // keeps the bare path, so no new query surface appears elsewhere.
+    let bare_path = req.path();
+    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+        match req.url().ok().and_then(|url| {
+            url.query()
+                .filter(|query| !query.is_empty())
+                .map(|query| format!("{bare_path}?{query}"))
+        }) {
+            Some(with_query) => with_query,
+            None => bare_path,
+        }
+    } else {
+        bare_path
+    };
     let request = handlers::Request {
         method: req.method().to_string(),
-        path: req.path(),
+        path: handler_path,
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
@@ -4589,6 +5067,74 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "/v1/vault");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+    }
+
+    /// Drive one ready future to completion on a noop waker (the gate
+    /// answers without awaiting: the handler runs inline on `Complete`
+    /// and never runs otherwise).
+    fn drive_gate<F: Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let mut future = Box::pin(future);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the dispatch gate must answer without awaiting"),
+        }
+    }
+
+    fn gate_request(method: &str, path: &str) -> handlers::Request {
+        handlers::Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dispatch_gate_answers_oversize_per_route_without_dispatching() {
+        // The handler must never run on a rejected body: reaching it
+        // would let a truncated upload act.
+        let probe = |collected: CollectedBody, method: &str, path: &str| {
+            drive_gate(dispatch_collected(
+                collected,
+                gate_request(method, path),
+                |_| async { panic!("rejected bodies never dispatch") },
+            ))
+        };
+        // An oversized admin upload answers the route's own 413
+        // null-job shape — the same body the in-handler pre-gate
+        // serves — so the collection seam and the handler cannot drift.
+        let admin = probe(CollectedBody::Oversized, "POST", "/v1/admin/ingest");
+        assert_eq!(admin.status, 413);
+        assert_eq!(
+            admin.body,
+            r#"{"code":"payload_too_large","job_id":null,"reason":"too_large","status":"failed"}"#
+        );
+        // Every other oversized route keeps the generic 400, and a
+        // transport failure is never an upload-shaped answer.
+        let other = probe(CollectedBody::Oversized, "POST", "/api/ingest");
+        assert_eq!(other.status, 400);
+        assert_eq!(
+            other.body,
+            r#"{"code":"invalid_request","message":"invalid request","retryable":false}"#
+        );
+        let failed = probe(CollectedBody::TransportFailure, "POST", "/v1/admin/ingest");
+        assert_eq!(failed.status, 400);
+        assert_eq!(failed.body, other.body);
+        // A complete body still dispatches with the bytes in place.
+        let seen = drive_gate(dispatch_collected(
+            CollectedBody::Complete(vec![1, 2, 3]),
+            gate_request("POST", "/v1/admin/ingest"),
+            |request| async move {
+                assert_eq!(request.body, vec![1, 2, 3]);
+                handlers::invalid_request()
+            },
+        ));
+        assert_eq!(seen.status, 400);
     }
 
     #[test]

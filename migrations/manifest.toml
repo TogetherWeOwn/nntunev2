@@ -142,3 +142,8 @@ sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"
 file = "0029_paid_invoice_history.sql"
 target = "app"
 sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
+
+[[migration]]
+file = "0030_admin_ingest.sql"
+target = "app"
+sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"

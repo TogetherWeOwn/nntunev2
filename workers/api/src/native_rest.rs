@@ -500,6 +500,17 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/admin/settings" {
                 return SessionOnly;
             }
+            // Admin ingest reads (migration 0030): the exact list path
+            // (the entry preserves its query string, so the filter and
+            // window survive the runtime's query strip) plus one
+            // single-segment job id. Deeper shapes deny here, before
+            // any spend.
+            if path == "/v1/admin/ingest"
+                || path.starts_with("/v1/admin/ingest?")
+                || one_segment_after("/v1/admin/ingest/", path)
+            {
+                return SessionOnly;
+            }
             Deny
         }
         // HEAD revalidates exactly the GET-readable catalog roots: a
@@ -537,6 +548,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
+                || path == "/v1/admin/ingest"
             {
                 return SessionOnly;
             }
