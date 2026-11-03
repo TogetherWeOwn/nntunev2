@@ -106,6 +106,7 @@ case "$sql" in
   *"SELECT lines_done FROM mb_import_cursor"*) printf '%s\n' "${FAKE_LINES_DONE:-0}" ;;
   *"SELECT count(*) FROM mb_import_dlq"*) printf '%s\n' "${FAKE_POISON_COUNT:-0}" ;;
   *"SELECT last_packet FROM mb_import_state"*) printf '%s\n' "${FAKE_LAST_PACKET:-0}" ;;
+  *"FROM information_schema.tables"*) printf '%s\n' "${FAKE_PHASE2_TABLES_PRESENT:-15}" ;;
   *"CREATE TEMP TABLE want_parent"*)
     # Only report the orphan while its line_no is still among the queried
     # parents: track probes twice (one per parent) and a row split out by
@@ -479,6 +480,7 @@ for case_name in plain encoded; do
   check_eq "import full [$case_name]: exit" "0" "$run_exit"
   check_file_contains "import full [$case_name]: completes" "$scenario_dir/stdout" "import: done"
   check_file_contains "import full [$case_name]: seeds replication state" "$scenario_dir/stdout" "seeded mb_import_state.last_packet=500"
+  check_sql_at_least "import full [$case_name]: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
   check_sql_at_least "import full [$case_name]: cursor insert ran per table" "$capture_dir" "INSERT INTO mb_import_cursor" 4
   check_sql_at_least "import full [$case_name]: cursor read ran per table" "$capture_dir" "SELECT lines_done FROM mb_import_cursor" 4
   check_sql_at_least "import full [$case_name]: FK parent probe ran for release+recording+track(x2)" "$capture_dir" "CREATE TEMP TABLE want_parent" 4
@@ -503,6 +505,7 @@ echo "=== already-complete import: skip path, older DUMP_SEQ never rewinds ==="
 prep_scenario "import-complete-plain"
 run_import FAKE_LINES_DONE=3 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=7 FAKE_FK_BAD= DUMP_SEQ=5
 check_eq "import complete: exit" "0" "$run_exit"
+check_sql_at_least "import complete: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
 check_file_contains "import complete: skip reported" "$scenario_dir/stdout" "already complete"
 check_file_contains "import complete: older seed leaves state untouched" "$scenario_dir/stderr" "leaving state untouched"
 check_eq "import complete: no chunk transaction" "0" "$(count_sql "$capture_dir" "RETURNING lines_done")"
@@ -518,6 +521,7 @@ check_eq "import fk: exit" "0" "$run_exit"
 check_file_contains "import fk: orphan routing reported (artist parent)" "$scenario_dir/stdout" "fk_missing_artist"
 check_file_contains "import fk: orphan routing reported (release parent)" "$scenario_dir/stdout" "fk_missing_release"
 check_file_contains "import fk: completes" "$scenario_dir/stdout" "import: done"
+check_sql_at_least "import fk: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
 check_file_not_contains "import fk: no DUMP_SEQ seed claimed" "$scenario_dir/stdout" "seeded mb_import_state.last_packet"
 if [[ -s "$capture_dir/python.count" ]]; then ok "import fk: python3 FK-split child ran (argv captured)"; else bad "import fk: python3 FK-split child never ran"; fi
 common_post_checks
