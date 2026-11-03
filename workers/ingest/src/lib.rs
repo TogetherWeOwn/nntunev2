@@ -35,6 +35,7 @@ pub mod caller_auth;
 pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
+pub mod flac;
 pub mod indexer_fetch;
 pub mod ingest_jobs;
 pub mod jobs;
