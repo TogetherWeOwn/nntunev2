@@ -28,7 +28,8 @@ use crate::auth::{
 };
 use crate::handlers::{
     self, AdminWriteOutcome, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow,
-    PairAdmission, QaIssuedCode, RateLimitBudget, Store, StoreError, UserRecord, VaultRow,
+    PairAdmission, PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow,
+    UserRecord, VaultRow,
 };
 use crate::providers::{
     insert_provider_sql, prune_superseded_providers_sql, purge_unreferenced_providers_sql,
@@ -1646,6 +1647,124 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn plans(&self) -> Result<Vec<PlanRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(crate::billing::plans_select_statement(), &[])
+                    .await
+                    .map_err(|_| StoreError)?;
+                rows.iter()
+                    .map(|r| {
+                        let price_cents: i32 = r.try_get("price_cents").map_err(|_| StoreError)?;
+                        let stream_hours: i32 =
+                            r.try_get("stream_hours_month").map_err(|_| StoreError)?;
+                        let concurrent: i32 = r
+                            .try_get("max_concurrent_streams")
+                            .map_err(|_| StoreError)?;
+                        Ok(PlanRow {
+                            id: r.try_get("id").map_err(|_| StoreError)?,
+                            price_cents: u64_of(i64::from(price_cents))?,
+                            stream_hours_month: u64_of(i64::from(stream_hours))?,
+                            max_concurrent_streams: u64_of(i64::from(concurrent))?,
+                        })
+                    })
+                    .collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn subscription_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<(Option<SubscriptionRow>, bool), StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::billing::subscription_live_select_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // `query_opt`'s rule: the live-slot partial unique allows
+                // at most one row; more is an error, never a guess.
+                if rows.len() > 1 {
+                    return Err(StoreError);
+                }
+                let live = rows
+                    .first()
+                    .map(|r| {
+                        Ok::<SubscriptionRow, StoreError>(SubscriptionRow {
+                            plan_id: r.try_get("plan_id").map_err(|_| StoreError)?,
+                            status: r.try_get("status").map_err(|_| StoreError)?,
+                            cancel_at_period_end: r
+                                .try_get("cancel_at_period_end")
+                                .map_err(|_| StoreError)?,
+                            paid_through_at_unix: r
+                                .try_get("paid_through_at_unix")
+                                .map_err(|_| StoreError)?,
+                            grace_until_unix: r
+                                .try_get("grace_until_unix")
+                                .map_err(|_| StoreError)?,
+                            current_period_end_unix: r
+                                .try_get("current_period_end_unix")
+                                .map_err(|_| StoreError)?,
+                        })
+                    })
+                    .transpose()?;
+                // The ever-existed probe only matters when the live slot
+                // is empty (a live row already proves history), so skip
+                // the second query for subscribed users.
+                let ever = if live.is_some() {
+                    true
+                } else {
+                    let any = client
+                        .query_typed(
+                            crate::billing::subscription_any_select_statement(),
+                            &[(&user_id, Type::TEXT)],
+                        )
+                        .await
+                        .map_err(|_| StoreError)?;
+                    !any.is_empty()
+                };
+                Ok((live, ever))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn stream_seconds_month(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> Result<u64, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::ledger::ledger_monthly_total_statement(),
+                        &[(&user_id, Type::TEXT), (&period_month, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                // The aggregate always yields exactly one row (COALESCE 0).
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                u64_of(rows[0].try_get("stream_seconds").map_err(|_| StoreError)?)
             },
             TOTAL_TIMEOUT_MS,
         )

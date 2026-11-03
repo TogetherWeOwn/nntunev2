@@ -8,9 +8,11 @@ import { BillingApiError, fetchUsage } from './billingClient';
  *
  * Contract under test:
  * - `period` is required and uses the existing `YYYY-MM` shape.
- * - `streamSecondsMonth`, `concurrentNow`, `libraryTracks` and
- *   `ingestToday` are required finite, nonnegative numbers.
- * - Unknown extra fields are allowed; valid zero usage is preserved.
+ * - `streamSecondsMonth` is a required finite, nonnegative number.
+ * - `resetsAt` is a required real ISO date string.
+ * - Unknown extra fields are allowed (including the retired
+ *   `concurrentNow`, `libraryTracks` and `ingestToday`); valid zero
+ *   usage is preserved.
  * - Anything else rejects (so loaders take their existing recoverable
  *   failure path) instead of resolving with malformed or fabricated data.
  * - HTTP error semantics (401/404/402/429) are unchanged.
@@ -19,12 +21,10 @@ import { BillingApiError, fetchUsage } from './billingClient';
 const VALID = {
 	period: '2026-10',
 	streamSecondsMonth: 3661,
-	concurrentNow: 1,
-	libraryTracks: 42,
-	ingestToday: 3
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 
-const NUMERIC_FIELDS = ['streamSecondsMonth', 'concurrentNow', 'libraryTracks', 'ingestToday'] as const;
+const NUMERIC_FIELDS = ['streamSecondsMonth'] as const;
 
 /** HTTP 200 with a JSON-serialized body, as a real endpoint would send. */
 function jsonOk(body: unknown): typeof fetch {
@@ -69,15 +69,20 @@ describe('fetchUsage accepts well-formed successful payloads', () => {
 		const zero = {
 			period: '2026-01',
 			streamSecondsMonth: 0,
-			concurrentNow: 0,
-			libraryTracks: 0,
-			ingestToday: 0
+			resetsAt: '2026-02-01T00:00:00Z'
 		};
 		await expect(fetchUsage(jsonOk(zero))).resolves.toEqual(zero);
 	});
 
 	it('allows unknown extra fields alongside the required ones', async () => {
-		const withExtra = { ...VALID, futureField: 'anything', another: { nested: true } };
+		const withExtra = {
+			...VALID,
+			concurrentNow: 1,
+			libraryTracks: 42,
+			ingestToday: 3,
+			futureField: 'anything',
+			another: { nested: true }
+		};
 		const result = await fetchUsage(jsonOk(withExtra));
 		expect(result).toMatchObject(VALID);
 	});
@@ -86,9 +91,7 @@ describe('fetchUsage accepts well-formed successful payloads', () => {
 		const body = {
 			period: '1999-12',
 			streamSecondsMonth: 90.5,
-			concurrentNow: 0,
-			libraryTracks: 1_000_000,
-			ingestToday: 9999
+			resetsAt: '2000-01-01'
 		};
 		await expect(fetchUsage(jsonOk(body))).resolves.toEqual(body);
 	});
@@ -106,7 +109,7 @@ describe('fetchUsage rejects malformed successful payloads', () => {
 		await expectMalformedRejection(jsonOk(body));
 	});
 
-	it.each(['period', ...NUMERIC_FIELDS])('rejects a payload missing %s', async (field) => {
+	it.each(['period', 'resetsAt', ...NUMERIC_FIELDS])('rejects a payload missing %s', async (field) => {
 		await expectMalformedRejection(jsonOk(without(field)));
 	});
 
@@ -155,6 +158,21 @@ describe('fetchUsage rejects malformed successful payloads', () => {
 		['null', null]
 	])('rejects a period that is %s', async (_label, period) => {
 		await expectMalformedRejection(jsonOk({ ...VALID, period }));
+	});
+
+	it.each([
+		['empty string', ''],
+		['garbage text', 'garbage'],
+		['month 13', '2026-13-01T00:00:00Z'],
+		['February 30', '2026-02-30'],
+		['loose single-digit Date.parse input', '1'],
+		['missing time zone', '2026-11-01T00:00:00'],
+		['epoch number', 1793491200000],
+		['null', null],
+		['boolean', true],
+		['object', { iso: '2026-11-01' }]
+	])('rejects a resetsAt that is %s', async (_label, resetsAt) => {
+		await expectMalformedRejection(jsonOk({ ...VALID, resetsAt }));
 	});
 
 	it('does not fabricate zero usage for an empty object', async () => {

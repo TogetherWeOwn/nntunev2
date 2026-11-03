@@ -19,16 +19,16 @@ function mockFetch(
 const USAGE_HEAVY = {
 	period: '2026-10',
 	streamSecondsMonth: 50 * 3600,
-	concurrentNow: 0,
-	libraryTracks: 40000,
-	ingestToday: 0
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 
 const PAID_SUBSCRIPTION = {
-	planId: 'pro-5x',
+	state: 'active',
+	planId: 'pro',
 	status: 'active',
 	currentPeriodEnd: null,
-	trialEndsAt: null
+	graceUntil: null,
+	cancelAtPeriodEnd: false
 };
 
 function fetchWithSubscription(body: unknown): typeof fetch {
@@ -77,7 +77,14 @@ describe('billing loader with an unconfirmed plan', () => {
 		const fetchFn = mockFetch({
 			'/v1/me/subscription': {
 				status: 200,
-				body: { planId: 'plus', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+				body: {
+					state: 'active',
+					planId: 'plus',
+					status: 'active',
+					currentPeriodEnd: null,
+					graceUntil: null,
+					cancelAtPeriodEnd: false
+				}
 			},
 			'/v1/me/usage': {
 				status,
@@ -131,14 +138,14 @@ describe('billing loader with an unconfirmed plan', () => {
 
 		expect(data.planId).toBe('free');
 		expect(data.planUnknown).toBe(true);
-		// Real usage (50h) exceeds the trial cap (10h): it must NOT be
-		// scored against trial limits, so no alert and no upgrade CTA exist.
+		// Real usage (50h) must NOT be scored against the unconfirmed
+		// plan's caps, so no alert and no upgrade CTA exist.
 		expect(data.usageStatus).toBeNull();
 		expect(data.loadError).toMatch(/subscription/i);
 		expect(data.hadFetchError).toBe(true);
 	});
 
-	it('treats a 404 subscription as a backend failure with a retry, not a fresh account', async () => {
+	it('treats a 404 subscription as a backend failure with a retry, not no_subscription', async () => {
 		const fetchFn = mockFetch({
 			'/v1/me/subscription': { status: 404, body: { error: 'not found' } },
 			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
@@ -156,7 +163,14 @@ describe('billing loader with an unconfirmed plan', () => {
 		const fetchFn = mockFetch({
 			'/v1/me/subscription': {
 				status: 200,
-				body: { planId: 'plus', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+				body: {
+					state: 'active',
+					planId: 'plus',
+					status: 'active',
+					currentPeriodEnd: null,
+					graceUntil: null,
+					cancelAtPeriodEnd: false
+				}
 			},
 			'/v1/me/usage': { status: 404, body: { error: 'not found' } }
 		});
@@ -174,11 +188,12 @@ describe('billing loader with an unconfirmed plan', () => {
 			'/v1/me/subscription': {
 				status: 200,
 				body: {
-					planId: 'pro-5x',
+					state: 'active',
+					planId: 'pro',
 					status: 'past_due',
 					currentPeriodEnd: null,
-					trialEndsAt: null,
-					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+					cancelAtPeriodEnd: false
 				}
 			},
 			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
@@ -187,7 +202,7 @@ describe('billing loader with an unconfirmed plan', () => {
 		const data = await loadPage(fetchFn);
 
 		expect(data.planUnknown).toBe(false);
-		expect(data.planId).toBe('pro-5x');
+		expect(data.planId).toBe('pro');
 		expect(data.manageBillingOnly).toBe(true);
 		expect(data.usageStatus).not.toBeNull();
 		// Portal-only: usage stays scored, but no checkout target may leak
@@ -203,11 +218,12 @@ describe('billing loader with an unconfirmed plan', () => {
 			'/v1/me/subscription': {
 				status: 200,
 				body: {
-					planId: 'pro-5x',
+					state: 'active',
+					planId: 'pro',
 					status: 'past_due',
 					currentPeriodEnd: null,
-					trialEndsAt: null,
-					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString()
+					graceUntil: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+					cancelAtPeriodEnd: false
 				}
 			},
 			'/v1/me/usage': { status: 200, body: USAGE_HEAVY }
@@ -230,11 +246,11 @@ describe('billing loader with an unconfirmed plan', () => {
 	] as const)(
 		'preserves paid status %s and offers the portal, never checkout or an outage retry',
 		async (status) => {
-			const subscription = { ...PAID_SUBSCRIPTION, status };
+			const subscription = { ...PAID_SUBSCRIPTION, state: 'lapsed', status };
 			const data = await loadPage(fetchWithSubscription(subscription));
 
 			expect(data.subscription).toEqual(subscription);
-			expect(data.planId).toBe('pro-5x');
+			expect(data.planId).toBe('pro');
 			expect(data.planUnknown).toBe(true);
 			expect(data.usageStatus).toBeNull();
 			expect(data.manageBillingOnly).toBe(true);
@@ -280,11 +296,18 @@ describe('billing loader with an unconfirmed plan', () => {
 		const fetchFn = mockFetch({
 			'/v1/me/subscription': {
 				status: 200,
-				body: { planId: 'plus', status: 'active', currentPeriodEnd: null, trialEndsAt: null }
+				body: {
+					state: 'active',
+					planId: 'plus',
+					status: 'active',
+					currentPeriodEnd: null,
+					graceUntil: null,
+					cancelAtPeriodEnd: false
+				}
 			},
 			'/v1/me/usage': {
 				status: 200,
-				body: { period: '2026-10', streamSecondsMonth: 90 * 3600, concurrentNow: 0, libraryTracks: 10, ingestToday: 0 }
+				body: { period: '2026-10', streamSecondsMonth: 90 * 3600, resetsAt: '2026-11-01T00:00:00Z' }
 			}
 		});
 
@@ -293,7 +316,7 @@ describe('billing loader with an unconfirmed plan', () => {
 		expect(data.planUnknown).toBe(false);
 		expect(data.usageStatus).not.toBeNull();
 		expect(data.usageStatus?.state).toBe('soft');
-		expect(data.usageStatus?.upgradeTo).toBe('pro-5x');
+		expect(data.usageStatus?.upgradeTo).toBe('pro');
 		expect(data.manageBillingOnly).toBe(false);
 	});
 });
@@ -312,30 +335,32 @@ describe('billing period-end wording', () => {
 		it.each(['2026-11-15T12:00:00Z', null])(
 			'shows only a neutral period end for %s',
 			async (currentPeriodEnd) => {
-				const trialEndsAt = status === 'trialing' ? '2099-11-01T12:00:00Z' : null;
-				const subscription = { ...PAID_SUBSCRIPTION, status, currentPeriodEnd, trialEndsAt };
+				// Only a stored `active` folds to the server's active state;
+				// every other stored status (trialing included) is lapsed.
+				const subscription = {
+					...PAID_SUBSCRIPTION,
+					state: status === 'active' ? 'active' : 'lapsed',
+					status,
+					currentPeriodEnd
+				};
 				const data = await loadPage(fetchWithSubscription(subscription));
 				const body = await renderPage(data);
 
 				expect(data.subscription).toEqual(subscription);
 				expect(body).toContain(`Status: ${status}`);
 				expect(body).not.toMatch(/renews/i);
+				expect(body).not.toContain('trial ends');
 				if (currentPeriodEnd) {
 					expect(body).toContain(`period ends ${new Date(currentPeriodEnd).toLocaleDateString()}`);
 				} else {
 					expect(body).not.toContain('period ends');
 				}
-				if (trialEndsAt) {
-					expect(body).toContain(`trial ends ${new Date(trialEndsAt).toLocaleDateString()}`);
-				} else {
-					expect(body).not.toContain('trial ends');
-				}
-				const confirmed = status === 'active' || status === 'trialing';
+				const confirmed = status === 'active';
 				expect(data.planUnknown).toBe(!confirmed);
 				expect(data.manageBillingOnly).toBe(!confirmed);
 				expect(data.usageStatus === null).toBe(!confirmed);
 				expect(body).toContain(confirmed ? 'Manage billing' : 'Manage billing to resolve');
-				expect(body.includes('Upgrade to pro-20x')).toBe(confirmed);
+				expect(body.includes('Upgrade to max')).toBe(confirmed);
 				expect(body).not.toContain('Invalid Date');
 			}
 		);
@@ -350,7 +375,7 @@ describe('billing loader rejects malformed successful subscription payloads reco
 		['scalar', 'subscription'],
 		['local expired status', { ...PAID_SUBSCRIPTION, status: 'expired' }],
 		['unknown status', { ...PAID_SUBSCRIPTION, status: 'banana' }],
-		['missing required dates', { planId: 'pro-5x', status: 'active' }],
+		['missing required dates', { planId: 'pro', status: 'active' }],
 		['wrong-typed date', { ...PAID_SUBSCRIPTION, currentPeriodEnd: 1794745800000 }],
 		['unparseable date', { ...PAID_SUBSCRIPTION, currentPeriodEnd: 'garbage' }]
 	])('keeps %s out of subscription state and rendering', async (_label, subscription) => {
@@ -370,7 +395,7 @@ describe('billing loader rejects malformed successful subscription payloads reco
 		expect(body).not.toContain('Upgrade to');
 	});
 
-	describe.each(['currentPeriodEnd', 'trialEndsAt', 'graceUntil'] as const)(
+	describe.each(['currentPeriodEnd', 'graceUntil'] as const)(
 		'invalid %s does not reach rendering',
 		(field) => {
 			it.each([
@@ -407,7 +432,7 @@ describe('billing loader rejects malformed successful subscription payloads reco
 
 		const second = await loadPage(fetchWithSubscription(PAID_SUBSCRIPTION));
 		expect(second.subscription).toEqual(PAID_SUBSCRIPTION);
-		expect(second.planId).toBe('pro-5x');
+		expect(second.planId).toBe('pro');
 		expect(second.planUnknown).toBe(false);
 		expect(second.usageStatus).not.toBeNull();
 		expect(second.loadError).toBeNull();
@@ -421,13 +446,12 @@ describe('billing loader rejects malformed successful subscription payloads reco
 			const subscription = {
 				...PAID_SUBSCRIPTION,
 				currentPeriodEnd: '2028-02-29T00:15:00+05:30',
-				trialEndsAt: '2026-02-28',
 				...optionalGrace
 			};
 			const data = await loadPage(fetchWithSubscription(subscription));
 
 			expect(data.subscription).toEqual(subscription);
-			expect(data.planId).toBe('pro-5x');
+			expect(data.planId).toBe('pro');
 			expect(data.planUnknown).toBe(false);
 			expect(data.loadError).toBeNull();
 			expect(data.hadFetchError).toBe(false);

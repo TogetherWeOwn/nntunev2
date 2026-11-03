@@ -47,6 +47,14 @@ pub const REGISTRY: &[CodeSpec] = &[
         status: 402,
         retryable: false,
     },
+    // Registered ahead of the grant-issuance gate that emits it (the
+    // parity test does not assert a current emitter) so clients can build
+    // the never-subscribed / lapsed paywall states against the real code.
+    CodeSpec {
+        code: "subscription_required",
+        status: 402,
+        retryable: false,
+    },
     CodeSpec {
         code: "forbidden",
         status: 403,

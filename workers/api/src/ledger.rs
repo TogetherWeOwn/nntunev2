@@ -207,6 +207,48 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Inverse of [`civil_from_days`] (Hinnant's algorithm): days since the Unix
+/// epoch for a civil date. Only ever called with day 1 of a valid month.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// First instant (Unix seconds, UTC) of the calendar month after the one
+/// containing `now_unix` — the stream-hour meter's reset instant (the
+/// period is the UTC calendar month, deliberately not the billing
+/// anniversary; ADR 0004). An instant exactly at a month start resets at
+/// the *next* month start.
+pub fn next_month_start_unix(now_unix: u64) -> u64 {
+    let (year, month, _) = civil_from_days((now_unix / 86_400) as i64);
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    (days_from_civil(next_year, next_month, 1) * 86_400) as u64
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` rendering of a Unix-seconds instant (UTC), for
+/// the billing/usage DTOs. Dependency-free, same civil conversion as
+/// [`period_month_for_timestamp`].
+pub fn iso8601_utc(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60
+    )
+}
+
 /// Validated ledger intent. The Worker binds it to
 /// [`ledger_insert_statement`]. Never serialized to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +564,32 @@ mod tests {
         assert!(derive_play_idempotency_key(&"u".repeat(129), "t", "p").is_err());
         assert!(derive_play_idempotency_key("u", &"t".repeat(513), "p").is_err());
         assert!(derive_play_idempotency_key("u", "t", &"p".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn reset_and_iso_vectors() {
+        // ISO rendering: epoch, a mid-month instant, a leap day.
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(iso8601_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+        // Reset = first instant of the next UTC calendar month, including
+        // the December rollover and an instant exactly at a month start.
+        let reset = |now: u64| iso8601_utc(next_month_start_unix(now) as i64);
+        assert_eq!(reset(1_700_000_000), "2023-12-01T00:00:00Z");
+        // 2026-12-31T23:59:59Z is one second before 2027-01-01.
+        assert_eq!(reset(1_798_761_599), "2027-01-01T00:00:00Z");
+        // 2026-01-01T00:00:00Z exactly: the *next* month start, never now.
+        assert_eq!(reset(1_767_225_600), "2026-02-01T00:00:00Z");
+        // Leap February has 29 days: 2024-02-29 resets 2024-03-01.
+        assert_eq!(reset(1_709_164_800), "2024-03-01T00:00:00Z");
+        // The reset always lands in the following period_month.
+        for now in [0_u64, 1_700_000_000, 1_767_225_600, 1_798_761_599] {
+            assert_ne!(
+                period_month_for_timestamp(next_month_start_unix(now)),
+                period_month_for_timestamp(now),
+                "reset for {now} must leave the current period"
+            );
+        }
     }
 
     #[test]
