@@ -31,9 +31,9 @@ use crate::auth::{
     SingleUseStore,
 };
 use crate::handlers::{
-    self, AdminWriteOutcome, AsyncDns, ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow,
-    PairAdmission, PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow,
-    UserRecord, VaultRow,
+    self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
+    ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
+    QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord, VaultRow,
 };
 use crate::providers::{
     insert_provider_sql, prune_superseded_providers_sql, purge_unreferenced_providers_sql,
@@ -823,6 +823,39 @@ fn user_from_row(row: &tokio_postgres::Row) -> Result<UserRecord, StoreError> {
     })
 }
 
+/// One `invite_codes` row (migration 0033). Expects the extended
+/// column set; `issuer_email` is present only in the by-hash lookup's
+/// join, so a missing column mappers to `None` there.
+fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError> {
+    let opt_u64 = |name: &str| -> Result<Option<u64>, StoreError> {
+        row.try_get::<_, Option<i64>>(name)
+            .map_err(|_| StoreError)?
+            .map(u64_of)
+            .transpose()
+    };
+    Ok(InviteRecord {
+        id: row.try_get("id").map_err(|_| StoreError)?,
+        code_hash: row.try_get("code_hash").map_err(|_| StoreError)?,
+        used: row.try_get("used").map_err(|_| StoreError)?,
+        created_at: u64_of(row.try_get("created_at").map_err(|_| StoreError)?)?,
+        issued_by: row.try_get("issued_by").map_err(|_| StoreError)?,
+        kind: row.try_get("kind").map_err(|_| StoreError)?,
+        email: row.try_get("email").map_err(|_| StoreError)?,
+        expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+        redeemed_by: row.try_get("redeemed_by").map_err(|_| StoreError)?,
+        redeemed_at: opt_u64("redeemed_at")?,
+        revoked_at: opt_u64("revoked_at")?,
+        revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
+        window_id: row.try_get("window_id").map_err(|_| StoreError)?,
+        issuer_email: row.try_get("issuer_email").ok().flatten(),
+    })
+}
+
+const INVITE_COLUMNS: &str = "invite_codes.id, invite_codes.code_hash, invite_codes.used, \
+    invite_codes.created_at, invite_codes.issued_by, invite_codes.kind, invite_codes.email, \
+    invite_codes.expires_at, invite_codes.redeemed_by, invite_codes.redeemed_at, \
+    invite_codes.revoked_at, invite_codes.revoked_by, invite_codes.window_id";
+
 fn credential_from_row(row: &tokio_postgres::Row) -> Result<PasskeyCredential, StoreError> {
     Ok(PasskeyCredential {
         cred_id_b64url: row.try_get("cred_id").map_err(|_| StoreError)?,
@@ -910,7 +943,20 @@ async fn claim_single_use_on(
             client.query_typed(statement, &params[..]).await
         }
         SingleUseClaim::Invite { record } => {
-            let params: [Param<'_>; 1] = [(&record.code_hash, Type::TEXT)];
+            // The spend stamps come from `prepare_invite_redemption`;
+            // a record without them was never prepared and must not
+            // claim (bind would otherwise spend as user "" at 0).
+            let (Some(redeemed_by), Some(redeemed_at)) =
+                (record.redeemed_by.as_deref(), record.redeemed_at)
+            else {
+                return Err(StoreError);
+            };
+            let redeemed_at = i64_of(redeemed_at).map_err(|_| StoreError)?;
+            let params: [Param<'_>; 3] = [
+                (&record.code_hash, Type::TEXT),
+                (&redeemed_by, Type::TEXT),
+                (&redeemed_at, Type::INT8),
+            ];
             client.query_typed(statement, &params[..]).await
         }
     }
@@ -941,6 +987,7 @@ async fn complete_registration_on(
     challenge: &PasskeyChallenge,
     magic: &MagicLinkRecord,
     invite: Option<&InviteRecord>,
+    invite_audit: Option<&AuditEvent>,
     credential: &PasskeyCredential,
     now: u64,
 ) -> Result<(), StoreError> {
@@ -972,6 +1019,45 @@ async fn complete_registration_on(
         if claim_single_use_on(&transaction, claim).await? != 1 {
             return Err(StoreError);
         }
+    }
+    if let Some(record) = invite {
+        // Stamp the invite tree on the new account and write the
+        // `invite.redeemed` audit in this same transaction: an audit
+        // failure rolls the claims back, leaving the invite unspent
+        // and the signup retryable. `invited_by` is read from the
+        // CLAIMED invite row inside this transaction, never from the
+        // pre-claim snapshot: if the issuer was deleted after
+        // `invite_by_hash`, the row's `issued_by` is already NULL
+        // (ON DELETE SET NULL), while the snapshot still names the
+        // deleted user and the `users.invited_by` FK would reject it,
+        // rolling back an otherwise valid enrollment forever.
+        transaction
+            .query_typed(
+                "UPDATE users SET invited_by = (SELECT issued_by FROM invite_codes WHERE code_hash = $2), invite_code_hash = $2 WHERE id = $1",
+                &[
+                    (&credential.user_id, Type::TEXT),
+                    (&record.code_hash, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+        let audit = invite_audit.ok_or(StoreError)?;
+        transaction
+            .query_typed(
+                "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+                &[
+                    (&audit.user_id, Type::TEXT),
+                    (&audit.action, Type::TEXT),
+                    (&audit.ok, Type::BOOL),
+                    (&audit.source_ip, Type::TEXT),
+                    (&i64_of(audit.at)?, Type::INT8),
+                    (&audit.subject_user_id, Type::TEXT),
+                    (&audit.details, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| StoreError)?;
     }
     insert_credential_on(&transaction, credential).await?;
     // Any earlier error or deadline drops the transaction and rolls back
@@ -1265,7 +1351,7 @@ async fn admin_set_app_setting_on(
     Ok(AdminWriteOutcome::Applied(previous))
 }
 
-/// Read one stored admin job row (migration 0030) from a locked SELECT:
+/// Read one stored admin job row (migration 0034) from a locked SELECT:
 /// `None` for unknown ids and pipeline rows (the readers fence on
 /// `source = 'admin'`, so the pipeline ledger never leaks through).
 /// `file_count`/`segment_count` are INTEGER columns, so they decode as
@@ -1296,7 +1382,7 @@ fn stored_admin_ingest_job_from(
     })
 }
 
-/// Admin ingest upload (migration 0030): one transaction, like the role
+/// Admin ingest upload (migration 0034): one transaction, like the role
 /// and settings writes, under the same fixed lock order — the shared
 /// `admin_writes` serialization lock first (so a demotion committed
 /// before this upload holds the lock is visible to the actor re-check,
@@ -1560,7 +1646,7 @@ async fn admin_ingest_upload_on(
     })
 }
 
-/// Store-level admin ingest delete (migration 0030, no route serves
+/// Store-level admin ingest delete (migration 0034, no route serves
 /// it): the original goes first, then the job, under the actor
 /// re-check — the `RESTRICT` order. A second delete of the same id
 /// reports `Missing`; a re-upload afterwards lands a fresh row. No
@@ -1621,6 +1707,167 @@ async fn admin_ingest_delete_on(
         return Ok(AdminIngestDeleteOutcome::Missing);
     }
     Ok(AdminIngestDeleteOutcome::Deleted)
+}
+/// Re-read the actor's role under the admin-write serialization lock;
+/// shared first step of every admin write transaction. The actor row
+/// lock fences against any other writer of the actor's role until
+/// commit (see `admin_set_user_role_on` for the full lock order).
+async fn admin_actor_locked(
+    transaction: &tokio_postgres::Transaction<'_>,
+    actor_user_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_typed(
+            "SELECT pg_advisory_xact_lock(hashtext('admin_writes'))",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let actor = transaction
+        .query_typed(
+            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            &[(&actor_user_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if actor.len() > 1 {
+        return Err(StoreError);
+    }
+    let actor_role: Option<String> = actor
+        .first()
+        .map(|row| row.try_get::<_, String>("role").map_err(|_| StoreError))
+        .transpose()?;
+    Ok(crate::admin::is_admin_role(actor_role.as_deref()))
+}
+
+/// Admin invite issue (migration 0033): the INSERT and its
+/// `invite.issued` audit row commit together under the shared
+/// admin-write locks. The audit row references the invite by the
+/// returned row id only — code plaintext and hash never appear in it.
+async fn admin_issue_invite_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    record: &InviteRecord,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminInviteIssueOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    if !admin_actor_locked(&transaction, actor_user_id).await? {
+        return Ok(AdminInviteIssueOutcome::ActorNotAdmin);
+    }
+    let rows = transaction
+        .query_typed(
+            "INSERT INTO invite_codes (code_hash, used, created_at, issued_by, kind, email, expires_at) \
+             VALUES ($1, FALSE, $2, $3, $4, $5, $6) RETURNING id",
+            &[
+                (&record.code_hash, Type::TEXT),
+                (&i64_of(record.created_at)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+                (&record.kind, Type::TEXT),
+                (&record.email, Type::TEXT),
+                (&i64_of(record.expires_at)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() != 1 {
+        return Err(StoreError);
+    }
+    let invite_id: i64 = rows[0].try_get("id").map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, \
+               jsonb_build_object('invite_id', $5, 'kind', $6, 'email_bound', $7, 'expires_at', $8))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::auth::INVITE_ISSUED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&invite_id, Type::INT8),
+                (&record.kind, Type::TEXT),
+                (&record.email.is_some(), Type::BOOL),
+                (&i64_of(record.expires_at)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminInviteIssueOutcome::Issued(invite_id))
+}
+
+/// Admin invite revoke (migration 0033): the conditional UPDATE and
+/// its `invite.revoked` audit row commit together. The invite row is
+/// locked first, so a redemption claim executing concurrently either
+/// committed first (and the locked read sees the spend) or waits and
+/// then loses to the committed `revoked_at` — revocation wins the
+/// race whenever it commits before the claim's UPDATE.
+async fn admin_revoke_invite_on(
+    client: &mut tokio_postgres::Client,
+    actor_user_id: &str,
+    invite_id: i64,
+    source_ip: &str,
+    now: u64,
+) -> Result<AdminInviteRevokeOutcome, StoreError> {
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    if !admin_actor_locked(&transaction, actor_user_id).await? {
+        return Ok(AdminInviteRevokeOutcome::ActorNotAdmin);
+    }
+    let locked = transaction
+        .query_typed(
+            "SELECT used, redeemed_at, revoked_at FROM invite_codes WHERE id = $1 FOR UPDATE",
+            &[(&invite_id, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if locked.len() > 1 {
+        return Err(StoreError);
+    }
+    let Some(row) = locked.first() else {
+        return Ok(AdminInviteRevokeOutcome::Missing);
+    };
+    let used: bool = row.try_get("used").map_err(|_| StoreError)?;
+    let redeemed_at: Option<i64> = row.try_get("redeemed_at").map_err(|_| StoreError)?;
+    let revoked_at: Option<i64> = row.try_get("revoked_at").map_err(|_| StoreError)?;
+    if used || redeemed_at.is_some() {
+        return Ok(AdminInviteRevokeOutcome::AlreadyRedeemed);
+    }
+    if revoked_at.is_some() {
+        return Ok(AdminInviteRevokeOutcome::AlreadyRevoked);
+    }
+    transaction
+        .query_typed(
+            "UPDATE invite_codes SET revoked_at = $2, revoked_by = $3 WHERE id = $1",
+            &[
+                (&invite_id, Type::INT8),
+                (&i64_of(now)?, Type::INT8),
+                (&actor_user_id, Type::TEXT),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
+             VALUES ($1, $2, TRUE, $3, $4, NULL, jsonb_build_object('invite_id', $5))",
+            &[
+                (&actor_user_id, Type::TEXT),
+                (&crate::auth::INVITE_REVOKED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+                (&i64_of(now)?, Type::INT8),
+                (&invite_id, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(AdminInviteRevokeOutcome::Revoked)
 }
 
 impl Store for PgStore {
@@ -1757,14 +2004,23 @@ impl Store for PgStore {
         challenge: &PasskeyChallenge,
         magic: &MagicLinkRecord,
         invite: Option<&InviteRecord>,
+        invite_audit: Option<&AuditEvent>,
         credential: &PasskeyCredential,
         now: u64,
     ) -> Result<(), StoreError> {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                complete_registration_on(&mut client, challenge, magic, invite, credential, now)
-                    .await
+                complete_registration_on(
+                    &mut client,
+                    challenge,
+                    magic,
+                    invite,
+                    invite_audit,
+                    credential,
+                    now,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -1961,7 +2217,7 @@ impl Store for PgStore {
                 // `accepted_at` is BIGINT epoch seconds (the 0022 converged
                 // shape), so the UTC day is epoch/86400 — exactly the
                 // fake's epoch-day key; no local-time skew is possible.
-                // Pipeline rows only: admin-upload rows (migration 0030)
+                // Pipeline rows only: admin-upload rows (migration 0034)
                 // carry the uploading admin's id for the FK/fence, and
                 // counting them here would burn the ordinary daily
                 // intake allowance on admin activity.
@@ -2141,26 +2397,23 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // The issuer's current email rides along so the pure
+                // prepare can refuse self-invites before any claim.
+                let statement = format!(
+                    "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
+                     FROM invite_codes \
+                     LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
+                     WHERE invite_codes.code_hash = $1"
+                );
                 let rows = client
-                    .query_typed(
-                        "SELECT code_hash, used, created_at FROM invite_codes WHERE code_hash = $1",
-                        &[(&code_hash, Type::TEXT)],
-                    )
+                    .query_typed(&statement, &[(&code_hash, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 // `query_opt`'s rule: more than one row is an error.
                 if rows.len() > 1 {
                     return Err(StoreError);
                 }
-                rows.first()
-                    .map(|r| {
-                        Ok(InviteRecord {
-                            code_hash: r.try_get("code_hash").map_err(|_| StoreError)?,
-                            used: r.try_get("used").map_err(|_| StoreError)?,
-                            created_at: u64_of(r.try_get("created_at").map_err(|_| StoreError)?)?,
-                        })
-                    })
-                    .transpose()
+                rows.first().map(invite_from_row).transpose()
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -3300,6 +3553,37 @@ impl Store for PgStore {
         .await
     }
 
+    async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // One EXISTS probe over the same established states
+                // the reaper protects (`unverified_user_filter`):
+                // credential, any session row (a completed sign-in
+                // leaves one, revoked or not), vault, or a promoted
+                // (non-member) role. A missing user row is simply
+                // never-admitted.
+                let sql = format!(
+                    "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
+                    member = crate::admin::ROLE_MEMBER
+                );
+                let rows = client
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("admitted").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
         Self::bounded(async {
         let client = self.connect().await?;
@@ -3535,6 +3819,89 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 admin_ingest_delete_on(&mut client, actor_user_id, job_id).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+    async fn admin_issue_invite(
+        &self,
+        actor_user_id: &str,
+        record: &InviteRecord,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminInviteIssueOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_issue_invite_on(&mut client, actor_user_id, record, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_list_invites(
+        &self,
+        issuer: Option<&str>,
+        status: Option<&str>,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<InviteRecord>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // The status filter mirrors `InviteRecord::status`
+                // exactly (redeemed > revoked > expired > active).
+                let status_predicate = match status {
+                    Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
+                    Some("revoked") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)"
+                    }
+                    Some("expired") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
+                    }
+                    Some("active") => {
+                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
+                    }
+                    _ => "TRUE",
+                };
+                let statement = format!(
+                    "SELECT {INVITE_COLUMNS} FROM invite_codes \
+                     WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate} \
+                     ORDER BY id DESC LIMIT $3"
+                );
+                let rows = client
+                    .query_typed(
+                        &statement,
+                        &[
+                            (&issuer, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                            (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.admin_list_invites")
+                    })?;
+                rows.iter().map(invite_from_row).collect()
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_revoke_invite(
+        &self,
+        actor_user_id: &str,
+        invite_id: i64,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<AdminInviteRevokeOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_revoke_invite_on(&mut client, actor_user_id, invite_id, source_ip, now).await
             },
             TOTAL_TIMEOUT_MS,
         )

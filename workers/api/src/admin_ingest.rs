@@ -1,5 +1,5 @@
 //! Admin NZB ingest: per-file upload validation, the encrypted
-//! no-expiry original, and the redacted job views (migration 0030).
+//! no-expiry original, and the redacted job views (migration 0034).
 //!
 //! Pure decisions plus the v2 field envelope live here, mirroring the
 //! `track_sources` `nzb_ref_*` envelope shapes from migration 0022
@@ -70,7 +70,7 @@ const AAD_DOMAIN: &str = "nntune-envelope-v2";
 const AAD_TABLE: &str = "ingest_originals";
 const AAD_FIELD: &str = "nzb_body";
 
-/// Fixed failure vocabulary (migration 0030 `failure_reason` CHECK).
+/// Fixed failure vocabulary (migration 0034 `failure_reason` CHECK).
 /// The wire `code` is the registry code for the HTTP status; the
 /// `reason` is this vocabulary word. Parser errors are never echoed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

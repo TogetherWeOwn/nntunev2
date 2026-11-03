@@ -1,4 +1,4 @@
--- Regression test for migration 0030 (admin ingest). Run after ALL
+-- Regression test for migration 0034 (admin ingest). Run after ALL
 -- migrations are applied — twice, since the runner replays every
 -- replay-safe migration (see ../run_migration_tests.sh) — so the
 -- assertions below also prove the replay did not reset or duplicate

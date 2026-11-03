@@ -888,10 +888,11 @@ jobs:
       - name: Smoke-test default CMD as the runtime user
         run: set -o pipefail; docker run --rm mb-import:ci | grep -q '^Usage:'
       # Apply only the mirror-target migrations (base 0001 + importer 0014
-      # + track membership 0016); app migrations need the full app schema
+      # + track membership 0016 + replication ledger 0017 + W6b slice
+      # 0030); app migrations need the full app schema
       # and run in api-migrations.
       - name: Apply mirror migrations
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0030_mb_mirror_w6b.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
       - name: Run import integration suite in the shipped image
