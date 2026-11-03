@@ -320,7 +320,7 @@ jobs:
             sudo apt-get install -y --no-install-recommends postgresql-client ca-certificates
           fi
           test -r /etc/ssl/certs/ca-certificates.crt
-      - name: Verify actual staging session schema (read-only)
+      - name: Verify actual staging migration schema (read-only)
         id: schema
         if: steps.config.outputs.configured == 'true'
         env:
@@ -377,7 +377,7 @@ jobs:
             echo "Worker: nntune-api-staging (env staging)"
             echo "deployed=$deployed"
             echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
-            echo "Read-only session schema gate: ${SCHEMA_OUTCOME:-not-run}"
+            echo "Read-only migration schema gate: ${SCHEMA_OUTCOME:-not-run}"
             echo "Deploy api to staging: ${DEPLOY_OUTCOME:-not-run}"
             if [ "$deployed" = true ]; then
               echo "Source SHA: $source_sha"

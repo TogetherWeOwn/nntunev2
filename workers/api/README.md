@@ -176,14 +176,16 @@ silently downgrade a marked operation to an unbound empty-body refresh.
 Apply app migrations `0024_session_refresh_retry.sql` and
 `0025_session_refresh_claim_clock.sql` **before** deploying this Worker.
 Existing receipts without a claim clock cannot recover; no history is backfilled.
-The staging deployment now fails closed unless its read-only schema gate verifies
-all three nullable receipt columns and their exact types on the actual database
-identified by the deployed Hyperdrive origin. It reuses the existing staging
-migrator secret, checks private target identity, and never applies a migration.
-Because the Worker resolves unqualified `sessions` through its runtime role,
-the gate also requires that no other non-system `sessions` relation exists
-(including indexes, partitioned indexes and composite relations), so any role
-search path that resolves the name resolves the checked public table. Disposable
+The staging deployment fails closed unless its read-only schema gate verifies,
+on the actual database identified by the deployed Hyperdrive origin, that the
+`schema_migrations` tracking rows (written by `apply_migration.py` on every
+apply) match `migrations/manifest.toml` by file name and sha256, with
+pre-merge renames recognised through each entry's `renamed_from` history. It
+reuses the existing staging migrator secret, checks private target identity,
+and never applies a migration. The gate also requires that no other
+non-system `schema_migrations` relation exists (including indexes,
+partitioned indexes and composite relations), so any role search path that
+resolves the name resolves the checked public table. Disposable
 PostgreSQL CI executes this exact catalog query against positive, shadow and
 system/temp-exception fixtures; inverted-exclusion and omitted-kind mutants
 must fail verdict assertions, not just SQL-source checks.
@@ -594,7 +596,7 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:436-460`) and
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:440-464`) and
 `fixture-check` (`.github/workflows/ci.yml:65-74`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under
