@@ -134,6 +134,11 @@ target = "app"
 sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
 
 [[migration]]
+file = "0027_posted_files.sql"
+target = "app"
+sha256 = "0cc1e99a7cb35858257b2eb41e4ca43984b39e72948d4ccc4d228691c583239a"
+
+[[migration]]
 file = "0028_admin_foundation.sql"
 target = "app"
 sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"
