@@ -466,7 +466,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     match method {
         "GET" => {
             // Catalog reads → library:read (roots and subpaths).
+            // `/api/library` is the legacy alias serving the same entries
+            // as `/v1/library`: same scope, never a second one.
             if path == "/v1/library"
+                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path.starts_with("/v1/releases/")
@@ -535,6 +538,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         // map is explicitly updated.
         "HEAD" => {
             if path == "/v1/library"
+                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path == "/v1/tracks"
@@ -745,6 +749,8 @@ mod tests {
         // catalog root; non-catalog and unknown HEAD shapes stay Deny.
         for path in [
             "/v1/library",
+            // Legacy alias: same entries, same scope.
+            "/api/library",
             "/v1/artists",
             "/v1/releases",
             "/v1/tracks",

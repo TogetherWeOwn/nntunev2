@@ -167,3 +167,8 @@ sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
 file = "0034_admin_ingest.sql"
 target = "app"
 sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"
+
+[[migration]]
+file = "0035_library_table.sql"
+target = "app"
+sha256 = "e2355b660e6e4cfc22beaaa5a609af3c9aa21b74d12d0fe4d1d6bfb4916ba178"
