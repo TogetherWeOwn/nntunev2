@@ -41,7 +41,7 @@ missing artist_type, release credit-name rows, track recording, medium
 release);
 the Dockerfile's test stage runs them during the normal image build without
 shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
-`etl.py:148-160` (`DUMP_TS`, temp SQLite projection), `:319-335` (immutable
+`etl.py:188-197` (`DUMP_TS` validation), `:223-228` (temp SQLite projection), `:319-335` (immutable
 snapshot + atomic `curated` swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
 `.github/workflows/ci.yml:298-313`.)
