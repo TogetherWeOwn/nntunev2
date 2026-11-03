@@ -169,13 +169,20 @@ if [[ -n "$phase2_present" ]]; then
     # Present and readable, but possibly empty: the ETL publishes a
     # zero-row file when a projection is legitimately empty (every
     # recording-recording link is a music-video link, so the song-relation
-    # file is empty). Empty phase-2 files import as a no-op below; only a
-    # missing or unreadable file refuses the group.
+    # file is empty). Empty phase-2 files import as a no-op below, except
+    # release_credit: every release carries at least one credit row, so an
+    # empty credit file beside a nonempty release dump is a truncated
+    # snapshot, never a legitimate projection. Only a missing or unreadable
+    # file refuses the group here; the credit exception is refused below.
     if [[ ! -f "$tsv" || ! -r "$tsv" ]]; then
       echo "import: refusing $tsv (phase-2 tables import as a group: present and readable required)" >&2
       exit 1
     fi
   done
+  if [[ -f "$dump_dir/mbdump-release_credit.tsv" && ! -s "$dump_dir/mbdump-release_credit.tsv" && -s "$dump_dir/mbdump-release.tsv" ]]; then
+    echo "import: refusing empty mbdump-release_credit.tsv with nonempty release dump (truncated snapshot); replication state remains unchanged" >&2
+    exit 1
+  fi
 fi
 
 if [[ -n "${DUMP_SEQ:-}" ]]; then
@@ -446,6 +453,16 @@ for table in $base_tables$phase2_present; do
   # way, so cursor line numbers and part-file ranges agree on every shape.
   total="$(awk 'END { print NR+0 }' "$tsv")"
   if (( 10#$total == 0 )); then
+    if [[ "$table" == "release_credit" && -s "$dump_dir/mbdump-release.tsv" ]]; then
+      # Every release carries at least one credit row (ETL guard), so an
+      # empty credit file beside a nonempty release dump is a truncated
+      # snapshot. Refuse even though other empty phase-2 projections skip
+      # as a no-op below. The group preflight above refuses this before any
+      # mutation; this per-table guard covers the same shape if the loop is
+      # ever reached directly.
+      echo "import: refusing empty $table dump with nonempty release dump; replication state remains unchanged" >&2
+      exit 1
+    fi
     if [[ " $phase2_tables " == *" $table "* ]]; then
       # Zero-row phase-2 projection (see the group preflight above): the
       # snapshot carries no edges for this table, so there is nothing to

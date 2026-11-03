@@ -533,6 +533,28 @@ check_eq "replicate gap: exit" "2" "$run_exit"
 check_file_contains "replicate gap: retirement reported" "$scenario_dir/stderr" "retired"
 retired_post_checks "$scenario_dir" "$capture_dir"
 
+echo "=== empty release_credit with nonempty release: refused before any mutation ==="
+prep_scenario "import-empty-credit-plain"
+: > "$scenario_dir/dump/mbdump-release_credit.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import empty credit: exit" "1" "$run_exit"
+check_file_contains "import empty credit: refusal reported" "$scenario_dir/stderr" "refusing empty mbdump-release_credit.tsv"
+check_eq "import empty credit: no chunk transaction" "0" "$(count_sql "$capture_dir" "RETURNING lines_done")"
+check_eq "import empty credit: no schema gate (refused before any mutation)" "0" "$(count_sql "$capture_dir" "FROM information_schema.tables")"
+assert_no_sentinels_in_file "script output [$url_case]" "$scenario_dir/stdout"
+assert_no_sentinels_in_file "script output [$url_case]" "$scenario_dir/stderr"
+assert_no_leftover_secret_files "$scenario_dir"
+
+echo "=== empty recording_recording with nonempty credit: legitimate empty still skips ==="
+prep_scenario "import-empty-song-relation-plain"
+: > "$scenario_dir/dump/mbdump-recording_recording.tsv"
+run_import FAKE_LINES_DONE=0 FAKE_POISON_COUNT=0 FAKE_LAST_PACKET=0 FAKE_FK_BAD= DUMP_SEQ=500
+check_eq "import empty song-relation: exit" "0" "$run_exit"
+check_file_contains "import empty song-relation: completes" "$scenario_dir/stdout" "import: done"
+check_file_contains "import empty song-relation: skip reported" "$scenario_dir/stdout" "recording_recording dump is empty"
+check_sql_at_least "import empty song-relation: phase-2 schema gate ran" "$capture_dir" "FROM information_schema.tables" 1
+common_post_checks
+
 echo
 echo "test-argv-hygiene: $passes passed, $failures failed"
 if (( failures != 0 )); then

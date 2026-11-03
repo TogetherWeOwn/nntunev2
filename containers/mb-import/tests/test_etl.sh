@@ -151,6 +151,28 @@ grep -q 'expected 19 fields, got 1' "$temp_dir/preserved.err"
 ( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
 cp "$temp_dir/artist.bak" "$temp_dir/mbdump/artist"
 
+# COPY escape decoder: octal/hex escapes denote bytes, so an escaped
+# multibyte UTF-8 sequence decodes once as strict UTF-8 (matching the
+# mb-import-validate decoder). Equivalent raw spellings collapse to one
+# curated token, so alias projection partitions by the decoded key.
+python3 - "$container_dir" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from etl import copy_decode, copy_roundtrip
+assert copy_decode(r'Caf\303\251') == 'Café', repr(copy_decode(r'Caf\303\251'))
+assert copy_decode('Café') == 'Café'
+assert copy_decode(r'Caf\303\251') == copy_decode('Café')
+assert copy_roundtrip(r'Caf\303\251') == copy_roundtrip('Café')
+assert copy_decode(r'A\040B') == 'A B'
+assert copy_decode(r'\x61') == 'a'
+assert copy_decode(r'bad\q') is None
+assert copy_decode('has\rmiddle') is None
+assert copy_decode('bad\x00nul') is None
+assert copy_decode(r'\xFF') is None
+assert copy_decode(r'\303') is None
+print('copy_decode utf-8 checks passed')
+EOF
+
 # A subsequent valid newer timestamp publishes successfully.
 DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 new_target="$(readlink "$temp_dir/mbdump/curated")"

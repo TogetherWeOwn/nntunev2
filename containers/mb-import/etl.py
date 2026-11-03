@@ -165,16 +165,18 @@ def copy_decode(token: str) -> str | None:
 
     Mirrors the validator's decoder: raw upstream spellings such as `A B`
     and `A\\040B` decode to the same value, so alias callers must group on
-    this (not on the raw token) before projecting.
+    this (not on the raw token) before projecting. Octal/hex escapes denote
+    bytes — including the bytes of a multibyte UTF-8 character — so the
+    field is collected as bytes and decoded once as strict UTF-8.
     """
-    out: list[str] = []
+    decoded = bytearray()
     i, n = 0, len(token)
     while i < n:
         c = token[i]
         if c != "\\":
             if c == "\r":
                 return None
-            out.append(c)
+            decoded.extend(c.encode("utf-8"))
             i += 1
             continue
         i += 1
@@ -182,7 +184,7 @@ def copy_decode(token: str) -> str | None:
             return None
         e = token[i]
         if e in _COPY_NAMED:
-            out.append(_COPY_NAMED[e])
+            decoded.extend(_COPY_NAMED[e].encode("utf-8"))
             i += 1
         elif "0" <= e <= "7":
             j = i
@@ -190,7 +192,7 @@ def copy_decode(token: str) -> str | None:
                 j += 1
             if int(token[i:j], 8) > 255:
                 return None
-            out.append(chr(int(token[i:j], 8)))
+            decoded.append(int(token[i:j], 8))
             i = j
         elif e == "x":
             j = i + 1
@@ -198,14 +200,16 @@ def copy_decode(token: str) -> str | None:
                 j += 1
             if j == i + 1:
                 return None
-            out.append(chr(int(token[i + 1:j], 16)))
+            decoded.append(int(token[i + 1:j], 16))
             i = j
         else:
             return None
-    decoded = "".join(out)
-    if "\x00" in decoded:
+    if 0 in decoded:
         return None
-    return decoded
+    try:
+        return bytes(decoded).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def copy_decode_or_raw(token: str) -> str:
