@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::queue::{validate_mbid, LibraryWrite, QueueMsg};
 
 /// Service binding name for the `workers/mb` read API: must match
-/// `[[services]]` in `wrangler.toml.example`.
+/// `[[services]]` in `wrangler.toml`.
 pub const MB_API_BINDING: &str = "MB_API";
 
 /// Host used for service-binding fetches. The binding routes by service,

@@ -1,0 +1,111 @@
+# NNTune v2 MusicBrainz mirror Worker: read API over Hyperdrive + KV edge cache.
+#
+# Deploy contract (provisioned by the DevOps card; no secrets here):
+# - `workers_dev = false` in every environment and no `[[routes]]`: the
+#   only caller is the ingest Worker's `MB_API` service binding, which must
+#   name this Worker's per-environment service name (`nntune-mb-staging` in
+#   staging, `nntune-mb-production` in production). Pinned by
+#   `tests/wrangler_workers_dev_off.rs`.
+# - The MB mirror Hyperdrive config is one shared read mirror for both
+#   environments (docs/ops.md); the KV namespace and R2 bucket are per env.
+#   `ENVIRONMENT` is informational only: the worker does not read it yet,
+#   and the per-env `ART_CACHE` binding is what selects the bucket.
+# - KV sharing (stated per decision 6): `MB_CACHE` shares the single reserved
+#   config namespace per env with ingest `INGEST_STATE`/`INGEST_PAYLOADS`
+#   (staging `1d4f21508a214ebfa8ff7b594989d6f6`, prod
+#   `9664ceed71464521bb6baae2d9374006`) because dedicated namespaces are not
+#   provisioned. Keys are disjoint by prefix: `mb:lookup:<kind>:<mbid>` and
+#   `mb:release-recordings:<mbid>` (src/lib.rs) versus ingest
+#   `ingest:checkpoint:`/`ingest:verify:` (workers/ingest/src/checkpoint.rs)
+#   and `nzb:sha256:` (workers/ingest/src/dispatch.rs:31). Sharing couples
+#   quota/blast radius; accepted for staging. Split later without code change.
+# - Production `ART_CACHE` still names the staging bucket: the prod
+#   override to `nntunev2-art-prod` is owned by the MB art-cache activation
+#   (docs/ops.md R2 reconciliation table; `[[known_drift]]` in
+#   `.github/scripts/binding_manifest.toml`), not by this card. Production
+#   sections are parity shape only — no production deploy lane exists in
+#   this card (production goes through the Release Manager).
+#
+# Top-level target is the default `wrangler deploy` (production). Named
+# environments below restate their own bindings (Cloudflare does not
+# inherit them).
+
+name = "nntune-mb-production"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+# No public surface: reachable only through the MB_API service binding.
+# Pinned by tests/wrangler_workers_dev_off.rs.
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
+[vars]
+# Environment label for log lines (public, non-secret; informational only,
+# the worker does not branch on it yet).
+ENVIRONMENT = "production"
+
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the deploy lane (for example
+# `--var BUILD_SHA:$GITHUB_SHA`). Workers log it as the `build_sha` field
+# on every record; an absent or invalid value renders as "unknown" (never a
+# missing key, never fail-closed), which means the lane did not supply it.
+
+[[hyperdrive]]
+binding = "MB_DB"
+id = "1c6460d5112448888031973c87f671bc"
+
+[[kv_namespaces]]
+binding = "MB_CACHE"
+id = "9664ceed71464521bb6baae2d9374006"
+
+# Artwork cache (docs/ops.md inventory). Public release `caa_url`
+# generation remains deferred until bucket bindings and public hosts are
+# activated; this worker never proxies full images inline.
+[[r2_buckets]]
+binding = "ART_CACHE"
+bucket_name = "nntunev2-art-staging"
+
+[env.staging]
+name = "nntune-mb-staging"
+workers_dev = false
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+
+[[env.staging.hyperdrive]]
+binding = "MB_DB"
+id = "1c6460d5112448888031973c87f671bc"
+
+[[env.staging.kv_namespaces]]
+binding = "MB_CACHE"
+id = "1d4f21508a214ebfa8ff7b594989d6f6"
+
+[[env.staging.r2_buckets]]
+binding = "ART_CACHE"
+bucket_name = "nntunev2-art-staging"
+
+[env.production]
+name = "nntune-mb-production"
+workers_dev = false
+
+[env.production.vars]
+ENVIRONMENT = "production"
+
+# Production sections are parity shape only: no production deploy lane
+# exists in this card (production goes through the Release Manager).
+
+[[env.production.hyperdrive]]
+binding = "MB_DB"
+id = "1c6460d5112448888031973c87f671bc"
+
+[[env.production.kv_namespaces]]
+binding = "MB_CACHE"
+id = "9664ceed71464521bb6baae2d9374006"
+
+# Still the staging bucket: the prod override to `nntunev2-art-prod` is
+# owned by the MB art-cache activation (see the header). Tracked as
+# `[[known_drift]]` in `.github/scripts/binding_manifest.toml`.
+[[env.production.r2_buckets]]
+binding = "ART_CACHE"
+bucket_name = "nntunev2-art-staging"

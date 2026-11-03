@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const workflow = readFileSync(new URL('../../.github/workflows/deploy.yml', import.meta.url), 'utf8');
-const api = workflow.split('\n  staging-api:\n')[1]!.split('\n  post-deploy-e2e:\n')[0]!
+// Scoped to the staging-api job only: the staging-mb and staging-ingest lanes
+// sit between staging-api and post-deploy-e2e and carry their own same-shaped
+// outcome outputs, which would otherwise satisfy the api-job pins (and mute
+// the wiring mutants below). Their evidence lives in workflows.spec.ts.
+const api = workflow.split('\n  staging-api:\n')[1]!.split('\n  staging-mb:\n')[0]!
   .replace(/^\s*#.*$/gm, '');
 
 function step(name: string, source = api): string {

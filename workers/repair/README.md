@@ -7,7 +7,7 @@ The no-route Worker that fronts the par2 repair Container
   caller is the ingest Worker's `REPAIR_CONTAINER` service binding
   (`POST /repair`). Every other method/path is a 404.
   (Sources: `wrangler.toml:18` and the `NOT YET DEPLOYED` header;
-  `src/runtime.rs:74-77,132-135`; `workers/ingest/wrangler.toml.example:129-133`;
+  `src/runtime.rs:74-77,132-135`; `workers/ingest/wrangler.toml:140-145`;
   `workers/ingest/src/repair.rs:18-24`.)
 - **One Durable Object per job.** Requests are validated, then routed
   to `RepairContainer` (`id_from_name(job_id)`), so a job's repair
@@ -56,9 +56,12 @@ Not deployed yet (verified 2026-10-17). Deploying requires Cloudflare
 Containers enabled on the existing plan with no new spend; that
 confirmation and the deploy itself are operator actions. Until then
 `wrangler.toml` is the deploy contract and ingest stays unable to
-finish a `Repairing` job (its consumer also remains disabled).
+finish a `Repairing` job (the re-verify guard in the ingest README stays
+open, and the ingest staging lane stays operator-disabled until TWO-1660
+closes search intake — the `[[queues.consumers]]` stanza itself is live in
+`workers/ingest/wrangler.toml:175-181`).
 (Sources: `wrangler.toml:11-13`;
-`workers/ingest/wrangler.toml.example:30-31,52-56`;
+`workers/ingest/wrangler.toml:64-82` (live consumer), `:175-181` (staging);
 `workers/ingest/src/repair.rs:158-227` (`call_repair`) — binding,
 transport and body-read failure is `Retry`, never a terminal outcome.)
 

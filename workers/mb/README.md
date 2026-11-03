@@ -122,7 +122,7 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   generation remains deferred until bucket bindings and public hosts are
   activated; this worker never proxies full images inline.
   (Sources: buckets `workers/mb/src/lib.rs:62-66`;
-  `workers/mb/wrangler.toml.example:21-26,38-52`;
+  `workers/mb/wrangler.toml:53-58,75-77,100-102`;
   `docs/ops.md:63-64,330,373`;
   `docs/adr/0003-cache-scope.md:38-44`; JSON-only routes `lib.rs:1132-1159`.)
 
@@ -206,7 +206,8 @@ Commercial use notes the MetaBrainz support tier (see ADR 0007).
 ## Dev
 
 ```sh
-cp wrangler.toml.example wrangler.toml  # fill ids locally, never commit
+# The real `workers/mb/wrangler.toml` is committed; ids come from `docs/ops.md`.
+# Never commit secrets (Worker secrets are operator-set in Cloudflare).
 cargo fmt --check --manifest-path workers/mb/Cargo.toml \
   && cargo clippy --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown -- -D warnings \
   && cargo test --manifest-path workers/mb/Cargo.toml

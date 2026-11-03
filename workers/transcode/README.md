@@ -8,7 +8,7 @@ The no-route Worker that fronts the `opus-64` transcode Container
   (`POST /transcode`). Every other method/path is a 404.
   (Sources: `wrangler.toml:15,18` and the `NOT YET DEPLOYED` header
   `:11-13`; `src/runtime.rs:129-147`;
-  `workers/ingest/wrangler.toml.example:163-168` (service binding);
+  `workers/ingest/wrangler.toml:147-152` (service binding);
   `workers/ingest/src/transcode.rs:95-100` (binding contract),
   `:323-324` (`call_transcode`).)
 - **One Durable Object per job.** Requests are validated, then routed
