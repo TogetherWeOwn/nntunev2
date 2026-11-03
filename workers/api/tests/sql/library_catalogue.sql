@@ -18,19 +18,25 @@
 -- (the store pre-filters every element through `enrichment_key`; literals
 -- stand in for the $n parameters below). The browse lists and the release
 -- detail resolve only through the caller's ledger membership (ADR 0006
--- §6): member releases/pairs come from the app-side membership reads
--- (raw stored text, no `::uuid` cast — the `member_*` helpers normalize in
--- Rust), and the mirror lists probe exactly those member MBIDs. The
--- tracks list probe is still a SUPERSET of the member pairs; exact-pair
--- retention is Rust's job (`retain_member_track_occurrences`, pinned by
--- the `catalogue` unit tests). Rust assembly (`assemble_library_rows`) is
--- likewise pinned by the `catalogue` unit tests; this file pins the SQL
--- halves: the page's EMITTED order (read back with `row_number() over ()`,
--- never re-sorted), verbatim pass-through, probe contents including the
--- tracks-probe superset, the membership reads (distinct member MBIDs,
--- case-insensitive detail gate), the LIMIT bound, per-user isolation, the
--- three member-scoped mirror collections, and the release detail read
--- (membership gate plus album-ordered tracks).
+-- §6): member releases/pairs/recordings come from the app-side membership
+-- reads (raw stored text, no `::uuid` cast — the `member_*` helpers
+-- normalize in Rust), and the mirror lists probe exactly those member
+-- values. The membership enumerations are uncapped (they span the
+-- caller's whole ledger; the LIMIT bound applies to the mirror response
+-- after matching), and the tracks list probe joins EXACT pairs via
+-- aligned unnest columns — a same-recording row from another release
+-- never reaches the response, and `retain_member_track_occurrences`
+-- (pinned by the `catalogue` unit tests) stays as the post-filter safety
+-- net. The release detail's track read filters to the caller's member
+-- recordings on that release. Rust assembly (`assemble_library_rows`,
+-- including repeated-recording positions) is likewise pinned by the
+-- `catalogue` unit tests; this file pins the SQL halves: the page's
+-- EMITTED order (read back with `row_number() over ()`, never re-sorted),
+-- verbatim pass-through, probe contents including the exact-pair tracks
+-- probe, the membership reads (distinct member values, case-insensitive
+-- detail gate), the LIMIT bound, per-user isolation, the three
+-- member-scoped mirror collections, and the release detail read
+-- (membership gate, member-only album-ordered tracks).
 
 BEGIN;
 
@@ -65,12 +71,16 @@ BEGIN
            ('22222222-1111-2222-3333-444444444444'::uuid,
             'aaaaaaaa-1111-2222-3333-444444444444'::uuid, 'Track Two', 2, 210000),
            ('33333333-1111-2222-3333-444444444444'::uuid,
-            'aaaaaaaa-1111-2222-3333-444444444444'::uuid, 'Track Three', 3, 220000);
+            'aaaaaaaa-1111-2222-3333-444444444444'::uuid, 'Track Three', 3, 220000),
+           ('44444444-1111-2222-3333-444444444444'::uuid,
+            'aaaaaaaa-1111-2222-3333-444444444444'::uuid, 'Track Four', 4, 230000);
 
     -- The second release shares two recordings with the fixture release:
-    -- the tracks probe below must return both rows even though no page
-    -- job pairs the second recording with the second release (the probe
-    -- is a superset; exact-pair matching is Rust's job).
+    -- the (dddddddd, 11111111) member pair for user-lib-1 below returns its
+    -- row, while (dddddddd, 22222222) has no member pair and stays
+    -- excluded. Track Four (44444444) sits on the fixture release in the
+    -- mirror but in no caller's ledger, so the member-filtered release
+    -- detail below drops it.
     INSERT INTO mb_track (release_mbid, recording_mbid, medium_no, track_no)
     VALUES ('aaaaaaaa-1111-2222-3333-444444444444'::uuid,
             '11111111-1111-2222-3333-444444444444'::uuid, 1, 1),
@@ -78,6 +88,8 @@ BEGIN
             '22222222-1111-2222-3333-444444444444'::uuid, 1, 2),
            ('aaaaaaaa-1111-2222-3333-444444444444'::uuid,
             '33333333-1111-2222-3333-444444444444'::uuid, 1, 3),
+           ('aaaaaaaa-1111-2222-3333-444444444444'::uuid,
+            '44444444-1111-2222-3333-444444444444'::uuid, 1, 4),
            ('dddddddd-1111-2222-3333-444444444444'::uuid,
             '11111111-1111-2222-3333-444444444444'::uuid, 1, 1),
            ('dddddddd-1111-2222-3333-444444444444'::uuid,
@@ -189,38 +201,52 @@ BEGIN
         RAISE EXCEPTION 'recordings probe content wrong: %', actual;
     END IF;
 
-    -- Tracks probe (`library_tracks_statement` shape): the two ANY
-    -- probes are independent, so the result is a SUPERSET of the page's
-    -- exact pairs — the (second release, Track Two) row exists here even
-    -- though no page job pairs them. `assemble_library_rows` matches
-    -- exact pairs only, so this row never enriches a listing.
-    SELECT count(*) INTO row_count_var FROM (
-        SELECT release_mbid::text AS release_mbid, recording_mbid::text AS recording_mbid,
-               medium_no, track_no FROM mb_track
-        WHERE release_mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[])
-          AND recording_mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444}'::uuid[])
+    -- Tracks probe (`tracks_list_statement` shape): the exact-pair join.
+    -- Aligned unnest columns pair back to the caller's member pairs
+    -- (literals stand in for $1/$2, pair-aligned element by element: the
+    -- five well-formed member pairs for user-lib-1), so the (second
+    -- release, Track Two) cross row is EXCLUDED even though the second
+    -- release and Track Two are each members elsewhere.
+    SELECT array_agg(release_mbid || ':' || track_no::text ORDER BY release_mbid, medium_no, track_no) INTO actual FROM (
+        SELECT t.release_mbid::text AS release_mbid, t.recording_mbid::text AS recording_mbid,
+               rec.title, rec.duration_ms, t.medium_no, t.track_no, r.title AS release_title,
+               r.artist_mbid::text AS artist_mbid, a.name AS artist_name
+        FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid
+        JOIN mb_release r ON r.mbid = t.release_mbid
+        LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid
+        JOIN unnest('{aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[],
+                    '{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444,11111111-1111-2222-3333-444444444444}'::uuid[]) AS p(rel, rec)
+        ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
+        ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT 50
     ) s;
-    IF row_count_var <> 5 THEN
-        RAISE EXCEPTION 'tracks probe must return the 3 exact pairs plus 2 cross pairs: %', row_count_var;
+    IF actual <> ARRAY['aaaaaaaa-1111-2222-3333-444444444444:1',
+                       'aaaaaaaa-1111-2222-3333-444444444444:2',
+                       'aaaaaaaa-1111-2222-3333-444444444444:3',
+                       'dddddddd-1111-2222-3333-444444444444:1'] THEN
+        RAISE EXCEPTION 'track collection must return exactly the member pairs: %', actual;
     END IF;
+    -- The excluded cross row proves the join is exact, not two ANY probes.
     SELECT count(*) INTO row_count_var FROM (
-        SELECT release_mbid::text AS release_mbid, recording_mbid::text AS recording_mbid
-        FROM mb_track
-        WHERE release_mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[])
-          AND recording_mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444}'::uuid[])
+        SELECT t.release_mbid::text AS release_mbid, t.recording_mbid::text AS recording_mbid
+        FROM mb_track t
+        JOIN unnest('{aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[],
+                    '{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444,11111111-1111-2222-3333-444444444444}'::uuid[]) AS p(rel, rec)
+        ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
     ) s
     WHERE release_mbid = 'dddddddd-1111-2222-3333-444444444444'
       AND recording_mbid = '22222222-1111-2222-3333-444444444444';
-    IF row_count_var <> 1 THEN
-        RAISE EXCEPTION 'tracks probe missed the unpaired cross row';
+    IF row_count_var <> 0 THEN
+        RAISE EXCEPTION 'exact-pair join leaked the non-member cross row';
     END IF;
 
-    -- Occurrence positions ride the release's own rows.
+    -- Occurrence positions ride the release's own rows (Track Four is an
+    -- unowned mirror row: it appears here but drops out of the
+    -- member-filtered release detail below).
     SELECT array_agg(medium_no::text || '.' || track_no::text ORDER BY medium_no, track_no) INTO actual FROM (
         SELECT medium_no, track_no FROM mb_track
         WHERE release_mbid = 'aaaaaaaa-1111-2222-3333-444444444444'::uuid
     ) s;
-    IF actual <> ARRAY['1.1', '1.2', '1.3'] THEN
+    IF actual <> ARRAY['1.1', '1.2', '1.3', '1.4'] THEN
         RAISE EXCEPTION 'occurrence positions wrong: %', actual;
     END IF;
 
@@ -252,11 +278,13 @@ BEGIN
     -- Membership reads (`catalogue_member_*_statement` shapes): distinct
     -- member MBIDs as raw stored text (no `::uuid` cast — the store
     -- normalizes in Rust, so uppercase and poisoned values flow through
-    -- here and are dropped only at probe-bind time).
+    -- here and are dropped only at probe-bind time). The enumerations are
+    -- uncapped: no LIMIT, so the whole ledger is visible to the bounded
+    -- mirror responses.
     SELECT array_agg(release_mbid ORDER BY release_mbid COLLATE "C") INTO actual FROM (
         SELECT DISTINCT release_mbid FROM library
         WHERE user_id = 'user-lib-1' AND release_mbid IS NOT NULL
-        ORDER BY release_mbid ASC LIMIT 50
+        ORDER BY release_mbid ASC
     ) s;
     IF actual <> ARRAY['AAAAAAAA-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444',
@@ -273,7 +301,7 @@ BEGIN
         FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true
         WHERE l.user_id = 'user-lib-1' AND l.release_mbid IS NOT NULL
         AND coalesce(cardinality(l.recording_mbids), 0) > 0
-        ORDER BY release_mbid ASC, recording_mbid ASC LIMIT 50
+        ORDER BY release_mbid ASC, recording_mbid ASC
     ) s;
     IF actual <> ARRAY['AAAAAAAA-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
@@ -283,6 +311,38 @@ BEGIN
                        'dddddddd-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
                        'not-a-uuid:also-not-a-uuid'] THEN
         RAISE EXCEPTION 'member pairs wrong: %', actual;
+    END IF;
+    -- Release recordings (`catalogue_member_release_recordings_statement`
+    -- shape): the caller's distinct recordings on one release, uncapped,
+    -- case-insensitive like the detail gate (the uppercase job's recording
+    -- collapses into the same member set the store probes).
+    SELECT array_agg(recording_mbid ORDER BY recording_mbid) INTO actual FROM (
+        SELECT DISTINCT u.recording_mbid AS recording_mbid
+        FROM library l
+        JOIN LATERAL (SELECT value AS recording_mbid
+        FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true
+        WHERE l.user_id = 'user-lib-1'
+          AND lower(l.release_mbid) = 'aaaaaaaa-1111-2222-3333-444444444444'
+          AND coalesce(cardinality(l.recording_mbids), 0) > 0
+        ORDER BY recording_mbid ASC
+    ) s;
+    IF actual <> ARRAY['11111111-1111-2222-3333-444444444444',
+                       '22222222-1111-2222-3333-444444444444',
+                       '33333333-1111-2222-3333-444444444444'] THEN
+        RAISE EXCEPTION 'member release recordings wrong: %', actual;
+    END IF;
+    -- A release the caller never touched yields no member recordings.
+    SELECT count(*) INTO row_count_var FROM (
+        SELECT DISTINCT u.recording_mbid AS recording_mbid
+        FROM library l
+        JOIN LATERAL (SELECT value AS recording_mbid
+        FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true
+        WHERE l.user_id = 'user-lib-2'
+          AND lower(l.release_mbid) = 'dddddddd-1111-2222-3333-444444444444'
+          AND coalesce(cardinality(l.recording_mbids), 0) > 0
+    ) s;
+    IF row_count_var <> 0 THEN
+        RAISE EXCEPTION 'non-member release must own no member recordings';
     END IF;
     -- Detail gate (`catalogue_release_membership_statement` shape):
     -- case-insensitive, so the uppercase job counts as membership of the
@@ -303,12 +363,13 @@ BEGIN
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'detail gate found a non-member release';
     END IF;
-    -- user-lib-2 owns exactly one release and one pair (the LIMIT pin's
-    -- 55 identical jobs collapse to one distinct member each).
+    -- user-lib-2 owns exactly one release and one pair: the membership
+    -- enumerations are uncapped (the 55 identical jobs collapse to one
+    -- distinct member each).
     SELECT array_agg(release_mbid ORDER BY release_mbid) INTO actual FROM (
         SELECT DISTINCT release_mbid FROM library
         WHERE user_id = 'user-lib-2' AND release_mbid IS NOT NULL
-        ORDER BY release_mbid ASC LIMIT 50
+        ORDER BY release_mbid ASC
     ) s;
     IF actual <> ARRAY['aaaaaaaa-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'user-lib-2 member releases wrong: %', actual;
@@ -320,8 +381,12 @@ BEGIN
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'empty recordings probe must return no rows';
     END IF;
-    SELECT count(*) INTO row_count_var FROM mb_track
-    WHERE release_mbid = ANY('{}'::uuid[]) AND recording_mbid = ANY('{}'::uuid[]);
+    -- Empty member-track pairs probe zero rows: with no pairs the exact-pair
+    -- join (`JOIN unnest($1, $2)`) binds two empty uuid arrays and matches
+    -- nothing; the casts must hold on empty input.
+    SELECT count(*) INTO row_count_var FROM mb_track t
+    JOIN unnest('{}'::uuid[], '{}'::uuid[]) AS p(rel, rec)
+      ON t.release_mbid = p.rel AND t.recording_mbid = p.rec;
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'empty tracks probe must return no rows';
     END IF;
@@ -339,6 +404,12 @@ BEGIN
     SELECT count(*) INTO row_count_var FROM mb_release r WHERE r.mbid = ANY('{}'::uuid[]);
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'empty member release list must return no rows';
+    END IF;
+    SELECT count(*) INTO row_count_var FROM mb_track t
+    JOIN unnest('{}'::uuid[], '{}'::uuid[]) AS p(rel, rec)
+      ON t.release_mbid = p.rel AND t.recording_mbid = p.rec;
+    IF row_count_var <> 0 THEN
+        RAISE EXCEPTION 'empty member track list must return no rows';
     END IF;
 
     -- Per-user isolation: no user-lib-2 row may appear on the lib-1 page.
@@ -436,12 +507,14 @@ BEGIN
     IF actual <> ARRAY['1', '2', '3', '1', '2'] THEN
         RAISE EXCEPTION 'track collection order wrong: %', actual;
     END IF;
-    -- user-lib-2's single member pair probes exactly one occurrence.
+    -- user-lib-2's single member pair probes exactly one occurrence: one
+    -- aligned pair row binds one exact (release, recording) join key.
     SELECT count(*) INTO row_count_var FROM (
         SELECT t.release_mbid::text AS release_mbid
         FROM mb_track t
-        WHERE t.release_mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444}'::uuid[])
-          AND t.recording_mbid = ANY('{11111111-1111-2222-3333-444444444444}'::uuid[])
+        JOIN unnest('{aaaaaaaa-1111-2222-3333-444444444444}'::uuid[],
+                    '{11111111-1111-2222-3333-444444444444}'::uuid[]) AS p(rel, rec)
+          ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
         ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT 50
     ) s;
     IF row_count_var <> 1 THEN
@@ -467,11 +540,17 @@ BEGIN
     IF row_count_var <> 0 THEN
         RAISE EXCEPTION 'release detail found an unknown release';
     END IF;
+    -- (`release_tracks_statement` shape): the member-recordings filter
+    -- (`AND recording_mbid = ANY($2)`) keeps member occurrences only, in
+    -- album order. The literals stand in for user-lib-1's member recordings
+    -- on aaaaaaaa (111/222/333): unowned 444 is on the release in the mirror
+    -- but drops out of the member detail, as does non-member cccccccc.
     SELECT array_agg(recording_mbid ORDER BY medium_no, track_no, recording_mbid) INTO actual FROM (
         SELECT t.recording_mbid::text AS recording_mbid, rec.title, rec.duration_ms,
                t.medium_no, t.track_no
         FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid
         WHERE t.release_mbid = 'aaaaaaaa-1111-2222-3333-444444444444'::text::uuid
+          AND t.recording_mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444}'::uuid[])
         ORDER BY t.medium_no ASC, t.track_no ASC, rec.mbid ASC LIMIT 1000
     ) s;
     IF actual <> ARRAY['11111111-1111-2222-3333-444444444444',

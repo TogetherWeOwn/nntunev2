@@ -54,10 +54,15 @@
 //!   transport (`handlers::Request` carries no query field), so every list
 //!   statement ends in `LIMIT $N` bound to [`CATALOGUE_MAX_PAGE_SIZE`]
 //!   (collections) or [`CATALOGUE_RELEASE_TRACKS_MAX`] (release detail,
-//!   mirroring the mirror worker's own recordings cap). Cursor paging needs
-//!   the `Request` query-field churn and is an explicit slice-2 follow-up,
-//!   as are `/v1/search` (W14) and per-track/per-artist item reads (each
-//!   needs its own ADR 0010 scope-map entry first).
+//!   mirroring the mirror worker's own recordings cap). The bound applies
+//!   to the response AFTER membership matching (exact-pair join, member
+//!   recordings filter), never to the membership input: the app-side
+//!   membership enumerations span the caller's whole ledger (one indexed
+//!   per-user scan) so a first page never omits member rows that sort
+//!   inside it. Cursor paging needs the `Request` query-field churn and is
+//!   an explicit slice-2 follow-up, as are `/v1/search` (W14) and
+//!   per-track/per-artist item reads (each needs its own ADR 0010
+//!   scope-map entry first).
 //! - Library order is matched-first, then `job_id DESC`, then album
 //!   position: playable content surfaces first, which is also what the M1
 //!   `recording_mbids` poll reads at `items[0]`. The order is stable for
@@ -433,6 +438,16 @@ pub fn enrichment_key(raw: &str) -> Option<String> {
 /// mirror-absent MBIDs yield `None`, never an error. Track hits match exact
 /// (release, recording) pairs only: the tracks probe returns a superset, so
 /// a same-recording row from another release never enriches this row.
+///
+/// A release may repeat a recording at several positions (the mirror key is
+/// `(release, medium, track)`, not `(release, recording)`), and the page
+/// carries one row per ingest-array element in album order. Hits for one
+/// pair are therefore kept as a position-sorted list and dealt out in page
+/// order: the i-th page occurrence takes the i-th album position, so
+/// repeated recordings keep their distinct positions instead of collapsing
+/// onto one row. Occurrences past the known positions reuse the last hit,
+/// keeping the sequence non-decreasing; the single-pair case behaves
+/// exactly as before.
 pub fn assemble_library_rows(
     page: &[LibraryPageRow],
     recordings: &[LibraryRecordingHit],
@@ -444,14 +459,31 @@ pub fn assemble_library_rows(
         .iter()
         .filter_map(|hit| enrichment_key(&hit.recording_mbid).map(|key| (key, hit)))
         .collect();
-    let track_by_pair: HashMap<(String, String), &LibraryTrackHit> = tracks
-        .iter()
-        .filter_map(|hit| {
-            enrichment_key(&hit.release_mbid).and_then(|release| {
-                enrichment_key(&hit.recording_mbid).map(|recording| ((release, recording), hit))
-            })
-        })
-        .collect();
+    let mut track_by_pair: HashMap<(String, String), Vec<&LibraryTrackHit>> = HashMap::new();
+    for hit in tracks {
+        let Some(release) = enrichment_key(&hit.release_mbid) else {
+            continue;
+        };
+        let Some(recording) = enrichment_key(&hit.recording_mbid) else {
+            continue;
+        };
+        track_by_pair
+            .entry((release, recording))
+            .or_default()
+            .push(hit);
+    }
+    for hits in track_by_pair.values_mut() {
+        hits.sort_by_key(|hit| (hit.medium_no, hit.track_no));
+    }
+    let mut consumed: HashMap<(String, String), usize> = HashMap::new();
+    let mut take_track_hit = |release: &str, recording: &str| -> Option<&LibraryTrackHit> {
+        let key = (release.to_string(), recording.to_string());
+        let hits = track_by_pair.get(&key)?;
+        let used = consumed.entry(key).or_insert(0);
+        let hit = hits.get((*used).min(hits.len().saturating_sub(1))).copied();
+        *used += 1;
+        hit
+    };
     let release_by_mbid: HashMap<String, &LibraryReleaseHit> = releases
         .iter()
         .filter_map(|hit| enrichment_key(&hit.release_mbid).map(|key| (key, hit)))
@@ -467,9 +499,7 @@ pub fn assemble_library_rows(
                 .as_deref()
                 .and_then(|key| release_by_mbid.get(key));
             let track_hit = match (&release_key, &recording_key) {
-                (Some(release), Some(recording)) => {
-                    track_by_pair.get(&(release.clone(), recording.clone()))
-                }
+                (Some(release), Some(recording)) => take_track_hit(release, recording),
                 _ => None,
             };
             LibraryDbRow {
@@ -601,14 +631,35 @@ pub fn member_release_mbids(rows: &[MembershipReleaseRow]) -> Vec<String> {
     mbids
 }
 
-/// Distinct well-formed (release, recording) pairs the caller owns plus the
-/// release and recording arrays that probe them: the two `ANY` probes are
-/// independent, so the mirror returns a superset and the store keeps only
-/// exact pairs via [`retain_member_track_occurrences`]. All three outputs are
-/// sorted and deduplicated for a stable probe.
-pub fn member_pair_arrays(
-    rows: &[MembershipTrackPairRow],
-) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+/// One app-side ledger row's recording for the per-release membership gate:
+/// a distinct recording MBID the caller owns on one release. Same no-cast
+/// discipline as [`MembershipReleaseRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipReleaseRecordingRow {
+    pub recording_mbid: String,
+}
+
+/// Distinct well-formed recording MBIDs the caller owns on one release,
+/// sorted for a stable probe. Feeds the release detail's member-only track
+/// read (ADR 0006: a detail read that returns catalog ids resolves each one
+/// through the caller's memberships).
+pub fn member_recording_mbids(rows: &[MembershipReleaseRecordingRow]) -> Vec<String> {
+    let mut mbids: Vec<String> = rows
+        .iter()
+        .filter_map(|row| enrichment_key(&row.recording_mbid))
+        .collect();
+    mbids.sort();
+    mbids.dedup();
+    mbids
+}
+
+/// Distinct well-formed (release, recording) pairs the caller owns, sorted
+/// and deduplicated for a stable probe. The mirror's exact-pair join probes
+/// these directly (see [`tracks_list_statement`] and
+/// [`member_pair_columns`]); [`retain_member_track_occurrences`] keeps only
+/// exact pairs as a safety net. Malformed stored values never leave this
+/// function.
+pub fn member_pair_arrays(rows: &[MembershipTrackPairRow]) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = rows
         .iter()
         .filter_map(|row| {
@@ -619,19 +670,30 @@ pub fn member_pair_arrays(
         .collect();
     pairs.sort();
     pairs.dedup();
-    let mut releases: Vec<String> = pairs.iter().map(|pair| pair.0.clone()).collect();
-    releases.sort();
-    releases.dedup();
-    let mut recordings: Vec<String> = pairs.iter().map(|pair| pair.1.clone()).collect();
-    recordings.sort();
-    recordings.dedup();
-    (releases, recordings, pairs)
+    pairs
+}
+
+/// The caller's member pairs split into two aligned columns for the
+/// exact-pair join in [`tracks_list_statement`]: element `i` of each column
+/// is pair `i`, so the mirror's `unnest($1, $2)` pairs them back with no
+/// cross product. Sorted and deduplicated for a stable probe, like
+/// [`member_pair_arrays`].
+pub fn member_pair_columns(pairs: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+    let mut sorted: Vec<(String, String)> = pairs.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let releases: Vec<String> = sorted.iter().map(|pair| pair.0.clone()).collect();
+    let recordings: Vec<String> = sorted.iter().map(|pair| pair.1.clone()).collect();
+    debug_assert_eq!(releases.len(), recordings.len());
+    (releases, recordings)
 }
 
 /// Keep only the mirror track occurrences whose (release, recording) pair is
 /// in the caller's membership, preserving probe order. A same-recording row
 /// from another release never survives: membership is per occurrence (ADR
-/// 0002 §6), not per recording.
+/// 0002 §6), not per recording. The mirror's exact-pair join already
+/// returns member pairs only; this is the safety net if the statement ever
+/// drifts back to independent probes.
 pub fn retain_member_track_occurrences(
     rows: Vec<TrackDbRow>,
     pairs: &[(String, String)],
@@ -649,19 +711,25 @@ pub fn retain_member_track_occurrences(
         .collect()
 }
 
-/// App-side distinct member releases for the browse lists. Parameters: owner
-/// user id ($1), member-release bound ($2, [`CATALOGUE_MAX_PAGE_SIZE`]): the
-/// responses are first pages too, so the membership input is capped at the
-/// same bound, ordered by release MBID for a stable page.
+/// App-side distinct member releases for the browse lists: every release
+/// the caller owns, ordered by release MBID. Parameters: owner user id
+/// ($1) only. The enumeration is deliberately uncapped — capping the input
+/// at the response page size drops member releases whose artists then never
+/// appear (the response page has room for them), so the member input spans
+/// the caller's whole ledger (one indexed per-user scan) while the mirror
+/// responses stay bounded at [`CATALOGUE_MAX_PAGE_SIZE`].
 pub fn catalogue_member_releases_statement() -> &'static str {
     "SELECT DISTINCT release_mbid FROM library \
      WHERE user_id = $1 AND release_mbid IS NOT NULL \
-     ORDER BY release_mbid ASC LIMIT $2"
+     ORDER BY release_mbid ASC"
 }
 
-/// App-side distinct member (release, recording) pairs for the track list.
-/// Parameters: owner user id ($1), member-pair bound ($2,
-/// [`CATALOGUE_MAX_PAGE_SIZE`]), same stable-page discipline as above.
+/// App-side distinct member (release, recording) pairs for the track list:
+/// every pair the caller owns, ordered by release then recording.
+/// Parameters: owner user id ($1) only, same uncapped-enumeration
+/// discipline as above — the exact-pair join applies the response bound
+/// after matching, so the track page is the first page of the caller's
+/// whole occurrence set.
 pub fn catalogue_member_track_pairs_statement() -> &'static str {
     "SELECT DISTINCT l.release_mbid AS release_mbid, u.recording_mbid AS recording_mbid \
      FROM library l \
@@ -669,7 +737,25 @@ pub fn catalogue_member_track_pairs_statement() -> &'static str {
      FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true \
      WHERE l.user_id = $1 AND l.release_mbid IS NOT NULL \
      AND coalesce(cardinality(l.recording_mbids), 0) > 0 \
-     ORDER BY release_mbid ASC, recording_mbid ASC LIMIT $2"
+     ORDER BY release_mbid ASC, recording_mbid ASC"
+}
+
+/// App-side distinct member recordings on one release for the release
+/// detail's track read: every recording the caller owns on that release.
+/// Parameters: owner user id ($1), requested release MBID lowercased through
+/// [`enrichment_key`] ($2), same case-insensitive gate as
+/// [`catalogue_release_membership_statement`]. Uncapped like the other
+/// membership enumerations — a release's distinct recordings are bounded by
+/// the release itself — while the mirror read stays capped at
+/// [`CATALOGUE_RELEASE_TRACKS_MAX`].
+pub fn catalogue_member_release_recordings_statement() -> &'static str {
+    "SELECT DISTINCT u.recording_mbid AS recording_mbid \
+     FROM library l \
+     JOIN LATERAL (SELECT value AS recording_mbid \
+     FROM unnest(l.recording_mbids) AS u2(value)) AS u ON true \
+     WHERE l.user_id = $1 AND lower(l.release_mbid) = $2 \
+     AND coalesce(cardinality(l.recording_mbids), 0) > 0 \
+     ORDER BY recording_mbid ASC"
 }
 
 /// App-side membership probe for the release detail read. Parameters: owner
@@ -706,10 +792,17 @@ pub fn releases_list_statement() -> &'static str {
 /// Track-occurrence collection page, member-scoped: every member `mb_track`
 /// appearance with its recording, release, and artist (inner joins —
 /// `mb_track` foreign keys guarantee the parents). Ordered by release, then
-/// true album position. Parameters: the caller's well-formed member release
-/// ($1) and recording ($2) MBIDs (same cast and pre-filter as above); the
-/// store keeps exact pairs only via [`retain_member_track_occurrences`].
-/// Row bound ($3, [`CATALOGUE_MAX_PAGE_SIZE`]).
+/// true album position. Parameters: the caller's member pairs as two
+/// aligned columns — releases ($1) and recordings ($2) from
+/// [`member_pair_columns`], same cast and pre-filter as above; the row
+/// bound ($3, [`CATALOGUE_MAX_PAGE_SIZE`]).
+///
+/// The pair join is exact, not two independent probes: `unnest` pairs
+/// column element `i` back into pair `i` and the `ON` clause admits only
+/// that occurrence, so the `LIMIT` applies to member occurrences — a
+/// same-recording row from another release can no longer consume response
+/// slots. [`retain_member_track_occurrences`] stays as the post-filter
+/// safety net.
 pub fn tracks_list_statement() -> &'static str {
     "SELECT t.release_mbid::text AS release_mbid, t.recording_mbid::text AS recording_mbid, \
      rec.title, rec.duration_ms, t.medium_no, t.track_no, r.title AS release_title, \
@@ -717,7 +810,8 @@ pub fn tracks_list_statement() -> &'static str {
      FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid \
      JOIN mb_release r ON r.mbid = t.release_mbid \
      LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
-     WHERE t.release_mbid = ANY($1::uuid[]) AND t.recording_mbid = ANY($2::uuid[]) \
+     JOIN unnest($1::uuid[], $2::uuid[]) AS p(rel, rec) \
+     ON t.release_mbid = p.rel AND t.recording_mbid = p.rec \
      ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT $3"
 }
 
@@ -734,18 +828,21 @@ pub fn release_read_statement() -> &'static str {
      WHERE r.mbid = $1::text::uuid"
 }
 
-/// One release's recordings in true album order from `mb_track` (migration
-/// 0016), not from `mb_recording`: the mirror keeps only one canonical
-/// release per recording there, and `mb_track` holds every appearance with
-/// its medium position — the mirror worker's `RELEASE_RECORDINGS_SQL`
-/// idiom. Parameters: release MBID ($1), row bound ($2,
-/// [`CATALOGUE_RELEASE_TRACKS_MAX`]).
+/// One release's member recordings in true album order from `mb_track`
+/// (migration 0016), not from `mb_recording`: the mirror keeps only one
+/// canonical release per recording there, and `mb_track` holds every
+/// appearance with its medium position — the mirror worker's
+/// `RELEASE_RECORDINGS_SQL` idiom. Parameters: release MBID ($1), the
+/// caller's well-formed member recording MBIDs on that release ($2, from
+/// [`member_recording_mbids` — a detail read that returns catalog ids
+/// resolves each one through the caller's memberships, ADR 0006), row
+/// bound ($3, [`CATALOGUE_RELEASE_TRACKS_MAX`]).
 pub fn release_tracks_statement() -> &'static str {
     "SELECT t.recording_mbid::text AS recording_mbid, rec.title, rec.duration_ms, \
      t.medium_no, t.track_no \
      FROM mb_track t JOIN mb_recording rec ON rec.mbid = t.recording_mbid \
-     WHERE t.release_mbid = $1::text::uuid \
-     ORDER BY t.medium_no ASC, t.track_no ASC, rec.mbid ASC LIMIT $2"
+     WHERE t.release_mbid = $1::text::uuid AND t.recording_mbid = ANY($2::uuid[]) \
+     ORDER BY t.medium_no ASC, t.track_no ASC, rec.mbid ASC LIMIT $3"
 }
 
 #[cfg(test)]
@@ -953,25 +1050,31 @@ mod tests {
     fn statements_bind_limits_and_guard_every_mirror_join() {
         // Every list ends in a bound LIMIT: unbounded mirror scans can
         // never reach a response. The member lists bind their membership
-        // arrays first, so the row bound moves to $2 ($3 for tracks).
+        // arrays first, so the row bound moves to $2 ($3 for the pair- and
+        // member-filtered reads).
         assert!(artists_list_statement().ends_with("LIMIT $2"));
         assert!(releases_list_statement().ends_with("LIMIT $2"));
         assert!(tracks_list_statement().ends_with("LIMIT $3"));
         assert!(library_page_statement().ends_with("LIMIT $2"));
         assert!(artists_list_statement().contains("ANY($1::uuid[])"));
         assert!(releases_list_statement().contains("ANY($1::uuid[])"));
-        assert!(tracks_list_statement().contains("ANY($1::uuid[])"));
-        assert!(tracks_list_statement().contains("ANY($2::uuid[])"));
+        // The track list joins exact pairs (aligned unnest columns), never
+        // two independent probes: non-member cross rows cannot consume the
+        // response bound.
+        assert!(tracks_list_statement().contains("unnest($1::uuid[], $2::uuid[])"));
+        assert!(!tracks_list_statement().contains("ANY("));
         assert!(library_recordings_statement().contains("ANY($1::uuid[])"));
         assert!(library_tracks_statement().contains("ANY($2::uuid[])"));
         assert!(library_releases_statement().contains("ANY($1::uuid[])"));
-        assert!(release_tracks_statement().ends_with("LIMIT $2"));
+        assert!(release_tracks_statement().ends_with("LIMIT $3"));
+        assert!(release_tracks_statement().contains("ANY($2::uuid[])"));
         // Owner scoping never leaves SQL: the library page, the membership
         // reads, and nothing else take a user, and each filters on it. The
         // mirror probes take member MBID arrays only.
         assert!(library_page_statement().contains("l.user_id = $1"));
         assert!(catalogue_member_releases_statement().contains("user_id = $1"));
         assert!(catalogue_member_track_pairs_statement().contains("l.user_id = $1"));
+        assert!(catalogue_member_release_recordings_statement().contains("l.user_id = $1"));
         assert!(catalogue_release_membership_statement().contains("user_id = $1"));
         for statement in [
             artists_list_statement(),
@@ -1051,6 +1154,7 @@ mod tests {
         for statement in [
             catalogue_member_releases_statement(),
             catalogue_member_track_pairs_statement(),
+            catalogue_member_release_recordings_statement(),
             catalogue_release_membership_statement(),
         ] {
             assert!(
@@ -1090,29 +1194,55 @@ mod tests {
         assert_eq!(
             tracks_list_statement().matches("::uuid[]").count(),
             2,
-            "track list must cast exactly its member release and recording arrays"
+            "track list must cast exactly its member pair columns"
+        );
+        assert_eq!(
+            release_tracks_statement().matches("::uuid").count(),
+            2,
+            "release tracks must cast exactly its release and member recording inputs"
         );
     }
 
     #[test]
-    fn membership_reads_stay_bounded_and_owner_scoped() {
+    fn membership_reads_span_the_ledger_and_stay_owner_scoped() {
         // The browse lists resolve through these app-side reads, so they
-        // carry the same disciplines as the library page: owner filter,
-        // stable order, and a bound LIMIT. The detail probe answers one
-        // row for a member and zero rows for anyone else.
+        // carry the library page's disciplines: owner filter and stable
+        // order. They carry NO bound LIMIT by design — capping the
+        // membership input at the response page size drops member rows
+        // whose response page still has room (artists past 50 releases,
+        // occurrences past 50 pairs), so the enumerations span the
+        // caller's whole ledger while the mirror responses stay bounded.
+        // The detail probes answer one row (or the member set) for a
+        // member and zero rows for anyone else.
         let releases = catalogue_member_releases_statement();
         assert!(releases.contains("user_id = $1"));
         assert!(releases.contains("release_mbid IS NOT NULL"));
-        assert!(releases.contains("ORDER BY release_mbid ASC LIMIT $2"));
+        assert!(releases.contains("ORDER BY release_mbid ASC"));
+        assert!(
+            !releases.contains("LIMIT"),
+            "member releases must not cap the enumeration: {releases}"
+        );
         let pairs = catalogue_member_track_pairs_statement();
         assert!(pairs.contains("l.user_id = $1"));
         assert!(pairs.contains("unnest(l.recording_mbids)"));
-        assert!(pairs.contains("ORDER BY release_mbid ASC, recording_mbid ASC LIMIT $2"));
+        assert!(pairs.contains("ORDER BY release_mbid ASC, recording_mbid ASC"));
+        assert!(
+            !pairs.contains("LIMIT"),
+            "member pairs must not cap the enumeration: {pairs}"
+        );
+        let recordings = catalogue_member_release_recordings_statement();
+        assert!(recordings.contains("l.user_id = $1"));
+        assert!(recordings.contains("lower(l.release_mbid) = $2"));
+        assert!(recordings.contains("unnest(l.recording_mbids)"));
+        assert!(
+            !recordings.contains("LIMIT"),
+            "member release recordings must not cap the enumeration: {recordings}"
+        );
         let membership = catalogue_release_membership_statement();
         assert!(membership.contains("user_id = $1"));
         assert!(membership.contains("lower(release_mbid) = $2"));
         assert!(membership.ends_with("LIMIT 1"));
-        for statement in [releases, pairs] {
+        for statement in [releases, pairs, recordings] {
             assert!(
                 !statement.contains("mb_"),
                 "app-side membership must not name mirror tables: {statement}"
@@ -1155,12 +1285,37 @@ mod tests {
                 recording_mbid: GOOD_MBID.to_string(),
             },
         ];
-        let (releases, recordings, pairs) = member_pair_arrays(&rows);
-        assert_eq!(releases, vec![GOOD_RELEASE.to_string()]);
-        assert_eq!(recordings, vec![GOOD_MBID.to_string()]);
+        let pairs = member_pair_arrays(&rows);
         assert_eq!(
             pairs,
             vec![(GOOD_RELEASE.to_string(), GOOD_MBID.to_string())]
+        );
+        // Probe columns stay aligned: element i of each column is pair i,
+        // so the mirror's unnest pairs them back with no cross product.
+        let (releases, recordings) = member_pair_columns(&pairs);
+        assert_eq!(releases, vec![GOOD_RELEASE.to_string()]);
+        assert_eq!(recordings, vec![GOOD_MBID.to_string()]);
+        assert_eq!(
+            member_pair_columns(&[]),
+            (Vec::<String>::new(), Vec::<String>::new()),
+            "no pairs bind two empty arrays (zero mirror rows)"
+        );
+        // Release-detail recordings normalize the same way: uppercase
+        // meets lowercase, poison never leaves.
+        let release_rows = vec![
+            MembershipReleaseRecordingRow {
+                recording_mbid: GOOD_MBID.to_string(),
+            },
+            MembershipReleaseRecordingRow {
+                recording_mbid: GOOD_MBID_UPPER.to_string(),
+            },
+            MembershipReleaseRecordingRow {
+                recording_mbid: "not-a-uuid".to_string(),
+            },
+        ];
+        assert_eq!(
+            member_recording_mbids(&release_rows),
+            vec![GOOD_MBID.to_string()]
         );
         let member = TrackDbRow {
             release_mbid: GOOD_RELEASE.to_ascii_uppercase(),
@@ -1305,6 +1460,46 @@ mod tests {
         assert_eq!(unmatched.recording_mbid, None);
         assert_eq!(unmatched.recording_ord, 0);
         assert!(unmatched.recording_mbids.is_empty());
+    }
+
+    #[test]
+    fn assemble_library_rows_deals_repeated_recordings_in_album_order() {
+        // One release repeats a recording at two positions (the mirror key
+        // is (release, medium, track)): the two page occurrences take the
+        // two positions in page order instead of collapsing onto one row.
+        // Probe order is deliberately scrambled — assembly sorts by album
+        // position, never by probe emission.
+        let page = vec![
+            page_row("job-1", Some(GOOD_RELEASE), Some(GOOD_MBID), 1),
+            page_row("job-1", Some(GOOD_RELEASE), Some(GOOD_MBID), 2),
+            // A third occurrence past the known positions reuses the last
+            // hit, keeping the sequence non-decreasing.
+            page_row("job-1", Some(GOOD_RELEASE), Some(GOOD_MBID), 3),
+        ];
+        let tracks = vec![
+            LibraryTrackHit {
+                release_mbid: GOOD_RELEASE.to_string(),
+                recording_mbid: GOOD_MBID.to_string(),
+                medium_no: Some(1),
+                track_no: Some(10),
+            },
+            LibraryTrackHit {
+                release_mbid: GOOD_RELEASE.to_string(),
+                recording_mbid: GOOD_MBID.to_string(),
+                medium_no: Some(1),
+                track_no: Some(1),
+            },
+        ];
+        let rows = assemble_library_rows(&page, &[], &tracks, &[]);
+        assert_eq!(rows.len(), 3);
+        let positions: Vec<(Option<i16>, Option<i16>)> = rows
+            .iter()
+            .map(|row| (row.medium_no, row.track_no))
+            .collect();
+        assert_eq!(
+            positions,
+            vec![(Some(1), Some(1)), (Some(1), Some(10)), (Some(1), Some(10))]
+        );
     }
 
     #[test]

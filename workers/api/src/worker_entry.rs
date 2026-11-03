@@ -1165,6 +1165,16 @@ fn catalogue_member_pair_from_row(
     })
 }
 
+/// Map one app-side member recording row (one release's recordings for the
+/// release detail's member-only track read) to the catalogue row.
+fn catalogue_member_recording_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::catalogue::MembershipReleaseRecordingRow, StoreError> {
+    Ok(crate::catalogue::MembershipReleaseRecordingRow {
+        recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
+    })
+}
+
 /// Map one release-detail track row (recording columns only; the release
 /// context joins in [`crate::catalogue::assemble_release_detail`]).
 fn catalogue_release_track_from_row(
@@ -3600,8 +3610,10 @@ impl Store for PgStore {
     }
 
     /// Member-scoped artist collection: the caller's distinct member
-    /// releases from the app ledger, then the artists of exactly those
-    /// releases from the mirror. One bound per side, shared deadline.
+    /// releases from the app ledger (the whole ledger, uncapped — capping
+    /// the input at the page size drops artists whose releases sort past
+    /// the cap), then the first page of exactly those releases' artists
+    /// from the mirror. Shared deadline.
     async fn catalogue_artists(
         &self,
         user_id: &str,
@@ -3616,7 +3628,7 @@ impl Store for PgStore {
                 let member = client
                     .query_typed(
                         crate::catalogue::catalogue_member_releases_statement(),
-                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| {
@@ -3645,7 +3657,8 @@ impl Store for PgStore {
     }
 
     /// Member-scoped release collection: same membership input as
-    /// [`Self::catalogue_artists`], then the member releases themselves.
+    /// [`Self::catalogue_artists`], then the first page of the member
+    /// releases themselves.
     async fn catalogue_releases(
         &self,
         user_id: &str,
@@ -3660,7 +3673,7 @@ impl Store for PgStore {
                 let member = client
                     .query_typed(
                         crate::catalogue::catalogue_member_releases_statement(),
-                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| {
@@ -3689,9 +3702,11 @@ impl Store for PgStore {
     }
 
     /// Member-scoped track-occurrence collection: the caller's distinct
-    /// member (release, recording) pairs from the app ledger, then the
-    /// mirror occurrences for those pairs with exact-pair retention — a
-    /// same-recording row from another release never enriches this caller.
+    /// member (release, recording) pairs from the app ledger (the whole
+    /// ledger, uncapped), then the mirror occurrences for exactly those
+    /// pairs — the pair join admits no cross-release rows, so the bound
+    /// applies to member occurrences, with exact-pair retention as the
+    /// safety net.
     async fn catalogue_tracks(
         &self,
         user_id: &str,
@@ -3706,7 +3721,7 @@ impl Store for PgStore {
                 let member = client
                     .query_typed(
                         crate::catalogue::catalogue_member_track_pairs_statement(),
-                        &[(&user_id, Type::TEXT), (&limit, Type::INT8)],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| {
@@ -3716,8 +3731,9 @@ impl Store for PgStore {
                     .iter()
                     .map(catalogue_member_pair_from_row)
                     .collect::<Result<_, _>>()?;
-                let (member_releases, member_recordings, member_pairs) =
-                    crate::catalogue::member_pair_arrays(&member);
+                let member_pairs = crate::catalogue::member_pair_arrays(&member);
+                let (pair_releases, pair_recordings) =
+                    crate::catalogue::member_pair_columns(&member_pairs);
                 let mirror = self.connect_mirror().await?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.catalogue_tracks");
@@ -3725,8 +3741,8 @@ impl Store for PgStore {
                     .query_typed(
                         crate::catalogue::tracks_list_statement(),
                         &[
-                            (&member_releases, Type::TEXT_ARRAY),
-                            (&member_recordings, Type::TEXT_ARRAY),
+                            (&pair_releases, Type::TEXT_ARRAY),
+                            (&pair_recordings, Type::TEXT_ARRAY),
                             (&limit, Type::INT8),
                         ],
                     )
@@ -3801,6 +3817,10 @@ impl Store for PgStore {
     /// Release tracks, member-scoped: same gate as [`Self::catalogue_release`]
     /// so the tracks read is self-sufficient — a non-member id yields the
     /// empty list (the handler only reaches this read for a member release).
+    /// A member release yields only the caller's own recordings on it, in
+    /// album order: the read returns catalog ids, so each one resolves
+    /// through the caller's memberships (ADR 0006), and non-member
+    /// recordings on a partly owned release stay out.
     async fn catalogue_release_tracks(
         &self,
         user_id: &str,
@@ -3826,12 +3846,30 @@ impl Store for PgStore {
                 if member.is_empty() {
                     return Ok(Vec::new());
                 }
+                let member = client
+                    .query_typed(
+                        crate::catalogue::catalogue_member_release_recordings_statement(),
+                        &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.catalogue_release_tracks")
+                    })?;
+                let member: Vec<crate::catalogue::MembershipReleaseRecordingRow> = member
+                    .iter()
+                    .map(catalogue_member_recording_from_row)
+                    .collect::<Result<_, _>>()?;
+                let member_recordings = crate::catalogue::member_recording_mbids(&member);
                 let mirror = self.connect_mirror().await?;
                 let limit = i64::from(crate::catalogue::CATALOGUE_RELEASE_TRACKS_MAX);
                 let rows = mirror
                     .query_typed(
                         crate::catalogue::release_tracks_statement(),
-                        &[(&mbid, Type::TEXT), (&limit, Type::INT8)],
+                        &[
+                            (&mbid, Type::TEXT),
+                            (&member_recordings, Type::TEXT_ARRAY),
+                            (&limit, Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| {
