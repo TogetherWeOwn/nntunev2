@@ -1588,10 +1588,12 @@ pub trait Store {
     /// Catalogue slice-1 reads: the per-user ingest library plus
     /// the shared mirror collections. Read-only: implementations must not
     /// create users, ledger rows, or mirror entries. Owner scoping lives in
-    /// the SQL (`WHERE ... user_id = $1`); no owner id is ever returned.
-    /// Fail-open-empty defaults keep out-of-tree `Store` impls compiling
-    /// (their catalogue routes serve empty pages); production and the test
-    /// fake override every method below.
+    /// the SQL: the library page filters `WHERE ... user_id = $1`, and the
+    /// browse lists plus the release detail resolve only through the
+    /// caller's ledger membership (ADR 0006 §6). No owner id is ever
+    /// returned. Fail-open-empty defaults keep out-of-tree `Store` impls
+    /// compiling (their catalogue routes serve empty pages); production
+    /// and the test fake override every method below.
     /// Per-user library page (joined ledger rows, matched-first order).
     fn catalogue_library(
         &self,
@@ -1599,37 +1601,43 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::LibraryDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
-    /// Shared artist collection page (no owner scoping: mirror reads are
-    /// caller-independent once authenticated).
+    /// Caller-member artist collection page (only artists of the caller's
+    /// member releases).
     fn catalogue_artists(
         &self,
+        _user_id: &str,
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ArtistDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
-    /// Shared release collection page (artist-joined).
+    /// Caller-member release collection page (artist-joined).
     fn catalogue_releases(
         &self,
+        _user_id: &str,
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
-    /// Shared track-occurrence collection page.
+    /// Caller-member track-occurrence collection page (exact pairs only).
     fn catalogue_tracks(
         &self,
+        _user_id: &str,
     ) -> impl Future<Output = Result<Vec<crate::catalogue::TrackDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
-    /// One release by MBID (`None` when unknown — the detail handler
-    /// answers 404).
+    /// One release by MBID (`None` when unknown or non-member — the detail
+    /// handler answers 404 for both, indistinguishably).
     fn catalogue_release(
         &self,
+        _user_id: &str,
         _mbid: &str,
     ) -> impl Future<Output = Result<Option<crate::catalogue::ReleaseDbRow>, StoreError>> {
         async { Ok(None) }
     }
-    /// One release's tracks in album order (empty when the release has no
-    /// mirror occurrences yet — still a 200 with no tracks).
+    /// One member release's tracks in album order (empty when the release
+    /// has no mirror occurrences yet — still a 200 with no tracks — and
+    /// empty for a non-member release, which the handler never reaches).
     fn catalogue_release_tracks(
         &self,
+        _user_id: &str,
         _mbid: &str,
     ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
@@ -3910,7 +3918,52 @@ where
         Ok(user) => user,
         Err(resp) => return resp,
     };
-    match ctx.store.catalogue_library(&user_id).await {
+    catalogue_library_entries(ctx, &user_id).await
+}
+
+/// `GET /api/library`: the legacy alias serving the same entries as
+/// `GET /v1/library` (the documented M1 shape — bare array or `{ items }`
+/// with string-`id` rows). Outside the bearer scope map, so this handler
+/// owns authentication exactly like the `/api/ingest` cap guard: a
+/// presented `Authorization` header is verified as a session bearer with
+/// no session-cookie rescue (a native-REST `ntk_` credential is not a
+/// session and fails closed here with the generic 401, never the gate's
+/// 404), while a header-absent call falls back to the session cookie.
+/// Store failure is the generic 500.
+async fn catalogue_library_alias<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let user_id = if req.authorization.is_some() {
+        match ctx.authenticate_bearer_session(req).await {
+            Ok((claims, _token)) => claims.user_id,
+            Err(resp) => return resp,
+        }
+    } else {
+        match ctx.authenticate(req, false).await {
+            Ok((claims, _token)) => claims.user_id,
+            Err(resp) => return resp,
+        }
+    };
+    catalogue_library_entries(ctx, &user_id).await
+}
+
+/// Shared store read plus serialization for the two library routes: the
+/// caller arrives authenticated, this only assembles the entries.
+async fn catalogue_library_entries<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    match ctx.store.catalogue_library(user_id).await {
         Ok(rows) => {
             let entries: Vec<crate::catalogue::LibraryEntry> =
                 rows.iter().map(crate::catalogue::library_entry).collect();
@@ -3955,9 +4008,10 @@ where
     }
 }
 
-/// `GET /v1/artists`: the shared artist collection as a bare array.
-/// Authenticated callers only (the data is shared, the route is not
-/// public): anonymous callers answer 401 before any store read.
+/// `GET /v1/artists`: the caller's member artist collection as a bare
+/// array (only artists of the caller's member releases).
+/// Authenticated callers only: anonymous callers answer 401 before any
+/// store read.
 async fn catalogue_artists<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -3969,10 +4023,11 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_artists().await {
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    match ctx.store.catalogue_artists(&user_id).await {
         Ok(rows) => {
             let entries: Vec<crate::catalogue::ArtistResponse> =
                 rows.iter().map(crate::catalogue::artist_response).collect();
@@ -4033,8 +4088,8 @@ where
     )
 }
 
-/// `GET /v1/releases`: the shared release collection as a bare array.
-/// Authentication posture matches [`catalogue_artists`].
+/// `GET /v1/releases`: the caller's member release collection as a bare
+/// array. Authentication posture matches [`catalogue_artists`].
 async fn catalogue_releases<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -4046,10 +4101,11 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_releases().await {
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    match ctx.store.catalogue_releases(&user_id).await {
         Ok(rows) => {
             let entries: Vec<crate::catalogue::ReleaseResponse> = rows
                 .iter()
@@ -4061,8 +4117,9 @@ where
     }
 }
 
-/// `GET /v1/tracks`: the shared track-occurrence collection as a bare
-/// array. Authentication posture matches [`catalogue_artists`].
+/// `GET /v1/tracks`: the caller's member track-occurrence collection as a
+/// bare array (exact member pairs only). Authentication posture matches
+/// [`catalogue_artists`].
 async fn catalogue_tracks<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -4074,10 +4131,11 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_tracks().await {
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
+    match ctx.store.catalogue_tracks(&user_id).await {
         Ok(rows) => {
             let entries: Vec<crate::catalogue::TrackResponse> =
                 rows.iter().map(crate::catalogue::track_response).collect();
@@ -4087,10 +4145,11 @@ where
     }
 }
 
-/// `GET /v1/releases/{mbid}`: one release plus its tracks in album order.
-/// Only single-segment, well-formed MBIDs reach the store (anything else —
-/// empty, nested, malformed — is the plain 404, indistinguishable from
-/// unknown); unknown releases are 404; store failure is the generic 500.
+/// `GET /v1/releases/{mbid}`: one member release plus its tracks in album
+/// order. Only single-segment, well-formed MBIDs reach the store (anything
+/// else — empty, nested, malformed — is the plain 404, indistinguishable
+/// from unknown); unknown and non-member releases are 404; store failure is
+/// the generic 500.
 async fn catalogue_release<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -4102,9 +4161,10 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
+    let user_id = match catalogue_caller(ctx, req, bearer).await {
+        Ok(user_id) => user_id,
+        Err(resp) => return resp,
+    };
     let mbid = match req.path.strip_prefix("/v1/releases/") {
         Some(rest)
             if !rest.is_empty()
@@ -4115,14 +4175,14 @@ where
         }
         _ => return not_found(),
     };
-    let release = match ctx.store.catalogue_release(mbid).await {
+    let release = match ctx.store.catalogue_release(&user_id, mbid).await {
         Ok(release) => release,
         Err(_) => return internal(),
     };
     let Some(release) = release else {
         return not_found();
     };
-    match ctx.store.catalogue_release_tracks(mbid).await {
+    match ctx.store.catalogue_release_tracks(&user_id, mbid).await {
         Ok(tracks) => catalogue_response(&crate::catalogue::assemble_release_detail(
             &release, &tracks,
         )),
@@ -7433,9 +7493,13 @@ pub(crate) fn preflight_response() -> Response {
 /// a presented credential); a request with NO `Authorization` header skips
 /// the bearer gate and falls through to the dispatch below, so session
 /// cookie holders see no behavior change (ADR 0010). The catalogue slice-1
-/// data routes (`/v1/library`, the `/api/library` alias, `/v1/artists`,
-/// `/v1/releases`, `/v1/tracks`, `/v1/releases/{mbid}`) run their
-/// session-or-bearer dispatch off the identity captured here; every other
+/// `/v1` data routes (`/v1/library`, `/v1/artists`, `/v1/releases`,
+/// `/v1/tracks`, `/v1/releases/{mbid}`) run their session-or-bearer
+/// dispatch off the identity captured here; the `/api/library` legacy
+/// alias sits outside the bearer scope map (like `/api/ingest`) and runs
+/// its own session-or-bearer-session dispatch in the handler — a presented
+/// `Authorization` header is verified as a session with no cookie rescue,
+/// a header-absent call falls back to the session cookie; every other
 /// bearer-scope route still lands on the 404 below — default-deny holds
 /// until its route lands the same way. A presented-but-invalid bearer fails
 /// closed here with that same plain 404 — uniform posture, never a distinct
@@ -7535,12 +7599,15 @@ where
         // can never enter it. Deliberately outside `is_known_path`.
         ("POST", BILLING_WEBHOOK_PATH) => billing_webhook(ctx, req).await,
         // Catalogue slice 1: session-or-bearer reads over the
-        // ingest ledger plus the MusicBrainz mirror. `/api/library` is the
-        // legacy alias the M1 journey owns: it serves the same entries as
-        // `/v1/library`, never a reshaped contract.
-        ("GET", "/v1/library") | ("GET", "/api/library") => {
-            catalogue_library(ctx, req, bearer_user.as_deref()).await
-        }
+        // ingest ledger plus the MusicBrainz mirror.
+        ("GET", "/v1/library") => catalogue_library(ctx, req, bearer_user.as_deref()).await,
+        // Legacy alias the M1 journey owns: the same entries as
+        // `/v1/library`, never a reshaped contract — but outside the
+        // bearer scope map, so its handler owns authentication (the
+        // `/api/ingest` precedent): a presented `Authorization` header is
+        // verified as a session with no cookie rescue, a header-absent
+        // call falls back to the session cookie.
+        ("GET", "/api/library") => catalogue_library_alias(ctx, req).await,
         ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
@@ -7860,6 +7927,61 @@ mod tests {
         /// Catalogue store-error pin: when set, every catalogue read fails
         /// like a production query outage (the handlers answer 500).
         fail_catalogue_reads: RefCell<bool>,
+    }
+
+    impl FakeStore {
+        /// Member releases for a fake user, mirroring the production
+        /// membership read: distinct well-formed release MBIDs from the
+        /// fake ledger, sorted for a stable page.
+        fn fake_member_releases(&self, user_id: &str) -> Vec<String> {
+            let mut mbids: Vec<String> = self
+                .catalogue_library
+                .borrow()
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| {
+                    row.release_mbid
+                        .as_deref()
+                        .and_then(crate::catalogue::enrichment_key)
+                })
+                .collect();
+            mbids.sort();
+            mbids.dedup();
+            mbids
+        }
+        /// Member (release, recording) pairs for a fake user, mirroring
+        /// the production pairs read: exact well-formed pairs from the
+        /// fake ledger's full recording arrays, sorted for a stable page.
+        fn fake_member_pairs(&self, user_id: &str) -> Vec<(String, String)> {
+            let mut pairs: Vec<(String, String)> = self
+                .catalogue_library
+                .borrow()
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| {
+                    row.release_mbid
+                        .as_deref()
+                        .and_then(crate::catalogue::enrichment_key)
+                        .map(|release| {
+                            row.recording_mbids
+                                .iter()
+                                .filter_map(|recording| {
+                                    crate::catalogue::enrichment_key(recording)
+                                        .map(|recording| (release.clone(), recording))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .flatten()
+                .collect();
+            pairs.sort();
+            pairs.dedup();
+            pairs
+        }
     }
 
     impl Store for FakeStore {
@@ -8801,32 +8923,81 @@ mod tests {
         }
         async fn catalogue_artists(
             &self,
+            user_id: &str,
         ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
             }
-            Ok(self.catalogue_artists.borrow().clone())
+            let member = self.fake_member_releases(user_id);
+            let artist_mbids: std::collections::HashSet<String> = self
+                .catalogue_releases
+                .borrow()
+                .iter()
+                .filter(|row| member.iter().any(|mbid| mbid == &row.mbid))
+                .filter_map(|row| row.artist_mbid.clone())
+                .collect();
+            Ok(self
+                .catalogue_artists
+                .borrow()
+                .iter()
+                .filter(|row| artist_mbids.contains(&row.mbid))
+                .cloned()
+                .collect())
         }
         async fn catalogue_releases(
             &self,
+            user_id: &str,
         ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
             }
-            Ok(self.catalogue_releases.borrow().clone())
+            let member = self.fake_member_releases(user_id);
+            Ok(self
+                .catalogue_releases
+                .borrow()
+                .iter()
+                .filter(|row| member.iter().any(|mbid| mbid == &row.mbid))
+                .cloned()
+                .collect())
         }
-        async fn catalogue_tracks(&self) -> Result<Vec<crate::catalogue::TrackDbRow>, StoreError> {
+        async fn catalogue_tracks(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::catalogue::TrackDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
             }
-            Ok(self.catalogue_tracks.borrow().clone())
+            let pairs = self.fake_member_pairs(user_id);
+            let owned: std::collections::HashSet<&(String, String)> =
+                pairs.iter().collect();
+            Ok(self
+                .catalogue_tracks
+                .borrow()
+                .iter()
+                .filter(|row| {
+                    crate::catalogue::enrichment_key(&row.release_mbid)
+                        .and_then(|release| {
+                            crate::catalogue::enrichment_key(&row.recording_mbid)
+                                .map(|recording| (release, recording))
+                        })
+                        .is_some_and(|pair| owned.contains(&pair))
+                })
+                .cloned()
+                .collect())
         }
         async fn catalogue_release(
             &self,
+            user_id: &str,
             mbid: &str,
         ) -> Result<Option<crate::catalogue::ReleaseDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
+            }
+            let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                return Ok(None);
+            };
+            if !self.fake_member_releases(user_id).iter().any(|m| m == &key) {
+                return Ok(None);
             }
             Ok(self
                 .catalogue_releases
@@ -8837,10 +9008,17 @@ mod tests {
         }
         async fn catalogue_release_tracks(
             &self,
+            user_id: &str,
             mbid: &str,
         ) -> Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError> {
             if *self.fail_catalogue_reads.borrow() {
                 return Err(StoreError);
+            }
+            let Some(key) = crate::catalogue::enrichment_key(mbid) else {
+                return Ok(Vec::new());
+            };
+            if !self.fake_member_releases(user_id).iter().any(|m| m == &key) {
+                return Ok(Vec::new());
             }
             Ok(self
                 .catalogue_release_tracks
@@ -22484,14 +22662,15 @@ mod tests {
         let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
         seed_library(&h, "u1");
         // The gate-authorized bearer reaches the data route with no session
-        // cookie and no second gate spend.
-        for path in ["/v1/library", "/api/library"] {
-            let resp = h.call_bearer("GET", path, Some(format!("Bearer {secret}")));
-            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
-            let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
-            assert_eq!(items.len(), 3, "{path}");
-            assert_eq!(items[0]["id"], CAT_REC_A, "{path}");
-        }
+        // cookie and no second gate spend. (`/api/library` sits outside
+        // the bearer scope map, so a native-REST bearer there is the
+        // alias handler's 401 — pinned by
+        // `catalogue_library_alias_session_transports` below.)
+        let resp = h.call_bearer("GET", "/v1/library", Some(format!("Bearer {secret}")));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["id"], CAT_REC_A);
         // Wrong scope stays the names-only 403 (the gate owns it).
         let stream_minted = mint_call(
             &h,
@@ -22505,6 +22684,61 @@ mod tests {
             Some(format!("Bearer {stream_secret}")),
         );
         assert_eq!(forbidden.status, 403, "{}", forbidden.body);
+    }
+
+    #[test]
+    fn catalogue_library_alias_session_transports() {
+        // The legacy alias is outside the bearer scope map (its handler
+        // owns auth, the `/api/ingest` precedent): the session cookie and
+        // the session-as-Bearer header both serve the same entries as
+        // `/v1/library`, while a presented native-REST bearer fails closed
+        // with the generic 401 — never the gate's 404, never a rescue by
+        // the cookie.
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        seed_library(&h, "u1");
+        let session = cookie
+            .split_once('=')
+            .map(|(_, value)| value)
+            .expect("login sets a session pair");
+        // Session-as-Bearer with no cookie serves the identical entries.
+        let via_bearer =
+            h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
+        assert_eq!(via_bearer.status, 200, "{}", via_bearer.body);
+        let via_cookie = h.call_full("GET", "/api/library", None, Some(cookie.clone()), Some(ORIGIN));
+        assert_eq!(via_cookie.status, 200, "{}", via_cookie.body);
+        assert_eq!(
+            via_bearer.body, via_cookie.body,
+            "alias must serve one shape on both session transports"
+        );
+        let items: Vec<serde_json::Value> = serde_json::from_str(&via_bearer.body).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["id"], CAT_REC_A);
+        // A native-REST credential is not a session: 401 even when the
+        // shape is well-formed, even beside a valid cookie (no rescue).
+        for authorization in [
+            Some(format!("Bearer ntk_{}", "0".repeat(43))),
+            Some("Bearer ntk_short".to_string()),
+        ] {
+            let refused = h.call_bearer("GET", "/api/library", authorization);
+            assert_eq!(refused.status, 401, "{}", refused.body);
+            assert_eq!(
+                refused.body, r#"{"error":"check your email and try again"}"#,
+                "alias keeps the generic session 401"
+            );
+        }
+        let no_rescue = Request {
+            method: "GET".to_string(),
+            path: "/api/library".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some(format!("Bearer ntk_{}", "0".repeat(43))),
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
+        assert_eq!(no_rescue.status, 401, "{}", no_rescue.body);
     }
 
     #[test]
@@ -22530,6 +22764,7 @@ mod tests {
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
         seed_catalogue(&h);
+        seed_library(&h, "u1");
         let artists = h.call_full(
             "GET",
             "/v1/artists",
@@ -22582,6 +22817,7 @@ mod tests {
         seed_user(&h, "u1", "a@example.com");
         let cookie = magic_login(&h, "a@example.com");
         seed_catalogue(&h);
+        seed_library(&h, "u1");
         let resp = h.call_full(
             "GET",
             &format!("/v1/releases/{CAT_RELEASE}"),
@@ -22613,6 +22849,96 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_collections_are_member_scoped() {
+        const OTHER_RELEASE: &str = "bbbbbbbb-2222-3333-4444-555555555555";
+        const OTHER_ARTIST: &str = "eeeeeeee-2222-3333-4444-555555555555";
+        const OTHER_REC: &str = "22222222-3333-4444-5555-666666666666";
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let cookie_b = magic_login(&h, "b@example.com");
+        seed_catalogue(&h);
+        // A second global release the caller never ingested: the member
+        // caller must never see it, and the caller with no ledger at all
+        // sees empty pages plus a 404 detail.
+        h.store
+            .catalogue_artists
+            .borrow_mut()
+            .push(crate::catalogue::ArtistDbRow {
+                mbid: OTHER_ARTIST.to_string(),
+                name: "Other Artist".to_string(),
+                sort_name: "Artist, Other".to_string(),
+                artist_type: Some("Person".to_string()),
+                country: Some("US".to_string()),
+            });
+        h.store
+            .catalogue_releases
+            .borrow_mut()
+            .push(crate::catalogue::ReleaseDbRow {
+                mbid: OTHER_RELEASE.to_string(),
+                title: "Other Release".to_string(),
+                release_type: Some("Album".to_string()),
+                year: Some(1991),
+                artist_mbid: Some(OTHER_ARTIST.to_string()),
+                artist_name: Some("Other Artist".to_string()),
+            });
+        h.store
+            .catalogue_tracks
+            .borrow_mut()
+            .push(crate::catalogue::TrackDbRow {
+                release_mbid: OTHER_RELEASE.to_string(),
+                recording_mbid: OTHER_REC.to_string(),
+                title: "Other Track".to_string(),
+                duration_ms: Some(180_000),
+                medium_no: Some(1),
+                track_no: Some(1),
+                release_title: "Other Release".to_string(),
+                artist_mbid: Some(OTHER_ARTIST.to_string()),
+                artist_name: Some("Other Artist".to_string()),
+            });
+        // A same-recording cross-release occurrence: the recording is a
+        // member recording, but the occurrence is not a member pair.
+        h.store
+            .catalogue_tracks
+            .borrow_mut()
+            .push(crate::catalogue::TrackDbRow {
+                release_mbid: OTHER_RELEASE.to_string(),
+                recording_mbid: CAT_REC_A.to_string(),
+                title: "Other Occurrence".to_string(),
+                duration_ms: Some(200_000),
+                medium_no: Some(1),
+                track_no: Some(2),
+                release_title: "Other Release".to_string(),
+                artist_mbid: Some(OTHER_ARTIST.to_string()),
+                artist_name: Some("Other Artist".to_string()),
+            });
+        seed_library(&h, "u1");
+        for path in ["/v1/artists", "/v1/releases", "/v1/tracks"] {
+            let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+            let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(items.len(), 1, "{path}: {}", resp.body);
+            assert!(
+                !resp.body.contains(OTHER_RELEASE) && !resp.body.contains(OTHER_ARTIST),
+                "{path}: non-member rows must never reach a member: {}",
+                resp.body
+            );
+        }
+        let forbidden =
+            h.call_full("GET", &format!("/v1/releases/{OTHER_RELEASE}"), None, Some(cookie.clone()), Some(ORIGIN));
+        assert_eq!(forbidden.status, 404, "{}", forbidden.body);
+        for path in ["/v1/artists", "/v1/releases", "/v1/tracks"] {
+            let resp = h.call_full("GET", path, None, Some(cookie_b.clone()), Some(ORIGIN));
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+            assert_eq!(resp.body, "[]", "{path}: a caller with no ledger sees no rows");
+        }
+        let stranger =
+            h.call_full("GET", &format!("/v1/releases/{CAT_RELEASE}"), None, Some(cookie_b), Some(ORIGIN));
+        assert_eq!(stranger.status, 404, "{}", stranger.body);
+    }
+
+    #[test]
     fn catalogue_store_outage_is_500() {
         let h = harness();
         seed_user(&h, "u1", "a@example.com");
@@ -22630,6 +22956,15 @@ mod tests {
             assert_eq!(resp.status, 500, "{path}");
             assert_eq!(resp.body, r#"{"error":"internal error"}"#, "{path}");
         }
+        // The alias's bearer-session transport hits the same store read,
+        // so it outages the same way (auth succeeds, the read fails).
+        let session = cookie
+            .split_once('=')
+            .map(|(_, value)| value)
+            .expect("login sets a session pair");
+        let outage = h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
+        assert_eq!(outage.status, 500, "{}", outage.body);
+        assert_eq!(outage.body, r#"{"error":"internal error"}"#);
     }
 
     #[test]

@@ -74,6 +74,18 @@ SESSION_TTL_SECS = "86400"
 # binding = "HYPERDRIVE"
 # id = "<fill in staging/prod id>"
 
+# Second Hyperdrive binding: the shared MusicBrainz read mirror (`MB_DB`,
+# see MIRROR_HYPERDRIVE_BINDING in src/worker_entry.rs). The catalogue reads
+# reach it with three bounded mirror probes (recordings, tracks, releases);
+# the app binding above stays the only writer. Same config id in staging
+# and prod (the `nntunev2-mb` shared mirror; docs/ops.md Worker bindings
+# row) — fill in the inventory id for a hand deploy. The mirror config MUST
+# be cache-disabled too (same gate procedure as above); the Worker attests
+# both bindings at startup.
+# [[hyperdrive]]
+# binding = "MB_DB"
+# id = "<shared mirror id, same in staging and prod>"
+
 # Workers Logs persistence for the structured api records (the build_sha
 # evidence is read there). Without this block the deployed Worker has
 # observability=null and persists nothing. The `staging-api` lane in

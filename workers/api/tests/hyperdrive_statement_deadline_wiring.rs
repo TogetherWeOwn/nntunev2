@@ -7,10 +7,12 @@
 //! operation against the shared with_deadline helper, expiring to the opaque
 //! StoreError. Every `Store for PgStore` method and `SingleUseStore::claim`
 //! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
-//! async block contains that method's self.connect() (connect plus all of
-//! its statements share one bound: finishing one statement must not unbind
-//! a later stalled one). Hyperdrive RESETs pooled backends, so this
-//! per-method race is what bounds statements where they run.
+//! async block contains that method's connects — self.connect(), the
+//! self.connect_mirror() the catalogue reads use, or (catalogue_library)
+//! both — plus all of its statements (connects and statements share one
+//! bound: finishing one statement must not unbind a later stalled one).
+//! Hyperdrive RESETs pooled backends, so this per-method race is what
+//! bounds statements where they run.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -183,8 +185,12 @@ fn assert_bounded(piece: &str, name: &str) {
         call.args[0].starts_with("async{"),
         "{name} must bound one async operation"
     );
+    // App-only, mirror-only, or (catalogue_library) both: every connect
+    // the method runs must sit inside the bound operation, sharing the one
+    // TOTAL_TIMEOUT_MS race with the statements.
     assert!(
-        call.args[0].contains("self.connect()"),
+        call.args[0].contains("self.connect()")
+            || call.args[0].contains("self.connect_mirror()"),
         "{name} must run its connect inside the bound operation"
     );
     assert_eq!(
@@ -195,20 +201,17 @@ fn assert_bounded(piece: &str, name: &str) {
         call.after.starts_with(".await"),
         "{name} must await the bound operation"
     );
-    // Placement: the whole method connects exactly once, and no statement
-    // runs outside the bounded argument. A client that escapes the seam —
-    // an extra connect, or a query/execute/transaction after the awaited
-    // bound — fails here, not in production.
-    assert_eq!(
-        piece.matches("self.connect()").count(),
-        1,
-        "{name} must connect exactly once, inside the bound operation"
-    );
+    // Placement: every connect runs inside the bounded argument (the
+    // remainder check below forbids both connect spellings outside it),
+    // and no statement runs outside it either. A client that escapes the
+    // seam — an extra connect, or a query/execute/transaction after the
+    // awaited bound — fails here, not in production.
     let arg = call.args[0];
     let arg_start = arg.as_ptr() as usize - piece.as_ptr() as usize;
     let remainder = format!("{}{}", &piece[..arg_start], &piece[arg_start + arg.len()..]);
     for marker in [
         "self.connect()",
+        "self.connect_mirror()",
         ".query",
         ".execute",
         ".batch_execute",

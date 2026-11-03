@@ -659,13 +659,16 @@ mod surface_acceptance {
         // the uniform-404 pin above no longer covers its routes. The gate
         // posture is unchanged: malformed, unknown, revoked, or expired keys
         // 404 with no session rescue and no successful-use accounting, on
-        // every landed route. Absent bearers dispatch instead: a session
-        // cookie serves (empty pages on this fixture store), anonymous
-        // callers take the generic 401.
+        // every landed `/v1` route. (`/api/library` is outside the bearer
+        // scope map — its handler answers presented bearers with the
+        // generic 401, pinned by
+        // `legacy_library_alias_keeps_handler_auth_posture` below.)
+        // Absent bearers dispatch instead: a session cookie serves (empty
+        // pages on this fixture store), anonymous callers take the generic
+        // 401.
         let detail = "/v1/releases/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let paths = [
             "/v1/library",
-            "/api/library",
             "/v1/artists",
             "/v1/releases",
             "/v1/tracks",
@@ -724,7 +727,6 @@ mod surface_acceptance {
         let (h, cookie, _bearer, _id) = bearer_harness();
         for path in [
             "/v1/library",
-            "/api/library",
             "/v1/artists",
             "/v1/releases",
             "/v1/tracks",
@@ -746,6 +748,89 @@ mod surface_acceptance {
         );
         let anon = request(&h, "GET", detail, None, None);
         assert_eq!(anon.status, 401);
+    }
+
+    #[test]
+    fn legacy_library_alias_keeps_handler_auth_posture() {
+        // `/api/library` serves the same entries as `/v1/library` but sits
+        // outside the bearer scope map (the `/api/ingest` precedent): its
+        // handler owns auth, so a presented native-REST bearer — even a
+        // valid, unexpired, unrevoked one — is not a session and fails
+        // closed with the generic 401, never the gate's 404, with no
+        // cookie rescue and no successful-use accounting. The two session
+        // transports (cookie, session-as-Bearer) both serve; anonymous
+        // callers 401.
+        const ALIAS: &str = "/api/library";
+        for state in ["malformed", "unknown", "valid", "revoked", "expired"] {
+            let (h, cookie, bearer, id) = bearer_harness();
+            if state == "revoked" {
+                h.store
+                    .native_credentials
+                    .borrow_mut()
+                    .get_mut(&id)
+                    .unwrap()
+                    .record
+                    .revoked_at = Some(NOW - 1);
+            } else if state == "expired" {
+                h.store
+                    .native_credentials
+                    .borrow_mut()
+                    .get_mut(&id)
+                    .unwrap()
+                    .record
+                    .expires_at = NOW - 1;
+            }
+            let header = match state {
+                "malformed" => "Bearer ",
+                "unknown" => "Bearer ntk_syntheticUnknownKey0000000000000000000000000",
+                _ => &bearer,
+            };
+            for cookie in [None, Some(cookie.as_str())] {
+                let refused = request(&h, "GET", ALIAS, Some(header), cookie);
+                assert_eq!(
+                    refused.status, 401,
+                    "GET {ALIAS}: {state} bearer is not a session"
+                );
+                assert_eq!(
+                    refused.body, r#"{"error":"check your email and try again"}"#,
+                    "GET {ALIAS}: {state} keeps the generic session 401"
+                );
+                assert!(refused.set_cookie.is_none(), "no session rescue/refresh");
+                assert_eq!(
+                    h.store.native_use_calls.get(),
+                    0,
+                    "alias bearers cannot record successful use"
+                );
+                assert!(
+                    !refused.body.contains("ntk_"),
+                    "no credential material in refusal"
+                );
+            }
+        }
+        // Session transports serve the same empty page on this fixture
+        // store; anonymous 401s.
+        let (h, cookie, _bearer, _id) = bearer_harness();
+        let session = cookie
+            .split_once('=')
+            .map(|(_, value)| value)
+            .expect("login sets a session pair");
+        let via_cookie = request(&h, "GET", ALIAS, None, Some(&cookie));
+        assert_eq!(via_cookie.status, 200, "GET {ALIAS}: cookie serves");
+        let via_bearer = request(
+            &h,
+            "GET",
+            ALIAS,
+            Some(&format!("Bearer {session}")),
+            None,
+        );
+        assert_eq!(via_bearer.status, 200, "GET {ALIAS}: session-as-Bearer serves");
+        assert_eq!(
+            via_bearer.body, via_cookie.body,
+            "GET {ALIAS}: one shape on both session transports"
+        );
+        assert_eq!(via_bearer.body, "[]", "fixture store holds no rows");
+        let anon = request(&h, "GET", ALIAS, None, None);
+        assert_eq!(anon.status, 401, "GET {ALIAS}: anonymous 401s");
     }
 
     #[test]

@@ -39,12 +39,19 @@
 -- - No GRANTs (0022 precedent: staging/prod rely on database default
 --   privileges; role names are host-owned, docs/ops.md).
 -- - Replay-safe: every statement is `IF NOT EXISTS`.
+--
+-- Conventions (migrations/README.md): the first executable statement is the
+-- `SET search_path` header so the migration is self-contained under any
+-- role or runner `search_path`, and every relation reference is
+-- schema-qualified (`public.…`).
 
-CREATE TABLE IF NOT EXISTS library (
+SET search_path = public, pg_catalog;
+
+CREATE TABLE IF NOT EXISTS public.library (
     idempotency_key TEXT PRIMARY KEY,
     job_id          TEXT NOT NULL,
-    user_id         TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+    user_id         TEXT NOT NULL REFERENCES public.users (id) ON DELETE RESTRICT,
     release_mbid    TEXT NULL,
     recording_mbids TEXT[] NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_library_user ON library (user_id);
+CREATE INDEX IF NOT EXISTS idx_library_user ON public.library (user_id);

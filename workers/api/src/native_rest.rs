@@ -465,11 +465,14 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     }
     match method {
         "GET" => {
-            // Catalog reads → library:read (roots and subpaths).
-            // `/api/library` is the legacy alias serving the same entries
-            // as `/v1/library`: same scope, never a second one.
+            // Catalog reads → library:read (roots and subpaths). The
+            // `/api/library` legacy alias is deliberately outside this map
+            // (like `/api/ingest`): it serves the same entries as
+            // `/v1/library` through its own session-or-bearer-session
+            // dispatch, so a presented native-REST bearer on the alias is
+            // the handler's 401 — never the gate's 404, never a second
+            // scope.
             if path == "/v1/library"
-                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path.starts_with("/v1/releases/")
@@ -537,8 +540,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         // revalidates, and every other HEAD shape stays Deny until the
         // map is explicitly updated.
         "HEAD" => {
+            // The `/api/library` alias stays out here too: HEAD has no
+            // dispatch reader, so the alias answers the plain dispatch 404
+            // like every other unmapped HEAD shape.
             if path == "/v1/library"
-                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path == "/v1/tracks"
@@ -749,8 +754,6 @@ mod tests {
         // catalog root; non-catalog and unknown HEAD shapes stay Deny.
         for path in [
             "/v1/library",
-            // Legacy alias: same entries, same scope.
-            "/api/library",
             "/v1/artists",
             "/v1/releases",
             "/v1/tracks",
@@ -763,7 +766,16 @@ mod tests {
                 "HEAD {path}"
             );
         }
-        for path in ["/v1/plays", "/v1/stream", "/v1/ingest", "/v1/nope"] {
+        // The `/api/library` alias is outside the bearer scope map (its
+        // handler owns session-or-bearer-session auth), so HEAD on the
+        // alias stays Deny like the other unmapped HEAD shapes.
+        for path in [
+            "/api/library",
+            "/v1/plays",
+            "/v1/stream",
+            "/v1/ingest",
+            "/v1/nope",
+        ] {
             assert_eq!(
                 scope_for_operation("HEAD", path),
                 RouteDecision::Deny,

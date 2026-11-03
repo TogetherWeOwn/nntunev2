@@ -503,7 +503,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
 | Transcode service (ingest `TRANSCODE_CONTAINER` target) | `nntune-transcode-staging` | `nntune-transcode` |
 | MB service (ingest `MB_API` target; per-env `name` committed in `workers/mb/wrangler.toml:24,:61,:80`) | `nntune-mb-staging` | `nntune-mb-production` |
-| Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
+| Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz`, `/api/library` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
 | MB Hyperdrive variable | `HYPERDRIVE_ID_MB` (shared mirror) | `HYPERDRIVE_ID_MB` (shared mirror) |
@@ -545,6 +545,7 @@ config sources in the Non-storage bindings inventory below.
 | `mb` (`workers/mb/wrangler.toml`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID; the prod section still names the staging bucket until the MB art-cache activation lands (`[[known_drift]]`) |
 | `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
+| `api` (`workers/api/wrangler.toml.example`) | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `ingest` (`workers/ingest/wrangler.toml`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
 | `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
 | `mb` / `ingest` (shared reserved namespace) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; all three bindings share the single reserved namespace per env (dedicated namespaces not provisioned). Keys disjoint by prefix: `ingest:checkpoint:`/`ingest:verify:` (`workers/ingest/src/checkpoint.rs`), `nzb:sha256:` (`workers/ingest/src/dispatch.rs:31`), `mb:lookup:`/`mb:release-recordings:` (`workers/mb/src/lib.rs`). Sharing couples quota/blast radius; accepted for staging; split later without code change |
