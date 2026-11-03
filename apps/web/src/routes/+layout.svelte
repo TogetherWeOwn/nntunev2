@@ -201,7 +201,18 @@
 	let createAnchor = $state<'rail' | 'topbar' | null>(null);
 	let menuOpener = $state<HTMLElement | null>(null);
 
-	function toggleMenu(kind: 'create' | 'account', event: MouseEvent): void {
+	function menuIdFor(kind: 'create' | 'account', anchor: 'rail' | 'topbar' | null): string {
+		return kind === 'create' ? `nt-create-menu-${anchor ?? 'rail'}` : 'nt-account-menu';
+	}
+
+	function focusFirstMenuItem(menuId: string): void {
+		document
+			.getElementById(menuId)
+			?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')
+			?.focus();
+	}
+
+	async function toggleMenu(kind: 'create' | 'account', event: MouseEvent): Promise<void> {
 		const trigger = event.currentTarget as HTMLElement;
 		if (openMenu === kind) {
 			openMenu = null;
@@ -213,6 +224,10 @@
 				? (trigger.dataset.createAnchor === 'topbar' ? 'topbar' : 'rail')
 				: null;
 			menuOpener = trigger;
+			// Move focus from the trigger into the menu so keyboard users
+			// land on the first item instead of tabbing from the button.
+			await tick();
+			focusFirstMenuItem(menuIdFor(kind, createAnchor));
 		}
 	}
 
@@ -224,7 +239,26 @@
 	}
 
 	function onMenuKeydown(event: KeyboardEvent): void {
-		if (event.key === 'Escape') closeMenus(true);
+		if (event.key === 'Escape') {
+			closeMenus(true);
+			return;
+		}
+		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+		// Arrow keys travel between items within the open menu; the menu
+		// keeps the roles, so traversal must not depend on Tab order.
+		const root = (event.currentTarget as HTMLElement).closest('[data-menu-root]');
+		const items = root
+			? [...root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])')]
+			: [];
+		if (items.length === 0) return;
+		event.preventDefault();
+		const active = document.activeElement as HTMLElement | null;
+		const at = active ? items.indexOf(active) : -1;
+		const next =
+			event.key === 'ArrowDown'
+				? items[(at + 1) % items.length]
+				: items[(at - 1 + items.length) % items.length];
+		next?.focus();
 	}
 
 	function onMenuFocusOut(event: FocusEvent): void {

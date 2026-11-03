@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import ts from 'typescript';
 import { addTrack, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
@@ -73,6 +73,8 @@ test('queues shelf favorites in star order, not library/title order, with displa
 		], currentIndex: 0
 	});
 	expect(page.read().announcement).toMatch(/queued 3.*0 already queued/i);
+	expect(readMiniPlayerHint()?.trackId).toBe('mike');
+	expect(readMiniPlayerHint()?.title).toBe('Mike Song');
 });
 
 test('keeps already queued tracks in place and preserves a non-first current selection', () => {

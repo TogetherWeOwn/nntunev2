@@ -4,9 +4,9 @@
 		invalidateLibraryCache,
 		type LibraryItem
 	} from '#lib/library/cache.js';
-	import { loadFavorites } from '#lib/library/favorites.js';
+	import { favoritesKey, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
-	import { loadRecentFinds } from '#lib/library/recent-finds.js';
+	import { loadRecentFinds, recentFindsKey } from '#lib/library/recent-finds.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 
 	// Home shows only the visitor's own data: their library snapshot, their
@@ -32,15 +32,32 @@
 
 	const session = browserStorage('session');
 	const local = browserStorage('local');
-	const favoriteIds = loadFavorites(session, local);
-	const recentQueries = loadRecentFinds(session, local);
+	let favoriteIds = $state(loadFavorites(session, local));
+	let recentQueries = $state(loadRecentFinds(session, local));
 
 	$effect(() => {
 		void refresher.refresh();
 		return () => refresher.dispose();
 	});
 
+	// Another tab's write leaves the Liked count and recent list stale until
+	// Home remounts; reload the changed list when its storage key changes
+	// (a null key means the area was cleared, so reload both lists).
+	$effect(() => {
+		const onStorage = (event: StorageEvent): void => {
+			if (event.key === null || event.key === favoritesKey(session)) {
+				favoriteIds = loadFavorites(session, local);
+			}
+			if (event.key === null || event.key === recentFindsKey(session)) {
+				recentQueries = loadRecentFinds(session, local);
+			}
+		};
+		window.addEventListener('storage', onStorage);
+		return () => window.removeEventListener('storage', onStorage);
+	});
+
 	const preview = $derived(items.slice(0, 5));
+	const liked = $derived(selectFavoriteItems(items, favoriteIds));
 </script>
 
 <svelte:head>
@@ -79,9 +96,9 @@
 		</section>
 	{/if}
 
-	{#if favoriteIds.length > 0}
+	{#if liked.length > 0}
 		<section aria-labelledby="home-liked-heading">
-			<h2 id="home-liked-heading">Liked ({favoriteIds.length})</h2>
+			<h2 id="home-liked-heading">Liked ({liked.length})</h2>
 			<p><a href="/library/liked">Open Liked</a></p>
 		</section>
 	{/if}

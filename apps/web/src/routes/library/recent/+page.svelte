@@ -1,6 +1,10 @@
 <script lang="ts">
 	import { browserStorage } from '#lib/library/cache.js';
-	import { loadRecentFinds, saveRecentFinds } from '#lib/library/recent-finds.js';
+	import {
+		loadRecentFinds,
+		MAX_RECENT_FINDS,
+		saveRecentFinds
+	} from '#lib/library/recent-finds.js';
 	import { pushToast } from '#lib/shell/toasts.js';
 
 	// Recent lists the visitor's own recent library searches for this auth
@@ -20,8 +24,14 @@
 			action: {
 				label: 'Undo',
 				run: () => {
-					queries = previous;
-					saveRecentFinds(session, local, previous);
+					// Keep searches saved after Clear (the toast survives
+					// navigation): stored entries missing from the cleared
+					// snapshot move to the front instead of being lost.
+					const added = loadRecentFinds(session, local).filter(
+						(query) => !previous.includes(query)
+					);
+					queries = [...added, ...previous].slice(0, MAX_RECENT_FINDS);
+					saveRecentFinds(session, local, queries);
 				}
 			}
 		});

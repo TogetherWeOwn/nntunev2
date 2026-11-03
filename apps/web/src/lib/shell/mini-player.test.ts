@@ -44,10 +44,13 @@ describe('mini-player hint', () => {
 	});
 
 	it('a throwing listener breaks nothing', () => {
+		const seen: Array<MiniPlayerHint | null> = [];
 		onMiniPlayerHint(() => {
 			throw new Error('listener boom');
 		});
+		onMiniPlayerHint((hint) => seen.push(hint));
 		setMiniPlayerHint(HINT);
 		expect(readMiniPlayerHint()).toEqual(HINT);
+		expect(seen).toEqual([null, HINT]);
 	});
 });

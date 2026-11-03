@@ -9,6 +9,7 @@
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
+	import { restoreFavoriteId } from '#lib/library/favorites-order.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { pushToast } from '#lib/shell/toasts.js';
@@ -51,19 +52,30 @@
 	}
 
 	function removeFavorite(id: string, title: string): void {
-		const previous = [...favoriteIds];
+		// Re-read storage so a favorite added in another tab is not dropped
+		// by this removal; fall back to component state when storage is
+		// stale (it lacks the id this list just rendered).
+		const stored = loadFavorites(session, local);
+		const previous = stored.includes(id) ? stored : [...favoriteIds];
 		const previousIndex = previous.indexOf(id);
+		if (previousIndex < 0) return;
+		const anchor = {
+			previousIndex,
+			predecessor: previousIndex > 0 ? previous[previousIndex - 1] : null,
+			successor: previousIndex < previous.length - 1 ? previous[previousIndex + 1] : null
+		};
 		persist(previous.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
 				run: () => {
-					// Restore only this track against the current list so
-					// concurrent Undos never overwrite each other's removals.
-					if (favoriteIds.includes(id)) return;
-					const next = [...favoriteIds];
-					next.splice(Math.min(Math.max(previousIndex, 0), next.length), 0, id);
-					persist(next);
+					// Restore only this track against the stored list, so a
+					// navigation or another tab's save is never overwritten,
+					// and anchor on the surviving successor so adjacent Undos
+					// restore the original order in either sequence.
+					const current = loadFavorites(session, local);
+					const next = restoreFavoriteId(current, id, anchor);
+					if (next !== current) persist([...next]);
 				}
 			}
 		});
