@@ -5316,6 +5316,12 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
+    // answer the typed 409 up front rather than a lease 429/500 after
+    // the fence refuses the write.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
     // displace the current holder.
@@ -5498,6 +5504,11 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // Same fence as issuance (ADR 0002 rule 3): a deleting account's
+    // heartbeat is the typed 409, never an `active` extension.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
     let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
         return validation_failed("invalid request");
     };
@@ -6937,7 +6948,18 @@ mod tests {
         ) -> Result<crate::playback::LeaseAcquire, StoreError> {
             // Mirror the conditional upsert: insert at epoch 1, or
             // replace at epoch+1 when expired, same-session, or
-            // takeover — else Held with the remaining TTL.
+            // takeover — else Held with the remaining TTL. The
+            // statement's deletion fence writes nothing (zero rows,
+            // which the Pg glue reads back as Held), no epoch burned.
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(crate::playback::LeaseAcquire::Held {
+                    retry_after_secs: self
+                        .playback_leases
+                        .borrow()
+                        .get(user_id)
+                        .map_or(0, |row| row.retry_after_secs(now)),
+                });
+            }
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get(user_id) {
                 Some(existing)
@@ -6973,7 +6995,12 @@ mod tests {
             expires_at: u64,
         ) -> Result<bool, StoreError> {
             // Mirror the conditional UPDATE: only the exact
-            // (session, play, epoch) holder extends.
+            // (session, play, epoch) holder extends, monotonically
+            // (an out-of-order older deadline never shortens), and
+            // never for a deleting account (in-statement fence).
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get_mut(user_id) {
                 Some(row)
@@ -6981,7 +7008,7 @@ mod tests {
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
-                    row.expires_at = expires_at;
+                    row.expires_at = row.expires_at.max(expires_at);
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -10456,6 +10483,91 @@ mod tests {
         assert_eq!(resp.status, 200, "{}", resp.body);
         let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(body["lease"], "expired");
+    }
+
+    #[test]
+    fn play_routes_answer_account_deleting_for_a_deleting_account() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        // Issuance: the typed 409, no lease written, no grant minted.
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a deleting account must not acquire a lease"
+        );
+        // Heartbeat: same 409, even for a lease row seeded directly —
+        // the touch must never extend a deleting account's lease.
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a deleting account's lease must not extend"
+        );
+        // The FakeStore mirrors the statement fences directly, so a
+        // handler regression that skipped the pre-check still could
+        // not write (acquire reads Held, touch reads false).
+        let acquired = block_on(h.store.acquire_playback_lease(
+            "user-plays-1",
+            "tab-b",
+            "track-9",
+            "play-x",
+            NOW,
+            NOW + 45,
+            true,
+        ))
+        .expect("store call succeeds");
+        assert!(matches!(
+            acquired,
+            crate::playback::LeaseAcquire::Held { .. }
+        ));
+        let touched = block_on(h.store.touch_playback_lease(
+            "user-plays-1",
+            "tab-a",
+            "play-seeded",
+            7,
+            NOW,
+            NOW + 45,
+        ))
+        .expect("store call succeeds");
+        assert!(!touched);
     }
 
     #[test]

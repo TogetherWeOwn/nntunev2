@@ -12,15 +12,18 @@
  *   null for anything else (no dead-end error toast: a limit always yields a
  *   paywall model, never null).
  * - `PaywallModel` shape:
- *   `{ kind: 'terminal' | 'retryable'; ctaHref: '/pricing';
+ *   `{ kind: 'terminal' | 'retryable'; ctaHref: '/pricing' | null;
  *      headline: string; detail: string;
  *      retryAfterSeconds: number | null; countdownText: string | null }`
  *   - 402 -> `kind: 'terminal'`, `retryAfterSeconds: null`, `countdownText: null`.
  *   - 429 -> `kind: 'retryable'`, `retryAfterSeconds` parsed from the
  *     `Retry-After` response header (delta-seconds), `countdownText` names
  *     that many seconds (e.g. contains "45" for `Retry-After: 45`).
- *   - `ctaHref` is always `/pricing`; `headline`/`detail` are non-empty and
- *     name the current usage.
+ *   - `ctaHref` is `/pricing` wherever an upgrade changes the answer;
+ *     `headline`/`detail` are non-empty and name the current usage. The
+ *     concurrent-stream lease 429 (`x-plan-limit: concurrent_streams=...`)
+ *     is the exception: no plan raises it, so `ctaHref` is null and the
+ *     copy names the other device instead.
  * - `PAYWALL_SHOWN_EVENT` is the documented analytics event name:
  *   `'usage_limit_paywall_shown'`.
  * - `trackPaywallShown(track, model)` calls `track(name, props)` exactly once
@@ -143,6 +146,47 @@ describe('plan-limit 402/429 handling with upgrade CTA', () => {
 			expect(model.detail.toLowerCase()).toContain('needs a plan');
 			expect(model.detail.toLowerCase()).not.toContain('resubscribe');
 		}
+	});
+
+	it('429 concurrent-stream lease names the other device and offers no upgrade', async () => {
+		const planLimit = await loadPlanLimit();
+		const headers = new Headers();
+		headers.set('Retry-After', '30');
+		headers.set('x-plan-limit', 'concurrent_streams=1');
+
+		const model = planLimit.toPaywallModel({
+			status: 429,
+			headers,
+			body: { code: 'rate_limited', message: 'another session is playing' }
+		});
+
+		expect(model).not.toBeNull();
+		expect(model.kind).toBe('retryable');
+		// No plan raises the concurrent allowance: an upgrade CTA here
+		// would send the user to pricing and change nothing.
+		expect(model.ctaHref).toBeNull();
+		expect(model.headline.toLowerCase()).toContain('another device');
+		expect(model.detail.toLowerCase()).toContain('other device');
+		expect(model.detail.toLowerCase()).not.toContain('upgrade');
+		expect(model.retryAfterSeconds).toBe(30);
+		expect(model.countdownText).toContain('30');
+	});
+
+	it('429 without the concurrent dimension keeps the upgrade CTA', async () => {
+		const planLimit = await loadPlanLimit();
+		const headers = new Headers();
+		headers.set('Retry-After', '30');
+		headers.set('x-plan-limit', 'stream_hours_month=100');
+
+		const model = planLimit.toPaywallModel({
+			status: 429,
+			headers,
+			body: { code: 'rate_limited' }
+		});
+
+		expect(model).not.toBeNull();
+		expect(model.ctaHref).toBe('/pricing');
+		expect(model.headline.toLowerCase()).not.toContain('another device');
 	});
 
 	it('paywall display fires the documented analytics event with no PII', async () => {
