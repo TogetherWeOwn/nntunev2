@@ -269,6 +269,17 @@ jobs:
         run: python3 .github/scripts/clean_room_lint.py
       - name: Unit-test the clean-room lint
         run: python3 .github/scripts/test_clean_room_lint.py
+      # Fixture licence guard (docs/fixture-audio-licences.md): no
+      # tracked audio/NZB outside a CC0-manifest path, every fixture
+      # manifest carries an allow-listed licence, code references
+      # only manifest-listed R2 keys. Needs no credentials; the
+      # fetch-by-key helper's own suite is offline too.
+      - name: Check fixture audio licences
+        run: python3 .github/scripts/check_fixture_licences.py
+      - name: Unit-test the fixture licence guard
+        run: python3 .github/scripts/test_check_fixture_licences.py
+      - name: Unit-test the CC0 fixture fetcher
+        run: python3 fixtures/cc0/test_fetch_fixture.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling

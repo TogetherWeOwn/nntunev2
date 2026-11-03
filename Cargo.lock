@@ -891,6 +891,10 @@ name = "nntune-subsonic"
 version = "0.1.0"
 
 [[package]]
+name = "nntune-test-fixtures"
+version = "0.1.0"
+
+[[package]]
 name = "nntune-test-nntp"
 version = "0.1.0"
 dependencies = [
