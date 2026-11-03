@@ -149,11 +149,21 @@ target = "mirror"
 sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
 
 [[migration]]
-file = "0031_posted_files.sql"
+file = "0031_meter_derivation_and_leases.sql"
 target = "app"
-sha256 = "6c32727f45d824a8c71a2e74843a3e6740f248913f31d6e25e7e82a6d5233791"
+sha256 = "0073041714e1a43d69f9dcb42483a3cc12baf6945326b8b20bac94047c85611a"
 
 [[migration]]
-file = "0032_posted_files_crypto.sql"
+file = "0032_ledger_seconds_floor.sql"
 target = "app"
-sha256 = "5f157f5460a76c2db3bbec3d2e94db1f4a91d1bce7f2e9cd3c74dcbe553a91a3"
+sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
+
+[[migration]]
+file = "0033_posted_files.sql"
+target = "app"
+sha256 = "a581a32971148ad0dd2b12c90e12898ecb3fcb55fb1d13daa8b35e2bbb88df01"
+
+[[migration]]
+file = "0034_posted_files_crypto.sql"
+target = "app"
+sha256 = "4fdbcf80e441afd5ef30f82ca378d19f32a71382793a9564d9388c8fa2d3f40f"
