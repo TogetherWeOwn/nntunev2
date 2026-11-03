@@ -150,11 +150,20 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a + b
 }
 
+/// Number of full-order bases in GF(2^16): φ(65535) = 32 768. No larger
+/// [`input_bases`] count can succeed, so larger counts are rejected before
+/// any allocation.
+pub const MAX_INPUT_BASES: usize = 32_768;
+
 /// Vandermonde bases for `count` input slices: the first `count` full-order
 /// powers of the primitive element, i.e. `antilog[logbase]` skipping every
 /// `logbase` with `gcd(65535, logbase) != 1`. Fails closed past the group
-/// order (the scheme has no more full-order bases beyond it).
+/// order (the scheme has no more full-order bases beyond it), and rejects
+/// counts past [`MAX_INPUT_BASES`] before allocating.
 pub fn input_bases(count: usize) -> Option<Vec<u16>> {
+    if count > MAX_INPUT_BASES {
+        return None;
+    }
     let alog = alog_table();
     let mut bases = Vec::with_capacity(count);
     let mut logbase: u32 = 0;
@@ -203,9 +212,9 @@ pub fn nibble_tables(factor: u16) -> NibbleMul {
 }
 
 /// Scalar multiply-accumulate: `dst[i] ^= mul(src[i], factor)` via `t`.
-/// Lengths must match; empty slices are a no-op.
+/// Panics on length mismatch; empty slices are a no-op.
 pub fn madd_scalar(dst: &mut [u16], src: &[u16], t: &NibbleMul) {
-    debug_assert_eq!(dst.len(), src.len());
+    assert_eq!(dst.len(), src.len());
     for (d, &w) in dst.iter_mut().zip(src.iter()) {
         let n0 = (w & 0xF) as usize;
         let n1 = ((w >> 4) & 0xF) as usize;
@@ -333,7 +342,10 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
 /// Dispatches to the simd128 kernel where available, otherwise the scalar
 /// nibble loop. A zero factor is a no-op (matches the reference early-out).
 pub fn madd(dst: &mut [u16], src: &[u16], factor: u16) {
-    debug_assert_eq!(dst.len(), src.len());
+    // Unconditional: this safe fn guards unsafe backend reads sized by
+    // `dst.len()`, so a shorter `src` must panic here, never read OOB in a
+    // release simd128 build.
+    assert_eq!(dst.len(), src.len());
     if factor == 0 || dst.is_empty() {
         return;
     }

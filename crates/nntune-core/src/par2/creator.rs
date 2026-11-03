@@ -65,6 +65,14 @@ pub const MAX_DATA_SLICES: u64 = 20_000;
 /// length/slice combination from committing gigabytes in a Worker isolate.
 pub const MAX_ACCUMULATOR_BYTES: u64 = 256 << 20;
 
+/// Scratch budget for the [`recover_slices`] dense solve (64 MiB). The
+/// Gauss-Jordan inversion holds three `m × m` `u16` matrices for `m` missing
+/// slices (6`m`² bytes), so this caps `m` near 3 300 — far above honest
+/// geometry (10% redundancy over at most [`MAX_DATA_SLICES`] slices caps `m`
+/// at ~2 000) while failing closed on absurd geometry (20 000 missing would
+/// otherwise commit ~2.4 GB and OOM the isolate).
+pub const MAX_RECOVERY_SCRATCH_BYTES: u64 = 64 << 20;
+
 /// Streaming zero-run chunk for slice-tail padding (same shape as the read
 /// side's hasher chunks).
 const ZERO_CHUNK_SIZE: usize = 8192;
@@ -464,7 +472,9 @@ pub fn create_single_file(filename: &[u8], data: &[u8], slice_size: u64) -> Resu
 ///
 /// Returns the reconstructed `(index, bytes)` pairs in index order. Errors
 /// when more slices are missing than recovery slices cover, on size or index
-/// violations, or on a singular matrix (which honest sets never produce).
+/// violations, when the dense-solve scratch would pass
+/// [`MAX_RECOVERY_SCRATCH_BYTES`], or on a singular matrix (which honest
+/// sets never produce).
 pub fn recover_slices(
     block_size: usize,
     data_count: usize,
@@ -507,6 +517,19 @@ pub fn recover_slices(
     }
     if missing.is_empty() {
         return Ok(Vec::new());
+    }
+    // Fail closed before the dense `m × m` solve below: three `u16`
+    // matrices (6 bytes per cell) must fit the scratch budget, checked
+    // without overflow.
+    {
+        let m = missing.len() as u64;
+        let bytes = m.checked_mul(m).and_then(|cells| cells.checked_mul(6));
+        if bytes.map_or(true, |b| b > MAX_RECOVERY_SCRATCH_BYTES) {
+            return Err(malformed(format!(
+                "recovery of {} slices needs past the {MAX_RECOVERY_SCRATCH_BYTES}-byte scratch budget",
+                missing.len()
+            )));
+        }
     }
 
     let bases = gf16::input_bases(data_count).ok_or_else(|| malformed("no bases"))?;

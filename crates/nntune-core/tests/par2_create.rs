@@ -280,6 +280,33 @@ fn kernel_matches_independent_russian_peasant_model() {
     gf16::madd(&mut empty, &[], 7);
 }
 
+#[test]
+#[should_panic(expected = "assertion")]
+fn madd_panics_on_length_mismatch() {
+    // Release simd128 sizes its unsafe reads by `dst.len()`; a shorter `src`
+    // must panic here, never read out of bounds.
+    let mut dst = vec![0u16; 8];
+    gf16::madd(&mut dst, &[], 1);
+}
+
+#[test]
+#[should_panic(expected = "assertion")]
+fn madd_scalar_panics_on_length_mismatch() {
+    let mut dst = vec![0u16; 8];
+    let t = gf16::nibble_tables(1);
+    gf16::madd_scalar(&mut dst, &[1u16, 2], &t);
+}
+
+#[test]
+fn input_bases_rejects_impossible_counts() {
+    // φ(65535) = 32 768 full-order bases exist; anything larger is
+    // impossible and must fail closed instead of panicking on capacity.
+    assert!(gf16::input_bases(usize::MAX).is_none());
+    assert!(gf16::input_bases(32_769).is_none());
+    assert_eq!(gf16::input_bases(32_768).unwrap().len(), 32_768);
+    assert!(gf16::input_bases(0).unwrap().is_empty());
+}
+
 // --- Round-trips -----------------------------------------------------------------
 
 fn roundtrip(data_len: usize, slice: u64, erase: &[u32], seed: u64) {
@@ -368,6 +395,15 @@ fn loss_beyond_redundancy_fails() {
         &set.recovery_pairs(),
     )
     .is_err());
+}
+
+#[test]
+fn recover_slices_rejects_absurd_matrix_geometry() {
+    // 20 000 missing slices of 2 bytes each is ~80 KB of input but a
+    // 20 000 × 20 000 dense solve (~2.4 GB): fail closed on the scratch
+    // budget instead of OOMing the isolate.
+    let recovery: Vec<(u16, Vec<u8>)> = (0..20_000).map(|i| (i as u16, vec![0u8; 2])).collect();
+    assert!(recover_slices(2, 20_000, &[], &recovery).is_err());
 }
 
 // --- Reference-binary interop (gated) --------------------------------------------
