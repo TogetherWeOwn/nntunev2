@@ -31,6 +31,10 @@ nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
 # Shared SSRF address guard + test vectors (single owner with the ingest
 # fetch guards; never fork the predicate).
 nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
+# Shared NZB parser for admin ingest validation (default-features off:
+# no TLS transport in this worker's graph; same shape as
+# workers/ingest).
+nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"

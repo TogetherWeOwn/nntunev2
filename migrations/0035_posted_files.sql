@@ -1,4 +1,4 @@
--- NNTune v2 migration 0034: two-spool posted-file ledger (TWO-1768).
+-- NNTune v2 migration 0035: two-spool posted-file ledger (TWO-1768).
 --
 -- One content-global row per tagged plaintext sha256, recording the
 -- first-spool post and the second-spool (stage B2.5) verification state.
@@ -32,6 +32,8 @@
 -- - All DDL is IF NOT EXISTS (replay-safe): the replay pass in
 --   workers/api/tests/run_migration_tests.sh re-applies this file as a
 --   clean no-op.
+
+SET search_path = public, pg_catalog;
 
 CREATE TABLE IF NOT EXISTS posted_files (
     id                  TEXT PRIMARY KEY DEFAULT (gen_random_uuid()::TEXT)

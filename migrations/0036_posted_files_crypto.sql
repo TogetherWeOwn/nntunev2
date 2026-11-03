@@ -1,9 +1,9 @@
--- NNTune v2 migration 0035: posted-file crypto envelope + geometry (TWO-1761).
+-- NNTune v2 migration 0036: posted-file crypto envelope + geometry (TWO-1761).
 --
--- Extends the migration 0034 `posted_files` row (TWO-1768 two-spool ledger)
+-- Extends the migration 0035 `posted_files` row (TWO-1768 two-spool ledger)
 -- with the encrypt-on-write half of the record: the per-file key and the
 -- NZB/article geometry, both sealed in the existing AES-GCM envelope v2.
--- 0034 carries copy state (backbone pair, counts, spool states); this file
+-- 0035 carries copy state (backbone pair, counts, spool states); this file
 -- carries key custody and geometry. One table, one writer module
 -- (workers/ingest/src/posted_files.rs); the verify card owns state reuse.
 --
@@ -11,7 +11,7 @@
 -- inside the sealed manifest envelope below — never as plaintext columns,
 -- files, URLs or log lines. `header_nonce` is public (article 0 carries
 -- the rclone header in the clear). Backbone labels stay labels-only
--- (0034 CHECKs); hostnames/usernames never reach the database.
+-- (0035 CHECKs); hostnames/usernames never reach the database.
 --
 -- Envelope layout (mirrors track_sources file_ref_*/nzb_ref_* in
 -- migrations/0022_library_artifacts.sql):
@@ -54,13 +54,15 @@
 -- ENVELOPE_AAD_* in workers/ingest/src/posted_files.rs.
 --
 -- Conventions (each pinned to a precedent, not invented here):
--- - BIGINT epoch seconds with the 253402300799 ceiling (0022, 0034), not
+-- - BIGINT epoch seconds with the 253402300799 ceiling (0022, 0035), not
 --   timestamptz; post_verified_at/last_retention_check are NULL until the
---   verify/retention flows stamp them (0034 original_nzb_sha256 precedent
+--   verify/retention flows stamp them (0035 original_nzb_sha256 precedent
 --   for NULL-able flow-stamped columns).
 -- - All DDL is IF NOT EXISTS (replay-safe): the replay pass in
 --   workers/api/tests/run_migration_tests.sh re-applies this file as a
 --   clean no-op.
+
+SET search_path = public, pg_catalog;
 
 ALTER TABLE posted_files
     ADD COLUMN IF NOT EXISTS plaintext_size BIGINT

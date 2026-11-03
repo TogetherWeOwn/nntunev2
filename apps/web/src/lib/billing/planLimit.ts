@@ -27,7 +27,9 @@ import { formatResetInstant } from './usage';
  *   out the countdown or upgrade immediately. `x-plan-limit:
  *   concurrent_streams=<cap>` names the other-device surface (spec §3.4's
  *   two-level truth: the other device pauses itself within ~15 s, its
- *   next track is refused, already-delivered audio is not recalled).
+ *   next track is refused, already-delivered audio is not recalled). The
+ *   lease is not plan-raisable — every plan allows one concurrent stream —
+ *   so that model explains the other device and omits the upgrade CTA.
  *
  * The wire shape of the limit headers is `x-plan-limit: <dimension>=<cap>`
  * (server `Denial::headers`); only the dimension before `=` is matched.
@@ -63,7 +65,14 @@ export interface PaywallModel {
 	status: number;
 	/** Server limit code (`plan_limit_exceeded`, `subscription_required`, `rate_limited`, ...) when the body named one. */
 	code: string | null;
-	ctaHref: '/pricing' | '/account/billing';
+	/**
+	 * CTA destination (pricing, or the billing page for lapsed
+	 * subscriptions), or null when no plan change can help (the
+	 * concurrent-stream lease: every plan plays on one device at a
+	 * time, so the modal omits the upgrade action instead of promising
+	 * one that changes nothing).
+	 */
+	ctaHref: '/pricing' | '/account/billing' | null;
 	/** CTA link text; the modal falls back to its upgrade wording when omitted. */
 	ctaLabel?: string;
 	headline: string;
@@ -258,9 +267,11 @@ export function formatCountdown(totalSeconds: number): string {
  * lapsed (→ billing page / portal); `plan_limit_exceeded` is the at-cap
  * surface only for the `stream_hours_month` dimension (the same code
  * covers the daily ingest cap); a 429 naming `concurrent_streams` is the
- * other-device surface. Every other limit response — other dimensions,
- * a missing dimension, uncoded bodies — keeps the generic copy, so a
- * non-playback refusal never claims listening hours are exhausted.
+ * other-device surface, with no upgrade CTA (`ctaHref: null`) because no
+ * plan raises that allowance. Every other limit response — other
+ * dimensions, a missing dimension, uncoded bodies — keeps the generic
+ * copy, so a non-playback refusal never claims listening hours are
+ * exhausted.
  */
 export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 	if (res.status !== 402 && res.status !== 429) return null;
@@ -313,8 +324,10 @@ export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 	if (!terminal && dimension === 'concurrent_streams') {
 		return {
 			...base,
-			ctaHref: PRICING_HREF,
-			ctaLabel: 'See plans',
+			// No plan raises the concurrent allowance (every plan seeds
+			// one stream), so no upgrade CTA: it would promise a fix
+			// pricing cannot deliver.
+			ctaHref: null,
 			headline: 'Playing on another device',
 			detail: OTHER_DEVICE_DETAIL
 		};

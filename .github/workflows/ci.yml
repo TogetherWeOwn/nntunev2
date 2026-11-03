@@ -895,6 +895,9 @@ jobs:
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0030_mb_mirror_w6b.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
+          # These pre-convention migrations carry no search_path header, so pin
+          # the session exactly like workers/api/tests/run_migration_tests.sh.
+          PGOPTIONS: '-c search_path=public,pg_catalog'
       - name: Run import integration suite in the shipped image
         run: >-
           docker run --rm --network host

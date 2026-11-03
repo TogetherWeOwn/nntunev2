@@ -16,8 +16,11 @@
 //!   portable core emits exactly one signal (see [`crate::play_route`]).
 //! - `POST /probe` on the Durable Object runs one ingest probe batch
 //!   ([`crate::probe`]); `POST /body` fetches one article body
-//!   ([`crate::body`]); `POST /delivered` validates and acknowledges one
-//!   delivered-byte report ([`crate::delivered`]). There is no public
+//!   ([`crate::body`]); `POST /delivered` accounts one delivered-byte
+//!   report into the per-play meter book ([`crate::delivered`],
+//!   [`crate::meter_sink`]) persisted in DO storage, and the DO alarm
+//!   flushes cumulative windows to the api Worker's signed internal
+//!   endpoint over the `API` service binding until acked. There is no public
 //!   route to any of them: callers reach the object through a Durable
 //!   Object binding (`NNTP_POOL`, cross-script from the ingest Worker for
 //!   probe/body; this Worker's own binding for delivered), addressed by
@@ -43,8 +46,9 @@ use worker::{
 
 use crate::api_error::ApiError;
 use crate::body::{parse_body_request, run_body, BodyReply, MAX_BODY_REQUEST_BYTES};
-use crate::delivered::{serve_delivered, DeliveredInterval, MAX_DELIVERED_REQUEST_BYTES};
+use crate::delivered::{parse_delivered_report, DeliveredInterval, MAX_DELIVERED_REQUEST_BYTES};
 use crate::grant;
+use crate::meter_sink::{self, MeterBook};
 use crate::play_route::{self, PLAY_CONTENT_TYPE, TRACK_MANIFEST_SUFFIX};
 use crate::pool::Pool;
 use crate::probe::{
@@ -66,6 +70,20 @@ const AUDIO_CACHE_BINDING: &str = "AUDIO_CACHE";
 const POOL_BINDING: &str = "NNTP_POOL";
 /// Delivered-report URL on the pool object (path: [`routes::DELIVERED_PATH`]).
 const POOL_DELIVERED_URL: &str = "https://nntp-pool/delivered";
+/// Service binding to the api Worker (meter sink flush target).
+const API_SERVICE_BINDING: &str = "API";
+/// Flush URL on the api Worker (path: [`meter_sink::SINK_PATH`]); the
+/// host is never resolved — the service binding routes the fetch.
+const API_SINK_URL: &str = "https://nntune-api/internal/v1/play-windows";
+/// First flush delay after a delivered report lands: long enough to
+/// batch a burst of range responses from one play, short enough that
+/// monthly usage trails playback by seconds, not minutes.
+const METER_FLUSH_DELAY_MS: i64 = 20_000;
+/// Re-arm delay after a failed or unconfigured flush; the windows
+/// stay pending in DO storage across alarms and evictions.
+const METER_RETRY_DELAY_MS: i64 = 60_000;
+/// Re-arm delay when a batch cap left more windows pending.
+const METER_CONTINUE_DELAY_MS: i64 = 1_000;
 /// A track pointer object is one sha256-hex hash; anything bigger is not a
 /// pointer and is never buffered whole.
 const MAX_POINTER_BYTES: u64 = 256;
@@ -210,6 +228,7 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
                 track_id: track_id.to_string(),
                 start,
                 end: start,
+                file_bytes: Some(blob_len),
             },
         )),
     };
@@ -315,9 +334,12 @@ fn api_error_response(error: &ApiError, extra: Option<(&str, &str)>) -> Result<R
         .with_headers(headers))
 }
 
-#[durable_object(fetch)]
+#[durable_object(alarm)]
 pub struct NntpPool {
     state: State,
+    /// The Worker's bindings, kept for the alarm: the meter flush needs
+    /// the `API` service binding and the `METER_SINK_SECRET` secret.
+    env: Env,
     /// Built by the first probe that passes validation and loads provider
     /// settings, with the provider's cap; a changed cap applies when the
     /// runtime next evicts this instance.
@@ -328,9 +350,10 @@ pub struct NntpPool {
 impl DurableObject for NntpPool {
     /// Builds the object without a pool; `pool` stays unset until a probe
     /// passes validation and loads provider settings.
-    fn new(state: State, _env: Env) -> Self {
+    fn new(state: State, env: Env) -> Self {
         Self {
             state,
+            env,
             pool: OnceCell::new(),
             clock: WallClock::default(),
         }
@@ -348,6 +371,21 @@ impl DurableObject for NntpPool {
             PoolAction::RunProbe => respond(self.probe(&mut req).await),
             PoolAction::RunBody => respond_body(self.body(&mut req).await),
             PoolAction::RunDelivered => respond(self.delivered(&mut req).await),
+        }
+    }
+
+    /// Meter flush alarm: drains pending play windows to the api sink
+    /// and re-arms itself while any remain ([`NntpPool::flush_meter`]).
+    /// Failure paths reschedule explicitly; only when the reschedule
+    /// itself fails (the alarm storage write) does this error out, so
+    /// the platform's alarm retry is the backstop of last resort
+    /// instead of a silently stranded book.
+    async fn alarm(&self) -> Result<Response> {
+        match self.flush_meter().await {
+            Ok(()) => Response::empty(),
+            Err(()) => Err(worker::Error::RustError(
+                "meter flush could not reschedule its alarm".to_string(),
+            )),
         }
     }
 }
@@ -434,9 +472,12 @@ impl NntpPool {
         BodyReply::from(run_body(pool, dial, tick, &fetch).await)
     }
 
-    /// Validates and acknowledges one delivered-byte report for this
-    /// object's owner ([`crate::delivered`]); accounting lands with
-    /// the enforcement and meter card behind this envelope.
+    /// Accounts one delivered-byte report for this object's owner:
+    /// validate ([`crate::delivered`]), merge into the persisted meter
+    /// book ([`MeterBook`]), and make sure a flush alarm is armed. The
+    /// `202` acknowledge renders through [`crate::delivered::DeliveredReply`]
+    /// exactly as before accounting existed; storage trouble answers
+    /// `503` so the play route re-reports (duplicates merge to zero).
     async fn delivered(&self, req: &mut Request) -> ProbeReply {
         let Some(pool_user) = self.state.id().name() else {
             return route_reply(ProbeDecision::OwnerMissing);
@@ -445,7 +486,193 @@ impl NntpPool {
             Ok(body) => body,
             Err(e) => return ProbeReply::from(Err(e)),
         };
-        serve_delivered(&pool_user, &body).into()
+        let interval = match parse_delivered_report(&body, &pool_user) {
+            Ok(interval) => interval,
+            Err(e) => {
+                return crate::delivered::DeliveredReply::from(Result::<(), ProbeError>::Err(e))
+                    .into()
+            }
+        };
+        let storage_busy = || {
+            crate::delivered::DeliveredReply::from(Result::<(), ProbeError>::Err(
+                ProbeError::Busy {
+                    retry_after_ms: 1000,
+                },
+            ))
+        };
+        let now_unix = Date::now().as_millis() / 1000;
+        let mut book = match self.load_meter_book(&pool_user).await {
+            Ok(book) => book,
+            Err(()) => return storage_busy().into(),
+        };
+        if !book.record(&interval, now_unix) {
+            return crate::delivered::DeliveredReply::from(Result::<(), ProbeError>::Err(
+                ProbeError::BadRequest("report does not fit the meter book"),
+            ))
+            .into();
+        }
+        if self.save_meter_book(&book).await.is_err() {
+            return storage_busy().into();
+        }
+        // The 202 tells the play route to stop retrying, so it is
+        // only earned once a flush alarm demonstrably exists: on an
+        // arming failure answer busy and let the route re-report —
+        // the duplicate merges to zero and re-arms.
+        if self.arm_meter_alarm(METER_FLUSH_DELAY_MS).await.is_err() {
+            return storage_busy().into();
+        }
+        crate::delivered::DeliveredReply::from(Ok(())).into()
+    }
+
+    /// The persisted meter book for this object's owner, or a fresh
+    /// one when storage holds none (or holds another owner's — the
+    /// object id IS the user, so a mismatched book can only be
+    /// corruption; starting over under-meters rather than misbills).
+    async fn load_meter_book(&self, pool_user: &str) -> core::result::Result<MeterBook, ()> {
+        let stored: Option<MeterBook> = self
+            .state
+            .storage()
+            .get(meter_sink::METER_BOOK_KEY)
+            .await
+            .map_err(|_| ())?;
+        Ok(match stored {
+            Some(book) if book.user_id == pool_user => book,
+            _ => MeterBook::new(pool_user),
+        })
+    }
+
+    async fn save_meter_book(&self, book: &MeterBook) -> core::result::Result<(), ()> {
+        self.state
+            .storage()
+            .put(meter_sink::METER_BOOK_KEY, book)
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Arm the flush alarm unless one is already pending: one alarm
+    /// drains the whole book, so re-arming per report would only push
+    /// the flush later. `Err` means no alarm is known to exist — the
+    /// caller must not acknowledge work as durably scheduled.
+    async fn arm_meter_alarm(&self, delay_ms: i64) -> core::result::Result<(), ()> {
+        let storage = self.state.storage();
+        match storage.get_alarm().await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => storage.set_alarm(delay_ms).await.map_err(|_| ()),
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Unconditionally (re)schedule the next flush attempt.
+    async fn reschedule_meter_alarm(&self, delay_ms: i64) -> core::result::Result<(), ()> {
+        self.state
+            .storage()
+            .set_alarm(delay_ms)
+            .await
+            .map_err(|_| ())
+    }
+
+    /// One flush pass: send the pending cumulative windows to the api
+    /// sink, mark what it answered terminally, persist, and re-arm
+    /// while anything remains. Every failure path keeps the windows
+    /// pending and schedules a retry — a window is only ever dropped
+    /// by the api naming it terminal, or by the flushed-retention
+    /// eviction after an ack. `Err` is reserved for "the retry alarm
+    /// itself could not be scheduled"; the alarm handler surfaces it
+    /// so the platform retries the alarm instead of stranding the
+    /// book.
+    async fn flush_meter(&self) -> core::result::Result<(), ()> {
+        let Some(pool_user) = self.state.id().name() else {
+            return Ok(());
+        };
+        let Ok(mut book) = self.load_meter_book(&pool_user).await else {
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+        };
+        let now_unix = Date::now().as_millis() / 1000;
+        let sent = book.pending_windows();
+        if sent.is_empty() {
+            book.evict_flushed(now_unix);
+            let _ = self.save_meter_book(&book).await;
+            return Ok(());
+        }
+        let Some(body) = meter_sink::batch_body(&sent) else {
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+        };
+        let secret = self
+            .env
+            .secret(meter_sink::METER_SINK_SECRET_VAR)
+            .ok()
+            .map(|value| value.to_string().into_bytes());
+        let Some(authorization) =
+            meter_sink::authorization_header(secret.as_deref(), now_unix, &body)
+        else {
+            // Unprovisioned or short secret: never flush unsigned.
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+        };
+        let ack = match self.post_meter_batch(&authorization, body).await {
+            Ok(ack) => ack,
+            Err(()) => {
+                return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+            }
+        };
+        // The fetch above awaited with the input gates open (they
+        // only hold during storage operations), so /delivered may
+        // have recorded and saved a newer book mid-flight. Apply the
+        // ack to a RELOADED book: saving the pre-fetch copy would
+        // erase those intervals, and their 202 already told the play
+        // route not to retry. `mark_flushed` clamps to each play's
+        // current union, so mid-flight growth stays pending. If the
+        // reload fails, leave everything pending — re-sending the
+        // same cumulative snapshots is a no-op at the api.
+        let Ok(mut book) = self.load_meter_book(&pool_user).await else {
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+        };
+        book.mark_flushed(&sent, &ack.terminal_play_ids());
+        book.evict_flushed(now_unix);
+        if self.save_meter_book(&book).await.is_err() {
+            // The api already converged these cumulative snapshots;
+            // re-sending them after a storage failure is a no-op there.
+            return self.reschedule_meter_alarm(METER_RETRY_DELAY_MS).await;
+        }
+        if book.has_pending() {
+            return self.reschedule_meter_alarm(METER_CONTINUE_DELAY_MS).await;
+        }
+        Ok(())
+    }
+
+    /// POST one signed batch to the api sink and parse its ack. Any
+    /// transport error, non-200 status, or unreadable ack retries via
+    /// the next alarm: the api upsert is cumulative and monotonic, so
+    /// re-sending a batch whose ack was lost adds zero.
+    async fn post_meter_batch(
+        &self,
+        authorization: &str,
+        body: Vec<u8>,
+    ) -> core::result::Result<meter_sink::FlushAck, ()> {
+        let fetcher = self.env.service(API_SERVICE_BINDING).map_err(|_| ())?;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|_| ())?;
+        headers
+            .set("authorization", authorization)
+            .map_err(|_| ())?;
+        let body_text = String::from_utf8(body).map_err(|_| ())?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body_text)));
+        let request = Request::new_with_init(API_SINK_URL, &init).map_err(|_| ())?;
+        let mut response = fetcher.fetch_request(request).await.map_err(|_| ())?;
+        if response.status_code() != 200 {
+            return Err(());
+        }
+        // The ack names at most the batch's play ids; cap the read so
+        // a hostile or broken endpoint cannot balloon the DO.
+        let text = response.text().await.map_err(|_| ())?;
+        if text.len() > 64 * 1024 {
+            return Err(());
+        }
+        meter_sink::parse_ack(text.as_bytes()).ok_or(())
     }
 
     /// The user's provider settings and connection cap.

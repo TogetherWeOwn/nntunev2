@@ -85,7 +85,7 @@ emit the code.
 | `account_deleting` | 409 | false | api | An account the write targets — the caller's own, or an admin write's subject — is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
 | `invalid_request` | 400 | false | api, ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `MB_SEARCH_EMPTY_QUERY` | 400 | false | mb | Empty or whitespace-only `q` on `GET /v1/mb/search`; returned before `type` validation without touching the mirror or the cache. Send a non-empty `q` of at least 2 chars. |
-| `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
+| `payload_too_large` | 413 | false | api, ingest | Body, NZB, or element counts exceed the intake caps. The api worker emits it only for admin NZB uploads that breach the admin caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |
 | `validation_failed` | 422 | false | api | Well-formed request whose values fail validation (names, items, provider config). |
 | `rate_limited` | 429 | true | api, ingest, stream | Too many requests or no pool connection free right now; retry after backoff. |

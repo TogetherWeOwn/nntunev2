@@ -233,7 +233,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+/// HMAC-SHA256 over `msg`; shared with the meter sink signer
+/// ([`crate::meter_sink`]) so the crate keeps one MAC implementation.
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let key_block: [u8; 64] = if key.len() > 64 {
         let digest = sha256(key);
         let mut block = [0u8; 64];

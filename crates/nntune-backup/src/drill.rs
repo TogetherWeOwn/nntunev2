@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::bundle::{self, BundleError, BundleWriter, Manifest, TableCount};
 use crate::envelope::{
@@ -31,6 +31,15 @@ const RCLONE_MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
 const HEADER_NONCE_LEN: usize = 24;
 const PLAIN_BLOCK: usize = 64 * 1024;
 const DERIVED_LEN: usize = 80;
+/// First ranged-read length (article-window shaped). The fixture must
+/// exceed it so *both* ranged reads authenticate ciphertext, and it
+/// already exceeds one 64 KiB rclone block, so the drill also proves
+/// decrypt across a block boundary.
+const FIRST_READ_LEN: u64 = 70_000;
+/// Minimum fixture size: anything smaller would report success without
+/// authenticating a ciphertext block (`--bytes 0` is the degenerate
+/// case: two zero-length reads, matching empty hashes).
+pub const MIN_FIXTURE_BYTES: u64 = FIRST_READ_LEN + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrillError {
@@ -39,6 +48,7 @@ pub enum DrillError {
     Crypto(String),
     KeyringMissingVersion(u32),
     HashMismatch,
+    FixtureTooSmall,
 }
 
 impl core::fmt::Display for DrillError {
@@ -51,6 +61,10 @@ impl core::fmt::Display for DrillError {
                 write!(f, "drill keyring missing version: {v}")
             }
             DrillError::HashMismatch => write!(f, "drill hash mismatch"),
+            DrillError::FixtureTooSmall => write!(
+                f,
+                "drill fixture too small: must exceed {FIRST_READ_LEN} bytes"
+            ),
         }
     }
 }
@@ -243,10 +257,24 @@ pub fn restore_and_decrypt(
 
     // Fail closed before touching any row: the bundle must verify,
     // both at the backup store and again after the copy into the
-    // isolated restore environment. All reads below come from
-    // `restore_dir`, never `bundle_dir`.
+    // isolated restore environment.
     bundle::verify_bundle(bundle_dir).map_err(DrillError::Bundle)?;
     copy_dir(bundle_dir, restore_dir).map_err(|e| DrillError::Bundle(BundleError::Io(e)))?;
+    decrypt_restored_dir(restore_dir, keyring, tool, started)
+}
+
+/// Decrypt the fixture from an already-isolated restore directory.
+/// Split from [`restore_and_decrypt`] so the evidence hash can be
+/// tested with the source and restored manifests diverged: this
+/// function takes no `bundle_dir` at all, so the manifest digest it
+/// reports can only come from the restored copy. All reads come from
+/// `restore_dir`, never the backup store.
+fn decrypt_restored_dir(
+    restore_dir: &Path,
+    keyring: &KeyringRecovery,
+    tool: &str,
+    started: i64,
+) -> Result<DrillEvidence, DrillError> {
     let manifest = bundle::verify_bundle(restore_dir).map_err(DrillError::Bundle)?;
 
     let row_raw = std::fs::read(restore_dir.join("tables/track_sources.jsonl"))
@@ -255,14 +283,17 @@ pub fn restore_and_decrypt(
         serde_json::from_slice(row_raw.split(|b| *b == b'\n').next().unwrap_or(&row_raw))
             .map_err(|e| DrillError::Bundle(BundleError::Json(e.to_string())))?;
 
-    let kek = keyring.get(row.kek_version)?;
+    // `Zeroizing` so every `?` exit below (malformed row fields,
+    // failed open, blob read) drops the KEK zeroized instead of
+    // leaving the copy on the stack.
+    let mut kek = Zeroizing::new(keyring.get(row.kek_version)?);
     let env = Envelope {
         dek_wrapped_nonce: b64_nonce(&row.dek_wrapped_nonce_b64)?,
         dek_wrapped: b64_bytes(&row.dek_wrapped_b64, 48)?,
         payload_nonce: b64_nonce(&row.payload_nonce_b64)?,
         ciphertext: b64_bytes(&row.ciphertext_b64, 0)?,
     };
-    let media_key = envelope::open_media_key(
+    let mut media_key = match envelope::open_media_key(
         &kek,
         &row.user_id,
         &row.row_key,
@@ -270,12 +301,23 @@ pub fn restore_and_decrypt(
         row.payload_format,
         row.kek_version,
         &env,
-    )?;
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            kek.zeroize();
+            return Err(DrillError::Envelope(e));
+        }
+    };
+    kek.zeroize();
     if media_key.len() != 32 {
+        media_key.zeroize();
         return Err(DrillError::Crypto("media key length".to_string()));
     }
-    let mut derived = [0u8; DERIVED_LEN];
+    // `Zeroizing` for the same reason: the blob `fs::read` `?`
+    // below must not drop the derived key material unzeroized.
+    let mut derived = Zeroizing::new([0u8; DERIVED_LEN]);
     derived[..32].copy_from_slice(&media_key);
+    media_key.zeroize();
 
     let blob = std::fs::read(restore_dir.join("blobs/drill-track-1.bin"))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("blob read: {e}"))))?;
@@ -287,24 +329,35 @@ pub fn restore_and_decrypt(
     // the row: try sizes by block arithmetic from the ciphertext
     // length (last block may be partial).
     let plaintext_size = plaintext_size_from_blob(blob.len() as u64);
-    let mut first = vec![0u8; plaintext_size.min(70_000) as usize];
-    let n1 = nntune_core::decrypt::rclone::read_at(&blob, &derived, plaintext_size, &mut first, 0)
-        .map_err(|e| DrillError::Crypto(e.to_string()))?;
+    let mut first = vec![0u8; plaintext_size.min(FIRST_READ_LEN) as usize];
+    let n1 =
+        nntune_core::decrypt::rclone::read_at(&blob, &derived[..], plaintext_size, &mut first, 0)
+            .map_err(|e| {
+            derived.zeroize();
+            DrillError::Crypto(e.to_string())
+        })?;
     first.truncate(n1);
     let mut rest = vec![0u8; plaintext_size.saturating_sub(n1 as u64) as usize];
     let n2 = nntune_core::decrypt::rclone::read_at(
         &blob,
-        &derived,
+        &derived[..],
         plaintext_size,
         &mut rest,
         n1 as u64,
     )
-    .map_err(|e| DrillError::Crypto(e.to_string()))?;
+    .map_err(|e| {
+        derived.zeroize();
+        DrillError::Crypto(e.to_string())
+    })?;
     rest.truncate(n2);
+    derived.zeroize();
     let mut restored = first;
     restored.extend_from_slice(&rest);
 
-    let manifest_raw = std::fs::read(bundle_dir.join(bundle::MANIFEST_FILE))
+    // The evidence hash covers the manifest as restored into the
+    // isolated environment — the same copy every other read above
+    // came from — never the backup-store original.
+    let manifest_raw = std::fs::read(restore_dir.join(bundle::MANIFEST_FILE))
         .map_err(|e| DrillError::Bundle(BundleError::Io(format!("manifest read: {e}"))))?;
     let finished = now_unix();
     Ok(DrillEvidence {
@@ -345,9 +398,16 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
         let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
+            // `file_type` does not follow links (unlike `is_dir` on the
+            // path): an offsite bundle containing a symlink refuses the
+            // restore instead of traversing outside the bundle boundary.
+            let ftype = entry.file_type().map_err(|e| e.to_string())?;
+            if ftype.is_symlink() {
+                return Err(format!("refuses symlink: {}", entry.path().display()));
+            }
             let path = entry.path();
             let rel = path.strip_prefix(src).map_err(|e| e.to_string())?;
-            if path.is_dir() {
+            if ftype.is_dir() {
                 stack.push(path);
             } else {
                 std::fs::copy(&path, dst.join(rel)).map_err(|e| e.to_string())?;
@@ -386,6 +446,12 @@ pub fn run_synthetic_drill(
     plaintext: &[u8],
     tool: &str,
 ) -> Result<(DrillEvidence, PathBuf, PathBuf), DrillError> {
+    // Fail closed on fixtures that would pass without authenticating a
+    // ciphertext block: empty or sub-`FIRST_READ_LEN` plaintexts leave
+    // one ranged read empty and never cross a block boundary.
+    if (plaintext.len() as u64) < MIN_FIXTURE_BYTES {
+        return Err(DrillError::FixtureTooSmall);
+    }
     let seq = DRILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tag = format!("{}-{}-{seq}", std::process::id(), now_unix());
     let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
@@ -469,6 +535,79 @@ mod tests {
             err,
             DrillError::Bundle(BundleError::HashMismatch { .. })
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn undersized_fixture_fails_closed() {
+        // Empty and sub-`FIRST_READ_LEN` fixtures must not report
+        // success: they authenticate no ciphertext block.
+        assert_eq!(
+            run_synthetic_drill(&[], "test").unwrap_err(),
+            DrillError::FixtureTooSmall
+        );
+        let small = vec![0u8; FIRST_READ_LEN as usize];
+        assert_eq!(
+            run_synthetic_drill(&small, "test").unwrap_err(),
+            DrillError::FixtureTooSmall
+        );
+        // Exactly one byte over the first-read length passes admission
+        // (and crosses a 64 KiB block boundary).
+        let pt: Vec<u8> = (0..MIN_FIXTURE_BYTES).map(|i| (i % 251) as u8).collect();
+        let (ev, bundle_dir, restore_dir) = run_synthetic_drill(&pt, "test").unwrap();
+        assert!(ev.hash_match);
+        let _ = std::fs::remove_dir_all(bundle_dir.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_refuses_symlink() {
+        let tag = format!("{}-symlink", std::process::id());
+        let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.bin"), b"real").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(src.join("real.bin"), src.join("link.bin")).unwrap();
+        let err = copy_dir(&src, &dst).unwrap_err();
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn evidence_hash_covers_restored_manifest() {
+        // The evidence digest must come from the manifest as restored
+        // into the isolated environment, never the backup-store
+        // original: diverge the two sides to different-but-valid bytes
+        // (compact vs pretty serialization, same semantics) before the
+        // decrypt half runs, and assert the restored digest. Reading
+        // the source manifest instead would report the diverged hash.
+        let pt = fixture_bytes();
+        let tag = format!("{}-manifest-src", std::process::id());
+        let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
+        let bundle_dir = base.join("backup-store");
+        let restore_dir = base.join("isolated-restore");
+        let _ = std::fs::remove_dir_all(&base);
+        let (_m, keyring) = backup_fixture(&bundle_dir, &pt, "test").unwrap();
+        copy_dir(&bundle_dir, &restore_dir).unwrap();
+        let restored_raw = std::fs::read(restore_dir.join(bundle::MANIFEST_FILE)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&restored_raw).unwrap();
+        let divergent = serde_json::to_vec(&v).unwrap();
+        assert_ne!(
+            divergent, restored_raw,
+            "test needs distinct serializations to diverge the manifests"
+        );
+        std::fs::write(bundle_dir.join(bundle::MANIFEST_FILE), &divergent).unwrap();
+        let started = now_unix();
+        let mut ev = decrypt_restored_dir(&restore_dir, &keyring, "test", started).unwrap();
+        ev.plaintext_sha256 = bundle::sha256_hex(&pt);
+        ev.hash_match = ev.plaintext_sha256 == ev.restored_sha256;
+        assert!(ev.hash_match);
+        assert_eq!(ev.bundle_manifest_sha256, bundle::sha256_hex(&restored_raw));
+        assert_ne!(ev.bundle_manifest_sha256, bundle::sha256_hex(&divergent));
         let _ = std::fs::remove_dir_all(&base);
     }
 
