@@ -151,6 +151,98 @@ def get(row: list[str], position: int) -> str:
     return row[position - 1]
 
 
+# COPY text escape vocabulary the curated dumps share with the validator
+# (crates/mb-import-validate) and the importer duplicate pre-check
+# (import.sh): named escapes, 1-3 octal digits (value <= 255) and 1-2 hex
+# digits. Anything else after a backslash is undecodable.
+_COPY_NAMED = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+               "v": "\v", "\\": "\\"}
+_COPY_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def copy_decode(token: str) -> str | None:
+    """Decode one COPY text field, or None when it cannot validate.
+
+    Mirrors the validator's decoder: raw upstream spellings such as `A B`
+    and `A\\040B` decode to the same value, so alias callers must group on
+    this (not on the raw token) before projecting.
+    """
+    out: list[str] = []
+    i, n = 0, len(token)
+    while i < n:
+        c = token[i]
+        if c != "\\":
+            if c == "\r":
+                return None
+            out.append(c)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            return None
+        e = token[i]
+        if e in _COPY_NAMED:
+            out.append(_COPY_NAMED[e])
+            i += 1
+        elif "0" <= e <= "7":
+            j = i
+            while j < n and j - i < 3 and "0" <= token[j] <= "7":
+                j += 1
+            if int(token[i:j], 8) > 255:
+                return None
+            out.append(chr(int(token[i:j], 8)))
+            i = j
+        elif e == "x":
+            j = i + 1
+            while j < n and j - i - 1 < 2 and token[j] in _COPY_HEX:
+                j += 1
+            if j == i + 1:
+                return None
+            out.append(chr(int(token[i + 1:j], 16)))
+            i = j
+        else:
+            return None
+    decoded = "".join(out)
+    if "\x00" in decoded:
+        return None
+    return decoded
+
+
+def copy_decode_or_raw(token: str) -> str:
+    """Decoded value for grouping, or the raw token when it cannot decode.
+
+    Undecodable spellings keep today's behaviour: they pass through to the
+    curated dump, where the validator routes them to the dead-letter table
+    instead of silently vanishing from the projection.
+    """
+    decoded = copy_decode(token)
+    return decoded if decoded is not None else token
+
+
+def copy_escape(decoded: str) -> str:
+    """Re-escape a decoded value for COPY text output.
+
+    The projection stores raw upstream bytes, so a decoded value must be
+    escaped before writing: a decoded tab or newline would otherwise split
+    the curated line, and a decoded backslash would read back as an escape.
+    Only called on values `copy_decode` accepted (no NUL, no raw CR).
+    """
+    return (decoded.replace("\\", "\\\\").replace("\b", "\\b")
+                   .replace("\f", "\\f").replace("\n", "\\n")
+                   .replace("\r", "\\r").replace("\t", "\\t")
+                   .replace("\v", "\\v"))
+
+
+def copy_roundtrip(token: str) -> str:
+    """Decode-then-escape one text field for curated output.
+
+    Equivalent spellings (`A B`, `A\\040B`) collapse to one canonical
+    token; undecodable spellings pass through raw for the poison path.
+    """
+    decoded = copy_decode(token)
+    return copy_escape(decoded) if decoded is not None else token
+
+
 def value(field: str) -> str | None:
     return None if field == NULL else field
 
@@ -286,6 +378,11 @@ def main() -> int:
             output_dir = work_dir / "curated"
             output_dir.mkdir()
             db = sqlite3.connect(db_path)
+            # COPY-decode helper for the alias projection: equivalent raw
+            # upstream spellings must share one window partition (see
+            # project_alias). Deterministic, so it is usable in ORDER BY.
+            db.create_function("copy_decode_or_raw", 1,
+                               copy_decode_or_raw, deterministic=True)
             try:
                 db.executescript("""
                     CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
@@ -849,11 +946,17 @@ def main() -> int:
                 """
                 release_credit_count = insert_select(db, release_credit_query, output_dir / "mbdump-release_credit.tsv", updated_at)
                 # Aliases: one row per (entity, name, locale), NULL locales
-                # rewritten to ''. Duplicate spellings collapse to one
-                # source row — the primary-for-locale row wins, then the
-                # greatest sort name — so sort_name and primary_flag always
-                # come from the same row instead of mixing MAX() columns
-                # from different rows.
+                # rewritten to ''. Rows group on the COPY-decoded name and
+                # locale — raw upstream spellings such as `A B` and
+                # `A\\040B` decode to one value, and separate groups would
+                # reach the TSV as two tokens for one key, tripping the
+                # importer's duplicate-key refusal. The winner's text
+                # fields are re-escaped for COPY output, so the curated
+                # dump carries one canonical spelling. Duplicate spellings
+                # collapse to one source row — the primary-for-locale row
+                # wins, then the greatest sort name — so sort_name and
+                # primary_flag always come from the same row instead of
+                # mixing MAX() columns from different rows.
                 def project_alias(table: str, parent: str, out: str) -> int:
                     query = f"""
                         SELECT gid,name,locale,sort_name,primary_flag FROM (
@@ -862,8 +965,9 @@ def main() -> int:
                                    al.sort_name AS sort_name,
                                    al.primary_flag AS primary_flag,
                                    ROW_NUMBER() OVER (
-                                       PARTITION BY a.gid,al.name,
-                                                    COALESCE(al.locale,'')
+                                       PARTITION BY a.gid,
+                                                    copy_decode_or_raw(al.name),
+                                                    copy_decode_or_raw(COALESCE(al.locale,''))
                                        ORDER BY al.primary_flag DESC,
                                                 al.sort_name DESC,
                                                 al.entity
@@ -871,11 +975,15 @@ def main() -> int:
                             FROM {table} al
                             JOIN {parent} a ON a.id=al.entity
                         ) WHERE rn=1
-                        ORDER BY gid,name,locale
+                        ORDER BY gid,
+                                 copy_decode_or_raw(name),
+                                 copy_decode_or_raw(locale)
                     """
                     return insert_select(
                         db, query, output_dir / out, updated_at,
-                        lambda row: (row[0], row[1], row[2], row[3],
+                        lambda row: (row[0], copy_roundtrip(row[1]),
+                                     copy_roundtrip(row[2]),
+                                     copy_roundtrip(row[3]),
                                      "true" if row[4] == "t" else "false"),
                     )
 

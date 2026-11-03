@@ -20,8 +20,8 @@ BEGIN;
 -- - Release credits project artist_credit_name rows through the release
 --   credit only; release-group credits stay deferred.
 -- - Alias tables collapse to one row per (entity, name, locale): NULL
---   locales become '' and duplicate spellings collapse with MAX() in the
---   ETL, so the natural-key primary key can never collide within a dump.
+--   locales become '' and duplicate spellings collapse with ROW_NUMBER() in
+--   the ETL, so the natural-key primary key can never collide within a dump.
 -- - release_label rows whose label is NULL are skipped in the ETL (a
 --   catalogue number with no label is not a label edge); NULL catalogue
 --   numbers become ''.
@@ -36,7 +36,10 @@ BEGIN;
 -- DLQ stay operator surfaces, never served.
 -- Replay-safety: every statement is IF NOT EXISTS / additive; the
 -- table_name CHECKs swap in place like 0016/0030 (Postgres auto-named
--- column checks from 0014/0016 are replaced, never edited).
+-- column checks from 0014/0016 are replaced, never edited). The swaps use
+-- NOT VALID plus a post-COMMIT VALIDATE CONSTRAINT each, so the swap never
+-- scans the cursor/DLQ tables under lock; re-running VALIDATE on an
+-- already-valid constraint is a no-op success.
 
 -- Works (compositions) and labels come first: the relation and
 -- release-label tables below reference them. work_type / label_type are
@@ -232,7 +235,9 @@ CREATE INDEX IF NOT EXISTS mb_label_alias_name_trgm_idx
     ON public.mb_label_alias USING gin (name gin_trgm_ops);
 
 -- The import cursor/DLQ table_name checks (migrations 0014, 0016, 0030;
--- Postgres auto-named column checks) learn the fifteen phase-2 tables.
+-- Postgres auto-named column checks) learn the fifteen phase-2 tables. The
+-- swaps are NOT VALID inside the transaction and validated after COMMIT, so
+-- the swap never scans the cursor/DLQ tables under the swap lock.
 ALTER TABLE public.mb_import_cursor DROP CONSTRAINT IF EXISTS mb_import_cursor_table_name_check;
 ALTER TABLE public.mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_check
     CHECK (table_name IN ('artist', 'release', 'recording', 'track',
@@ -244,7 +249,7 @@ ALTER TABLE public.mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_c
                           'release_credit',
                           'artist_alias', 'release_alias', 'recording_alias',
                           'release_group_alias', 'work_alias', 'label_alias',
-                          'release_label'));
+                          'release_label')) NOT VALID;
 ALTER TABLE public.mb_import_dlq DROP CONSTRAINT IF EXISTS mb_import_dlq_table_name_check;
 ALTER TABLE public.mb_import_dlq ADD CONSTRAINT mb_import_dlq_table_name_check
     CHECK (table_name IN ('artist', 'release', 'recording', 'track',
@@ -256,5 +261,7 @@ ALTER TABLE public.mb_import_dlq ADD CONSTRAINT mb_import_dlq_table_name_check
                           'release_credit',
                           'artist_alias', 'release_alias', 'recording_alias',
                           'release_group_alias', 'work_alias', 'label_alias',
-                          'release_label'));
+                          'release_label')) NOT VALID;
 COMMIT;
+ALTER TABLE public.mb_import_cursor VALIDATE CONSTRAINT mb_import_cursor_table_name_check;
+ALTER TABLE public.mb_import_dlq VALIDATE CONSTRAINT mb_import_dlq_table_name_check;
