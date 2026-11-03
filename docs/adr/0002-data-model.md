@@ -49,10 +49,10 @@ user credentials are purged, never migrated into the pool.
 | Per-user `indexers` rows (user-supplied Newznab URL + key) | Retired as user data. No user supplies an indexer URL or key; any indexer use is service/admin configuration under the admin-ingest SSRF boundary. |
 | `user_cache_grants` + own-provider byte proof (rules 3 and 6, sweep/GC grant steps, the `(user_id, provider_id)` FK discipline) | Retired (ADR 0013). Serving authorization is: authenticated caller, active entitlement, track available in the shared catalogue. Cache presence is never authorization; ADR 0013's no-oracle and publication/sweep rules still bind. |
 | Per-user `track_media` (`user_id` in the PK, per-user bad-match isolation) | Global: one curated track → content-hash mapping per track, published by the service (ingest verification or ADR 0013 cache fill). A bad admin match is corrected for everyone by republishing — the deliberate trade recorded in ADR 0013. |
-| Per-user `track_sources` (PK `(user_id, track_id)`, retained only while that user holds library/playlist references) | Curated source: one service-owned source per track (PK `(track_id)`), written by admin ingest. Retention follows catalogue lifecycle, not any user's membership; removing a track from libraries/playlists never deletes it. The envelope format is unchanged, but the AAD inputs are service-owned (rule 1): `owner_scope` is the tagged curated-source scope, never a user id, and `row_key` is `track_id`. Legacy per-user source payloads are retired, never carried over: their ciphertext is bound to `(user_id, track_id)` AAD and cannot be re-bound by copying, and user-sourced payloads do not become shared catalogue provenance — curated sources are created fresh by admin ingest under the new AAD, and the forward migration deletes the legacy per-user rows. |
+| Per-user `track_sources` (PK `(user_id, track_id)`, retained only while that user holds library/playlist references) | Curated source: one service-owned source per track (PK `(track_id)`), written by admin ingest. Retention follows catalogue lifecycle, not any user's membership; removing a track from libraries/playlists never deletes it. The envelope format is unchanged, but the AAD inputs are service-owned (rule 1): `owner_scope` is the tagged curated-source scope, never a user id, and `row_key` is `track_id`. Legacy per-user source payloads are retired, never carried over: their ciphertext is bound to `(user_id, track_id)` AAD and cannot be re-bound by copying, and user-sourced payloads do not become shared catalogue provenance — curated sources are created fresh by admin ingest under the new AAD, and the forward migration deletes the legacy per-user rows. Source ordering is persisted as `accepted_seq` copies on `track_sources`/`track_media` (§6), so replacement and serving never need the ingesting job row to still exist. |
 | `plans.cache_bytes_budget`, `cache_retention_days`, `cache_priority`; the per-user `cache_bytes` gauge (rule 3, ADR 0004) | Retired. One global gauge against ADR 0013's `popcache.cap_bytes`; columns dropped once no reader remains. |
 | Rule 3 writers: user-scoped `ingest_jobs` accept; stream worker publishing per-user media/grants "after full own-provider fetch" | Ingest is admin-initiated (`ingest_jobs.user_id` records the acting admin; per-user ingest caps are flagged in ADR 0004, not redesigned here). The stream worker publishes no per-user rows: on a cache miss it fetches through the pool, and ADR 0013 fills publish the global mapping asynchronously. Eviction deletes mappings/objects per ADR 0013, never sources. |
-| Rule 3 deletion / §6 predicates keyed on own source, own grants, own media (both-counts-zero source cleanup, grant batches, "own source proves the caller's import", playlist source predicate, restore via retained own source + own-provider rebuild, local-row owner = ingesting user) | Superseded. Account/library/playlist deletion removes only user-owned rows (memberships, playlist entries, plays, credentials, the legacy vault row). It never deletes curated sources, global media mappings or cache objects. Library/playlist writes still require the caller's own membership (ADR 0006 gate), but no own source: playability needs a curated source for the track, and entry-keyed restore resolves through the entry plus that curated source. Local catalogue rows are owned by the ingest job/catalogue, not by an end user. |
+| Rule 3 deletion / §6 predicates keyed on own source, own grants, own media (both-counts-zero source cleanup, grant batches, "own source proves the caller's import", playlist source predicate, restore via retained own source + own-provider rebuild, local-row owner = ingesting user) | Superseded. Account/library/playlist deletion removes only user-owned rows (memberships, playlist entries, plays, credentials, the legacy vault row). It never deletes curated sources, global media mappings or cache objects. Library/playlist writes still require the caller's own membership (ADR 0006 gate), but no own source: playability needs a curated source for the track, and entry-keyed restore resolves through the entry plus that curated source. Local catalogue rows are owned by the ingest job/catalogue, not by an end user. Periodic local-catalog GC enumerates by `local_key` presence, not job provenance (rule 3), so referenced rows that survive an ingesting admin's erasure with provenance nulled are still collected once their last reference is removed. |
 
 What does **not** change: catalog identity, matching and the manifest
 producer (§6 mechanics now run for admin ingest into the shared catalogue),
@@ -166,6 +166,9 @@ usage_ledger          id BIGSERIAL PK, user_id FK, period DATE (UTC day),
                       ingest_jobs BIGINT NOT NULL DEFAULT 0 CHECK (ingest_jobs >= 0),
                       UNIQUE (user_id, period) -- flows only, no cache gauge
 ingest_jobs           id PK, user_id FK, idempotency_key TEXT, accepted_at,
+                      accepted_seq BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
+                      -- monotonic acceptance order; copied onto track_sources/
+                      -- track_media at write so ordering survives job erasure
                       status TEXT ('queued'|'running'|'done'|'failed'),
                       UNIQUE (user_id, idempotency_key)
 pool_providers        id PK, label, host, port, tls, username,
@@ -186,6 +189,10 @@ artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE N
                       2026-11-03: local rows are catalogue-owned, not job-owned),
                       name, partial UNIQUE (mbid) WHERE mbid IS NOT NULL,
                       INDEX (local_job_id) WHERE local_job_id IS NOT NULL
+                      -- the UNIQUE (local_key) index doubles as the periodic
+                      -- GC enumeration path (`local_key IS NOT NULL` presence
+                      -- test, contents never parsed); it survives provenance
+                      -- nulling, the local_job_id index does not
 releases              id PK, mbid UUID NULL (MB release), local_key TEXT UNIQUE NULL,
                       local_job_id UUID NULL FK → ingest_jobs ON DELETE SET NULL
                       (same provenance rule as artists),
@@ -193,6 +200,7 @@ releases              id PK, mbid UUID NULL (MB release), local_key TEXT UNIQUE 
                       artist_id FK, title, release_type, year,
                       partial UNIQUE (mbid) WHERE mbid IS NOT NULL,
                       INDEX (local_job_id) WHERE local_job_id IS NOT NULL
+                      -- UNIQUE (local_key): periodic GC enumeration, as artists
 tracks                id PK, mbid UUID NULL INDEXED (MB recording, NOT unique),
                       release_id FK NOT NULL, title, medium_no INTEGER NOT NULL,
                       track_no INTEGER NOT NULL, duration_ms,
@@ -215,12 +223,17 @@ track_sources         track_id FK, source_job_id NULL FK → ingest_jobs
                       ON DELETE SET NULL, -- durable service provenance, not
                       -- user data: survives erasure of the acting admin's job
                       -- rows (applied schema: NOT NULL ON DELETE RESTRICT)
+                      accepted_seq BIGINT NOT NULL, -- plain copy of the
+                      -- ingesting job's accepted_seq (not an FK, never
+                      -- nulled): the replacement/serving ordering key (§6)
                       nzb_ref_encrypted BYTEA + nzb_ref_* envelope fields,
                       PK (track_id), -- curated source, one per track (2026-11-03;
                       -- was per-user PK (user_id, track_id) in the applied schema)
                       INDEX (source_job_id) -- ingest_jobs-delete RI path
 track_media           track_id FK, source_job_id NULL FK → ingest_jobs
                       ON DELETE SET NULL, -- provenance only, as track_sources
+                      accepted_seq BIGINT NOT NULL, -- as track_sources: the
+                      -- producing job's seq; serving matches on this copy
                       content_hash FK → cache_objects, format TEXT, bitrate INTEGER,
                       verified_at, last_served_at,
                       PK (track_id, content_hash),
@@ -651,7 +664,10 @@ reference test and every `DELETE FROM tracks` RI check;
 ingest_jobs` RI check; `(content_hash)` on `track_media`
 and partial `release_art` for the sweep step-5 mark test;
 and `local_job_id` for
-owner-local catalog rows. A repeat DELETE of the same account/container is
+owner-local catalog rows during account erasure (while the job rows still
+exist), and the unique `local_key` indexes under a `local_key IS NOT NULL`
+presence test for periodic local-catalog GC enumeration (contents never
+parsed; that path is unaffected by provenance nulling). A repeat DELETE of the same account/container is
 idempotent: while its operation row exists the API returns the existing
 operation id with `202`, not a unique violation or a fence `409`. A crash
 resumes that operation via the executor or the sweep, never only via a user
@@ -729,7 +745,11 @@ one-day absolute cap from ADR 0008 and are not extended by the grace window);
 the sweep deletes sessions only when erasure begins.
 Enumerate the user's own `ingest_jobs` and their `local_job_id` owner index
 before deleting jobs; this indexed owner path (not `local_key` parsing) drives
-local catalog cleanup, independent of current memberships/sources. In batches
+the erasure-time local catalog cleanup, independent of current
+memberships/sources. It is an erasure-time path only: referenced rows that
+survive this sweep keep living with `local_job_id` nulled (below), and their
+later collection is the periodic GC's job, on the `local_key`-presence path
+that does not depend on the deleted job. In batches
 keyed on the `(user_id, played_at)` event indexes remove `play_event_outbox`,
 the user's monthly `play_events`, `stream_play_ledger` rows, and
 `usage_ledger` rows before deleting referenced tracks or the user; account
@@ -769,10 +789,16 @@ block it: `track_sources.source_job_id`, `track_media.source_job_id` and
 `artists`/`releases.local_job_id` are nullable `ON DELETE SET NULL` in the
 target schema (the forward migration that curates sources and globalizes
 media also converts these FKs from the applied `NOT NULL ... ON DELETE
-RESTRICT`, rebuilds the `track_media` PK without `source_job_id`, and drops
-the `local_job_id` NOT-NULL-when-`local_key` invariant), so surviving curated
+RESTRICT`, rebuilds the `track_media` PK without `source_job_id`, drops
+the `local_job_id` NOT-NULL-when-`local_key` invariant, and backfills
+`accepted_seq` onto every curated source and global media mapping from its
+ingesting job — total, never guessed, because those applied RESTRICT FKs
+mean the job row still exists for every such row at migration time), so surviving curated
 sources, global mappings and referenced local catalogue rows keep living
-with provenance nulled and erasure never fails with 23503 — and empty library/playlist containers, the legacy vault row (credential
+with provenance nulled and erasure never fails with 23503. The persisted
+`accepted_seq` copies are plain NOT NULL values, not FKs, and are never
+nulled, so source replacement ordering and the serving match (§6) survive
+the job's deletion unchanged. Also remove empty library/playlist containers, the legacy vault row (credential
 purge), Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
 then, in the same transaction as the final `DELETE FROM users` after taking
@@ -798,19 +824,27 @@ survives except that one retained deletion event; remove **all** of that
 user's `delete_operations` rows and, last, the account operation and user.
 Honor each actual FK in the migration manifest's order; do
 not rely on cascade. The job ids and `local_job_id` values remain available until
-the local sweep completes. Periodic owner-keyed local-catalog GC enumerates local
-rows via the indexed `artists.local_job_id` / `releases.local_job_id`
-(not by parsing `local_key`; new local writes populate both, backfilled once)
-and removes rows with no library/playlist references. Per-track event erasure
+the erasure-time local sweep completes. Periodic local-catalog GC is not
+owner- or job-keyed: it enumerates local artist/release rows by
+`local_key IS NOT NULL` on the unique `artists.local_key` /
+`releases.local_key` indexes — a presence test only; `local_key` contents are
+never parsed — reaching their tracks via `release_id`, and removes rows with
+no library/playlist references. Because that enumeration never touches
+`local_job_id`, a local row whose provenance an ingesting admin's erasure
+nulled is enumerated exactly like one whose job still exists; the partial
+`local_job_id` indexes serve only the erasure-time sweep above, while the
+job rows exist (new local writes populate both `local_key` and
+`local_job_id`, backfilled once). Per-track event erasure
 is the second explicit exception to append-only: each GC batch first deletes
 that batch's `play_event_outbox`/`play_events` rows for its orphan track ids
 (using the `(track_id)` indexes) in the same transaction before `DELETE FROM
 tracks`, so a played-then-removed local track cannot fail with 23503. Local-track
 consolidation remaps `play_event_outbox`/`play_events` (plus memberships,
 playlists and sources) to the surviving track before retiring a duplicate.
-This covers rows orphaned by earlier final-membership removal as well as
-interrupted account deletion, and runs before those jobs are eligible for
-cleanup. Curated `track_sources` rows are catalogue data: periodic GC never
+This covers rows orphaned by earlier final-membership removal, rows orphaned
+only after an ingesting admin's erasure nulled their provenance, and
+interrupted account deletion; the erasure-time local sweep still runs
+before those job rows are deleted. Curated `track_sources` rows are catalogue data: periodic GC never
 removes one for lacking library/playlist references (that BYOP-era
 reconciliation is retired); a source is removed only with its track under
 catalogue lifecycle. A curated source is fetch data, not read/stream
@@ -862,7 +896,7 @@ is not terminal cancellation.
 
 ### 5. Flows, gauges and partitions
 
-`play_events` is append-only for normal operation and monthly-partitioned, with exactly two deletion exceptions, both defined in rule 3: (a) account erasure, which deletes that user's outbox and event rows before deleting tracks/users; (b) periodic owner-keyed local-catalog GC per-track erasure, which deletes only the orphan track ids' outbox/event rows in the same batch transaction before deleting those tracks, plus consolidation remap of outbox/events to the surviving track. Other retention/drop policy requires its own approved operation, not this ADR. Partition maintenance creates future partitions and alerts if one is missing; no silent dropped writes.
+`play_events` is append-only for normal operation and monthly-partitioned, with exactly two deletion exceptions, both defined in rule 3: (a) account erasure, which deletes that user's outbox and event rows before deleting tracks/users; (b) periodic local-catalog GC per-track erasure (enumerated by `local_key` presence, rule 3), which deletes only the orphan track ids' outbox/event rows in the same batch transaction before deleting those tracks, plus consolidation remap of outbox/events to the surviving track. Other retention/drop policy requires its own approved operation, not this ADR. Partition maintenance creates future partitions and alerts if one is missing; no silent dropped writes.
 The stream writer generates each `event_id` and its exact UTC `played_at` **once
 before dispatch**, committing the immutable event to `play_event_outbox`.
 An outbox dispatcher retries undelivered rows; it sets `delivered_at` only after
@@ -1067,8 +1101,11 @@ manifest_group_first_audio_ordinal)`: use the lowest `audio_ordinal` in that ent
 artist group for an artist, or release group for a release. This makes multi-album
 retries deterministic without conflating those two groupings. Every local
 artist/release write also populates indexed `local_job_id` with that same job id
-(plus a one-time backfill parsing existing keys); GC and sweeps query
-`local_job_id`, never parse `local_key` at runtime. For local tracks,
+(plus a one-time backfill parsing existing keys); the erasure-time local
+sweep queries `local_job_id` while the job still exists, and periodic
+local-catalog GC enumerates by `local_key IS NOT NULL` on the unique index —
+neither path parses `local_key` contents at runtime (presence test only), so
+provenance nulling cannot hide a local row from GC. For local tracks,
 first apply the identity-gated claimed-position collapse above, then use claimed
 `(disc, track)` for the surviving distinct occurrences only when every survivor
 in that release group has a positive, unique pair AND no same-pair group in that
@@ -1100,14 +1137,27 @@ normal retry/dead-letter handling.
 
 For a second admin ingest of the same shared track, `track_sources` remains
 one slot per `track_id` (2026-11-03 revision: the curated source is
-service-owned, not per-user). Compare jobs by `(ingest_jobs.accepted_at,
-source_job_id)`; under the source-row conflict lock, only a newer accepted job
-may replace the encrypted source. In that same transaction, superseding the
+service-owned, not per-user). Ordering is persisted on the rows themselves,
+independent of whether the ingesting job still exists: at write, the
+curated source's `accepted_seq` and each media mapping's `accepted_seq`
+copy the ingesting job's monotonic `accepted_seq` (plain NOT NULL values,
+never nulled; `source_job_id` is provenance only and takes no part in
+ordering or serving). Under the source-row conflict lock, only a job whose
+`accepted_seq` is greater than the stored `track_sources.accepted_seq` may
+replace the encrypted source — so a later correction ingest replaces a
+source whose original ingesting job was erased (provenance nulled, seq
+retained), and a replayed older job never replaces it. In that same transaction, superseding the
 source makes older `track_media` rows ineligible for serving and removes the
 stale global media mapping; shared cache objects remain while any mapping or
 `release_art` row references them. Associate each verified media mapping with
-its `source_job_id`. Serve only the mapping for the current source job; when
-several hashes exist for that job, choose latest `verified_at`, then ascending
+the `accepted_seq` of the job that produced it (a mapping published by an
+ADR 0013 cache fill against the current source copies that source's
+`accepted_seq`). Serve only mappings whose
+`accepted_seq` equals the current `track_sources.accepted_seq`; the match
+is on those NOT NULL copies, never on `source_job_id` equality — two rows
+whose provenance is both NULL do not match each other, and media from a
+superseded seq stays ineligible after its job is erased. When
+several hashes exist for the current seq, choose latest `verified_at`, then ascending
 `content_hash` as a deterministic tie-break. This preserves a usable source
 and an unambiguous media choice after retries or re-ingests. Local-to-MB
 consolidation is separate transactional work: preserve/remap membership,
@@ -1154,9 +1204,12 @@ only during transition (opaque refs, never guessed into track rows), never by a
 non-owner. An owner read resolves embedded rows through the owner's own
 memberships exactly like any other playlist read. Local-row provenance is
 derived via the indexed `local_job_id` → `ingest_jobs` (whose `user_id` is
-the acting admin, never an end-user owner); visibility still comes only from
-the library-scope rule, never from job provenance. `local_key` parsing is
-legacy backfill only, never a runtime access path.
+the acting admin, never an end-user owner) while that job exists; after the
+acting admin's erasure the provenance is NULL and derives nothing.
+Visibility still comes only from
+the library-scope rule, never from job provenance, present or nulled. `local_key` parsing is
+legacy backfill only, never a runtime access path (the GC presence test
+above does not parse it).
 Mirror-verified global rows (when they ship) use the same membership gate: shared
 metadata is readable only for tracks in the caller's library. Audio
 additionally requires active entitlement and a curated source for the track
@@ -1238,9 +1291,16 @@ not create a membership. Dormancy does not bypass caps.
 
 Implementation acceptance covers concurrent different-job admin ingests of
 one matched release position (one global row, one library count), with the
-newer accepted job replacing the curated source and invalidating the stale
-global media mapping; serving selects only a current-source hash and
-uses the documented deterministic tie-break. Include opposite-order multi-track
+job of greater persisted `accepted_seq` replacing the curated source and invalidating the stale
+global media mapping; serving selects only a hash whose `accepted_seq`
+matches the current source and
+uses the documented deterministic tie-break. Include replacement after
+erasure of the original ingesting admin: the surviving source (provenance
+nulled, `accepted_seq` retained) is replaced by a later correction ingest
+and not by a replayed older job; serving between the erasure and the
+replacement selects only media whose `accepted_seq` matches the current
+source, and stale-seq media with nulled provenance is never served on a
+NULL-provenance match. Include opposite-order multi-track
 inputs to prove sorted upserts and bounded retries. Cover the same recording on
 two releases and two positions on one release (distinct tracks), multidisc positions,
 NULL mirror `track_no` remaining unknown/local, unmatched-job retry, deterministic
@@ -1351,13 +1411,21 @@ retaining its `release_mbid_hint` without guessing. Also require:
   Account deletion erases the user's outbox/events/ledger before tracks/users
   (including the `play_events` and outbox track/user FKs), then processes
   memberships, local catalog, jobs and remaining user-FK children
-  in valid FK order; no local tracks/releases/art or tenant tags survive. Include
+  in valid FK order; no *unreferenced* local tracks/releases/art or tenant
+  tags survive (referenced local catalogue rows are the ingesting-admin case
+  below and must survive — satisfying this assertion by deleting shared
+  catalogue content is a failure). Include
   an account with played local tracks and pending outbox rows and assert no 23503
   on track/user deletion. Include an ingesting admin whose jobs produced
   catalogue tracks still in other users' libraries and assert erasure
   completes with no 23503: the curated sources, global media mappings and
   referenced local catalogue rows survive with `source_job_id`/`local_job_id`
   provenance nulled, and only the admin's user rows and job rows are removed.
+  Then remove the last library membership and playlist reference to one of
+  those surviving local tracks and assert periodic local-catalog GC —
+  enumerating by `local_key` presence, not the nulled `local_job_id` —
+  collects its local artist/release/track rows (with per-track event
+  erasure and no 23503), leaving no uncollectable catalogue orphan.
   Billing gate: delete a paying and a past_due account and
   assert remote cancellation is confirmed terminal before local billing rows are
   removed; include an account whose `billing_operations` row is still
@@ -1372,10 +1440,12 @@ retaining its `release_mbid_hint` without guessing. Also require:
   trial-eligible per the ADR 0005 tombstone check. Deleting an account that
   never reached Stripe writes no tombstone and does not wedge. Include a user who
   previously removed the final local library membership and playlist reference:
-  owner-keyed GC must find/delete those rows via indexed `local_job_id`, not
-  memberships and never by parsing `local_key`. GC played-track case: play a
+  periodic local-catalog GC must find/delete those rows by enumerating
+  `local_key IS NOT NULL` on the unique index — not via memberships, never by
+  parsing `local_key` contents, and not via `local_job_id` (only the
+  erasure-time sweep may use that path, while the job rows exist). GC played-track case: play a
   local track, remove its final membership and playlist reference, then run the
-  owner-keyed GC and assert its outbox/event rows and track delete with no 23503
+  periodic local-catalog GC and assert its outbox/event rows and track delete with no 23503
   while the user still exists; retire a duplicate local track and assert its
   outbox/events remap to the survivor. Race each writer (ingest write,
   library/playlist edit and restore, play-event writes, art
@@ -1402,6 +1472,8 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `play_event_outbox` and on partitioned `play_events`, plus `(track_id)`
   indexes on `library_tracks`, `playlist_tracks`, `track_sources` and
   `track_media`, `(source_job_id)` indexes on `track_sources`/`track_media`,
+  the unique `(local_key)` indexes on `artists`/`releases` (the periodic-GC
+  enumeration path) alongside their partial `(local_job_id)` indexes,
   `(content_hash)` indexes on `track_media` and partial
   `release_art`, a `(user_id)` index on `auth_challenges` (`audit_log`
   reuses the existing `idx_audit_user` — no duplicate), a partial
@@ -1409,10 +1481,13 @@ retaining its `release_mbid_hint` without guessing. Also require:
   sweep, and a `(pepper_version, email_hmac)` index on
   `deleted_billing_tombstones`.
   At a seeded size assert EXPLAIN uses the index (no Seq Scan, no
-  per-partition Seq Scan) for the GC reference test, a 500-track delete batch,
+  per-partition Seq Scan) for the GC reference test, GC enumeration of local
+  rows by `local_key` presence (including rows whose `local_job_id` is NULL),
+  a 500-track delete batch,
   an ingest_jobs delete during account erasure, the sweep step-5 mark test,
   and the tombstone trial check under every retained pepper version; the delete
-  cursor keys on those real paths and the local sweep queries `local_job_id`.
+  cursor keys on those real paths, the erasure-time local sweep queries
+  `local_job_id`, and periodic GC queries `local_key` presence.
   Tombstone keyring case: rows under v1 and rotated v2 both match, and retiring
   v1 is refused while a v1 row remains.
   FKs remain restrictive; the two rule-5 exceptions are the only play-event
