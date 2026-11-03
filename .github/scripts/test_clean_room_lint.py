@@ -14,7 +14,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from clean_room_lint import find_path_violations, find_violations, main, scan_path
+from clean_room_lint import (
+    find_path_violations,
+    find_violations,
+    main,
+    redact_path,
+)
 
 
 def rules_for(text, path=""):
@@ -64,6 +69,16 @@ class TestBrand(unittest.TestCase):
             "competitor-brand", rules_for("font-family: 'Spotify Mix', sans-serif")
         )
 
+    def test_underscore_separated_tokens_flag(self):
+        # Underscores separate tokens in asset names and identifiers;
+        # \b alone would treat these as one word and miss the brand.
+        self.assertIn("competitor-brand", rules_for('SPOTIFY_CLIENT_ID = "x"'))
+        self.assertIn("competitor-brand", rules_for("spotify_logo.svg"))
+        self.assertIn("competitor-font", rules_for("CircularStd_Book.woff2"))
+
+    def test_name_inside_longer_token_does_not_flag(self):
+        self.assertEqual([], find_violations("xspotify2 is a made-up string"))
+
     def test_flags_circular_capital(self):
         self.assertIn("competitor-font", rules_for("font-family: Circular"))
         self.assertIn("competitor-font", rules_for("CircularSp book"))
@@ -80,6 +95,28 @@ class TestBrand(unittest.TestCase):
 
     def test_neighbouring_hex_is_clean(self):
         self.assertEqual([], find_violations("--accent: #7c9aff"))
+
+    def test_green_with_alpha_suffix_flags(self):
+        # #RRGGBBAA renders the banned green; opacity is not a defence.
+        self.assertIn("competitor-colour", rules_for("--accent: #1DB954FF"))
+        self.assertIn("competitor-colour", rules_for("--accent: #1ed76080"))
+        self.assertIn("competitor-colour", rules_for("0xFF1DB954"))
+
+    def test_unrelated_eight_digit_colour_is_clean(self):
+        # #AA1DB954 is RGB AA1DB9 + alpha 54, not a banned green.
+        self.assertEqual([], find_violations("--accent: #AA1DB954"))
+
+    def test_hash_ending_in_green_digits_is_clean(self):
+        self.assertEqual(
+            [],
+            find_violations("rev 9f2c41db954e rejected; id deadbeef1db954 ok"),
+        )
+
+    def test_split_byte_literals_flag(self):
+        self.assertIn(
+            "competitor-colour", rules_for("Color(0xFF, 0x1D, 0xB9, 0x54)")
+        )
+        self.assertIn("competitor-colour", rules_for("rgb(0x1e,0xd7,0x60)"))
 
 
 class TestEvidencePath(unittest.TestCase):
@@ -129,20 +166,27 @@ class TestPathScan(unittest.TestCase):
             "competitor-brand",
             find_path_violations("apps/web/static/spotify-logo.svg"),
         )
+        self.assertIn(
+            "competitor-brand",
+            find_path_violations("apps/web/static/spotify_logo.svg"),
+        )
+        self.assertIn(
+            "competitor-font",
+            find_path_violations("apps/web/static/CircularStd_Book.woff2"),
+        )
 
     def test_clean_path(self):
         self.assertEqual(
             [], find_path_violations("apps/web/src/lib/player/queue.ts")
         )
 
-    def test_scan_path_reports_path_rule(self):
-        hits = scan_path("AGENTS.md")  # definitional: path-only scan
-        self.assertEqual([], hits)
-
     def test_definitional_files_skip_content_scan(self):
         # AGENTS.md states the ban list and so necessarily names the
         # banned things; its content must not fail the gate.
-        self.assertEqual([], scan_path("AGENTS.md"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "AGENTS.md"])
+        self.assertEqual(0, rc)
 
 
 class TestMain(unittest.TestCase):
@@ -161,6 +205,27 @@ class TestMain(unittest.TestCase):
             rc = main(["clean_room_lint.py", "docs/youtube-backend-spike.md"])
         self.assertEqual(0, rc)  # spike doc is allowlisted for extraction
         self.assertNotIn("yt-dlp", buf.getvalue())
+
+    def test_path_violation_report_is_redacted(self):
+        # A banned path must fail without re-publishing its own bytes:
+        # the annotation carries the redacted path, never the shape.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["clean_room_lint.py", "research/nntune-spotify/notes.txt"])
+        self.assertEqual(1, rc)
+        out = buf.getvalue()
+        self.assertNotIn("nntune-spotify", out)
+        self.assertNotIn("spotify", out.lower())
+        self.assertIn("host-evidence-path", out)
+
+    def test_redact_path_masks_and_preserves(self):
+        self.assertEqual(
+            "apps/web/src/lib/player/queue.ts",
+            redact_path("apps/web/src/lib/player/queue.ts"),
+        )
+        redacted = redact_path("static/spotify_logo.svg")
+        self.assertNotIn("spotify", redacted)
+        self.assertTrue(redacted.endswith("_logo.svg"))
 
 
 if __name__ == "__main__":

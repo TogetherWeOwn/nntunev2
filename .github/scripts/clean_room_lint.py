@@ -18,14 +18,21 @@ itself carry the contiguous shapes it bans:
     its module name). These are direct-stream / extractor shapes; the
     only permitted YouTube playback is the official visible embed.
   competitor-brand
-    The competitor's name as a word, any case. Covers asset and code
-    references and branded font names containing it ("... Mix").
+    The competitor's name as a token, any case. Tokens are split on
+    underscores as well as punctuation, so `..._logo.svg`,
+    `<NAME>_CLIENT_ID` and `... Mix` all match, while the name buried
+    inside a longer alphanumeric token does not.
   competitor-font
-    `Circular` with a capital C (plus common cut suffixes Sp/Std/TT).
-    The capital keeps the lowercase generic English word usable.
+    `Circular` with a capital C (plus common cut suffixes Sp/Std/TT),
+    same token rule. The capital keeps the lowercase generic English
+    word usable.
   competitor-colour
-    The two competitor brand greens as hex (`#1D` + `B954`,
-    `#1E` + `D760`, `#` optional, any case).
+    The two competitor brand greens as complete hex literals: 6 digits
+    (`#1D` + `B954`, `#1E` + `D760`) or 8 digits with any alpha suffix
+    (`#RRGGBBAA`; `AARRGGBB` forms match too, via the opaque-alpha
+    suffix check), plus split literals (`0x1D, 0xB9, 0x54` in any
+    spacing/case). A longer hex run that merely contains the digits
+    is not the colour and does not match.
   host-evidence-path
     An absolute host research path (`/home/<user>/research/...`) or a
     `research/<evidence-dir>` fragment. Matched by shape so the real
@@ -52,8 +59,11 @@ property, so every entry names its reason):
     extraction code under cover of it.
 
 Reports print file:line + rule id only — never the matched bytes (CI
-logs on this repo are public). An input that cannot be read fails the
-run: an incomplete scan is never a successful check.
+logs on this repo are public). When the match is in the path itself,
+the matched span is replaced with `*` characters before the path is
+annotated, so the report locates the file without re-publishing the
+banned bytes. An input that cannot be read fails the run: an
+incomplete scan is never a successful check.
 
 Usage:
   python3 .github/scripts/clean_room_lint.py [PATH ...]
@@ -90,10 +100,31 @@ SPIKE_ALLOWLIST_FILES = frozenset({"docs/youtube-backend-spike.md"})
 _BRAND = "spot" + "ify"
 _EVIDENCE_DIR = "nntune-" + _BRAND
 
+# Token edges: underscores separate tokens (asset names, env vars,
+# identifiers), but letters and digits do not. `\b` alone would treat
+# `spotify_logo` as one word and miss the brand token.
+_L = r"(?<![A-Za-z0-9])"
+_R = r"(?![A-Za-z0-9])"
+
 _EXTRACTION = re.compile(r"googlevideo|/youtubei/|yt[-_]dlp", re.IGNORECASE)
-_BRAND_WORD = re.compile(rf"\b{_BRAND}\b", re.IGNORECASE)
-_FONT = re.compile(r"\bCircular(?:Sp|Std|TT)?\b")
-_COLOUR = re.compile(r"#?(?:1DB954|1ED760)\b", re.IGNORECASE)
+_BRAND_WORD = re.compile(rf"{_L}{_BRAND}{_R}", re.IGNORECASE)
+_FONT = re.compile(rf"{_L}Circular(?:Sp|Std|TT)?{_R}")
+# Whole hex literals only: exactly 6 digits, or 8 with the alpha byte
+# on either side (#RRGGBBAA, and AARRGGBB as in 0xFF1D...). A longer
+# hex run merely containing the digits (a hash, an unrelated 8-digit
+# colour whose last six digits happen to match) is not the colour.
+_COLOUR = re.compile(
+    r"(?<![0-9A-Fa-f])(?:(?:1DB954|1ED760)(?:[0-9A-Fa-f]{2})?"
+    r"|FF(?:1DB954|1ED760))(?![0-9A-Fa-f])",
+    re.IGNORECASE,
+)
+# Split literals: three adjacent hex bytes spelling the colour
+# (0x1D, 0xB9, 0x54 in any spacing/case).
+_GREENS = (("1D", "B9", "54"), ("1E", "D7", "60"))
+_COLOUR_SPLIT = re.compile(
+    "|".join(rf"0x{x}\s*,\s*0x{y}\s*,\s*0x{z}" for x, y, z in _GREENS),
+    re.IGNORECASE,
+)
 _EVIDENCE = re.compile(
     rf"/home/[^\s/]+/research/|\bresearch/{re.escape(_EVIDENCE_DIR)}\b"
 )
@@ -103,6 +134,7 @@ RULES = (
     ("competitor-brand", _BRAND_WORD),
     ("competitor-font", _FONT),
     ("competitor-colour", _COLOUR),
+    ("competitor-colour", _COLOUR_SPLIT),
     ("host-evidence-path", _EVIDENCE),
 )
 
@@ -137,11 +169,27 @@ def find_path_violations(path):
     clean. Spike paths keep the same single-rule exemption.
     """
     spike = _is_spike_path(path)
-    return [
-        rule_id
-        for rule_id, pattern in RULES
-        if not (spike and rule_id == "youtube-extraction") and pattern.search(path)
-    ]
+    return sorted(
+        {
+            rule_id
+            for rule_id, pattern in RULES
+            if not (spike and rule_id == "youtube-extraction")
+            and pattern.search(path)
+        }
+    )
+
+
+def redact_path(path):
+    """Replace every rule-matching span in a path with `*` characters.
+
+    Only used for diagnostics: the report locates the file without
+    re-publishing banned bytes into public CI logs. Applied to every
+    path the runner prints, violations and read errors alike; a clean
+    path comes back unchanged.
+    """
+    for _, pattern in RULES:
+        path = pattern.sub(lambda m: "*" * (m.end() - m.start()), path)
+    return path
 
 
 def tracked_files():
@@ -151,16 +199,9 @@ def tracked_files():
     return [p for p in out.split("\0") if p]
 
 
-def scan_path(path):
-    hits = [(1, f"{rule_id}-path") for rule_id in find_path_violations(path)]
-    if path in DEFINITIONAL_EXCLUSIONS:
-        return hits
-    with open(path, "rb") as fh:
-        data = fh.read()
-    # No binary early-return (same reasoning as public_text_lint): a
-    # tracked binary is public once merged, so scan a lossless
-    # latin-1 decode for embedded strings.
-    return hits + find_violations(data.decode("latin-1"), path)
+# Content reads use a lossless latin-1 decode with no binary
+# early-return (same reasoning as public_text_lint): a tracked binary
+# is public once merged, so embedded strings are scanned too.
 
 
 def main(argv):
@@ -170,20 +211,30 @@ def main(argv):
     scanned = 0
     failed = 0
     for path in paths:
-        try:
-            hits = scan_path(path)
-        except (OSError, UnicodeError) as exc:
-            failed += 1
-            print(
-                f"::error file={_escape_annotation_property(path)}"
-                f"::clean-room: {_failure_category(exc)}"
-            )
-            continue
-        scanned += 1
+        # Diagnostic form only: report paths are redacted so a banned
+        # path never re-publishes its own bytes (see redact_path).
+        shown = _escape_annotation_property(redact_path(path))
+        # Path hits are reported first: an unreadable file with a banned
+        # name must show both findings, not just the read error.
+        hits = [(1, f"{rule_id}-path") for rule_id in find_path_violations(path)]
+        if path not in DEFINITIONAL_EXCLUSIONS:
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except (OSError, UnicodeError) as exc:
+                failed += 1
+                print(
+                    f"::error file={shown}::clean-room: "
+                    f"{_failure_category(exc)}"
+                )
+            else:
+                scanned += 1
+                hits += find_violations(data.decode("latin-1"), path)
+        else:
+            scanned += 1
         for lineno, rule_id in hits:
             print(
-                f"::error file={_escape_annotation_property(path)},line={lineno}"
-                f"::clean-room: {rule_id}"
+                f"::error file={shown},line={lineno}::clean-room: {rule_id}"
             )
             total_hits += 1
             per_rule[rule_id] = per_rule.get(rule_id, 0) + 1
