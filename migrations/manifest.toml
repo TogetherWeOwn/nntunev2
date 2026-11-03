@@ -147,3 +147,13 @@ sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
 file = "0030_mb_mirror_w6b.sql"
 target = "mirror"
 sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
+
+[[migration]]
+file = "0031_meter_derivation_and_leases.sql"
+target = "app"
+sha256 = "0073041714e1a43d69f9dcb42483a3cc12baf6945326b8b20bac94047c85611a"
+
+[[migration]]
+file = "0032_ledger_seconds_floor.sql"
+target = "app"
+sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
