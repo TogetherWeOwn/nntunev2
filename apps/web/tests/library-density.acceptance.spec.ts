@@ -275,8 +275,9 @@ test('DEN-00 control: real page, rows, queue, find/order/appearance controls and
 	const { writes } = await openLibrary(page);
 	await queueTwo(page);
 	await expectRowTextsVisible(page);
-	await expect(page.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }))).toBeVisible();
+	// Page main only: the app-shell top bar carries its own Search field.
+	await expect(page.getByRole('main').getByRole('searchbox', { name: /find|search/i })
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }))).toBeVisible();
 	await expect(page.getByRole('combobox', { name: /order|sort/i })).toBeVisible();
 	await expect(page.getByRole('combobox', { name: 'Appearance', exact: true })).toBeVisible();
 	expect(targetSizeViolations(await rowTargets(page)),
@@ -483,8 +484,9 @@ test('DEN-08 views: Compact persists across find, ordering and favorites use on 
 	await expectRowHeightBelow(row(page, 'den-alpha'), comfortableLibrary, 'Compact applies before view changes');
 
 	// Find: filtered rows stay compact and readable.
-	const find = page.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+	// Page main only: the app-shell top bar carries its own Search field.
+	const find = page.getByRole('main').getByRole('searchbox', { name: /find|search/i })
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }));
 	await find.fill('Alpha');
 	await expect(row(page, 'den-beta')).toBeHidden();
 	await expect(row(page, 'den-alpha')).toBeVisible();

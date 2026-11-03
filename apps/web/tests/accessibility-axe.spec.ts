@@ -24,7 +24,12 @@ const ROUTES = [
 	'/account/billing',
 	'/account/provider',
 	'/demo/player',
+	'/home',
+	'/search',
+	'/settings',
 	'/library',
+	'/library/liked',
+	'/library/recent',
 	'/library/import',
 	'/onboarding/byop'
 ] as const;
@@ -36,9 +41,11 @@ async function mockApi(page: Page, route: string) {
 		r.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
 	);
 	// The library renders its row controls only with tracks present; scan that
-	// populated state instead of the empty list.
+	// populated state instead of the empty list. Search and Liked render
+	// their result rows and remove controls only from the same rows, so
+	// they scan populated too.
 	const library =
-		route === '/library'
+		route === '/library' || route === '/search' || route === '/library/liked'
 			? [
 					{ id: 'mango', title: 'Mango Season', artist: 'Acceptance Band' },
 					{ id: 'apple', title: 'Apple Cart', artist: 'Acceptance Band' }
@@ -76,13 +83,33 @@ async function expectNoSeriousOrCriticalViolations(page: Page, route: string) {
 
 async function visit(page: Page, route: string) {
 	await mockApi(page, route);
-	await page.goto(route, { waitUntil: 'load' });
+	// Search renders results only for an applied query; drive the populated
+	// state through the URL the top-bar search and the page share (?q=).
+	const url = route === '/search' ? '/search?q=mango' : route;
+	if (route === '/library/liked') {
+		// Liked projects stored favorites onto the library rows; seed a
+		// fixed auth context so the remove controls render populated.
+		await page.addInitScript(() => {
+			sessionStorage.setItem('nntune.library.auth-context.v1', 'axe-populated');
+			localStorage.setItem(
+				'nntune.library.favorites.v1.axe-populated',
+				JSON.stringify(['mango', 'apple'])
+			);
+		});
+	}
+	await page.goto(url, { waitUntil: 'load' });
 	await expect(page.locator('main')).toBeVisible();
 	if (route === '/demo/player') {
 		await expect(page.getByTestId('leveling-toggle')).toBeVisible();
 	}
 	if (route === '/library') {
 		await expect(page.getByTestId('library-item').first()).toBeVisible();
+	}
+	if (route === '/search') {
+		await expect(page.getByText(/results? for/)).toBeVisible();
+	}
+	if (route === '/library/liked') {
+		await expect(page.getByRole('button', { name: /from Liked/ }).first()).toBeVisible();
 	}
 	await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
 }

@@ -3,6 +3,7 @@ import ts from 'typescript';
 import { addTrack, createQueue, currentTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -16,7 +17,7 @@ function restartFixture() {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
 		'applyShareLink', 'applyPendingShareSeek', 'seekableIncludesStart',
 		'restartIsAvailable', 'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus'
 	]);
@@ -46,6 +47,7 @@ function restartFixture() {
 	const bindings = {
 		addTrack, createQueue, queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget,
+		clearMiniPlayerHint, setMiniPlayerHint,
 		tick: () => Promise.resolve(), window: { location }, element, track
 	};
 	const page = new Function(...Object.keys(bindings), `

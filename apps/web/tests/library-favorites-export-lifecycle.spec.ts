@@ -216,7 +216,8 @@ test('[FAVEXPORT-L05] leaving the page releases the retained Blob URL', async ({
 
 	// Client-side navigation keeps the document, so the page teardown is
 	// the only thing that can revoke the retained URL.
-	await page.getByRole('link', { name: 'Select NZB locally', exact: true }).click();
+	await page.getByRole('button', { name: 'Create', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Import NZB file', exact: true }).click();
 	await expect(page).toHaveURL(/\/library\/import/);
 	await expect.poll(() => blobLive(page)).toBe(0);
 });

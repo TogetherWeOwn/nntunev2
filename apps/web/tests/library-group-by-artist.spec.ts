@@ -169,9 +169,12 @@ function row(page: Page, id: string): Locator {
 }
 
 function findField(page: Page): Locator {
+	// Scoped to the page main: the app-shell top bar carries its own
+	// global Search field, which must never satisfy this locator.
 	return page
+		.getByRole('main')
 		.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }));
 }
 
 async function requireFind(page: Page): Promise<Locator> {
