@@ -162,6 +162,10 @@ def parse_rows(stdout):
 # qualified, but a same-named relation in another non-system schema would
 # shadow the unqualified name for other roles; requiring that none exists
 # keeps the checked table the only one any search path can resolve.
+# The rows are deploy proof, so the guard also requires that no role
+# other than the table owner (the migrator) holds a table-level write
+# privilege: apply_migration.py's DDL pins that on every apply, and the
+# gate fails closed in between if a write grant appears.
 GUARD_SQL = """BEGIN READ ONLY;
 SELECT current_database() = 'nntunev2_staging'
    AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -171,6 +175,10 @@ SELECT current_database() = 'nntunev2_staging'
                  AND n.nspname NOT IN ('public','pg_catalog','information_schema')
                  AND n.nspname NOT LIKE 'pg\\_temp\\_%'
                  AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%')
+   AND NOT EXISTS (SELECT 1 FROM pg_class c CROSS JOIN aclexplode(c.relacl) a
+               WHERE c.oid=to_regclass('public.schema_migrations')
+                 AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')
+                 AND a.grantee <> c.relowner)
    AND (SELECT count(*) = 2 FROM pg_attribute a
         WHERE a.attrelid=to_regclass('public.schema_migrations') AND a.attnum > 0
           AND NOT a.attisdropped AND a.atttypmod = -1

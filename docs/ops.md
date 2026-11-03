@@ -344,7 +344,15 @@ verifies the file bytes against `migrations/manifest.toml` and writes a
 `public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
 the same transaction** as the migration; a file carrying its own
 `BEGIN`/`COMMIT` is applied by hand and then recorded with
-`--record-only`. The staging deploy's read-only schema gate
+`--record-only`. Every invocation requires `--expect-database <name>`
+(matching the `DATABASE_URL` database and checked again inside the
+transaction against `current_database()` — a URL pointed at the wrong
+database creates and records nothing), and the apply refuses while an
+earlier same-target manifest entry is unrecorded, so history cannot be
+skipped or reordered. The tracking table's DDL pins its write
+privileges to the table owner on every apply — its rows are deploy
+proof — and the staging gate fails closed while any other role holds
+a write grant on it. The staging deploy's read-only schema gate
 (`.github/scripts/staging_api_schema_gate.py`) compares those rows with
 the manifest's `app` entries — file name plus sha256 — and fails closed
 on a missing, unlisted, sha-mismatched or double-applied migration. That
@@ -363,7 +371,9 @@ then recognises the old row as that entry's apply. The
 and the migrations gate rejects an alias whose sha differs from the
 entry's (a different sha would certify bytes never applied).
 History is append-only — never rewrite or delete a `schema_migrations`
-row to make a rename fit.
+row to make a rename fit, and the migrations gate's drift check
+rejects removing or changing a `renamed_from` entry that exists on
+the base branch (additions are fine).
 
 Tracking began with the 2026-11-03 backfill
 (`docs/ops/schema-migrations-backfill-2026-11-03-app.sql` and

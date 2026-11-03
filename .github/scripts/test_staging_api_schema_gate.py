@@ -80,9 +80,17 @@ class SchemaGateTests(unittest.TestCase):
         # against the manifest, again in a read-only transaction.
         rows_options = self.calls[-1][1]
         self.assertEqual(rows_options["input"], gate.ROWS_SQL)
+        # The guard fails closed while a non-owner role holds a write
+        # grant on the tracking table (its rows are deploy proof).
+        self.assertIn("aclexplode(c.relacl)", options["input"])
+        self.assertIn("a.grantee <> c.relowner", options["input"])
         for options in (options, rows_options):
+            # Strip string literals first: the guard names privilege
+            # types ('INSERT', ...) as data, which is not a mutation.
+            import re
+            statements = re.sub(r"'[^']*'", "''", options["input"])
             for mutation in ("ALTER", "INSERT", "UPDATE", "DELETE", "DROP"):
-                self.assertNotIn(mutation, options["input"])
+                self.assertNotIn(mutation, statements)
 
     def test_tls_verifies_hostname_with_the_system_ca_bundle(self):
         base = self.env["PLANETSCALE_MIGRATOR_URL_STAGING"].split("?", 1)[0]

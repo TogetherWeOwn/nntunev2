@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -62,6 +63,61 @@ class RenamedFromTests(unittest.TestCase):
         code, output = self.run_gate(self.manifest(line))
         self.assertEqual(code, 1, output)
         self.assertIn("bad-rename", output)
+
+    # -- drift: renamed_from history is append-only against the base --
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.root, check=True,
+                              text=True, capture_output=True)
+
+    def make_base(self, renamed_from):
+        (self.migrations / "manifest.toml").write_text(
+            self.manifest(renamed_from), encoding="utf-8")
+        self.git("init", "-q")
+        self.git("config", "user.email", "migration-gate-test@example.invalid")
+        self.git("config", "user.name", "Migration Gate Test")
+        self.git("add", "migrations")
+        self.git("commit", "-qm", "base migrations")
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def run_drift(self, base_ref, renamed_from):
+        (self.migrations / "manifest.toml").write_text(
+            self.manifest(renamed_from), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = migrations_gate.main(
+                ["--root", str(self.root), "--base-ref", base_ref])
+        return code, out.getvalue() + err.getvalue()
+
+    def alias_line(self, *aliases):
+        items = ", ".join(
+            f'{{ file = "{name}", sha256 = "{self.sha}" }}' for name in aliases)
+        return f"renamed_from = [{items}]\n"
+
+    def test_removing_rename_history_fails_drift(self):
+        # A manifest-only deletion of rename history would orphan the
+        # row staging recorded under the original name.
+        base = self.make_base(self.alias_line("0001_beta_old.sql"))
+        code, output = self.run_drift(base, "")
+        self.assertEqual(code, 1, output)
+        self.assertIn("rename-history-removed", output)
+
+    def test_keeping_rename_history_passes_drift(self):
+        line = self.alias_line("0001_beta_old.sql")
+        base = self.make_base(line)
+        code, output = self.run_drift(base, line)
+        self.assertEqual(code, 0, output)
+
+    def test_appending_rename_history_passes_drift(self):
+        base = self.make_base(self.alias_line("0001_beta_old.sql"))
+        code, output = self.run_drift(
+            base, self.alias_line("0001_beta_old.sql", "0002_beta_older.sql"))
+        self.assertEqual(code, 0, output)
+
+    def test_adding_history_to_entry_without_any_passes_drift(self):
+        base = self.make_base("")
+        code, output = self.run_drift(base, self.alias_line("0001_beta_old.sql"))
+        self.assertEqual(code, 0, output)
 
     def test_bad_alias_sha_fails(self):
         line = 'renamed_from = [{ file = "0001_beta_old.sql", sha256 = "ABC" }]\n'

@@ -14,7 +14,15 @@ recognised through the manifest, never by rewriting history.
 Usage:
     DATABASE_URL=postgresql://... \\
     python3 .github/scripts/apply_migration.py \\
-        --file migrations/0032_example.sql --applied-by "operator"
+        --file migrations/0032_example.sql --applied-by "operator" \\
+        --expect-database nntunev2_staging
+
+``--expect-database`` is mandatory: the connected database must match
+it both before connecting (against DATABASE_URL) and inside the apply
+transaction (``current_database()``), for the DDL step, normal applies
+and ``--record-only`` alike — a migrator URL pointed at the wrong
+database must never create the tracking table, run migration DDL, or
+record false history there.
 
 Files carrying their own top-level transaction control (or psql
 meta-commands, which can escape the transaction) cannot join the
@@ -32,19 +40,58 @@ import sys
 import tomllib
 import urllib.parse
 
+# The tracking table's rows are deploy proof for the staging gate, so
+# its write privileges are pinned here, in the one DDL constant shared
+# by the migrator and the committed backfill files: no role other than
+# the table owner (the migrator role that creates it) may hold a write
+# privilege, whatever the database's default privileges granted at
+# CREATE time. The revoke pass runs on every DDL execution, so a later
+# stray GRANT is removed by the next apply; the staging gate also fails
+# closed while such a grant exists. Read privileges are untouched.
 DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
     file       TEXT PRIMARY KEY,
     sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     applied_by TEXT NOT NULL
-);"""
+);
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON TABLE public.schema_migrations FROM PUBLIC;
+DO $privileges$
+DECLARE
+    grant_row record;
+BEGIN
+    FOR grant_row IN
+        SELECT DISTINCT a.grantee
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN aclexplode(c.relacl) a
+        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
+          AND a.privilege_type IN
+              ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+          AND a.grantee <> c.relowner
+    LOOP
+        IF grant_row.grantee = 0 THEN
+            EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                 || 'ON TABLE public.schema_migrations FROM PUBLIC';
+        ELSE
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                'ON TABLE public.schema_migrations FROM %I',
+                pg_get_userbyid(grant_row.grantee));
+        END IF;
+    END LOOP;
+END
+$privileges$;"""
 
 # Serializes every apply against this database (see the guard below).
 ADVISORY_LOCK_KEY = 7271901
 ALREADY_SAME = "schema-migrations: already recorded"
 ALREADY_DIFFERENT = "schema-migrations: recorded with a different sha256"
+WRONG_DATABASE = "schema-migrations: unexpected database"
+MISSING_PRIOR = "schema-migrations: earlier migration not recorded"
 
 FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
+DATABASE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 TXN_CONTROL_RE = re.compile(
     r"\b(BEGIN|COMMIT|ROLLBACK)(\s+(WORK|TRANSACTION))?\s*;|\bSTART\s+TRANSACTION\b",
     re.I,
@@ -106,30 +153,49 @@ def load_manifest(manifest_path):
     return data.get("migration", [])
 
 
+def entry_identity(entry):
+    identity = [(entry["file"], entry["sha256"])]
+    identity += [(alias["file"], alias["sha256"])
+                 for alias in entry.get("renamed_from", [])]
+    return identity
+
+
 def resolve_entry(entries, filename, sha256):
-    """Return (target, identity) for an applied-under name, or raise.
+    """Return (target, identity, priors) for an applied-under name, or raise.
 
     Identity is every (file, sha256) pair the entry may be recorded
     under: its current name plus each ``renamed_from`` original.
+    Priors are the identities of every earlier same-target manifest
+    entry; the guard requires each of them to be recorded already, so
+    an apply can never skip or reorder history (the mirror target has
+    no downstream gate that would catch a gap).
     """
-    for entry in entries:
-        identity = [(entry["file"], entry["sha256"])]
-        identity += [(alias["file"], alias["sha256"])
-                     for alias in entry.get("renamed_from", [])]
+    for index, entry in enumerate(entries):
+        identity = entry_identity(entry)
         if dict(identity).get(filename) is not None:
             if dict(identity)[filename] != sha256:
                 raise ApplyError(
                     f"{filename} sha256 {sha256} does not match the manifest "
                     f"{dict(identity)[filename]}"
                 )
-            return entry["target"], identity
+            priors = [entry_identity(earlier) for earlier in entries[:index]
+                      if earlier["target"] == entry["target"]]
+            return entry["target"], identity, priors
     raise ApplyError(f"{filename} is not listed in the manifest")
 
 
-def quote_literal(value):
+def quote_literal(value, label="applied-by"):
     if any(ord(ch) < 0x20 for ch in value) or not value.strip():
-        raise ApplyError("applied-by must be non-empty printable text")
+        raise ApplyError(f"{label} must be non-empty printable text")
     return "'" + value.replace("'", "''") + "'"
+
+
+def validate_expected_database(expected_database):
+    if not isinstance(expected_database, str) \
+            or not DATABASE_RE.match(expected_database):
+        raise ApplyError(
+            "--expect-database must be a plain database name ([A-Za-z0-9_]+)")
+    return expected_database
 
 
 def insert_sql(filename, sha256, applied_by, applied_at=None, on_conflict=True):
@@ -149,33 +215,66 @@ def insert_sql(filename, sha256, applied_by, applied_at=None, on_conflict=True):
     )
 
 
-def guard_sql(identity):
-    """Abort the transaction if this migration identity is recorded.
+def database_guard_sql(expected_database):
+    """Abort if the connected database is not the expected one.
+
+    Runs inside whichever transaction follows it, so a mismatch leaves
+    nothing behind — not even the tracking table from the DDL step.
+    """
+    return f"""DO $dbguard$
+BEGIN
+    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+        RAISE EXCEPTION '{WRONG_DATABASE}';
+    END IF;
+END
+$dbguard$;"""
+
+
+def ddl_sql(expected_database):
+    return database_guard_sql(expected_database) + "\n" + DDL + "\n"
+
+
+def guard_sql(identity, expected_database, priors=()):
+    """Abort the transaction on a wrong DB or bad recording state.
 
     The marker texts are ours, so the caller can tell "already applied
     with these bytes" (a no-op) from a conflicting record (refuse)
-    without rendering database output.
+    without rendering database output. Priors are earlier same-target
+    identities; each must already be recorded, under any of its names,
+    before this migration may apply.
     """
-    pairs = ", ".join(
-        f"({quote_literal(name)}, '{sha}')" for name, sha in identity)
+    def pairs_of(pairs):
+        return ", ".join(
+            f"({quote_literal(name)}, '{sha}')" for name, sha in pairs)
+
     names = ", ".join(quote_literal(name) for name, _sha in identity)
+    prior_checks = "".join(f"""
+    IF NOT EXISTS (SELECT 1 FROM public.schema_migrations
+               WHERE (file, sha256) IN ({pairs_of(prior)})) THEN
+        RAISE EXCEPTION '{MISSING_PRIOR}';
+    END IF;""" for prior in priors)
     return f"""SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});
 DO $guard$
 BEGIN
+    IF current_database() <> {quote_literal(expected_database, "expect-database")} THEN
+        RAISE EXCEPTION '{WRONG_DATABASE}';
+    END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
-               WHERE (file, sha256) IN ({pairs})) THEN
+               WHERE (file, sha256) IN ({pairs_of(identity)})) THEN
         RAISE EXCEPTION '{ALREADY_SAME}';
     END IF;
     IF EXISTS (SELECT 1 FROM public.schema_migrations
                WHERE file IN ({names})) THEN
         RAISE EXCEPTION '{ALREADY_DIFFERENT}';
-    END IF;
+    END IF;{prior_checks}
 END
 $guard$;"""
 
 
-def compose(file_path, manifest_path, applied_by, record_only=False):
+def compose(file_path, manifest_path, applied_by, record_only=False,
+            *, expect_database):
     """Return (sql, filename, sha256, target) for one apply, or raise."""
+    validate_expected_database(expect_database)
     path = pathlib.Path(file_path)
     filename = path.name
     if not FILE_RE.match(filename):
@@ -185,14 +284,15 @@ def compose(file_path, manifest_path, applied_by, record_only=False):
     except OSError as exc:
         raise ApplyError(f"cannot read migration: {exc}") from exc
     sha256 = hashlib.sha256(contents).hexdigest()
-    target, identity = resolve_entry(load_manifest(manifest_path), filename, sha256)
+    target, identity, priors = resolve_entry(
+        load_manifest(manifest_path), filename, sha256)
     body = contents.decode("utf-8")
     if not record_only and has_toplevel_txn_control(body):
         raise ApplyError(
             f"{filename} carries top-level transaction control or psql "
             "meta-commands; apply it by hand, then re-run with --record-only"
         )
-    parts = [guard_sql(identity)]
+    parts = [guard_sql(identity, expect_database, priors)]
     if not record_only:
         parts.append(body.rstrip() + "\n")
     parts.append(insert_sql(filename, sha256, applied_by, on_conflict=False))
@@ -247,6 +347,13 @@ def psql(child, sql, single_transaction=False):
             raise _AlreadyRecorded(same=True)
         if ALREADY_DIFFERENT in result.stderr:
             raise _AlreadyRecorded(same=False)
+        if WRONG_DATABASE in result.stderr:
+            raise ApplyError(
+                "connected database does not match --expect-database; refusing")
+        if MISSING_PRIOR in result.stderr:
+            raise ApplyError(
+                "an earlier same-target migration is not recorded; "
+                "apply migrations in manifest order")
         raise ApplyError("psql failed; see the operator-side psql output")
     return result.stdout
 
@@ -261,6 +368,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--file", required=True, help="migration SQL file")
     parser.add_argument("--applied-by", required=True)
+    parser.add_argument("--expect-database", required=True,
+                        help="database this apply must target; checked "
+                             "against DATABASE_URL and current_database()")
     parser.add_argument("--manifest", default="migrations/manifest.toml")
     parser.add_argument("--record-only", action="store_true",
                         help="only write the tracking row (file already applied)")
@@ -269,12 +379,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         sql, filename, _sha256, target = compose(
-            args.file, args.manifest, args.applied_by, args.record_only)
+            args.file, args.manifest, args.applied_by, args.record_only,
+            expect_database=args.expect_database)
         if args.dry_run:
-            print(DDL + "\n" + sql, end="")
+            print(ddl_sql(args.expect_database) + sql, end="")
             return 0
         child = connection_env(os.environ.get("DATABASE_URL", ""))
-        psql(child, DDL + "\n")
+        if child["PGDATABASE"] != args.expect_database:
+            raise ApplyError(
+                "DATABASE_URL database does not match --expect-database; refusing")
+        # Guarded + single-transaction: on the wrong database the
+        # tracking table itself must never appear.
+        psql(child, ddl_sql(args.expect_database), single_transaction=True)
         try:
             psql(child, sql, single_transaction=True)
         except _AlreadyRecorded as recorded:

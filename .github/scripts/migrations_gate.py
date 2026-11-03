@@ -227,6 +227,15 @@ def check_drift(root, base_ref):
         for index, entry in enumerate(base_entries, start=1):
             if not all(isinstance(entry.get(key), str) for key in ("file", "target", "sha256")):
                 raise GateError(f"base migrations/manifest.toml entry {index} requires string file, target, and sha256")
+            renamed_from = entry.get("renamed_from", [])
+            if not isinstance(renamed_from, list) or any(
+                not isinstance(item, dict)
+                or not all(isinstance(item.get(key), str) for key in ("file", "sha256"))
+                for item in renamed_from
+            ):
+                raise GateError(
+                    f"base migrations/manifest.toml entry {index} renamed_from must be a list of file/sha256 tables"
+                )
         base_manifest = {entry["file"]: entry for entry in base_entries}
 
     violations = 0
@@ -276,6 +285,29 @@ def check_drift(root, base_ref):
             if manifest_changed:
                 report("applied-edited", filename, f"manifest target or checksum differs from base {base_ref}")
                 violations += 1
+            if previous is not None and current_entry is not None:
+                # renamed_from is append-only history: additions record
+                # a new pre-merge rename, but removing or altering an
+                # existing (file, sha256) pair would orphan the row a
+                # database already recorded under that original name,
+                # and the staging gate would then fail closed on a
+                # manifest-only edit. Compare as (file, sha256) pairs,
+                # so changing an alias's sha counts as removal too.
+                previous_aliases = {
+                    (alias["file"], alias["sha256"])
+                    for alias in previous.get("renamed_from", [])
+                }
+                current_aliases = {
+                    (alias["file"], alias["sha256"])
+                    for alias in current_entry.get("renamed_from", [])
+                }
+                if not previous_aliases <= current_aliases:
+                    report(
+                        "rename-history-removed",
+                        filename,
+                        f"renamed_from entries are append-only; an entry present on base {base_ref} was removed or changed",
+                    )
+                    violations += 1
     return violations
 
 

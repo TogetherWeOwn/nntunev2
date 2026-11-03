@@ -96,6 +96,14 @@ FIXTURES = {
     "double-apply": (
         f"INSERT INTO public.schema_migrations (file, sha256, applied_by) "
         f"VALUES ('0001_beta_old.sql', '{B_SHA}', 'fixture');", "", False),
+    # Rows are deploy proof: a write grant to anyone but the owner must
+    # fail the guard even when the rows themselves match the manifest.
+    "non-owner-write-grant": (
+        "GRANT INSERT ON public.schema_migrations TO PUBLIC;",
+        "REVOKE INSERT ON public.schema_migrations FROM PUBLIC;", False),
+    "non-owner-read-grant": (
+        "GRANT SELECT ON public.schema_migrations TO PUBLIC;",
+        "REVOKE SELECT ON public.schema_migrations FROM PUBLIC;", True),
 }
 
 ARGS = ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
@@ -131,9 +139,18 @@ def assert_verdict(env, name):
 
     def run(args, **options):
         options["env"] = env
+        if name == "temp-exception" and "pg_class" in options.get("input", ""):
+            # A temp table exists only in its own session, so running the
+            # setup through a separate exec_sql session would make this
+            # fixture vacuous: the guard would never see the pg_temp
+            # relation whose exclusion it is meant to exercise. Prepend
+            # the CREATE TEMP TABLE to the guard's own psql script (the
+            # one carrying the pg_class guard query), so the temp shadow
+            # is live in the session that runs GUARD_SQL.
+            options["input"] = setup + "\n" + options["input"]
         return psql(args, **options)
 
-    exec_sql(env, PUBLIC_TABLE + setup)
+    exec_sql(env, PUBLIC_TABLE + ("" if name == "temp-exception" else setup))
     try:
         try:
             gate.check(synthetic, fetch=lambda _: payload, run=run, expected=EXPECTED)
@@ -165,7 +182,17 @@ def main():
             print(f"staging-schema-postgres: passed {name}")
 
         mutations = (
-            ("inverted exclusion", "AND NOT EXISTS", "AND EXISTS", "public-only"),
+            ("inverted exclusion", "AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN",
+             "AND EXISTS (SELECT 1 FROM pg_class c JOIN", "public-only"),
+            # Dropping the pg_temp exclusion must turn the same-session
+            # temp shadow into a guard failure; if this mutant survives,
+            # the temp-exception fixture is not exercising the exclusion.
+            ("dropped pg_temp exclusion",
+             "AND n.nspname NOT LIKE 'pg\\_temp\\_%'", "AND true", "temp-exception"),
+            # Dropping the non-owner write-grant exclusion must let a
+            # PUBLIC write grant pass the guard.
+            ("dropped write-grant exclusion",
+             "AND a.grantee <> c.relowner", "AND false", "non-owner-write-grant"),
             *((f"omitted {fixture} kind", "WHERE c.relname='schema_migrations'",
                "WHERE c.relname='schema_migrations' AND c.relkind IN ('r','p','v','m','f','S')", fixture)
               for fixture in ("index", "partitioned-index", "composite")),

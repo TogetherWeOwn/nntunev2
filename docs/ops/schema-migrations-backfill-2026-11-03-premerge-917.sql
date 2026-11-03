@@ -11,6 +11,34 @@ CREATE TABLE IF NOT EXISTS public.schema_migrations (
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     applied_by TEXT NOT NULL
 );
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON TABLE public.schema_migrations FROM PUBLIC;
+DO $privileges$
+DECLARE
+    grant_row record;
+BEGIN
+    FOR grant_row IN
+        SELECT DISTINCT a.grantee
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN aclexplode(c.relacl) a
+        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
+          AND a.privilege_type IN
+              ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+          AND a.grantee <> c.relowner
+    LOOP
+        IF grant_row.grantee = 0 THEN
+            EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                 || 'ON TABLE public.schema_migrations FROM PUBLIC';
+        ELSE
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                'ON TABLE public.schema_migrations FROM %I',
+                pg_get_userbyid(grant_row.grantee));
+        END IF;
+    END LOOP;
+END
+$privileges$;
 
 INSERT INTO public.schema_migrations (file, sha256, applied_at, applied_by)
 VALUES (
