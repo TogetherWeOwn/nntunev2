@@ -163,15 +163,12 @@ pub fn obfuscate_article<R: FillRandom>(
     fill_alphabet(rng, &mut domain_right, LOWER_ALNUM)?;
     let message_id = format!(
         "{}@{}.{}",
-        str::from_utf8(&local[..]).map_err(|_| Error::Malformed(
-            "generated message-id is not valid text".into()
-        ))?,
-        str::from_utf8(&domain_left[..]).map_err(|_| Error::Malformed(
-            "generated message-id is not valid text".into()
-        ))?,
-        str::from_utf8(&domain_right[..]).map_err(|_| Error::Malformed(
-            "generated message-id is not valid text".into()
-        ))?,
+        std::str::from_utf8(&local[..])
+            .map_err(|_| Error::Malformed("generated message-id is not valid text".into()))?,
+        std::str::from_utf8(&domain_left[..])
+            .map_err(|_| Error::Malformed("generated message-id is not valid text".into()))?,
+        std::str::from_utf8(&domain_right[..])
+            .map_err(|_| Error::Malformed("generated message-id is not valid text".into()))?,
     );
     if !valid_segment_id(&message_id) {
         return Err(Error::Malformed(
@@ -188,28 +185,32 @@ pub fn obfuscate_article<R: FillRandom>(
     // SAFETY: every byte comes from the ASCII alphabet above.
     let from = format!(
         "{}@{}.{}",
-        str::from_utf8(&from_local[..]).expect("alphabet is ASCII"),
-        str::from_utf8(&from_domain_left[..]).expect("alphabet is ASCII"),
-        str::from_utf8(&from_domain_right[..]).expect("alphabet is ASCII"),
+        std::str::from_utf8(&from_local[..]).expect("alphabet is ASCII"),
+        std::str::from_utf8(&from_domain_left[..]).expect("alphabet is ASCII"),
+        std::str::from_utf8(&from_domain_right[..]).expect("alphabet is ASCII"),
     );
 
     let mut subject = [0u8; OBFUSCATED_SUBJECT_LEN];
     fill_alphabet(rng, &mut subject, SUBJECT_ALPHABET)?;
     // SAFETY: every byte comes from the ASCII alphabet above.
-    let subject = str::from_utf8(&subject[..]).expect("alphabet is ASCII").to_string();
+    let subject = std::str::from_utf8(&subject[..])
+        .expect("alphabet is ASCII")
+        .to_string();
 
     let mut yenc_name = [0u8; OBFUSCATED_YENC_NAME_LEN];
     fill_alphabet(rng, &mut yenc_name, LOWER_ALNUM)?;
     // SAFETY: every byte comes from the ASCII alphabet above.
-    let yenc_name = str::from_utf8(&yenc_name[..])
+    let yenc_name = std::str::from_utf8(&yenc_name[..])
         .expect("alphabet is ASCII")
         .to_string();
 
     let jitter_span = DATE_JITTER_SECS * 2 + 1;
     let offset = uniform_below(rng, jitter_span as u64)? as i64 - DATE_JITTER_SECS;
-    let date = format_nntp_date(now_unix_secs.checked_add(offset).ok_or_else(|| {
-        Error::Malformed("posting clock plus date jitter overflows".into())
-    })?)?;
+    let date = format_nntp_date(
+        now_unix_secs
+            .checked_add(offset)
+            .ok_or_else(|| Error::Malformed("posting clock plus date jitter overflows".into()))?,
+    )?;
 
     Ok(ObfuscatedArticle {
         message_id,
@@ -339,7 +340,10 @@ pub fn assemble_article(headers: &[u8], body: &[u8]) -> Result<Vec<u8>> {
 /// character (which includes DEL via `is_control`). Printable values pass;
 /// the 998-byte ceiling is enforced at render.
 fn check_header_value(name: &str, value: &str) -> Result<()> {
-    if value.chars().any(|c| c == '\r' || c == '\n' || c.is_control()) {
+    if value
+        .chars()
+        .any(|c| c == '\r' || c == '\n' || c.is_control())
+    {
         return Err(Error::Malformed(format!(
             "{name} header value carries a framing-breaking character"
         )));
@@ -382,10 +386,10 @@ fn check_body_framing(body: &[u8]) -> Result<()> {
 ///
 /// The returned bytes end with CRLF.
 fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
-    if name.is_empty()
-        || name.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7F)
-    {
-        return Err(Error::Malformed("header name is not a valid field name".into()));
+    if name.is_empty() || name.bytes().any(|b| b <= b' ' || b == b':' || b >= 0x7F) {
+        return Err(Error::Malformed(
+            "header name is not a valid field name".into(),
+        ));
     }
     let first_prefix = format!("{name}: ");
     let mut lines: Vec<String> = Vec::new();

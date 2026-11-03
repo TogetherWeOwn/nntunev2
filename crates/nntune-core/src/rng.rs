@@ -27,7 +27,9 @@ impl FillRandom for SystemRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) -> Result<()> {
         getrandom::getrandom(dest).map_err(|_| {
             // `io::Error::other` is stable since 1.74; MSRV is 1.75.
-            Error::Io(io::Error::other("CSPRNG failure: no random bytes available"))
+            Error::Io(io::Error::other(
+                "CSPRNG failure: no random bytes available",
+            ))
         })
     }
 }
