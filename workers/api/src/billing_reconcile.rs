@@ -456,18 +456,15 @@ pub fn reconcile_subscription(
                 span_end = Some(qualified.end);
                 let same_plan = span_plan.as_deref() == Some(qualified.plan.as_str());
                 span_start = Some(if same_plan {
-                    span_start.map_or(qualified.start, |start: i64| {
-                        start.min(qualified.start)
-                    })
+                    span_start.map_or(qualified.start, |start: i64| start.min(qualified.start))
                 } else {
                     qualified.start
                 });
                 span_plan = Some(qualified.plan.clone());
             } else if span_plan.as_deref() == Some(qualified.plan.as_str()) {
-                span_start =
-                    Some(span_start.map_or(qualified.start, |start: i64| {
-                        start.min(qualified.start)
-                    }));
+                span_start = Some(
+                    span_start.map_or(qualified.start, |start: i64| start.min(qualified.start)),
+                );
             }
             if qualified.plan == item_plan {
                 item_end = Some(item_end.map_or(qualified.end, |end: i64| end.max(qualified.end)));
@@ -1374,7 +1371,10 @@ mod tests {
         };
         let outcome = reconcile_subscription(&stored, &snapshot, NOW);
         assert_eq!(outcome.fail_closed, None);
-        assert_eq!(outcome.row.plan_id, "pro-5x", "no new plan money: plan stays");
+        assert_eq!(
+            outcome.row.plan_id, "pro-5x",
+            "no new plan money: plan stays"
+        );
         assert_eq!(outcome.row.paid_through_unix, Some(e2));
         assert_eq!(outcome.row.status, "past_due", "fresh failure applies");
         assert_eq!(
@@ -1494,7 +1494,11 @@ mod tests {
         };
         let mut invoice = paid_invoice(id, PRICE_PLUS, d1, d15, paid_at);
         invoice.lines = Some(InvoiceLines {
-            data: if plus_first { vec![plus, pro] } else { vec![pro, plus] },
+            data: if plus_first {
+                vec![plus, pro]
+            } else {
+                vec![pro, plus]
+            },
             has_more: false,
         });
         invoice
@@ -1531,16 +1535,21 @@ mod tests {
         // The scoping above must not drop same-plan days: two pro lines
         // arriving latest-end-last still span their full range.
         let mut invoice = paid_invoice("in_pro2", PRICE_PRO, NOW - 10 * 86_400, NOW, NOW);
-        invoice.lines.as_mut().expect("lines").data.push(InvoiceLine {
-            id: "in_pro2-early".to_string(),
-            amount: 900,
-            currency: Some("usd".to_string()),
-            price: Some(PRICE_PRO.to_string()),
-            period: Some(crate::stripe::InvoiceLinePeriod {
-                start: Some(NOW - 20 * 86_400),
-                end: Some(NOW - 5 * 86_400),
-            }),
-        });
+        invoice
+            .lines
+            .as_mut()
+            .expect("lines")
+            .data
+            .push(InvoiceLine {
+                id: "in_pro2-early".to_string(),
+                amount: 900,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PRO.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(NOW - 20 * 86_400),
+                    end: Some(NOW - 5 * 86_400),
+                }),
+            });
         let remote = RemoteSubscription {
             subscription: subscription("active", PRICE_PRO),
             invoices: vec![invoice],
