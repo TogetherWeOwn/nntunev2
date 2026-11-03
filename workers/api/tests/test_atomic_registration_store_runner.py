@@ -122,8 +122,8 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
         extra.add(runner.PREFIX + "postgres_unlisted_surprise")
         self.assert_rejected_before_execution(extra)
 
-    def test_expected_inventory_has_twenty_three_db_cases_and_four_config_cases(self):
-        self.assertEqual(len(runner.EXPECTED), 23)
+    def test_expected_inventory_has_twenty_seven_db_cases_and_four_config_cases(self):
+        self.assertEqual(len(runner.EXPECTED), 27)
         self.assertIn(
             runner.PREFIX + "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
             runner.EXPECTED,
@@ -136,6 +136,10 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
             "postgres_reap_preserves_admin_stub_accounts",
             "postgres_admin_role_change_on_a_deleting_subject_writes_nothing",
             "postgres_admin_role_change_rolls_back_when_the_audit_insert_fails",
+            "postgres_admin_invite_issue_and_revoke_audit_by_row_id",
+            "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
+            "postgres_registration_invite_claim_stamps_spend_and_invited_by",
+            "postgres_registration_invite_claim_survives_issuer_deletion",
         ):
             self.assertIn(runner.PREFIX + name, runner.EXPECTED)
         self.assertEqual(len(runner.EXPECTED_CONFIG), 4)

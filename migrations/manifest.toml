@@ -159,6 +159,11 @@ target = "app"
 sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
 
 [[migration]]
-file = "0033_mb_mirror_phase2_relations.sql"
+file = "0033_invite_codes.sql"
+target = "app"
+sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
+
+[[migration]]
+file = "0034_mb_mirror_phase2_relations.sql"
 target = "mirror"
-sha256 = "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"
+sha256 = "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"
