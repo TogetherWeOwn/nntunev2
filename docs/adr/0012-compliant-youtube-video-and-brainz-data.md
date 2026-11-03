@@ -14,8 +14,8 @@ The product wants music videos and richer catalogue data. Three facts
 constrain how:
 
 1. **The existing `workers/youtube` spike is not a compliant
-   shipping path.** It extracts audio streams yt-dlp-style (Innertube
-   client, stream-URL parsing, Range passthrough, planned residential
+   shipping path.** It extracts audio streams downloader-style
+   (private player-API client, stream-URL parsing, Range passthrough, planned residential
    proxy and signature solving). That breaks the YouTube API Services
    Developer Policies: III.I.7–8 (no separating audio/video),
    III.I.9 (no background player), III.I.14 (no access via other
@@ -510,11 +510,13 @@ arbitrary track.
   on: the §3 CSP security review,
   terms/privacy updates (III.A), and the 30-day TTL job. (The two
   owner decisions that gated this record closed 2026-11-03: §5, §7.)
-  The CI guardrails (grep gate over the new video/curation paths —
-  no `googlevideo`, `/youtubei/` or `yt-dlp` references there; the
-  kept, flag-off `workers/youtube` spike directory is the one
-  exclusion, per §7; no `search.list` on the play path) are
-  acceptance criteria for the build changes, which also re-check
+  The CI guardrails are acceptance criteria for the build changes:
+  the clean-room lint already in CI bans extraction-endpoint and
+  downloader references repo-wide (its rule text names the exact
+  tokens; this record deliberately does not reproduce them), with
+  the kept, flag-off `workers/youtube` spike directory as the one
+  named exemption from that rule, per §7; the build changes extend
+  the same gate to no `search.list` on the play path. They also re-check
   the YouTube policy revision history — these policies change, and
   this ADR cites the revisions read above.
 - Follow-on build work, each its own change: mirror schema
