@@ -171,21 +171,20 @@ and it is an operator decision recorded in config history.
 
 ### Playback source order (consumption contract)
 
-This record states its own consumption contract, self-contained; it
-does not depend on an unpublished record. The playback resolver order
-implementations of this ADR must follow is: **curated FLAC — R2
+This record states its own consumption contract, self-contained, so
+it can be read without following the cross-reference below. The
+playback resolver order implementations of this ADR must follow is: **curated FLAC — R2
 popularity cache first, then NNTP through the provider pool — then the
 YouTube embed, then unavailable**. Unavailable tracks are hidden by
 default. YouTube is also the music-video source for every track,
 including ones streamed from this cache, as a separate visible playback
 under the YouTube embed rules in `AGENTS.md` (visible official IFrame
-player, never audio-only or background playback). The proposed
-PlayableSource record (ADR 0012) is expected to become the
-authoritative home for this order once it is accepted and published;
-until then it is pending and nothing here defers to it — if the
-accepted 0012 ever states a different order, this section is revised
-to match in the same change that adopts it. Nothing in this record
-introduces offline downloads or weakens the one-concurrent-stream
+player, never audio-only or background playback). The PlayableSource
+record (ADR 0012) is accepted and published (merged in #886) and is
+the authoritative home for this order; the order stated above matches
+it. If ADR 0012 is ever revised to state a different order, this
+section is revised to match in the same change that adopts it.
+Nothing in this record introduces offline downloads or weakens the one-concurrent-stream
 lease: cached plays take the same lease and hour-meter writes as NNTP
 plays.
 
