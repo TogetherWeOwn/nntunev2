@@ -4891,6 +4891,17 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
             .await
         })
     }
+    fn expire_checkout_session(
+        &self,
+        session_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::expire_checkout_session_request(&session_id))
+                .await
+        })
+    }
     fn retrieve_subscription(
         &self,
         subscription_id: String,

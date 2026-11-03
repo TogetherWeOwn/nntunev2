@@ -140,6 +140,36 @@ advance `plan_id`/`paid_through_at`, disable new purchases for it and alert for
 reconciliation. Existing previously confirmed coverage/allowances retain only
 their original deadlines; an unknown price grants no new or higher paid caps.
 
+### Reconcile folds and purchase-flight replacement
+
+A reconcile pass folding an older remote snapshot must not regress a fresher
+stored pass: coverage (`paid_through_at`, and the `plan_id`/`paid_invoice_id`
+tied to it) advances monotonically, and the same staleness predicate — the new
+evidence ends strictly before the stored paid end — guards stored `status` and
+`grace_until` instead of writing stale verbatim fields over a fresher pass.
+Empty-money observations are not stale (a first-failure `past_due` still sets
+the renewal grace); equal-money status order is unknowable across passes, so
+equal-end folds converge on the next hourly reconcile. When an equal paid end
+carries a new plan (a plan switch landing exactly on the old period end), the
+fold adopts the subscription item's current plan with unchanged coverage,
+anchored on the new evidence.
+
+An existing open Checkout Session — or a single-flight loser converging onto
+one — is reused only when its recorded price matches the newly requested
+price. A second attempt naming a different plan never inherits the first
+attempt's session: the open session is expired first, the flight is
+superseded, and a fresh operation mints under a fresh Stripe idempotency key.
+Repairing a confirmed-expired or Stripe-404-missing session replaces the same
+way (no expiry call: Stripe already converged the state), so a repair can
+never replay a dead session inside Stripe's retention window. An unconfirmed
+retrieve (any non-404 failure) fails retryable instead of minting beside
+unknown state.
+
+Paid-invoice history keeps one row per confirmed paid invoice under its own
+lines' plan — including invoices from an earlier plan after a plan change —
+idempotent on the invoice id; coverage still follows only the current item's
+plan.
+
 Once the previous subscription is confirmed Stripe-terminal, a new paid
 subscription may be created with a new operation id (a fresh Checkout
 Session).

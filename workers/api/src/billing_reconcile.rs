@@ -45,16 +45,25 @@
 //!   with a price.
 //! - Monotonic coverage under the per-user lock (held by the store
 //!   layer): duplicates and older invoices never regress a later confirmed
-//!   plan/period; the plan only changes on newly reconciled money.
+//!   plan/period; the plan only changes on newly reconciled money, or
+//!   relabels to the item's plan on an equal-end snapshot. A snapshot whose
+//!   item-plan money ends strictly before the stored coverage is stale: it
+//!   retains the stored plan, status, grace, bindings and anchor instead of
+//!   regressing them. A snapshot with no item-plan money is not stale on
+//!   that basis alone — a failed renewal observes `past_due` with no new
+//!   invoice, and that observation sets the grace below.
 //! - Renewal grace: the first failed renewal after a paid period sets
 //!   `grace_until` to that paid end plus [`RENEWAL_GRACE_SECS`]. Retries
 //!   and duplicate events never extend a stored grace; successful recovery
 //!   (new money reconciled) clears it, as does `active` and terminal
 //!   state. A failed FIRST payment has no paid end and gets no grace.
-//! - History: every confirmed paid service invoice yields exactly one
-//!   [`PaidInvoiceRow`] (idempotent on the invoice id at the store layer),
-//!   anchored on `status_transitions.paid_at`. Invoices without it are
-//!   skipped: no anchor, no coverage, no history row.
+//! - History: every confirmed paid service invoice that resolves through
+//!   `plan_prices` to any plan yields exactly one [`PaidInvoiceRow`]
+//!   (idempotent on the invoice id at the store layer), labeled with its
+//!   own lines' plan — so earlier-plan invoices row after a plan change
+//!   instead of being skipped — anchored on `status_transitions.paid_at`.
+//!   Invoices without it are skipped: no anchor, no coverage, no history
+//!   row.
 //!
 //! New purchases disable on fail-closed only (the stored verbatim row is
 //! nonterminal and unresolvable, so the purchase path cannot proceed past
@@ -214,27 +223,38 @@ fn resolve_plan(bindings: &[PriceBinding], price_id: &str) -> Option<String> {
         .map(|binding| binding.plan_id.clone())
 }
 
-/// One qualifying service line: positive amount, a test-mode mapping to
-/// the item's plan (never `free`, never another plan), and a bounded
-/// period end. Everything else is skipped for coverage — one-off, credit,
-/// free-price, unrelated-plan, unknown-price, or open-ended lines confer
-/// nothing and never fail the pass on their own.
-fn qualifying_end(
+/// One invoice line's qualifying contribution: its resolved (non-`free`)
+/// plan plus its bounded service period. Positive amount, an exact
+/// test-mode mapping, and a bounded end — one-off, credit, free-price,
+/// unknown-price, or open-ended lines confer nothing and never fail the
+/// pass on their own. Coverage additionally requires the line's plan to
+/// match the subscription item's plan (see the fold); history accepts any
+/// qualifying plan, so earlier-plan invoices still row. `start` defaults
+/// to `end` when Stripe omits it (a zero-length point, never a guess).
+struct QualifiedLine {
+    plan: String,
+    start: i64,
+    end: i64,
+}
+
+fn qualify_line(
     bindings: &[PriceBinding],
-    item_plan: &str,
     line_price: Option<&str>,
     amount: i64,
-    period_end: Option<i64>,
-) -> Option<i64> {
-    if amount <= 0 || item_plan == "free" {
+    period: Option<&crate::stripe::InvoiceLinePeriod>,
+) -> Option<QualifiedLine> {
+    if amount <= 0 {
         return None;
     }
     let price_id = line_price?;
     let plan = resolve_plan(bindings, price_id)?;
-    if plan != item_plan {
+    if plan == "free" {
         return None;
     }
-    period_end
+    let period = period?;
+    let end = period.end?;
+    let start = period.start.unwrap_or(end);
+    Some(QualifiedLine { plan, start, end })
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -354,6 +374,14 @@ pub fn reconcile_subscription(
     // Advance path (`active` / `past_due`): fold every bound paid invoice.
     // A live or misbound invoice fails the pass; a merely unhelpful one
     // (wrong sub, unpaid, unanchored, no qualifying line) is skipped.
+    //
+    // Coverage advances ONLY from lines resolving to the subscription
+    // item's plan; history rows cover every confirmed paid service invoice
+    // resolving through `plan_prices` to ANY plan, so earlier-plan
+    // invoices row (labeled with their own plan) after a plan change
+    // instead of being skipped. The store inserts history idempotently on
+    // the invoice id, so the next reconcile backfills rows that older
+    // passes skipped.
     let mut history = Vec::new();
     let mut new_end: Option<i64> = None;
     let mut anchor_invoice: Option<String> = None;
@@ -386,54 +414,92 @@ pub fn reconcile_subscription(
             .as_ref()
             .map(|lines| lines.data.as_slice())
             .unwrap_or(&[]);
-        let mut period_start: Option<i64> = None;
-        let mut period_end: Option<i64> = None;
+        let mut span_start: Option<i64> = None;
+        let mut span_end: Option<i64> = None;
+        let mut span_plan: Option<String> = None;
+        let mut item_end: Option<i64> = None;
         for line in lines {
-            let line_end = qualifying_end(
+            let Some(qualified) = qualify_line(
                 &local.bindings,
-                &item_plan,
                 line.price.as_deref(),
                 line.amount,
-                line.period.as_ref().and_then(|period| period.end),
-            );
-            let Some(line_end) = line_end else {
+                line.period.as_ref(),
+            ) else {
                 continue;
             };
-            let line_start = line
-                .period
-                .as_ref()
-                .and_then(|period| period.start)
-                .unwrap_or(line_end);
-            period_start =
-                Some(period_start.map_or(line_start, |start: i64| start.min(line_start)));
-            period_end = Some(period_end.map_or(line_end, |end: i64| end.max(line_end)));
+            span_start =
+                Some(span_start.map_or(qualified.start, |start: i64| start.min(qualified.start)));
+            if span_end.is_none_or(|end| qualified.end > end) {
+                span_end = Some(qualified.end);
+                span_plan = Some(qualified.plan.clone());
+            }
+            if qualified.plan == item_plan {
+                item_end = Some(item_end.map_or(qualified.end, |end: i64| end.max(qualified.end)));
+            }
         }
-        let (Some(start), Some(end)) = (period_start, period_end) else {
+        let (Some(start), Some(end), Some(plan)) = (span_start, span_end, span_plan) else {
             continue;
         };
         history.push(PaidInvoiceRow {
             stripe_invoice_id: invoice.id.clone(),
             stripe_subscription_id: sub.id.clone(),
-            plan_id: item_plan.clone(),
+            plan_id: plan,
             period_start_unix: start,
             period_end_unix: end,
             amount_cents: invoice.amount_paid,
             currency,
             paid_at_unix: paid_at,
         });
-        if new_end.is_none_or(|current| end > current) {
-            new_end = Some(end);
-            anchor_invoice = Some(invoice.id.clone());
+        if let Some(end) = item_end {
+            if new_end.is_none_or(|current| end > current) {
+                new_end = Some(end);
+                anchor_invoice = Some(invoice.id.clone());
+            }
         }
     }
 
     let previous = local.live.as_ref();
     let previous_end = previous.and_then(|row| row.paid_through_unix);
+    // Staleness: a snapshot whose item-plan money ends strictly before
+    // the stored coverage folded an older remote state. It retains the
+    // stored plan, status, grace, bindings and anchor instead of
+    // regressing them; the history rows above still emit (the store
+    // dedupes on the invoice id). A snapshot with no item-plan money is
+    // NOT stale on that basis alone: a first failed renewal observes
+    // `past_due` with no new invoice, and that observation must set the
+    // grace below. Terminal and held paths branch before any money
+    // comparison, so only the advancing statuses can take this arm.
+    let stale = matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev);
+    if stale {
+        let kept = previous.expect("stale requires stored coverage");
+        return ReconcileOutcome {
+            row: ReconciledRow {
+                stripe_subscription_id: sub.id.clone(),
+                stripe_customer_id: remote_customer,
+                stripe_item_id: kept.stripe_item_id.clone(),
+                stripe_price_id: kept.stripe_price_id.clone(),
+                plan_id: kept.plan_id.clone(),
+                status: kept.status.clone(),
+                current_period_end_unix: sub.current_period_end,
+                cancel_at_period_end: sub.cancel_at_period_end,
+                paid_through_unix: kept.paid_through_unix,
+                paid_invoice_id: None,
+                grace_until_unix: kept.grace_until_unix,
+            },
+            history,
+            fail_closed: None,
+        };
+    }
     // Monotonic coverage: duplicates and older invoices never regress a
-    // later confirmed plan/period; the plan only changes on newly
-    // reconciled money.
+    // later confirmed plan/period. New money (a strictly greater item-plan
+    // end) adopts the subscription's current item plan and anchors on the
+    // new invoice. An equal-end snapshot relabels to the current item plan
+    // without advancing coverage — that is the defined equal-end
+    // plan-switch outcome — anchored on the new evidence; anything older
+    // is unreachable here (stale returns above).
     let recovered = new_end.is_some_and(|end| previous_end.is_none_or(|prev| end > prev));
-    let (plan_id, paid_through_unix, paid_invoice_id) = if recovered {
+    let tied = !recovered && new_end.is_some() && new_end == previous_end;
+    let (plan_id, paid_through_unix, paid_invoice_id) = if recovered || tied {
         (item_plan, new_end, anchor_invoice)
     } else {
         (
@@ -536,9 +602,27 @@ fn fail_closed(
 /// the flight (the partial unique only covers these three).
 pub const SINGLE_FLIGHT_STATES: [&str; 3] = ["pending", "submitted", "needs_reconcile"];
 
+/// Terminal mark for an operation deliberately replaced (price-mismatch or
+/// dead-session repair): the flight releases, so the replacement inserts a
+/// fresh operation with a fresh Stripe idempotency key. A Stripe key is
+/// therefore never reused after its session died — repairs cannot replay
+/// a dead session inside Stripe's retention window. Never a member of
+/// [`SINGLE_FLIGHT_STATES`], so marking it frees the slot.
+pub const SUPERSEDED_OP_STATE: &str = "superseded";
+
 /// True while the operation still reserves the per-user single flight.
 pub fn is_single_flight_state(state: &str) -> bool {
     SINGLE_FLIGHT_STATES.contains(&state)
+}
+
+/// Requested-vs-selected price check for session reuse: an open operation
+/// records the price its session was created for (`None` only for corrupt
+/// payloads, which keep today's reuse). A second attempt naming a
+/// different price must not inherit that session — the caller expires and
+/// replaces deliberately instead of handing over the first attempt's
+/// price.
+pub fn checkout_price_matches(op: &StoredCheckoutOp, price_id: &str) -> bool {
+    op.price_id.as_deref().is_none_or(|held| held == price_id)
 }
 
 /// A stored checkout operation (payload fields parsed tolerantly — an
@@ -747,9 +831,16 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// write itself*: the inputs are folded before the per-user advisory
 /// lock is taken, so a pass that read an older remote snapshot can
 /// commit after a fresher pass — the CASE keeps the greatest confirmed
-/// coverage instead of regressing it. Status, item bindings,
-/// period end and grace still update verbatim (the pure fold owns the
-/// grace-set-once/clear-on-recovery rules against its snapshot).
+/// coverage instead of regressing it. The same staleness guard covers
+/// `status` and `grace_until`: a pass whose money ends strictly before
+/// the stored coverage keeps the stored status/grace instead of writing
+/// stale verbatim fields over a fresher pass (the pure fold already
+/// retains them; this guard closes the commit race where a stale-reading
+/// pass commits second). Item bindings, period end and cancel still
+/// update verbatim.
+/// Full staleness predicate (mirrored in both CASEs): EXCLUDED money is
+/// non-NULL, stored money is non-NULL, and EXCLUDED ends strictly before
+/// stored.
 ///
 /// Full parameter order:
 /// $1 user_id · $2 stripe_subscription_id · $3 stripe_customer_id ·
@@ -758,7 +849,7 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
 /// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL.
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = EXCLUDED.grace_until"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
@@ -946,10 +1037,184 @@ mod tests {
         // No new money: plan and coverage stay exactly where they were.
         assert_eq!(outcome.row.plan_id, "pro-5x");
         assert_eq!(outcome.row.paid_through_unix, Some(NOW + 60 * 86_400));
-        // History still records each confirmed service invoice exactly once
+        // History records each confirmed service invoice exactly once —
+        // including the earlier-plan invoice, labeled with its own plan
         // (the store layer dedupes replays on the invoice id).
-        assert_eq!(outcome.history.len(), 1, "only the item-plan invoice rows");
-        assert_eq!(outcome.history[0].stripe_invoice_id, "in_9");
+        assert_eq!(outcome.history.len(), 2);
+        let older = outcome
+            .history
+            .iter()
+            .find(|row| row.stripe_invoice_id == "in_1")
+            .expect("earlier-plan invoice rows");
+        assert_eq!(older.plan_id, "plus");
+        assert_eq!(older.period_end_unix, NOW - 30 * 86_400);
+        let current = outcome
+            .history
+            .iter()
+            .find(|row| row.stripe_invoice_id == "in_9")
+            .expect("item-plan invoice rows");
+        assert_eq!(current.plan_id, "pro-5x");
+    }
+
+    // --- Stale snapshots cannot regress status/grace; equal ends relabel ---
+
+    #[test]
+    fn stale_snapshot_cannot_regress_status_or_grace() {
+        let fresh_end = NOW + 60 * 86_400;
+        let stale_end = NOW + 30 * 86_400;
+        // Stored: active with later coverage, no grace. A pass folding an
+        // older snapshot (past_due, older money) retains everything.
+        let stored = local("plus", Some(fresh_end), None);
+        let stale = RemoteSubscription {
+            subscription: subscription("past_due", PRICE_PLUS),
+            invoices: vec![paid_invoice(
+                "in_old",
+                PRICE_PLUS,
+                NOW - 30 * 86_400,
+                stale_end,
+                NOW - 10,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &stale, NOW);
+        assert_eq!(outcome.fail_closed, None, "stale is clean, not fail-closed");
+        assert_eq!(outcome.row.plan_id, "plus", "stored plan retained");
+        assert_eq!(outcome.row.paid_through_unix, Some(fresh_end));
+        assert_eq!(outcome.row.status, "active", "stored status retained");
+        assert_eq!(outcome.row.grace_until_unix, None, "no grace resurrected");
+        assert_eq!(outcome.row.stripe_price_id, PRICE_PLUS);
+        // The stale snapshot's invoice still rows for history (the store
+        // dedupes replays on the invoice id).
+        assert_eq!(outcome.history.len(), 1);
+        assert_eq!(outcome.history[0].stripe_invoice_id, "in_old");
+
+        // Mirror direction: stored past_due with a grace, folded over by an
+        // older `active` snapshot, keeps the fresher status and grace.
+        let grace = fresh_end + RENEWAL_GRACE_SECS;
+        let stored = local("plus", Some(fresh_end), Some(grace));
+        let mut stored = stored;
+        stored.live.as_mut().expect("live").status = "past_due".to_string();
+        let stale = RemoteSubscription {
+            subscription: subscription("active", PRICE_PLUS),
+            invoices: vec![paid_invoice(
+                "in_older",
+                PRICE_PLUS,
+                NOW - 60 * 86_400,
+                stale_end,
+                NOW - 20,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &stale, NOW);
+        assert_eq!(outcome.row.status, "past_due");
+        assert_eq!(outcome.row.grace_until_unix, Some(grace));
+        assert_eq!(outcome.row.paid_through_unix, Some(fresh_end));
+
+        // No item-plan money at all is NOT stale on that basis alone: a
+        // first failed renewal observes `past_due` with no new invoice,
+        // and that observation must set the grace. The snapshot's status
+        // still applies verbatim — only provably older money retains.
+        let stored = local("plus", Some(fresh_end), None);
+        let failed = RemoteSubscription {
+            subscription: subscription("past_due", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let outcome = reconcile_subscription(&stored, &failed, NOW);
+        assert_eq!(outcome.row.status, "past_due", "verbatim on empty money");
+        assert_eq!(
+            outcome.row.grace_until_unix,
+            Some(fresh_end + RENEWAL_GRACE_SECS),
+            "empty-money failure still sets the first grace"
+        );
+        assert_eq!(outcome.row.plan_id, "plus");
+        assert_eq!(outcome.row.paid_through_unix, Some(fresh_end));
+    }
+
+    #[test]
+    fn equal_end_plan_switch_adopts_current_item_plan() {
+        let end = NOW + 30 * 86_400;
+        // Stored plus coverage; the subscription's item moved to pro with a
+        // new invoice ending at the same instant: relabel, same coverage,
+        // anchor on the new evidence.
+        let stored = local("plus", Some(end), None);
+        let switched = RemoteSubscription {
+            subscription: subscription("active", PRICE_PRO),
+            invoices: vec![paid_invoice(
+                "in_new",
+                PRICE_PRO,
+                NOW - 30 * 86_400,
+                end,
+                NOW,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &switched, NOW);
+        assert_eq!(outcome.fail_closed, None);
+        assert_eq!(outcome.row.plan_id, "pro-5x", "equal end relabels");
+        assert_eq!(outcome.row.paid_through_unix, Some(end), "no advance");
+        assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("in_new"));
+        assert_eq!(outcome.row.status, "active");
+        assert_eq!(outcome.row.grace_until_unix, None);
+        assert_eq!(outcome.history.len(), 1);
+        assert_eq!(outcome.history[0].plan_id, "pro-5x");
+
+        // Equal end, same plan (duplicate delivery): everything stays, and
+        // the anchor refreshes to the identical evidence harmlessly.
+        let stored = local("plus", Some(end), None);
+        let duplicate = RemoteSubscription {
+            subscription: subscription("active", PRICE_PLUS),
+            invoices: vec![paid_invoice(
+                "in_1",
+                PRICE_PLUS,
+                NOW - 30 * 86_400,
+                end,
+                NOW,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &duplicate, NOW);
+        assert_eq!(outcome.row.plan_id, "plus");
+        assert_eq!(outcome.row.paid_through_unix, Some(end));
+        assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("in_1"));
+        assert_eq!(outcome.row.status, "active");
+    }
+
+    #[test]
+    fn tie_past_due_sets_first_grace_but_stale_never_resurrects() {
+        let end = NOW - 3_600;
+        // Stored active coverage, no grace. An equal-money `past_due`
+        // snapshot is NOT stale: the first failed renewal after a paid
+        // period sets the grace, exactly as a fresh observation would.
+        let stored = local("plus", Some(end), None);
+        let failed = RemoteSubscription {
+            subscription: subscription("past_due", PRICE_PLUS),
+            invoices: vec![paid_invoice(
+                "in_1",
+                PRICE_PLUS,
+                end - 30 * 86_400,
+                end,
+                NOW,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &failed, NOW);
+        assert_eq!(outcome.row.status, "past_due");
+        assert_eq!(
+            outcome.row.grace_until_unix,
+            Some(end + RENEWAL_GRACE_SECS),
+            "tie observes the failure and sets the grace"
+        );
+        // An OLDER-money `past_due` snapshot against the same stored row is
+        // stale: it must not resurrect a grace (nor flip the status).
+        let older = RemoteSubscription {
+            subscription: subscription("past_due", PRICE_PLUS),
+            invoices: vec![paid_invoice(
+                "in_0",
+                PRICE_PLUS,
+                end - 60 * 86_400,
+                end - 30 * 86_400,
+                NOW - 100,
+            )],
+        };
+        let outcome = reconcile_subscription(&stored, &older, NOW);
+        assert_eq!(outcome.row.status, "active");
+        assert_eq!(outcome.row.grace_until_unix, None);
+        assert_eq!(outcome.row.paid_through_unix, Some(end));
     }
 
     #[test]
@@ -1279,9 +1544,30 @@ mod tests {
         assert!(is_single_flight_state("pending"));
         assert!(is_single_flight_state("submitted"));
         assert!(is_single_flight_state("needs_reconcile"));
-        for released in ["succeeded", "failed", "canceled", ""] {
+        for released in ["succeeded", "failed", "canceled", SUPERSEDED_OP_STATE, ""] {
             assert!(!is_single_flight_state(released), "{released} releases");
         }
+    }
+
+    #[test]
+    fn price_check_matches_held_price_only() {
+        let op = StoredCheckoutOp {
+            id: "op-1".to_string(),
+            user_id: "u1".to_string(),
+            state: "submitted".to_string(),
+            price_id: Some(PRICE_PLUS.to_string()),
+            session_id: Some("cs_123".to_string()),
+            subscription_id: None,
+        };
+        assert!(checkout_price_matches(&op, PRICE_PLUS));
+        assert!(!checkout_price_matches(&op, PRICE_PRO));
+        // A corrupt payload (no recorded price) keeps today's reuse rather
+        // than stranding the flight.
+        let corrupt = StoredCheckoutOp {
+            price_id: None,
+            ..op
+        };
+        assert!(checkout_price_matches(&corrupt, PRICE_PRO));
     }
 
     #[test]
@@ -1332,6 +1618,18 @@ mod tests {
                 .contains("WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at"),
             "coverage advances monotonically in the write itself: a pass folded from an older snapshot never regresses confirmed coverage",
         );
+        // The same staleness predicate guards status and grace: a stale
+        // pass committing second keeps the stored verbatim fields instead
+        // of writing older ones over a fresher pass.
+        for guarded in [
+            "status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.status ELSE EXCLUDED.status END",
+            "grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND EXCLUDED.paid_through_at < subscriptions.paid_through_at THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END",
+        ] {
+            assert!(
+                store_reconciled_subscription_statement().contains(guarded),
+                "stale-fold guard missing: {guarded}",
+            );
+        }
         assert!(
             release_webhook_event_statement()
                 .contains("DELETE FROM billing_webhook_events WHERE stripe_event_id = $1"),
