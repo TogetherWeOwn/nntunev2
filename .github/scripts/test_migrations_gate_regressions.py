@@ -298,6 +298,33 @@ class TestSearchPathHeader(MigrationGateCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual("", result.stdout)
 
+    def test_header_inside_nested_block_comment_fails(self):
+        # PostgreSQL block comments nest, so the SET here is comment text
+        # and the first executable statement is CREATE TABLE.
+        base_ref = self.add_numbered(
+            ["0030_base.sql"],
+            "0031_new.sql",
+            "/* outer /* inner */ " + self.HEADER + "*/\n"
+            "CREATE TABLE public.example (id integer PRIMARY KEY);\n",
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("migrations-gate: missing-search-path: 0031_new.sql: ", result.stdout)
+
+    def test_header_after_complete_nested_block_comment_passes(self):
+        base_ref = self.add_numbered(
+            ["0030_base.sql"],
+            "0031_new.sql",
+            "/* outer /* inner */ still comment */\n" + self.HEADER + "CREATE TABLE public.example (id integer PRIMARY KEY);\n",
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("", result.stdout)
+
     def test_new_migration_at_or_below_cutoff_needs_no_header(self):
         base_ref = self.make_base(["0001_first.sql"])
         self.write_migration("0002_second.sql", "CREATE TABLE example (id integer PRIMARY KEY);\n")

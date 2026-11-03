@@ -48,7 +48,11 @@ def report(code, filename, detail):
 
 
 def strip_leading_trivia(text):
-    """Remove leading blank lines, `--` line comments and `/* … */` blocks."""
+    """Remove leading blank lines, `--` line comments and `/* … */` blocks.
+
+    PostgreSQL block comments nest, so depth is tracked: scanning stops at
+    the `*/` that closes the outermost block, not the first one seen.
+    """
     pos = 0
     length = len(text)
     while pos < length:
@@ -58,10 +62,20 @@ def strip_leading_trivia(text):
             end = text.find("\n", pos)
             pos = length if end == -1 else end + 1
         elif text.startswith("/*", pos):
-            end = text.find("*/", pos + 2)
-            if end == -1:
+            depth = 1
+            i = pos + 2
+            while i < length and depth > 0:
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth > 0:
                 return ""
-            pos = end + 2
+            pos = i
         else:
             break
     return text[pos:]
@@ -285,7 +299,12 @@ def check_drift(root, base_ref):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--base-ref")
+    parser.add_argument(
+        "--base-ref",
+        help="base ref to diff against; enables the drift, applied-history, "
+        "and search_path header checks, which only cover files new against "
+        "this ref (without it, only the manifest check runs)",
+    )
     try:
         args = parser.parse_args(argv)
         root = args.root.resolve()
