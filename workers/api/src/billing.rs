@@ -243,6 +243,17 @@ pub fn plans_select_statement() -> &'static str {
     "SELECT id, price_cents, stream_hours_month, max_concurrent_streams FROM plans ORDER BY price_cents ASC, id ASC"
 }
 
+/// Parameters: user_id. Whether any subscription row — live or terminal
+/// — ever reached paid coverage (a non-NULL paid end). The live-slot
+/// select above cannot answer this: terminal rows are excluded from
+/// it, and a canceled-after-paying account must still read `lapsed`,
+/// not `never_subscribed`, at the playback gate
+/// ([`crate::playback::subscription_refusal`]). An abandoned checkout
+/// (`incomplete`, never paid) correctly reads false.
+pub fn subscription_ever_paid_statement() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id = $1 AND paid_through_at IS NOT NULL) AS ever_paid"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +280,11 @@ mod tests {
             plans_select_statement(),
             "SELECT id, price_cents, stream_hours_month, max_concurrent_streams FROM plans ORDER BY price_cents ASC, id ASC",
             "plans select",
+        );
+        assert_eq!(
+            subscription_ever_paid_statement(),
+            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id = $1 AND paid_through_at IS NOT NULL) AS ever_paid",
+            "ever-paid probe",
         );
     }
 

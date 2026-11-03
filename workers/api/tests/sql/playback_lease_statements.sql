@@ -1,0 +1,145 @@
+-- Regression test for the playback-enforcement statements: the lease
+-- acquire/touch upserts from workers/api/src/playback.rs, the ever-paid
+-- probe from billing.rs, and the plans-row caps read from
+-- plan_limits.rs — mirrored here with literal values. Run after ALL
+-- migrations (see ../run_migration_tests.sh) in one rolled-back
+-- transaction; any broken expectation RAISEs and fails the run.
+--
+-- Scope: first acquire lands at epoch 1; same-session re-acquire
+-- replaces the track and bumps the epoch; another session facing a
+-- live lease gets zero rows (the 429); takeover and post-expiry
+-- acquires bump the epoch; the touch extends only the exact holder;
+-- ever-paid distinguishes paid-once from never-paid.
+
+BEGIN;
+
+INSERT INTO users (id, email, created_at)
+VALUES ('pls-user', 'pls-user@example.com', 1000),
+       ('pls-never', 'pls-never@example.com', 1000),
+       ('pls-lapsed', 'pls-lapsed@example.com', 1000);
+
+-- First acquire: epoch 1.
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    VALUES ('pls-user', 'sess-1', 'track-1', 'play-1', 1, 2000, 1955)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 1955 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
+    RETURNING epoch
+)
+SELECT epoch INTO TEMP TABLE pls_got1 FROM got;
+
+-- Same session, new track (queue advance): replaces, epoch 2.
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    VALUES ('pls-user', 'sess-1', 'track-2', 'play-2', 1, 2010, 1965)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 1965 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
+    RETURNING epoch
+)
+SELECT epoch INTO TEMP TABLE pls_got2 FROM got;
+
+-- Another session against the live lease, no takeover: zero rows.
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    VALUES ('pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
+    RETURNING epoch
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_got3 FROM got;
+
+-- Same other session WITH takeover: epoch 3, holder changes.
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    VALUES ('pls-user', 'sess-2', 'track-3', 'play-3', 1, 2020, 1975)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 1975 OR playback_leases.session_id = EXCLUDED.session_id OR TRUE
+    RETURNING epoch
+)
+SELECT epoch INTO TEMP TABLE pls_got4 FROM got;
+
+-- Touch by the displaced holder (stale epoch): zero rows.
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = 2100, updated_at = 1980
+    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2
+    RETURNING expires_at
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
+
+-- Touch by the current holder: extends.
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = 2100, updated_at = 1980
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
+    RETURNING expires_at
+)
+SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
+
+-- After expiry (now past 2100) a third session acquires: epoch 4.
+WITH got AS (
+    INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at)
+    VALUES ('pls-user', 'sess-3', 'track-4', 'play-4', 1, 2200, 2155)
+    ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at
+    WHERE playback_leases.expires_at <= 2155 OR playback_leases.session_id = EXCLUDED.session_id OR FALSE
+    RETURNING epoch
+)
+SELECT epoch INTO TEMP TABLE pls_got5 FROM got;
+
+-- Ever-paid: an incomplete (never paid) row reads false; a canceled
+-- row with a paid end reads true even though it left the live slot.
+INSERT INTO subscriptions
+    (user_id, stripe_subscription_id, stripe_customer_id,
+     stripe_subscription_item_id, stripe_price_id, plan_id, status,
+     paid_through_at)
+VALUES ('pls-never', 'sub_pls_never', 'cus_pls_never', 'si_pls_never',
+        'price_pls', 'plus', 'incomplete', NULL),
+       ('pls-lapsed', 'sub_pls_lapsed', 'cus_pls_lapsed', 'si_pls_lapsed',
+        'price_pls', 'plus', 'canceled', TIMESTAMPTZ '2026-01-01 00:00:00+00');
+
+DO $$
+BEGIN
+    IF (SELECT epoch FROM pls_got1) <> 1 THEN
+        RAISE EXCEPTION 'first acquire must land at epoch 1';
+    END IF;
+    IF (SELECT epoch FROM pls_got2) <> 2 THEN
+        RAISE EXCEPTION 'same-session re-acquire must bump the epoch';
+    END IF;
+    IF (SELECT n FROM pls_got3) <> 0 THEN
+        RAISE EXCEPTION 'live lease must refuse another session (zero rows)';
+    END IF;
+    IF (SELECT epoch FROM pls_got4) <> 3 THEN
+        RAISE EXCEPTION 'takeover must bump the epoch';
+    END IF;
+    IF (SELECT n FROM pls_touch_stale) <> 0 THEN
+        RAISE EXCEPTION 'displaced holder touch must not extend';
+    END IF;
+    IF (SELECT expires_at FROM pls_touch_ok) <> 2100 THEN
+        RAISE EXCEPTION 'holder touch must extend the lease';
+    END IF;
+    IF (SELECT epoch FROM pls_got5) <> 4 THEN
+        RAISE EXCEPTION 'post-expiry acquire must bump the epoch';
+    END IF;
+    IF (SELECT session_id || ':' || play_id FROM playback_leases
+        WHERE user_id = 'pls-user') <> 'sess-3:play-4' THEN
+        RAISE EXCEPTION 'final holder must be the post-expiry acquirer';
+    END IF;
+
+    IF (SELECT EXISTS(SELECT 1 FROM subscriptions
+            WHERE user_id = 'pls-never' AND paid_through_at IS NOT NULL)) THEN
+        RAISE EXCEPTION 'never-paid account must read ever_paid = false';
+    END IF;
+    IF NOT (SELECT EXISTS(SELECT 1 FROM subscriptions
+            WHERE user_id = 'pls-lapsed' AND paid_through_at IS NOT NULL)) THEN
+        RAISE EXCEPTION 'canceled-after-paying account must read ever_paid = true';
+    END IF;
+
+    -- Plans-row caps read: the seeded plus row carries 100 h / 1 stream.
+    IF (SELECT stream_hours_month || ':' || max_concurrent_streams
+        FROM plans WHERE id = 'plus') <> '100:1' THEN
+        RAISE EXCEPTION 'plus caps row must read 100:1';
+    END IF;
+    IF EXISTS (SELECT 1 FROM plans WHERE id = 'no-such-plan') THEN
+        RAISE EXCEPTION 'unknown plan id must have no caps row';
+    END IF;
+END $$;
+
+ROLLBACK;
