@@ -36,6 +36,7 @@ pub mod checkpoint;
 pub mod dispatch;
 pub mod fixtures;
 pub mod flac;
+pub mod full_file;
 pub mod indexer_fetch;
 pub mod ingest_jobs;
 pub mod jobs;
