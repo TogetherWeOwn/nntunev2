@@ -32,10 +32,13 @@
 //!
 //! Real-catalogue gate (O7): synthetic/staging switching (fixtures, the B7
 //! staging run) may proceed with the default gate, but pointer-switching
-//! the real catalogue is forbidden until the keyring/KEK offsite backup +
-//! proven restore drill card (TWO-1772) completes. The gate is an explicit
-//! [`PointerSwitchGate`] value plus the [`REAL_CATALOGUE_SWITCH_ENV`] admin
-//! flag — default off, enforced by [`check_gate`], never a comment.
+//! the real catalogue is forbidden until the O7 staging-leg card (TWO-1956:
+//! staging-leg restore-drill record + offsite-copy existence, split out of
+//! TWO-1772 whose code leg merges separately) completes. The gate is an
+//! explicit [`PointerSwitchGate`] value plus the
+//! [`REAL_CATALOGUE_SWITCH_ENV`] admin flag — default off, enforced by
+//! [`check_gate`], never a comment. [`O7_GATE_CARD`] pins the card the
+//! `o7_drill_complete` half keys on.
 //!
 //! Dashboard surfacing: [`TrackPointerState::as_dashboard_str`] renders the
 //! per-track state the health work reads (`original` / `reposting` /
@@ -80,9 +83,17 @@ pub const POINTER_STATES: [&str; 4] = [
 /// Admin/config flag enabling real-catalogue pointer switching. Read from
 /// the process environment by the wire-up (never inside this module, so
 /// host tests pin the parsing without env access); unset/anything-else is
-/// deny. Stays `false` until the O7 drill card completes AND an operator
-/// sets it — see [`PointerSwitchGate`].
+/// deny. Stays `false` until the O7 staging-leg card ([`O7_GATE_CARD`])
+/// completes AND an operator sets it — see [`PointerSwitchGate`].
 pub const REAL_CATALOGUE_SWITCH_ENV: &str = "M2_ALLOW_REAL_CATALOGUE_SWITCH";
+
+/// Paperclip card the O7 real-catalogue gate keys on: the O7 staging leg
+/// (staging-leg restore-drill record + offsite-copy existence evidence).
+/// The real catalogue must not switch until this card is done; the code
+/// leg on TWO-1772 merging does NOT open the gate. The wire-up sets
+/// [`PointerSwitchGate::o7_drill_complete`] from this card's completion
+/// evidence only.
+pub const O7_GATE_CARD: &str = "TWO-1956";
 
 /// Latest bindable `updated_at`: mirrors the ledger epoch convention
 /// (`accepted_at <= 253402300799` in migration 0021), so a caller clock
@@ -161,16 +172,16 @@ impl TargetCatalogue {
     }
 }
 
-/// The O7 real-catalogue gate. Both halves must hold before the real
-/// catalogue may switch: the admin flag (an operator sets
-/// [`REAL_CATALOGUE_SWITCH_ENV`] after the drill) AND the drill evidence
-/// itself. Default denies everything real.
+/// The O7 real-catalogue gate, keyed on [`O7_GATE_CARD`]. Both halves must
+/// hold before the real catalogue may switch: the admin flag (an operator
+/// sets [`REAL_CATALOGUE_SWITCH_ENV`] after the drill) AND the drill
+/// evidence itself. Default denies everything real.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerSwitchGate {
     /// Operator-set allow flag (from [`REAL_CATALOGUE_SWITCH_ENV`]).
     pub allow_real_catalogue_switch: bool,
-    /// Whether the O7 keyring/KEK backup + proven restore drill completed
-    /// with evidence on its card.
+    /// Whether the O7 staging-leg card ([`O7_GATE_CARD`]: keyring/KEK
+    /// backup + proven restore drill) completed with evidence on its card.
     pub o7_drill_complete: bool,
 }
 
@@ -660,7 +671,6 @@ mod tests {
         payload_nonce: &'a [u8],
     ) -> TrackSourceParams<'a> {
         TrackSourceParams {
-            user_id: "user_01",
             track_id: TRACK,
             source_job_id: JOB_NEW,
             indexer_id: None,
@@ -857,6 +867,9 @@ mod tests {
 
     #[test]
     fn real_catalogue_gate_defaults_off_and_refuses_precisely() {
+        // The gate keys on the O7 staging-leg card (TWO-1956), not the O7
+        // code leg (TWO-1772): the code leg merging must not open the gate.
+        assert_eq!(O7_GATE_CARD, "TWO-1956");
         let gate = PointerSwitchGate::default();
         assert!(!gate.real_catalogue_allowed());
         // Staging/fixture switching proceeds under the default gate.
