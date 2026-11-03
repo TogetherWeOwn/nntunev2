@@ -44,10 +44,13 @@ import urllib.parse
 # its write privileges are pinned here, in the one DDL constant shared
 # by the migrator and the committed backfill files: no role other than
 # the table owner (the migrator role that creates it) may hold a write
-# privilege, whatever the database's default privileges granted at
-# CREATE time. The revoke pass runs on every DDL execution, so a later
-# stray GRANT is removed by the next apply; the staging gate also fails
-# closed while such a grant exists. Read privileges are untouched.
+# privilege — on the table (``pg_class.relacl``) or on any column
+# (``pg_attribute.attacl``; column-level INSERT alone can forge a
+# tracking row, and it never appears in ``relacl``) — whatever the
+# database's default privileges granted at CREATE time. The revoke
+# pass runs on every DDL execution, so a later stray GRANT is removed
+# by the next apply; the staging gate also fails closed while such a
+# grant exists. Read privileges are untouched.
 DDL = """CREATE TABLE IF NOT EXISTS public.schema_migrations (
     file       TEXT PRIMARY KEY,
     sha256     TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
@@ -77,6 +80,33 @@ BEGIN
             EXECUTE format(
                 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
                 'ON TABLE public.schema_migrations FROM %I',
+                pg_get_userbyid(grant_row.grantee));
+        END IF;
+    END LOOP;
+    -- Column privileges live in pg_attribute.attacl, not relacl, so the
+    -- table-level pass above cannot see them; revoke per column. Only
+    -- INSERT, UPDATE and REFERENCES exist as column-level writes.
+    FOR grant_row IN
+        SELECT DISTINCT a.grantee, t.attname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute t ON t.attrelid = c.oid
+            AND t.attnum > 0 AND NOT t.attisdropped
+        CROSS JOIN aclexplode(t.attacl) a
+        WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'
+          AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
+          AND a.grantee <> c.relowner
+    LOOP
+        IF grant_row.grantee = 0 THEN
+            EXECUTE format(
+                'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
+                'ON TABLE public.schema_migrations FROM PUBLIC',
+                grant_row.attname, grant_row.attname, grant_row.attname);
+        ELSE
+            EXECUTE format(
+                'REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I) '
+                'ON TABLE public.schema_migrations FROM %I',
+                grant_row.attname, grant_row.attname, grant_row.attname,
                 pg_get_userbyid(grant_row.grantee));
         END IF;
     END LOOP;

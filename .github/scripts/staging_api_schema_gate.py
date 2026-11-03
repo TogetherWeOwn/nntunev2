@@ -163,9 +163,11 @@ def parse_rows(stdout):
 # shadow the unqualified name for other roles; requiring that none exists
 # keeps the checked table the only one any search path can resolve.
 # The rows are deploy proof, so the guard also requires that no role
-# other than the table owner (the migrator) holds a table-level write
-# privilege: apply_migration.py's DDL pins that on every apply, and the
-# gate fails closed in between if a write grant appears.
+# other than the table owner (the migrator) holds a write privilege on
+# the table (relacl) or on any column (attacl — column-level INSERT
+# alone can forge a tracking row and never appears in relacl):
+# apply_migration.py's DDL pins that on every apply, and the gate
+# fails closed in between if a write grant appears.
 GUARD_SQL = """BEGIN READ ONLY;
 SELECT current_database() = 'nntunev2_staging'
    AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -178,6 +180,12 @@ SELECT current_database() = 'nntunev2_staging'
    AND NOT EXISTS (SELECT 1 FROM pg_class c CROSS JOIN aclexplode(c.relacl) a
                WHERE c.oid=to_regclass('public.schema_migrations')
                  AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')
+                 AND a.grantee <> c.relowner)
+   AND NOT EXISTS (SELECT 1 FROM pg_class c
+               JOIN pg_attribute t ON t.attrelid=c.oid AND t.attnum > 0 AND NOT t.attisdropped
+               CROSS JOIN aclexplode(t.attacl) a
+               WHERE c.oid=to_regclass('public.schema_migrations')
+                 AND a.privilege_type IN ('INSERT','UPDATE','REFERENCES')
                  AND a.grantee <> c.relowner)
    AND (SELECT count(*) = 2 FROM pg_attribute a
         WHERE a.attrelid=to_regclass('public.schema_migrations') AND a.attnum > 0

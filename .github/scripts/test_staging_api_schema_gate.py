@@ -81,8 +81,10 @@ class SchemaGateTests(unittest.TestCase):
         rows_options = self.calls[-1][1]
         self.assertEqual(rows_options["input"], gate.ROWS_SQL)
         # The guard fails closed while a non-owner role holds a write
-        # grant on the tracking table (its rows are deploy proof).
+        # grant on the tracking table (its rows are deploy proof) —
+        # table-level (relacl) or column-level (attacl).
         self.assertIn("aclexplode(c.relacl)", options["input"])
+        self.assertIn("aclexplode(t.attacl)", options["input"])
         self.assertIn("a.grantee <> c.relowner", options["input"])
         for options in (options, rows_options):
             # Strip string literals first: the guard names privilege

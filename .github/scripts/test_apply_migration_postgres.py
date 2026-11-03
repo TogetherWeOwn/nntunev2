@@ -14,7 +14,8 @@ database and proves:
 - applying out of manifest order refuses until priors are recorded;
 - the advisory lock is held while the migration body runs;
 - a mid-migration failure leaves neither schema change nor tracking row;
-- re-running the DDL revokes a stray non-owner write grant.
+- re-running the DDL revokes a stray non-owner write grant, table-level
+  or column-level (``pg_attribute.attacl``).
 
 No provider calls or deployed databases: require the workflow's exact
 throwaway endpoint, create a fresh fixture database, and refuse to
@@ -48,6 +49,13 @@ def run_psql(env, sql):
 
 def scalar(env, sql):
     return run_psql(env, sql)
+
+
+def assert_psql_fails(env, sql):
+    result = subprocess.run(ARGS, input=sql, env=env, text=True,
+                            capture_output=True, timeout=15)
+    # Never print connection details or database stderr.
+    assert result.returncode != 0, "expected psql to fail, but it succeeded"
 
 
 MIGRATIONS = {
@@ -192,6 +200,58 @@ def main():
                   AND a.grantee = 0;""")
             assert grants == "SELECT", f"expected only SELECT for PUBLIC, got {grants!r}"
             print("apply-migration-postgres: passed write-privileges-pinned")
+
+            # Column-level pinning: column privileges live in
+            # pg_attribute.attacl, invisible to the relacl pass. A role
+            # holding ONLY column INSERT can forge a tracking row
+            # (applied_at defaults) until the next DDL run revokes it;
+            # column SELECT must survive. Roles are cluster-global, so
+            # the scenario drops its role again in the finally.
+            run_psql(test_env, "CREATE ROLE apply_column_sneak;")
+            try:
+                run_psql(test_env, """
+                    GRANT INSERT (file, sha256, applied_by)
+                        ON public.schema_migrations TO apply_column_sneak;
+                    GRANT SELECT (file)
+                        ON public.schema_migrations TO apply_column_sneak;
+                    GRANT UPDATE (applied_by)
+                        ON public.schema_migrations TO PUBLIC;""")
+                forged = ("SET ROLE apply_column_sneak;\n"
+                          "INSERT INTO public.schema_migrations "
+                          "(file, sha256, applied_by) VALUES "
+                          f"('0006_forged.sql', '{'f' * 64}', 'sneak');")
+                # Pre-DDL the forged insert succeeds, so the post-DDL
+                # failure below cannot pass vacuously.
+                run_psql(test_env, forged)
+                run_psql(test_env, "DELETE FROM public.schema_migrations "
+                                   "WHERE file = '0006_forged.sql';")
+                apply_migration.psql(
+                    test_env, apply_migration.ddl_sql(TEST_DB),
+                    single_transaction=True)
+                write_grants = scalar(test_env, """
+                    SELECT count(*) FROM pg_class c
+                    JOIN pg_attribute t ON t.attrelid = c.oid
+                    CROSS JOIN aclexplode(t.attacl) a
+                    WHERE c.oid = to_regclass('public.schema_migrations')
+                      AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
+                      AND a.grantee <> c.relowner;""")
+                assert write_grants == "0", \
+                    f"expected no non-owner column write grants, got {write_grants!r}"
+                sneak_grants = scalar(test_env, """
+                    SELECT string_agg(DISTINCT a.privilege_type, ',')
+                    FROM pg_attribute t CROSS JOIN aclexplode(t.attacl) a
+                    WHERE t.attrelid = to_regclass('public.schema_migrations')
+                      AND a.grantee = (SELECT oid FROM pg_roles
+                                       WHERE rolname = 'apply_column_sneak');""")
+                assert sneak_grants == "SELECT", \
+                    f"expected only SELECT for the sneak role, got {sneak_grants!r}"
+                assert_psql_fails(test_env, forged)
+                assert recorded_files(test_env) == (
+                    "0002_alpha.sql,0003_beta.sql,0004_broken.sql,0005_own_txn.sql")
+            finally:
+                run_psql(test_env, "DROP OWNED BY apply_column_sneak;\n"
+                                   "DROP ROLE apply_column_sneak;")
+            print("apply-migration-postgres: passed column-write-privileges-pinned")
     finally:
         run_psql(env, f"DROP DATABASE {TEST_DB};")
 

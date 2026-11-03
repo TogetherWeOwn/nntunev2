@@ -158,6 +158,11 @@ class ComposeTests(unittest.TestCase):
     def test_ddl_pins_write_privileges_and_database(self):
         self.assertIn("REVOKE INSERT, UPDATE, DELETE", apply_migration.DDL)
         self.assertIn("aclexplode(c.relacl)", apply_migration.DDL)
+        # Column-level grants (attacl) bypass relacl entirely and must
+        # be revoked per column too.
+        self.assertIn("aclexplode(t.attacl)", apply_migration.DDL)
+        self.assertIn("REVOKE INSERT (%I), UPDATE (%I), REFERENCES (%I)",
+                      apply_migration.DDL)
         self.assertIn("a.grantee <> c.relowner", apply_migration.DDL)
         ddl = apply_migration.ddl_sql("nntune_apply_test")
         # The database check precedes CREATE TABLE so a wrong-database

@@ -104,6 +104,25 @@ FIXTURES = {
     "non-owner-read-grant": (
         "GRANT SELECT ON public.schema_migrations TO PUBLIC;",
         "REVOKE SELECT ON public.schema_migrations FROM PUBLIC;", True),
+    # Column-level write grants live in pg_attribute.attacl, not relacl:
+    # a named role holding ONLY column INSERT can still forge a row
+    # (applied_at defaults), so the guard must reject it too. Roles are
+    # cluster-global, so cleanup revokes and drops them before the
+    # table drop that follows.
+    "non-owner-column-write-grant": (
+        "CREATE ROLE column_gate_sneak;\n"
+        "GRANT INSERT (file, sha256, applied_by) "
+        "ON public.schema_migrations TO column_gate_sneak;",
+        "REVOKE INSERT (file, sha256, applied_by) "
+        "ON public.schema_migrations FROM column_gate_sneak;\n"
+        "DROP ROLE column_gate_sneak;", False),
+    "non-owner-column-read-grant": (
+        "CREATE ROLE column_gate_reader;\n"
+        "GRANT SELECT (file, sha256) "
+        "ON public.schema_migrations TO column_gate_reader;",
+        "REVOKE SELECT (file, sha256) "
+        "ON public.schema_migrations FROM column_gate_reader;\n"
+        "DROP ROLE column_gate_reader;", True),
 }
 
 ARGS = ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
@@ -190,9 +209,23 @@ def main():
             ("dropped pg_temp exclusion",
              "AND n.nspname NOT LIKE 'pg\\_temp\\_%'", "AND true", "temp-exception"),
             # Dropping the non-owner write-grant exclusion must let a
-            # PUBLIC write grant pass the guard.
+            # PUBLIC write grant pass the guard. Anchors carry their
+            # privilege-type line so the table-level (relacl) and
+            # column-level (attacl) exclusions stay distinguishable.
             ("dropped write-grant exclusion",
-             "AND a.grantee <> c.relowner", "AND false", "non-owner-write-grant"),
+             "AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')\n"
+             "                 AND a.grantee <> c.relowner",
+             "AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')\n"
+             "                 AND false",
+             "non-owner-write-grant"),
+            # Same for the column-level exclusion: dropping it must let
+            # a role holding only column INSERT pass the guard.
+            ("dropped column write-grant exclusion",
+             "AND a.privilege_type IN ('INSERT','UPDATE','REFERENCES')\n"
+             "                 AND a.grantee <> c.relowner",
+             "AND a.privilege_type IN ('INSERT','UPDATE','REFERENCES')\n"
+             "                 AND false",
+             "non-owner-column-write-grant"),
             *((f"omitted {fixture} kind", "WHERE c.relname='schema_migrations'",
                "WHERE c.relname='schema_migrations' AND c.relkind IN ('r','p','v','m','f','S')", fixture)
               for fixture in ("index", "partitioned-index", "composite")),
