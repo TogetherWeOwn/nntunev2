@@ -27,8 +27,12 @@ done
 # Reapply replay-safe migrations to prove they are clean no-ops. Migration 0006
 # predates this check and has an unconditional ADD COLUMN; applied migrations
 # are immutable, so it is intentionally excluded from the replay pass.
+# Migration 0021 is excluded for a different reason: migration 0026 drops
+# columns its seed INSERT names (and the usage_ledger table it creates), and
+# applied migrations cannot be edited, so 0021 cannot re-run after 0026.
 for f in "${migrations[@]}"; do
   [[ "${f##*/}" == "0006_account_deletion.sql" ]] && continue
+  [[ "${f##*/}" == "0021_billing_schema.sql" ]] && continue
   psql_run -f "$f"
 done
 for f in "${tests[@]}"; do

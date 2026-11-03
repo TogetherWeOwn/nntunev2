@@ -626,8 +626,8 @@ pub trait Store {
             Ok(None)
         }
     }
-    /// Ingest jobs consumed today (UTC) from the daily `usage_ledger`
-    /// aggregate (migration 0021): 0 when no row exists yet. The intake
+    /// Ingest jobs consumed today (UTC), counted from accepted
+    /// `ingest_jobs` rows: 0 when none exist yet. The intake
     /// cap guard feeds this to `plan_limits::check_ingest_write`; the
     /// staging-only over-limit mint seeds it. Default 0 keeps out-of-tree
     /// `Store` impls compiling (their guard allows until the write path
@@ -642,7 +642,7 @@ pub trait Store {
             Ok(0)
         }
     }
-    /// Seed today's `usage_ledger` ingest count to at least `ingest_jobs`
+    /// Seed today's ingest count to at least `ingest_jobs`
     /// (an idempotent reseed never lowers the count): the staging-only
     /// over-limit mint pre-seeds a capped account this way, so the intake
     /// guard refuses it without hammering a real path. Positive counts
@@ -3861,11 +3861,11 @@ where
         return internal();
     }
     if overlimit {
-        // A capped account is a free-capped account whose daily ingest
-        // aggregate is pre-seeded to the cap: the intake guard refuses it
-        // without hammering a real path, and the seed (not the plan
-        // string, which is never stored) is what the guard reads.
-        let cap = u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day);
+        // A capped account is an account whose daily ingest count is
+        // pre-seeded to the fixed daily ingest limit: the intake guard
+        // refuses it without hammering a real path, and the seed (not the
+        // plan string, which is never stored) is what the guard reads.
+        let cap = u64::from(crate::plan_limits::DAILY_INGEST_LIMIT);
         if ctx
             .store
             .seed_qa_ingest_usage(&user.id, ctx.now, cap)
@@ -3897,14 +3897,14 @@ fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
 }
 
 /// Cap guard on the NZB intake path (`POST /api/ingest`): the caller's
-/// session (Bearer transport) is authenticated, today's ingest aggregate
-/// is checked against the caller's caps, and a capped caller is refused
-/// with the plan-limit wire. Everyone else falls through to the plain
-/// 404 — the ingest-write path owns the accept arm and has not landed
-/// yet, so this slice only refuses; it never accepts a job. Paid-cap
-/// resolution lands with the subscription-read slice, so free caps apply
-/// to every caller until then (conservative: refuse early, never
-/// over-admit). The request body is never inspected: refusal is an
+/// session (Bearer transport) is authenticated, today's ingest count
+/// is checked against the fixed non-plan daily ingest limit
+/// (`plan_limits::DAILY_INGEST_LIMIT`, ADR 0004 revision of 2026-11-03),
+/// and a capped caller is refused with the plan-limit wire. Everyone else
+/// falls through to the plain 404 — the ingest-write path owns the accept
+/// arm and has not landed yet, so this slice only refuses; it never
+/// accepts a job. The same limit applies to every caller until the
+/// user-ingest retirement removes the intake path. The request body is never inspected: refusal is an
 /// identity-plus-usage decision, so a capped caller cannot buy
 /// processing by shaping the upload.
 async fn ingest_cap_guard<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -3922,9 +3922,7 @@ where
         Ok(usage) => u32::try_from(usage).unwrap_or(u32::MAX),
         Err(_) => return internal(),
     };
-    match crate::plan_limits::check_ingest_write(crate::plan_limits::PlanId::Free, ingest_today)
-        .denial()
-    {
+    match crate::plan_limits::check_ingest_write(ingest_today).denial() {
         Some(denial) => plan_limit_refusal(denial),
         None => not_found(),
     }
@@ -4247,9 +4245,9 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
-        /// Mirror of the daily `usage_ledger` ingest aggregate, keyed by
+        /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
-        /// production `to_timestamp($2)::date` period boundary.
+        /// production UTC-day boundary over `ingest_jobs.accepted_at`.
         usage: RefCell<HashMap<(String, u64), u64>>,
     }
 
@@ -5676,8 +5674,8 @@ mod tests {
     fn qa_mint_seam_mints_overlimit_with_seeded_ingest_usage() {
         let h = qa_harness();
         // The capped account mints as 201 like a free one, but today's
-        // ingest aggregate is pre-seeded to the free cap, so the intake
-        // guard refuses it without touching a real path.
+        // ingest count is pre-seeded to the fixed daily limit, so the
+        // intake guard refuses it without touching a real path.
         let resp = h.call_mint_seam(
             serde_json::json!({"email": "capped@example.test", "plan": "overlimit"}),
             Some(QA_TOKEN),
@@ -5691,10 +5689,7 @@ mod tests {
             .unwrap()
             .expect("minted user exists");
         let usage = block_on(h.store.ingest_jobs_today(&user.id, NOW)).unwrap();
-        assert_eq!(
-            usage,
-            u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day)
-        );
+        assert_eq!(usage, u64::from(crate::plan_limits::DAILY_INGEST_LIMIT));
     }
 
     /// Mint through the seam and return the raw per-account session token.

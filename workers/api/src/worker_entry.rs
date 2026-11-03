@@ -1343,13 +1343,15 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // UTC-day boundary in SQL (`to_timestamp($2)::date`), so
-                // the period matches the fake's epoch-day key exactly: no
-                // local-time skew between the two implementations.
+                // Daily count derived from accepted `ingest_jobs` rows
+                // (the daily fold table was dropped in migration 0026).
+                // `accepted_at` is BIGINT epoch seconds (the 0022 converged
+                // shape), so the UTC day is epoch/86400 — exactly the
+                // fake's epoch-day key; no local-time skew is possible.
                 let rows = client
                     .query_typed(
-                        "SELECT ingest_jobs FROM usage_ledger WHERE user_id = $1 \
-                         AND period = to_timestamp($2)::date",
+                        "SELECT COUNT(*)::BIGINT AS ingest_jobs FROM ingest_jobs WHERE user_id = $1 \
+                         AND accepted_at / 86400 = $2 / 86400",
                         &[(&user_id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
@@ -1374,22 +1376,30 @@ impl Store for PgStore {
         now: u64,
         ingest_jobs: u64,
     ) -> Result<(), StoreError> {
-        Self::bounded(async {
-        let client = self.connect().await?;
-        client
-            .query_typed(
-                "INSERT INTO usage_ledger (user_id, period, ingest_jobs) VALUES ($1, to_timestamp($2)::date, $3) \
-                 ON CONFLICT (user_id, period) DO UPDATE SET ingest_jobs = GREATEST(usage_ledger.ingest_jobs, EXCLUDED.ingest_jobs)",
-                &[
-                    (&user_id, Type::TEXT),
-                    (&i64_of(now)?, Type::INT8),
-                    (&i64_of(ingest_jobs)?, Type::INT8),
-                ],
-            )
-            .await
-            .map_err(|_| StoreError)?;
-        Ok(())
-        }, TOTAL_TIMEOUT_MS).await
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // Seed as synthetic accepted `ingest_jobs` rows for the day (the
+                // count above derives from them): deterministic QA idempotency
+                // keys make a reseed a no-op that never lowers the count.
+                client
+                    .query_typed(
+                        "INSERT INTO ingest_jobs (user_id, idempotency_key, accepted_at, status) \
+                 SELECT $1, 'qa-seed:' || g, $2, 'done' FROM generate_series(1, $3) AS g \
+                 ON CONFLICT (user_id, idempotency_key) DO NOTHING",
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                            (&i64_of(ingest_jobs)?, Type::INT8),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
