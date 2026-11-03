@@ -191,6 +191,8 @@ class FetchFixtureTest(unittest.TestCase):
         with self.assertRaises(fetch_fixture.FetchError) as ctx:
             fetch_fixture.download(req, self.cache / "nope.flac")
         self.assertIn("NoSuchKey", str(ctx.exception))
+        # Only the code is surfaced; the remote <Message> text is not.
+        self.assertNotIn("does not exist", str(ctx.exception))
 
     def test_plaintext_http_base_url_is_refused(self):
         # Loopback http (self.base_url) stays allowed for test servers;

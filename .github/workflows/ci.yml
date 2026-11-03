@@ -1357,8 +1357,8 @@ jobs:
         # no secrets, so the step notices and the spec skips cleanly.
         # The toolcache Python in this container cannot import ssl
         # (urllib: "unknown url type: https"), so the download prefers
-        # an SSL-capable interpreter (system python, or apt's); the
-        # suite then only needs the pre-warmed cache.
+        # the image's SSL-capable system python; the suite then only
+        # needs the pre-warmed cache.
         working-directory: ${{ github.workspace }}
         env:
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
@@ -1375,9 +1375,8 @@ jobs:
             if [ -x /usr/bin/python3 ] && /usr/bin/python3 -c 'import ssl' >/dev/null 2>&1; then
               fetcher=/usr/bin/python3
             else
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends python3 >/dev/null
-              fetcher=/usr/bin/python3
+              echo "::error::no SSL-capable python3 available for the fixture fetch"
+              exit 1
             fi
           fi
           fetched="$("$fetcher" fixtures/cc0/fetch_fixture.py --position 1)"

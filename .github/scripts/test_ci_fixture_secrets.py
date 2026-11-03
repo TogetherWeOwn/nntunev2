@@ -78,6 +78,17 @@ class TestFixtureSecretWiring(unittest.TestCase):
                 job_id,
             )
 
+    def test_web_e2e_fetch_step_selects_an_ssl_capable_python(self):
+        """The container's toolcache Python cannot import ssl.
+
+        Without the fallback selection the web-e2e download dies with
+        "unknown url type: https" even though the step is present, so
+        pin the ssl probe and the system-python fallback explicitly.
+        """
+        job = self.jobs["web-e2e"]
+        self.assertIn("python3 -c 'import ssl'", job)
+        self.assertIn("fetcher=/usr/bin/python3", job)
+
     def test_fetch_proof_step_notices_when_secrets_are_absent(self):
         """Fork PRs (no secrets) must notice-and-skip, never fail."""
         for job_id in ("rust-ingest", "web-e2e"):

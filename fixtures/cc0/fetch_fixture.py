@@ -302,19 +302,18 @@ def build_request(key: str, env: dict) -> urllib.request.Request:
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
-    """Extract the S3 `<Code>: <Message>` from an HTTP error body.
+    """Extract only the S3 `<Code>` from an HTTP error body.
 
     A bare "HTTP Error 404" cannot distinguish a missing key from a
-    missing bucket; the S3 error code can, and it carries no secrets.
+    missing bucket; the S3 error code can. The free-text `<Message>`
+    is deliberately not surfaced: remote message text does not belong
+    in CI logs.
     """
     try:
         body = exc.read(65536).decode("utf-8", errors="replace")
     except Exception:
         return ""
     code = re.search(r"<Code>([^<]+)</Code>", body)
-    message = re.search(r"<Message>([^<]+)</Message>", body)
-    if code and message:
-        return f" ({code.group(1)}: {message.group(1)})"
     if code:
         return f" ({code.group(1)})"
     return ""
