@@ -1,9 +1,9 @@
--- NNTune v2 migration 0028: posted-file crypto envelope + geometry (TWO-1761).
+-- NNTune v2 migration 0029: posted-file crypto envelope + geometry (TWO-1761).
 --
--- Extends the migration 0027 `posted_files` row (TWO-1768 two-spool ledger)
+-- Extends the migration 0028 `posted_files` row (TWO-1768 two-spool ledger)
 -- with the encrypt-on-write half of the record: the per-file key and the
 -- NZB/article geometry, both sealed in the existing AES-GCM envelope v2.
--- 0027 carries copy state (backbone pair, counts, spool states); this file
+-- 0028 carries copy state (backbone pair, counts, spool states); this file
 -- carries key custody and geometry. One table, one writer module
 -- (workers/ingest/src/posted_files.rs); the verify card owns state reuse.
 --
@@ -11,7 +11,7 @@
 -- inside the sealed manifest envelope below — never as plaintext columns,
 -- files, URLs or log lines. `header_nonce` is public (article 0 carries
 -- the rclone header in the clear). Backbone labels stay labels-only
--- (0027 CHECKs); hostnames/usernames never reach the database.
+-- (0028 CHECKs); hostnames/usernames never reach the database.
 --
 -- Envelope layout (mirrors track_sources file_ref_*/nzb_ref_* in
 -- migrations/0022_library_artifacts.sql):
@@ -33,10 +33,30 @@
 -- envelopes have card-fixed formats, while 0022's formats are minter-
 -- assigned and intentionally open.
 --
+-- Envelope v2 AAD binding (ADR 0002: `domain, purpose, table, field,
+-- owner_scope, row_key, envelope_version, payload_format`, plus
+-- `kek_version` on the DEK-wrap AAD only; canonical length-prefixed
+-- encoding, never delimiter joins). The mint generalizes
+-- workers/api/src/providers.rs::aad_v2 with this tuple — NOT the v1
+-- delimiter AAD (`v1|vault|<user_id>`) of vault.rs::encrypt_vault, which
+-- carries no table/field/row binding and must never mint these columns:
+-- - file key: domain = "nntune-envelope-v2", purpose = "payload" (or "dek"
+--   for the wrap), table = "posted_files", field = "file_key",
+--   owner_scope = "global:posted_files" (rows are content-global: no user
+--   exists, so the scope is an explicit tagged global, never a user id or
+--   an empty string), row_key = plaintext_sha256 (the only row identity
+--   that exists at mint time — the DB id is assigned on write),
+--   envelope_version = 2, payload_format = 1.
+-- - manifest: the same tuple with field = "manifest".
+-- The two envelopes share payload format 1, so file-key<->manifest
+-- separation rests entirely on the AAD `field` element: cross-envelope and
+-- cross-row substitution fail closed at decrypt. Pinned in code as
+-- ENVELOPE_AAD_* in workers/ingest/src/posted_files.rs.
+--
 -- Conventions (each pinned to a precedent, not invented here):
--- - BIGINT epoch seconds with the 253402300799 ceiling (0022, 0027), not
+-- - BIGINT epoch seconds with the 253402300799 ceiling (0022, 0028), not
 --   timestamptz; post_verified_at/last_retention_check are NULL until the
---   verify/retention flows stamp them (0027 original_nzb_sha256 precedent
+--   verify/retention flows stamp them (0028 original_nzb_sha256 precedent
 --   for NULL-able flow-stamped columns).
 -- - All DDL is IF NOT EXISTS (replay-safe): the replay pass in
 --   workers/api/tests/run_migration_tests.sh re-applies this file as a

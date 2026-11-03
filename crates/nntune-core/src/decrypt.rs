@@ -183,7 +183,7 @@ pub mod rclone {
     /// Ciphertext bytes per block.
     pub const CIPHER_BLOCK_SIZE: u64 = PLAIN_BLOCK_SIZE + CIPHER_OVERHEAD;
 
-    const MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
+    pub(crate) const MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
 
     /// Authenticates and decrypts an arbitrary plaintext range from an
     /// rclone-crypt file. `derived` must be the 80-byte scrypt output; only
@@ -306,8 +306,9 @@ pub mod rclone {
         }
     }
 
-    /// Encrypts one plaintext block with the rclone construction (test and
-    /// tooling helper — the data plane only ever decrypts). `sealed` must be
+    /// Encrypts one plaintext block with the rclone construction (the
+    /// production seal path behind [`crate::encrypt`]; also used by tests
+    /// and tooling). `sealed` must be
     /// `plaintext.len() + CIPHER_OVERHEAD` bytes; the tag is prepended.
     pub fn seal_block(
         derived: &[u8],

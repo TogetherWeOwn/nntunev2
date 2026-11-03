@@ -1,4 +1,4 @@
-//! `posted_files` writer: pure statements (migrations 0027 + 0028).
+//! `posted_files` writer: pure statements (migrations 0028 + 0029).
 //!
 //! Pipeline position: the post flow writes one content-global row per
 //! tagged plaintext sha256 after the poster seals the file (encrypt with
@@ -10,12 +10,12 @@
 //! classification the wire-up uses. Zero execution here — the
 //! writers-wiring follow-up owns the DB calls.
 //!
-//! Table split: migration 0027 (TWO-1768 two-spool ledger) owns copy state
-//! — the backbone pair, counts, spool states — and migration 0028
+//! Table split: migration 0028 (TWO-1768 two-spool ledger) owns copy state
+//! — the backbone pair, counts, spool states — and migration 0029
 //! (TWO-1761) owns key custody and geometry — sizes, header nonce, the two
 //! envelopes, verify/retention timestamps. One table, one writer module:
 //! the insert below binds the FULL row (both halves), because every new
-//! column is `NOT NULL`-complete for poster-written rows (the 0028
+//! column is `NOT NULL`-complete for poster-written rows (the 0029
 //! `posted_files_crypto_complete` guard). The state machine on top
 //! (`SpoolCopyState`, dedupe reuse) stays in [`crate::two_spool`]; reuse
 //! logic lands on the verify card, not here.
@@ -23,10 +23,15 @@
 //! Envelope boundary (KEK never in ingest): this module pins the
 //! `file_key_*`/`manifest_*` companion contract — envelope v2 as SQL
 //! literals, lengths, kek versions, payload formats — and validates bound
-//! values, but it never mints. Minting reuses the vault envelope code
-//! (`workers/api/src/vault.rs::encrypt_vault`, fresh DEK per envelope:
-//! 32-byte DEK + 16-byte tag = the 48-byte `*_dek_wrapped` the schema
-//! CHECKs) and lands with the providers-minting sibling, which seals:
+//! values, but it never mints. Minting lives with the providers-minting
+//! sibling, which generalizes the canonical v2 AAD construction
+//! (`workers/api/src/providers.rs::aad_v2`, ADR 0002: length-prefixed
+//! frames, never delimiter joins) with the tuple pinned below — NOT the v1
+//! delimiter AAD (`v1|vault|<user_id>`) of
+//! `workers/api/src/vault.rs::encrypt_vault`, which carries no
+//! table/field/row binding and must never mint these columns. Each envelope
+//! gets a fresh DEK (32-byte DEK + 16-byte tag = the 48-byte
+//! `*_dek_wrapped` the schema CHECKs). The sibling seals:
 //! - file key envelope (payload format 1): the raw 32-byte per-file key.
 //! - manifest envelope (payload format 1): the `posted_manifest_v1` JSON
 //!   document — `nzb_xml_base64` (standard-base64 NZB 1.1), one
@@ -37,35 +42,77 @@
 //!   segment lists exist ONLY inside this sealed manifest — never as
 //!   plaintext columns, files, URLs or log lines.
 //!
+//! Envelope v2 AAD binding (ADR 0002: `domain, purpose, table, field,
+//! owner_scope, row_key, envelope_version, payload_format`, plus
+//! `kek_version` on the DEK-wrap AAD only; payload AAD excludes it so an
+//! authorized rewrap never touches the payload):
+//! - file key: `domain = "nntune-envelope-v2"`, `purpose = "payload"` (or
+//!   `"dek"` for the wrap), [`ENVELOPE_AAD_TABLE`], [`FILE_KEY_AAD_FIELD`],
+//!   [`ENVELOPE_AAD_OWNER_SCOPE`], `row_key = plaintext_sha256`,
+//!   `envelope_version = 2`, `payload_format = 1`.
+//! - manifest: the same tuple with [`MANIFEST_AAD_FIELD`].
+//! `row_key` is the tagged plaintext sha256 because it is the only row
+//! identity that exists at mint time (the DB `id` is assigned on write and
+//! re-selected, so it cannot be minted into). The two envelopes share
+//! payload format 1, so file-key↔manifest separation rests entirely on the
+//! AAD `field` element: cross-envelope and cross-row substitution fail
+//! closed at decrypt time.
+//!
 //! The conflict target is `ON CONFLICT (plaintext_sha256) DO NOTHING`
-//! (first writer wins): rows are content-global, envelope bytes are stable
-//! for identical inputs, and a divergent later write is a pipeline bug that
-//! must not flap a shared row. A zero-row write is either a benign replay
-//! or a lost write; the consumer separates them with the sha re-select
-//! plus [`classify_posted_file_zero_rows`], never by assuming.
+//! (first writer wins): rows are content-global, and a divergent later
+//! write is a pipeline bug that must not flap a shared row. Every post
+//! mints a fresh file key, header nonce, DEKs and GCM nonces, so envelope
+//! bytes are NOT stable across posts — existence (and reuse of the stored
+//! key/manifest) is decided *before* posting, never re-sealed on replay;
+//! the reuse check itself lands on the verify card, not here. A zero-row
+//! write is either a benign replay or a lost write; the consumer separates
+//! them with the sha re-select plus [`classify_posted_file_zero_rows`],
+//! never by assuming.
 
 use crate::track_writers::{ENVELOPE_NONCE_BYTES, ENVELOPE_WRAPPED_DEK_BYTES};
 use crate::two_spool::{validate_backbone_label, validate_plaintext_sha256, SpoolCopyState};
 
 /// Public rclone header nonce length (bytes). Posted in article 0 in the
-/// clear; mirrors the 0028 `CHECK` (`octet_length(header_nonce) = 24`).
+/// clear; mirrors the 0029 `CHECK` (`octet_length(header_nonce) = 24`).
 pub const HEADER_NONCE_BYTES: usize = 24;
 
 /// `file_key_*` payload format: the raw 32-byte per-file key. Card-fixed
-/// (0028 `CHECK`s `= 1`); the mint assigns nothing else here.
+/// (0029 `CHECK`s `= 1`); the mint assigns nothing else here.
 pub const FILE_KEY_PAYLOAD_FORMAT: i16 = 1;
 
 /// `manifest_*` payload format: the `posted_manifest_v1` JSON document
-/// described above. Card-fixed (0028 `CHECK`s `= 1`).
+/// described above. Card-fixed (0029 `CHECK`s `= 1`).
 pub const MANIFEST_PAYLOAD_FORMAT: i16 = 1;
 
-/// Latest representable epoch second (0022/0027 ceiling, year 9999).
+/// Envelope v2 AAD domain for both posted-file envelopes (ADR 0002).
+pub const ENVELOPE_AAD_DOMAIN: &str = "nntune-envelope-v2";
+
+/// Envelope v2 AAD table pin: both envelopes bind `posted_files`.
+pub const ENVELOPE_AAD_TABLE: &str = "posted_files";
+
+/// Envelope v2 AAD field pins. File key and manifest are distinct fields,
+/// so cross-envelope substitution fails closed at decrypt time even though
+/// both envelopes share payload format 1.
+pub const FILE_KEY_AAD_FIELD: &str = "file_key";
+pub const MANIFEST_AAD_FIELD: &str = "manifest";
+
+/// Envelope v2 AAD owner scope: posted-file rows are content-global (no
+/// user exists), so both envelopes bind this explicit tagged global scope —
+/// never a user id, never an empty string (ADR 0002).
+pub const ENVELOPE_AAD_OWNER_SCOPE: &str = "global:posted_files";
+
+/// Format 1 seals exactly the raw 32-byte file key: 32 bytes of key plus
+/// the 16-byte GCM tag. The manifest envelope is variable-length (a JSON
+/// document), so only the file-key side pins its body length here.
+pub const FILE_KEY_ENVELOPE_BODY_BYTES: usize = 48;
+
+/// Latest representable epoch second (0022/0028 ceiling, year 9999).
 pub const MAX_EPOCH: i64 = 253402300799;
 
-/// Largest article set one row tracks (0027 `CHECK`, `<= 1000000`).
+/// Largest article set one row tracks (0028 `CHECK`, `<= 1000000`).
 pub const MAX_ARTICLE_COUNT: i32 = 1_000_000;
 
-/// Database wire string for a spool copy state: the 0027 `IN` list, which
+/// Database wire string for a spool copy state: the 0028 `IN` list, which
 /// is also the `snake_case` serde alphabet of [`SpoolCopyState`].
 pub fn spool_copy_state_db_str(state: SpoolCopyState) -> &'static str {
     match state {
@@ -89,7 +136,7 @@ pub fn parse_spool_copy_state(raw: &str) -> Result<SpoolCopyState, &'static str>
     }
 }
 
-/// One full posted-file row: every bound column of the 0027 + 0028 insert.
+/// One full posted-file row: every bound column of the 0028 + 0029 insert.
 /// `id` and `created_at` are DB-owned and never bound;
 /// `post_verified_at`/`last_retention_check` start NULL and are stamped by
 /// the touch statements below.
@@ -216,7 +263,7 @@ fn validate_envelope_side(
     Ok(())
 }
 
-/// Validates every bound value against the 0027 + 0028 `CHECK`s before the
+/// Validates every bound value against the 0028 + 0029 `CHECK`s before the
 /// wire-up binds it. Static messages: safe to surface, nothing secret.
 pub fn validate_posted_file_params(params: &PostedFileParams) -> Result<(), &'static str> {
     if !validate_plaintext_sha256(params.plaintext_sha256) {
@@ -257,6 +304,11 @@ pub fn validate_posted_file_params(params: &PostedFileParams) -> Result<(), &'st
         params.file_key_dek_wrapped,
         params.file_key_payload_nonce,
     )?;
+    // Fail fast at bind time: a mint bug that seals anything but the raw
+    // 32-byte key would otherwise surface only at playback.
+    if params.file_key_encrypted.len() != FILE_KEY_ENVELOPE_BODY_BYTES {
+        return Err("file key envelope body must be 48 bytes");
+    }
     if params.file_key_payload_format != FILE_KEY_PAYLOAD_FORMAT {
         return Err("file key payload format must be 1");
     }
@@ -442,7 +494,7 @@ mod tests {
             plaintext_size: 720_896,
             article_payload_size: 721_072,
             header_nonce: &[0u8; HEADER_NONCE_BYTES],
-            file_key_encrypted: &[1u8; 64],
+            file_key_encrypted: &[1u8; FILE_KEY_ENVELOPE_BODY_BYTES],
             file_key_kek_version: 1,
             file_key_dek_wrapped_nonce: &[2u8; ENVELOPE_NONCE_BYTES],
             file_key_dek_wrapped: &[3u8; ENVELOPE_WRAPPED_DEK_BYTES],
@@ -517,6 +569,34 @@ mod tests {
         let mut p = valid_params();
         p.original_nzb_sha256 = Some("short");
         assert!(validate_posted_file_params(&p).is_err());
+    }
+
+    #[test]
+    fn envelope_aad_tuple_is_pinned() {
+        // The minting sibling binds exactly this tuple (see the module
+        // header); a rename here without a mint-side change breaks decrypt.
+        assert_eq!(ENVELOPE_AAD_DOMAIN, "nntune-envelope-v2");
+        assert_eq!(ENVELOPE_AAD_TABLE, "posted_files");
+        assert_eq!(FILE_KEY_AAD_FIELD, "file_key");
+        assert_eq!(MANIFEST_AAD_FIELD, "manifest");
+        assert_ne!(FILE_KEY_AAD_FIELD, MANIFEST_AAD_FIELD);
+        assert_eq!(ENVELOPE_AAD_OWNER_SCOPE, "global:posted_files");
+        assert_eq!(FILE_KEY_ENVELOPE_BODY_BYTES, 48);
+    }
+
+    #[test]
+    fn file_key_envelope_body_is_exactly_48_bytes() {
+        let mut p = valid_params();
+        p.file_key_encrypted = &[0u8; FILE_KEY_ENVELOPE_BODY_BYTES - 1];
+        assert!(validate_posted_file_params(&p).is_err());
+        let mut p = valid_params();
+        p.file_key_encrypted = &[0u8; FILE_KEY_ENVELOPE_BODY_BYTES + 1];
+        assert!(validate_posted_file_params(&p).is_err());
+        // The manifest envelope carries a variable-length JSON document, so
+        // any non-empty body validates; only the file-key side is exact.
+        let mut p = valid_params();
+        p.manifest_encrypted = &[0u8; 1];
+        assert!(validate_posted_file_params(&p).is_ok());
     }
 
     #[test]

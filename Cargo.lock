@@ -925,6 +925,7 @@ dependencies = [
  "tokio-rustls",
  "webpki-roots",
  "worker",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
--- Regression test for the posted-file record (migrations 0027 + 0028,
+-- Regression test for the posted-file record (migrations 0028 + 0029,
 -- workers/ingest/src/posted_files.rs). Run after ALL migrations are applied
 -- (see ../run_migration_tests.sh). Everything happens inside one transaction
 -- that is rolled back, so it leaves no rows; any broken expectation RAISEs
@@ -6,8 +6,8 @@
 --
 -- This test executes the writer insert in its exact shape (literals stand in
 -- for the $n parameters): the content-global row converging on the tagged
--- plaintext sha256 with the two-spool copy state (0027) plus the
--- encrypt-on-write crypto envelope and geometry (0028) — plus the
+-- plaintext sha256 with the two-spool copy state (0028) plus the
+-- encrypt-on-write crypto envelope and geometry (0029) — plus the
 -- sha re-select the writer uses to separate a benign replay from a lost
 -- write, the verify/retention timestamp touches, and the negatives
 -- (sha/backbone/state/count CHECKs, envelope length + version + format
@@ -44,7 +44,7 @@ BEGIN
         'present', 'unknown', FALSE, FALSE,
         720896, 721072,
         '\x000000000000000000000000000000000000000000000000'::bytea,
-        '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041'::bytea,
+        '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
         2, 1,
         '\x000000000000000000000000'::bytea,
         '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
@@ -68,6 +68,7 @@ BEGIN
       AND plaintext_size = 720896 AND article_payload_size = 721072
       AND octet_length(header_nonce) = 24
       AND file_key_envelope_version = 2 AND file_key_kek_version = 1
+      AND octet_length(file_key_encrypted) = 48
       AND octet_length(file_key_dek_wrapped_nonce) = 12
       AND octet_length(file_key_dek_wrapped) = 48
       AND octet_length(file_key_payload_nonce) = 12
@@ -108,7 +109,7 @@ BEGIN
         'present', 'unknown', FALSE, FALSE,
         720896, 721072,
         '\x000000000000000000000000000000000000000000000000'::bytea,
-        '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041'::bytea,
+        '\x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30'::bytea,
         2, 1,
         '\x000000000000000000000000'::bytea,
         '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
