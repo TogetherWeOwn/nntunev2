@@ -726,6 +726,7 @@ dependencies = [
  "cbc",
  "crc32fast",
  "crypto_secretbox",
+ "getrandom 0.2.17",
  "libc",
  "md5",
  "quick-xml",
