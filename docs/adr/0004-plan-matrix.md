@@ -52,7 +52,10 @@ is bounded once per environment by ADR 0013's `popcache.cap_bytes`; cache
 occupancy is not a plan-enforcement dimension at any tier. The
 `plans` cache columns are removed from the schema once no reader remains
 (ADR 0013 §Consequences); until that migration lands they are dead columns,
-not a storage promise at any tier.
+not a storage promise at any tier. The applied plans seed keeps its legacy
+cache values (applied migrations are immutable), and the seed-parity pin
+against this table covers the retained plan values only — the retired cache
+trio is deliberately unpinned because it is no longer plan data.
 
 ### Measurement and enforcement
 

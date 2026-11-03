@@ -226,56 +226,58 @@ mod tests {
     fn seed_rows_match_adr_0004() {
         // The ADR 0004 decision table is the single source for the plans
         // seed: parse it and assert every tier's INSERT tuple in migration
-        // 0021 carries the same values (price $ to cents, cache GiB to
-        // bytes), so editing the table without reseeding — or reseeding
-        // without the table — fails instead of silently repricing. Same
-        // include_str! doc-parity pattern as
-        // plan_limits::caps_match_adr_0004_decision_table.
+        // 0021 carries the same values (price $ to cents), so editing the
+        // table without reseeding — or reseeding without the table — fails
+        // instead of silently repricing. Same include_str! doc-parity
+        // pattern as plan_limits::caps_match_adr_0004_decision_table.
+        //
+        // The tuple's trailing cache trio (cache_priority,
+        // cache_bytes_budget, cache_retention_days) is deliberately no
+        // longer pinned: ADR 0004's 2026-11-03 revision retired the
+        // per-plan cache columns under ADR 0013 (one shared cache, no
+        // per-user share), so they are not plan data and left the ADR
+        // table. Migration 0021 is applied and immutable; its seeded
+        // cache values are dead columns until the forward drop migration
+        // lands, so this pin covers the retained plan values only (the
+        // tuple prefix through ingest_jobs_day).
         let doc = include_str!("../../../docs/adr/0004-plan-matrix.md");
         let migration = include_str!("../../../migrations/0021_billing_schema.sql");
         let mut seen = HashSet::new();
         for line in doc.lines().filter(|l| l.starts_with('|')) {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             // cells: ["", plan, price, stream hrs, concurrent, library,
-            //          ingest, cache GiB, retention days, priority, ""].
+            //          ingest, ""].
             // Header/separator rows lack a `$` price.
-            if cells.len() < 10 || !cells[2].starts_with('$') {
+            if cells.len() < 8 || !cells[2].starts_with('$') {
                 continue;
             }
-            let (id, dollars, stream_hrs, concurrent, library, ingest, gib, retention, priority) =
-                match cells[1] {
-                    p if p.starts_with("Free") => (
-                        "free", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Plus" => (
-                        "plus", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Pro 5x" => (
-                        "pro-5x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6], &cells[7],
-                        &cells[8], &cells[9],
-                    ),
-                    "Pro 20x" => (
-                        "pro-20x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
-                        &cells[7], &cells[8], &cells[9],
-                    ),
-                    _ => continue,
-                };
+            let (id, dollars, stream_hrs, concurrent, library, ingest) = match cells[1] {
+                p if p.starts_with("Free") => (
+                    "free", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
+                ),
+                "Plus" => (
+                    "plus", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
+                ),
+                "Pro 5x" => (
+                    "pro-5x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
+                ),
+                "Pro 20x" => (
+                    "pro-20x", &cells[2], &cells[3], &cells[4], &cells[5], &cells[6],
+                ),
+                _ => continue,
+            };
             let cents: i64 = dollars
                 .trim_start_matches('$')
                 .replace(',', "")
                 .parse::<i64>()
                 .expect("ADR price parses")
                 * 100;
-            let gib: i64 = gib.replace(',', "").parse().expect("ADR cache GiB parses");
             let expected = format!(
-                "('{id}', {cents}, {stream_hrs}, {concurrent}, {library}, {ingest}, '{priority}', {bytes}, {retention})",
+                "('{id}', {cents}, {stream_hrs}, {concurrent}, {library}, {ingest},",
                 stream_hrs = stream_hrs.replace(',', ""),
                 concurrent = concurrent.replace(',', ""),
                 library = library.replace(',', ""),
                 ingest = ingest.replace(',', ""),
-                bytes = gib * 1_073_741_824,
             );
             assert!(
                 migration.contains(&expected),
