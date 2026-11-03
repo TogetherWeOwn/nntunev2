@@ -25,7 +25,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue',
-		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange'
+		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
 	]);
 	const functions = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && handlers.has(node.name?.text ?? ''));
 	// Queue replacement clears real share state when the current source changes.

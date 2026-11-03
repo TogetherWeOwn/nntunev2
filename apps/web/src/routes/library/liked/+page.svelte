@@ -52,11 +52,19 @@
 
 	function removeFavorite(id: string, title: string): void {
 		const previous = [...favoriteIds];
+		const previousIndex = previous.indexOf(id);
 		persist(previous.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
-				run: () => persist(previous)
+				run: () => {
+					// Restore only this track against the current list so
+					// concurrent Undos never overwrite each other's removals.
+					if (favoriteIds.includes(id)) return;
+					const next = [...favoriteIds];
+					next.splice(Math.min(Math.max(previousIndex, 0), next.length), 0, id);
+					persist(next);
+				}
 			}
 		});
 	}

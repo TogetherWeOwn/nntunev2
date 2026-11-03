@@ -9,7 +9,11 @@
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
-	import { notifyLocalAuthTransition } from '#lib/auth-transition.js';
+	import {
+		notifyLocalAuthTransition,
+		subscribeLocalAuthTransition
+	} from '#lib/auth-transition.js';
+	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 	import {
 		clearMiniPlayerHint,
 		onMiniPlayerHint,
@@ -275,6 +279,15 @@
 	let miniHint = $state<MiniPlayerHint | null>(null);
 	let rightSnippet: Snippet | null = $state(null);
 
+	// Shell display state is device-local, but Undo closures and the
+	// mini-player hint capture the previous account's metadata. Any auth
+	// boundary — this tab (security page, account menu) or another tab's
+	// storage event — drops both so the next account starts clean.
+	function clearShellAtAuthBoundary(): void {
+		clearMiniPlayerHint();
+		clearToasts();
+	}
+
 	$effect(() => {
 		const offToasts = onToasts((list) => {
 			toasts = [...list];
@@ -285,10 +298,17 @@
 		const offPanel = onRightPanel((panel) => {
 			rightSnippet = panel;
 		});
+		const offAuth = subscribeLocalAuthTransition(clearShellAtAuthBoundary);
+		const onStorage = (event: StorageEvent): void => {
+			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clearShellAtAuthBoundary();
+		};
+		window.addEventListener('storage', onStorage);
 		return () => {
 			offToasts();
 			offHint();
 			offPanel();
+			offAuth();
+			window.removeEventListener('storage', onStorage);
 		};
 	});
 
