@@ -579,14 +579,22 @@ jobs:
   # service-binding target does not exist). Deploys the ingest Worker to its
   # `staging` env: no routes and no workers_dev, with a LIVE
   # `[[queues.consumers]]` stanza — the consumer goes live on deploy, so
-  # this lane must stay operator-disabled until TWO-1660 closes search
-  # intake (a search job would burn its retry budget against the unwired
-  # search boundary and quarantine). Passes the public BUILD_SHA var so
+  # this lane carries its own disabled-by-default enable gate
+  # (INGEST_STAGING_ENABLED): the Operator sets it only after TWO-1660
+  # closes search intake, since a search job admitted before the search
+  # boundary is wired would burn its retry budget against the unwired
+  # boundary and quarantine. The shared HYPERDRIVE_ID_STAGING var alone
+  # never enables this lane (the staging-api lane already needs it wired).
+  # The deploy additionally requires staging-mb deployed on the same run
+  # (its `MB_API` service binding targets `nntune-mb-staging`); when mb
+  # skips unconfigured, ingest skips with a notice instead of failing on
+  # the missing target. Passes the public BUILD_SHA var so
   # worker log records carry the deploy SHA (never a secret); secrets live
   # only in Cloudflare and are never written here. Fails closed on the
   # Hyperdrive cache-disabled gate for the shared app staging config
   # (no --allow-skip); skips with a notice until the Operator wires the
-  # staging variables (a skip is not evidence). Production is never touched:
+  # staging variables and enables the lane (a skip is not evidence).
+  # Production is never touched:
   # the generated config has no production env table and the job deploys
   # `--env staging` only.
   staging-ingest:
@@ -626,6 +634,7 @@ jobs:
         working-directory: workers/ingest
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          INGEST_STAGING_ENABLED: ${{ vars.INGEST_STAGING_ENABLED }}
         run: |
           set -euo pipefail
           missing=""
@@ -640,9 +649,24 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+          # Disabled-by-default enable gate: the shared HYPERDRIVE_ID_STAGING
+          # var alone never enables this lane (the staging-api lane already
+          # needs it wired). The Operator sets INGEST_STAGING_ENABLED only
+          # after search intake closes (runbook step 1); until then every
+          # downstream step skips and the live consumer never deploys.
+          if [ "${INGEST_STAGING_ENABLED:-}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### staging-ingest skipped: lane not enabled"
+              echo "INGEST_STAGING_ENABLED is not true (name only; disabled by default)."
+              echo "Enable only after search intake closes — runbook step 1."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Hyperdrive cache-disabled gate
         id: hyperdrive
-        if: steps.config.outputs.configured == 'true'
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
         working-directory: workers/api
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -651,7 +675,7 @@ jobs:
           set -euo pipefail
           ./check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"
       - name: Generate staging wrangler.toml
-        if: steps.config.outputs.configured == 'true'
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
         working-directory: workers/ingest
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
@@ -774,7 +798,7 @@ jobs:
           PY
       - name: Deploy ingest to staging
         id: deploy
-        if: steps.config.outputs.configured == 'true' && steps.hyperdrive.outcome == 'success'
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true' && steps.hyperdrive.outcome == 'success' && needs.staging-mb.outputs.deployed == 'true'
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -789,6 +813,8 @@ jobs:
         if: always()
         env:
           CONFIGURED: ${{ steps.config.outputs.configured }}
+          ENABLED: ${{ steps.config.outputs.enabled }}
+          MB_DEPLOYED: ${{ needs.staging-mb.outputs.deployed }}
           HYPERDRIVE_OUTCOME: ${{ steps.hyperdrive.outcome }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           JOB_STATUS: ${{ job.status }}
@@ -802,8 +828,13 @@ jobs:
             outcome=cancelled
           elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
             outcome=unconfigured
-          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && \
-               [ "$HYPERDRIVE_OUTCOME" = success ] && \
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = false ]; then
+            outcome=disabled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = true ] && \
+               [ "$MB_DEPLOYED" = false ]; then
+            outcome=mb-not-deployed
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = true ] && \
+               [ "$MB_DEPLOYED" = true ] && [ "$HYPERDRIVE_OUTCOME" = success ] && \
                [ "$DEPLOY_OUTCOME" = success ]; then
             deployed=true
             outcome=deployed
@@ -818,8 +849,16 @@ jobs:
             echo "### staging-ingest deployment outcome: $outcome"
             echo "Worker: nntune-ingest-staging (env staging)"
             echo "deployed=$deployed"
+            echo "Enable gate (INGEST_STAGING_ENABLED): ${ENABLED:-not-run}"
+            echo "staging-mb deployed this run: ${MB_DEPLOYED:-not-run}"
             echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
             echo "Deploy ingest to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$outcome" = "disabled" ]; then
+              echo "Lane is operator-disabled by default; set INGEST_STAGING_ENABLED only after search intake closes (runbook step 1)."
+            fi
+            if [ "$outcome" = "mb-not-deployed" ]; then
+              echo "staging-mb did not deploy this run (wire HYPERDRIVE_ID_MB first); ingest skips rather than failing on the missing MB_API target."
+            fi
             if [ "$deployed" = true ]; then
               echo "Source SHA: $source_sha"
               echo "BUILD_SHA var: $source_sha"

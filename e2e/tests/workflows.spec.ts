@@ -1962,7 +1962,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
   // own concurrency group, the staging GitHub-environment mapping,
   // staging-only deploy with the public BUILD_SHA var, ordering after
   // `staging-mb` (its `MB_API` service binding targets `nntune-mb-staging`,
-  // which that lane deploys first), the generated parity pin binding
+  // which that lane deploys first), the ingest-specific disabled-by-default
+  // enable gate (INGEST_STAGING_ENABLED, independent of the shared
+  // HYPERDRIVE_ID_STAGING var: the lane must stay operator-disabled until
+  // search intake closes), the mb-deployed gate (ingest must skip, not
+  // fail, when staging-mb did not deploy this run), the generated parity
+  // pin binding
   // HYPERDRIVE_ID_STAGING to the committed ingest LIBRARY_DB staging
   // inventory id, the LIVE queue consumer stanza (max_batch_size 10,
   // max_retries 4, DLQ), the MB_API service binding, Workers Logs
@@ -1995,6 +2000,15 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
     );
     expect(section).toContain('service = "nntune-alerts-staging"');
+    // Disabled-by-default enable gate: the deploy path must read the
+    // ingest-specific INGEST_STAGING_ENABLED repo variable and gate on an
+    // enabled output — never on the shared HYPERDRIVE_ID_STAGING var alone,
+    // which the api lane already needs wired.
+    expect(section).toContain('INGEST_STAGING_ENABLED');
+    expect(section).toContain("steps.config.outputs.enabled == 'true'");
+    // MB-deployed gate: with staging-mb skipped (unconfigured), ingest must
+    // skip instead of failing on the missing MB_API service target.
+    expect(section).toContain("needs.staging-mb.outputs.deployed == 'true'");
     const code = codeLines(section);
     for (const binding of ['NNTP_POOL', 'REPAIR_CONTAINER', 'TRANSCODE_CONTAINER']) {
       expect(code, `staging-ingest omits ${binding} until its target exists`).not.toContain(
@@ -2233,6 +2247,23 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // staging-mb ordering the deploy can fail on the missing service
     // binding (Cloudflare rejects deploys whose target does not exist).
     const ingestUnorderedMutant = jobsBody.replace('needs: [gate, staging-mb]', 'needs: [gate]');
+    // Ingest lane whose deploy gates only on the shared HYPERDRIVE_ID_STAGING
+    // var: with the api lane's variable wired, the next main push would
+    // deploy a live consumer before search intake closes. The enable gate
+    // must be ingest-specific and disabled by default.
+    const ingestNoEnableGateMutant = jobsBody.replace(
+      jobSection(jobsBody, 'staging-ingest'),
+      jobSection(jobsBody, 'staging-ingest')
+        .split("steps.config.outputs.enabled == 'true'")
+        .join("steps.config.outputs.configured == 'true'"),
+    );
+    // Ingest lane that deploys whenever its own config is set, even when
+    // staging-mb skipped: the MB_API service target does not exist yet and
+    // the deploy fails instead of skipping with a notice.
+    const ingestNoMbDeployedMutant = jobsBody.replace(
+      " && needs.staging-mb.outputs.deployed == 'true'",
+      '',
+    );
     // Ingest lane whose generated consumer drops the DLQ: a poisoned job
     // would burn its retry budget instead of quarantining.
     const ingestNoDlqMutant = jobsBody.replace(
@@ -2412,6 +2443,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       mbSharedGroupMutant,
       ingestSharedGroupMutant,
       ingestUnorderedMutant,
+      ingestNoEnableGateMutant,
+      ingestNoMbDeployedMutant,
       ingestNoDlqMutant,
       mbRenamedMutant,
       ingestNntpMutant,
@@ -2467,6 +2500,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(() => assertStagingMb(noMbBuildShaMutant)).toThrow();
     expect(() => assertDeployBody(noIngestBuildShaMutant)).toThrow();
     expect(() => assertStagingIngest(noIngestBuildShaMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNoEnableGateMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNoMbDeployedMutant)).toThrow();
     expect(() => assertStagingMb(mbSharedGroupMutant)).toThrow();
     expect(() => assertStagingIngest(ingestSharedGroupMutant)).toThrow();
     expect(() => assertStagingIngest(ingestUnorderedMutant)).toThrow();

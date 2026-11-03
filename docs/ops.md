@@ -756,7 +756,11 @@ secret *names* (the `CLOUDFLARE_*` credentials stay in repo secrets). The
 deploys either Worker — until every step below clears, in order:
 
 1. **TWO-1660 gate (ingest only).** Do not enable `staging-ingest` until
-   TWO-1660 closes search intake. The `[[queues.consumers]]` stanza in
+   TWO-1660 closes search intake. The lane reads the public repo variable
+   `INGEST_STAGING_ENABLED`, disabled by default — unset, or any value but
+   `true`, skips every downstream step with a notice, so the live consumer
+   can never deploy before the Operator acts. Leave it unset until intake
+   closes, then set it to `true`. The `[[queues.consumers]]` stanza in
    `workers/ingest/wrangler.toml` is live, so the consumer goes live the
    moment the lane first deploys; a search job admitted before the search
    boundary is wired would burn its retry budget against the unwired
@@ -769,7 +773,10 @@ deploys either Worker — until every step below clears, in order:
    table above. Each lane pins its variable against
    `.github/scripts/binding_manifest.toml` before generating its staging
    config and fails the job on mismatch, so a mistyped variable blocks the
-   deploy instead of deploying the wrong binding.
+   deploy instead of deploying the wrong binding. Set
+   `INGEST_STAGING_ENABLED` to `true` only after step 1 clears — wiring the
+   two Hyperdrive variables alone never enables `staging-ingest` (the api
+   lane already needs `HYPERDRIVE_ID_STAGING` wired).
 3. **Confirm Worker secrets are operator-set in Cloudflare (names only,
    never values).** The lanes deploy with `--var BUILD_SHA` (public) only.
    `wrangler secret put` each of the following before enabling the lanes:
@@ -802,7 +809,10 @@ deploys either Worker — until every step below clears, in order:
    with outputs `deployed=true`, `outcome=deployed`, and `source_sha`
    equal to the push SHA (which must also equal the deploy's `BUILD_SHA`
    argument and the Workers' `build_sha` log field — `"unknown"` is never
-   evidence). Then verify, read-only: the Cloudflare dashboard lists
+   evidence). An ingest run reporting `outcome=disabled` (enable gate unset)
+   or `outcome=mb-not-deployed` (mb skipped unconfigured) is a skip, not a
+   deploy — do not treat it as evidence; wire the missing piece and push
+   again. Then verify, read-only: the Cloudflare dashboard lists
    deployments for `nntune-mb-staging` and `nntune-ingest-staging`; the
    queue consumer is attached to `nntunev2-ingest-staging`; no
    `*.workers.dev` URL serves either Worker (`workers_dev = false`, no
