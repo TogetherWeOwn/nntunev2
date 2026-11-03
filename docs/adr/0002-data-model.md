@@ -167,8 +167,12 @@ usage_ledger          id BIGSERIAL PK, user_id FK, period DATE (UTC day),
                       UNIQUE (user_id, period) -- flows only, no cache gauge
 ingest_jobs           id PK, user_id FK, idempotency_key TEXT, accepted_at,
                       accepted_seq BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
-                      -- monotonic acceptance order; copied onto track_sources/
-                      -- track_media at write so ordering survives job erasure
+                      -- monotonic acceptance order, DB-assigned at the
+                      -- admission INSERT (the point of acceptance): the sole
+                      -- source-ordering truth (§6). accepted_at is
+                      -- caller-bound and is never an ordering input. Copied
+                      -- onto track_sources/track_media at write so ordering
+                      -- survives job erasure
                       status TEXT ('queued'|'running'|'done'|'failed'),
                       UNIQUE (user_id, idempotency_key)
 pool_providers        id PK, label, host, port, tls, username,
@@ -793,7 +797,19 @@ RESTRICT`, rebuilds the `track_media` PK without `source_job_id`, drops
 the `local_job_id` NOT-NULL-when-`local_key` invariant, and backfills
 `accepted_seq` onto every curated source and global media mapping from its
 ingesting job — total, never guessed, because those applied RESTRICT FKs
-mean the job row still exists for every such row at migration time), so surviving curated
+mean the job row still exists for every such row at migration time. The
+job seqs that backfill copies are themselves assigned by the same
+migration, in `(accepted_at, id)` order, before the identity sequence
+takes over: adding a `GENERATED ALWAYS AS IDENTITY` column numbers
+pre-existing rows in unspecified (scan) order, so the migration never
+copies that numbering — it adds `accepted_seq` as a plain column, fills
+it with `ROW_NUMBER() OVER (ORDER BY accepted_at, id)`, converts it to
+`GENERATED ALWAYS AS IDENTITY` with the sequence restarted above the
+maximum assigned value, and only then copies seq onto `track_sources`/
+`track_media`. `(accepted_at, id)` is used once, as the best available
+reconstruction of pre-migration acceptance order; for every row admitted
+after the migration, `accepted_seq` alone is the ordering truth (§6)),
+so surviving curated
 sources, global mappings and referenced local catalogue rows keep living
 with provenance nulled and erasure never fails with 23503. The persisted
 `accepted_seq` copies are plain NOT NULL values, not FKs, and are never
@@ -1142,7 +1158,20 @@ independent of whether the ingesting job still exists: at write, the
 curated source's `accepted_seq` and each media mapping's `accepted_seq`
 copy the ingesting job's monotonic `accepted_seq` (plain NOT NULL values,
 never nulled; `source_job_id` is provenance only and takes no part in
-ordering or serving). Under the source-row conflict lock, only a job whose
+ordering or serving). `accepted_seq` is the sole ordering truth: the
+database assigns it at the admission `INSERT` that writes the `queued`
+`ingest_jobs` row, and that insert is the point of acceptance — a job has
+no ordering position before it. `accepted_at` is a caller-bound timestamp
+(BIGINT unix seconds): a caller clock can skew, tie at second
+granularity, or disagree with admission order, so `accepted_at` is never
+compared for replacement or serving, and where the two orders disagree
+`accepted_seq` wins. A replayed admission allocates no new seq: the
+deterministic job id hits `ON CONFLICT (id) DO NOTHING` and the existing
+row's seq stands. Sequence gaps from rolled-back admissions are expected
+and irrelevant; only greater-than comparison matters. (The one exception
+is the forward migration, which numbers jobs that predate the column in
+`(accepted_at, id)` order before the identity sequence takes over —
+rule 3.) Under the source-row conflict lock, only a job whose
 `accepted_seq` is greater than the stored `track_sources.accepted_seq` may
 replace the encrypted source — so a later correction ingest replaces a
 source whose original ingesting job was erased (provenance nulled, seq
@@ -1300,7 +1329,14 @@ nulled, `accepted_seq` retained) is replaced by a later correction ingest
 and not by a replayed older job; serving between the erasure and the
 replacement selects only media whose `accepted_seq` matches the current
 source, and stale-seq media with nulled provenance is never served on a
-NULL-provenance match. Include opposite-order multi-track
+NULL-provenance match. Include a forward-migration case with pre-existing
+`ingest_jobs` rows whose physical order differs from `(accepted_at, id)`:
+the backfilled job seqs (and the copies on sources/media) follow
+`(accepted_at, id)`, and the identity sequence continues above the
+maximum backfilled value. Include post-migration ordering-truth cases: a
+later-admitted job with an earlier caller-bound `accepted_at` replaces by
+seq, and an earlier-admitted job with a later `accepted_at` does not.
+Include opposite-order multi-track
 inputs to prove sorted upserts and bounded retries. Cover the same recording on
 two releases and two positions on one release (distinct tracks), multidisc positions,
 NULL mirror `track_no` remaining unknown/local, unmatched-job retry, deterministic
