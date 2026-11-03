@@ -6,9 +6,14 @@
 //! Synthetic content only; no checked-in NZBs.
 
 use nntune_test_nntp::{ServerConfig, TestNntpServer};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+
+/// Fail fast instead of hanging to the CI job timeout when the server stops
+/// replying with the socket still open.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Client {
     reader: BufReader<OwnedReadHalf>,
@@ -30,7 +35,10 @@ impl Client {
 
     async fn read_line(&mut self) -> String {
         let mut s = String::new();
-        let n = self.reader.read_line(&mut s).await.unwrap();
+        let n = tokio::time::timeout(READ_TIMEOUT, self.reader.read_line(&mut s))
+            .await
+            .expect("timed out waiting for a response line")
+            .unwrap();
         assert!(n > 0, "connection closed while reading line");
         s
     }
@@ -57,7 +65,10 @@ impl Client {
         let mut raw = Vec::new();
         loop {
             let mut line: Vec<u8> = Vec::new();
-            let n = reader.read_until(b'\n', &mut line).await.unwrap();
+            let n = tokio::time::timeout(READ_TIMEOUT, reader.read_until(b'\n', &mut line))
+                .await
+                .expect("timed out waiting for a block line")
+                .unwrap();
             assert!(n > 0, "connection closed mid-block");
             if line.ends_with(b"\n") {
                 line.pop();
@@ -148,8 +159,17 @@ async fn post_then_stat_article_round_trip() {
     assert!(head_first.starts_with("221"), "got {head_first:?}");
     assert!(String::from_utf8_lossy(&head).contains("Subject: roundtrip"));
 
-    let (body_first, _) = c.cmd_block(&format!("BODY {id}")).await;
+    let (body_first, body) = c.cmd_block(&format!("BODY {id}")).await;
     assert!(body_first.starts_with("222"), "got {body_first:?}");
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(
+        body_text.contains("hello spool"),
+        "BODY missing body: {body_text:?}"
+    );
+    assert!(
+        !body_text.contains("Subject: roundtrip"),
+        "BODY sent headers: {body_text:?}"
+    );
 
     assert_eq!(server.posted_count().await, 1);
     assert!(server.is_stored(id).await);
@@ -260,6 +280,22 @@ async fn hidden_ids_stat_430_and_unhide_restores() {
     let ok = c.cmd(&format!("STAT {id}")).await;
     assert!(ok.starts_with("223"), "pre-hide: {ok:?}");
 
+    // Resolve the article number via XOVER (needs a selected group).
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "select: {g:?}");
+    let (xfirst, xblock) = c.cmd_block("XOVER 1-").await;
+    assert!(xfirst.starts_with("224"), "got {xfirst:?}");
+    let xtext = String::from_utf8_lossy(&xblock);
+    let number: u32 = xtext
+        .lines()
+        .find(|l| l.contains(id))
+        .expect("fixture in XOVER")
+        .split('\t')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
     server.hide(id).await;
     assert!(server.is_hidden(id).await);
     // Physically stored, but reads as missing while hidden.
@@ -271,6 +307,17 @@ async fn hidden_ids_stat_430_and_unhide_restores() {
     // wait for a `.` terminator that never comes.
     let first = c.cmd(&format!("ARTICLE {id}")).await;
     assert!(first.starts_with("430"), "hidden ARTICLE: {first:?}");
+    // Numeric lookups hit the same guard as Message-ID lookups.
+    let num_stat = c.cmd(&format!("STAT {number}")).await;
+    assert!(
+        num_stat.starts_with("430"),
+        "hidden numeric STAT: {num_stat:?}"
+    );
+    let num_art = c.cmd(&format!("ARTICLE {number}")).await;
+    assert!(
+        num_art.starts_with("430"),
+        "hidden numeric ARTICLE: {num_art:?}"
+    );
 
     server.unhide(id).await;
     let back = c.cmd(&format!("STAT {id}")).await;
@@ -285,6 +332,10 @@ async fn repost_of_hidden_id_repairs_instead_of_duplicating() {
     c.auth("testuser", "testpass").await;
 
     let id = "<single-yenc-001@nntune.test>";
+    let before = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(before.starts_with("211"), "pre-hide GROUP: {before:?}");
+    let count_before: u64 = before.split_whitespace().nth(1).unwrap().parse().unwrap();
+
     server.hide(id).await;
     let reply = c
         .post(
@@ -298,6 +349,21 @@ async fn repost_of_hidden_id_repairs_instead_of_duplicating() {
 
     let s = c.cmd(&format!("STAT {id}")).await;
     assert!(s.starts_with("223"), "repaired STAT: {s:?}");
+    // Listings show the repaired ID exactly once: the fixture is shadowed by
+    // the spool replacement, not counted alongside it.
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    let count_after: u64 = g.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(
+        count_after, count_before,
+        "repaired GROUP double-count: {g:?}"
+    );
+    let (xfirst, xblock) = c.cmd_block("XOVER 1-").await;
+    assert!(xfirst.starts_with("224"), "got {xfirst:?}");
+    let hits = String::from_utf8_lossy(&xblock)
+        .lines()
+        .filter(|l| l.contains(id))
+        .count();
+    assert_eq!(hits, 1, "repaired ID listed {hits}x");
     // The repaired bytes are stored once and served back.
     assert_eq!(server.posted_count().await, 1);
     let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
@@ -421,6 +487,8 @@ async fn group_and_xover_include_posted_omit_hidden() {
     let after = c.cmd("GROUP alt.binaries.nntune.test").await;
     let count_after: u64 = after.split_whitespace().nth(1).unwrap().parse().unwrap();
     assert_eq!(count_after, count_before + 1);
+    // LIST bounds track GROUP bounds for the posted article's group.
+    assert_list_matches_group(&mut c, "alt.binaries.nntune.test", &after).await;
 
     let (first, block) = c.cmd_block("XOVER 1-").await;
     assert!(first.starts_with("224"), "got {first:?}");
@@ -439,6 +507,27 @@ async fn group_and_xover_include_posted_omit_hidden() {
     let (xfirst, xblock) = c.cmd_block("XOVER 1-").await;
     assert!(xfirst.starts_with("224"), "got {xfirst:?}");
     assert!(!String::from_utf8_lossy(&xblock).contains(id));
+    // LIST bounds still track GROUP after the hide.
+    assert_list_matches_group(&mut c, "alt.binaries.nntune.test", &hidden_group).await;
+}
+
+/// `LIST` line for `group` reports the same low/high as a `GROUP` reply.
+async fn assert_list_matches_group(c: &mut Client, group: &str, group_reply: &str) {
+    let gparts: Vec<&str> = group_reply.split_whitespace().collect();
+    let (glow, ghigh) = (gparts[2], gparts[3]);
+    let (first, block) = c.cmd_block("LIST").await;
+    assert!(first.starts_with("215"), "got {first:?}");
+    let text = String::from_utf8_lossy(&block);
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(group))
+        .unwrap_or_else(|| panic!("LIST missing {group}: {text:?}"));
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(
+        (cols[2], cols[1]),
+        (glow, ghigh),
+        "LIST/GROUP mismatch: {line:?}"
+    );
 }
 
 #[tokio::test]
@@ -481,4 +570,161 @@ async fn posted_count_for_manifest_duplicate_assertion() {
     }
     assert_eq!(server.posted_count_for(&manifest).await, 3);
     assert_eq!(server.posted_count().await, 3);
+}
+
+#[tokio::test]
+async fn post_with_comma_separated_newsgroups_selects_first_group() {
+    // Production renders Newsgroups comma-separated (`a, b`); the first group
+    // wins (no stray comma stored, no 411 on the plain name).
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    let id = "<cross-001@nntune.test>";
+    let mut lines = vec![
+        "From: poster@nntune.test".to_string(),
+        "Newsgroups: alt.binaries.nntune.test, alt.binaries.other.test".to_string(),
+        "Subject: cross".to_string(),
+        "Date: Mon, 13 Oct 2026 00:00:00 +0000".to_string(),
+        format!("Message-ID: {id}"),
+        String::new(),
+    ];
+    lines.push("x".to_string());
+    let reply = c
+        .post(&lines.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .await;
+    assert!(reply.starts_with("240"), "got {reply:?}");
+
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "first group not selected: {g:?}");
+    let (first, block) = c.cmd_block("XOVER 1-").await;
+    assert!(first.starts_with("224"), "got {first:?}");
+    assert!(String::from_utf8_lossy(&block).contains(id));
+}
+
+#[tokio::test]
+async fn list_discovers_posted_group_and_reports_hidden_empty() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    let group = "alt.binaries.posted-only.test";
+    let id = "<posted-group-001@nntune.test>";
+    let mut lines = vec![
+        "From: poster@nntune.test".to_string(),
+        format!("Newsgroups: {group}"),
+        "Subject: new group".to_string(),
+        "Date: Mon, 13 Oct 2026 00:00:00 +0000".to_string(),
+        format!("Message-ID: {id}"),
+        String::new(),
+    ];
+    lines.push("x".to_string());
+    let reply = c
+        .post(&lines.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        .await;
+    assert!(reply.starts_with("240"), "got {reply:?}");
+
+    // GROUP recognizes the posted group and LIST advertises it with matching
+    // bounds.
+    let g = c.cmd(&format!("GROUP {group}")).await;
+    assert!(g.starts_with("211"), "got {g:?}");
+    assert_list_matches_group(&mut c, group, &g).await;
+
+    // Hiding the only article leaves the group available but empty, in both
+    // GROUP and LIST.
+    server.hide(id).await;
+    let empty = c.cmd(&format!("GROUP {group}")).await;
+    assert!(
+        empty.starts_with("211 0 0 0 "),
+        "hidden-only group not empty: {empty:?}"
+    );
+    assert_list_matches_group(&mut c, group, &empty).await;
+}
+
+#[tokio::test]
+async fn folded_subject_unfolds_in_xover() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    let id = "<folded-001@nntune.test>";
+    let reply = c
+        .post(&[
+            "From: poster@nntune.test",
+            "Newsgroups: alt.binaries.nntune.test",
+            "Subject: alpha alpha alpha alpha alpha alpha alpha alpha",
+            " continued words here",
+            "Date: Mon, 13 Oct 2026 00:00:00 +0000",
+            &format!("Message-ID: {id}"),
+            "",
+            "x",
+        ])
+        .await;
+    assert!(reply.starts_with("240"), "got {reply:?}");
+
+    let g = c.cmd("GROUP alt.binaries.nntune.test").await;
+    assert!(g.starts_with("211"), "got {g:?}");
+    let (first, block) = c.cmd_block("XOVER 1-").await;
+    assert!(first.starts_with("224"), "got {first:?}");
+    let text = String::from_utf8_lossy(&block);
+    assert!(
+        text.contains("continued words here"),
+        "fold lost in XOVER: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn post_without_message_id_stores_generated_id_in_headers() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    let reply = c
+        .post(&[
+            "From: poster@nntune.test",
+            "Newsgroups: alt.binaries.nntune.test",
+            "Subject: no id",
+            "Date: Mon, 13 Oct 2026 00:00:00 +0000",
+            "",
+            "x",
+        ])
+        .await;
+    assert!(reply.starts_with("240"), "got {reply:?}");
+    let id = reply.split_whitespace().last().unwrap().to_string();
+    assert!(id.starts_with("<posted-"), "generated ID: {reply:?}");
+
+    // HEAD serves the generated Message-ID, agreeing with STAT.
+    let s = c.cmd(&format!("STAT {id}")).await;
+    assert!(s.starts_with("223"), "got {s:?}");
+    let (first, head) = c.cmd_block(&format!("HEAD {id}")).await;
+    assert!(first.starts_with("221"), "got {first:?}");
+    let text = String::from_utf8_lossy(&head);
+    assert!(
+        text.contains(&format!("Message-ID: {id}")),
+        "generated ID missing from HEAD: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_post_gets_441_and_stores_nothing() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let mut c = Client::connect(&server).await;
+    c.auth("testuser", "testpass").await;
+
+    // One line past the 8 MiB cap: the server drains to the terminator, then
+    // rejects with 441 and stores nothing.
+    let big = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let lines: Vec<&[u8]> = vec![
+        b"From: poster@nntune.test",
+        b"Newsgroups: alt.binaries.nntune.test",
+        b"Subject: big",
+        b"Date: Mon, 13 Oct 2026 00:00:00 +0000",
+        b"Message-ID: <oversize-001@nntune.test>",
+        b"",
+        &big,
+    ];
+    let reply = c.post_raw(&lines).await;
+    assert!(reply.starts_with("441"), "got {reply:?}");
+    assert_eq!(server.posted_count().await, 0);
+    assert!(!server.is_stored("<oversize-001@nntune.test>").await);
 }

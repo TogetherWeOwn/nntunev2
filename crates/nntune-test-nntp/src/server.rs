@@ -443,9 +443,12 @@ async fn handle_connection(
                 };
                 let spool = shared.spool.lock().await;
                 // RFC 3977 s3.1.2: a group that is neither the configured
-                // group nor carried by any visible article does not exist.
+                // group nor carried by any stored article does not exist.
+                // Stored, not visible: a group whose articles are all hidden
+                // is still available, just empty (`211 0 0 0` below).
                 let known = g == shared.config.group
-                    || visible_iter(&shared.config, &spool).any(|a| a.group == g);
+                    || shared.config.articles.iter().any(|a| a.group == g)
+                    || spool.posted.iter().any(|a| a.group == g);
                 if !known {
                     drop(spool);
                     let _ = writer.write_all(b"411 No such newsgroup\r\n").await;
@@ -471,20 +474,35 @@ async fn handle_connection(
                 if !check_auth(&shared.config, &authed, &mut writer).await {
                     continue;
                 }
-                // RFC 3977 §7.6.3: `group high low status` (high first).
-                let g = shared.config.group.clone();
+                // RFC 3977 §7.6.3: `group high low status` (high first), one
+                // line per group. Advertise the configured group plus every
+                // group carried by stored articles (fixtures or spool), so a
+                // group introduced by POST is discoverable. Bounds cover
+                // visible articles only, matching GROUP (a fully-hidden group
+                // reports 0 0).
                 let spool = shared.spool.lock().await;
-                let (low, high) = visible_iter(&shared.config, &spool)
-                    .filter(|a| a.group == g)
-                    .map(|a| a.number)
-                    .fold((u32::MAX, 0u32), |(lo, hi), n| (lo.min(n), hi.max(n)));
+                let mut names: Vec<String> = shared
+                    .config
+                    .articles
+                    .iter()
+                    .chain(spool.posted.iter())
+                    .map(|a| a.group.clone())
+                    .collect();
+                names.push(shared.config.group.clone());
+                names.sort();
+                names.dedup();
+                let mut out = String::from("215 List follows\r\n");
+                for name in &names {
+                    let (low, high) = visible_iter(&shared.config, &spool)
+                        .filter(|a| &a.group == name)
+                        .map(|a| a.number)
+                        .fold((u32::MAX, 0u32), |(lo, hi), n| (lo.min(n), hi.max(n)));
+                    let (low, high) = if low == u32::MAX { (0, 0) } else { (low, high) };
+                    out.push_str(&format!("{name} {high} {low} y\r\n"));
+                }
                 drop(spool);
-                let (low, high) = if low == u32::MAX { (0, 0) } else { (low, high) };
-                let _ = writer
-                    .write_all(
-                        format!("215 List follows\r\n{g} {high} {low} y\r\n.\r\n").as_bytes(),
-                    )
-                    .await;
+                out.push_str(".\r\n");
+                let _ = writer.write_all(out.as_bytes()).await;
             }
             "XOVER" => {
                 if !check_auth(&shared.config, &authed, &mut writer).await {
@@ -692,8 +710,10 @@ fn split_cmd(line: &str) -> (String, String) {
 }
 
 /// Visible articles: fixture corpus plus the per-instance `POST` spool,
-/// minus runtime-hidden IDs. The caller holds the spool lock; the returned
-/// iterator borrows both.
+/// minus runtime-hidden IDs. A fixture whose Message-ID has a spool
+/// replacement (hide → re-post repair) is served from the spool copy only,
+/// so `GROUP`/`XOVER` never list one ID twice. The caller holds the spool
+/// lock; the returned iterator borrows both.
 fn visible_iter<'a>(
     config: &'a ServerConfig,
     spool: &'a Spool,
@@ -701,6 +721,7 @@ fn visible_iter<'a>(
     config
         .articles
         .iter()
+        .filter(|a| !spool.posted.iter().any(|p| p.message_id == a.message_id))
         .chain(spool.posted.iter())
         .filter(|a| !spool.hidden.contains(&a.message_id))
 }
@@ -722,17 +743,13 @@ async fn find_visible_by_id(shared: &Arc<Shared>, id: &str) -> Option<Article> {
 }
 
 async fn find_visible_by_number(shared: &Arc<Shared>, n: u32) -> Option<Article> {
+    // Resolve through the same visible set as the listings, so a numeric
+    // lookup can never return a shadowed (repaired) fixture or a hidden ID.
     let spool = shared.spool.lock().await;
-    let found = spool
-        .posted
-        .iter()
-        .chain(shared.config.articles.iter())
+    let found = visible_iter(&shared.config, &spool)
         .find(|a| a.number == n)
         .cloned();
-    match found {
-        Some(a) if spool.hidden.contains(&a.message_id) => None,
-        other => other,
-    }
+    found
 }
 
 /// Outcome of reading a `POST` body (dot-terminated block, RFC 3977 §6.3).
@@ -808,16 +825,29 @@ async fn read_post_block(
     }
 }
 
-/// Case-insensitive header lookup over the head block (no folding).
-fn header_field<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+/// Case-insensitive header lookup with RFC 5322 unfolding: continuation
+/// lines (leading WSP) are joined to the field with a space, so a folded
+/// `Subject` reads whole in `XOVER` just as `HEAD` serves it.
+fn header_field(head: &str, name: &str) -> Option<String> {
+    let mut found: Option<String> = None;
     for line in head.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(ref mut f) = found {
+                f.push(' ');
+                f.push_str(line.trim());
+            }
+            continue;
+        }
+        if found.is_some() {
+            break;
+        }
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case(name) {
-                return Some(v.trim());
+                found = Some(v.trim().to_string());
             }
         }
     }
-    None
+    found
 }
 
 /// Store a posted article and render the `240`/`435` reply.
@@ -833,9 +863,9 @@ async fn store_posted(shared: &Arc<Shared>, poster: &str, raw: &[u8]) -> String 
     let head = String::from_utf8_lossy(&raw[..head_end]);
     let body = &raw[head_end..];
     let mut spool = shared.spool.lock().await;
-    let message_id = match header_field(&head, "message-id") {
-        Some(id) => normalize_id(id),
-        None => format!("<posted-{}@nntune.test>", spool.next_number),
+    let (generated_id, message_id) = match header_field(&head, "message-id") {
+        Some(id) => (false, normalize_id(&id)),
+        None => (true, format!("<posted-{}@nntune.test>", spool.next_number)),
     };
     let in_corpus = shared
         .config
@@ -854,24 +884,38 @@ async fn store_posted(shared: &Arc<Shared>, poster: &str, raw: &[u8]) -> String 
     // hide → post → hide → post cycle replaces the earlier bytes).
     spool.posted.retain(|a| a.message_id != message_id);
     spool.hidden.remove(&message_id);
+    // Production renders Newsgroups comma-separated (`a, b`): split on
+    // commas and whitespace and take the first group. (This fake models one
+    // group per article; cross-post fan-out would need a model change.)
     let group = header_field(&head, "newsgroups")
-        .and_then(|g| g.split_whitespace().next())
+        .as_deref()
+        .and_then(|g| {
+            g.split(|c: char| c == ',' || c.is_whitespace())
+                .find(|s| !s.is_empty())
+        })
         .map(|s| s.to_string())
         .unwrap_or_else(|| shared.config.group.clone());
+    // A generated ID must also land in the stored headers, or HEAD/ARTICLE
+    // would disagree with the STAT reply that reports it.
+    let raw: Vec<u8> = if generated_id && raw[..head_end].ends_with(b"\r\n\r\n") {
+        let mut fixed = Vec::with_capacity(raw.len() + message_id.len() + 16);
+        fixed.extend_from_slice(&raw[..head_end - 2]);
+        fixed.extend_from_slice(format!("Message-ID: {message_id}\r\n").as_bytes());
+        fixed.extend_from_slice(b"\r\n");
+        fixed.extend_from_slice(&raw[head_end..]);
+        fixed
+    } else {
+        raw.to_vec()
+    };
     let article = Article {
         number: spool.next_number,
         message_id: message_id.clone(),
         group,
-        subject: header_field(&head, "subject")
-            .unwrap_or("(posted article)")
-            .to_string(),
-        from: header_field(&head, "from")
-            .unwrap_or(&format!("{poster}@nntune.test"))
-            .to_string(),
+        subject: header_field(&head, "subject").unwrap_or_else(|| "(posted article)".to_string()),
+        from: header_field(&head, "from").unwrap_or_else(|| format!("{poster}@nntune.test")),
         date: header_field(&head, "date")
-            .unwrap_or("Mon, 13 Oct 2026 00:00:00 +0000")
-            .to_string(),
-        raw: raw.to_vec(),
+            .unwrap_or_else(|| "Mon, 13 Oct 2026 00:00:00 +0000".to_string()),
+        raw,
         payload: body.to_vec(),
     };
     spool.next_number = spool.next_number.saturating_add(1);

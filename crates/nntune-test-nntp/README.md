@@ -42,10 +42,13 @@ Default credentials: `testuser/testpass` (max 2 connections),
 
 - `POST` (`340`/`240`): stores articles in a per-instance in-memory spool
   keyed by message-ID, served back via `ARTICLE`/`BODY`/`HEAD`/`STAT`
-  (and included in `GROUP`/`XOVER`). Re-posting a visible ID is a
+  (and included in `GROUP`/`LIST`/`XOVER`). Re-posting a visible ID is a
   duplicate (`435`); `440` while `posting_allowed` is off, `480` without
   auth, `441` on empty/oversize submissions. Dot-unstuffing and the `.`
-  terminator follow RFC 3977 §6.3.
+  terminator follow RFC 3977 §6.3. A missing `Message-ID` is generated
+  (`<posted-N@nntune.test>`) and stored in the headers; comma-separated
+  `Newsgroups` selects the first group; folded headers are unfolded for
+  the overview.
 - Runtime hiding: `server.hide(id)` / `unhide(id)` / `set_hidden(ids)`
   make retrieval answer `430` for those IDs (propagation gaps, article
   loss); re-posting a hidden ID succeeds (`240`) and repairs it without
