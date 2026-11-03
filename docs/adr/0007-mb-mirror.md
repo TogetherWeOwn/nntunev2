@@ -1,14 +1,19 @@
 # ADR 0007: Our Own MusicBrainz Mirror (PlanetScale Postgres + Cloudflare Compute)
 
-- **Status:** Accepted
+- **Status:** Accepted; licence terms (Context, points 3 and 6,
+  Consequences) amended 2026-11-03 by
+  [0012-compliant-youtube-video-and-brainz-data.md](0012-compliant-youtube-video-and-brainz-data.md)
 - **Date:** 2026-10-13
 
 ## Context
 
 Library matching needs fast, local MusicBrainz lookups (artist / release /
 recording + fuzzy search) without depending on `musicbrainz.org` at request
-time (rate limits, availability). Core MusicBrainz data is CC0; the Cover Art
-Archive (CAA) has its own terms. All relational data lives in PlanetScale
+time (rate limits, availability). Core MusicBrainz data is CC0, but the
+hourly Live Data Feed replication packets — and supplementary data such as
+tags (including genre associations), ratings and annotations — are
+CC BY-NC-SA 3.0, and CAA images are copyrighted by their owners with no
+licence granted (point 6, as amended). All relational data lives in PlanetScale
 Postgres via Hyperdrive (ADR 0001/0002); interactive traffic stays
 serverless; batch runs in Containers.
 
@@ -23,7 +28,13 @@ serverless; batch runs in Containers.
    chunk (`mb_import_cursor`), with poison rows in `mb_import_dlq`.
 3. **Hourly replication** applies MusicBrainz replication packets via a
    scheduled Container/Workflow. SLO: **replication lag < 2 h** (packet
-   applied within 2 h of publication); lag is recorded per packet.
+   applied within 2 h of publication); lag is recorded per packet. The
+   packets are CC BY-NC-SA 3.0, so this point operates only under the
+   MetaBrainz supporter tier (branch A in
+   [0012-compliant-youtube-video-and-brainz-data.md](0012-compliant-youtube-video-and-brainz-data.md)
+   §5); under its branch B the mirror uses twice-weekly CC0 core dumps
+   instead and this point's lag SLO is replaced by dump freshness
+   (≤4 days).
 4. **Read API** lives in `workers/mb` (Rust `workers-rs`): MBID lookup for
    artist / release / recording plus trigram search, over Hyperdrive, with
    KV / Cache API caching. See `workers/mb/README.md`.
@@ -34,8 +45,14 @@ serverless; batch runs in Containers.
    public URLs are deferred until the R2 bindings and public hosts are
    activated.
 6. **Terms:** core data is CC0 (no attribution required, credit given
-   anyway); commercial use notes the MetaBrainz support tier. CAA images
-   follow upstream licence terms per image.
+   anyway). Replication packets and supplementary data (tags including
+   genre associations, ratings, annotations) are CC BY-NC-SA 3.0:
+   commercial use requires the MetaBrainz supporter tier, or that data
+   is excluded (the two branches in
+   [0012-compliant-youtube-video-and-brainz-data.md](0012-compliant-youtube-video-and-brainz-data.md)
+   §5). CAA grants no licence: images remain copyrighted by their
+   owners, and caching/serving them in this paid product is a flagged
+   open legal risk (§6 of that record), not a per-image licence.
 
 ## Consequences
 
@@ -43,5 +60,7 @@ serverless; batch runs in Containers.
   schema, including `pg_trgm` indexes for search.
 - `workers/mb` documents its lookup + search p95 methodology; numbers land
   in its README once staging measures exist.
-- Replication lag is a monitored SLO (< 2 h); missed packets page, they
-  never silently skip.
+- Replication lag is a monitored SLO (< 2 h) under the licensed
+  hourly-feed branch; missed packets page, they never silently skip.
+  Under the CC0-dump branch, dump freshness (≤4 days) is monitored the
+  same way.
