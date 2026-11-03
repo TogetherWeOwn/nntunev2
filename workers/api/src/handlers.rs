@@ -6306,6 +6306,7 @@ mod tests {
                 serde_json::json!({"key": key, "old": previous, "new": new_value}),
             ));
             Ok(AdminWriteOutcome::Applied(previous))
+        }
         async fn claim_webhook_event(&self, event_id: &str) -> Result<bool, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
@@ -11164,6 +11165,7 @@ mod tests {
             mailer: &h.mailer,
             dialer: &h.dialer,
             dns: &h.dns,
+            stripe: &h.stripe,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
         };
@@ -11174,6 +11176,7 @@ mod tests {
                 cookie: Some(cookie.to_string()),
                 origin: Some(ORIGIN.to_string()),
                 authorization: None,
+                stripe_signature: None,
                 body: serde_json::json!({"value": 14}).to_string().into_bytes(),
             };
             block_on(handle(&stale_ctx, &req))
@@ -11201,6 +11204,7 @@ mod tests {
             cookie: Some(admin_cookie),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let list = block_on(handle(&stale_ctx, &get_req));
@@ -11232,6 +11236,7 @@ mod tests {
             cookie: Some(admin_cookie),
             origin: None,
             authorization: Some("Bearer ntk_synthetic".to_string()),
+            stripe_signature: None,
             body: Vec::new(),
         };
         let both = block_on(handle(&h.ctx(), &req));
