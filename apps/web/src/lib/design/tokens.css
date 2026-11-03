@@ -75,3 +75,185 @@
 	--nt-good: #57d98d;
 	--nt-bad: #ff7a7a;
 }
+
+/* NNTune design tokens, second layer: surface scale, type scale, radii,
+ * sizes, motion and the self-hosted typeface. The nine color tokens above
+ * keep their names and values in every palette; this layer only adds.
+ * Usage rules (contrast pairs, the good/bad text fence, reduced motion)
+ * live beside the components in lib/design/README.
+ */
+
+/* Self-hosted Figtree (open font licence), latin subset, weights 400/700/800.
+ * Files ship under /fonts so the font-src self policy holds; the --nt-font
+ * stack falls back to system-ui when a file is missing, so text never blocks.
+ */
+@font-face {
+	font-family: 'Figtree';
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url('/fonts/figtree-latin-400-normal.woff2') format('woff2');
+}
+
+@font-face {
+	font-family: 'Figtree';
+	font-style: normal;
+	font-weight: 700;
+	font-display: swap;
+	src: url('/fonts/figtree-latin-700-normal.woff2') format('woff2');
+}
+
+@font-face {
+	font-family: 'Figtree';
+	font-style: normal;
+	font-weight: 800;
+	font-display: swap;
+	src: url('/fonts/figtree-latin-800-normal.woff2') format('woff2');
+}
+
+/* Theme-independent tokens: type, space aliases, radii, sizes, motion. */
+:root {
+	--nt-font: 'Figtree', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+	--nt-text-2xs: 0.6875rem;
+	--nt-text-xs: 0.75rem;
+	--nt-text-sm: 0.875rem;
+	--nt-text-base: 1rem;
+	--nt-text-lg: 1.125rem;
+	--nt-text-xl: 1.25rem;
+	--nt-text-2xl: 1.5rem;
+	--nt-text-3xl: 2rem;
+	--nt-text-4xl: 2.5rem;
+	--nt-text-display: clamp(2rem, 6vw, 4.5rem);
+
+	--nt-leading-sm: 1.35;
+	--nt-leading-base: 1.5;
+	--nt-leading-3xl: 1.15;
+	--nt-leading-4xl: 1.1;
+	--nt-leading-display: 1.05;
+
+	--nt-weight-body: 400;
+	--nt-weight-strong: 700;
+	--nt-weight-display: 800;
+
+	/* Pixel-true spacing aliases. The space-1..5 steps above stay canonical;
+	 * space-1 is 4px, space-2 is 8px, space-3 is 16px, space-4 is 24px and
+	 * space-5 is 40px at the default root size.
+	 */
+	--nt-space-px-2: 2px;
+	--nt-space-px-4: 4px;
+	--nt-space-px-6: 6px;
+	--nt-space-px-8: 8px;
+	--nt-space-px-12: 12px;
+	--nt-space-px-16: 16px;
+	--nt-space-px-20: 20px;
+	--nt-space-px-24: 24px;
+	--nt-space-px-32: 32px;
+	--nt-space-px-40: 40px;
+	--nt-space-px-48: 48px;
+	--nt-space-px-64: 64px;
+
+	/* The legacy --nt-radius stays for existing surfaces until migrated. */
+	--nt-radius-xs: 0.125rem;
+	--nt-radius-sm: 0.25rem;
+	--nt-radius-md: 0.375rem;
+	--nt-radius-pane: 0.5rem;
+	--nt-radius-dialog: 0.75rem;
+	--nt-radius-pill: 999px;
+
+	--nt-control-sm: 2rem;
+	--nt-control: 3rem;
+	--nt-control-lg: 3.5rem;
+	--nt-icon: 1.5rem;
+	--nt-topbar-h: 3rem;
+	--nt-player-h: 4.5rem;
+	--nt-rail-w: 14.5rem;
+	--nt-rail-w-min: 12.5rem;
+	--nt-rail-w-max: 30rem;
+	--nt-rail-w-icons: 4.5rem;
+	--nt-panel-w: 20rem;
+	--nt-panel-w-min: 17.5rem;
+	--nt-panel-w-max: 26.25rem;
+	--nt-shell-gap: 0.5rem;
+	--nt-content-max: 1955px;
+	--nt-target-coarse: 2.5rem;
+
+	--nt-z-rail: 4;
+	--nt-z-above-panes: 5;
+	--nt-z-player: 6;
+	--nt-z-above-player: 7;
+	--nt-z-dialog: 1050;
+	--nt-z-popover: 1060;
+	--nt-z-toast: 1070;
+	--nt-z-skip-link: 9999;
+
+	--nt-dur-micro: 50ms;
+	--nt-dur-fast: 100ms;
+	--nt-dur-fade: 150ms;
+	--nt-dur-exit: 200ms;
+	--nt-dur-enter: 250ms;
+	--nt-dur-panel: 300ms;
+	--nt-dur-expand: 400ms;
+	--nt-ease-productive: cubic-bezier(0.3, 0, 0, 1);
+	--nt-ease-enter: cubic-bezier(0, 0, 0.2, 1);
+	--nt-ease-exit: cubic-bezier(0.8, 0, 1, 1);
+}
+
+/* Surface scale, dark (default; also the explicit dark override below). */
+:root {
+	--nt-surface-pane: #10131b;
+	--nt-surface-raised: var(--nt-bg-raised);
+	--nt-surface-hover: #1b2133;
+	--nt-surface-press: #0e1119;
+	--nt-surface-tint: rgb(242 244 248 / 0.08);
+	--nt-surface-tint-hover: rgb(242 244 248 / 0.12);
+	--nt-surface-tint-press: rgb(242 244 248 / 0.16);
+	--nt-fg-subtle: #8b95ab;
+	--nt-scrim: rgb(0 0 0 / 0.6);
+	--nt-shadow-overlay: 0 4px 12px rgb(0 0 0 / 0.3);
+	--nt-hero-scrim: linear-gradient(to top, rgb(16 19 27 / 0.92), rgb(16 19 27 / 0));
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--nt-surface-pane: #eef0f6;
+		--nt-surface-raised: var(--nt-bg-raised);
+		--nt-surface-hover: #e8ebf4;
+		--nt-surface-press: #dde2ef;
+		--nt-surface-tint: rgb(20 24 36 / 0.06);
+		--nt-surface-tint-hover: rgb(20 24 36 / 0.12);
+		--nt-surface-tint-press: rgb(20 24 36 / 0.16);
+		--nt-fg-subtle: #5d6780;
+		--nt-scrim: rgb(11 13 18 / 0.45);
+		--nt-shadow-overlay: 0 4px 12px rgb(0 0 0 / 0.3);
+		--nt-hero-scrim: linear-gradient(to top, rgb(238 240 246 / 0.94), rgb(238 240 246 / 0));
+	}
+}
+
+:root[data-appearance='light'] {
+	--nt-surface-pane: #eef0f6;
+	--nt-surface-raised: var(--nt-bg-raised);
+	--nt-surface-hover: #e8ebf4;
+	--nt-surface-press: #dde2ef;
+	--nt-surface-tint: rgb(20 24 36 / 0.06);
+	--nt-surface-tint-hover: rgb(20 24 36 / 0.12);
+	--nt-surface-tint-press: rgb(20 24 36 / 0.16);
+	--nt-fg-subtle: #5d6780;
+	--nt-scrim: rgb(11 13 18 / 0.45);
+	--nt-shadow-overlay: 0 4px 12px rgb(0 0 0 / 0.3);
+	--nt-hero-scrim: linear-gradient(to top, rgb(238 240 246 / 0.94), rgb(238 240 246 / 0));
+}
+
+:root[data-appearance='dark'] {
+	--nt-surface-pane: #10131b;
+	--nt-surface-raised: var(--nt-bg-raised);
+	--nt-surface-hover: #1b2133;
+	--nt-surface-press: #0e1119;
+	--nt-surface-tint: rgb(242 244 248 / 0.08);
+	--nt-surface-tint-hover: rgb(242 244 248 / 0.12);
+	--nt-surface-tint-press: rgb(242 244 248 / 0.16);
+	--nt-fg-subtle: #8b95ab;
+	--nt-scrim: rgb(0 0 0 / 0.6);
+	--nt-shadow-overlay: 0 4px 12px rgb(0 0 0 / 0.3);
+	--nt-hero-scrim: linear-gradient(to top, rgb(16 19 27 / 0.92), rgb(16 19 27 / 0));
+}
