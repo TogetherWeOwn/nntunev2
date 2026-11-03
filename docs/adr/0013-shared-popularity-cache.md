@@ -99,11 +99,20 @@ an R2 read and an NNTP fetch through the provider pool (ADR 0014).
   that path lands, stream-serve events are the interim source; the rollup
   below reads either through one query, so the swap is not a redesign.
 - A scheduled rollup (Workflow, hourly) maintains `track_popularity`:
-  play counts over trailing 24-hour, 7-day and 30-day windows, distinct
-  listener count over 30 days, `last_played_at`, and a `score`. The score
-  weights recent and distinct-listener plays over raw repeats, so one
-  user looping a track cannot pin it alone. The exact weights are
-  configuration (below), not schema.
+  play counts over trailing 24-hour, 7-day and 30-day windows
+  (`plays_24h`, `plays_7d`, `plays_30d`), distinct listener counts over
+  **both** trailing windows admission and scoring need
+  (`distinct_listeners_7d`, `distinct_listeners_30d`), `last_played_at`,
+  and a `score`. Distinct counts are `COUNT(DISTINCT listener)` computed
+  by the rollup directly from play events over each trailing window —
+  never by summing per-day or per-bucket distinct counts, which would
+  double-count a listener active in more than one bucket. Admission
+  below reads `distinct_listeners_7d` against
+  `popcache.admit_min_listeners_7d`; it never derives a 7-day distinct
+  count from the 30-day figure. The score weights recent and
+  distinct-listener plays over raw repeats, so one user looping a track
+  cannot pin it alone. The exact weights are configuration (below), not
+  schema.
 - Admission is **write-on-threshold, never write-on-first-play**: a first
   play streams over NNTP and only counts. A track becomes fill-eligible
   when it crosses the configured threshold (initial default: at least 3
@@ -162,15 +171,32 @@ and it is an operator decision recorded in config history.
 
 ### Playback source order (consumption contract)
 
-This cache serves one step of the playback resolver whose authoritative
-home is the PlayableSource record (ADR 0012): **curated FLAC — R2
+This record states its own consumption contract, self-contained; it
+does not depend on an unpublished record. The playback resolver order
+implementations of this ADR must follow is: **curated FLAC — R2
 popularity cache first, then NNTP through the provider pool — then the
 YouTube embed, then unavailable**. Unavailable tracks are hidden by
 default. YouTube is also the music-video source for every track,
 including ones streamed from this cache, as a separate visible playback
-under ADR 0012's rules. Nothing in this record introduces offline
-downloads or weakens the one-concurrent-stream lease: cached plays take
-the same lease and hour-meter writes as NNTP plays.
+under the YouTube embed rules in `AGENTS.md` (visible official IFrame
+player, never audio-only or background playback). The proposed
+PlayableSource record (ADR 0012) is expected to become the
+authoritative home for this order once it is accepted and published;
+until then it is pending and nothing here defers to it — if the
+accepted 0012 ever states a different order, this section is revised
+to match in the same change that adopts it. Nothing in this record
+introduces offline downloads or weakens the one-concurrent-stream
+lease: cached plays take the same lease and hour-meter writes as NNTP
+plays.
+
+**REA angle:** before the score weights are tuned on staging data,
+study how shipped open-source music servers operate their on-disk
+transcode/media caches (admission, size caps, eviction under
+pressure) — source first, REA only for behaviour the source does not
+settle — to learn the failure modes of popularity admission (one-hit
+pollution, loop pinning) this design must avoid. That study informs
+weight tuning in the implementation slices; it is not a blocker for
+this record.
 
 ## Alternatives
 

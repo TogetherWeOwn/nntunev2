@@ -1,13 +1,15 @@
 # NNTune v2
 
-Serverless BYO-Usenet-provider music streaming on Cloudflare.
+Serverless music streaming on Cloudflare, from a shared curated catalogue.
 
-## Vision: BYOP
+## Vision
 
-Users **bring their own Usenet provider** — NNTune v2 never bundles or
-resells Usenet access. You connect your existing provider account; we provide
-the music experience on top: search, streaming, library management and
-offline-friendly caching.
+Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,
+admin-curated catalogue: playback is fetched through service-owned backend
+provider accounts (ADR 0014), and tracks proven popular by real plays are
+served from a shared R2 popularity cache (ADR 0013). We provide the music
+experience on top: search, streaming and library management. There are no
+user provider accounts to connect and no offline downloads.
 
 ## Plans
 

@@ -150,12 +150,26 @@ pool; they are service telemetry, never user-visible.
 
 ### Playback source order (consumption contract)
 
-The pool serves the NNTP step of the playback resolver whose
-authoritative home is ADR 0012: **curated FLAC — R2 popularity cache
-(ADR 0013) first, then NNTP through this pool — then the YouTube embed,
-then unavailable**. A pool miss after cross-account failover is what
-"unavailable over NNTP" means in that order; it falls through to YouTube,
-never to a user-supplied source (none exist).
+This record states its own consumption contract, self-contained; it
+does not depend on an unpublished record. The pool serves the NNTP
+step of this playback resolver order: **curated FLAC — R2 popularity
+cache (ADR 0013) first, then NNTP through this pool — then the YouTube
+embed, then unavailable**. A pool miss after cross-account failover is
+what "unavailable over NNTP" means in that order; it falls through to
+YouTube, never to a user-supplied source (none exist). The proposed
+PlayableSource record (ADR 0012) is expected to become the
+authoritative home for this order once it is accepted and published;
+until then it is pending and nothing here defers to it — if the
+accepted 0012 ever states a different order, this section is revised
+to match in the same change that adopts it.
+
+**REA angle:** study how shipped open-source Usenet downloaders
+operate multi-server pools (per-server connection caps, priority and
+failover across servers, handling of missing-article and rate/abuse
+responses) — source first, REA only for behaviour the source does not
+settle — before the selection/failover implementation slice fixes its
+breaker and backoff parameters. That study informs those parameters;
+it is not a blocker for this record.
 
 ## Alternatives
 
