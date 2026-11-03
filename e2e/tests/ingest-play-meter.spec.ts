@@ -1,5 +1,4 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
-import { readFileSync } from 'node:fs';
 import {
   API,
   TESTIDS,
@@ -28,9 +27,7 @@ import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
-  apiPost,
   applyAccountToPage,
-  completeByopWizard,
   requireApiAccount,
   submitPublicUiSignup,
   tryMintTestAccount,
@@ -43,28 +40,23 @@ import {
   requireRealNzbFixture,
 } from '../helpers/real-nzb-fixture.js';
 
-// Golden path part 2: ingest the staged real NZB (secret-held RAR set,
-// `TEST_NZB_PATH` staged by the workflow into `RUNNER_TEMP` only — there are
-// no checked-in NZB fixtures) → stream with Range seeks → usage meter moves
-// → plan metadata stays consistent → browser playback, seek and Media
-// Session → separately minted over-limit staging accounts are refused on
-// stream and on ingest with the documented plan-limit status (headers, code,
-// upgrade CTA, no leaks). Legs that need decoded audio or a streamable track
-// skip by name in real-NZB mode (RAR read pending — see REAL_NZB_RAR_SKIP):
-// the secret-held RAR set cannot complete ingest (the pipeline has no RAR
-// read: an RAR-only subset leaves zero transcode inputs and fails permanent
-// before any library row), so ingest completion and reload skip too — only
-// the intake-level ingest-refusal leg still runs. The upload path resolves
-// lazily inside the uploading tests so a missing staging fails the run red,
-// never silently.
+// Golden path part 2 (parked under TWO-1635): user NZB ingest is retired
+// (TWO-1630), so every leg that needs a user-uploaded track — ingest,
+// reload, Range, meter, browser playback, seek and Media Session — skips by
+// name (see USER_NZB_RETIRED_SKIP plus the journey gate allow-list in
+// e2e/scripts/enforce-journey-evidence.mjs). The assertions stay in the file
+// and return via admin-ingested tracks once admin ingest can seed a curated
+// track on staging. The only live leg in this file is the stream plan-limit
+// refusal on a separately minted over-limit account (the ingest-refusal leg
+// is deleted: user ingest caps are retired with user ingest itself).
 
-// Golden path part 2: ingest the NZB fixture → stream with Range seeks →
-// usage meter moves → plan metadata stays consistent → browser playback,
-// seek and Media Session → separately minted over-limit staging accounts are
-// refused on stream and on ingest with the documented plan-limit status
-// (headers, code, upgrade CTA, no leaks). Plan-limit legs run last: both
-// fail red-by-design until enforcement lands, and in describe.serial a
-// failure skips every later test.
+// Golden path part 2: ingest → stream with Range seeks → usage meter moves
+// → plan metadata stays consistent → browser playback, seek and Media
+// Session → a separately minted over-limit staging account is refused on
+// stream with the documented plan-limit status (headers, code, upgrade CTA,
+// no leaks). The plan-limit leg runs last in its isolated group: it fails
+// red-by-design until enforcement lands, and in describe.serial a failure
+// skips every later test in the same group.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -112,6 +104,21 @@ function cappedSecrets(capped: TestAccount): NamedSecret[] {
   return secrets;
 }
 
+// TWO-1635: user NZB ingest retired (TWO-1630). Every leg below that needs a
+// user-uploaded track carries this skip; the journey gate allow-lists each
+// parked title by name (e2e/scripts/enforce-journey-evidence.mjs). Un-park
+// (remove the guard here and the allow-list entry there) once admin ingest
+// can seed a curated track on staging. The predicate stays a call (rather
+// than inlining `test.skip(true, ...)` plus `return`) so the retained
+// assertions below stay reachable and keep typechecking — an unconditional
+// skip+return would make them unreachable and drop narrowing.
+const USER_NZB_RETIRED_SKIP =
+  'user NZB ingest retired (TWO-1630); reseeds when admin ingest can seed a curated track on staging';
+
+function userNzbIngestRetired(): boolean {
+  return true;
+}
+
 test.describe.serial('ingest → play → meter → browser', () => {
   // Ingest polling (queue + NNTP fetch + verify) can take minutes on staging.
   test.describe.configure({ timeout: 300_000 });
@@ -126,11 +133,16 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     // Real-NZB mode cannot complete ingest: the staged RAR subset has no
     // decodable audio and the pipeline fails it permanent at transcode
     // (zero transcode inputs, no library row) — parked by name until RAR
-    // read lands. Live provider proof in this mode is the BYOP wizard's
-    // test-connection plus the provider 430 control.
+    // read lands. Live provider proof in this mode is the provider 430
+    // control (the BYOP wizard's test-connection retired with it).
     if (realNzbActive()) {
       test.skip(true, REAL_NZB_RAR_SKIP);
       return;
@@ -151,12 +163,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
       // steps below additionally require the seam — see requireApiAccount.
       sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
-
-    // The ingest worker probes through the user's authenticated provider
-    // connection, so the ingesting identity completes the BYOP wizard first
-    // (shared helper with the signup spec). Fails closed without the NNTP
-    // password rather than ingesting into a provider-less account.
-    await completeByopWizard(page, baseURL);
 
     await page.goto(`${baseURL}/library/import`, {
       waitUntil: 'domcontentloaded',
@@ -192,6 +198,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'reload');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
       return;
     }
     // No completable ingest in real-NZB mode means no library row to reload.
@@ -266,6 +277,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of probing anonymously when neither a minted
     // session nor the QA seam token exists.
@@ -321,6 +337,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'meter');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
@@ -390,6 +411,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'playback');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
       return;
     }
     // Same identity discipline as Range/meter: playback must run as the
@@ -601,6 +627,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of driving the player anonymously when neither a
     // minted session nor the QA seam token exists.
@@ -793,6 +824,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     // Same identity discipline as Range/meter/playback: the metadata must be
     // read as the ingesting account, never anonymously or as the generic QA
     // seam. Full playback proof stays with the playback spec — here a light
@@ -928,15 +964,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
   });
 });
 
-// Plan-limit legs in their own group AFTER the journey serial: both fail
+// Plan-limit leg in its own group AFTER the journey serial: it fails
 // red-by-design until enforcement lands, and in describe.serial a failure
-// skips every later test in the SAME group — isolating them here means a
-// red plan-limit leg (or a red browser leg above) can never skip the other
-// group's verdicts. Each leg mints its own capped account (never the
-// journey identity, never each other's), so a capped-account failure
-// implicates only its own leg. The stream leg requires the overlimit seam
-// to pre-seed a streamable track: ingesting as the capped account would
-// contradict the ingest-refusal leg (the same ingest must be refused).
+// skips every later test in the SAME group — isolating it here means a red
+// plan-limit leg (or a red browser leg above) can never skip the other
+// group's verdicts. It mints its own capped account (never the journey
+// identity), so a capped-account failure implicates only this leg. The leg
+// requires the overlimit seam to pre-seed a streamable track: user NZB
+// ingest is retired (TWO-1630), so there is no user-ingest path left for a
+// capped account to take (the ingest-refusal leg was deleted with it).
 test.describe('plan limit', () => {
   test.describe.configure({ timeout: 300_000 });
 
@@ -950,8 +986,7 @@ test.describe('plan limit', () => {
     }
     if (realNzbActive()) {
       // The capped stream leg needs a pre-seeded streamable track, which the
-      // RAR set cannot produce until RAR read lands. Refusal-shape coverage
-      // continues through the ingest-refusal leg below, which needs no audio.
+      // RAR set cannot produce until RAR read lands.
       test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
@@ -992,7 +1027,7 @@ test.describe('plan limit', () => {
     expect(
       trackId,
       'library is empty for the capped account: the overlimit seam must pre-seed ' +
-        'a streamable track (ingest-as-capped would contradict the ingest-refusal leg)',
+        'a streamable track (user NZB ingest is retired, so no upload path can fill it)',
     ).toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
     const res = await apiGet(
@@ -1017,43 +1052,4 @@ test.describe('plan limit', () => {
     });
   });
 
-  test('over-limit staging account is refused on ingest with a plan-limit status', async ({
-    request,
-  }) => {
-    const baseURL = stagingBaseUrl('skip', 'plan-limit-ingest');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    // A separately minted capped account (never the journey identity, never
-    // the stream leg's account): each refusal leg implicates only its own
-    // capped account. Placed last so its red-by-design failure skips nothing.
-    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-ingest');
-    const headers = accountHeaders(capped);
-    // The fixture bytes are a valid NZB document, posted raw: the cap check
-    // is a guard on the ingest-write path, so a capped account is refused
-    // 402/429 rather than accepted for processing. This is the ingest the
-    // stream leg must NOT perform as its capped account.
-    const ingestUrl = `${baseURL}${API.ingest}`;
-    const res = await apiPost(
-      request,
-      ingestUrl,
-      { ...headers, 'Content-Type': 'application/octet-stream' },
-      readFileSync(requireRealNzbFixture()),
-      'plan-limit-ingest',
-    );
-    const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');
-    // Same refusal verdict as the stream leg: without enforcement this fails
-    // naming the missing status (accepted, or no route yet); with
-    // enforcement it passes. The route is the documented POST /api/ingest
-    // (e2e/helpers/contract.ts): no fallback route, no skip — an absent
-    // route fails naming its status.
-    assertPlanLimitRefusal({
-      status: res.status(),
-      headers: res.headers(),
-      bodyText,
-      secrets: cappedSecrets(capped),
-      context: 'plan-limit-ingest',
-    });
-  });
 });

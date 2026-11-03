@@ -75,9 +75,9 @@ for (const { status, error } of [
 		expect(finishPosts).toBe(1);
 
 		await confirmButton(page).click();
-		await page.waitForURL('/onboarding/byop');
+		await page.waitForURL('/library');
 		expect(finishPosts).toBe(2);
-		await expect(page.getByText(/signed in as/i)).toContainText('retry@example.com');
+		await expect(page.getByRole('heading', { level: 1 })).toContainText('Library');
 	});
 }
 
@@ -107,9 +107,9 @@ test('network failure on redeem stays on confirm with a retryable alert, then th
 	expect(finishPosts).toBe(1);
 
 	await confirmButton(page).click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(2);
-	await expect(page.getByText(/signed in as/i)).toContainText('offline@example.com');
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('Library');
 });
 
 test('timed-out redeem stays on confirm with a retryable alert', async ({ page }) => {
@@ -199,7 +199,7 @@ test('held redeem disables confirm, announces working politely, and ignores a se
 	expect(finishPosts).toBe(1);
 
 	release();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(finishPosts).toBe(1);
-	await expect(page.getByText(/signed in as/i)).toContainText('held@example.com');
+	await expect(page.getByRole('heading', { level: 1 })).toContainText('Library');
 });

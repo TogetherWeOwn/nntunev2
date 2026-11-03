@@ -75,7 +75,7 @@ export const API = {
   // Staging-only emailed-code retrieval seam (paired staging-seam build slice):
   // returns the issued signup code for an `example.test` mailbox without
   // minting an account. Fail-closed without the staging flag; absent in
-  // production. A renamed path fails the wizard-arrival spec with this key
+  // production. A renamed path fails the signup-arrival spec with this key
   // named.
   testCodes: '/api/test-codes',
   // API Worker auth-start routes that spend the shared per-IP start budget

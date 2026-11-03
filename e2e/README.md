@@ -1,9 +1,9 @@
 # NNTune v2 — E2E + staging smoke harness
 
-Playwright suite covering the venture slice on **staging**: signup → BYOP
-wizard (synthetic NNTP endpoint) → NZB ingest → playback with Range seeks →
-usage meter → plan-limit enforcement. Plus a fast synthetic smoke
-(`health.spec.ts`) that doubles as the post-deploy monitor.
+Playwright suite covering the venture slice on **staging**: signup →
+library → playback with Range seeks → usage meter → plan-limit
+enforcement. Plus a fast synthetic smoke (`health.spec.ts`) that doubles
+as the post-deploy monitor.
 
 Public repo: **secret names only, never values.** Values live in GitHub
 Actions secrets (CI) or shell exports (local).
@@ -60,10 +60,9 @@ the activation checklist is accurate:
   `helpers/contract.ts` `TESTIDS` is declared in its expected route file.
   This is a source-level route contract, not proof that conditional markup is
   reachable or visible at runtime; the smoke separately checks selected hooks
-  in rendered pages. `/signup`'s real submission, the BYOP wizard's backend
-  behavior, ingest/library/stream/usage endpoints, and usage-meter enforcement
-  still depend on their venture slices; the journey specs expose those missing
-  backend behaviors directly.
+  in rendered pages. `/signup`'s real submission, ingest/library/stream/usage
+  endpoints, and usage-meter enforcement still depend on their venture
+  slices; the journey specs expose those missing backend behaviors directly.
 
 ## Player contract migration (app-shell redesign, design spec v1)
 
@@ -155,9 +154,9 @@ npm-based harness (`e2e/package-lock.json`).
 |---|---|---|
 | `STAGING_BASE_URL` | yes (post-deploy) | `https://` staging origin. Unset → the synthetic smoke skips with notice; the post-deploy full journey fails closed. |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | whenever staging is configured | QA service-token pair. Both absent or either absent → fail closed before requests. |
-| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the wizard-arrival spec (`signup-wizard-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
-| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for BYOP spec | Real staging NNTP provider (a real service despite the `SYNTHETIC_` names — rename needs an operator; defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the BYOP allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a transport the wizard cannot represent. |
-| `SYNTHETIC_NNTP_PASS` | for BYOP spec | No default — fail closed when missing. |
+| `QA_AUTH_TOKEN` | optional | Bearer for `POST /api/test-accounts` (staging-only seam) and `POST /api/test-codes` (staging-only emailed-code retrieval seam for `example.test` mailboxes — returns the issued code without minting). Absent → UI signup fallback, and the library-arrival spec (`signup-arrival.spec.ts`) skips locally / fails closed on CI. The dedicated public UI-signup case ignores both seams either way. |
+| `SYNTHETIC_NNTP_HOST` / `_PORT` / `_USER` / `_TLS` | for provider 430 control | Real staging NNTP provider (a real service despite the `SYNTHETIC_` names — rename needs an operator; defaults: `synthetic-nntp`, `563`, `e2e`, TLS on). The port must be in the provider allowlist (`119` or `563`) and TLS-off is rejected — the harness fails closed on a transport the endpoint helper cannot represent. |
+| `SYNTHETIC_NNTP_PASS` | for provider 430 control | No default — fail closed when missing. |
 | `TEST_NZB_PATH` | post-deploy journey | Runtime path of the secret-held real-NZB subset staged by the workflow prepare step (`RUNNER_TEMP` only). Legs ingest it via `requireRealNzbFixture()` and decoded-audio legs skip by name; unset → the run fails red (no synthetic fallback since TWO-1169). Never set locally. |
 | `REAL_NZB_MODE` | CI only | `true` when the prepare step staged the real NZB; drives the journey gate's extended allow-list instead of the standard single-fixme budget. |
 | `NNTUNE_TEST_NZB_XZ_B64_1` / `_2` | CI workflow secrets only | Halves of the xz-compressed, base64-encoded real NZB (48 KB secret cap). Rebuilt into `RUNNER_TEMP` only with a SHA-256 prefix check, truncated to one whole data file, then the full NZB is deleted. Secret names only, never values. |
@@ -208,29 +207,26 @@ How the suite uses them:
   tried first, a form-submission UI signup (emailed-code step) second (each journey file signs
   up its own identity — Playwright isolates module state per file, so there
   is no cross-file account sharing). Independently of that choice,
-  `signup-byop.spec.ts` carries a dedicated public UI-signup case
+  `signup.spec.ts` carries a dedicated public UI-signup case
   (`submitPublicUiSignup`, null identity): it always submits the real
   `/signup` form with a unique synthetic mailbox and requires the
   emailed-code step with no inline error, even when `QA_AUTH_TOKEN`
   is set, so a seam-backed run still proves public UI form submission.
-  Form-to-wizard arrival is asserted by `signup-wizard-arrival.spec.ts`: the
+  Form-to-library arrival is asserted by `signup-arrival.spec.ts`: the
   code-plus-passkey finish retrieves the code from the staging-only
-  `POST /api/test-codes` seam, which is implemented in the API worker but
-  awaits its staging deployment and activation
+  `POST /api/test-codes` seam, which is live on staging
   (see row 1 of `docs/m1-exit-traceability.md`). Once `QA_AUTH_TOKEN` is set the seam is
   required infrastructure: transport errors, non-2xx and non-JSON mint
   responses throw instead of collapsing into a silent skip, and API-driven
-  steps (`requireApiAccount`) refuse to run anonymously. The identity that
-  ingests always completes the BYOP wizard first (shared
-  `completeByopWizard` helper), because the ingest worker probes through the
-  user's provider connection. The over-limit checks need the seam to support
-  `{plan:"overlimit"}` (metering card): the stream leg and the ingest leg
-  each mint their own capped account (never the journey identity, never each
-  other's) and run AFTER the browser legs at the end of the serial chain, so
-  a red-by-design capped-account failure skips no other verdict. The stream
+  steps (`requireApiAccount`) refuse to run anonymously. User NZB ingest is
+  retired (TWO-1630), so no journey leg completes a provider wizard or
+  uploads at `/library/import` anymore. The over-limit check needs the seam
+  to support `{plan:"overlimit"}` (metering card): the stream leg mints its
+  own capped account (never the journey identity) and runs AFTER the browser
+  legs in its isolated group, so a red-by-design capped-account failure
+  skips no other verdict. The stream
   leg requires the seam to pre-seed a streamable track on its capped account:
-  ingesting the fixture as the capped account would contradict the
-  ingest-refusal leg (the same ingest must be refused). An unavailable
+  there is no user-ingest path left that could fill it. An unavailable
   over-limit seam fails instead of skipping — locally and on CI — so
   plan-limit enforcement can never pass unexercised. Each leg asserts the
   full refusal verdict (`assertPlanLimitRefusal` in `helpers/contract.ts`):
@@ -259,26 +255,25 @@ How the suite uses them:
   set and the ingest pipeline has no RAR read (transcode inputs skip
   non-audio files), so an RAR-only subset fails permanent at transcode
   before any library row is written — there is currently no completable
-  ingest. Live legs in real-NZB mode are signup, the BYOP wizard with
-  test-connection, the provider 430 control and the intake-level
-  ingest-refusal leg; the ingest-completion, reload, Range, meter,
-  playback, seek, Media Session, over-limit-stream and queue-order legs
-  skip by name until RAR read (and the per-file manifest for legs needing
-  2+ tracks) lands — parked legs un-park under TWO-1174. The journey gate
-  budgets that fixed allow-list via `REAL_NZB_MODE` instead of the
-  standard single-fixme budget; any failure or off-list skip still fails
-  the run in both modes.
+  ingest. Live legs in real-NZB mode are signup, library arrival,
+  returning-user login, the provider 430 control and the stream plan-limit
+  refusal leg; the user-NZB legs (ingest completion in both spec files,
+  reload, Range, meter, playback, seek, Media Session, queue order) skip by
+  name under TWO-1635 — user NZB ingest is retired, so they wait for admin
+  ingest to seed a curated track on staging, not for RAR read (RAR-set
+  legs additionally keep their TWO-1174 park). The journey gate budgets
+  that fixed allow-list via `REAL_NZB_MODE` instead of the standard
+  ten-skip budget (fixme plus nine parked legs); any failure or off-list
+  skip still fails the run in both modes.
 - Provider budget + 430 control: the staging NNTP provider is a shared
   account with production, so each run holds at most a trickle of
   connections. The workflow concurrency group (`e2e-staging`,
   cancel-in-progress: false) serializes provider runs, and
   `E2E_NNTP_MAX_CONNECTIONS` (default 2, hard max 10 —
   `helpers/provider-budget.ts`) caps each run so 8+ connections stay free.
-  The BYOP wizard joins the budget: `completeByopWizard` sets its
-  connections input from the run budget and verifies it (testid
-  `byop-connections`, pinned by `tests/byop-transport.spec.ts`), so the
-  wizard-saved connection count can never exceed the run cap.
-  Legs fetch only the segments they need. `tests/provider-430-control.spec.ts`
+  The provider 430 control reads the run budget through the same helper, so
+  the live proof never exceeds the run cap. Legs fetch only the segments
+  they need. `tests/provider-430-control.spec.ts`
   is the live proof that costs almost nothing: one direct NNTP connection
   asserting a minted never-posted probe ID answers 430 — 502 fails fast
   with no retry (Playwright retries disabled for the file), the socket
@@ -350,12 +345,12 @@ On failure CI sanitizes then uploads `test-results/` only (7 days, junit).
 Raw traces and screenshots are disabled: tracing records request
 headers/bodies and screenshots can expose account/provider information. CI
 uses the junit reporter only — the html reporter embeds step fill values
-(including the BYOP password) as a base64 zip in
+(including filled credential values) as a base64 zip in
 `playwright-report/index.html`, so it is never published. Sanitization is
 still required with traces off: Playwright (as pinned in
 `e2e/package.json`) writes
 `test-results/**/error-context.md` (an ARIA snapshot rendering filled input
-values, including the BYOP password) — the workflow deletes
+values) — the workflow deletes
 error-context.md plus the whole `playwright-report/` dir before upload, and
 offline self-tests run a real failing fill under the CI reporter config,
 apply the exact checked-in sanitize blocks, and assert the marker password

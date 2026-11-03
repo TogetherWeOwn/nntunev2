@@ -18,10 +18,16 @@
   one-day limit and required fixtures/checks without permitting partial cutovers.
 - **Revised:** 2026-10-18 — slice-1 per-play precursor: `migrations/0020_stream_play_ledger.sql`
   creates `stream_play_ledger` (one row per billed play window, `play:` idempotency keys,
-  monthly `period_month` folds). It does NOT replace the daily `usage_ledger` defined below
-  (`period DATE`, `ingest_jobs`, `UNIQUE (user_id, period)`); a later slice folds these windows
-  into that daily aggregate. The distinct name keeps the future daily `CREATE TABLE IF NOT
-  EXISTS usage_ledger` from colliding.
+  monthly `period_month` folds).
+- **Revised:** 2026-11-03 — owner product model (TWO-1629, ADR 0004/0005 revision):
+  plans are `free` (reserved, non-selectable) / `plus` / `pro` / `max` with only
+  price, stream-hours and concurrency columns (ingest/library/cache plan
+  dimensions dropped); trial columns dropped (`billing_accounts.trial_started_at`,
+  `subscriptions.trial_end`) and a Stripe-reported `trialing` is an unknown,
+  fail-closed, non-slot-reserving status; the daily `usage_ledger` is dropped —
+  monthly usage is the direct `SUM(user, period_month)` fold over
+  `stream_play_ledger`, and the ingest daily count derives from `ingest_jobs`
+  accepted rows.
 - **Baseline inspected:** main `553902652cc8f5bea149c3a1bfbc55725ce5f757`
   (includes `migrations/0001_mb_mirror.sql`, `0002_auth_vault.sql` and
   `0003_library.sql` via #28 plus `workers/api/src/library.rs` playlist
@@ -95,17 +101,14 @@ subsonic_credentials  id PK, user_id FK, label,
                       token_secret_encrypted BYTEA NULL + token_* envelope fields,
                       auth_mode TEXT ('apikey'|'token'|'both', default 'apikey'),
                       scope TEXT DEFAULT 'subsonic', created_at, last_used_at, revoked_at
-plans                 id TEXT PK ('free','plus','pro-5x','pro-20x'), price_cents,
-                      stream_hours_month, max_concurrent_streams, max_library_tracks,
-                      ingest_jobs_day, cache_priority,
-                      cache_bytes_budget BIGINT, cache_retention_days INTEGER
+plans                 id TEXT PK ('free' reserved/non-selectable,'plus','pro','max'),
+                      price_cents, stream_hours_month, max_concurrent_streams
 plan_prices           stripe_price_id TEXT PK, plan_id FK → plans NOT NULL,
                       currency TEXT NOT NULL, price_cents INTEGER NOT NULL,
                       billing_interval TEXT NOT NULL, livemode BOOLEAN NOT NULL,
                       selectable BOOLEAN NOT NULL DEFAULT FALSE,
                       partial UNIQUE (plan_id) WHERE selectable
-billing_accounts      user_id TEXT PK/FK, stripe_customer_id TEXT UNIQUE NULL,
-                      trial_started_at NULL (write-once after confirmed trial creation)
+billing_accounts      user_id TEXT PK/FK, stripe_customer_id TEXT UNIQUE NULL
 billing_operations    id PK, user_id FK, kind TEXT, state TEXT,
                       request_key TEXT UNIQUE, request_payload JSONB,
                       stripe_subscription_id TEXT NULL, stripe_invoice_id TEXT NULL,
@@ -121,14 +124,10 @@ subscriptions         id PK, user_id FK,
                       plan_id FK → plans (last confirmed entitlement plan),
                       status TEXT (Stripe status, rule 4), current_period_end,
                       cancel_at_period_end BOOLEAN DEFAULT FALSE,
-                      trial_end NULL, paid_through_at NULL, paid_invoice_id TEXT NULL,
+                      paid_through_at NULL, paid_invoice_id TEXT NULL,
                       grace_until NULL,
                       partial UNIQUE (user_id) WHERE status IN
-                      ('incomplete','trialing','active','past_due','unpaid','paused')
-usage_ledger          id BIGSERIAL PK, user_id FK, period DATE (UTC day),
-                      stream_seconds BIGINT NOT NULL DEFAULT 0 CHECK (stream_seconds >= 0),
-                      ingest_jobs BIGINT NOT NULL DEFAULT 0 CHECK (ingest_jobs >= 0),
-                      UNIQUE (user_id, period) -- flows only, no cache gauge
+                      ('incomplete','active','past_due','unpaid','paused')
 ingest_jobs           id PK, user_id FK, idempotency_key TEXT, accepted_at,
                       status TEXT ('queued'|'running'|'done'|'failed'),
                       UNIQUE (user_id, idempotency_key)
@@ -393,25 +392,24 @@ deleted_billing_tombstones id UUID PK, stripe_customer_id TEXT NULL,
                       UNIQUE (stripe_customer_id) WHERE stripe_customer_id IS NOT NULL,
                       email_hmac TEXT NOT NULL, pepper_version INTEGER NOT NULL,
                       INDEX (pepper_version, email_hmac),
-                      trial_started_at timestamptz NULL (write-once copy),
                       open_invoice_refs JSONB NOT NULL DEFAULT '[]',
                       debt_refs JSONB NOT NULL DEFAULT '[]', deleted_at timestamptz NOT NULL
                       -- no FK to users; skipped (no row) when stripe_customer_id
-                      -- IS NULL and no trial/debt history exists. email_hmac is
+                      -- IS NULL and no invoice/debt history exists. email_hmac is
                       -- HMAC-SHA256 of the normalized email (trim, lowercase,
                       -- strip plus-tags) under the BILLING_EMAIL_PEPPER
                       -- versioned keyring (Worker secret: current_version plus at
                       -- most one previous_version with a version→key map, v1 at
                       -- launch; same shape as SUBSONIC_INDEX_PEPPER in rule 2).
-                      -- Trial lookup tries every retained pepper version against
+                      -- Debt lookup tries every retained pepper version against
                       -- the composite (pepper_version, email_hmac) index. A
                       -- version is retired only after no tombstone row references
                       -- it within the 36-month retention; an HMAC cannot be
                       -- rehashed without the plaintext, so early retirement
-                      -- would silently end trial single-use for those rows.
-                      -- Retained 36 months for trial single-use and invoice/debt
-                      -- history, then deleted; the retention basis is trial-abuse
-                      -- prevention plus invoice/debt reconciliation as stated
+                      -- would silently end debt matching for those rows.
+                      -- Retained 36 months for invoice/debt
+                      -- history, then deleted; the retention basis is
+                      -- invoice/debt reconciliation as stated
                       -- here. The raw email/name remain only on the
                       -- retained remote Stripe customer, never in this table
 ```
@@ -423,9 +421,8 @@ or media already exist.
 
 Slice-1 precursor (`stream_play_ledger`, migration `0020`): per-play billed windows with
 deterministic `play:{user}:{track}:{play}` idempotency keys (128/512/512 limits, alphabet
-`[A-Za-z0-9_:-]`) and monthly `period_month` folds feed the rule-5 daily `usage_ledger`
-in a later slice; the daily `usage_ledger` table exists (migration 0021) but no writer folds
-into it or assumes its `(user_id, period)` upsert yet. Play-key binding, zero-row `SELECT` + classify (exact redelivery
+`[A-Za-z0-9_:-]`) and monthly `period_month` folds are the rule-5 monthly usage
+authority directly (`SUM(user, period_month)`); there is no daily fold table. Play-key binding, zero-row `SELECT` + classify (exact redelivery
 vs conflict), and the shared key vectors live in `workers/api/src/ledger.rs` with the stream
 worker's `derive_play_idempotency_key`. The precursor's `ledger_insert_statement` is a rule-3
 fenced writer: `SELECT ... FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL
@@ -442,7 +439,7 @@ invite_codes ──< users (invite_code_hash, logical reference)
 users ──1 billing_accounts ──< billing_operations
 users ──< subscriptions >── plans ──< plan_prices
 users ──< subsonic_credentials / providers / indexers
-users ──< usage_ledger / ingest_jobs / play_event_outbox / play_events / delete_operations
+users ──< ingest_jobs / play_event_outbox / play_events / delete_operations
 users ──< libraries ──< library_tracks >── tracks >── releases >── artists
 users ──< track_sources >── tracks
 users ──< track_media >── tracks
@@ -534,7 +531,8 @@ native REST (ADR 0006).
 
 ### 3. Library, source and byte ownership have distinct writers
 
-- **API accept transaction:** `ingest_jobs` plus its daily count, idempotent on
+- **API accept transaction:** `ingest_jobs` (the daily count derives from
+  accepted rows), idempotent on
   `(user_id, idempotency_key)`; enqueue via a retryable outbox/dispatch contract.
 - **Ingest `write` stage, after `match`:** normalized tracks, membership and
   encrypted `track_sources` in one transaction. Preserve an ordered per-track
@@ -677,8 +675,8 @@ Enumerate the user's own `ingest_jobs` and their `local_job_id` owner index
 before deleting jobs; this indexed owner path (not `local_key` parsing) drives
 local catalog cleanup, independent of current memberships/sources. In batches
 keyed on the `(user_id, played_at)` event indexes remove `play_event_outbox`,
-the user's monthly `play_events`, `stream_play_ledger` rows, and
-`usage_ledger` rows before deleting referenced tracks or the user; account
+the user's monthly `play_events` and `stream_play_ledger` rows
+before deleting referenced tracks or the user; account
 erasure is the first explicit exception to append-only event retention
 (rule 5). Then remove playlist entries and
 library memberships, media, grants and sources. Remove owner-local catalog rows
@@ -700,14 +698,13 @@ retry, no recreation of the user). Confirm every one
 reached terminal status (`canceled`/`incomplete_expired`) remotely and
 persisted locally before any billing row is deleted. Then copy a minimal
 tombstone into `deleted_billing_tombstones` (`stripe_customer_id` when
-non-NULL, `email_hmac`, `trial_started_at` write-once copy, open invoice/debt
-refs; skipped only when there is no customer id and no trial/debt history)
+non-NULL, `email_hmac`, open invoice/debt
+refs; skipped only when there is no customer id and no invoice/debt history)
 before deleting local billing operations/subscriptions/accounts. The Stripe
 customer is retained remotely for invoice/debt history, never deleted with the
 account; a webhook for an unknown or tombstoned customer that still shows a
 live remote subscription cancels it immediately and alerts, otherwise it
-reconciles debt without recreating a user and alerts. This preserves ADR 0005
-trial single-use (`trial_started_at` survives as the tombstone copy) and the
+reconciles debt without recreating a user and alerts. This preserves the
 rule 4 ban on freeing a slot while remote billing can still collect. Then remove ingest
 jobs and empty library/playlist containers, providers/indexers/vaults, Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
@@ -756,21 +753,24 @@ not a daily/monthly flow; artwork uses the separate lifecycle in ADR 0003.
 
 ### 4. Subscription slots are not the same as entitlement
 
-ADR 0005 defines the full creation/conversion/reconciliation contract. There is
+ADR 0005 defines the full creation/plan-change/reconciliation contract. There is
 **no provisional NULL-id subscription**. API-response and webhook reconciliation
-use the same real Stripe id; paid conversion updates that same subscription/item.
+use the same real Stripe id; the first purchase creates the subscription via
+Stripe Checkout, and a paid plan change updates that same subscription/item.
 `billing_operations` prevents concurrent creates and preserves retry identity.
 `billing_webhook_events` makes duplicate delivery processing idempotent.
 
-Store all eight Stripe statuses: `incomplete`, `incomplete_expired`, `trialing`,
-`active`, `past_due`, `canceled`, `unpaid`, `paused`. The six nonterminal statuses
+Store Stripe statuses verbatim: `incomplete`, `incomplete_expired`,
+`active`, `past_due`, `canceled`, `unpaid`, `paused`, and any unknown provider
+status. The five nonterminal known statuses
 reserve the partial-unique user slot; only confirmed `canceled` and
-`incomplete_expired` release it. There is no local `expired` shortcut that frees
+`incomplete_expired` release it. A Stripe-reported `trialing` is an unknown
+status here: stored verbatim, fail-closed, and not slot-reserving. There is
+no local `expired` shortcut that frees
 a slot while a remote subscription can still bill.
 
 Entitlement is derived from the single row:
 
-- `trialing AND trial_end > now()` → free caps.
 - `active AND plan_id != 'free'` → the confirmed paid plan while
   `paid_through_at > now()`, **or** while `cancel_at_period_end=false` and
   `now() < paid_through_at + interval '3 hours'`. The latter is the fixed
@@ -783,9 +783,6 @@ Entitlement is derived from the single row:
   the fixed seven-day **renewal-only** grace. No grace for first payment.
 - Anything else → no entitlement. `users` has no plan column.
 
-The exact trial setting is
-`trial_settings.end_behavior.missing_payment_method = cancel`; additionally
-schedule end-of-trial cancellation regardless of card presence (ADR 0005).
 The API's hourly `billing-reconcile` job handles elapsed grace without a webhook;
 the new-purchase path runs the same reconciliation inline. Both confirm remote
 termination before replacement. Timestamp predicates cut access immediately even
@@ -805,30 +802,27 @@ number of seconds, not a cumulative playback total. Split events at UTC midnight
 so each belongs to one daily/monthly cap period. The composite PK includes the
 partition key as PostgreSQL requires; `UNIQUE(event_id)` alone is invalid here.
 
-**No asynchronous rollup or independent checkpoint.** In one DB transaction,
-`INSERT INTO play_events ... ON CONFLICT (event_id, played_at) DO NOTHING RETURNING
-user_id, played_at, stream_seconds` feeds a grouped daily ledger upsert. Increment
-`usage_ledger.stream_seconds` only by those **inserted/returned** rows, with
-`period=(played_at AT TIME ZONE 'UTC')::date`. Both counters are `NOT NULL DEFAULT 0`;
-stream and ingest writers insert or increment only their own counter, preserving
-zero for the other. Use additive `ON CONFLICT (user_id, period) DO UPDATE` so
-concurrent stream/ingest writers cannot lose one another's increments. Commit
+**No asynchronous rollup or independent checkpoint, and no daily fold
+table.** Monthly stream usage is the direct indexed
+`SUM(user, period_month)` over the per-play `stream_play_ledger` windows —
+the single authority (ADR 0004). Event inserts stay idempotent
+(`INSERT INTO play_events ... ON CONFLICT (event_id, played_at) DO NOTHING`),
+so duplicate delivery adds zero. Commit
 before acknowledging delivery. A crash before commit
-rolls back both; a crash after commit redelivers as a zero-increment no-op. A
-missing partition or ledger error aborts both and leaves the event retryable.
+rolls back; a crash after commit redelivers as a no-op. A
+missing partition or ledger error aborts and leaves the event retryable.
 The committed event row is the durable dedupe receipt; no undefined checkpoint
 table is needed. Producers must reject attempts to reuse an identity for a changed
 payload. Retention must preserve receipts through the approved replay horizon;
 do not replay dropped partitions into the live ledger without a separate rebuild.
 
-Ingest counts increment at acceptance. Only stream seconds sum across days for a
-monthly cap; ingest uses today's row.
+Ingest counts derive at read time from today's accepted `ingest_jobs` rows.
+Only stream seconds sum for a monthly cap.
 Cache bytes are the live grant gauge; concurrent streams are pool-DO leases;
 library size is distinct per-user membership (ADR 0004). Analytics Engine is
 observability only. Duplicate queue delivery must not increment any flow twice.
 Acceptance must cover concurrent duplicate delivery, crash before/after commit,
-missing partitions, concurrent ingest increments, stream-then-ingest and
-ingest-then-stream ledger-row creation (both counters remain numeric and increment
+missing partitions, concurrent ingest accepts (each counted
 once), and midnight/month boundaries. These are required implementation tests, not
 executed DB tests in this docs PR.
 
@@ -1258,12 +1252,12 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `submitted`/`needs_reconcile` at deletion time and assert the gate resolves
   it, lists all remote subscriptions, and cancels each immediately under the
   pinned contract before deleting rows. A `deleted_billing_tombstones` row
-  retains customer id (when non-NULL), email HMAC, trial start and open
+  retains customer id (when non-NULL), email HMAC and open
   invoice/debt refs (no row when no customer and no history); the Stripe
   customer is retained; a webhook for that tombstoned customer with a still-live
   remote subscription cancels it and alerts, otherwise it reconciles without
-  recreating a user; and re-registering the same email HMAC is not
-  trial-eligible per the ADR 0005 tombstone check. Deleting an account that
+  recreating a user; and re-registering the same email HMAC still matches
+  the tombstone for debt reconciliation per ADR 0005. Deleting an account that
   never reached Stripe writes no tombstone and does not wedge. Include a user who
   previously removed the final local library membership and playlist reference:
   owner-keyed GC must find/delete those rows via indexed `local_job_id`, not
@@ -1305,7 +1299,7 @@ retaining its `release_mbid_hint` without guessing. Also require:
   At a seeded size assert EXPLAIN uses the index (no Seq Scan, no
   per-partition Seq Scan) for the GC reference test, a 500-track delete batch,
   an ingest_jobs delete during account erasure, the sweep step-5 mark test,
-  and the tombstone trial check under every retained pepper version; the delete
+  and the tombstone debt check under every retained pepper version; the delete
   cursor keys on those real paths and the local sweep queries `local_job_id`.
   Tombstone keyring case: rows under v1 and rotated v2 both match, and retiring
   v1 is refused while a v1 row remains.

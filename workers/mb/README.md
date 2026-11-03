@@ -5,7 +5,7 @@ database (via Hyperdrive). Schema: `migrations/0001_mb_mirror.sql`
 (mirror tables plus the single-row `mb_import_state` snapshot),
 `0016_mb_track.sql` (`mb_track` listing source),
 `0017_mb_replication_packet_ledger.sql` (per-packet SLO ledger) and
-`0026_mb_mirror_w6b.sql` (release groups, curated URL relationships,
+`0027_mb_mirror_w6b.sql` (release groups, curated URL relationships,
 music-video pairs and ISRCs).
 Decision: `docs/adr/0007-mb-mirror.md`.
 
@@ -170,6 +170,15 @@ method, not the measurements.
 once staging measures exist.)
 
 ### Replication SLO
+
+> **Superseded decision (2026-11-03):** [ADR 0012 §5](../../docs/adr/0012-compliant-youtube-video-and-brainz-data.md)
+> and the amended [ADR 0007](../../docs/adr/0007-mb-mirror.md) replace
+> hourly replication with twice-weekly CC0 core dumps (freshness
+> target ≤4 days; no supporter tier, account or token). The
+> per-packet contract below documents the ledger/evaluator as built
+> for the old hourly design — do not configure monitoring against
+> the 2-hour rule for the CC0 mirror. Retiring or replacing this
+> evaluator is part of the follow-on mirror build change.
 
 The SLO contract is the per-packet rule from ADR 0007: **each packet must
 be applied within 2 hours of publication**. The evaluator does not calculate

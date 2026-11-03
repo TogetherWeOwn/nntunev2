@@ -1,7 +1,17 @@
-# mb-import — dump import + hourly replication (batch only)
+# mb-import — dump import (batch only; hourly replication retired)
 
 Container image for the two batch jobs behind `nntunev2-mb`
 (ADR 0007). Interactive traffic never runs here.
+
+> **Decision changed (2026-11-03):** [ADR 0012 §5](../../docs/adr/0012-compliant-youtube-video-and-brainz-data.md)
+> and the amended [ADR 0007](../../docs/adr/0007-mb-mirror.md) drop the
+> hourly Live Data Feed: the mirror is CC0-only on twice-weekly core
+> dumps with a ≤4-day freshness target, and no MetaBrainz supporter
+> tier, account or token is held. The replication job, its packet
+> ledger and the <2 h SLO below describe the superseded hourly design
+> that is still in the tree — do not configure schedules or
+> monitoring against them for the CC0 mirror. Retiring/replacing
+> them is part of the follow-on mirror build change, not done here.
 
 ## Jobs
 
@@ -111,7 +121,7 @@ field order; use an extract from the matching schema revision. Derivations:
   CHECK's canonical 12-character form. (Sources: `etl.py:70-84` (pinned
   GIDs), `:277-321` (allowlist resolution, kept-link set, empty-slice
   refusal), `:519-586` (url, artist/recording-url, music-video and ISRC
-  projections); `migrations/0026_mb_mirror_w6b.sql`.)
+  projections); `migrations/0027_mb_mirror_w6b.sql`.)
 - Orphan references fail the ETL before any curated file is written:
   artist type/area/country, artist-credit artists, group primary types,
   release groups/credits/years, track mediums/recordings, medium releases,
@@ -240,11 +250,11 @@ with a newer `DUMP_TS`, or a database restore. A position whose
 replacement row landed in the DLQ (poison or FK orphan) also loses its
 old row, leaving a visible gap rather than a stale recording. No
 data-destroying migrations in this path; 0014/0016 swap constraints in
-place (cursor PK, DLQ unique, `table_name` checks), and 0026 adds its six
+place (cursor PK, DLQ unique, `table_name` checks), and 0027 adds its six
 tables the same way (extending the cursor/DLQ `table_name` checks in
 place). (Sources: `import.sh:214-239`
 (prune, DLQ gap), `:618-636` (single transaction, forward-only
 guard, final-chunk prune); `test-import.sh:555-565` (older dump leaves rows alone);
 `migrations/0016_mb_track.sql:38-43` (check swaps);
 `migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps);
-`migrations/0026_mb_mirror_w6b.sql:103-114` (`table_name` check extension).)
+`migrations/0027_mb_mirror_w6b.sql:103-114` (`table_name` check extension).)
