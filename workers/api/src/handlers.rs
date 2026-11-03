@@ -1408,14 +1408,18 @@ pub trait Store {
         async move { Ok(None) }
     }
     /// Record the created session (and later terminal marks) on the
-    /// operation row. Default `Err` (fail closed).
+    /// operation row — but only while the row still holds the single
+    /// flight. Reports whether the mark landed: a mark that arrives after
+    /// a deliberate supersede must not resurrect the retired row, so the
+    /// caller retries into the replacement instead. Default `Err` (fail
+    /// closed).
     fn update_checkout_operation(
         &self,
         _op_id: &str,
         _state: &str,
         _price_id: &str,
         _session_id: Option<&str>,
-    ) -> impl Future<Output = Result<(), StoreError>> {
+    ) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Err(StoreError) }
     }
     /// One guarded admin NZB upload attempt (migration 0034): validate
@@ -6526,12 +6530,21 @@ where
         })
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    // Best-effort mark: the session already exists under our idempotency
-    // key, so a lost mark only costs a retrieve on the next attempt.
-    let _ = ctx
+    // Conditional mark: the session already exists under our idempotency
+    // key, so a lost mark only costs a retrieve on the next attempt — but
+    // a mark that lands after a deliberate supersede must not resurrect
+    // the retired row. A missed mark means the flight moved on (the
+    // replacer expired this very session before retiring the row), so the
+    // in-hand session is dead: fail retryable and let the retry converge
+    // onto the replacement instead of handing out an expired URL.
+    let marked = ctx
         .store
         .update_checkout_operation(operation_id, "submitted", price_id, Some(&session.id))
-        .await;
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
     session.url.ok_or(EnsureCheckoutError::Failed)
 }
 
@@ -6551,6 +6564,154 @@ where
 pub enum EnsureCheckoutError {
     Unavailable,
     Failed,
+}
+
+/// What one retrieved flight session decides: reuse its URL, retire it so
+/// the caller mints a replacement, accept the completed purchase, or keep
+/// the flight without minting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlightSessionDecision {
+    /// Open, price-matched, with a URL: hand it over.
+    Reuse(String),
+    /// Deliberately retired (expired first while still open, or confirmed
+    /// dead): the caller mints the replacement under a fresh operation.
+    Replace,
+    /// Complete and paid: reconciled through the shared driver; the caller
+    /// refuses the duplicate purchase.
+    Completed,
+    /// Complete but unpaid, or any other unrecognized state: the flight
+    /// stays open for the real completion; the caller fails retryable
+    /// without minting beside unknown state.
+    Retained,
+}
+
+/// Branch on one flight session retrieved fresh from Stripe (never trusted
+/// from the row): reuse the open price-matched session, expire a still-open
+/// unusable one before its deliberate replacement, reconcile a completed
+/// paid session through the shared driver, or retain the flight without
+/// minting for anything else. Only `status == "expired"` deliberately
+/// replaces among the closed states: a `complete` session that is not paid
+/// (`unpaid` async processing, `no_payment_required` subscription already
+/// created) can still succeed, so a retry must never mint a second
+/// subscription checkout beside it. A Stripe-404 (past retention, never
+/// minted) replaces like a confirmed-expired session; any other retrieve
+/// failure fails retryable instead of minting beside unknown state.
+async fn handle_flight_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    session_id: &str,
+    price_id: &str,
+) -> Result<FlightSessionDecision, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = match ctx
+        .stripe
+        .retrieve_checkout_session(session_id.to_string())
+        .await
+    {
+        Ok(session) => session,
+        Err(err) if err.http_status == 404 => {
+            // Missing (past retention, never minted): same deliberate
+            // replacement as a confirmed-expired session.
+            replace_checkout_operation(ctx, op, None).await?;
+            return Ok(FlightSessionDecision::Replace);
+        }
+        Err(_) => return Err(EnsureCheckoutError::Failed),
+    };
+    if session.status.as_deref() == Some("open") {
+        if crate::billing_reconcile::checkout_price_matches(op, price_id) {
+            if let Some(url) = session.url {
+                return Ok(FlightSessionDecision::Reuse(url));
+            }
+        }
+        // Open but unusable for this attempt: price-mismatched (the flight
+        // belongs to another price) or URL-less. Expire it first — a
+        // replacement never mints beside a possibly-payable session — then
+        // replace deliberately.
+        replace_checkout_operation(ctx, op, Some(session_id)).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    if session.status.as_deref() == Some("complete")
+        && session.payment_status.as_deref() == Some("paid")
+    {
+        // The purchase completed but its webhook was lost (or lands after
+        // this retry): reconcile the paid session through the shared driver
+        // instead of minting a second payable session. Money already landed,
+        // whatever price it names — no replacement is minted on this path.
+        reconcile_checkout_session(ctx, session_id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        return Ok(FlightSessionDecision::Completed);
+    }
+    if session.status.as_deref() == Some("expired") {
+        // Confirmed dead without payment: no expiry call needed — Stripe
+        // converges the state itself — just supersede and replace.
+        replace_checkout_operation(ctx, op, None).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    // Complete but not paid, or any other unrecognized state: the flight
+    // stays open for the real completion and nothing mints beside it —
+    // retryable, never a blind replace.
+    Ok(FlightSessionDecision::Retained)
+}
+
+/// Recover the Stripe session for a session-less operation under its
+/// ORIGINAL operation id and recorded price, and carry the recovered id on
+/// the operation (best-effort mark repair — a lost mark only costs a
+/// re-resolve on the next attempt). A missing `session_id` does not mean
+/// Stripe has no session: the create mark is best-effort, so the same-key
+/// replay recovers the original create without duplicating, and when
+/// nothing was ever created the replay first-creates exactly one session
+/// under that key. Either way the caller retires the recovered session per
+/// its retrieved state before superseding — a replacement never mints
+/// beside a possibly-payable session. Any Stripe failure fails retryable
+/// with the flight untouched: nothing supersedes beside unknown state.
+async fn resolve_sessionless_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    mut op: crate::billing_reconcile::StoredCheckoutOp,
+    recorded_price_id: &str,
+    customer_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<crate::billing_reconcile::StoredCheckoutOp, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let recovered = ctx
+        .stripe
+        .create_checkout_session(crate::stripe::CreateCheckoutSession {
+            operation_id: op.id.clone(),
+            customer_id: customer_id.to_string(),
+            price_id: recorded_price_id.to_string(),
+            success_url: success_url.to_string(),
+            cancel_url: cancel_url.to_string(),
+        })
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    op.session_id = Some(recovered.id.clone());
+    // Conditional, like the create-path mark: the in-memory row already
+    // carries the recovered id for this attempt, so a lost mark only costs
+    // a re-resolve on the next one — never a duplicate session. A missed
+    // mark means the row retired while the replay was in flight (a
+    // concurrent replacer superseded it): fail retryable with the flight
+    // untouched instead of acting on the dead row.
+    let state = op.state.clone();
+    let marked = ctx
+        .store
+        .update_checkout_operation(&op.id, &state, recorded_price_id, op.session_id.as_deref())
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
+    Ok(op)
 }
 
 pub async fn ensure_checkout_session<S, M, D, N>(
@@ -6611,39 +6772,68 @@ where
         .open_checkout_operation(user_id)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    if let Some(op) = open {
-        // An open session is verified fresh: still-open reuses its fresh
-        // URL (lost responses and concurrent attempts converge here —
-        // no second session is minted). A closed, expired, or vanished
-        // session repairs under the SAME operation id (same idempotency
-        // key replays, never duplicates).
-        if let Some(session_id) = op.session_id.clone() {
-            if let Ok(session) = ctx
-                .stripe
-                .retrieve_checkout_session(session_id.clone())
-                .await
-            {
-                if session.status.as_deref() == Some("open") {
-                    if let Some(url) = session.url {
-                        return Ok(url);
-                    }
-                } else if session.status.as_deref() == Some("complete")
-                    && session.payment_status.as_deref() == Some("paid")
-                {
-                    // The purchase completed but its webhook was lost (or
-                    // lands after this retry): reconcile the paid session
-                    // through the shared driver instead of minting a second
-                    // payable session under the same idempotency key. A
-                    // failed or still-absent retrieve falls through to the
-                    // repair below; only a confirmed-expired session or a
-                    // missing one repairs.
-                    reconcile_checkout_session(ctx, &session_id)
-                        .await
-                        .map_err(|_| EnsureCheckoutError::Failed)?;
-                    return Err(EnsureCheckoutError::Unavailable);
-                }
-            }
+    if let Some(mut op) = open {
+        // A session-less operation whose recorded price no longer matches
+        // is resolved under its ORIGINAL operation id and price before
+        // anything retires it: a lost mark does not mean Stripe has no
+        // session, so the same-key replay recovers it first and the flight
+        // below retires it per its retrieved state. Only then does the
+        // flight supersede — a replacement never mints beside a
+        // possibly-payable session. A price-matched orphan still repairs
+        // under its own id further below (same key replays the lost create,
+        // never duplicates). An unresolvable flight (no bound customer to
+        // replay with, or any Stripe failure) fails retryable with the
+        // flight untouched: nothing supersedes beside unknown state.
+        if op.session_id.is_none()
+            && !crate::billing_reconcile::checkout_price_matches(&op, price_id)
+        {
+            let Some(customer_id) = input.stripe_customer_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            let recorded = op.price_id.clone().unwrap_or_else(|| price_id.to_string());
+            op = resolve_sessionless_operation(
+                ctx,
+                op,
+                &recorded,
+                &customer_id,
+                success_url,
+                cancel_url,
+            )
+            .await?;
         }
+        if let Some(session_id) = op.session_id.clone() {
+            // An open session is verified fresh against Stripe before reuse,
+            // and its recorded price must match the newly requested one: a
+            // second attempt naming a different plan never inherits the first
+            // attempt's session. A confirmed-expired or Stripe-404-missing
+            // session is deliberately replaced — the dead operation is
+            // superseded (releasing the flight) and a fresh operation mints
+            // under a fresh Stripe idempotency key, so a repair can never
+            // replay a dead session inside Stripe's retention window. Lost
+            // responses and same-price concurrent attempts still converge
+            // here: no second session is minted for them.
+            return match handle_flight_session(ctx, &op, &session_id, price_id).await? {
+                FlightSessionDecision::Reuse(url) => Ok(url),
+                FlightSessionDecision::Replace => {
+                    create_fresh_checkout_session(
+                        ctx,
+                        user_id,
+                        input.stripe_customer_id.clone(),
+                        price_id,
+                        success_url,
+                        cancel_url,
+                        test_clock,
+                    )
+                    .await
+                }
+                FlightSessionDecision::Completed => Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => Err(EnsureCheckoutError::Failed),
+            };
+        }
+        // Orphan operation (no session recorded — either never created, or
+        // the mark was lost) whose price still matches: repair under its own
+        // id (same key replays the lost create, never duplicates).
+        // (Mismatched orphans resolved above and carry a session now.)
         let Some(customer_id) = input.stripe_customer_id.clone() else {
             billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
             return Err(EnsureCheckoutError::Unavailable);
@@ -6651,46 +6841,200 @@ where
         return create_session_under(ctx, &op.id, &customer_id, price_id, success_url, cancel_url)
             .await;
     }
-    // No flight: mint the operation id, ensure the customer (with the
-    // test-clock seam), then insert single-flight — a racer converges on
-    // the winner's row below instead of minting a second subscription.
-    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
-    let customer_id = match input.stripe_customer_id.clone() {
-        Some(customer_id) => customer_id,
-        None => {
-            ctx.stripe
-                .create_customer(crate::stripe::CreateCustomer {
-                    operation_id: operation_id.clone(),
-                    user_id: Some(user_id.to_string()),
-                    test_clock: test_clock.map(str::to_string),
-                })
-                .await
-                .map_err(|_| EnsureCheckoutError::Failed)?
-                .id
-        }
-    };
-    let outcome = ctx
-        .store
-        .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
-        .await
-        .map_err(|_| EnsureCheckoutError::Failed)?;
-    let converged = outcome.op();
-    // Converge on the winner-bound customer: a racing loser that started
-    // unbound minted its own orphan customer before the insert, and the
-    // pre-insert snapshot still names nothing. Re-read the binding — the
-    // payable session must sit on the bound customer.
-    let customer_id =
-        converged_session_customer(ctx, user_id, input.stripe_customer_id.clone(), customer_id)
-            .await?;
-    create_session_under(
+    create_fresh_checkout_session(
         ctx,
-        &converged.id,
-        &customer_id,
+        user_id,
+        input.stripe_customer_id.clone(),
         price_id,
         success_url,
         cancel_url,
+        test_clock,
     )
     .await
+}
+
+/// Fresh-operation purchase attempt (no usable open flight): mint the
+/// operation id, ensure the customer (with the test-clock seam), then
+/// insert single-flight — a racer converges on the winner's row below
+/// instead of minting a second subscription. The converged operation's
+/// recorded price is checked before minting: a single-flight loser that
+/// asked for a different price replaces deliberately instead of
+/// inheriting the winner's session.
+async fn create_fresh_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    snapshot_customer: Option<String>,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
+    let mut snapshot_customer = snapshot_customer;
+    let mut minted_customer: Option<String> = None;
+    loop {
+        let customer_id = match snapshot_customer.clone() {
+            Some(customer_id) => customer_id,
+            None => match minted_customer.clone() {
+                Some(customer_id) => customer_id,
+                None => {
+                    let created = ctx
+                        .stripe
+                        .create_customer(crate::stripe::CreateCustomer {
+                            operation_id: operation_id.clone(),
+                            user_id: Some(user_id.to_string()),
+                            test_clock: test_clock.map(str::to_string),
+                        })
+                        .await
+                        .map_err(|_| EnsureCheckoutError::Failed)?;
+                    minted_customer = Some(created.id.clone());
+                    created.id
+                }
+            },
+        };
+        let outcome = ctx
+            .store
+            .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        let converged = outcome.op();
+        // A converged loser that named a different price must not inherit the
+        // winner's session (which keeps the first attempt's price). A
+        // session-less winner is still creating (or lost its mark): recover
+        // under the winner's key and price first, exactly like an orphan —
+        // otherwise the replace below would orphan a payable session.
+        // Either way the winner's session retires per its retrieved state
+        // before the retry mints under this attempt's fresh operation.
+        if !crate::billing_reconcile::checkout_price_matches(converged, price_id) {
+            let resolved = match converged.session_id.clone() {
+                Some(_) => converged.clone(),
+                None => {
+                    let customer_id = converged_session_customer(
+                        ctx,
+                        user_id,
+                        snapshot_customer.clone(),
+                        customer_id.clone(),
+                    )
+                    .await?;
+                    let recorded = converged
+                        .price_id
+                        .clone()
+                        .unwrap_or_else(|| price_id.to_string());
+                    resolve_sessionless_operation(
+                        ctx,
+                        converged.clone(),
+                        &recorded,
+                        &customer_id,
+                        success_url,
+                        cancel_url,
+                    )
+                    .await?
+                }
+            };
+            let Some(session_id) = resolved.session_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            match handle_flight_session(ctx, &resolved, &session_id, price_id).await? {
+                // Unreachable: the price mismatches by construction, so the
+                // winner's session is never reusable here. Fail safe — the
+                // retry heals it, and nothing mints beside unknown state.
+                FlightSessionDecision::Reuse(_) => return Err(EnsureCheckoutError::Failed),
+                FlightSessionDecision::Replace => {
+                    // Re-read the binding (the supersede released the flight, so the
+                    // retry sees whatever the winner bound). A still-unbound retry
+                    // reuses this attempt's already-minted customer instead of
+                    // minting a second orphan.
+                    snapshot_customer = snapshot_customer_fresh(ctx, user_id).await?;
+                    continue;
+                }
+                FlightSessionDecision::Completed => return Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => return Err(EnsureCheckoutError::Failed),
+            }
+        }
+        // Converge on the winner-bound customer: a racing loser that started
+        // unbound minted its own orphan customer before the insert, and the
+        // pre-insert snapshot still names nothing. Re-read the binding — the
+        // payable session must sit on the bound customer.
+        let customer_id =
+            converged_session_customer(ctx, user_id, snapshot_customer.clone(), customer_id)
+                .await?;
+        return create_session_under(
+            ctx,
+            &converged.id,
+            &customer_id,
+            price_id,
+            success_url,
+            cancel_url,
+        )
+        .await;
+    }
+}
+
+/// Re-read the account's bound customer after a deliberate replacement
+/// (the supersede released the flight, so the retry reads whatever the
+/// winner bound). `None` when still unbound — the caller then reuses its
+/// already-minted customer instead of minting a second orphan.
+async fn snapshot_customer_fresh<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+) -> Result<Option<String>, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    Ok(ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+        .stripe_customer_id)
+}
+
+/// Deliberately retire an open flight: expire the still-open Stripe
+/// session when one is named (so no second payable session lingers
+/// beside its replacement), then mark the operation superseded — the
+/// flight releases, and the replacement inserts a fresh operation with a
+/// fresh Stripe idempotency key. Confirmed-dead sessions pass `None` (no
+/// expiry call: Stripe already converged the state). Any expiry or store
+/// failure fails the attempt retryable: a replacement never mints beside
+/// a possibly-payable session.
+async fn replace_checkout_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    expire_session_id: Option<&str>,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Some(session_id) = expire_session_id {
+        ctx.stripe
+            .expire_checkout_session(session_id.to_string())
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+    }
+    // A supersede is idempotent retirement: the conditional mark may
+    // report `false` when the row already retired, which is success here.
+    ctx.store
+        .update_checkout_operation(
+            &op.id,
+            crate::billing_reconcile::SUPERSEDED_OP_STATE,
+            &op.price_id.clone().unwrap_or_default(),
+            op.session_id.as_deref(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| EnsureCheckoutError::Failed)
 }
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
@@ -7169,6 +7513,12 @@ mod tests {
         /// statements. A loser converging while the flag is set sees the op
         /// but no binding.
         defer_customer_bind: RefCell<bool>,
+        /// Race pin: when set, `create_checkout_operation` lands this
+        /// winner row just before its own insert, mirroring a racer that
+        /// wins the single flight between this attempt's open-flight read
+        /// and its insert. The attempt must converge onto (and, on a price
+        /// mismatch, deliberately replace) the winner.
+        plant_winner_on_next_create: RefCell<Option<crate::billing_reconcile::StoredCheckoutOp>>,
         /// Paid-invoice history by Stripe invoice id (idempotent on the id,
         /// mirroring `paid_invoice_history`).
         invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
@@ -8363,6 +8713,7 @@ mod tests {
                     plan_id: row.plan_id.clone(),
                     status: row.status.clone(),
                     paid_through_unix: row.paid_through_unix,
+                    paid_invoice_id: row.paid_invoice_id.clone(),
                     grace_until_unix: row.grace_until_unix,
                 }
             });
@@ -8405,8 +8756,19 @@ mod tests {
             // Mirrors the production upsert's monotonic coverage CASE: a
             // pass that folded an older snapshot commits without
             // regressing confirmed `paid_through_at` (or the plan and
-            // anchor tied to it). Status and bindings still update
-            // verbatim; history still converges on the invoice id.
+            // anchor tied to it). An equal-end pass carrying an anchor
+            // relabels the plan and anchor (the defined equal-end
+            // plan-switch outcome) — but only when the stored row still
+            // matches what the pass read — so a keep committing after a
+            // relabel, or an older relabel committing after a newer one,
+            // keeps the stored ones instead of reversing the newer
+            // plan/anchor. An anchor-less tie keeps the stored ones too.
+            // The same staleness predicate guards
+            // `status` and `grace_until`: strictly older money — or the
+            // anchor-less equal-end shape only the stale fold emits — keeps
+            // the stored verbatim fields instead of writing stale ones over
+            // a fresher pass. Bindings still update verbatim; history still
+            // converges on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
             let merged = match rows.get(user_id) {
                 Some(existing)
@@ -8417,11 +8779,40 @@ mod tests {
                             .paid_through_unix
                             .is_none_or(|previous| end > previous)
                     });
+                    let relabels = !advances
+                        && outcome.row.paid_invoice_id.is_some()
+                        && matches!(
+                            (outcome.row.paid_through_unix, existing.paid_through_unix),
+                            (Some(end), Some(previous)) if end == previous
+                        )
+                        // Mirrors the tie arm (`subscriptions.plan_id =
+                        // $14 AND subscriptions.paid_invoice_id IS NOT
+                        // DISTINCT FROM $13`): only a pass whose read row
+                        // is still stored relabels — a late keep, or an
+                        // older relabel, committing after the row moved
+                        // keeps the stored plan/anchor. `None` read plan
+                        // never equals a stored plan, so an anchor-less
+                        // keep never relabels either.
+                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                        && existing.paid_invoice_id == outcome.read_anchor;
+                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                        (Some(end), Some(previous)) => {
+                            end < previous
+                                || (end == previous
+                                    && outcome.row.paid_invoice_id.is_none()
+                                    && existing.paid_invoice_id.is_some())
+                        }
+                        _ => false,
+                    };
                     let mut row = outcome.row.clone();
-                    if !advances {
+                    if !advances && !relabels {
                         row.paid_through_unix = existing.paid_through_unix;
                         row.plan_id = existing.plan_id.clone();
                         row.paid_invoice_id = existing.paid_invoice_id.clone();
+                    }
+                    if stale {
+                        row.status = existing.status.clone();
+                        row.grace_until_unix = existing.grace_until_unix;
                     }
                     row
                 }
@@ -8462,6 +8853,13 @@ mod tests {
         ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
+            }
+            // Race pin: land the winner between the caller's open-flight
+            // read and this insert (consumed once).
+            if let Some(winner) = self.plant_winner_on_next_create.borrow_mut().take() {
+                self.checkout_ops
+                    .borrow_mut()
+                    .insert(winner.id.clone(), winner);
             }
             let mut ops = self.checkout_ops.borrow_mut();
             // The partial unique admits at most one open flight per user:
@@ -8516,18 +8914,25 @@ mod tests {
             state: &str,
             price_id: &str,
             session_id: Option<&str>,
-        ) -> Result<(), StoreError> {
+        ) -> Result<bool, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Best-effort mark like production: a missing row (already
-            // resolved elsewhere) still answers `Ok`.
-            if let Some(op) = self.checkout_ops.borrow_mut().get_mut(op_id) {
-                op.state = state.to_string();
-                op.price_id = Some(price_id.to_string());
-                op.session_id = session_id.map(str::to_string);
+            // Mirrors the production conditional mark: only an unresolved
+            // row takes the mark. A missing or already-retired row (lost
+            // mark, or superseded while its Stripe create was still in
+            // flight) reports `false` instead of resurrecting the flight.
+            let mut ops = self.checkout_ops.borrow_mut();
+            let Some(op) = ops.get_mut(op_id) else {
+                return Ok(false);
+            };
+            if !crate::billing_reconcile::is_single_flight_state(&op.state) {
+                return Ok(false);
             }
-            Ok(())
+            op.state = state.to_string();
+            op.price_id = Some(price_id.to_string());
+            op.session_id = session_id.map(str::to_string);
+            Ok(true)
         }
         async fn admin_ingest_upload(
             &self,
@@ -8917,6 +9322,25 @@ mod tests {
         /// Subscription ids passed to `cancel_subscription` (proves a
         /// recovered or unknown remote is never canceled).
         canceled: RefCell<Vec<String>>,
+        /// Session ids passed to `expire_checkout_session` (proves a
+        /// price-mismatched or dead session is deliberately retired
+        /// before its replacement mints).
+        expired: RefCell<Vec<String>>,
+        /// Operation ids that minted through `create_checkout_session`
+        /// (proves a replacement mints under a fresh operation — hence a
+        /// fresh Stripe idempotency key — never the dead session's).
+        /// Same-key replays are not mints and are not logged here.
+        session_create_ops: RefCell<Vec<String>>,
+        /// Session id minted per operation id: the production Stripe
+        /// replays a create under a seen idempotency key instead of
+        /// minting again, and the orphan-recovery path depends on it
+        /// (recover under the old key, then retire per the retrieved
+        /// state). Replays answer the stored session without bumping
+        /// `sessions_created`.
+        sessions_by_op: RefCell<HashMap<String, String>>,
+        /// Session ids that retrieve as Stripe 404s (proves a missing
+        /// session repairs under a fresh key instead of replaying).
+        missing_sessions: RefCell<HashSet<String>>,
         /// Method names that fail like a Stripe outage.
         fail: RefCell<HashSet<String>>,
         /// Next customer id minted by `create_customer`.
@@ -8972,23 +9396,38 @@ mod tests {
                 if self.fail("create_checkout_session") {
                     return self.err();
                 }
+                // Same-key replay, like the real idempotency key: answer
+                // the stored session without minting again.
+                if let Some(id) = self.sessions_by_op.borrow().get(&req.operation_id).cloned() {
+                    if let Some(session) = self.sessions.borrow().get(&id).cloned() {
+                        return Ok(session);
+                    }
+                }
                 let mut created = self.sessions_created.borrow_mut();
                 *created += 1;
+                self.session_create_ops
+                    .borrow_mut()
+                    .push(req.operation_id.clone());
                 self.session_customers
                     .borrow_mut()
                     .push(req.customer_id.clone());
                 let id = format!("cs_test_{created}");
                 let url = format!("https://checkout.stripe.com/pay/{id}");
-                Ok(crate::stripe::CheckoutSession {
-                    id,
+                let session = crate::stripe::CheckoutSession {
+                    id: id.clone(),
                     status: Some("open".to_string()),
                     payment_status: Some("unpaid".to_string()),
                     customer: Some(req.customer_id),
                     subscription: None,
                     url: Some(url),
-                    client_reference_id: Some(req.operation_id),
+                    client_reference_id: Some(req.operation_id.clone()),
                     livemode: false,
-                })
+                };
+                self.sessions_by_op
+                    .borrow_mut()
+                    .insert(req.operation_id, id.clone());
+                self.sessions.borrow_mut().insert(id, session.clone());
+                Ok(session)
             })
         }
         fn retrieve_checkout_session(
@@ -9004,11 +9443,51 @@ mod tests {
                 if self.fail("retrieve_checkout_session") {
                     return self.err();
                 }
+                if self.missing_sessions.borrow().contains(&session_id) {
+                    return Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    ));
+                }
                 self.sessions
                     .borrow()
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn expire_checkout_session(
+            &self,
+            session_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("expire_checkout_session") {
+                    return self.err();
+                }
+                self.expired.borrow_mut().push(session_id.clone());
+                // Like the real `POST /v1/checkout/sessions/{id}/expire`:
+                // the stored session transitions and the expired object
+                // comes back, so a follow-up retrieve observes it; an
+                // unknown id 404s.
+                let mut sessions = self.sessions.borrow_mut();
+                match sessions.get_mut(&session_id) {
+                    Some(session) => {
+                        session.status = Some("expired".to_string());
+                        session.url = None;
+                        Ok(session.clone())
+                    }
+                    None => Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    )),
+                }
             })
         }
         fn retrieve_subscription(
@@ -10599,15 +11078,16 @@ mod tests {
         // pass folded from an older snapshot. Coverage (`paid_through_at`
         // and the plan/anchor tied to it) stays at the fresher values —
         // the production upsert's monotonic CASE, mirrored by the fake —
-        // while status still updates verbatim and both paid invoices keep
-        // their history rows.
+        // and the stale pass keeps the stored status/grace instead of
+        // writing older verbatim fields over the fresher pass. Both paid
+        // invoices still keep their history rows.
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         h.store
             .billing_customers
             .borrow_mut()
             .insert("u1".to_string(), "cus_test_1".to_string());
-        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str| {
+        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str, grace: Option<i64>| {
             crate::billing_reconcile::ReconciledRow {
                 stripe_subscription_id: "sub_test_1".to_string(),
                 stripe_customer_id: "cus_test_1".to_string(),
@@ -10619,7 +11099,7 @@ mod tests {
                 cancel_at_period_end: false,
                 paid_through_unix: paid,
                 paid_invoice_id: anchor.map(str::to_string),
-                grace_until_unix: None,
+                grace_until_unix: grace,
             }
         };
         let history_row = |id: &str, end: i64| crate::billing_reconcile::PaidInvoiceRow {
@@ -10632,20 +11112,29 @@ mod tests {
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
         };
+        let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
             row: row(
                 Some(BILLING_NOW + BILLING_PERIOD),
                 Some("in_test_2"),
-                "active",
+                "past_due",
+                Some(fresh_grace),
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            // Inserts (no stored row yet), so the guard never reads this.
+            read_plan: None,
+            read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
         let stale = crate::billing_reconcile::ReconcileOutcome {
-            row: row(Some(BILLING_NOW), Some("in_test_1"), "past_due"),
+            row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            // Read the fresh row: strictly-older money, so the stale arm
+            // fires on the ends regardless.
+            read_plan: Some(PLAN_PLUS.to_string()),
+            read_anchor: Some("in_test_2".to_string()),
         };
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
         let live = live_for(&h, "u1").expect("live row stored");
@@ -10662,12 +11151,630 @@ mod tests {
             Some("in_test_2"),
             "the anchor stays with the advancing money"
         );
-        assert_eq!(live.status, "past_due", "status still updates verbatim");
+        assert_eq!(
+            live.status, "past_due",
+            "a stale snapshot never regresses status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(fresh_grace),
+            "a stale snapshot never clears a fresher grace"
+        );
         assert_eq!(
             h.store.invoice_history.borrow().len(),
             2,
             "both paid invoices keep their history rows"
         );
+    }
+
+    /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
+    /// row plus the full price map, so `reconcile_subscription` runs the
+    /// real fold instead of a hand-built row.
+    fn fold_input(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        grace: Option<i64>,
+        anchor: Option<&str>,
+    ) -> crate::billing_reconcile::ReconcileInput {
+        crate::billing_reconcile::ReconcileInput {
+            stripe_customer_id: Some("cus_test_1".to_string()),
+            live: Some(crate::billing_reconcile::LiveRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            }),
+            bindings: test_bindings(),
+        }
+    }
+
+    fn stored_seed(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        anchor: Option<&str>,
+        grace: Option<i64>,
+    ) -> crate::billing_reconcile::ReconcileOutcome {
+        crate::billing_reconcile::ReconcileOutcome {
+            row: crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                current_period_end_unix: Some(BILLING_NOW + BILLING_PERIOD),
+                cancel_at_period_end: false,
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            },
+            history: vec![],
+            fail_closed: None,
+            // Seeds commit as inserts (no stored row yet), so the
+            // equal-end adopt arm never reads this.
+            read_plan: None,
+            read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_equal_end_plan_switch_persists_through_store() {
+        // The pure fold relabels on an equal-end plan switch, and the
+        // production upsert's plan/anchor CASEs must persist that relabel:
+        // stored PLUS ending E, paid PRO invoice also ending E → the row
+        // becomes PRO anchored on the new invoice. A strict-greater guard
+        // would keep PLUS and the old anchor forever (no later money can
+        // fix a stuck plan), so this test folds the real snapshot and
+        // commits through the store instead of asserting the fold alone.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_old"), None),
+        ))
+        .expect("seed stores");
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        // The pass reads the stored row (anchor `in_old`, present in the
+        // snapshot): a real pass always folds what it read, and the write
+        // only trusts a relabel whose read row is still stored.
+        let outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_old")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(outcome.row.plan_id, PLAN_PRO, "the fold relabels");
+        assert_eq!(
+            outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the fold anchors on the new evidence"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("switch stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the equal-end relabel persists in the write"
+        );
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor follows the new evidence"
+        );
+        assert_eq!(live.status, "active");
+        assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_stale_fold_commit_race_keeps_fresher_status_and_grace() {
+        // Interleaving built from REAL fold outcomes (not hand-built
+        // rows): stale pass S folds an older snapshot (E1 money) over
+        // stored E2/active, fresh pass F folds the equal-E2 failed renewal
+        // (past_due + first grace). F commits first, S second — S must
+        // compare strictly older in the write guard and keep the stored
+        // status/grace instead of overwriting them with older verbatim
+        // fields. Hand-building S with the stored end would bypass the
+        // fold's normalization and miss exactly this.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        let e1 = BILLING_NOW;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        h.store.invoice_history.borrow_mut().insert(
+            "in_seed".to_string(),
+            crate::billing_reconcile::PaidInvoiceRow {
+                stripe_invoice_id: "in_seed".to_string(),
+                stripe_subscription_id: "sub_test_1".to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                period_start_unix: BILLING_NOW - BILLING_PERIOD,
+                period_end_unix: e2,
+                amount_cents: 1_000,
+                currency: "usd".to_string(),
+                paid_at_unix: BILLING_NOW,
+            },
+        );
+        // S reads stored E2/active with remote money E1 < E2: stale.
+        let older = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                e1 - BILLING_PERIOD,
+                e1,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, None),
+            &older,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e1),
+            "the stale fold carries its evidence end into the write guard"
+        );
+        // F reads the same stored row with the equal-E2 failed renewal. A
+        // real fresh listing still carries the stored anchor invoice (the
+        // failure adds no new invoice, it does not erase the paid one), so
+        // the snapshot contains in_seed and the keep re-pins it — an
+        // anchor-less equal-end row against an anchored stored row is the
+        // stale shape, and must not be mistaken for this fresh outcome.
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        assert_eq!(
+            fresh_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_seed"),
+            "the fresh keep re-pins the stored anchor it observed"
+        );
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "the second-committing stale pass keeps the fresher status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "the second-committing stale pass keeps the fresher grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "both the seed and the stale invoice keep history rows"
+        );
+    }
+
+    #[test]
+    fn billing_stale_without_item_plan_money_keeps_recovery() {
+        // The NULL-evidence stale shape, built from REAL fold outcomes:
+        // stale pass S reads stored E2/active anchored `in_seed`, but its
+        // snapshot lost the anchor AND holds no item-plan money at all
+        // (empty listing) — so the fold emits no evidence end. The write
+        // guard only fires on non-NULL evidence, so the fold falls back to
+        // the stored end with the anchor cleared: the anchor-less
+        // equal-end shape the guard already reads as stale. F (the
+        // equal-E2 failed renewal: `past_due` + first grace) commits first,
+        // S second — S must keep the recovery's status/grace instead of
+        // overwriting them with the older verbatim fields.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        let emptied = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &emptied,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e2),
+            "a stale pass with no item-plan money carries the stored end so the guard can see it"
+        );
+        assert!(
+            stale_outcome.row.paid_invoice_id.is_none(),
+            "only the stale branch emits the anchor-less shape"
+        );
+        assert_eq!(
+            stale_outcome.read_anchor.as_deref(),
+            Some("in_seed"),
+            "the write needs the read anchor to tell keeps from relabels"
+        );
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "a stale pass with no evidence money keeps the recovery status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "a stale pass with no evidence money keeps the recovery grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_seed"),
+            "the anchor stays with the recovery"
+        );
+    }
+
+    #[test]
+    fn billing_relabel_first_keep_second_keeps_new_plan() {
+        // Relabel-then-keep commit order, built from REAL fold outcomes:
+        // keep pass K folds the pre-switch snapshot (plus/E/`in_plus`) and
+        // re-pins the anchor it read; relabel pass R folds the switched
+        // snapshot (pro item, both invoices, the switch paid later) over
+        // the same stored row. R commits first, K second — the stored row
+        // no longer matches what K read, so the write keeps the relabeled
+        // plan/anchor instead of flipping the row back to plus until the
+        // next reconcile.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let plus_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_plus",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+        };
+        let keep_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &plus_view,
+            BILLING_NOW,
+        );
+        assert_eq!(keep_outcome.row.plan_id, PLAN_PLUS, "the keep folds plus");
+        assert_eq!(
+            keep_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_plus"),
+            "the keep re-pins the anchor it read"
+        );
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the relabel adopts the current item plan"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the relabel anchors on the new evidence"
+        );
+        assert_eq!(
+            relabel_outcome.read_plan.as_deref(),
+            Some(PLAN_PLUS),
+            "the relabel records the plan it read"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_plus"),
+            "the relabel records the anchor it read"
+        );
+        // R commits first, K second.
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        block_on(h.store.store_reconcile_outcome("u1", &keep_outcome)).expect("keep stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the late keep does not reverse the committed relabel"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor stays with the new evidence"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_shared_invoice_relabel_persists_through_store() {
+        // One paid invoice carrying qualifying lines for BOTH plans, same
+        // end: stored PLUS/E anchored on `in_shared`, the item now reports
+        // PRO. The fold relabels onto the shared invoice — emitted anchor
+        // equalling the read anchor — and the write must still persist it
+        // when nothing moved the row meanwhile: gating the adopt on
+        // emitted-vs-read difference would leave PLUS stuck forever (no
+        // later money can fix a same-invoice switch), so the arm compares
+        // stored-vs-read instead. Built from a REAL fold outcome.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_shared"), None),
+        ))
+        .expect("seed stores");
+        let mut shared = test_invoice(
+            "in_shared",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            end,
+            BILLING_NOW,
+        );
+        shared
+            .lines
+            .as_mut()
+            .expect("invoice lines")
+            .data
+            .push(crate::stripe::InvoiceLine {
+                id: "in_shared_line_2".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PRO.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(end),
+                }),
+            });
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![shared],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_shared")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the fold relabels onto the shared invoice"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_shared"),
+            "the shared invoice anchors both plans"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_shared"),
+            "emitted and read anchors coincide here by construction"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "a same-invoice relabel persists when the row never moved"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_shared"),
+            "the anchor stays on the shared invoice"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_older_relabel_committing_second_keeps_newer_switch() {
+        // Two paid switches, same end, reverse commit order — built from
+        // REAL fold outcomes: older pass O reads stored plus/E/`in_plus`
+        // and relabels onto its own newer-paid evidence `in_old`; newer
+        // pass N relabels onto `in_new` (paid later still) and commits
+        // first. O commits second with a different anchor than it read, so
+        // an emitted-vs-read gate would revert the row to the older
+        // switch; the stored-vs-read arm keeps the newer plan/anchor.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let older_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let older_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &older_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            older_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_old"),
+            "the older pass relabels onto its own evidence"
+        );
+        let newer_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 120,
+                ),
+            ],
+        };
+        let newer_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &newer_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            newer_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the newer pass relabels onto the later payment"
+        );
+        // Newer commits first, older second.
+        block_on(h.store.store_reconcile_outcome("u1", &newer_outcome)).expect("newer stores");
+        block_on(h.store.store_reconcile_outcome("u1", &older_outcome)).expect("older stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "an older relabel committing second never reverts a newer switch"
+        );
+        assert_eq!(live.status, "active");
     }
 
     #[test]
@@ -10738,6 +11845,858 @@ mod tests {
         let live = live_for(&h, "u1").expect("reconciled");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
         assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_price_mismatched_open_session_expires_and_replaces() {
+        // The first attempt names PLUS and leaves its session open; the
+        // second attempt names PRO. The second attempt must not inherit the
+        // first attempt's session (which keeps the first attempt's price):
+        // the open session is expired first — a replacement never mints
+        // beside a possibly-payable session — the flight is superseded, and
+        // the replacement mints under a fresh operation id, hence a fresh
+        // Stripe idempotency key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_old_1".to_string(),
+            test_session(
+                "cs_old_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("price-mismatched attempt replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_old_1".to_string()].as_slice(),
+            "the mismatched open session is expired before replacement"
+        );
+        // The dead session transitioned, like the real expire endpoint.
+        let dead = &h.stripe.sessions.borrow()["cs_old_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        assert!(dead.url.is_none());
+        // The old flight is superseded (releasing the slot) with its price
+        // and session preserved for the audit trail.
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        // Exactly one new session, minted under a fresh operation id — a
+        // fresh idempotency key, never the dead session's — on the bound
+        // customer.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_test_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_session_mark_misses_retired_and_missing_rows() {
+        // The conditional mark only lands on unresolved rows: a mark that
+        // arrives after a deliberate supersede reports `false` and leaves
+        // the retired row untouched instead of resurrecting `submitted` on
+        // it; a missing row reports `false` the same way.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("mark"),
+            "unresolved row takes the mark"
+        );
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                crate::billing_reconcile::SUPERSEDED_OP_STATE,
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("retire"),
+            "open row retires"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("late mark"),
+            "retired row rejects the late mark"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_missing_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("missing mark"),
+            "missing row reports a miss"
+        );
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the late session id never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_late_create_mark_after_supersede_fails_without_reviving() {
+        // A replacer superseded op A while A's original Stripe create was
+        // still in flight. The late-arriving create must NOT resurrect
+        // `submitted` on the retired row (which would re-occupy the flight
+        // and hand out the now-expired session's URL): the conditional mark
+        // misses, the attempt fails retryable, and the flight stays free
+        // for the replacement.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let created = block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        block_on(replace_checkout_operation(&ctx, created.op(), None)).expect("supersede");
+        let open = block_on(h.store.open_checkout_operation("u1")).expect("open read");
+        assert_eq!(open, None, "supersede releases the flight");
+        // Late create under the retired id: Stripe replays the create (same
+        // key), but the mark misses the retired row.
+        let err = block_on(create_session_under(
+            &ctx,
+            "op_test_1",
+            "cus_test_1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Failed));
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id, None,
+            "late mark never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_converged_loser_with_different_price_replaces() {
+        // A racer wins the single flight between this attempt's open-flight
+        // read and its insert, naming a different price (the TOCTOU behind
+        // the converged-session price check). The loser must not inherit
+        // the winner's session: expire + supersede, then mint under its own
+        // fresh operation — reusing its already-minted customer instead of
+        // minting a second orphan.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_loser_1".to_string());
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_race_1".to_string(),
+            test_session(
+                "cs_race_1",
+                "open",
+                "unpaid",
+                Some("cus_winner_1"),
+                None,
+                Some("op_race_winner"),
+            ),
+        );
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: Some("cs_race_1".to_string()),
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_race_1".to_string()].as_slice(),
+            "the winner's open session is expired before replacement"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(winner.session_id.as_deref(), Some("cs_race_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        // One customer create: the retry reuses the loser's orphan once the
+        // winner's flight is retired and no binding exists yet.
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            [(Some("u1".to_string()), None)].as_slice()
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_loser_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_expired_session_repair_mints_under_fresh_key() {
+        // The recorded session is confirmed dead (expired without payment):
+        // no expiry call is needed — Stripe already converged the state —
+        // the dead operation is superseded and the repair mints under a
+        // fresh operation id, so the repair can never replay the dead
+        // session inside Stripe's retention window. Same price: the replace
+        // is about the dead session, not a plan switch.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        let mut dead = test_session(
+            "cs_old_1",
+            "expired",
+            "unpaid",
+            Some("cus_test_1"),
+            None,
+            Some("op_test_1"),
+        );
+        dead.url = None;
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .insert("cs_old_1".to_string(), dead);
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("expired repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a confirmed-dead session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_missing_session_repair_mints_under_fresh_key() {
+        // The recorded session is gone from Stripe (404, past retention or
+        // never minted): the same deliberate replacement as a
+        // confirmed-expired session — supersede, then mint fresh.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_gone_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe
+            .missing_sessions
+            .borrow_mut()
+            .insert("cs_gone_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("missing-session repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a missing session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+    }
+
+    #[test]
+    fn billing_session_retrieve_outage_fails_without_replacement() {
+        // An unconfirmed retrieve (any non-404 Stripe failure) fails
+        // retryable: no replacement mints beside a session whose state is
+        // unknown, and the flight stays open for the retry.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .fail
+            .borrow_mut()
+            .insert("retrieve_checkout_session".to_string());
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement beside unknown state"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the retry");
+        assert_eq!(open.id, "op_test_1");
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_unpaid_session_retains_flight_without_minting() {
+        // A `complete`/`unpaid` session is still processing asynchronously
+        // (the create request does not restrict payment methods): a retry
+        // must not supersede it and mint a second subscription checkout
+        // while the first can still succeed. The flight stays open for the
+        // real completion and the attempt fails retryable — no supersede,
+        // no mint.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_unpaid_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_unpaid_1".to_string(),
+            test_session(
+                "cs_unpaid_1",
+                "complete",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second subscription checkout beside a completable session"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the real completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_unpaid_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_no_payment_required_session_retains_flight_without_minting() {
+        // A `complete`/`no_payment_required` session already created its
+        // subscription: same deliberate-retention as `unpaid` — the flight
+        // stays open (the webhook reconciles the subscription out of the
+        // slot) and no second checkout mints.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_npr_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_npr_1".to_string(),
+            test_session(
+                "cs_npr_1",
+                "complete",
+                "no_payment_required",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second checkout beside the created subscription"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the webhook completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_npr_1"));
+    }
+
+    #[test]
+    fn billing_orphan_with_live_session_and_price_mismatch_expires_before_replacing() {
+        // A missing `session_id` does not mean Stripe has no session: the
+        // create mark is best-effort, and until the replay the same-key
+        // path was the only recovery. Here the orphan's PLUS session is
+        // still live in Stripe while the retry names PRO: the old flight
+        // must recover under its original key and price, expire the
+        // payable session, and only then supersede and mint fresh — never
+        // leave the first attempt's session payable beside the PRO one.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The mark was lost, but the session is live under the old key.
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_live_1".to_string(),
+            test_session(
+                "cs_live_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_old_1"),
+            ),
+        );
+        h.stripe
+            .sessions_by_op
+            .borrow_mut()
+            .insert("op_old_1".to_string(), "cs_live_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        // The replay recovered (not re-minted): exactly one mint, the
+        // replacement under its fresh operation id.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_old_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_live_1".to_string()].as_slice(),
+            "the recovered payable session expires before its replacement mints"
+        );
+        let dead = &h.stripe.sessions.borrow()["cs_live_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        let old = block_on(h.store.checkout_operation_by_id("op_old_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_orphan_mismatch_with_no_session_stillborn_expires_and_replaces() {
+        // The mismatched orphan never created anything: the same-key
+        // replay first-creates exactly one session under the old key, which
+        // is immediately expired (never payable) before the supersede and
+        // the fresh mint. No payable session lingers on either key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(
+            minted.as_slice(),
+            ["op_old_1".to_string(), minted[1].clone()].as_slice(),
+            "the replay recovers under the old key, the replacement under a fresh one"
+        );
+        assert_ne!(minted[1], "op_old_1");
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the stillborn session expires before the replacement mints"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_converged_sessionless_winner_with_price_mismatch_resolves_before_replacing() {
+        // A single-flight winner that has not recorded a session yet
+        // (still creating, or its mark was lost) while the loser names a
+        // different price: the loser must recover under the WINNER's key
+        // and price before retiring it — superseding blind would orphan a
+        // payable session the winner is about to mark.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: None,
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser resolves the winner then replaces");
+        // One replay under the winner's key (expired), one fresh mint under
+        // the loser's own operation.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 2);
+        assert_eq!(
+            minted[0], "op_race_winner",
+            "the recovery replays under the winner's key, never a fresh one"
+        );
+        assert_ne!(
+            minted[1], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the winner's recovered session expires before the replacement mints"
+        );
+        assert!(
+            h.stripe.customers_created.borrow().is_empty(),
+            "no orphan customer: the account was already bound"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(
+            winner.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the recovery repairs the winner's mark before retiring it"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[1]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_earlier_plan_invoices_keep_history_rows() {
+        // The subscription now sits on PRO after a plan change; the fold
+        // still writes one history row per confirmed paid invoice — the
+        // earlier PLUS invoice keeps its own plan label — while coverage
+        // follows the current item's plan. Redelivery stays idempotent on
+        // the invoice id.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_plus_1".to_string(),
+            test_invoice(
+                "in_plus_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_pro_1".to_string(),
+            test_invoice(
+                "in_pro_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 2 * BILLING_PERIOD,
+                BILLING_NOW + BILLING_PERIOD + 60,
+            ),
+        );
+        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("reconciles");
+        assert!(outcome.fail_closed.is_none());
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history["in_plus_1"].plan_id, PLAN_PLUS);
+        assert_eq!(history["in_pro_1"].plan_id, PLAN_PRO);
+        assert_eq!(
+            history["in_plus_1"].period_end_unix,
+            BILLING_NOW + BILLING_PERIOD
+        );
+        assert_eq!(
+            history["in_pro_1"].period_end_unix,
+            BILLING_NOW + 2 * BILLING_PERIOD
+        );
+        drop(history);
+        // Redelivery of the same remote state: same two rows, no dupes.
+        block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).expect("reconciles");
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "history stays idempotent on the invoice id"
+        );
     }
 
     #[test]
