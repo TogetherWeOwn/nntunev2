@@ -181,6 +181,13 @@ fn creator_rejects_bad_inputs() {
     assert!(Par2Creator::new(FILENAME, 3000, 1002).is_err());
     assert!(Par2Creator::new(FILENAME, 3000, 1000).is_ok());
     assert!(Par2Creator::new(FILENAME, 3000, 1 << 29).is_err());
+    // Accumulator budget (32 MiB, checked before allocation): 1 MiB slices
+    // over 321 data slices need 33 recovery slices = 33 MiB of accumulators,
+    // rejected even though the pre-round-2 256 MiB cap would have admitted
+    // it — and `finish` would then peak near 2x that against the 128 MB
+    // isolate cap. Just under the cap stays accepted (300 slices → 30 MiB).
+    assert!(Par2Creator::new(FILENAME, 321 * (1 << 20), 1 << 20).is_err());
+    assert!(Par2Creator::new(FILENAME, 300 * (1 << 20), 1 << 20).is_ok());
     // Bad names (mirrors the parser's rejections).
     assert!(Par2Creator::new(b"", 3000, SLICE).is_err());
     assert!(Par2Creator::new(b"\0\0\0\0", 3000, SLICE).is_err());
@@ -471,13 +478,15 @@ fn interop_repair_with_reference_binary_when_available() {
     }
     let _guard = Guard(base);
 
-    // Stage the created set plus a damaged target (two erased slices, within
-    // the 3-slice redundancy), then repair through the existing path.
+    // Stage the created set plus a damaged target (three erased slices: the
+    // full 3-slice redundancy, so the reference binary must use every
+    // recovery row including the exponent-2 row), then repair through the
+    // existing path.
     // Write the damaged file with the erased slices zeroed (simulating lost
     // articles replaced by nothing): repair must reconstruct them.
     fs::write(scratch.join("set.par2"), set.bytes()).unwrap();
     let mut staged = data.clone();
-    for i in [4usize, 17] {
+    for i in [4usize, 17, 20] {
         let start = i * slice as usize;
         let end = (start + slice as usize).min(staged.len());
         staged[start..end].fill(0);

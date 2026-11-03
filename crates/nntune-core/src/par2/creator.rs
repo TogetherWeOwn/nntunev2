@@ -60,10 +60,15 @@ pub const SLICE_ALIGNMENT: u64 = 128;
 /// past it fails closed instead of emitting an unrepairable set.
 pub const MAX_DATA_SLICES: u64 = 20_000;
 
-/// Upper bound on recovery accumulator bytes per file (256 MiB). Real sets
-/// sit near 10% of the file (megabytes); this only stops a hostile or buggy
-/// length/slice combination from committing gigabytes in a Worker isolate.
-pub const MAX_ACCUMULATOR_BYTES: u64 = 256 << 20;
+/// Upper bound on recovery accumulator bytes per file (32 MiB). `new`
+/// allocates the accumulators in full and `finish` holds them alive while
+/// retaining every recovery packet, so the finish peak is ≈2× the
+/// accumulators plus O(slice) scratch; sizing the cap here keeps even the
+/// accepted worst case (≈64 MiB peak) inside the 128 MB Worker-isolate
+/// budget this card streams within. Accumulators sit near 10% of the file,
+/// so 32 MiB still admits ~320 MB per file — far above the FLAC-track class
+/// this serves (≈3.5 MB accumulators); no honest caller is rejected.
+pub const MAX_ACCUMULATOR_BYTES: u64 = 32 << 20;
 
 /// Scratch budget for the [`recover_slices`] dense solve (64 MiB). The
 /// Gauss-Jordan inversion holds three `m × m` `u16` matrices for `m` missing
@@ -96,6 +101,12 @@ pub fn slice_size_for_article_payload(payload_bytes: u64) -> Result<u64> {
 }
 
 /// Number of data slices for `total_len` bytes at `slice_size`.
+///
+/// # Panics
+///
+/// Panics if `slice_size` is zero (integer division by zero). Callers must
+/// validate first — [`Par2Creator::new`] rejects a zero slice size before
+/// reaching this.
 pub fn data_slice_count(total_len: u64, slice_size: u64) -> u64 {
     total_len.div_ceil(slice_size)
 }
