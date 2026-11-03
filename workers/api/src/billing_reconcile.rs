@@ -1289,9 +1289,8 @@ mod tests {
     #[test]
     fn statements_bind_positionally_and_stay_pinned() {
         assert!(
-            reconcile_live_select_statement().contains(
-                "status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
-            ),
+            reconcile_live_select_statement()
+                .contains("status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"),
             "live slot matches the read path predicate",
         );
         assert!(
