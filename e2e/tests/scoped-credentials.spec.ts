@@ -1,5 +1,10 @@
-import { test, expect, type APIRequestContext } from '@playwright/test';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
+import { test, expect, type APIRequestContext, type APIResponse } from '@playwright/test';
+import {
+  accessHeaders,
+  assertNoAccessWall,
+  readApiBody,
+  stagingBaseUrl,
+} from '../helpers/access.js';
 import {
   apiGet,
   apiPost,
@@ -115,6 +120,44 @@ const BEARER_ONLY_MATRIX: ReadonlyArray<{
     reason: 'wrong-scope /v1/search must be exactly 403',
   },
 ];
+
+async function assertMatrixRefusal(
+  res: Pick<APIResponse, 'status' | 'headers' | 'text'>,
+  c: (typeof BEARER_ONLY_MATRIX)[number],
+): Promise<void> {
+  const bodyText = await readApiBody(res, c.path, 'scoped-credentials-matrix');
+  expect(res.status(), c.reason).toBe(c.expectedStatus);
+  // Match the real route's refusal, not just its status. Keep parsing and
+  // comparisons in memory: neither JSON errors nor matcher diffs may echo
+  // an untrusted body, field name or value into the evidence output.
+  let body: unknown;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    // The fixed, names-only failure below also covers non-JSON responses.
+  }
+  const expected: Record<string, unknown> =
+    c.expectedStatus === 401
+      ? { error: 'check your email and try again' }
+      : {
+          code: c.expectedStatus === 403 ? 'forbidden' : 'not_found',
+          message: c.expectedStatus === 403 ? 'insufficient scope' : 'not found',
+          retryable: false,
+        };
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    Array.isArray(body) ||
+    Object.keys(body).length !== Object.keys(expected).length ||
+    !Object.entries(expected).every(
+      ([key, value]) => (body as Record<string, unknown>)[key] === value,
+    )
+  ) {
+    throw new Error(
+      '[scoped-credentials-matrix] expected application refusal fields (names only)',
+    );
+  }
+}
 
 function nativeBaseUrl(): string | null {
   const raw = (process.env.NATIVE_REST_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -271,6 +314,56 @@ test.describe('credential contract table (offline, no staging)', () => {
     const headers = bearerHeaders('SECRET_SENTINEL');
     expect(Object.keys(headers).some((k) => /^(cookie|origin)$/i.test(k))).toBe(false);
   });
+
+  for (const c of BEARER_ONLY_MATRIX) {
+    const response = (body: string): Pick<APIResponse, 'status' | 'headers' | 'text'> => ({
+      status: () => c.expectedStatus,
+      headers: () => ({ 'content-type': 'application/json' }),
+      text: async () => body,
+    });
+
+    test(`matrix accepts genuine application refusal: ${c.id}`, async () => {
+      const body =
+        c.expectedStatus === 401
+          ? { error: 'check your email and try again' }
+          : {
+              code: c.expectedStatus === 403 ? 'forbidden' : 'not_found',
+              message: c.expectedStatus === 403 ? 'insufficient scope' : 'not found',
+              retryable: false,
+            };
+      await assertMatrixRefusal(response(JSON.stringify(body)), c);
+    });
+
+    if (c.expectedStatus === 401 || c.expectedStatus === 403) {
+      test(`matrix rejects body-only Access wall: ${c.id}`, async () => {
+        const wall = '<html>Cloudflare Access BODY_SENTINEL</html>';
+        await expect(assertMatrixRefusal(response(wall), c)).rejects.toThrow(
+          'hit the Cloudflare Access wall',
+        );
+      });
+    }
+
+    test(`matrix rejects non-application bodies with names-only diagnostics: ${c.id}`, async () => {
+      const bodies = [
+        '',
+        '<html>BODY_SENTINEL</html>',
+        'invalid-json-BODY_SENTINEL',
+        'null',
+        '[]',
+        '{"code":"BODY_SENTINEL","message":"BODY_SENTINEL","retryable":false}',
+        '{"error":"BODY_SENTINEL"}',
+        '{"error":"check your email and try again","grant":"BODY_SENTINEL"}',
+        '{"code":"forbidden","message":"insufficient scope","retryable":true}',
+      ];
+      for (const body of bodies) {
+        await expect(assertMatrixRefusal(response(body), c)).rejects.toThrow(
+          'expected application refusal fields (names only)',
+        );
+        const error = await assertMatrixRefusal(response(body), c).catch((e: Error) => e);
+        expect(error instanceof Error && !error.message.includes('BODY_SENTINEL')).toBe(true);
+      }
+    });
+  }
 
   test('bearer headers carry the secret in one place only', () => {
     const headers = bearerHeaders('SECRET_SENTINEL');
@@ -473,11 +566,7 @@ test.describe('staging credential lifecycle', () => {
                 {},
                 'scoped-credentials-matrix',
               );
-        assertNoAccessWall(
-          { status: res.status(), headers: res.headers(), bodyText: '', url: c.path },
-          'scoped-credentials-matrix',
-        );
-        expect(res.status(), c.reason).toBe(c.expectedStatus);
+        await assertMatrixRefusal(res, c);
       } finally {
         await bearerOnly.dispose();
       }
