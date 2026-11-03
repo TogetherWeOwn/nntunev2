@@ -83,12 +83,15 @@ labels are the durable record behind it.
 - Tests prove behaviour. Do not add bespoke oracle or proof scripts just to
   satisfy a reviewer; a new guard or gate script needs its own justification
   in the PR body (what it catches that tests cannot).
-- Staging migrations: a PR that adds or changes `migrations/*.sql` needs a
-  `Staging migration:` line in its body (`migrations-staging` enforces it);
-  see "Staging migrations" in `docs/ops.md`. Green checks are not enough for
-  such a PR: the DDL needs board approval before it is applied to staging, and
-  the PR merges only once its line says `applied`. `migrations-staging` passes
-  a `pending` line with only a warning, so do not merge on it.
+- Staging migrations: staging is verified against the database itself —
+  applies are recorded in `schema_migrations` and the staging deploy gate
+  compares them with `migrations/manifest.toml`; see "Staging migrations"
+  in `docs/ops.md`. Green checks are not enough for such a PR: the DDL
+  needs board approval before it is applied to staging (via
+  `.github/scripts/apply_migration.py`), and the PR merges only once the
+  apply is recorded. A PR that renames a migration must rename it
+  byte-identically and carry its `renamed_from` manifest history
+  (`migrations-staging` enforces it).
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection
   enabled) enforce this.

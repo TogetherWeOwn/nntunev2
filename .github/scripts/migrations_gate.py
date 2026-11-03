@@ -59,6 +59,26 @@ def load_manifest(root):
         filename = entry["file"]
         if Path(filename).name != filename or filename in {".", ".."}:
             raise GateError(f"{MANIFEST} entry {index} file must be a migration filename")
+        # Optional rename history: a staging database records a migration
+        # under the name it was applied with, so a file renumbered before
+        # merge keeps its original name+sha here for the staging gate to
+        # recognise (docs/ops.md, "Staging migrations").
+        renamed_from = entry.get("renamed_from", [])
+        if not isinstance(renamed_from, list) or any(
+            not isinstance(item, dict) for item in renamed_from
+        ):
+            raise GateError(
+                f"{MANIFEST} entry {index} renamed_from must be a list of tables"
+            )
+        for alias in renamed_from:
+            if not all(isinstance(alias.get(key), str) for key in ("file", "sha256")):
+                raise GateError(
+                    f"{MANIFEST} entry {index} renamed_from requires string file and sha256"
+                )
+            if Path(alias["file"]).name != alias["file"] or alias["file"] in {".", ".."}:
+                raise GateError(
+                    f"{MANIFEST} entry {index} renamed_from file must be a migration filename"
+                )
     return entries
 
 
@@ -129,6 +149,34 @@ def check_manifest(root):
         if not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) or entry["sha256"] != checksum:
             report("checksum", filename, "sha256 does not match the migration contents")
             violations += 1
+
+    # Rename aliases must be unambiguous: an old name can satisfy exactly
+    # one entry, and can never collide with a current migration name.
+    alias_owners = {}
+    for entry in entries:
+        for alias in entry.get("renamed_from", []):
+            alias_file = alias["file"]
+            if not NUMBERED_SQL.fullmatch(alias_file):
+                report("bad-rename", alias_file, "renamed_from file must start with a four-digit number and underscore")
+                violations += 1
+            if not re.fullmatch(r"[0-9a-f]{64}", alias["sha256"]):
+                report("bad-rename", alias_file, "renamed_from sha256 must be lowercase hex")
+                violations += 1
+            elif alias["sha256"] != entry["sha256"]:
+                # Renames must be byte-identical: a different sha would let
+                # the staging gate certify content that was never applied
+                # (the applied row carries the original bytes' sha). Edit
+                # nothing when renumbering — not even the header comment.
+                report("bad-rename", alias_file, "renamed_from sha256 must equal the entry sha256 (byte-identical renames only)")
+                violations += 1
+            if alias_file in manifest_files:
+                report("bad-rename", alias_file, "renamed_from file is also a current migration")
+                violations += 1
+            if alias_file in alias_owners:
+                report("bad-rename", alias_file, f"renamed_from file is already used by {alias_owners[alias_file]}")
+                violations += 1
+            else:
+                alias_owners[alias_file] = entry["file"]
 
     for filename in sorted(sql_files - manifest_files):
         report("unlisted", filename, "SQL migration is missing from the manifest")
@@ -218,6 +266,9 @@ def check_drift(root, base_ref):
             current_entry = current_entries.get(filename)
             manifest_changed = (previous is None) != (current_entry is None)
             if previous is not None and current_entry is not None:
+                # renamed_from is staging-apply history, not migration
+                # content: recording it never counts as editing an
+                # applied migration.
                 manifest_changed = manifest_changed or (
                     previous.get("target") != current_entry.get("target")
                     or (not contents_changed and previous.get("sha256") != current_entry.get("sha256"))
