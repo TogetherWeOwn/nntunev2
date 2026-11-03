@@ -10,7 +10,10 @@
 //!   miss answers `502 upstream_unavailable`: the wasm NNTP play adapter
 //!   lands with the operator provider wiring in the follow-up card (the
 //!   portable adapter over [`crate::play`] is fixture-proven natively);
-//!   everything else is a `404`.
+//!   everything else is a `404`. The same follow-up owns grant-rejection
+//!   meter signals on this path: the wasm fetch has no `Meter` sink yet,
+//!   so an authenticated rejection here emits nothing, where the
+//!   portable core emits exactly one signal (see [`crate::play_route`]).
 //! - `POST /probe` on the Durable Object runs one ingest probe batch
 //!   ([`crate::probe`]); `POST /body` fetches one article body
 //!   ([`crate::body`]); `POST /delivered` validates and acknowledges one
@@ -99,14 +102,17 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     let Ok(grant) = grant::verify(token, secret.as_bytes(), now_unix) else {
         return api_error_response(&ApiError::unauthorized(), None);
     };
-    if grant.track_id != track_id {
-        return api_error_response(&ApiError::forbidden(), None);
-    }
-    // A `v1` grant carries no play id to meter against; this route only
-    // serves `v2` (see [`crate::play_route`]).
+    // Same order as the portable route: the `v2` requirement before the
+    // track binding, so a `v1` grant — even one minted for another
+    // track — is a `401`, never a `403`. A `v1` grant carries no play
+    // id to meter against; this route only serves `v2` (see
+    // [`crate::play_route`]).
     let Some(play_id) = grant.play_id.clone() else {
         return api_error_response(&ApiError::unauthorized(), None);
     };
+    if grant.track_id != track_id {
+        return api_error_response(&ApiError::forbidden(), None);
+    }
 
     let Ok(bucket) = env.bucket(AUDIO_CACHE_BINDING) else {
         return api_error_response(&ApiError::internal_error(), None);
@@ -134,14 +140,11 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     let Ok(pointer_bytes) = pointer_body.bytes().await else {
         return unavailable();
     };
-    let Ok(hash) = std::str::from_utf8(&pointer_bytes) else {
+    // Pointer shape is portable-core contract (`cache.rs` owns the key
+    // layout and unit-tests it); this adapter only fetches the bytes.
+    let Some(blob_key) = crate::cache::blob_key_for_pointer(&pointer_bytes) else {
         return unavailable();
     };
-    let hash = hash.trim();
-    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return unavailable();
-    }
-    let blob_key = format!("audio/{hash}");
     let blob_len = match bucket.head(blob_key.clone()).await {
         Ok(Some(blob)) => blob.size(),
         _ => return unavailable(),

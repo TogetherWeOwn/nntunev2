@@ -98,6 +98,10 @@ the same decisions against R2.
   `std::net` and cannot run on wasm32, so the async Durable Object play
   adapter (plus operator provider config) is the follow-up card; the NNTP
   route itself is proven in the portable core by the acceptance tests.
+  Grant-rejection meter signals on the wasm path are deferred to that
+  same follow-up: the wasm fetch has no `Meter` sink yet, so an
+  authenticated rejection there emits nothing (the portable core emits
+  exactly one per “Grant-rejection meter signals” below).
 - **Secret.** Grant verification reads the `PLAY_GRANT_SECRET` secret
   binding (`wrangler secret put PLAY_GRANT_SECRET` per environment; the
   api Worker signs with the same value). Missing or empty fails closed:
@@ -235,8 +239,9 @@ delivered-byte intervals the route reports, and the lease epoch is carried
 for the enforcement card, which mints grants at the api Worker's
 issuance gate). `grant.rs` is the byte-exact format definition both sides
 share; a well-formed `v1` grant verifies but is refused by the route — it
-has no play id to meter against. A `v2` play id must pass the persisted-ledger
-field rule (`[A-Za-z0-9_-]`, 1..=512 bytes) or verification rejects the token
+has no play id to meter against. Every `v2` identity field must pass the
+persisted-ledger field rule (`[A-Za-z0-9_-]`; `user_id` 1..=128 bytes,
+`track_id`/`play_id` 1..=512 bytes) or verification rejects the token
 as `Malformed`, so a grant that verifies can always be metered. The TTL cap
 below applies identically to both versions.
 

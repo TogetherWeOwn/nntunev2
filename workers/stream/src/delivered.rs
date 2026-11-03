@@ -110,7 +110,11 @@ pub fn parse_delivered_report(
     }
     let report: DeliveredInterval = serde_json::from_slice(body)
         .map_err(|_| ProbeError::BadRequest("body must be a delivered report"))?;
-    if report.user_id.is_empty() || report.user_id.len() > MAX_USER_ID_LEN {
+    // The same ledger field rule `grant.rs` applies at verification
+    // (1..=128 bytes — the probe envelope's `MAX_USER_ID_LEN`):
+    // a user id outside it can never form the ledger key either.
+    debug_assert_eq!(MAX_USER_ID_LEN, 128);
+    if !is_valid_key_field(&report.user_id, MAX_USER_ID_LEN) {
         return Err(ProbeError::BadRequest("invalid user_id"));
     }
     if report.user_id != pool_user {
@@ -207,6 +211,20 @@ mod tests {
                 parse_delivered_report(&report_body("user-1", play, track, 0, 1), "user-1")
                     .is_err(),
                 "play={play:?} track={track:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmeterable_user_ids_are_refused() {
+        // Even when the report names the pool owner, a user id outside
+        // the ledger alphabet (or over the 128-byte cap) can never form
+        // the `play:{user}:{track}:{play}` key.
+        for bad_user in ["user:1", "user 1", "", &"u".repeat(129)] {
+            assert!(
+                parse_delivered_report(&report_body(bad_user, "play-7", "track-9", 0, 1), bad_user)
+                    .is_err(),
+                "user={bad_user:?}"
             );
         }
     }

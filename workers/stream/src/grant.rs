@@ -8,10 +8,13 @@
 //! - `v1`: `user_id|track_id|exp_unix` (the original play authorization).
 //! - `v2`: `user_id|track_id|play_id|lease_epoch|exp_unix` — adds the play
 //!   id the hour meter keys delivered-byte intervals by, and the
-//!   concurrency-lease epoch (replan spec §3.1/§3.4). `play_id` must pass
-//!   the persisted-ledger field rule (`[A-Za-z0-9_-]`, 1..=512 bytes) so a
-//!   grant that verifies here can always be metered; anything else is
-//!   [`GrantError::Malformed`]. The public play route requires `v2`.
+//!   concurrency-lease epoch (replan spec §3.1/§3.4). Every identity
+//!   field must pass the persisted-ledger field rule (`[A-Za-z0-9_-]`,
+//!   `user_id` 1..=128 bytes, `track_id` and `play_id` 1..=512 bytes) so
+//!   a grant that verifies here can always be metered — the ledger key
+//!   `play:{user}:{track}:{play}` can always be derived from it —
+//!   anything else is [`GrantError::Malformed`]. The public play route
+//!   requires `v2`.
 //!
 //! This module is the byte-exact format definition: the `api` Worker
 //! mirrors [`issue_v2_at`] when it mints grants at its issuance gate.
@@ -100,8 +103,9 @@ pub fn issue_at(
 /// Issue a `v2` grant expiring at `exp_unix` (the raw signer, like
 /// [`issue`]; production issuance clamps through [`issue_v2_at`]).
 ///
-/// `play_id` must be nonempty, contain no `|`, and pass the ledger field
-/// rule or [`verify`] rejects the minted token as malformed.
+/// `user_id`, `track_id`, and `play_id` must be nonempty, contain no
+/// `|`, and pass the ledger field rule or [`verify`] rejects the minted
+/// token as malformed.
 pub fn issue_v2(
     user_id: &str,
     track_id: &str,
@@ -184,7 +188,15 @@ pub(crate) fn verify_with_user(
             parts.next(),
         ) {
             (Some(u), Some(t), Some(p), Some(epoch), Some(e), None) => {
-                if !crate::meter::is_valid_key_field(p, 512) {
+                // Every identity field must be carryable by the ledger
+                // key (`play:{user}:{track}:{play}`, see
+                // `meter::derive_play_idempotency_key`): a grant that
+                // verifies here can always be metered, so refuse an
+                // unmeterable identity before any bytes are served.
+                if !crate::meter::is_valid_key_field(u, 128)
+                    || !crate::meter::is_valid_key_field(t, 512)
+                    || !crate::meter::is_valid_key_field(p, 512)
+                {
                     return Err((GrantError::Malformed, None));
                 }
                 let epoch: u64 = epoch.parse().map_err(|_| (GrantError::Malformed, None))?;
@@ -493,6 +505,49 @@ mod tests {
         assert_eq!(
             verify(&token, SECRET, 1_699_999_999),
             Err(GrantError::Malformed)
+        );
+    }
+
+    #[test]
+    fn v2_rejects_unmeterable_user_and_track_ids() {
+        // The ledger key is `play:{user}:{track}:{play}`: a user or track
+        // id outside the ledger alphabet (or over its byte cap) could
+        // serve bytes whose delivered report can never be metered, so
+        // the grant must not verify at all.
+        for bad_user in ["", "user:1", "user 1", "üsér", &"u".repeat(129)] {
+            let token = issue_v2(bad_user, "track-9", "play-7", 1, 1_700_000_000, SECRET);
+            assert_eq!(
+                verify(&token, SECRET, 1_699_999_999),
+                Err(GrantError::Malformed),
+                "user id {bad_user:?}"
+            );
+        }
+        for bad_track in ["", "track:9", "track 9", "träck", &"t".repeat(513)] {
+            let token = issue_v2("user-1", bad_track, "play-7", 1, 1_700_000_000, SECRET);
+            assert_eq!(
+                verify(&token, SECRET, 1_699_999_999),
+                Err(GrantError::Malformed),
+                "track id {bad_track:?}"
+            );
+        }
+        // Exact-limit ids are meterable and still verify.
+        let token = issue_v2(
+            &"u".repeat(128),
+            &"t".repeat(512),
+            &"p".repeat(512),
+            1,
+            1_700_000_000,
+            SECRET,
+        );
+        let grant = verify(&token, SECRET, 1_699_999_999).expect("exact-limit ids verify");
+        assert!(
+            crate::meter::derive_play_idempotency_key(
+                &grant.user_id,
+                &grant.track_id,
+                grant.play_id.as_deref().unwrap(),
+            )
+            .is_ok(),
+            "a verified v2 grant is always meterable"
         );
     }
 

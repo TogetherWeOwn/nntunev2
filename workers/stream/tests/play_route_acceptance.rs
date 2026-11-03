@@ -32,8 +32,8 @@ use nntune_stream::grant;
 use nntune_stream::meter::{MemoryMeter, MeterKind};
 use nntune_stream::play::StreamPool;
 use nntune_stream::play_route::{
-    serve_play, MemoryManifestStore, PlayRouteOutcome, PlayRouteRefusal, PlayRouteRequest,
-    PlayRouteServe, TrackManifest,
+    serve_play, ManifestStore, MemoryManifestStore, PlayRouteOutcome, PlayRouteRefusal,
+    PlayRouteRequest, PlayRouteServe, TrackManifest,
 };
 use nntune_stream::pool::Pool;
 use nntune_stream::yenc::{self, PartSpec};
@@ -481,6 +481,93 @@ fn bad_grants_are_refused_with_no_bytes_and_no_provider_contact() {
         let count = h.meter.events.iter().filter(|e| e.kind == kind).count();
         assert_eq!(count, 1, "{kind:?} must fire exactly once");
     }
+}
+
+/// Manifest store that counts lookups, so refusal tests can prove the
+/// route consults no source — not even segment metadata — until the
+/// grant has verified and bound the requested track.
+struct CountingManifestStore {
+    inner: MemoryManifestStore,
+    lookups: AtomicUsize,
+}
+
+impl ManifestStore for CountingManifestStore {
+    fn manifest(&self, track_id: &str) -> Option<TrackManifest> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        self.inner.manifest(track_id)
+    }
+}
+
+#[test]
+fn manifest_store_is_never_consulted_before_authorization_completes() {
+    let mut h = Harness::new(40_000, 20_000, true);
+    let store = CountingManifestStore {
+        inner: h.manifests.clone(),
+        lookups: AtomicUsize::new(0),
+    };
+    let forged = grant::issue_v2("user-1", TRACK_ID, "play-x", 3, EXP_UNIX, b"wrong-secret");
+    let expired = grant::issue_v2("user-1", TRACK_ID, "play-x", 3, NOW_UNIX - 1, SECRET);
+    let v1 = grant::issue("user-1", TRACK_ID, EXP_UNIX, SECRET);
+    let v1_wrong_track = grant::issue("user-1", "track-other", EXP_UNIX, SECRET);
+    let wrong_track = grant::issue_v2("user-1", "track-other", "play-x", 3, EXP_UNIX, SECRET);
+    let unmeterable = grant::issue_v2("user:1", TRACK_ID, "play-x", 3, EXP_UNIX, SECRET);
+
+    let cases: [(Option<String>, u16); 7] = [
+        (None, 401),
+        (Some(forged), 401),
+        (Some(expired), 401),
+        (Some(v1), 401),
+        // The `v2` requirement precedes the track binding in both
+        // adapters: a `v1` grant for another track is a 401, not a 403.
+        (Some(v1_wrong_track), 401),
+        (Some(wrong_track), 403),
+        (Some(unmeterable), 401),
+    ];
+    for (token, status) in cases {
+        let request = PlayRouteRequest {
+            track_id: TRACK_ID.to_string(),
+            token,
+            range: None,
+            trace_id: None,
+        };
+        let refusal = expect_refusal(serve_play(
+            &mut h.pool,
+            &mut h.cache,
+            &mut h.meter,
+            SECRET,
+            &store,
+            h.server.addr,
+            NOW_UNIX,
+            &request,
+        ));
+        assert_eq!(refusal.status, status);
+    }
+    assert_eq!(
+        store.lookups.load(Ordering::SeqCst),
+        0,
+        "no manifest lookup before the grant verifies and binds the track"
+    );
+
+    // An authorized request consults the store exactly once.
+    let request = PlayRouteRequest {
+        track_id: TRACK_ID.to_string(),
+        token: Some(grant_v2("play-counted")),
+        range: None,
+        trace_id: None,
+    };
+    let serve = expect_serve(serve_play(
+        &mut h.pool,
+        &mut h.cache,
+        &mut h.meter,
+        SECRET,
+        &store,
+        h.server.addr,
+        NOW_UNIX,
+        &request,
+    ));
+    assert_eq!(store.lookups.load(Ordering::SeqCst), 1);
+    let body = h.serve_to_completion(serve);
+    assert_eq!(body, h.plain);
 }
 
 #[test]

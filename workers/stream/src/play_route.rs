@@ -269,9 +269,17 @@ pub fn serve_play(
     // grant-rejection meter signals fire exactly once, as before.
     let mut play_id: Option<String> = None;
     let mut user_id: Option<String> = None;
+    // Authorization definitively completes only when the grant verifies
+    // *and* binds this track. Until then no source is touched — not even
+    // the manifest store: a failed or wrong-track pre-verify falls
+    // through to the play core with no manifest, and the core
+    // authorizes before it looks at segments, so the rejection (and its
+    // meter signal) is unchanged.
+    let mut authorized = false;
     if let Ok(grant) = grant::verify(token, secret, now_unix) {
         match grant.play_id {
             Some(id) => {
+                authorized = grant.track_id == request.track_id;
                 play_id = Some(id);
                 user_id = Some(grant.user_id);
             }
@@ -285,7 +293,11 @@ pub fn serve_play(
         }
     }
 
-    let manifest = manifests.manifest(&request.track_id);
+    let manifest = if authorized {
+        manifests.manifest(&request.track_id)
+    } else {
+        None
+    };
     let (segments, segment_ranges, cipher_key) = match &manifest {
         Some(manifest) => (
             manifest.segments.clone(),
