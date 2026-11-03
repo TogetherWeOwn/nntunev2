@@ -90,6 +90,61 @@ describe('plan-limit 402/429 handling with upgrade CTA', () => {
 		expect(model.countdownText).toContain('45');
 	});
 
+	it('402 subscription_required renders subscribe copy, never limit copy', async () => {
+		const planLimit = await loadPlanLimit();
+
+		const model = planLimit.toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'subscription_required', reason: 'never_subscribed' }
+		});
+
+		expect(model).not.toBeNull();
+		expect(model.kind).toBe('terminal');
+		expect(model.code).toBe('subscription_required');
+		expect(model.ctaHref).toBe('/pricing');
+		expect(model.headline.toLowerCase()).toContain('subscribe');
+		// No limit was reached: the copy must not claim one, and there is
+		// no countdown on a terminal refusal.
+		expect(model.detail.toLowerCase()).not.toContain('limit');
+		expect(model.detail.toLowerCase()).not.toContain('usage');
+		expect(model.retryAfterSeconds).toBeNull();
+		expect(model.countdownText).toBeNull();
+	});
+
+	it('402 subscription_required with reason lapsed renders reactivate copy', async () => {
+		const planLimit = await loadPlanLimit();
+
+		const model = planLimit.toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'subscription_required', reason: 'lapsed' }
+		});
+
+		expect(model).not.toBeNull();
+		expect(model.kind).toBe('terminal');
+		expect(model.ctaHref).toBe('/account/billing');
+		expect(model.headline.toLowerCase()).toContain('lapsed');
+		expect(model.detail.toLowerCase()).toContain('active again');
+		expect(model.detail.toLowerCase()).not.toContain('limit');
+	});
+
+	it('402 subscription_required without a known reason falls back to subscribe copy', async () => {
+		const planLimit = await loadPlanLimit();
+
+		for (const body of [
+			{ code: 'subscription_required' },
+			{ code: 'subscription_required', reason: 'something-else' },
+			{ code: 'subscription_required', reason: 42 }
+		]) {
+			const model = planLimit.toPaywallModel({ status: 402, headers: new Headers(), body });
+			expect(model).not.toBeNull();
+			expect(model.headline.toLowerCase()).toContain('subscribe');
+			expect(model.detail.toLowerCase()).toContain('needs a plan');
+			expect(model.detail.toLowerCase()).not.toContain('resubscribe');
+		}
+	});
+
 	it('paywall display fires the documented analytics event with no PII', async () => {
 		const planLimit = await loadPlanLimit();
 		expect(planLimit.PAYWALL_SHOWN_EVENT).toBe('usage_limit_paywall_shown');
