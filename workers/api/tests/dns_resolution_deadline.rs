@@ -176,13 +176,7 @@ impl handlers::Store for Store {
         Err(handlers::StoreError)
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
-        self.audits.borrow_mut().push(vault::AuditEvent {
-            user_id: event.user_id.clone(),
-            action: event.action.clone(),
-            ok: event.ok,
-            source_ip: event.source_ip.clone(),
-            at: event.at,
-        });
+        self.audits.borrow_mut().push(event.clone());
         Ok(())
     }
     async fn reserve_rate_limit(
@@ -356,6 +350,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: "198.51.100.9".into(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
     fn request(&self, method: &str, path: &str, body: serde_json::Value) -> handlers::Request {
@@ -365,6 +360,7 @@ impl Harness {
             cookie: Some(self.cookie.clone()),
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: if body.is_null() {
                 vec![]
             } else {

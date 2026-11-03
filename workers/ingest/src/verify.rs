@@ -65,7 +65,7 @@ use crate::dispatch::content_sha256_hex;
 use crate::jobs::validate_job_id;
 use crate::parse::ParsedFile;
 
-/// R2 binding for the ingest scratch bucket (see `wrangler.toml.example`).
+/// R2 binding for the ingest scratch bucket (see `wrangler.toml`).
 pub const SCRATCH_BINDING: &str = "INGEST_SCRATCH";
 
 /// Most files one Verifying step walks (the core parser's file cap).

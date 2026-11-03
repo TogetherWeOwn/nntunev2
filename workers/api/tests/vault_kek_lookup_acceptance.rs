@@ -387,6 +387,7 @@ impl Harness {
             dns: &self.dns,
             now: self.now.get(),
             source_ip: "198.51.100.9".to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         };
         let request = handlers::Request {
             method: method.to_string(),
@@ -394,6 +395,7 @@ impl Harness {
             cookie: cookie.map(str::to_string),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body,
         };
         block_on(handlers::handle(&ctx, &request))

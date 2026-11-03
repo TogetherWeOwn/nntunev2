@@ -83,7 +83,7 @@ test('security.txt is served at the canonical RFC 9116 path', async ({ request }
  *
  * Always-rendered (plain navigation): app-root, signup-email, signup-submit,
  * byop-host, byop-port, byop-user, byop-pass, byop-tls, usage-meter.
- * (User NZB import retired in TWO-1639: no import-file/import-status hooks.)
+ * (User NZB import retired: no import-file/import-status hooks.)
  *
  * Conditional (seeded states): signup-error (mocked 500 register/start),
  * byop-test-connection (wizard advanced to step 3), byop-save + byop-status
@@ -132,7 +132,7 @@ test('contract routes resolve and render their e2e hooks', async ({ page, reques
 	await page.goto('/library');
 	await expect(page.getByTestId('usage-meter')).toBeVisible();
 
-	// User NZB import retired (TWO-1639): the route is gone, so no
+	// User NZB import retired: the route is gone, so no
 	// import-file/import-status hooks render anywhere.
 	await expect(page.getByTestId('import-file')).toHaveCount(0);
 });
@@ -351,7 +351,7 @@ test('wizard hides save until a connection test passes', async ({ page }) => {
  * acceptance-owned. The paired build card lands the route changes on top
  * of this branch and must make them pass WITHOUT editing them; a wrong
  * test comes back to the acceptance card instead.
- * (User NZB import retired in TWO-1639: the import acceptance tests that
+ * (User NZB import retired: the import acceptance tests that
  * lived here were deleted with the route.)
  *
  * Honest-copy shape pinned here (exact wording is the builder's):
@@ -399,7 +399,7 @@ test('library usage copy is honest not-available-yet text', async ({ page }) => 
 });
 
 test('retired user NZB import accepts no upload or URL anywhere', async ({ page }) => {
-	// TWO-1639: no user route accepts an NZB upload or URL. The route is
+	// No user route accepts an NZB upload or URL. The route is
 	// gone (404), the shell carries no import link, and no import hooks
 	// render on any remaining route.
 	const gone = await page.goto('/library/import');

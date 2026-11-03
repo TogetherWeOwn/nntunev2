@@ -1,10 +1,18 @@
 # ADR 0003: Cache Scope + R2 Layout
 
-- **Status:** Accepted design; implementation and independent review gates remain.
+- **Status:** Partially superseded by ADR 0013 (2026-11-03): the per-user
+  grant layer (`user_cache_grants`, own-provider byte proof, per-user
+  budgets/retention/priority) is retired with the BYOP model. Shared
+  content-addressed storage, the R2 bucket map and the publication/sweep
+  race rules below remain in force as restated in ADR 0013.
+- **Status (original):** Accepted design; implementation and independent review gates remain.
 - **Date:** 2026-10-13
 - **Revised:** 2026-10-15 — explicit byte/retention budgets, live gauge,
   FK-safe reclamation and renewal-settlement-aware effective-plan lookup.
 - **Revised:** 2026-10-20 — per-environment bucket map and key prefixes.
+- **Revised:** 2026-11-03 — per-plan cache budget/retention/priority dimensions
+  retired with ADR 0004's revision (columns dropped in migration 0026); see the
+  supersession note under Accounting and collection.
 
 ## Context
 
@@ -216,6 +224,17 @@ is an idempotent replay. These are required implementation tests, not executed
 runtime tests in this ADR.
 
 ### Accounting and collection
+
+> **Supersession note (2026-11-03):** the per-plan cache dimensions this
+> section was written against (`plans.cache_bytes_budget`,
+> `plans.cache_retention_days`, `plans.cache_priority`) no longer exist:
+> ADR 0004's 2026-11-03 revision removed cache budget, retention, and
+> priority as plan dimensions, and migration 0026 dropped the columns
+> (the daily `usage_ledger` named below was dropped by the same
+> migration). The live gauge query stands, but the budget/retention/
+> priority inputs to the cache-GC order below must be redesigned on a
+> non-plan basis (global popularity cache) before cache-GC is
+> implemented; do not reintroduce per-plan cache columns for it.
 
 `plans.cache_bytes_budget` and `plans.cache_retention_days` have concrete values
 in ADR 0004. A user's `cache_bytes` is a **live gauge**:

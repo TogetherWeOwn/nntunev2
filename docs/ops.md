@@ -40,8 +40,8 @@ integration prerequisites on sibling branches are:
 |---|---|
 | [#2](https://github.com/TogetherWeOwn/nntunev2/pull/2), cache ADR | Physical audio/art buckets are separate per environment; prefixes live inside them. |
 | [#14](https://github.com/TogetherWeOwn/nntunev2/pull/14), scaffold | Replace placeholders only when activating the correct consumer bindings. |
-| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | The checked-in example still uses generic `nntune-ingest-jobs` and unsuffixed `nntune-ingest-dlq`, with its consumer commented out. Align producer/consumer queue names and the DLQ route to the per-environment inventory below before enabling a consumer. |
-| `workers/mb/wrangler.toml.example`, MB art cache | The `ART_CACHE` template names only `nntunev2-art-staging`; the prod deploy must override it with `nntunev2-art-prod` when the binding is activated. |
+| [#10](https://github.com/TogetherWeOwn/nntunev2/pull/10), ingest | The real `workers/ingest/wrangler.toml` now uses the per-environment queue names with a live `[[queues.consumers]]` stanza in every environment. Do not enable the staging lane until the runbook gate clears (TWO-1660 search intake); see "Operator runbook: enabling staging-mb / staging-ingest" below. |
+| `workers/mb/wrangler.toml`, MB art cache | Staging binds `nntunev2-art-staging`; the prod section still names the staging bucket on purpose — the prod override to `nntunev2-art-prod` is owned by the MB art-cache activation (`[[known_drift]]` in `.github/scripts/binding_manifest.toml`). |
 | [#11](https://github.com/TogetherWeOwn/nntunev2/pull/11), E2E | Supply the two pending Access client secrets before enabling the staging URL; see the Access section. |
 
 Their owners must coordinate these fixes at the next permitted review round and
@@ -92,14 +92,14 @@ bucket:
 | `nntunev2-audio-prod` | none reported — same evidence as staging; `workers/stream/wrangler.toml:34-36,59-61` declare only the prod `AUDIO_CACHE` bindings |
 
 No `lifecycle` field appears in the checked-in Worker/app Wrangler manifests
-(`workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`,
+(`workers/stream/wrangler.toml`, `workers/mb/wrangler.toml`,
 `workers/repair/wrangler.toml`, `workers/transcode/wrangler.toml`,
-`workers/ingest/wrangler.toml.example`,
+`workers/ingest/wrangler.toml`,
 `workers/api/wrangler.toml.example`, `apps/web/wrangler.toml`) — lifecycle is
 Cloudflare-side, not a Wrangler field, per the audio bucket sources in
 `docs/cache-policy.md` — and the only `lifecycle` string in those manifests is
 the scratch-prefix cleanup comment at
-`workers/ingest/wrangler.toml.example:136`. "None reported" records the
+`workers/ingest/wrangler.toml:117-123`. "None reported" records the
 verified absence of any reported rule for these two audio buckets
 (`workers/stream/wrangler.toml:47-49,59-61`); it does not assert the live
 Cloudflare-side state, which remains unverified for the audio buckets.
@@ -138,14 +138,13 @@ there is no active consumer ([DLQ documentation](https://developers.cloudflare.c
 | `nntunev2-ingest-dlq-staging` | `e7ab1d4b284f44f094c5fe62f9bf96a5` | staging DLQ | 345600 seconds (4 days) | 0 |
 | `nntunev2-ingest-dlq-prod` | `e9d0a9f5549249df9eebaa5c00951328` | prod DLQ | 345600 seconds (4 days) | 0 |
 
-**Routing discrepancy; stop before configuration changes.** The only checked-in
-ingest Wrangler configuration is `workers/ingest/wrangler.toml.example`. Its
-producer and commented consumer use `nntune-ingest-jobs`; its DLQ producer and
-commented `dead_letter_queue` use the unsuffixed `nntune-ingest-dlq`. The
-consumer block remains commented, and this example does not distinguish staging
-from production. These values do not match the environment-specific queue names
-in the table above. No queue or message was changed or consumed; do not enable
-or alter routing until the owning integration lane reconciles this discrepancy.
+**Routing alignment; the enablement gate is the runbook, not the names.** The
+real `workers/ingest/wrangler.toml` uses the per-environment queue names in
+the table above, with a live `[[queues.consumers]]` stanza (plus matching
+`dead_letter_queue`) in every environment — the consumer goes live the moment
+its environment deploys. No queue or message was changed or consumed; do not
+enable the staging lane until the "Operator runbook: enabling staging-mb /
+staging-ingest" gate below clears (TWO-1660 search intake).
 
 UNDO: API `DELETE /accounts/<acct>/queues/<queue_id>` after authorized
 consumer removal and pending-message checks.
@@ -156,6 +155,12 @@ consumer removal and pending-message checks.
 |---|---|---|
 | `nntunev2-config-staging` | `1d4f21508a214ebfa8ff7b594989d6f6` | staging |
 | `nntunev2-config-prod` | `9664ceed71464521bb6baae2d9374006` | prod |
+
+Shared use: each namespace above backs three bindings (`INGEST_STATE`,
+`INGEST_PAYLOADS`, `MB_CACHE`) with disjoint key prefixes
+(`ingest:checkpoint:`/`ingest:verify:`, `nzb:sha256:`, `mb:lookup:`/
+`mb:release-recordings:`); see the Worker bindings KV row. No separate
+namespaces are provisioned; a future split keeps binding names unchanged.
 
 UNDO: API `DELETE /accounts/<acct>/storage/kv/namespaces/<id>` after authorized
 consumer removal and data-retention checks.
@@ -332,15 +337,124 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-Nothing in CI applies `migrations/*.sql`; the staging deploy only runs a
-read-only schema gate and fails if the staging schema is behind the repo. Staging
-migrations are therefore applied out-of-band **before** merge, by the migrator
-role, after board approval for the DDL. A PR that adds or changes a migration
-must say so in its body, and the `migrations-staging` check fails until it does:
-`Staging migration: <files> — applied <YYYY-MM-DD> by <who>`, or
-`Staging migration: pending (blocked on <ticket>)` when the apply is still
-waiting on approval. A pending PR must not merge until the line is updated to
-`applied`; merging it anyway turns `staging-api` red.
+Nothing in CI applies `migrations/*.sql`; staging migrations are applied
+out-of-band **before** merge, by the migrator role, after board approval for
+the DDL. Applies go through `.github/scripts/apply_migration.py`, which
+verifies the file bytes against `migrations/manifest.toml` and writes a
+`public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
+the same transaction** as the migration; a file carrying its own
+`BEGIN`/`COMMIT` is applied by hand and then recorded with
+`--record-only`. Every invocation requires `--expect-database <name>`
+(matching the `DATABASE_URL` database and checked again inside the
+transaction against `current_database()` — a URL pointed at the wrong
+database creates and records nothing), and the apply refuses while an
+earlier same-target manifest entry is unrecorded, so history cannot be
+skipped or reordered. The tracking table's DDL pins its write
+privileges to the table owner on every apply — its rows are deploy
+proof — and the staging gate fails closed while any other role holds
+a write grant on it. The staging deploy's read-only schema gate
+(`.github/scripts/staging_api_schema_gate.py`) compares those rows with
+the manifest's `app` entries — file name plus sha256 — and fails closed
+on a missing, unlisted, sha-mismatched or double-applied migration. That
+comparison, not PR text, is the source of truth for what staging has:
+merging a migration that staging lacks turns `staging-api` red until it
+is applied and recorded.
+
+Rows keep the name a migration was **applied under**. When a PR branch
+renumbers a file that staging already has, the rename must be
+**byte-identical** — change the filename only, not even the header
+comment — and its manifest entry records the original name with the
+entry's own sha as
+`renamed_from = [{ file = "<old>", sha256 = "<same sha>" }]`; the gate
+then recognises the old row as that entry's apply. The
+`migrations-staging` PR check fails a rename that lacks this history,
+and the migrations gate rejects an alias whose sha differs from the
+entry's (a different sha would certify bytes never applied).
+History is append-only — never rewrite or delete a `schema_migrations`
+row to make a rename fit, and the migrations gate's drift check
+rejects removing or changing a `renamed_from` entry that exists on
+the base branch (additions are fine).
+
+Tracking began with the 2026-11-03 backfill
+(`docs/ops/schema-migrations-backfill-2026-11-03-app.sql` and
+`-mirror.sql`, generated by
+`.github/scripts/schema_migrations_backfill.py` from the frozen
+operator-verified staging state). The three pre-merge applies from
+#917 and #922 are recorded by the sibling `-premerge-917.sql` /
+`-premerge-922.sql` files, applied only when each PR merges (or
+equivalently via `apply_migration.py --record-only`), so the gate is
+green immediately after the app backfill. The mirror database is shared by staging and
+production reads, so its backfill — and creating the table on
+production at all — is applied only under a Release Manager decision;
+production applies use the same `apply_migration.py` path once their
+gate opens.
+
+### Admin bootstrap (owner promotion)
+
+Migration 0028 adds `users.role` (`member` default). The admin API can
+change roles only for an existing admin, and an admin can never change
+their own role through it — so the **first** admin in each environment is
+promoted by this reviewed operator step, run by the migrator role, never
+self-serve:
+
+**Ordering (do not reorder):** the owner account must exist and be
+promoted **before** `INVITES_REQUIRED` is flipped on in that
+environment. Once invites are required, signup needs a code, codes are
+issued by an admin, and with no admin promoted yet nobody — including the
+owner — can sign up. The flip is a separate operator env action taken
+last, on the invite-management work, after a first invite can be issued.
+
+Run in one transaction (replace the email; epoch seconds for `at`):
+
+```sql
+BEGIN;
+-- Precondition: exactly one row, currently a member.
+SELECT id, role FROM users WHERE email = '<owner-email>';
+-- The audit insert reads from the promotion itself, so no promotion
+-- (zero rows updated: already an admin, or no such account) means no
+-- audit row — the log can never record a change that did not happen.
+-- Exactly one row must be inserted; otherwise ROLLBACK and investigate.
+WITH promoted AS (
+  UPDATE users SET role = 'admin'
+  WHERE email = '<owner-email>' AND role = 'member'
+  RETURNING id
+)
+INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details)
+SELECT id, 'user.role_changed', TRUE, 'ops-bootstrap', <epoch-seconds>, id,
+       jsonb_build_object('old', 'member', 'new', 'admin', 'via', 'ops-bootstrap')
+FROM promoted;
+COMMIT;
+```
+
+(`user_id` is the promoted account: for this one operator-run change
+there is no acting user, and `details.via` records that it was the
+bootstrap rather than an admin-API write.) After promotion, the owner
+signs in normally and every further role change goes through
+`PUT /v1/admin/users/{id}/role`, which writes its own audit row.
+
+### Admin-issued invites
+
+Migration 0033 extends `invite_codes` (surrogate row id, issuer, kind,
+optional email binding, required expiry, redemption and revocation
+stamps) and adds `users.invited_by`. Signed-in admins manage invites
+through the role-gated admin API: `POST /v1/admin/invites` issues one
+invite (optionally bound to an email; per-invite expiry 1–30 days, or
+the `invite_default_expiry_days` setting), `GET /v1/admin/invites`
+(with `/status/{active|expired|redeemed|revoked}` and
+`/issuer/{user_id}` filters) lists lifecycle state, and
+`POST /v1/admin/invites/{id}/revoke` revokes an unredeemed invite.
+The plaintext code is returned exactly once, in the issue response;
+only its hash is stored, and audit rows (`invite.issued`,
+`invite.redeemed`, `invite.revoked`) reference the invite by row id —
+code material is never stored, logged, or audited. A code is consumed
+atomically inside signup completion only, so an abandoned signup
+leaves it redeemable, a committed revocation beats an in-flight
+redemption, and deleting the redeemed account never frees the code.
+Every invalid code — unknown, expired, revoked, spent, email-mismatch
+or the issuer's own email — gets the same generic signup error.
+Flipping `INVITES_REQUIRED` on stays the last operator step, after
+the bootstrap above and after a first invite has been issued and
+redeemed end-to-end in that environment.
 
 ### Hyperdrive bindings
 
@@ -430,7 +544,7 @@ Binding names are chosen in Worker configs; resource names must match this table
 | Stream service (ingest `NNTP_POOL` cross-script target) | `nntune-stream-staging` | `nntune-stream` |
 | Repair service (ingest `REPAIR_CONTAINER` target) | `nntune-repair-staging` | `nntune-repair` |
 | Transcode service (ingest `TRANSCODE_CONTAINER` target) | `nntune-transcode-staging` | `nntune-transcode` |
-| MB service (ingest `MB_API` target; Wrangler default-suffixed, no per-env `name` committed) | `nntune-mb-staging` | `nntune-mb-production` |
+| MB service (ingest `MB_API` target; per-env `name` committed in `workers/mb/wrangler.toml:24,:61,:80`) | `nntune-mb-staging` | `nntune-mb-production` |
 | Hostname | `staging.nntune.com` (+ Access; web catch-all + api `/v1/*`, `/healthz` and `/api/test-codes` routes) | `nntune.com` (decided 2026-10-21; apex attach after staging E2E PASS, `www` redirects to apex) |
 | App Hyperdrive variable | `HYPERDRIVE_ID_STAGING` | `HYPERDRIVE_ID_PROD` |
 | App PlanetScale branch / PostgreSQL database | `nntunev2` / `main` / `nntunev2_staging` | same `main` cluster / currently `postgres`; clean launch DB deferred |
@@ -469,20 +583,20 @@ config sources in the Non-storage bindings inventory below.
 | Worker (config source) | Binding | Type | staging | prod | ID / variable |
 |---|---|---|---|---|---|
 | `stream` (`workers/stream/wrangler.toml`) | `AUDIO_CACHE` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID |
-| `ingest` (`workers/ingest/wrangler.toml.example`) | `AUDIO_PUBLISH` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID; write-only publication binding (same buckets as `AUDIO_CACHE`), bucket name mirrored in the `AUDIO_BUCKET_NAME` var |
-| `mb` (`workers/mb/wrangler.toml.example`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID |
+| `ingest` (`workers/ingest/wrangler.toml`) | `AUDIO_PUBLISH` | R2 | `nntunev2-audio-staging` | `nntunev2-audio-prod` | name-bound, no ID; write-only publication binding (same buckets as `AUDIO_CACHE`), bucket name mirrored in the `AUDIO_BUCKET_NAME` var |
+| `mb` (`workers/mb/wrangler.toml`) | `ART_CACHE` | R2 | `nntunev2-art-staging` | `nntunev2-art-prod` | name-bound, no ID; the prod section still names the staging bucket until the MB art-cache activation lands (`[[known_drift]]`) |
 | `mb` | `MB_DB` | Hyperdrive | `nntunev2-mb` (shared mirror) | same | `1c6460d5112448888031973c87f671bc` / `HYPERDRIVE_ID_MB` |
 | `api` (`workers/api/wrangler.toml.example`) | `HYPERDRIVE` | Hyperdrive | `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | staging `61c87403f119430bbc3a7f571df47002` / `HYPERDRIVE_ID_STAGING`; prod `d38a229748f6452bb417c6d33d277a8d` / `HYPERDRIVE_ID_PROD` |
-| `ingest` (`workers/ingest/wrangler.toml.example`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
+| `ingest` (`workers/ingest/wrangler.toml`) | `LIBRARY_DB` | Hyperdrive | intended app `nntunev2-staging` | reserved: do not enable; clean launch DB deferred | same IDs / variables as `api`; prod must remain disabled until the clean launch DB is ready |
 | `ingest` | `INGEST_QUEUE` (producer) | Queue | `nntunev2-ingest-staging` | `nntunev2-ingest-prod` | staging `c9e6afdea0ca487c8d20f799a052b045`; prod `2bf7e1a0edd347c9aada2afbc0c24ae5` |
-| `mb` / `ingest` (at activation) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; assigned at activation, never by default |
+| `mb` / `ingest` (shared reserved namespace) | `MB_CACHE` / `INGEST_STATE` / `INGEST_PAYLOADS` | KV | reserved `nntunev2-config-staging` | reserved `nntunev2-config-prod` | staging `1d4f21508a214ebfa8ff7b594989d6f6`; prod `9664ceed71464521bb6baae2d9374006`; all three bindings share the single reserved namespace per env (dedicated namespaces not provisioned). Keys disjoint by prefix: `ingest:checkpoint:`/`ingest:verify:` (`workers/ingest/src/checkpoint.rs`), `nzb:sha256:` (`workers/ingest/src/dispatch.rs:31`), `mb:lookup:`/`mb:release-recordings:` (`workers/mb/src/lib.rs`). Sharing couples quota/blast radius; accepted for staging; split later without code change |
 
 Known config drift (tracked in the R2 reconciliation table, fixed by the
-owning lanes, not here): `workers/ingest/wrangler.toml.example` still names
-`nntune-ingest-jobs` for the producer and commented consumer, and the unsuffixed
-`nntune-ingest-dlq` for the DLQ producer and commented `dead_letter_queue`.
-Neither environment is represented by these values. Align producer, consumer,
-and DLQ names to the per-environment inventory before enabling the configs. Do
+owning lanes, not here): the ingest queue names are aligned — the real
+`workers/ingest/wrangler.toml` uses the per-environment producer, consumer
+and DLQ names above, with a live consumer in every environment. The remaining
+tracked drift is the mb prod `ART_CACHE` override (see the `ART_CACHE` row
+above and `[[known_drift]]` in `.github/scripts/binding_manifest.toml`). Do
 not add a nested `[[queues.consumers.dead_letter_queue]]` table: Wrangler
 rejects that shape, so it will not configure dead-letter routing.
 
@@ -499,45 +613,43 @@ worker and the exact config source for each row.
 | Binding | Type | Owning worker | staging | prod | Committed config source |
 |---|---|---|---|---|---|
 | `NNTP_POOL` (class declaration) | Durable Object | `stream` | class `NntpPool` | class `NntpPool` | `workers/stream/wrangler.toml:22-24` (top-level), `:44-46` (staging), `:56-58` (production); migration tag `v1` `:26-28`; code `workers/stream/src/runtime.rs:44`, `workers/stream/src/routes.rs:14` |
-| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | `workers/ingest/wrangler.toml.example:128-131` (pins the prod `script_name`; per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
+| `NNTP_POOL` (cross-script use) | Durable Object | `ingest` → `stream` | script `nntune-stream-staging` | script `nntune-stream` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target `nntune-stream-staging` does not exist); prod `workers/ingest/wrangler.toml:259-262` (per-env resolution follows the stream worker names in `workers/stream/wrangler.toml:43,55`) |
 | `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
-| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml.example:152-155`; code `workers/ingest/src/metering.rs:16-18` |
-| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | `workers/ingest/wrangler.toml.example:157-161` (pins the prod service name); target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:24` |
-| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | `workers/ingest/wrangler.toml.example:163-168` (pins the prod service name); target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
-| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml.example:170-175` (single `service = "nntune-mb"`, needs env split); target top-level `name = "nntune-mb"` `workers/mb/wrangler.toml.example:3` with no per-env `name` in `:41-52` (staging) or `:54-65` (production), so Wrangler publishes `nntune-mb-staging` / `nntune-mb-production`; code `workers/ingest/src/matching.rs:30` |
+| `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml:136-139` (top-level), `:212-214` (staging), `:272-274` (production); code `workers/ingest/src/metering.rs:16-18` |
+| `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:141-145`, production `:276-278`; target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:24` |
+| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:147-152`, production `:280-282`; target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
+| `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml:154-158` (top-level), `:216-221` (staging), `:284-286` (production); per-env names committed in `workers/mb/wrangler.toml:24` (top-level), `:61` (staging), `:80` (production); code `workers/ingest/src/matching.rs:30` |
 | `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:33` |
 | `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:34` |
 
 Notes, all referencing (not changing) owning-lane state:
 
-- The committed ingest example carries single (non-env-split) values for
-  its cross-script and service targets (`script_name = "nntune-stream"`,
-  `service = "nntune-repair"`, `service = "nntune-transcode"`,
-  `service = "nntune-mb"`). Stream, repair and transcode
-  have explicit per-env `name` overrides committed in their configs, so
-  their per-environment resolution follows the target workers' committed
-  names above; mb has no per-env `name` (`workers/mb/wrangler.toml.example:3`
-  only, none in `:41-52` or `:54-65`), so its per-environment values above
-  are the Wrangler default-suffixed names and ingest's single
-  `service = "nntune-mb"` needs the same env split. Wiring the env split is
-  owned by the integration lane, like the ingest queue-name drift recorded
-  in the R2 reconciliation table and the paragraph above.
+- The real ingest config carries per-environment values for its
+  cross-script and service targets: staging binds only `MB_API` to
+  `nntune-mb-staging` (`workers/ingest/wrangler.toml:216-221`) and omits
+  `NNTP_POOL`, `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` (`:195-202`),
+  while the top-level and production sections restate the full prod shape
+  (`:108-115`, `:141-158`, `:259-286`). Stream, repair and transcode have
+  explicit per-env `name` overrides committed in their configs, so their
+  per-environment resolution follows the target workers' committed names
+  above; mb likewise commits per-env names (`workers/mb/wrangler.toml:24`,
+  `:61`, `:80`), which ingest's per-env `MB_API` targets name directly.
 - The repair and transcode Workers are not yet deployed: their config
   headers (`workers/repair/wrangler.toml:11-13`,
   `workers/transcode/wrangler.toml:11-13`) require Cloudflare Containers on
   the existing plan (no new spend) with deploy as a later operator action.
   Until then the `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` target names
-  are reserved, not live — and ingest cannot deploy with the committed
-  example until those targets exist, because Cloudflare fails a deploy
-  whose service-binding target does not exist.
+  are reserved, not live — which is why the ingest staging section omits
+  those bindings: Cloudflare fails a deploy whose service-binding target
+  does not exist.
 - Deploy order is stream, mb, repair and transcode (once Containers are
   enabled) before ingest. Ingest reaches the per-user `NntpPool` object
   through the cross-script `NNTP_POOL` binding
-  (`workers/stream/wrangler.toml:4-8`), and it declares unconditional
-  `[[services]]` bindings to `nntune-repair`, `nntune-transcode`
-  and `nntune-mb` (`workers/ingest/wrangler.toml.example:157-175`; mb-first
-  is also stated at `:170-172`). Ingest cannot deploy with the committed
-  example until those service targets exist.
+  (`workers/stream/wrangler.toml:4-8`); its staging section declares only
+  the `MB_API` service binding to `nntune-mb-staging`
+  (`workers/ingest/wrangler.toml:216-221`, mb-first), re-adding
+  `NNTP_POOL`, `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` per environment
+  once each target Worker deploys (see the operator runbook below).
 
 ## Staging promotion checklist
 
@@ -617,9 +729,10 @@ environment exists on this repo.
 - [ ] Staging deploy evidence: record the successful push-triggered
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
-  workflow deploys `apps/web` (`staging-web`) plus the api Worker staging
-  lane (`staging-api`, staging only); it does not deploy stream, MB, ingest
-  or repair Workers. `/api/health` returns exactly `{ok, version}` — the public
+  workflow deploys `apps/web` (`staging-web`) plus the api, mb and ingest
+  Worker staging lanes (`staging-api`, `staging-mb`, `staging-ingest`;
+  staging only, mb before ingest); it does not deploy stream, repair or
+  transcode Workers. `/api/health` returns exactly `{ok, version}` — the public
   package version, never a build identifier
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
   `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves
@@ -665,9 +778,10 @@ environment exists on this repo.
   insufficient. To roll back `apps/web`, open that Actions run and choose
   **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
   `staging-web` is push-only and will be skipped. Verify the rerun's
-  `staging-web` success and staging health. The rerun also redeploys the api
-  Worker through `staging-api` when that lane is configured; that is not
-  verified api rollback, and each Worker needs its own rollback evidence.
+  `staging-web` success and staging health. The rerun also redeploys the api,
+  mb and ingest Workers through `staging-api`, `staging-mb` and
+  `staging-ingest` when those lanes are configured; that is not verified
+  Worker rollback, and each Worker needs its own rollback evidence.
   Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
@@ -677,13 +791,14 @@ environment exists on this repo.
 This section defines evidence only. It does not create a lane.
 
 **Current claim boundary.** `.github/workflows/deploy.yml` deploys
-`apps/web` (`staging-web` on push; no per-PR preview) plus the
-api Worker staging lane (`staging-api` on push, staging only, skipped until
-the Operator wires the staging variables).
+`apps/web` (`staging-web` on push; no per-PR preview) plus the api, mb and
+ingest Worker staging lanes (`staging-api`, `staging-mb`, `staging-ingest`
+on push, staging only, mb before ingest; each skipped until the Operator
+wires its staging variables).
 `.github/workflows/deploy-alerts-staging.yml` deploys only the
 `nntune-alerts-staging` consumer from `workers/observability`. No other
-tracked workflow deploys the backend Workers under `workers/` (`ingest`,
-`stream`, `mb`, `repair`, `transcode`), and
+tracked workflow deploys the remaining backend Workers under `workers/`
+(`stream`, `repair`, `transcode`), and
 `.github/workflows/e2e-staging.yml` exercises the staging web URL, not a
 Worker deploy or rollback. Worker source and Wrangler configs existing in
 the repo are not deployment. Therefore **no backend-Worker deploy,
@@ -691,10 +806,18 @@ rollback, activation, or staging acceptance is currently claimed**, for any
 Worker in any environment, until that Worker's lane exists and its gates
 pass on the exact head being promoted — for the api Worker that requires a
 `staging-api` job conclusion `success`, successful **executed** `Hyperdrive
-cache-disabled gate`, `Verify actual staging session schema (read-only)` and
+cache-disabled gate`, `Verify actual staging migration schema (read-only)` and
 `Deploy api to staging` steps, and the job output
-`deployed=true` (`outcome=deployed`) on the promotion run. Its `source_sha`
-output must match the promotion SHA and the deploy's `BUILD_SHA` argument.
+`deployed=true` (`outcome=deployed`) on the promotion run; for the mb Worker
+that requires a `staging-mb` job conclusion `success`, a successful
+**executed** `Deploy mb to staging` step, and `deployed=true`
+(`outcome=deployed`); for the ingest Worker that requires a `staging-ingest`
+job conclusion `success`, successful **executed** `Hyperdrive cache-disabled
+gate` and `Deploy ingest to staging` steps, and `deployed=true`
+(`outcome=deployed`). Each lane's `source_sha` output must match the
+promotion SHA and the deploy's `BUILD_SHA` argument (the Workers' deployed
+`build_sha` log field carries it; a missing or invalid value renders as
+`"unknown"`, never evidence).
 A missing-config job can conclude `success` while reporting
 `deployed=false`, `outcome=unconfigured`, and an empty `source_sha`; it is
 not deploy evidence. The names-only deployment summary also reports failed
@@ -716,7 +839,7 @@ be called accepted:
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
-| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging session schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2; a config-skipped `success` does not qualify. Record gate results by name and outcome only. |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging migration schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the MB Worker, retain the successful executed `Deploy mb to staging` step outcome plus `staging-mb` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the ingest Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy ingest to staging` step outcomes plus `staging-ingest` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. A config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
@@ -731,3 +854,97 @@ a data restore.
 Evidence records contain names, version identifiers, commit SHAs, and run
 or health-check URLs only. Do not record account IDs, tokens, credentials,
 database URLs, environment values, or personal login identities in them.
+
+## Operator runbook: enabling staging-mb / staging-ingest
+
+Operator-owned actions only. No secrets in the repo or the workflow: Worker
+secrets are operator-set in Cloudflare, and the lanes below only ever read
+secret *names* (the `CLOUDFLARE_*` credentials stay in repo secrets). The
+`staging-mb` and `staging-ingest` lanes exist in
+`.github/workflows/deploy.yml` but must stay operator-disabled — no push
+deploys either Worker — until every step below clears, in order:
+
+1. **TWO-1660 gate (ingest only).** Do not enable `staging-ingest` until
+   TWO-1660 closes search intake. The lane reads the public repo variable
+   `INGEST_STAGING_ENABLED`, disabled by default — unset, or any value but
+   `true`, skips every downstream step with a notice, so the live consumer
+   can never deploy before the Operator acts. Leave it unset until intake
+   closes, then set it to `true`. The `[[queues.consumers]]` stanza in
+   `workers/ingest/wrangler.toml` is live, so the consumer goes live the
+   moment the lane first deploys; a search job admitted before the search
+   boundary is wired would burn its retry budget against the unwired
+   boundary and quarantine. `staging-mb` has no such gate and may proceed
+   first — ingest needs it (`needs: [gate, staging-mb]`, since `MB_API`
+   targets `nntune-mb-staging`).
+2. **Wire the staging variables, mb first.** Set the public repo variables
+   (names only, never values) `HYPERDRIVE_ID_MB` then
+   `HYPERDRIVE_ID_STAGING`, matching the inventory IDs in the Hyperdrive
+   table above. Each lane pins its variable against
+   `.github/scripts/binding_manifest.toml` before generating its staging
+   config and fails the job on mismatch, so a mistyped variable blocks the
+   deploy instead of deploying the wrong binding. Set
+   `INGEST_STAGING_ENABLED` to `true` only after step 1 clears — wiring the
+   two Hyperdrive variables alone never enables `staging-ingest` (the api
+   lane already needs `HYPERDRIVE_ID_STAGING` wired).
+3. **Confirm Worker secrets are operator-set in Cloudflare (names only,
+   never values).** The lanes deploy with `--var BUILD_SHA` (public) only.
+   `wrangler secret put` each of the following before enabling the lanes:
+   - ingest staging (`nntune-ingest-staging`): `INGEST_CALLER_SECRET`
+     (required; every route fails closed without it — code
+     `workers/ingest/src/caller_auth.rs`, `workers/ingest/src/lib.rs`).
+   - ingest production shape (`nntune-ingest`, parity only, not deployed by
+     this card): same `INGEST_CALLER_SECRET`, operator-set when production
+     activates.
+   - api worker (staging and prod, `workers/api`): the same value
+     `INGEST_CALLER_SECRET` (grant minting fails closed without it — code
+     `workers/api/src/ingest_grant.rs`); it must match the ingest value.
+   - mb staging (`nntune-mb-staging`) and production shape: no Worker
+     secrets required (only public vars `BUILD_SHA`, `ENVIRONMENT`).
+   Public vars are not secrets: `BUILD_SHA` (lane-supplied `--var`) and
+   ingest `AUDIO_BUCKET_NAME` (`[vars]`). Record secret *presence* by name
+   only, never values.
+4. **Read-only live-inventory verification (no writes).** Before enabling
+   the lanes, confirm the live staging inventory still matches
+   `.github/scripts/binding_manifest.toml` and the tables above: queues
+   `nntunev2-ingest-staging` and `nntunev2-ingest-dlq-staging`, R2 buckets
+   `nntunev2-ingest-scratch-staging` / `nntunev2-audio-staging` /
+   `nntunev2-art-staging`, Hyperdrive ids behind `HYPERDRIVE_ID_MB` and
+   `HYPERDRIVE_ID_STAGING`, and KV namespace ids
+   `1d4f21508a214ebfa8ff7b594989d6f6`. Read-only GETs/listings only; if any
+   live id differs, stop and reconcile the manifest/inventory first — do not
+   enable the lanes.
+5. **Deploy and verify.** Push to `main` and require, on that run, the
+   `staging-mb` job then the `staging-ingest` job to conclude `success`
+   with outputs `deployed=true`, `outcome=deployed`, and `source_sha`
+   equal to the push SHA (which must also equal the deploy's `BUILD_SHA`
+   argument and the Workers' `build_sha` log field — `"unknown"` is never
+   evidence). An ingest run reporting `outcome=disabled` (enable gate unset)
+   or `outcome=mb-not-deployed` (mb skipped unconfigured) is a skip, not a
+   deploy — do not treat it as evidence; wire the missing piece and push
+   again. Then verify, read-only: the Cloudflare dashboard lists
+   deployments for `nntune-mb-staging` and `nntune-ingest-staging`; the
+   queue consumer is attached to `nntunev2-ingest-staging`; no
+   `*.workers.dev` URL serves either Worker (`workers_dev = false`, no
+   routes); mb answers over the `MB_API` service binding (ingest staging
+   `MB_API` targets `nntune-mb-staging`, never public HTTP). Confirm the
+   `nntune-alerts-staging` tail consumer receives both Workers' structured
+   records; the deployment summary alone proves neither health nor staging
+   acceptance.
+6. **Configure the one staging read account in the pool registry.** Write
+   against the merged pool-registry admin surface if it has landed;
+   otherwise mark this step explicitly blocked on TWO-1643 and do not
+   proceed with a manual workaround. Credentials are operator-entered only,
+   never in repo, logs, or cards.
+7. **Re-add the omitted bindings later.** Once `nntune-stream-staging`,
+   `nntune-repair-staging` and `nntune-transcode-staging` deploy, re-add
+   `NNTP_POOL`, `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER` to the ingest
+   staging section with the per-environment targets, remove the
+   corresponding `absent_in` entries from
+   `.github/scripts/binding_manifest.toml`, and re-run binding-parity
+   before the next staging deploy.
+8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
+   re-run the known-good push's `deploy.yml` run (**Re-run all jobs**;
+   never `workflow_dispatch` on an old SHA — the lanes are push-only and
+   would skip) and retain the per-Worker evidence in the table above. A
+   rerun redeploys every configured lane; that is not verified per-Worker
+   rollback unless each Worker's own outcome evidence is recorded.

@@ -724,7 +724,7 @@ export async function retrieveStagedSignupCode(
     throw new Error(
       `[code-seam] POST /api/test-codes failed: HTTP ${status} (seam absent or outage — ` +
         'names only, no values logged). The staging code-retrieval seam must ' +
-        'return the issued code for example.test mailboxes; without it the wizard-arrival ' +
+        'return the issued code for example.test mailboxes; without it the signup-arrival ' +
         'spec fails here. See e2e/README.md.',
     );
   }
@@ -775,7 +775,7 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
   } catch {
     throw new Error(
       '[webauthn] could not enable the virtual authenticator (names only — no values logged). ' +
-        'The wizard-arrival spec requires a Chromium virtual authenticator; refusing to ' +
+        'The signup-arrival spec requires a Chromium virtual authenticator; refusing to ' +
         'submit the passkey ceremony without one.',
     );
   }

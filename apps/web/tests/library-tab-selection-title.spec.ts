@@ -262,7 +262,7 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	await seed(page, baseURL!); await add(page, 'title-coral'); await settle(page);
 	const selected = await page.title();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
-	// User NZB import retired (TWO-1639): the SPA leg runs through Account
+	// User NZB import retired: the SPA leg runs through Account
 	// billing instead of the deleted /library/import route.
 	const navigation = page.getByRole('navigation', { name: 'Primary' });
 	await navigation.getByRole('link', { name: 'Account', exact: true }).click();

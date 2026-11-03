@@ -377,6 +377,21 @@ impl Default for ContentCache {
     }
 }
 
+/// Resolve a `track/<track_id>` pointer object's bytes to its blob key:
+/// the pointer is exactly one sha256-hex hash (surrounding whitespace
+/// tolerated), and the blob lives at `audio/<hash>`. Anything else —
+/// non-UTF-8, wrong length, non-hex — is not a pointer this cache
+/// wrote and resolves to `None`. This is the single definition of the
+/// pointer shape: the wasm runtime resolves R2 pointers through it, so
+/// the rule is unit-tested natively like the rest of the cache layout.
+pub fn blob_key_for_pointer(pointer: &[u8]) -> Option<String> {
+    let hash = std::str::from_utf8(pointer).ok()?.trim();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("audio/{hash}"))
+}
+
 /// R2 multipart part floor: every part except the last must be at least
 /// this big, and all non-final parts must be the same size (R2 errors
 /// 10011/10048 otherwise). Flushed parts are exactly this size.
@@ -431,6 +446,31 @@ impl MultipartUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_bytes_resolve_to_the_blob_key_only_for_a_sha256_hex_hash() {
+        let hash = ContentCache::hex_hash(b"audio-bytes");
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            blob_key_for_pointer(hash.as_bytes()),
+            Some(format!("audio/{hash}"))
+        );
+        // A trailing newline from a hand-written pointer still resolves.
+        assert_eq!(
+            blob_key_for_pointer(format!("  {hash}\n").as_bytes()),
+            Some(format!("audio/{hash}"))
+        );
+        for bad in [
+            &b""[..],
+            b"not-a-hash",
+            &vec![b'a'; 63][..],
+            &vec![b'a'; 65][..],
+            &vec![b'g'; 64][..],
+            &[0xffu8; 64][..],
+        ] {
+            assert_eq!(blob_key_for_pointer(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn tracks_resolve_to_their_plaintext() {

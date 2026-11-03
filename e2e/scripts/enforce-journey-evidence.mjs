@@ -32,16 +32,21 @@
  *     user-uploaded track skips by name in both modes — user NZB ingest is
  *     retired (TWO-1630) and the assertions return via admin-ingested tracks
  *     once admin ingest can seed a curated track on staging.
+ *   - the capped stream leg ("over-limit staging account is refused with a
+ *     plan-limit status"): it needs a pre-seeded streamable track, and
+ *     since the secret-held real-NZB staging leg retired under the
+ *     CC0-only fixture rule (docs/fixture-audio-licences.md) nothing stages
+ *     one. Parked by name with the same reseed condition as above.
  *
- * Real-NZB mode (REAL_NZB_MODE=true, set by the workflow after it stages the
- * secret-held RAR-set fixture — the only journey mode since the checked-in
- * NZBs were deleted): the legs below skip by name because the RAR set can
- * feed no completable ingest (the pipeline has no RAR read) and hence no
- * streamable track until RAR read lands (one upload is one library row
- * until the per-file manifest lands). Live legs in this mode are signup,
- * library arrival, returning-user login, the provider 430 control and the
- * stream plan-limit refusal leg (the BYOP wizard and the ingest-refusal leg
- * retired with user ingest itself).
+ * Real-NZB mode (REAL_NZB_MODE=true): dormant. No workflow sets it since
+ * the secret-held real-NZB staging leg retired under the CC0-only fixture
+ * rule — staging stages and ingests no NZB. The mode and its extended
+ * list stay only so the parked specs' matching skips keep their
+ * mode-specific reasons until the legs un-park or are deleted with the
+ * dormant fixture helper. When it was live, the legs below skipped by
+ * name because the RAR set could feed no completable ingest (the pipeline
+ * has no RAR read) and hence no streamable track until RAR read lands
+ * (one upload is one library row until the per-file manifest lands).
  * The extended allow-list is fixed here (each entry still binds to its owning
  * spec file and is consumed once), and the effective budget becomes the
  * extended list's length — MAX_ALLOWED_SKIPS keeps governing the non-staged
@@ -52,12 +57,12 @@
  * Environment:
  *   JUNIT_PATH            junit evidence to parse (default: test-results/junit.xml,
  *                         relative to the e2e/ working directory in CI).
- *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 10, the fixme plus
- *                         the nine parked legs below; standard mode only —
- *                         real-NZB mode budgets the extended allow-list
- *                         below instead).
- *   REAL_NZB_MODE         'true' when the run staged the secret-held real NZB
- *                         (workflow sets it from the prepare step's output).
+ *   MAX_ALLOWED_SKIPS     small allow-list budget (default: 11, the fixme,
+ *                         the nine parked legs and the capped stream leg
+ *                         below; standard mode only — real-NZB mode budgets
+ *                         the extended allow-list below instead).
+ *   REAL_NZB_MODE         dormant: 'true' when a run staged the secret-held
+ *                         real NZB. No workflow sets it anymore (see above).
  *   REQUIRE_QA_AUTH_TOKEN 'true' requires QA_AUTH_TOKEN to be set (journey job only;
  *                         the synthetic smoke does not use the account seam).
  *   QA_AUTH_TOKEN         checked for presence only — its value is never read,
@@ -71,7 +76,7 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const JUNIT_PATH = process.env.JUNIT_PATH ?? 'test-results/junit.xml';
-const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '10');
+const MAX_ALLOWED_SKIPS = Number(process.env.MAX_ALLOWED_SKIPS ?? '11');
 const REAL_NZB_MODE = (process.env.REAL_NZB_MODE ?? '') === 'true';
 const REQUIRE_QA_AUTH_TOKEN = (process.env.REQUIRE_QA_AUTH_TOKEN ?? '') === 'true';
 const SUMMARY_PATH = process.env.GITHUB_STEP_SUMMARY || null;
@@ -139,6 +144,15 @@ const ALLOWED_SKIPS = [
     match: 'player queue advances in library-selection order',
     reason: USER_NZB_RETIRED_REASON,
   },
+  {
+    // The capped stream leg needs a pre-seeded streamable track; the
+    // secret-held real-NZB staging leg that used to park it in real-NZB
+    // mode is retired (CC0-only fixture rule), so it parks by name in
+    // standard mode too, with the same reseed condition.
+    file: 'ingest-play-meter.spec.ts',
+    match: 'over-limit staging account is refused with a plan-limit status',
+    reason: USER_NZB_RETIRED_REASON,
+  },
 ];
 
 // Real-NZB-only skips: legs the secret-held RAR set cannot feed (no
@@ -202,11 +216,11 @@ const REAL_NZB_ALLOWED_SKIPS = [
   },
 ];
 
-// Union: the nine parked legs already cover the same-titled RAR-set legs in
-// both modes, so the real-NZB-only entries extend the standard list without
-// doubling any (file, match) pair — every skip title stays consumable exactly
-// once (11 entries: the fixme, the nine parked legs, and the capped-stream
-// leg, which runs live in standard mode and skips only in real-NZB mode).
+// Union: the standard list already covers every same-titled RAR-set leg
+// (the capped-stream leg parks in standard mode too since the real-NZB
+// staging leg retired), so the dormant real-NZB entries extend nothing —
+// every skip title stays consumable exactly once (11 entries: the fixme,
+// the nine parked legs, and the capped-stream leg).
 const ACTIVE_ALLOWED_SKIPS = REAL_NZB_MODE
   ? [
       ...ALLOWED_SKIPS,

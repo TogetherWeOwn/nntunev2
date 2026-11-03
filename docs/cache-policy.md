@@ -51,9 +51,10 @@ which buckets a Worker may never consume.
   absence of any reported rule, not an assertion of live Cloudflare-side
   state — see TTL section.
 - `nntunev2-art-staging` / `nntunev2-art-prod`: env and `ART_CACHE`
-  consumer per `workers/mb/wrangler.toml.example` (commented template:
-  top-level plus `env.staging` staging name, `env.production` prod name;
-  uncomment on activation) and the `docs/ops.md` environments matrix plus
+  consumer per the real `workers/mb/wrangler.toml` (top-level plus
+  `env.staging` staging name; the `env.production` section still names the
+  staging bucket until the MB art-cache activation lands — see the
+  `docs/ops.md` reconciliation table) and the `docs/ops.md` environments matrix plus
   worker-bindings row for `mb`. Lookup/search JSON edge headers are wired
   per `workers/mb/src/lib.rs` (`LOOKUP_CACHE_TTL_S = 86400`,
   `SEARCH_CACHE_TTL_S = 300`, `cache_control`, `json_headers`,
@@ -75,11 +76,11 @@ which buckets a Worker may never consume.
 - `nntunev2-archive-staging` / `nntunev2-archive-prod`: reserved with no
   Worker consumer per the reservation guard below (CI-enforced). No
   `archive` `bucket_name` appears in `workers/stream/wrangler.toml`,
-  `workers/mb/wrangler.toml.example` (commented art names only),
+  `workers/mb/wrangler.toml` (per-env `ART_CACHE` art names only),
   `workers/repair/wrangler.toml` (`INGEST_SCRATCH` only),
   `workers/transcode/wrangler.toml` (`INGEST_SCRATCH` only),
-  `workers/ingest/wrangler.toml.example` (`INGEST_SCRATCH` and
-  `AUDIO_PUBLISH` placeholders plus its never-bind-archive comment with
+  `workers/ingest/wrangler.toml` (`INGEST_SCRATCH` and
+  `AUDIO_PUBLISH` buckets plus its never-bind-archive comment with
   the documented §4.2 audio-publication exception), or
   `apps/web/wrangler.toml` (no R2 bindings); `docs/ops.md` lists both as
   reserved with no consumer and the binding manifest intentionally leaves
@@ -196,7 +197,7 @@ wiring, expiry, GC, or refill behavior.
 | `nntunev2-audio-staging`, `nntunev2-audio-prod` | `no-store` (this table above; deltas below) — authoritative for the real grant-gated play route | **Unwired on the Worker.** No `Cache-Control` string exists anywhere in `workers/stream/src`. The Worker fetch entry answers `404` until the play adapters land (`routes::decide_public_fetch`), and the `respond`/`respond_body` adapters set only `content-type` (plus `retry-after` when carried). The portable play core emits only `Cache-Status` (`HIT`/`MISS`/`STALE`) + `Age` via `PlayResponse::cache_headers` — freshness telemetry, not a browser/CDN directive, and the deploy-config slice must not wire `cache_headers()` onto edge responses without resolving ADR-0003 §"server-side telemetry only" (no hit/miss headers, to avoid hit oracles). **Separate synthetic demo (exempt):** the web helper `AUDIO_CACHE_CONTROL` (`private, max-age=60, must-revalidate`) is wired only on `/api/demo/audio` (no auth, no R2; pinned by `player-seek.spec.ts`), and is explicitly not the contract for the real play route. | `workers/stream/src/play.rs` (`PlayResponse::cache_headers`), `workers/stream/src/cache.rs` (`CacheStatus::header_value`), `workers/stream/src/routes.rs` (`PUBLIC_FETCH_STATUS`, `decide_public_fetch`), `workers/stream/src/runtime.rs` (`fetch`, `respond`, `respond_body`); demo-only: `apps/web/src/lib/player/cacheHeaders.ts` (`AUDIO_CACHE_CONTROL`), `apps/web/src/routes/api/demo/audio/+server.ts`, `apps/web/tests/player-seek.spec.ts`, `docs/adr/0003-cache-scope.md` (telemetry-only `cached_hit`) |
 | `nntunev2-art-staging`, `nntunev2-art-prod` (lookup/search JSON) | `public, max-age=86400` (lookup), `public, max-age=300` (search), failures `no-store` | **Wired — matches this table.** Success responses carry `Cache-Control: public, max-age=<ttl>` via `cache_control(ttl)`; failures (`cache_ttl: None`) render `no-store` in `json_headers` and are written to neither cache. | `workers/mb/src/lib.rs` (`cache_control`, `json_headers`, and the `cache_ttl == None` assertions such as `lookup_missing_is_404_and_not_cached`; the only literal `no-store` header assertion is the healthz test) |
 | `nntunev2-art-staging`, `nntunev2-art-prod` (art bytes) | `public, max-age=86400, immutable` wherever unauthenticated serving lands; gated art follows ADR-0003 (deltas below) | **Unwired on R2-backed art bytes.** No R2 image-body serving code path exists yet: the MusicBrainz Worker returns artwork URLs (e.g. `caa_url` on its entities) and never proxies full images inline, so there is nowhere to set the header on bucket-backed bytes. **Conflicting sources (both recorded, neither authoritative here):** ADR-0003 requires membership/entitlement-gated art to be served through the authenticated handler with `private`/`no-store`, not a public R2 URL — that rule wins for gated art. Separately, the synthetic web demo serves its placeholder via `ARTWORK_CACHE_CONTROL` (`public, max-age=31536000, immutable`) on `/api/demo/artwork` (no R2, no entitlement check; pinned by `cacheHeaders.test.ts` and `player-seek.spec.ts`), explicitly exempt from this prescription. | `workers/mb/src/lib.rs` (entities carry `caa_url`; no image-body response path), deltas below; `docs/adr/0003-cache-scope.md` (CAA/verified Bounds: authenticated handler, `private`/`no-store`); demo-only: `apps/web/src/lib/player/cacheHeaders.ts` (`ARTWORK_CACHE_CONTROL`), `apps/web/src/routes/api/demo/artwork/+server.ts` |
-| `nntunev2-archive-staging`, `nntunev2-archive-prod` | n/a (no reads) | **n/a — no reads, no binding.** No Worker in this repository may bind an archive bucket (CI-enforced); neither stream nor MusicBrainz manifests target one. | `.github/scripts/check_archive_bindings.py` plus `cache-policy` job in `.github/workflows/ci.yml` (required in `ci-ok`); `workers/stream/wrangler.toml`, `workers/mb/wrangler.toml.example`, `workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml.example`, `apps/web/wrangler.toml` |
+| `nntunev2-archive-staging`, `nntunev2-archive-prod` | n/a (no reads) | **n/a — no reads, no binding.** No Worker in this repository may bind an archive bucket (CI-enforced); neither stream nor MusicBrainz manifests target one. | `.github/scripts/check_archive_bindings.py` plus `cache-policy` job in `.github/workflows/ci.yml` (required in `ci-ok`); `workers/stream/wrangler.toml`, `workers/mb/wrangler.toml`, `workers/repair/wrangler.toml`, `workers/ingest/wrangler.toml`, `apps/web/wrangler.toml` |
 
 ## Header-consistency deltas (verified 2026-10-16)
 
@@ -225,5 +226,5 @@ wiring, expiry, GC, or refill behavior.
   demo exemption.
 - Name-alignment deltas: none remaining. `workers/stream/wrangler.toml`
   binds the exact per-environment audio names and
-  `workers/mb/wrangler.toml.example` references the suffixed art names.
+  `workers/mb/wrangler.toml` binds the suffixed art names per environment.
   Neither targets an archive bucket, so the guard passes.

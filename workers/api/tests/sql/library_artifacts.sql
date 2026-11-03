@@ -1,4 +1,4 @@
--- Regression test for migration 0022. Run after
+-- Regression test for migrations 0022/0027 (0027 globalises track_sources). Run after
 -- ALL migrations are applied (see ../run_migration_tests.sh). Everything
 -- happens inside one transaction that is rolled back, so it leaves no rows;
 -- any broken expectation RAISEs and (with ON_ERROR_STOP) fails the run.
@@ -171,13 +171,14 @@ BEGIN
         RAISE EXCEPTION 'fenced grant insert landed a row behind the deletion marker';
     END IF;
 
-    -- track_sources: one slot per (user_id, track_id), job-bound.
+    -- track_sources: one global slot per track_id (migration 0027), no
+    -- per-user owner, job-bound.
     INSERT INTO track_sources
-        (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted,
+        (track_id, source_job_id, indexer_id, nzb_ref_encrypted,
          nzb_ref_envelope_version, nzb_ref_kek_version,
          nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped,
          nzb_ref_payload_nonce, nzb_ref_payload_format)
-    VALUES ('user-la-1', '22222222-2222-2222-2222-222222222222',
+    VALUES ('22222222-2222-2222-2222-222222222222',
             'job_01testartifact0001', NULL, '\x0304'::bytea,
             2, 1,
             '\x000000000000000000000000'::bytea,
@@ -186,18 +187,18 @@ BEGIN
             1);
     BEGIN
         INSERT INTO track_sources
-            (user_id, track_id, source_job_id, indexer_id, nzb_ref_encrypted,
+            (track_id, source_job_id, indexer_id, nzb_ref_encrypted,
              nzb_ref_envelope_version, nzb_ref_kek_version,
              nzb_ref_dek_wrapped_nonce, nzb_ref_dek_wrapped,
              nzb_ref_payload_nonce, nzb_ref_payload_format)
-        VALUES ('user-la-1', '22222222-2222-2222-2222-222222222222',
+        VALUES ('22222222-2222-2222-2222-222222222222',
                 'job_01testartifact0001', NULL, '\x0304'::bytea,
                 2, 1,
                 '\x000000000000000000000000'::bytea,
                 '\x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'::bytea,
                 '\x000000000000000000000000'::bytea,
                 1);
-        RAISE EXCEPTION 'PK accepted a duplicate (user_id, track_id) source';
+        RAISE EXCEPTION 'PK accepted a duplicate track_id source';
     EXCEPTION WHEN unique_violation THEN
         NULL;
     END;
@@ -390,13 +391,15 @@ BEGIN
     END;
 
     -- Sweep step-5 mark indexes plus the GC/RI paths (ADR 0002 rule 3,
-    -- ADR 0003 §collection step 5) all exist.
+    -- ADR 0003 §collection step 5) all exist. idx_track_sources_track is
+    -- gone (migration 0027: redundant under PRIMARY KEY (track_id)); the
+    -- job lookup index stays.
     IF (SELECT count(*) FROM pg_indexes WHERE indexname IN
         ('idx_track_media_hash', 'idx_user_cache_grants_hash',
          'idx_track_media_track', 'idx_track_media_job',
-         'idx_track_sources_track', 'idx_track_sources_job',
-         'idx_tracks_mbid')) <> 7 THEN
-        RAISE EXCEPTION 'expected all seven 0022 access-path indexes to exist';
+         'idx_track_sources_job',
+         'idx_tracks_mbid')) <> 6 THEN
+        RAISE EXCEPTION 'expected all six 0022/0027 access-path indexes to exist';
     END IF;
 END $$;
 

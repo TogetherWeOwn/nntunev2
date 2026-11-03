@@ -701,6 +701,14 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("POST", "/v1/session/revoke-all", SessionOnly),
         ("DELETE", "/v1/account", SessionOnly),
         ("POST", "/v1/billing/checkout", SessionOnly),
+        // Admin surface (migration 0028): session + fresh DB role only.
+        ("GET", "/v1/admin/settings", SessionOnly),
+        (
+            "PUT",
+            "/v1/admin/settings/invite_default_expiry_days",
+            SessionOnly,
+        ),
+        ("PUT", "/v1/admin/users/u_1/role", SessionOnly),
         // Default-deny: cross-surface use, unlisted methods, unknown paths.
         ("GET", "/rest/getArtists.view", Deny),
         ("POST", "/rest/ping.view", Deny),
@@ -712,6 +720,16 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("DELETE", "/v1/plays", Deny),
         ("GET", "/v1/ingest", Deny),
         ("DELETE", "/v1/playlists", Deny),
+        // Admin lookalikes stay default-deny: wrong methods, deeper or
+        // empty segments, and sibling tails never classify.
+        ("POST", "/v1/admin/settings", Deny),
+        ("GET", "/v1/admin/settings/invite_default_expiry_days", Deny),
+        ("PUT", "/v1/admin/settings/", Deny),
+        ("PUT", "/v1/admin/settings/a/b", Deny),
+        ("PUT", "/v1/admin/users/u_1", Deny),
+        ("PUT", "/v1/admin/users/u_1/roles", Deny),
+        ("PUT", "/v1/admin/users//role", Deny),
+        ("GET", "/v1/admin/users/u_1/role", Deny),
         ("GET", "/v1/nope", Deny),
         ("GET", "/", Deny),
         ("", "", Deny),

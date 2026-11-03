@@ -198,7 +198,7 @@ test('missing library endpoint stays neutral and does not expose a cached snapsh
 	await expect(page.getByTestId('library-stale-badge')).toHaveCount(0);
 });
 
-test('empty library carries no NZB import link (retired TWO-1639)', async ({ page }) => {
+test('empty library carries no NZB import link', async ({ page }) => {
 	await page.route('**/api/library', (route) =>
 		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
 	);
@@ -294,7 +294,11 @@ test('magic-link redemption invalidates another tab library snapshot', async ({ 
 	);
 	// Keep this test focused on cross-tab cache invalidation, not the destination page.
 	await magicTab.route('**/api/library', (route) =>
-		route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify(SEEDED.items)
+		})
 	);
 	await magicTab.goto('/auth/magic?token=test-magic-token');
 	await magicTab.getByRole('button', { name: 'Sign in with this link' }).click();

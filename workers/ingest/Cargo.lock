@@ -726,6 +726,7 @@ dependencies = [
  "cbc",
  "crc32fast",
  "crypto_secretbox",
+ "getrandom 0.2.17",
  "libc",
  "md5",
  "quick-xml",
@@ -748,6 +749,7 @@ dependencies = [
  "nntune-core",
  "nntune-logging",
  "nntune-ssrf-guard",
+ "nntune-test-fixtures",
  "nntune-test-nntp",
  "serde",
  "serde-wasm-bindgen",
@@ -770,6 +772,10 @@ dependencies = [
 
 [[package]]
 name = "nntune-ssrf-guard"
+version = "0.1.0"
+
+[[package]]
+name = "nntune-test-fixtures"
 version = "0.1.0"
 
 [[package]]

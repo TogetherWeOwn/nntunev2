@@ -1,0 +1,296 @@
+# NNTune v2 ingest Worker: queue-driven pipeline, no public HTTP surface.
+#
+# Deploy contract (provisioned by the DevOps card; no secrets here):
+# - `workers_dev = false` in every environment and no `[[routes]]`: the
+#   routes still accept caller grants, so the only reachable surface must be
+#   one an authenticated caller fronts. The queue consumer below is the live
+#   entry point. Pinned by `tests/wrangler_workers_dev_off.rs`.
+# - Queue names are per environment (docs/ops.md inventory). The legacy
+#   single-name Rust consts (`INGEST_QUEUE_NAME`, `DLQ_QUEUE_NAME` in
+#   src/dispatch.rs and src/retry.rs) are pinned by unit tests and are NOT
+#   the deploy contract; the per-environment names below are.
+# - The `[[queues.consumers]]` stanza is live: the consumer goes live on
+#   deploy, so the staging deploy lane must stay operator-disabled until
+#   TWO-1660 closes search intake (a search job would burn its retry budget
+#   against the unwired search boundary and quarantine; see
+#   src/queue_consumer.rs). No staging producer can reach the routes over
+#   HTTP (no routes, no workers.dev), but that alone is not enablement
+#   evidence: enabling the lane is the TWO-1660-gated step.
+# - Staging omits `NNTP_POOL`, `REPAIR_CONTAINER` and `TRANSCODE_CONTAINER`
+#   (targets do not exist; Cloudflare fails a deploy whose service-binding
+#   target is missing). Code resolves each binding per call and degrades to
+#   a transient retry when absent — nothing is read at Worker startup — so
+#   the omission only affects calls that need those targets. Runbook:
+#   docs/ops.md "Operator runbook: enabling staging-mb / staging-ingest".
+#   Production restates the full shape for parity only (never deployed by
+#   this card; production goes through the Release Manager).
+# - KV sharing (stated per decision 6): `INGEST_STATE` and `INGEST_PAYLOADS`
+#   share the single reserved config namespace per env with the mb Worker's
+#   `MB_CACHE` (staging `1d4f21508a214ebfa8ff7b594989d6f6`, prod
+#   `9664ceed71464521bb6baae2d9374006`) because dedicated namespaces are not
+#   provisioned. Keys are disjoint by prefix: `ingest:checkpoint:<job_id>`
+#   and `ingest:verify:<job_id>` (src/checkpoint.rs), `nzb:sha256:<hex>`
+#   (src/dispatch.rs:31), versus mb `mb:lookup:<kind>:<mbid>` and
+#   `mb:release-recordings:<mbid>` (workers/mb/src/lib.rs). Sharing couples
+#   quota/blast radius; accepted for staging. Split later without code change
+#   (binding names stay, only ids change).
+#
+# Top-level target is the default `wrangler deploy` (production). Named
+# environments below restate their own bindings (Cloudflare does not
+# inherit them).
+
+name = "nntune-ingest"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+# Never public on *.workers.dev (see header). Pinned by
+# tests/wrangler_workers_dev_off.rs.
+workers_dev = false
+
+[build]
+command = "cargo install -q worker-build --locked && worker-build --release"
+
+[vars]
+# Audio bucket name behind the AUDIO_PUBLISH binding below (code:
+# src/transcode.rs, src/queue_consumer.rs). Per-environment override below.
+AUDIO_BUCKET_NAME = "nntunev2-audio-prod"
+
+# Build identity for log lines (public, non-secret): the 40-char lowercase
+# hex commit SHA supplied at deploy time by the deploy lane (for example
+# `--var BUILD_SHA:$GITHUB_SHA`). Workers log it as the `build_sha` field
+# on every record; an absent or invalid value renders as "unknown" (never a
+# missing key, never fail-closed), which means the lane did not supply it.
+
+# Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs).
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-prod"
+
+# Slice T2: DLQ producer (code: src/retry.rs). Producer-only so a poison job
+# can quarantine even before the consumer ships.
+[[queues.producers]]
+binding = "INGEST_DLQ"
+queue = "nntunev2-ingest-dlq-prod"
+
+# Consumer: handler exists (`event(queue)` in src/queue_consumer.rs) and is
+# LIVE in every environment that deploys this config. A budget stop persists
+# the partial tally, enqueues a fresh copy of the message via the
+# INGEST_QUEUE producer above (5 s delay), and acks the original, so a
+# progressing job spends neither its attempt budget nor the max_retries
+# slots below. Keep max_retries = CONSUMER_MAX_RETRIES (4) in src/retry.rs:
+# it equals PAYLOAD_RETRY_ATTEMPTS in src/dispatch.rs and MAX_ATTEMPTS - 1
+# in src/jobs.rs (a compile-time assert enforces this), and the retry
+# backoff (5/15/30/60 s, 110 s cumulative) needs all four retries to cover
+# the ~60 s KV lag plus the edge-cached negative-lookup window (consumer
+# reads with cacheTtl 30).
+[[queues.consumers]]
+queue = "nntunev2-ingest-prod"
+max_batch_size = 10
+max_retries = 4
+# Safety net for messages the handler never settles (panic, timeout):
+# Cloudflare moves the untouched body with no reason envelope. Without
+# dead_letter_queue, Cloudflare drops the message.
+dead_letter_queue = "nntunev2-ingest-dlq-prod"
+
+# Workflows: NOT YET. This crate exports no Workflow class, and
+# `[[workflows]]` requires a `class_name`, so any entry here is rejected at
+# deploy. Orchestration until then is Queue redelivery + job checkpoints
+# (src/jobs.rs). Re-add with `class_name` when the Workflow class ships.
+
+# Slice 2: library writes (code: src/library.rs).
+[[hyperdrive]]
+binding = "LIBRARY_DB"
+id = "d38a229748f6452bb417c6d33d277a8d"
+
+# Checkpoint store for the Queue consumer (job_id -> JobCheckpoint JSON).
+[[kv_namespaces]]
+binding = "INGEST_STATE"
+id = "9664ceed71464521bb6baae2d9374006"
+
+# Upload payload store (code: src/lib.rs store_upload_payload). The route
+# writes the approved NZB bytes here under the content-addressed
+# `nzb:sha256:<hex>` key from the Queue message before enqueueing; the
+# consumer fetches them by that key. (Bytes cannot ride the Queue message:
+# 2 MiB vs the 128 KB message limit.)
+[[kv_namespaces]]
+binding = "INGEST_PAYLOADS"
+id = "9664ceed71464521bb6baae2d9374006"
+
+# Segment probe (code: src/pool_probe.rs). Cross-script binding to the
+# stream Worker's per-user `NntpPool` Durable Object, addressed by
+# `id_from_name(user_id)`; the object has no public route. Deploy the
+# stream Worker (which declares the class) before this one.
+[[durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+script_name = "nntune-stream"
+
+# Verifying scratch staging (code: src/verify.rs, src/queue_consumer.rs).
+# Fetched files are staged under `ingest-scratch/{job_id}/r{round}/in/…`
+# plus a `manifest.json` as the repair handoff; the provisioned bucket's
+# 7-day lifecycle rule on the `ingest-scratch/` prefix is the cleanup
+# backstop (see docs/ops.md). Never bind the archive buckets here.
+# The audio-cache buckets below are the one deliberate exception: the
+# e2e spec's §4.2 publication step assigns artifact publication
+# (content-addressed `audio/` keys plus the `cache_objects` row) to
+# the ingest `Transcoding` step, so this Worker writes artifacts to
+# the audio bucket through AUDIO_PUBLISH. It never reads the bucket
+# and never touches archive keys.
+[[r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"
+
+[[r2_buckets]]
+binding = "AUDIO_PUBLISH"
+bucket_name = "nntunev2-audio-prod"
+
+# Slice 2: usage metering (code: src/metering.rs).
+[[analytics_engine_datasets]]
+binding = "INGEST_METER"
+dataset = "nntune_ingest_meter"
+
+# Repair dispatch target (code: src/repair.rs): the no-route repair
+# Worker in workers/repair, which fronts the par2 Container.
+[[services]]
+binding = "REPAIR_CONTAINER"
+service = "nntune-repair"
+
+# Transcode dispatch target (code: src/transcode.rs): the no-route
+# transcode Worker in workers/transcode, which fronts the opus-64
+# Container. Deploy that Worker before enabling the consumer.
+[[services]]
+binding = "TRANSCODE_CONTAINER"
+service = "nntune-transcode"
+
+# MusicBrainz read API for the Matching step (code: src/matching.rs,
+# src/queue_consumer.rs). Deploy the mb Worker before this one.
+[[services]]
+binding = "MB_API"
+service = "nntune-mb-production"
+
+[env.staging]
+name = "nntune-ingest-staging"
+workers_dev = false
+
+[env.staging.vars]
+AUDIO_BUCKET_NAME = "nntunev2-audio-staging"
+
+[[env.staging.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-staging"
+
+[[env.staging.queues.producers]]
+binding = "INGEST_DLQ"
+queue = "nntunev2-ingest-dlq-staging"
+
+# LIVE consumer (see the top-level note and the TWO-1660 gate there): goes
+# live the moment this environment deploys.
+[[env.staging.queues.consumers]]
+queue = "nntunev2-ingest-staging"
+max_batch_size = 10
+max_retries = 4
+dead_letter_queue = "nntunev2-ingest-dlq-staging"
+
+[[env.staging.hyperdrive]]
+binding = "LIBRARY_DB"
+id = "61c87403f119430bbc3a7f571df47002"
+
+[[env.staging.kv_namespaces]]
+binding = "INGEST_STATE"
+id = "1d4f21508a214ebfa8ff7b594989d6f6"
+
+[[env.staging.kv_namespaces]]
+binding = "INGEST_PAYLOADS"
+id = "1d4f21508a214ebfa8ff7b594989d6f6"
+
+# Staging omits NNTP_POOL (cross-script target `nntune-stream-staging`
+# does not exist), REPAIR_CONTAINER (`nntune-repair-staging` does not
+# exist) and TRANSCODE_CONTAINER (`nntune-transcode-staging` does not
+# exist): Cloudflare fails a deploy whose service-binding target is
+# missing, and there is no staging target to name. Re-add per environment
+# (with the per-env service/script name) once the target Worker deploys;
+# see the runbook in docs/ops.md. Binding calls resolve per request and
+# degrade to transient retries when absent — no startup read to update.
+
+[[env.staging.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-staging"
+
+[[env.staging.r2_buckets]]
+binding = "AUDIO_PUBLISH"
+bucket_name = "nntunev2-audio-staging"
+
+[[env.staging.analytics_engine_datasets]]
+binding = "INGEST_METER"
+dataset = "nntune_ingest_meter"
+
+# MB read API in staging (code: src/matching.rs). The staging-mb lane
+# deploys `nntune-mb-staging` first; without it this deploy fails on the
+# missing service target.
+[[env.staging.services]]
+binding = "MB_API"
+service = "nntune-mb-staging"
+
+[env.production]
+name = "nntune-ingest"
+workers_dev = false
+
+[env.production.vars]
+AUDIO_BUCKET_NAME = "nntunev2-audio-prod"
+
+# Production sections are parity shape only: no production deploy lane
+# exists in this card (production goes through the Release Manager).
+
+[[env.production.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntunev2-ingest-prod"
+
+[[env.production.queues.producers]]
+binding = "INGEST_DLQ"
+queue = "nntunev2-ingest-dlq-prod"
+
+[[env.production.queues.consumers]]
+queue = "nntunev2-ingest-prod"
+max_batch_size = 10
+max_retries = 4
+dead_letter_queue = "nntunev2-ingest-dlq-prod"
+
+[[env.production.hyperdrive]]
+binding = "LIBRARY_DB"
+id = "d38a229748f6452bb417c6d33d277a8d"
+
+[[env.production.kv_namespaces]]
+binding = "INGEST_STATE"
+id = "9664ceed71464521bb6baae2d9374006"
+
+[[env.production.kv_namespaces]]
+binding = "INGEST_PAYLOADS"
+id = "9664ceed71464521bb6baae2d9374006"
+
+[[env.production.durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+script_name = "nntune-stream"
+
+[[env.production.r2_buckets]]
+binding = "INGEST_SCRATCH"
+bucket_name = "nntunev2-ingest-scratch-prod"
+
+[[env.production.r2_buckets]]
+binding = "AUDIO_PUBLISH"
+bucket_name = "nntunev2-audio-prod"
+
+[[env.production.analytics_engine_datasets]]
+binding = "INGEST_METER"
+dataset = "nntune_ingest_meter"
+
+[[env.production.services]]
+binding = "REPAIR_CONTAINER"
+service = "nntune-repair"
+
+[[env.production.services]]
+binding = "TRANSCODE_CONTAINER"
+service = "nntune-transcode"
+
+[[env.production.services]]
+binding = "MB_API"
+service = "nntune-mb-production"

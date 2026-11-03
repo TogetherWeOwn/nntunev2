@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const workflow = readFileSync(new URL('../../.github/workflows/deploy.yml', import.meta.url), 'utf8');
-const api = workflow.split('\n  staging-api:\n')[1]!.split('\n  post-deploy-e2e:\n')[0]!
+// Scoped to the staging-api job only: the staging-mb and staging-ingest lanes
+// sit between staging-api and post-deploy-e2e and carry their own same-shaped
+// outcome outputs, which would otherwise satisfy the api-job pins (and mute
+// the wiring mutants below). Their evidence lives in workflows.spec.ts.
+const api = workflow.split('\n  staging-api:\n')[1]!.split('\n  staging-mb:\n')[0]!
   .replace(/^\s*#.*$/gm, '');
 
 function step(name: string, source = api): string {
@@ -82,7 +86,7 @@ function assertWiring(source: string) {
   }
   for (const [name, id, condition] of [
     ['Hyperdrive cache-disabled gate', 'hyperdrive', "steps.config.outputs.configured == 'true'"],
-    ['Verify actual staging session schema (read-only)', 'schema', "steps.config.outputs.configured == 'true'"],
+    ['Verify actual staging migration schema (read-only)', 'schema', "steps.config.outputs.configured == 'true'"],
     ['Deploy api to staging', 'deploy', "steps.config.outputs.configured == 'true' && steps.schema.outcome == 'success'"],
   ]) {
     const section = step(name!, source);
@@ -90,9 +94,9 @@ function assertWiring(source: string) {
     expect(section).toContain(`        if: ${condition}\n`);
     expect(section).not.toMatch(/always\(\)|failure\(\)|cancelled\(\)/);
   }
-  expect(step('Verify actual staging session schema (read-only)', source))
+  expect(step('Verify actual staging migration schema (read-only)', source))
     .toContain('run: python3 .github/scripts/staging_api_schema_gate.py');
-  expect(source.indexOf('- name: Verify actual staging session schema (read-only)'))
+  expect(source.indexOf('- name: Verify actual staging migration schema (read-only)'))
     .toBeLessThan(source.indexOf('- name: Deploy api to staging'));
   expect(step('Generate staging wrangler.toml', source)).toContain("        if: steps.config.outputs.configured == 'true'\n");
   expect(source).not.toContain('continue-on-error:');
@@ -174,7 +178,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     const { SCHEMA_OUTCOME: _schemaOutcome, ...env } = positive;
     const result = runShell(shell(reporter), env);
     expect(result.output).toBe('deployed=false\noutcome=failed\nsource_sha=\n');
-    expect(result.summary).toContain('Read-only session schema gate: not-run');
+    expect(result.summary).toContain('Read-only migration schema gate: not-run');
     expect(result.summary).not.toContain(sourceSha);
   });
 
@@ -185,7 +189,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     expect(result.output).toBe(`deployed=true\noutcome=deployed\nsource_sha=${sourceSha}\n`);
     expect(result.summary).toContain('deployment outcome: deployed');
     expect(result.summary).toContain('Hyperdrive cache-disabled gate: success');
-    expect(result.summary).toContain('Read-only session schema gate: success');
+    expect(result.summary).toContain('Read-only migration schema gate: success');
     expect(result.summary).toContain('Deploy api to staging: success');
     expect(result.summary).toContain(`Source SHA: ${sourceSha}`);
     expect(result.summary).toContain(`BUILD_SHA var: ${sourceSha}`);

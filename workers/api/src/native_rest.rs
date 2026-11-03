@@ -466,10 +466,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     match method {
         "GET" => {
             // Catalog reads → library:read (roots and subpaths).
-            // `/api/library` is the legacy alias serving the same entries
-            // as `/v1/library` (TWO-1583): same scope, never a second one.
             if path == "/v1/library"
-                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path.starts_with("/v1/releases/")
@@ -487,11 +484,48 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" || path == "/v1/indexers" || path == "/v1/vault" {
                 return SessionOnly;
             }
+            // Billing/usage display reads: session-only like checkout —
+            // API keys never see plan, usage, or subscription state.
+            if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
+                return SessionOnly;
+            }
             if path == "/v1/credentials" {
                 return SessionOnly;
             }
             if one_segment_after("/v1/operations/", path) {
                 return SessionOnly;
+            }
+            // Admin surface (migration 0028): session + fresh DB role,
+            // never bearer.
+            if path == "/v1/admin/settings" {
+                return SessionOnly;
+            }
+            // Admin ingest reads (migration 0034): the exact list path
+            // (the entry preserves its query string, so the filter and
+            // window survive the runtime's query strip) plus one
+            // single-segment job id. Deeper shapes deny here, before
+            // any spend.
+            if path == "/v1/admin/ingest"
+                || path.starts_with("/v1/admin/ingest?")
+                || one_segment_after("/v1/admin/ingest/", path)
+            {
+                return SessionOnly;
+            }
+            // Admin invite list (migration 0033): the bare path, or
+            // one filter pair (`status/{s}` / `issuer/{id}`). Deeper
+            // shapes deny here, before any spend.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((filter, value)) = rest.split_once('/') {
+                    if matches!(filter, "status" | "issuer")
+                        && !value.is_empty()
+                        && !value.contains('/')
+                    {
+                        return SessionOnly;
+                    }
+                }
             }
             Deny
         }
@@ -501,7 +535,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         // map is explicitly updated.
         "HEAD" => {
             if path == "/v1/library"
-                || path == "/api/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
                 || path == "/v1/tracks"
@@ -531,12 +564,26 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
+                || path == "/v1/admin/ingest"
             {
                 return SessionOnly;
             }
             if let Some(rest) = path.strip_prefix("/v1/libraries/") {
                 if let Some((id, tail)) = rest.split_once('/') {
                     if !id.is_empty() && tail == "members" {
+                        return SessionOnly;
+                    }
+                }
+            }
+            // Admin invite writes (migration 0033): issue at the bare
+            // path, revoke at `{id}/revoke`. Session-only, like the
+            // rest of the admin surface.
+            if path == "/v1/admin/invites" {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
+                if let Some((id, tail)) = rest.split_once('/') {
+                    if !id.is_empty() && tail == "revoke" {
                         return SessionOnly;
                     }
                 }
@@ -552,6 +599,18 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             if path == "/v1/me" || path == "/v1/vault" {
                 return SessionOnly;
+            }
+            // Admin writes (migration 0028): one setting key, or one
+            // user's role. Deeper shapes deny here, before any spend.
+            if one_segment_after("/v1/admin/settings/", path) {
+                return SessionOnly;
+            }
+            if let Some(rest) = path.strip_prefix("/v1/admin/users/") {
+                if let Some((id, tail)) = rest.split_once('/') {
+                    if !id.is_empty() && tail == "role" {
+                        return SessionOnly;
+                    }
+                }
             }
             Deny
         }
@@ -686,8 +745,6 @@ mod tests {
         // catalog root; non-catalog and unknown HEAD shapes stay Deny.
         for path in [
             "/v1/library",
-            // Legacy alias: same entries, same scope (TWO-1583).
-            "/api/library",
             "/v1/artists",
             "/v1/releases",
             "/v1/tracks",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate migration numbering, manifest metadata, checksums, and drift."""
+"""Validate migration numbering, manifest metadata, checksums, drift, and headers."""
 
 import argparse
 import hashlib
@@ -16,6 +16,11 @@ MIGRATIONS = Path("migrations")
 NUMBERED_SQL = re.compile(r"^(\d{4})_.+\.sql$")
 NUMBER_PREFIX = re.compile(r"^(\d{4})_")
 VALID_TARGETS = {"app", "mirror"}
+# Migrations numbered at or below this predate the search_path convention
+# (migrations/README.md) and are manifest-pinned without a header; every
+# new migration above it must open with SEARCH_PATH_HEADER.
+SEARCH_PATH_CUTOFF = 30
+SEARCH_PATH_HEADER = "SET search_path = public, pg_catalog;"
 
 
 class GateError(Exception):
@@ -42,6 +47,54 @@ def report(code, filename, detail):
     print(f"migrations-gate: {code}: {filename}: {detail}")
 
 
+def strip_leading_trivia(text):
+    """Remove leading blank lines, `--` line comments and `/* … */` blocks.
+
+    PostgreSQL block comments nest, so depth is tracked: scanning stops at
+    the `*/` that closes the outermost block, not the first one seen.
+    """
+    pos = 0
+    length = len(text)
+    while pos < length:
+        if text[pos] in " \t\r\n\v\f":
+            pos += 1
+        elif text.startswith("--", pos):
+            end = text.find("\n", pos)
+            pos = length if end == -1 else end + 1
+        elif text.startswith("/*", pos):
+            depth = 1
+            i = pos + 2
+            while i < length and depth > 0:
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth > 0:
+                return ""
+            pos = i
+        else:
+            break
+    return text[pos:]
+
+
+def has_search_path_header(data):
+    """Whether raw migration bytes open with the exact SET header statement.
+
+    Leading comments and blank lines may precede the header; nothing
+    executable may. The match is byte-exact by decision (TWO-1923): the
+    header is one canonical string, not a pattern.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return strip_leading_trivia(text.lstrip("\ufeff")).startswith(SEARCH_PATH_HEADER)
+
+
 def load_manifest(root):
     path = root / MANIFEST
     try:
@@ -59,6 +112,26 @@ def load_manifest(root):
         filename = entry["file"]
         if Path(filename).name != filename or filename in {".", ".."}:
             raise GateError(f"{MANIFEST} entry {index} file must be a migration filename")
+        # Optional rename history: a staging database records a migration
+        # under the name it was applied with, so a file renumbered before
+        # merge keeps its original name+sha here for the staging gate to
+        # recognise (docs/ops.md, "Staging migrations").
+        renamed_from = entry.get("renamed_from", [])
+        if not isinstance(renamed_from, list) or any(
+            not isinstance(item, dict) for item in renamed_from
+        ):
+            raise GateError(
+                f"{MANIFEST} entry {index} renamed_from must be a list of tables"
+            )
+        for alias in renamed_from:
+            if not all(isinstance(alias.get(key), str) for key in ("file", "sha256")):
+                raise GateError(
+                    f"{MANIFEST} entry {index} renamed_from requires string file and sha256"
+                )
+            if Path(alias["file"]).name != alias["file"] or alias["file"] in {".", ".."}:
+                raise GateError(
+                    f"{MANIFEST} entry {index} renamed_from file must be a migration filename"
+                )
     return entries
 
 
@@ -130,6 +203,34 @@ def check_manifest(root):
             report("checksum", filename, "sha256 does not match the migration contents")
             violations += 1
 
+    # Rename aliases must be unambiguous: an old name can satisfy exactly
+    # one entry, and can never collide with a current migration name.
+    alias_owners = {}
+    for entry in entries:
+        for alias in entry.get("renamed_from", []):
+            alias_file = alias["file"]
+            if not NUMBERED_SQL.fullmatch(alias_file):
+                report("bad-rename", alias_file, "renamed_from file must start with a four-digit number and underscore")
+                violations += 1
+            if not re.fullmatch(r"[0-9a-f]{64}", alias["sha256"]):
+                report("bad-rename", alias_file, "renamed_from sha256 must be lowercase hex")
+                violations += 1
+            elif alias["sha256"] != entry["sha256"]:
+                # Renames must be byte-identical: a different sha would let
+                # the staging gate certify content that was never applied
+                # (the applied row carries the original bytes' sha). Edit
+                # nothing when renumbering — not even the header comment.
+                report("bad-rename", alias_file, "renamed_from sha256 must equal the entry sha256 (byte-identical renames only)")
+                violations += 1
+            if alias_file in manifest_files:
+                report("bad-rename", alias_file, "renamed_from file is also a current migration")
+                violations += 1
+            if alias_file in alias_owners:
+                report("bad-rename", alias_file, f"renamed_from file is already used by {alias_owners[alias_file]}")
+                violations += 1
+            else:
+                alias_owners[alias_file] = entry["file"]
+
     for filename in sorted(sql_files - manifest_files):
         report("unlisted", filename, "SQL migration is missing from the manifest")
         violations += 1
@@ -179,6 +280,15 @@ def check_drift(root, base_ref):
         for index, entry in enumerate(base_entries, start=1):
             if not all(isinstance(entry.get(key), str) for key in ("file", "target", "sha256")):
                 raise GateError(f"base migrations/manifest.toml entry {index} requires string file, target, and sha256")
+            renamed_from = entry.get("renamed_from", [])
+            if not isinstance(renamed_from, list) or any(
+                not isinstance(item, dict)
+                or not all(isinstance(item.get(key), str) for key in ("file", "sha256"))
+                for item in renamed_from
+            ):
+                raise GateError(
+                    f"base migrations/manifest.toml entry {index} renamed_from must be a list of file/sha256 tables"
+                )
         base_manifest = {entry["file"]: entry for entry in base_entries}
 
     violations = 0
@@ -191,6 +301,21 @@ def check_drift(root, base_ref):
         expected = base_max + offset
         if number != expected:
             report("out-of-order", filename, f"new migration number must be {expected:04d}")
+            violations += 1
+
+    migrations_dir = root / MIGRATIONS
+    for number, filename in new_numbers:
+        if number <= SEARCH_PATH_CUTOFF:
+            continue
+        path = migrations_dir / filename
+        if path.is_symlink():
+            continue
+        try:
+            contents = path.read_bytes()
+        except OSError:
+            continue
+        if not has_search_path_header(contents):
+            report("missing-search-path", filename, f"new migration must open with {SEARCH_PATH_HEADER}")
             violations += 1
 
     for path in sorted(base_sql):
@@ -218,6 +343,9 @@ def check_drift(root, base_ref):
             current_entry = current_entries.get(filename)
             manifest_changed = (previous is None) != (current_entry is None)
             if previous is not None and current_entry is not None:
+                # renamed_from is staging-apply history, not migration
+                # content: recording it never counts as editing an
+                # applied migration.
                 manifest_changed = manifest_changed or (
                     previous.get("target") != current_entry.get("target")
                     or (not contents_changed and previous.get("sha256") != current_entry.get("sha256"))
@@ -225,13 +353,41 @@ def check_drift(root, base_ref):
             if manifest_changed:
                 report("applied-edited", filename, f"manifest target or checksum differs from base {base_ref}")
                 violations += 1
+            if previous is not None and current_entry is not None:
+                # renamed_from is append-only history: additions record
+                # a new pre-merge rename, but removing or altering an
+                # existing (file, sha256) pair would orphan the row a
+                # database already recorded under that original name,
+                # and the staging gate would then fail closed on a
+                # manifest-only edit. Compare as (file, sha256) pairs,
+                # so changing an alias's sha counts as removal too.
+                previous_aliases = {
+                    (alias["file"], alias["sha256"])
+                    for alias in previous.get("renamed_from", [])
+                }
+                current_aliases = {
+                    (alias["file"], alias["sha256"])
+                    for alias in current_entry.get("renamed_from", [])
+                }
+                if not previous_aliases <= current_aliases:
+                    report(
+                        "rename-history-removed",
+                        filename,
+                        f"renamed_from entries are append-only; an entry present on base {base_ref} was removed or changed",
+                    )
+                    violations += 1
     return violations
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--base-ref")
+    parser.add_argument(
+        "--base-ref",
+        help="base ref to diff against; enables the drift, applied-history, "
+        "and search_path header checks, which only cover files new against "
+        "this ref (without it, only the manifest check runs)",
+    )
     try:
         args = parser.parse_args(argv)
         root = args.root.resolve()

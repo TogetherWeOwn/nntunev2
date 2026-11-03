@@ -311,7 +311,7 @@ test('LORD-07 states: loading/error/empty retain their semantics; retry keeps a 
 	reply.items = [];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expect(page.getByRole('status')).toContainText(/library is empty/i);
-	// User NZB import retired (TWO-1639): the empty state carries no import link.
+	// User NZB import retired: the empty state carries no import link.
 	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
 	await expect(page.getByTestId('library-item')).toHaveCount(0);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);

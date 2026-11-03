@@ -872,6 +872,17 @@ pub struct AuditEvent {
     pub ok: bool,
     pub source_ip: String,
     pub at: u64,
+    /// The user an actor acted on (migration 0028), when the action has
+    /// one — e.g. the target of an admin role change, where `user_id`
+    /// stays the acting admin. `None` for self-actions.
+    #[serde(default)]
+    pub subject_user_id: Option<String>,
+    /// Canonical JSON object with ids and old-to-new scalar values only
+    /// (migration 0028 `details JSONB`). Never secret or code material:
+    /// no credentials, tokens, invite codes or their hashes — writers
+    /// reference rows by id.
+    #[serde(default)]
+    pub details: Option<String>,
 }
 
 /// Placeholder for the audit `source_ip` when the client address is
@@ -902,6 +913,27 @@ pub fn audit_event(user_id: &str, action: &str, ok: bool, source_ip: &str, now: 
         ok,
         source_ip: sanitize_source_ip(Some(source_ip)),
         at: now,
+        subject_user_id: None,
+        details: None,
+    }
+}
+
+/// An [`audit_event`] carrying the migration-0028 extension: the subject
+/// user the actor acted on and a details object (ids and old-to-new
+/// scalar values only; serialized here so the stored form is canonical).
+pub fn audit_event_extended(
+    user_id: &str,
+    action: &str,
+    ok: bool,
+    source_ip: &str,
+    now: u64,
+    subject_user_id: Option<&str>,
+    details: serde_json::Value,
+) -> AuditEvent {
+    AuditEvent {
+        subject_user_id: subject_user_id.map(str::to_string),
+        details: Some(details.to_string()),
+        ..audit_event(user_id, action, ok, source_ip, now)
     }
 }
 

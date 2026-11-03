@@ -26,7 +26,9 @@ export DATABASE_URL=postgres://$USER@localhost:5432/mb_seedcheck
 createdb --host=localhost --port=5432 --username="$USER" mb_seedcheck
 for m in 0001_mb_mirror 0014_mb_import_resume_dlq 0016_mb_track \
          0017_mb_replication_packet_ledger; do
-  psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -f migrations/${m}.sql
+  # Pre-convention migrations carry no search_path header: pin the session,
+  # exactly like workers/api/tests/run_migration_tests.sh.
+  PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -f migrations/${m}.sql
 done
 # Apply the seed (re-runnable upsert).
 psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 \

@@ -124,6 +124,46 @@ target = "app"
 sha256 = "120a35f3515e0c48e1df882f1eed17bb5eed425d9d91bf5da8ec86ec1f9318af"
 
 [[migration]]
-file = "0026_library_table.sql"
+file = "0026_plan_reseed_no_trial.sql"
 target = "app"
-sha256 = "02dfdb9104a0715430130b2ea4551c6f684b89bc156a8093ac1e508650432f98"
+sha256 = "b3668efdfd27bd81d9a9f86441c29925963943c30ed969303bd518af91f30b0c"
+
+[[migration]]
+file = "0027_track_sources_global.sql"
+target = "app"
+sha256 = "67ebbc16347589e856d68bcf17f939045b79de8fbc8ef0fc179b22ca70094ade"
+
+[[migration]]
+file = "0028_admin_foundation.sql"
+target = "app"
+sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"
+
+[[migration]]
+file = "0029_paid_invoice_history.sql"
+target = "app"
+sha256 = "ae1ff5ab6c7f4d060667aa1442d1a76dfa860bec0ddba86d83400462ee3131f8"
+
+[[migration]]
+file = "0030_mb_mirror_w6b.sql"
+target = "mirror"
+sha256 = "004fd5068e141c330d45fcc2cf23d48dc5623752b671d0b17fda8f085178b6ef"
+
+[[migration]]
+file = "0031_meter_derivation_and_leases.sql"
+target = "app"
+sha256 = "0073041714e1a43d69f9dcb42483a3cc12baf6945326b8b20bac94047c85611a"
+
+[[migration]]
+file = "0032_ledger_seconds_floor.sql"
+target = "app"
+sha256 = "9b65ff220fd094c2217d5a2c40ec8316490be432a3a59d03afa6df7559d36a77"
+
+[[migration]]
+file = "0033_invite_codes.sql"
+target = "app"
+sha256 = "12c4331ee4a69688d12352699db634d46a11a4f68814b31a6db572ecdcf01cda"
+
+[[migration]]
+file = "0034_admin_ingest.sql"
+target = "app"
+sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"

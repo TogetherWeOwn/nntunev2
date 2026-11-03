@@ -216,7 +216,7 @@ test('[FAVEXPORT-L05] leaving the page releases the retained Blob URL', async ({
 
 	// Client-side navigation keeps the document, so the page teardown is
 	// the only thing that can revoke the retained URL. User NZB import
-	// retired (TWO-1639): navigate away via Account instead.
+	// retired: navigate away via Account instead.
 	await page.getByRole('link', { name: 'Account', exact: true }).click();
 	await expect(page).toHaveURL(/\/account\/billing/);
 	await expect.poll(() => blobLive(page)).toBe(0);

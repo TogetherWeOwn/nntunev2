@@ -254,6 +254,21 @@
       "input": {
         "id": "synthetic-cred-id"
       }
+    },
+    {
+      "id": "plans-list",
+      "method": "GET",
+      "path": "/v1/plans"
+    },
+    {
+      "id": "me-usage",
+      "method": "GET",
+      "path": "/v1/me/usage"
+    },
+    {
+      "id": "me-subscription",
+      "method": "GET",
+      "path": "/v1/me/subscription"
     }
   ]
 }

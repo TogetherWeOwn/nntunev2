@@ -68,8 +68,11 @@
 //! are executable. Indexer
 //! search (hence probing for search-sourced jobs) has no executable
 //! consumer wiring yet, so those states settle as transient failures
-//! through the shared retry budget. The consumer therefore stays
-//! disabled in `wrangler.toml.example` until that boundary lands.
+//! through the shared retry budget. The `[[queues.consumers]]` stanza in
+//! `wrangler.toml` is therefore live config behind a lane gate: the
+//! staging deploy lane must stay operator-disabled until TWO-1660 closes
+//! search intake, or enabling it would burn search jobs' retry budget and
+//! quarantine them.
 
 use futures_util::{Stream, StreamExt};
 use worker::{Date, Env, MessageBuilder, MessageExt, QueueRetryOptionsBuilder};
@@ -131,7 +134,7 @@ const PROBE_CONTINUATION_DELAY_SECS: u32 = 5;
 
 // Compile-time: the two budget halves agree at the nominal 15 ms
 // sequential STAT round-trip, and a full consumer invocation
-// (`max_batch_size = 10` in wrangler.toml.example — keep in sync) of
+// (`max_batch_size = 10` in wrangler.toml — keep in sync) of
 // worst-case messages, each spending its whole wall budget, stays
 // inside the 15-minute invocation limit with 3x headroom.
 const _: () = assert!(

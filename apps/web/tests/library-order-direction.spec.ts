@@ -294,7 +294,7 @@ test('DORD-06 empty/singleton recomputation keeps the chosen direction for the n
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expectView(page, []);
 	await expect(page.getByRole('status')).toContainText(/library is empty/i);
-	// User NZB import retired (TWO-1639): the empty state carries no import link.
+	// User NZB import retired: the empty state carries no import link.
 	await expect(page.getByRole('link', { name: 'Import an NZB' })).toHaveCount(0);
 	reply.items = [{ id: 'single' }];
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();

@@ -25,7 +25,6 @@ const ROUTES = [
 	'/account/provider',
 	'/demo/player',
 	'/library',
-	'/library/import',
 	'/onboarding/byop'
 ] as const;
 

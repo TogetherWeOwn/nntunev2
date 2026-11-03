@@ -333,13 +333,7 @@ impl handlers::Store for FakeStore {
     }
 
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
-        self.audits.borrow_mut().push(vault::AuditEvent {
-            user_id: event.user_id.clone(),
-            action: event.action.clone(),
-            ok: event.ok,
-            source_ip: event.source_ip.clone(),
-            at: event.at,
-        });
+        self.audits.borrow_mut().push(event.clone());
         Ok(())
     }
 }
@@ -427,6 +421,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -437,6 +432,7 @@ impl Harness {
             cookie,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: b"{}".to_vec(),
         };
         block_on(handlers::handle(&self.ctx(), &request))

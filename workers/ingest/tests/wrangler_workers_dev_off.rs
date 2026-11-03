@@ -1,13 +1,14 @@
-//! The ingest routes trust a self-asserted `user_id` until callers are
-//! authenticated, so the binding map must never expose the Worker on its
-//! public `*.workers.dev` subdomain (wrangler defaults it to on).
+//! The ingest routes accept caller grants, so the binding map must never
+//! expose the Worker on its public `*.workers.dev` subdomain (wrangler
+//! defaults it to on). `workers_dev = false` is pinned at the top level
+//! and in every named environment of the real `wrangler.toml`.
 
-const EXAMPLE: &str = include_str!("../wrangler.toml.example");
+const CONFIG: &str = include_str!("../wrangler.toml");
 
 /// Top-level keys end at the first table header; a `workers_dev` line under
 /// any `[...]` table would not configure the Worker itself.
 fn top_level_value(key: &str) -> Option<&'static str> {
-    EXAMPLE
+    CONFIG
         .lines()
         .map(str::trim)
         .take_while(|line| !line.starts_with('['))
@@ -18,14 +19,49 @@ fn top_level_value(key: &str) -> Option<&'static str> {
         })
 }
 
+/// Value of `workers_dev` inside one `[env.<name>]` section (its own keys
+/// end at the next `[env.` header or any non-env table header).
+fn env_workers_dev(env_table: &str) -> Option<&'static str> {
+    let start = CONFIG.find(env_table)?;
+    let rest = &CONFIG[start + env_table.len()..];
+    // The env's own scalar keys run until the next table header.
+    let mut value = None;
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim() == "workers_dev" {
+                value = Some(v.split('#').next().unwrap_or("").trim());
+            }
+        }
+    }
+    value
+}
+
 #[test]
 fn workers_dev_subdomain_is_disabled_at_top_level() {
     assert_eq!(top_level_value("workers_dev"), Some("false"));
 }
 
 #[test]
+fn workers_dev_subdomain_is_disabled_in_every_env() {
+    for env_table in ["[env.staging]\n", "[env.production]\n"] {
+        assert_eq!(
+            env_workers_dev(env_table),
+            Some("false"),
+            "{env_table:?} must set workers_dev = false explicitly (no inherited defaults)"
+        );
+    }
+}
+
+#[test]
 fn no_table_reenables_workers_dev() {
-    let enabled = EXAMPLE
+    let enabled = CONFIG
         .lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#'))

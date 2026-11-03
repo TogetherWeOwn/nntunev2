@@ -163,9 +163,44 @@ SESSION_TTL_SECS = "86400"
 #                                 dual-pepper window — so pepper rotation
 #                                 currently means reissuing credentials (see
 #                                 ADR 0010 implementation status).
+#   PLAY_GRANT_SECRET             HMAC key for v2 play grants, shared with
+#                                 the stream Worker (same value on both).
+#                                 NOT base64 — unlike every secret above, the
+#                                 raw string bytes are the key on both sides,
+#                                 so stage a plain random string of at
+#                                 least 32 bytes (UTF-8; e.g.
+#                                 `openssl rand -hex 32`); base64-looking
+#                                 values are still used verbatim, which is
+#                                 consistent as long as both Workers hold the
+#                                 identical string. Unset or under 32 bytes:
+#                                 the play routes fail closed per-request,
+#                                 every other route keeps serving.
+#   METER_SINK_SECRET             HMAC key for the stream Worker's
+#                                 play-window flushes to
+#                                 POST /internal/v1/play-windows. Same
+#                                 raw-string rule as PLAY_GRANT_SECRET:
+#                                 plain random string of 32+ chars, same
+#                                 value on both Workers, never
+#                                 base64-decoded. Unset or under 32 chars:
+#                                 the endpoint fails closed and the stream
+#                                 side keeps windows pending (nothing
+#                                 meters, nothing is lost permanently).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
 #   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
 #                                 seam only). High-entropy; same value as the
 #                                 e2e-staging QA_AUTH_TOKEN secret. Staged only
 #                                 together with QA_CODE_SEAM=1 (staging env);
 #                                 never on prod.
+#   STRIPE_SECRET_KEY             Stripe bearer secret, TEST MODE ONLY
+#                                 (`sk_test_...`). Operator-provisioned; the
+#                                 Worker never hardcodes it. `sk_live_` or any
+#                                 other shape refuses startup (fail closed).
+#                                 Unset, Stripe-touching paths fail closed
+#                                 per-request (the webhook 500s so Stripe
+#                                 retries it) while every other route keeps
+#                                 serving.
+#   STRIPE_WEBHOOK_SECRET         Stripe webhook signing secret (`whsec_...`)
+#                                 for `POST /v1/billing/webhook`. Unset, the
+#                                 webhook fails closed per-request (500)
+#                                 before any signature verification — an
+#                                 unverifiable webhook is never acked.

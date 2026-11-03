@@ -44,6 +44,10 @@ use crate::auth::{
 };
 // Single unpadded-base64url codec (F-HARD-01): `crate::b64` over the
 // `base64` crate. The aliased names keep wire-format call sites unchanged.
+use crate::admin_ingest::{
+    self, AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome,
+    StoredAdminIngestJob,
+};
 use crate::b64::{decode as b64url_decode, encode as b64url_encode};
 use crate::providers::{self, ProviderMintRow};
 use crate::session::{self, SessionClaims, SessionRecord};
@@ -65,13 +69,15 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route accepts document
-/// uploads, every other route takes API-sized bodies. Both the entry's
-/// collection gate and the pre-routing size check call this, so the two
-/// caps cannot drift apart.
+/// Per-route request-body bound: the NZB intake route and the admin NZB
+/// upload route accept document uploads, every other route takes
+/// API-sized bodies. Both the entry's collection gate and the pre-routing
+/// size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
     if method == "POST" && path == "/api/ingest" {
         INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/admin/ingest" {
+        admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
     } else {
         MAX_BODY_BYTES
     }
@@ -155,11 +161,17 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
 /// are owned by the deletion executor, and their `delete_operations`
 /// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
-/// (`FakeStore` mirrors this through `deleting_users`).
+/// (`FakeStore` mirrors this through `deleting_users`). Admin accounts
+/// are exempt too: a promoted stub (the operator bootstrap promotes an
+/// existing account, which may hold no credential, session, vault or
+/// live proof yet) is never unverified-signup garbage, and reaping it
+/// would silently delete an admin (`FakeStore` mirrors this through
+/// `user_roles`).
 fn unverified_user_filter() -> String {
     format!(
         "created_at <= $1 \
          AND deleting_at IS NULL \
+         AND users.role = '{member}' \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
                          WHERE webauthn_credentials.user_id = users.id) \
@@ -173,7 +185,8 @@ fn unverified_user_filter() -> String {
                          WHERE sessions.user_id = users.id) \
          AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
                          WHERE magic_link_tokens.user_id = users.id \
-                           AND magic_link_tokens.expires_at > $3)"
+                           AND magic_link_tokens.expires_at > $3)",
+        member = crate::admin::ROLE_MEMBER
     )
 }
 
@@ -247,6 +260,34 @@ pub struct Config {
     /// looked up by exact version (composite `UNIQUE (pepper_version,
     /// key_hmac)`, migration 0019).
     pub native_rest_pepper_version: u32,
+    /// Stripe bearer secret (`STRIPE_SECRET_KEY` Worker secret), test mode
+    /// only. `None` until the operator provisions it (see the Worker entry
+    /// and `wrangler.toml.example`); unprovisioned, every Stripe-touching
+    /// path fails closed per-request (generic 500, so Stripe retries the
+    /// webhook) while every other route keeps serving. Never hardcoded.
+    pub stripe_secret_key: Option<String>,
+    /// Stripe webhook signing secret (`STRIPE_WEBHOOK_SECRET` Worker
+    /// secret). `None` until provisioned; unprovisioned, the webhook route
+    /// fails closed per-request (generic 500) before signature verification
+    /// — an unverifiable webhook is never parsed, never acked.
+    pub stripe_webhook_secret: Option<String>,
+    /// Play-grant HMAC secret shared with the stream Worker
+    /// (`PLAY_GRANT_SECRET`, [`crate::play_grant`]): the RAW string
+    /// bytes, never base64-decoded — the stream side keys its verifier
+    /// with the secret string's bytes, so both sides must agree byte
+    /// for byte. `None` until the operator provisions it; unprovisioned
+    /// (or under the 32-byte minimum, enforced at mint time) the play
+    /// routes fail closed per-request with a generic 500 while every
+    /// other route keeps serving.
+    pub play_grant_secret: Option<Vec<u8>>,
+    /// Meter-sink HMAC secret shared with the stream Worker
+    /// (`METER_SINK_SECRET`, [`crate::meter_sink`]): the RAW string
+    /// bytes, never base64-decoded, for the same reason as the
+    /// play-grant secret. `None` until provisioned; unprovisioned
+    /// (or under the 32-byte minimum) the internal sink route fails
+    /// closed per-request with a generic 500 while every other
+    /// route keeps serving.
+    pub meter_sink_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -314,6 +355,10 @@ impl Config {
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            play_grant_secret: None,
+            meter_sink_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -371,6 +416,41 @@ impl Config {
     pub fn with_native_rest_pepper(mut self, pepper: Vec<u8>, version: u32) -> Self {
         self.native_rest_pepper = Some(pepper);
         self.native_rest_pepper_version = version;
+        self
+    }
+
+    /// Provision the Stripe secrets. The Worker entry calls this only
+    /// after strict validation (the bearer must be a test-mode key —
+    /// `sk_live_` refuses the whole startup — and neither value may be
+    /// blank); unprovisioned (`None`) paths fail closed per-request, so
+    /// this setter never sees bad input in production. Native tests stage
+    /// synthetic secrets directly.
+    pub fn with_stripe(
+        mut self,
+        secret_key: Option<String>,
+        webhook_secret: Option<String>,
+    ) -> Self {
+        self.stripe_secret_key = secret_key;
+        self.stripe_webhook_secret = webhook_secret;
+        self
+    }
+
+    /// Provision the play-grant HMAC secret (raw bytes of the
+    /// `PLAY_GRANT_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by the minter per request (fail closed), so this
+    /// setter accepts whatever the entry staged; native tests pass
+    /// synthetic secrets directly.
+    pub fn with_play_grant_secret(mut self, secret: Vec<u8>) -> Self {
+        self.play_grant_secret = Some(secret);
+        self
+    }
+
+    /// Provision the meter-sink HMAC secret (raw bytes of the
+    /// `METER_SINK_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by [`crate::meter_sink::verify`] per request (fail
+    /// closed), so this setter accepts whatever the entry staged.
+    pub fn with_meter_sink_secret(mut self, secret: Vec<u8>) -> Self {
+        self.meter_sink_secret = Some(secret);
         self
     }
 
@@ -440,6 +520,62 @@ impl Config {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreError;
 
+/// Outcome of one admin write transaction (migration 0028). The
+/// transaction serializes every admin write and re-reads the actor's
+/// role under its locks, so a write authorized by the guard can still
+/// lose the race to a demotion that committed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminWriteOutcome {
+    /// The write and its audit row committed; carries the value the
+    /// write replaced (`None` = no prior stored value).
+    Applied(Option<String>),
+    /// The subject user does not exist (role writes only); nothing was
+    /// written or audited.
+    SubjectMissing,
+    /// The actor was no longer an admin when the write transaction
+    /// re-read their role; nothing was written or audited. The handler
+    /// answers the plain 404, as for any non-admin caller.
+    ActorNotAdmin,
+    /// The subject's account is scheduled for deletion (`deleting_at`
+    /// set; role writes only). ADR 0002 rule 3 fences every writer
+    /// from that moment, so nothing was written or audited; the
+    /// handler answers the typed `account_deleting` 409.
+    AccountDeleting,
+}
+
+/// Outcome of an admin invite issue (migration 0033): the insert and
+/// its `invite.issued` audit row commit together under the same
+/// admin-write serialization as [`AdminWriteOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminInviteIssueOutcome {
+    /// Issued; carries the surrogate row id the audit row references.
+    Issued(i64),
+    /// The actor was no longer an admin at write time; nothing was
+    /// written or audited. The handler answers the plain 404.
+    ActorNotAdmin,
+}
+
+/// Outcome of an admin invite revoke (migration 0033). The revocation
+/// stamps and its `invite.revoked` audit row commit together, and the
+/// conditional write makes revocation win any race against a
+/// redemption claim executing concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminInviteRevokeOutcome {
+    /// This call revoked the invite.
+    Revoked,
+    /// The invite was already revoked; nothing changed and no second
+    /// audit row was written (idempotent retry).
+    AlreadyRevoked,
+    /// The invite was already redeemed; revocation never reaches back
+    /// into a created account.
+    AlreadyRedeemed,
+    /// No invite with that id exists.
+    Missing,
+    /// The actor was no longer an admin at write time; nothing was
+    /// written or audited. The handler answers the plain 404.
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -481,6 +617,30 @@ pub struct VaultRow {
     pub blob: VaultBlob,
     pub indexer_configured: bool,
     pub updated_at: u64,
+}
+
+/// One `plans` row (migration 0021 as reseeded by 0026). Plan prices and
+/// quotas are data: the `GET /v1/plans` handler renders these rows, never
+/// a second hard-coded copy (the `PlanId` enum stays the parity mirror).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRow {
+    pub id: String,
+    pub price_cents: u64,
+    pub stream_hours_month: u64,
+    pub max_concurrent_streams: u64,
+}
+
+/// Owned live-slot subscription row for the billing display reads; feeds
+/// [`crate::billing::SubscriptionView`] by reference. Timestamps are Unix
+/// seconds, `None` where the DB column is NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRow {
+    pub plan_id: String,
+    pub status: String,
+    pub cancel_at_period_end: bool,
+    pub paid_through_at_unix: Option<i64>,
+    pub grace_until_unix: Option<i64>,
+    pub current_period_end_unix: Option<i64>,
 }
 
 /// Stored native REST credential (ADR 0010, migration 0019): the core
@@ -556,18 +716,26 @@ pub trait Store {
     /// Every claim must return exactly one row using `SingleUseClaim` SQL.
     /// Rejection, storage failure, or cancellation must never leave partial
     /// writes. Return success only after commit; no sequential fallback.
+    ///
+    /// When an invite is claimed, `invite_audit` is its `invite.redeemed`
+    /// row and MUST commit in the same transaction (an audit failure
+    /// leaves the invite unspent and the signup retryable); the store
+    /// also stamps `users.invited_by` / `users.invite_code_hash` from
+    /// the claimed invite in that transaction. `invite` and
+    /// `invite_audit` are always both present or both absent.
     fn complete_registration(
         &self,
         challenge: &PasskeyChallenge,
         magic: &MagicLinkRecord,
         invite: Option<&InviteRecord>,
+        invite_audit: Option<&AuditEvent>,
         credential: &PasskeyCredential,
         now: u64,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move {
             // Stores without a transactional implementation must refuse
             // enrollment, never fall back to separately committed claims.
-            let _ = (challenge, magic, invite, credential, now);
+            let _ = (challenge, magic, invite, invite_audit, credential, now);
             Err(StoreError)
         }
     }
@@ -626,8 +794,8 @@ pub trait Store {
             Ok(None)
         }
     }
-    /// Ingest jobs consumed today (UTC) from the daily `usage_ledger`
-    /// aggregate (migration 0021): 0 when no row exists yet. The intake
+    /// Ingest jobs consumed today (UTC), counted from accepted
+    /// `ingest_jobs` rows: 0 when none exist yet. The intake
     /// cap guard feeds this to `plan_limits::check_ingest_write`; the
     /// staging-only over-limit mint seeds it. Default 0 keeps out-of-tree
     /// `Store` impls compiling (their guard allows until the write path
@@ -642,7 +810,7 @@ pub trait Store {
             Ok(0)
         }
     }
-    /// Seed today's `usage_ledger` ingest count to at least `ingest_jobs`
+    /// Seed today's ingest count to at least `ingest_jobs`
     /// (an idempotent reseed never lowers the count): the staging-only
     /// over-limit mint pre-seeds a capped account this way, so the intake
     /// guard refuses it without hammering a real path. Positive counts
@@ -658,6 +826,177 @@ pub trait Store {
         async move {
             let _ = (user_id, now, ingest_jobs);
             Ok(())
+        }
+    }
+    /// Every plan row, cheapest first (`billing::plans_select_statement`).
+    /// Default `Err` keeps out-of-tree `Store` impls compiling while
+    /// failing closed: a billing display must never invent plan data.
+    /// Production and the test fake override it.
+    fn plans(&self) -> impl Future<Output = Result<Vec<PlanRow>, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// The live-slot subscription row plus whether any subscription row
+    /// ever existed (`billing::subscription_live_select_statement` +
+    /// `billing::subscription_any_select_statement`): the two reads
+    /// `billing::account_state` needs. Default `Err` fails closed like
+    /// [`Store::plans`]; production and the test fake override it.
+    fn subscription_snapshot(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<(Option<SubscriptionRow>, bool), StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// The live-slot subscription row (`billing::subscription_live_
+    /// select_statement`) feeding `resolve_effective_plan` at the
+    /// playback gate. Default `Err` fails closed: a store that cannot
+    /// read subscriptions must refuse grant issuance (generic 500),
+    /// never invent entitlement. Production and the test fake override.
+    fn live_subscription(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::SubscriptionRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Stream seconds metered for `(user_id, period_month)` — the monthly
+    /// `SUM` over `stream_play_ledger`
+    /// (`ledger::ledger_monthly_total_statement`), 0 when no plays are
+    /// metered. Default `Err` fails closed like [`Store::plans`];
+    /// production and the test fake override it.
+    fn stream_seconds_month(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// Whether any subscription row ever reached paid coverage
+    /// (`billing::subscription_ever_paid_statement`): the
+    /// `lapsed` vs `never_subscribed` discriminator. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
+    fn ever_subscribed(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Runtime caps from the `plans` row
+    /// (`plan_limits::plan_caps_select_statement`): `None` when the id
+    /// has no row (the gate fails closed to the reserved `free` caps).
+    /// Default `Err` fails closed like [`Store::live_subscription`].
+    fn plan_caps(
+        &self,
+        plan_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::plan_limits::PlanCaps>, StoreError>> {
+        async move {
+            let _ = plan_id;
+            Err(StoreError)
+        }
+    }
+    /// Billed stream seconds for (`user_id`, `period_month`) — the
+    /// single monthly-usage authority
+    /// (`ledger::ledger_monthly_total_statement`). Default `Err` fails
+    /// closed: an unreadable meter refuses new playback rather than
+    /// reading as zero usage.
+    fn monthly_stream_seconds(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// The user's `playback_leases` row, if any. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn playback_lease(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::LeaseRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Atomically acquire/replace the user's lease for a NEW play
+    /// (`playback::playback_lease_acquire_statement`): succeeds when
+    /// no row exists, the stored lease has expired at `now`, the same
+    /// client session re-acquires, or `takeover` is set; the epoch
+    /// increments in the store, never from a caller value. Otherwise
+    /// `Held` with the live lease's remaining TTL. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn acquire_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> impl Future<Output = Result<crate::playback::LeaseAcquire, StoreError>> {
+        async move {
+            let _ = (
+                user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            );
+            Err(StoreError)
+        }
+    }
+    /// Extend the exact holder's lease (`playback::playback_lease_
+    /// touch_statement`): true iff the (`session_id`, `play_id`,
+    /// `epoch`) triple still names the stored row. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn touch_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (user_id, session_id, play_id, epoch, now, expires_at);
+            Err(StoreError)
+        }
+    }
+    /// Derivation metadata for one (user, track) pair
+    /// (`meter_sink::track_meter_meta_statement`); unknown or
+    /// non-UUID tracks resolve to the all-`None` meta (the fallback
+    /// rung), never an error — only a store failure errors. Default
+    /// `Err` fails closed like [`Store::live_subscription`] (the sink
+    /// answers 500 and the DO retries; nothing meters on a guess).
+    fn track_meter_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        async move {
+            let _ = (user_id, track_id);
+            Err(StoreError)
+        }
+    }
+    /// Write one cumulative play window through the monotonic upsert
+    /// (`ledger::ledger_play_window_upsert_statement`): which
+    /// disposition the write converged to is reported for the sink
+    /// ack. Default `Err` fails closed like
+    /// [`Store::live_subscription`].
+    fn record_play_window(
+        &self,
+        window: &crate::ledger::PlayWindow,
+    ) -> impl Future<Output = Result<crate::meter_sink::PlayWindowOutcome, StoreError>> {
+        async move {
+            let _ = window;
+            Err(StoreError)
         }
     }
     /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
@@ -905,7 +1244,278 @@ pub trait Store {
     fn account_deleting(&self, _user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
     }
+    /// Whether the account was ever admitted past signup: it holds a
+    /// passkey credential, a session row (current or revoked — a
+    /// completed sign-in leaves one), or a provider vault, or it
+    /// carries a non-member role (promotion is an admission act; the
+    /// reaper's `unverified_user_filter` protects the same states).
+    /// The magic-finish invite gate refuses only accounts for which
+    /// this is false — a never-admitted signup in progress — so
+    /// established magic-only members keep signing in after
+    /// `INVITES_REQUIRED` flips. The default composes the credential
+    /// and vault reads only, keeping out-of-tree `Store` impls
+    /// compiling; production and the test fake override it with the
+    /// full predicate (sessions and role included).
+    fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            if !self.credentials_for_user(user_id).await?.is_empty() {
+                return Ok(true);
+            }
+            Ok(self.vault_by_user(user_id).await?.is_some())
+        }
+    }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
+    /// The stored `users.role` for the admin guard, read fresh per
+    /// request (migration 0028). Fail-closed default is absent — and
+    /// absent is never admin — so an unprovisioned store grants nothing;
+    /// production and the test fake override it.
+    fn user_role(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Set a user's role and write the extended `user.role_changed`
+    /// audit row (actor, subject, old-to-new) in one transaction:
+    /// the role must never change without its audit row. The
+    /// transaction re-reads the actor's role under its locks (see
+    /// `AdminWriteOutcome`), so two admins passing the guard
+    /// concurrently cannot demote each other to zero admins.
+    /// Fail-closed default; production and the test fake override it.
+    fn admin_set_user_role(
+        &self,
+        _actor_user_id: &str,
+        _subject_user_id: &str,
+        _new_role: &str,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every `app_settings` row as `(key, value)` pairs (migration
+    /// 0028). Fail-closed default is empty — the typed accessors then
+    /// resolve their built-in defaults; production and the test fake
+    /// override it.
+    fn app_settings(&self) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Upsert one `app_settings` row and write the extended
+    /// `settings.changed` audit row (actor, old-to-new) in one
+    /// transaction, revalidating the actor's role under the write
+    /// serialization lock (see `AdminWriteOutcome`): a settings write
+    /// can never commit after its actor's demotion. Fail-closed
+    /// default; production and the test fake override it.
+    fn admin_set_app_setting(
+        &self,
+        _actor_user_id: &str,
+        _key: &str,
+        _new_value: &str,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    // --- Stripe billing reconciliation (migrations 0021/0029) ------------------
+    //
+    // The webhook and the inline/API paths share one reconciliation
+    // function (`billing_reconcile::reconcile_subscription`); these are
+    // its store seams. Reads fail closed (`Err`, except where noted) so
+    // an unprovisioned store can never mint or extend entitlement; the
+    // reconcile write runs as one transaction under the per-user advisory
+    // lock (see the statements in `billing_reconcile`). Production
+    // (`PgStore`) and the test fake override all of them.
+    /// First claim of a verified webhook event id wins (`true`);
+    /// duplicates report `false` so retried deliveries ack 200 with no
+    /// state change. Default `Ok(true)` keeps out-of-tree `Store` impls
+    /// compiling (their webhooks reprocess, never double-advance: the
+    /// reconcile write itself is idempotent on the invoice id).
+    fn claim_webhook_event(
+        &self,
+        _event_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move { Ok(true) }
+    }
+    /// Release a claim whose handling failed mid-reconcile (Stripe 5xx,
+    /// store outage): the next delivery reprocesses instead of acking 200
+    /// on a consumed claim. Default no-op keeps out-of-tree `Store` impls
+    /// compiling; production and the test fake override it.
+    fn release_webhook_event(
+        &self,
+        _event_id: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move { Ok(()) }
+    }
+    /// The reconciliation input for one user: bound Stripe customer, live
+    /// subscription row, and the full `plan_prices` map. Default `Err`
+    /// (fail closed): without local state nothing advances.
+    fn load_reconcile_input(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<crate::billing_reconcile::ReconcileInput, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// Reverse lookup for webhooks that carry no operation binding:
+    /// the user bound to a Stripe customer id, if any. Default `Ok(None)`
+    /// (unknown customer: ack without state).
+    fn user_for_stripe_customer(
+        &self,
+        _customer_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async move { Ok(None) }
+    }
+    /// Persist one reconcile pass: the subscription row upsert plus the
+    /// idempotent history inserts, as a single transaction under the
+    /// per-user advisory lock. Default `Err` (fail closed): unconfirmed
+    /// state is never half-written.
+    fn store_reconcile_outcome(
+        &self,
+        _user_id: &str,
+        _outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// The user's unresolved single-flight checkout operation, if any (at
+    /// most one: `uq_billing_operations_single_flight`). Default `Ok(None)`
+    /// (no flight: the create path inserts, failing closed on `Err`).
+    fn open_checkout_operation(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError>>
+    {
+        async move { Ok(None) }
+    }
+    /// Single-flight checkout-operation insert: concurrent first attempts
+    /// converge (the partial unique admits exactly one; the loser reads
+    /// the winner's row). Binds the Stripe customer to the account, but
+    /// only when unbound — an existing binding is never overwritten by a
+    /// racing second customer create. Default `Err` (fail closed).
+    fn create_checkout_operation(
+        &self,
+        _op_id: &str,
+        _user_id: &str,
+        _price_id: &str,
+        _customer_id: Option<&str>,
+    ) -> impl Future<Output = Result<crate::billing_reconcile::CreateOpOutcome, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// Operation lookup by id (the webhook's `client_reference_id`
+    /// binding). Default `Ok(None)` (unknown operation: ack without state).
+    fn checkout_operation_by_id(
+        &self,
+        _op_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError>>
+    {
+        async move { Ok(None) }
+    }
+    /// Record the created session (and later terminal marks) on the
+    /// operation row — but only while the row still holds the single
+    /// flight. Reports whether the mark landed: a mark that arrives after
+    /// a deliberate supersede must not resurrect the retired row, so the
+    /// caller retries into the replacement instead. Default `Err` (fail
+    /// closed).
+    fn update_checkout_operation(
+        &self,
+        _op_id: &str,
+        _state: &str,
+        _price_id: &str,
+        _session_id: Option<&str>,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// One guarded admin NZB upload attempt (migration 0034): validate
+    /// the attempt, converge duplicates on the content-derived id, and
+    /// write the job row, the encrypted original (accepted attempts
+    /// only) and the `ingest.uploaded` audit row in one transaction,
+    /// revalidating the actor's role under the write serialization lock
+    /// (see `AdminWriteOutcome`). Fail-closed default; production and
+    /// the test fake override it.
+    fn admin_ingest_upload(
+        &self,
+        _attempt: &AdminIngestAttempt,
+    ) -> impl Future<Output = Result<AdminIngestUploadOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// One stored admin job row by id, or `None` for unknown ids and
+    /// pipeline rows (the admin reads never expose the pipeline
+    /// ledger). Never carries NZB bytes or parse detail: the row type
+    /// is redacted by construction. Fail-closed default is absent;
+    /// production and the test fake override it.
+    fn admin_ingest_get(
+        &self,
+        _job_id: &str,
+    ) -> impl Future<Output = Result<Option<StoredAdminIngestJob>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Stored admin job rows, newest first: `status` admits exactly one
+    /// view status (`accepted`/`failed`) or `None` for every admin job;
+    /// `limit`/`offset` are already bounded by the handler. Pipeline
+    /// rows never appear. Fail-closed default is empty; production and
+    /// the test fake override it.
+    fn admin_ingest_list(
+        &self,
+        _status: Option<&str>,
+        _limit: u64,
+        _offset: u64,
+    ) -> impl Future<Output = Result<Vec<StoredAdminIngestJob>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Store-level delete primitive (no route serves it): the original
+    /// goes first, then the job, under the actor re-check. A deleted
+    /// actor's attempt reports `ActorNotAdmin`; an unknown id (or a
+    /// pipeline row) reports `Missing`. No audit row: deletion writes
+    /// no new observable state. Fail-closed default; production and the
+    /// test fake override it.
+    fn admin_ingest_delete(
+        &self,
+        _actor_user_id: &str,
+        _job_id: &str,
+    ) -> impl Future<Output = Result<AdminIngestDeleteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Issue one invite and write its `invite.issued` audit row in one
+    /// transaction, revalidating the actor's role under the write
+    /// serialization lock (see [`AdminInviteIssueOutcome`]). The audit
+    /// row references the invite by the returned row id only — the
+    /// code and its hash never appear in it. Fail-closed default;
+    /// production and the test fake override it.
+    fn admin_issue_invite(
+        &self,
+        _actor_user_id: &str,
+        _record: &InviteRecord,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Every invite row, newest first, for the admin list. `issuer`
+    /// filters by exact `issued_by`; `status` filters by the derived
+    /// [`InviteRecord::status`] at `now` (`active`, `expired`,
+    /// `redeemed`, `revoked`); both may combine. The store caps the
+    /// result; pagination is post-M1. Fail-closed default is empty;
+    /// production and the test fake override it.
+    fn admin_list_invites(
+        &self,
+        _issuer: Option<&str>,
+        _status: Option<&str>,
+        _now: u64,
+        _limit: usize,
+    ) -> impl Future<Output = Result<Vec<InviteRecord>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Revoke one unredeemed invite and write its `invite.revoked`
+    /// audit row in one transaction, revalidating the actor's role
+    /// under the write serialization lock (see
+    /// [`AdminInviteRevokeOutcome`]). Fail-closed default; production
+    /// and the test fake override it.
+    fn admin_revoke_invite(
+        &self,
+        _actor_user_id: &str,
+        _invite_id: i64,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Persist a freshly issued native REST credential row (migration
     /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
     /// never report a mint it did not durably record; production and the
@@ -974,55 +1584,6 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
-    }
-    /// Catalogue slice-1 reads (TWO-1583): the per-user ingest library plus
-    /// the shared mirror collections. Read-only: implementations must not
-    /// create users, ledger rows, or mirror entries. Owner scoping lives in
-    /// the SQL (`WHERE ... user_id = $1`); no owner id is ever returned.
-    /// Fail-open-empty defaults keep out-of-tree `Store` impls compiling
-    /// (their catalogue routes serve empty pages); production and the test
-    /// fake override every method below.
-    /// Per-user library page (joined ledger rows, matched-first order).
-    fn catalogue_library(
-        &self,
-        _user_id: &str,
-    ) -> impl Future<Output = Result<Vec<crate::catalogue::LibraryDbRow>, StoreError>> {
-        async { Ok(Vec::new()) }
-    }
-    /// Shared artist collection page (no owner scoping: mirror reads are
-    /// caller-independent once authenticated).
-    fn catalogue_artists(
-        &self,
-    ) -> impl Future<Output = Result<Vec<crate::catalogue::ArtistDbRow>, StoreError>> {
-        async { Ok(Vec::new()) }
-    }
-    /// Shared release collection page (artist-joined).
-    fn catalogue_releases(
-        &self,
-    ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError>> {
-        async { Ok(Vec::new()) }
-    }
-    /// Shared track-occurrence collection page.
-    fn catalogue_tracks(
-        &self,
-    ) -> impl Future<Output = Result<Vec<crate::catalogue::TrackDbRow>, StoreError>> {
-        async { Ok(Vec::new()) }
-    }
-    /// One release by MBID (`None` when unknown — the detail handler
-    /// answers 404).
-    fn catalogue_release(
-        &self,
-        _mbid: &str,
-    ) -> impl Future<Output = Result<Option<crate::catalogue::ReleaseDbRow>, StoreError>> {
-        async { Ok(None) }
-    }
-    /// One release's tracks in album order (empty when the release has no
-    /// mirror occurrences yet — still a 200 with no tracks).
-    fn catalogue_release_tracks(
-        &self,
-        _mbid: &str,
-    ) -> impl Future<Output = Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError>> {
-        async { Ok(Vec::new()) }
     }
 }
 
@@ -1136,6 +1697,11 @@ pub struct Request {
     /// cookie, except the NZB intake route, which takes the session as a
     /// Bearer (the programmatic ingest caller holds no cookie jar).
     pub authorization: Option<String>,
+    /// Raw `Stripe-Signature` header value, if any. Carried only for the
+    /// billing webhook route (the signature is that route's authentication;
+    /// every other route ignores it). The entry lowercases header names, so
+    /// this arrives normalized.
+    pub stripe_signature: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -1323,6 +1889,12 @@ where
     pub mailer: &'a M,
     pub dialer: &'a D,
     pub dns: &'a N,
+    /// Stripe HTTPS transport (Worker `Fetch` in production, fixture fakes
+    /// in tests). A shared reference — not a fifth generic — so the ~40
+    /// existing `Ctx` signatures keep their shape; billing handlers are the
+    /// only readers. Unprovisioned postures supply
+    /// [`crate::stripe::NoStripeTransport`], whose every call fails closed.
+    pub stripe: &'a dyn crate::stripe::StripeTransport,
     pub now: u64,
     pub source_ip: String,
 }
@@ -1621,6 +2193,68 @@ where
         Ok((claims, token.to_string()))
     }
 
+    /// The admin guard (migration 0028): a cookie session whose
+    /// `users.role` — read fresh from the store on every call, never a
+    /// session claim — is exactly `admin`. Mutations additionally
+    /// require the fresh-session step-up, like credential minting.
+    ///
+    /// The admin surface is non-enumerable (TWO-70 A-AC1): every caller
+    /// who is not a confirmed admin gets the plain 404 an unknown path
+    /// gives, whatever went wrong — a presented `Authorization` header
+    /// (admin routes are `SessionOnly` in the scope map, and
+    /// native/API-key credentials can never call them, not even
+    /// alongside a valid admin cookie), a missing, invalid or non-admin
+    /// session, or a stale session on a mutation. Only a caller already
+    /// known to be an admin can hear anything else (the step-up prompt
+    /// below, validation, the generic 500) — so no response a non-admin
+    /// can elicit distinguishes an admin path from a nonexistent one.
+    ///
+    /// Role is checked before freshness: a non-admin must hear the
+    /// plain 404, never a step-up prompt that reauthenticating could
+    /// not satisfy. Only a confirmed admin can be asked to
+    /// reauthenticate for a mutation.
+    async fn authenticate_admin(
+        &self,
+        req: &Request,
+        mutation: bool,
+    ) -> Result<SessionClaims, Response> {
+        if req.authorization.is_some() {
+            return Err(not_found());
+        }
+        // `authenticate`'s own failures (a bad or missing cookie, and
+        // for mutations a missing or foreign Origin) collapse to the
+        // same plain 404: the caller is not yet known to be an admin.
+        let (claims, token) = self
+            .authenticate(req, mutation)
+            .await
+            .map_err(|_| not_found())?;
+        // A role-read failure collapses to the same 404: until the role
+        // is confirmed the caller is not known to be an admin, and a
+        // 500 here (which an unknown path never produces) would
+        // enumerate the surface. Production logs the failed statement
+        // server-side, so the outage stays visible to operators.
+        let role = self
+            .store
+            .user_role(&claims.user_id)
+            .await
+            .map_err(|_| not_found())?;
+        if !crate::admin::is_admin_role(role.as_deref()) {
+            return Err(not_found());
+        }
+        if mutation {
+            let record = self
+                .store
+                .session_by_id(&claims.session_id)
+                .await
+                .map_err(|_| internal())?
+                .ok_or_else(generic_auth)?;
+            let keys = self.cfg.session_keys();
+            session::require_fresh_session(&keys, &token, self.now, &record)
+                .map_err(session_error_response)?;
+        }
+        Ok(claims)
+    }
+
     /// Per-IP admission shared by register, login and magic start routes.
     /// The global budget is reserved only for outbound mail, so exhaustion
     /// cannot prevent users from obtaining an authentication challenge.
@@ -1767,6 +2401,17 @@ struct EmailBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RegisterStartBody {
+    email: String,
+    /// Optional invite pre-check: when presented, the code is
+    /// validated (never consumed) before any signup row is minted, so
+    /// a bad code fails at the code step. Consumption happens only
+    /// inside `complete_registration`.
+    invite_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterFinishBody {
     challenge: String,
     credential_id: String,
@@ -1817,12 +2462,70 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let Some(body) = parse_body::<EmailBody>(req) else {
+    let Some(body) = parse_body::<RegisterStartBody>(req) else {
         return generic_auth();
     };
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    // Invite pre-check (spec §6.3): when the signup page presents a
+    // code, validate it — never consume it — before any signup row is
+    // minted, so a bad code fails at the code step with the one
+    // generic error and leaves no account behind. The per-client and
+    // per-email redemption budgets are spent here exactly as at
+    // finish, so this check is no cheaper an oracle than finishing.
+    // Consumption still happens only inside `complete_registration`;
+    // a valid pre-check leaves the code redeemable.
+    if let Some(code) = &body.invite_code {
+        let attempt_key = format!("invite:{}:start", rate_limit_ip_key(&ctx.source_ip));
+        let email_key = email_rate_limit_key(ctx.cfg, &email);
+        let allowed = matches!(
+            ctx.store
+                .reserve_rate_limit_pair(
+                    RateLimitBudget {
+                        scope_key: &attempt_key,
+                        action: "auth.invite_redeem",
+                        limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
+                    },
+                    RateLimitBudget {
+                        scope_key: &email_key,
+                        action: "auth.invite_redeem_email",
+                        limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
+                    },
+                    ctx.now,
+                )
+                .await,
+            Ok(PairAdmission::Allowed)
+        );
+        if !allowed {
+            return generic_auth();
+        }
+        let invite = match ctx
+            .store
+            .invite_by_hash(&auth::hash_invite_code(code))
+            .await
+        {
+            Ok(Some(invite)) => invite,
+            Ok(None) => return generic_auth(),
+            Err(_) => return internal(),
+        };
+        // No user row exists yet: validate against a sentinel id that
+        // can never equal an issuer, so the hash/spend/revoked/expiry/
+        // email-bind/self-invite (by email) predicates all run; the
+        // prepared record is discarded.
+        let issuer_email = invite.issuer_email.clone();
+        let redemption = auth::InviteRedemption {
+            user_id: "",
+            email: &email,
+            issuer_email: issuer_email.as_deref(),
+            now: ctx.now,
+        };
+        if auth::prepare_invite_redemption(invite, code, &redemption).is_err() {
+            return generic_auth();
+        }
+    }
     // Identical 200 shape for every admitted outcome below (new email,
     // abandoned signup, already-registered account): this route must not be
     // an account-existence oracle. A taken email gets an unbound challenge
@@ -2114,23 +2817,36 @@ where
     // token intact for a corrected retry (the signup page stays on the
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
-    let invite_to_consume = if ctx.cfg.invites_required || body.invite_code.is_some() {
-        // Atomic per-client redemption budget BEFORE the lookup: parallel
-        // guesses share one reservation (no check-then-act race), and the
-        // denial is the generic error (no throttle oracle). Keyed by
-        // client prefix and account, per `auth::invite_attempt_allowed`.
+    let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
+        // Atomic redemption budgets BEFORE the lookup, claimed as one
+        // all-or-none pair: the per-client key (10/300s, keyed by client
+        // prefix and account, per `auth::invite_attempt_allowed`) and
+        // the per-email key (5/hour), so rotating IPs or pre-created
+        // rows cannot multiply guesses against one invited address.
+        // Denial is the generic error — it never reveals which limit
+        // fired (no throttle oracle).
         let attempt_key = format!("invite:{}:{}", rate_limit_ip_key(&ctx.source_ip), user_id);
-        let allowed = ctx
-            .store
-            .reserve_rate_limit(
-                &attempt_key,
-                "auth.invite_redeem",
-                u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
-                ctx.now,
-                auth::INVITE_REDEMPTION_WINDOW_SECS,
-            )
-            .await
-            .unwrap_or(false);
+        let email_key = email_rate_limit_key(ctx.cfg, &magic.email);
+        let allowed = matches!(
+            ctx.store
+                .reserve_rate_limit_pair(
+                    RateLimitBudget {
+                        scope_key: &attempt_key,
+                        action: "auth.invite_redeem",
+                        limit: u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_REDEMPTION_WINDOW_SECS,
+                    },
+                    RateLimitBudget {
+                        scope_key: &email_key,
+                        action: "auth.invite_redeem_email",
+                        limit: u64::from(auth::INVITE_EMAIL_MAX_ATTEMPTS),
+                        window_secs: auth::INVITE_EMAIL_WINDOW_SECS,
+                    },
+                    ctx.now,
+                )
+                .await,
+            Ok(PairAdmission::Allowed)
+        );
         if !allowed {
             return generic_auth();
         }
@@ -2146,12 +2862,47 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
-        if auth::consume_invite(invite.clone(), &code).is_err() {
-            return generic_auth();
-        }
-        Some(invite)
+        // The snapshot prepare validates every refusal class with the
+        // one generic error (unknown/expired/revoked/email-mismatch/
+        // self-invite are indistinguishable) and stamps the spend the
+        // conditional claim will bind. It grants nothing on its own.
+        let issuer_email = invite.issuer_email.clone();
+        let redemption = auth::InviteRedemption {
+            user_id: &user_id,
+            email: &magic.email,
+            issuer_email: issuer_email.as_deref(),
+            now: ctx.now,
+        };
+        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+            Ok(prepared) => prepared,
+            Err(_) => return generic_auth(),
+        };
+        // The `invite.redeemed` audit rides the enrollment transaction
+        // inside `complete_registration`, so it can never be separated
+        // from the claim it records. It references the invite by row
+        // id only — no code or hash material.
+        let audit = vault::audit_event_extended(
+            prepared.issued_by.as_deref().unwrap_or("system"),
+            auth::INVITE_REDEEMED_AUDIT_ACTION,
+            true,
+            &ctx.source_ip,
+            ctx.now,
+            Some(&user_id),
+            serde_json::json!({
+                "invite_id": if prepared.id > 0 {
+                    serde_json::json!(prepared.id)
+                } else {
+                    serde_json::Value::Null
+                },
+            }),
+        );
+        Some((prepared, audit))
     } else {
         None
+    };
+    let (invite_to_consume, invite_audit) = match invite_redemption.as_ref() {
+        Some((invite, audit)) => (Some(invite), Some(audit)),
+        None => (None, None),
     };
     // Preserve the RP/origin/expiry snapshot validation; the transaction
     // below must still win every conditional claim before enrollment.
@@ -2178,7 +2929,8 @@ where
         .complete_registration(
             &challenge,
             &magic,
-            invite_to_consume.as_ref(),
+            invite_to_consume,
+            invite_audit,
             &stored,
             ctx.now,
         )
@@ -2681,6 +3433,25 @@ where
             Err(_) => {}
         }
     }
+    // Invite-required posture: a never-admitted account is a signup
+    // in progress, and its emailed token (sent by register/start as
+    // the inbox proof) must not mint a session on this route — that
+    // would complete a signup with no invite consumed. Refuse
+    // generically WITHOUT spending the token, so the legitimate
+    // enrollment at register/finish can still use it. "Never
+    // admitted" is the full reaper-protected predicate (no
+    // credential AND no prior session AND no vault AND member role),
+    // NOT mere credential-lessness: magic-only accounts are an
+    // established state, and gating on credentials alone would lock
+    // those members out the moment invites flip on, with
+    // register/finish demanding an invite they never needed.
+    if ctx.cfg.invites_required {
+        match ctx.store.account_admitted(&record.user_id).await {
+            Ok(false) => return generic_auth(),
+            Ok(true) => {}
+            Err(_) => return internal(),
+        }
+    }
     // Pure validation is not authentication: prepare everything that can fail
     // before the database claim, then commit the claim AND session together.
     // No cookie or success audit may escape before that transaction commits.
@@ -2997,193 +3768,128 @@ where
     }
 }
 
-/// Resolve the catalogue caller: a gate-authorized bearer wins, otherwise
-/// the session cookie, otherwise the generic 401. The gate already 404s
-/// presented-but-invalid bearers, so reaching this function with
-/// `bearer = None` means no credential was presented at all — the 401
-/// discloses nothing (every catalogue path is a known, scope-mapped route).
-async fn catalogue_caller<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Result<String, Response>
+/// `GET /v1/plans`: every plan row for pricing display. Prices/quotas are
+/// plan *data* read from the `plans` table (the one runtime source, ADR
+/// 0004); the reserved `free` row (and any unrecognised id, fail-closed)
+/// is marked non-selectable so no client offers it at checkout. Session
+/// only: the signed-out pricing page renders its static fallback mirror.
+async fn plans_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    if let Some(user) = bearer {
-        if !user.is_empty() {
-            return Ok(user.to_string());
-        }
-    }
-    match ctx.authenticate(req, false).await {
-        Ok((claims, _token)) => Ok(claims.user_id),
-        Err(resp) => Err(resp),
-    }
-}
-
-/// Serialize a catalogue page, failing closed on the (in practice
-/// unreachable) encoding error rather than panicking.
-fn catalogue_response<T: serde::Serialize>(entries: &T) -> Response {
-    match serde_json::to_value(entries) {
-        Ok(body) => json_response(200, body),
-        Err(_) => internal(),
-    }
-}
-
-/// `GET /v1/library` and the legacy `GET /api/library` alias: the caller's
-/// joined ingest ledger as a bare array (the documented `/api/library`
-/// shape the M1 journey pins — bare array or `{ items }` with string-`id`
-/// rows). Store failure is the generic 500.
-async fn catalogue_library<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let user_id = match catalogue_caller(ctx, req, bearer).await {
-        Ok(user) => user,
+    let (_claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    match ctx.store.catalogue_library(&user_id).await {
+    match ctx.store.plans().await {
         Ok(rows) => {
-            let entries: Vec<crate::catalogue::LibraryEntry> =
-                rows.iter().map(crate::catalogue::library_entry).collect();
-            catalogue_response(&entries)
-        }
-        Err(_) => internal(),
-    }
-}
-
-/// `GET /v1/artists`: the shared artist collection as a bare array.
-/// Authenticated callers only (the data is shared, the route is not
-/// public): anonymous callers answer 401 before any store read.
-async fn catalogue_artists<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_artists().await {
-        Ok(rows) => {
-            let entries: Vec<crate::catalogue::ArtistResponse> =
-                rows.iter().map(crate::catalogue::artist_response).collect();
-            catalogue_response(&entries)
-        }
-        Err(_) => internal(),
-    }
-}
-
-/// `GET /v1/releases`: the shared release collection as a bare array.
-/// Authentication posture matches [`catalogue_artists`].
-async fn catalogue_releases<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_releases().await {
-        Ok(rows) => {
-            let entries: Vec<crate::catalogue::ReleaseResponse> = rows
+            let plans: Vec<serde_json::Value> = rows
                 .iter()
-                .map(crate::catalogue::release_response)
+                .map(|row| {
+                    let selectable = crate::plan_limits::PlanId::parse_id(&row.id)
+                        .is_some_and(|plan| plan != crate::plan_limits::PlanId::Free);
+                    serde_json::json!({
+                        "id": row.id,
+                        "priceCents": row.price_cents,
+                        "streamHoursMonth": row.stream_hours_month,
+                        "maxConcurrentStreams": row.max_concurrent_streams,
+                        "selectable": selectable,
+                    })
+                })
                 .collect();
-            catalogue_response(&entries)
+            json_response(200, serde_json::json!({ "plans": plans }))
         }
         Err(_) => internal(),
     }
 }
 
-/// `GET /v1/tracks`: the shared track-occurrence collection as a bare
-/// array. Authentication posture matches [`catalogue_artists`].
-async fn catalogue_tracks<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Response
+/// `GET /v1/me/usage`: this UTC calendar month's metered stream seconds
+/// (the ledger `SUM`, the single authority) plus the reset instant the
+/// UI must show wherever usage appears (spec §3.2). Display only —
+/// enforcement reads the same fold server-side at grant issuance.
+async fn usage_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    match ctx.store.catalogue_tracks().await {
-        Ok(rows) => {
-            let entries: Vec<crate::catalogue::TrackResponse> =
-                rows.iter().map(crate::catalogue::track_response).collect();
-            catalogue_response(&entries)
-        }
-        Err(_) => internal(),
-    }
-}
-
-/// `GET /v1/releases/{mbid}`: one release plus its tracks in album order.
-/// Only single-segment, well-formed MBIDs reach the store (anything else —
-/// empty, nested, malformed — is the plain 404, indistinguishable from
-/// unknown); unknown releases are 404; store failure is the generic 500.
-async fn catalogue_release<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    bearer: Option<&str>,
-) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    if let Err(resp) = catalogue_caller(ctx, req, bearer).await {
-        return resp;
-    }
-    let mbid = match req.path.strip_prefix("/v1/releases/") {
-        Some(rest)
-            if !rest.is_empty()
-                && !rest.contains('/')
-                && crate::catalogue::is_catalogue_mbid(rest) =>
-        {
-            rest
-        }
-        _ => return not_found(),
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
     };
-    let release = match ctx.store.catalogue_release(mbid).await {
-        Ok(release) => release,
+    let period = crate::ledger::period_month_for_timestamp(ctx.now);
+    match ctx
+        .store
+        .stream_seconds_month(&claims.user_id, &period)
+        .await
+    {
+        Ok(stream_seconds) => json_response(
+            200,
+            serde_json::json!({
+                "period": period,
+                "streamSecondsMonth": stream_seconds,
+                "resetsAt": crate::ledger::iso8601_utc(
+                    crate::ledger::next_month_start_unix(ctx.now) as i64
+                ),
+            }),
+        ),
+        Err(_) => internal(),
+    }
+}
+
+/// `GET /v1/me/subscription`: the caller's subscription display state.
+/// Always 200 for a session (a missing row is the `no_subscription`
+/// state, not a 404): `state` is derived server-side from the ADR 0005
+/// effective-plan predicate, `status` is the stored provider status
+/// verbatim (null when no live row), and no Stripe ids ever leave the
+/// server. Display only — the gate re-derives entitlement at grant
+/// issuance and never trusts this DTO.
+async fn subscription_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let (row, ever_subscribed) = match ctx.store.subscription_snapshot(&claims.user_id).await {
+        Ok(snapshot) => snapshot,
         Err(_) => return internal(),
     };
-    let Some(release) = release else {
-        return not_found();
-    };
-    match ctx.store.catalogue_release_tracks(mbid).await {
-        Ok(tracks) => catalogue_response(&crate::catalogue::assemble_release_detail(
-            &release, &tracks,
-        )),
-        Err(_) => internal(),
-    }
+    let view = row.as_ref().map(|row| crate::billing::SubscriptionView {
+        plan_id: &row.plan_id,
+        status: &row.status,
+        cancel_at_period_end: row.cancel_at_period_end,
+        paid_through_at_unix: row.paid_through_at_unix,
+        grace_until_unix: row.grace_until_unix,
+        current_period_end_unix: row.current_period_end_unix,
+    });
+    let now_unix = i64::try_from(ctx.now).unwrap_or(i64::MAX);
+    let state = crate::billing::account_state(view, ever_subscribed, now_unix);
+    json_response(
+        200,
+        serde_json::json!({
+            "state": state.as_str(),
+            "planId": row.as_ref().map(|row| row.plan_id.as_str()),
+            "status": row.as_ref().map(|row| row.status.as_str()),
+            "currentPeriodEnd": row
+                .as_ref()
+                .and_then(|row| row.current_period_end_unix)
+                .map(crate::ledger::iso8601_utc),
+            "graceUntil": row
+                .as_ref()
+                .and_then(|row| row.grace_until_unix)
+                .map(crate::ledger::iso8601_utc),
+            "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
+        }),
+    )
 }
 
 /// Failure of one [`build_provider_mint_row`] call: the OS RNG was
@@ -4099,11 +4805,11 @@ where
         return internal();
     }
     if overlimit {
-        // A capped account is a free-capped account whose daily ingest
-        // aggregate is pre-seeded to the cap: the intake guard refuses it
-        // without hammering a real path, and the seed (not the plan
-        // string, which is never stored) is what the guard reads.
-        let cap = u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day);
+        // A capped account is an account whose daily ingest count is
+        // pre-seeded to the fixed daily ingest limit: the intake guard
+        // refuses it without hammering a real path, and the seed (not the
+        // plan string, which is never stored) is what the guard reads.
+        let cap = u64::from(crate::plan_limits::DAILY_INGEST_LIMIT);
         if ctx
             .store
             .seed_qa_ingest_usage(&user.id, ctx.now, cap)
@@ -4120,29 +4826,35 @@ where
 /// Render a plan-limit denial on the wire (`docs/api-errors.md` 402 /
 /// 429 rows): status, names-only body, and the limit + reset headers (plus
 /// `retry-after` on 429) the client needs to render the upgrade path.
-/// Note: both `retry_after` and `Denial::headers()` render `retry-after`
-/// on a 429, so the first 429-shaped denial on a path using this helper
-/// must dedupe one of them. Every denial on the ingest path today is a
-/// 402 (no `retry-after`), so no duplication exists yet.
+/// `Response.retry_after` is rendered by the entry as the wire
+/// `retry-after` header, so the copy inside `Denial::headers()` is
+/// dropped when the field is set — a 429 never carries the header twice.
 fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
+    let extra_headers = denial
+        .headers()
+        .into_iter()
+        .filter(|(name, _)| {
+            denial.retry_after_secs.is_none() || name != crate::plan_limits::RETRY_AFTER_HEADER
+        })
+        .collect();
     Response {
         status: denial.status,
         body: denial.body_json(),
         set_cookie: None,
         retry_after: denial.retry_after_secs,
-        extra_headers: denial.headers(),
+        extra_headers,
     }
 }
 
 /// Cap guard on the NZB intake path (`POST /api/ingest`): the caller's
-/// session (Bearer transport) is authenticated, today's ingest aggregate
-/// is checked against the caller's caps, and a capped caller is refused
-/// with the plan-limit wire. Everyone else falls through to the plain
-/// 404 — the ingest-write path owns the accept arm and has not landed
-/// yet, so this slice only refuses; it never accepts a job. Paid-cap
-/// resolution lands with the subscription-read slice, so free caps apply
-/// to every caller until then (conservative: refuse early, never
-/// over-admit). The request body is never inspected: refusal is an
+/// session (Bearer transport) is authenticated, today's ingest count
+/// is checked against the fixed non-plan daily ingest limit
+/// (`plan_limits::DAILY_INGEST_LIMIT`, ADR 0004 revision of 2026-11-03),
+/// and a capped caller is refused with the plan-limit wire. Everyone else
+/// falls through to the plain 404 — the ingest-write path owns the accept
+/// arm and has not landed yet, so this slice only refuses; it never
+/// accepts a job. The same limit applies to every caller until the
+/// user-ingest retirement removes the intake path. The request body is never inspected: refusal is an
 /// identity-plus-usage decision, so a capped caller cannot buy
 /// processing by shaping the upload.
 async fn ingest_cap_guard<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -4160,15 +4872,2170 @@ where
         Ok(usage) => u32::try_from(usage).unwrap_or(u32::MAX),
         Err(_) => return internal(),
     };
-    match crate::plan_limits::check_ingest_write(crate::plan_limits::PlanId::Free, ingest_today)
-        .denial()
-    {
+    match crate::plan_limits::check_ingest_write(ingest_today).denial() {
         Some(denial) => plan_limit_refusal(denial),
         None => not_found(),
     }
 }
 
+// --- Admin surface (migration 0028) ---------------------------------------------------------
+//
+// Session-only, role-gated by `authenticate_admin`, and non-enumerable
+// (TWO-70 A-AC1): the scope map marks every path below `SessionOnly`,
+// so bearer credentials never reach these handlers through the gate,
+// and the guard answers every non-admin probe — presented bearer,
+// missing, bad or non-admin session — with the plain 404. Preflight
+// agrees (`options_preflight_served` excludes the whole namespace).
+// Role and settings writes land together with their extended audit
+// rows in one store transaction that re-reads the actor's role under
+// its locks (`AdminWriteOutcome`).
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminRoleBody {
+    role: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminSettingBody {
+    value: u32,
+}
+
+/// `GET /v1/admin/settings` — every typed setting at its effective
+/// value (stored row, or the built-in default when no row exists). A
+/// stored row that no longer parses fails closed with the generic 500
+/// instead of silently reporting the default.
+async fn admin_settings_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Err(resp) = ctx.authenticate_admin(req, false).await {
+        return resp;
+    }
+    let rows = match ctx.store.app_settings().await {
+        Ok(rows) => rows,
+        Err(_) => return internal(),
+    };
+    let mut settings = serde_json::Map::new();
+    for key in crate::admin::ALL_SETTING_KEYS {
+        let stored = rows
+            .iter()
+            .find(|(name, _)| name == key.as_str())
+            .map(|(_, value)| value.as_str());
+        match key.resolve(stored) {
+            Some(value) => {
+                settings.insert(key.as_str().to_string(), serde_json::json!(value));
+            }
+            None => return internal(),
+        }
+    }
+    json_response(200, serde_json::json!({"settings": settings}))
+}
+
+/// `PUT /v1/admin/settings/{key}` — write one typed setting. The key
+/// must be one of the closed `SettingKey` set and the value must
+/// satisfy its bounds; anything else writes nothing.
+async fn admin_setting_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(raw_key) = req.path.strip_prefix("/v1/admin/settings/") else {
+        return not_found();
+    };
+    if raw_key.is_empty() || raw_key.contains('/') {
+        return not_found();
+    }
+    let Some(key) = crate::admin::SettingKey::parse(raw_key) else {
+        return not_found();
+    };
+    let Some(body) = parse_body::<AdminSettingBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(value) = key.validate(body.value) else {
+        return validation_failed("setting value out of range");
+    };
+    let rendered = crate::admin::SettingKey::render(value);
+    let previous = match ctx
+        .store
+        .admin_set_app_setting(
+            &claims.user_id,
+            key.as_str(),
+            &rendered,
+            &ctx.source_ip,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(AdminWriteOutcome::Applied(previous)) => previous,
+        // The actor lost admin between the guard and the write
+        // transaction's re-check: answer as any non-admin is answered.
+        Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
+            return not_found();
+        }
+        // A settings write has no subject user, so a store reporting
+        // the role-write fence here is broken, never a client answer.
+        Ok(AdminWriteOutcome::AccountDeleting) => return internal(),
+        Err(_) => return internal(),
+    };
+    // The previous value is reported at its effective resolution: no
+    // prior row means the default was in force, and a prior row that
+    // no longer parses reports as null rather than echoing corrupt
+    // stored text back.
+    let previous_value = match previous.as_deref() {
+        Some(raw) => key.parse_stored(raw).map(|v| serde_json::json!(v)),
+        None => Some(serde_json::json!(key.default_value())),
+    };
+    json_response(
+        200,
+        serde_json::json!({
+            "key": key.as_str(),
+            "value": value,
+            "previous_value": previous_value,
+        }),
+    )
+}
+
+/// `PUT /v1/admin/users/{id}/role` — promote or demote one user. An
+/// admin can never change their own role through the API: the first
+/// admin comes from the reviewed operator step (docs/ops.md), and
+/// self-demotion is the one-click path to locking every admin out.
+async fn admin_user_role_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(rest) = req.path.strip_prefix("/v1/admin/users/") else {
+        return not_found();
+    };
+    let Some((subject_id, "role")) = rest.split_once('/') else {
+        return not_found();
+    };
+    if subject_id.is_empty() || subject_id.contains('/') {
+        return not_found();
+    }
+    let Some(body) = parse_body::<AdminRoleBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let Some(new_role) = crate::admin::parse_role(&body.role) else {
+        return validation_failed("unknown role");
+    };
+    if subject_id == claims.user_id {
+        return validation_failed("admins cannot change their own role");
+    }
+    let previous = match ctx
+        .store
+        .admin_set_user_role(
+            &claims.user_id,
+            subject_id,
+            new_role,
+            &ctx.source_ip,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(AdminWriteOutcome::Applied(previous)) => previous,
+        // Unknown subject, or the actor stopped being an admin
+        // between the guard and the write transaction's re-check —
+        // both are the plain 404.
+        Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
+            return not_found();
+        }
+        // The subject is scheduled for deletion: ADR 0002 rule 3
+        // fences the write, answered with the typed 409.
+        Ok(AdminWriteOutcome::AccountDeleting) => {
+            return account_deleting_response();
+        }
+        Err(_) => return internal(),
+    };
+    let Some(previous) = previous else {
+        // A role write always replaces a stored role (the subject row
+        // exists and `users.role` is NOT NULL); a store reporting
+        // otherwise is broken, never a success with a null old role.
+        return internal();
+    };
+    json_response(
+        200,
+        serde_json::json!({
+            "user_id": subject_id,
+            "role": new_role,
+            "previous_role": previous,
+        }),
+    )
+}
+
+// --- Admin ingest (migration 0034) ---------------------------------------------------------
+
+/// 413 for an admin NZB upload whose body breached the collection cap:
+/// the in-handler pre-gate answers oversized admin uploads this way,
+/// with the null-job failure shape — no row, no audit, no parse. This
+/// shape serves direct-`handle` callers only: the production entry gate
+/// (`dispatch_collected` in `worker_entry.rs`) answers `Oversized` with
+/// the route-blind uniform 400 (`invalid_request`) before auth, never
+/// dispatching, so an oversized body through the entry never reaches
+/// this arm.
+pub(crate) fn admin_ingest_oversized() -> Response {
+    admin_ingest_failure(413, "payload_too_large", "too_large", None)
+}
+
+/// One admin ingest failure body: `{job_id, status, code, reason}` —
+/// the registry wire code for the status plus the fixed vocabulary
+/// reason. Carries no NZB bytes and no parser detail; `job_id` is null
+/// exactly when no content was parsed (empty or oversized bodies).
+fn admin_ingest_failure(status: u16, code: &str, reason: &str, job_id: Option<&str>) -> Response {
+    json_response(
+        status,
+        serde_json::json!({
+            "job_id": job_id,
+            "status": "failed",
+            "code": code,
+            "reason": reason,
+        }),
+    )
+}
+
+/// Redacted job view for a stored admin row: counts and the failure
+/// reason only. `deduplicated` marks a POST that converged on a
+/// pre-existing row (list/get views never carry it).
+fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> serde_json::Value {
+    match admin_ingest::view_status(&job.db_status) {
+        Some("accepted") => {
+            let mut view = serde_json::json!({
+                "job_id": job.job_id,
+                "status": "accepted",
+                "accepted_at": job.accepted_at,
+                "nzb_bytes": job.nzb_bytes,
+                "file_count": job.file_count,
+                "segment_count": job.segment_count,
+                "has_original": job.has_original,
+                "uploader_user_id": job.uploader_user_id,
+            });
+            if let Some(deduplicated) = deduplicated {
+                view["deduplicated"] = deduplicated.into();
+            }
+            view
+        }
+        _ => {
+            let mut view = serde_json::json!({
+                "job_id": job.job_id,
+                "status": "failed",
+                "code": job
+                    .failure_reason
+                    .as_deref()
+                    .and_then(admin_ingest::FailureReason::parse)
+                    .map(|reason| reason.wire_code())
+                    .unwrap_or("invalid_request"),
+                "reason": job.failure_reason,
+            });
+            if let Some(deduplicated) = deduplicated {
+                view["deduplicated"] = deduplicated.into();
+            }
+            view
+        }
+    }
+}
+
+/// `POST /v1/admin/ingest` — accept one raw NZB upload. The guard runs
+/// first (mutation, so a stale admin session steps up); the body then
+/// classifies in intake order (empty, too large, not-NZB heuristic,
+/// real core parse, total-segment cap). Accepted bytes are encrypted
+/// into the no-expiry original and everything commits in one guarded
+/// store transaction; a rejected body still writes its failed job row
+/// (same transaction, same audit shape). Empty and oversized bodies
+/// write nothing and audit nothing — there is no parsed content to
+/// name. Randomness failure is the existing 503 `unavailable`
+/// envelope, like every other envelope fill.
+async fn admin_ingest_upload<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    match admin_ingest::classify_upload(&req.body) {
+        Err(reason) => {
+            if reason == admin_ingest::FailureReason::Empty {
+                return admin_ingest_failure(400, reason.wire_code(), reason.as_str(), None);
+            }
+            let hex = admin_ingest::content_sha256_hex(&req.body);
+            let attempt = AdminIngestAttempt {
+                actor_user_id: claims.user_id.clone(),
+                job_id: admin_ingest::derive_job_id(&req.body),
+                idempotency_key: admin_ingest::idempotency_key(&hex),
+                content_sha256_hex: hex,
+                nzb_bytes: req.body.len() as u64,
+                file_count: None,
+                segment_count: None,
+                failure: Some(reason),
+                original: None,
+                kek_version: ctx.cfg.kek_version,
+                source_ip: ctx.source_ip.clone(),
+                now: ctx.now,
+            };
+            match ctx.store.admin_ingest_upload(&attempt).await {
+                // A fresh rejection answers the reason's own status;
+                // a replay converges on the stored failed row (200).
+                Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    let status = if deduplicated {
+                        200
+                    } else {
+                        reason.http_status()
+                    };
+                    let view = admin_ingest_view(&job, Some(deduplicated));
+                    json_response(status, view)
+                }
+                // The actor lost admin between the guard and the write
+                // transaction's re-check: answer as any non-admin is.
+                Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                // The actor scheduled account deletion: ADR 0002 rule 3
+                // fences the write, answered with the typed 409.
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
+                Err(_) => internal(),
+            }
+        }
+        Ok(valid) => {
+            let hex = admin_ingest::content_sha256_hex(&req.body);
+            let job_id = admin_ingest::derive_job_id(&req.body);
+            let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
+                Some(kek) => kek,
+                None => return internal(),
+            };
+            let envelope = match admin_ingest::encrypt_ingest_original(
+                current_kek,
+                ctx.cfg.kek_version,
+                &hex,
+                &job_id,
+                &req.body,
+            ) {
+                Ok(envelope) => envelope,
+                Err(crate::vault::VaultError::RandomnessUnavailable) => return unavailable(),
+                Err(_) => return internal(),
+            };
+            let attempt = AdminIngestAttempt {
+                actor_user_id: claims.user_id.clone(),
+                job_id,
+                idempotency_key: admin_ingest::idempotency_key(&hex),
+                content_sha256_hex: hex,
+                nzb_bytes: req.body.len() as u64,
+                file_count: Some(valid.file_count),
+                segment_count: Some(valid.segment_count),
+                failure: None,
+                original: Some(envelope),
+                kek_version: ctx.cfg.kek_version,
+                source_ip: ctx.source_ip.clone(),
+                now: ctx.now,
+            };
+            match ctx.store.admin_ingest_upload(&attempt).await {
+                // Fresh acceptance is 201; a replay converges on the
+                // stored row (200 with `deduplicated: true`).
+                Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    let status = if deduplicated { 200 } else { 201 };
+                    let view = admin_ingest_view(&job, Some(deduplicated));
+                    json_response(status, view)
+                }
+                Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
+                Err(_) => internal(),
+            }
+        }
+    }
+}
+
+/// `GET /v1/admin/ingest/{id}` — one stored admin job, redacted.
+/// Unknown ids, pipeline rows and malformed shapes are the plain 404.
+async fn admin_ingest_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if ctx.authenticate_admin(req, false).await.is_err() {
+        return not_found();
+    }
+    let Some(rest) = req.path.strip_prefix("/v1/admin/ingest/") else {
+        return not_found();
+    };
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') {
+        return not_found();
+    }
+    match ctx.store.admin_ingest_get(rest).await {
+        Ok(Some(job)) => {
+            if admin_ingest::view_status(&job.db_status).is_none() {
+                return internal();
+            }
+            json_response(200, admin_ingest_view(&job, None))
+        }
+        Ok(None) => not_found(),
+        Err(_) => internal(),
+    }
+}
+
+/// `GET /v1/admin/ingest` — stored admin jobs, newest first, redacted.
+/// The runtime strips the query string before handlers run; the entry
+/// preserves it for exactly this route, so `?status=&limit=&offset=`
+/// filters apply in production and in tests alike. An unknown status
+/// is the 422 `validation_failed` envelope; unparsable windows fall
+/// back to the bounded default, never an error.
+async fn admin_ingest_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if ctx.authenticate_admin(req, false).await.is_err() {
+        return not_found();
+    }
+    let (bare, query) = match req.path.split_once('?') {
+        Some((bare, query)) => (bare, query),
+        None => (req.path.as_str(), ""),
+    };
+    if bare != "/v1/admin/ingest" {
+        return not_found();
+    }
+    let mut status_raw: Option<&str> = None;
+    let mut limit_raw: Option<&str> = None;
+    let mut offset_raw: Option<&str> = None;
+    for pair in query.split('&') {
+        let (key, value) = match pair.split_once('=') {
+            Some(split) => split,
+            None => continue,
+        };
+        match key {
+            "status" => status_raw = Some(value),
+            "limit" => limit_raw = Some(value),
+            "offset" => offset_raw = Some(value),
+            _ => {}
+        }
+    }
+    let Some(status) = admin_ingest::parse_status_filter(status_raw) else {
+        return validation_failed("unknown status");
+    };
+    // The store filters on the ledger status; the view names it
+    // `accepted` while the row stays `queued` for the future dispatch
+    // slice (the source discriminator keeps the pipeline off it).
+    let db_status = match status {
+        None => None,
+        Some("accepted") => Some("queued"),
+        Some("failed") => Some("failed"),
+        Some(_) => return internal(),
+    };
+    let (limit, offset) = admin_ingest::parse_list_window(limit_raw, offset_raw);
+    match ctx.store.admin_ingest_list(db_status, limit, offset).await {
+        Ok(jobs) => {
+            let mut views = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                if admin_ingest::view_status(&job.db_status).is_none() {
+                    return internal();
+                }
+                views.push(admin_ingest_view(job, None));
+            }
+            json_response(
+                200,
+                serde_json::json!({"jobs": views, "limit": limit, "offset": offset}),
+            )
+        }
+        Err(_) => internal(),
+    }
+}
+// --- Admin invites (migration 0033) --------------------------------------------------------
+//
+// API-only in M1: issue (plaintext shown once in the response, hash
+// only at rest), list/search by issuer/status, revoke. Everything
+// here rides the same non-enumerable `authenticate_admin` guard as
+// the 0028 surface, and every write commits with its audit row in
+// one transaction that re-reads the actor's role under its locks.
+
+/// Cap on one admin invite list response; pagination is post-M1.
+const ADMIN_INVITE_LIST_LIMIT: usize = 200;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminInviteIssueBody {
+    /// When set, redemption requires signup with this exact email.
+    email: Option<String>,
+    /// Per-invite expiry in days (1–30); absent means the
+    /// `invite_default_expiry_days` setting.
+    expires_in_days: Option<u32>,
+}
+
+/// One invite as the admin API reports it: lifecycle fields only —
+/// the code and its hash are never in any response.
+fn invite_admin_json(record: &InviteRecord, now: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.id,
+        "status": record.status(now),
+        "kind": record.kind,
+        "email": record.email,
+        "issued_by": record.issued_by,
+        "created_at": record.created_at,
+        "expires_at": record.expires_at,
+        "redeemed_by": record.redeemed_by,
+        "redeemed_at": record.redeemed_at,
+        "revoked_at": record.revoked_at,
+        "revoked_by": record.revoked_by,
+    })
+}
+
+/// `POST /v1/admin/invites` — issue one admin invite. The plaintext
+/// code is returned exactly once, in this response; only its hash is
+/// stored, and neither is ever logged or audited (the audit row
+/// references the new row id).
+async fn admin_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(body) = parse_body::<AdminInviteIssueBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    let email = match body.email.as_deref() {
+        Some(raw) => match normalize_email(raw) {
+            Some(email) => Some(email),
+            None => return validation_failed("invalid email"),
+        },
+        None => None,
+    };
+    let expiry_key = crate::admin::SettingKey::InviteDefaultExpiryDays;
+    let expires_in_days = match body.expires_in_days {
+        Some(days) => match expiry_key.validate(days) {
+            Some(days) => days,
+            None => return validation_failed("invite expiry out of range"),
+        },
+        None => {
+            let rows = match ctx.store.app_settings().await {
+                Ok(rows) => rows,
+                Err(_) => return internal(),
+            };
+            let stored = rows
+                .iter()
+                .find(|(name, _)| name == expiry_key.as_str())
+                .map(|(_, value)| value.as_str());
+            match expiry_key.resolve(stored) {
+                Some(days) => days,
+                None => return internal(),
+            }
+        }
+    };
+    let code = match auth::generate_invite_code() {
+        Ok(code) => code,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+        Err(_) => return internal(),
+    };
+    let record = InviteRecord::new_issued(
+        auth::hash_invite_code(&code),
+        Some(claims.user_id.clone()),
+        auth::INVITE_KIND_ADMIN,
+        email,
+        ctx.now,
+        ctx.now
+            .saturating_add(u64::from(expires_in_days).saturating_mul(86_400)),
+    );
+    let invite_id = match ctx
+        .store
+        .admin_issue_invite(&claims.user_id, &record, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(AdminInviteIssueOutcome::Issued(id)) => id,
+        // The actor lost admin between the guard and the write
+        // transaction's re-check: answer as any non-admin is answered.
+        Ok(AdminInviteIssueOutcome::ActorNotAdmin) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let mut issued = record;
+    issued.id = invite_id;
+    json_response(
+        201,
+        serde_json::json!({
+            "invite": invite_admin_json(&issued, ctx.now),
+            // Shown once: the issuer copies it now. It is not stored,
+            // not logged, and cannot be read back.
+            "code": code,
+        }),
+    )
+}
+
+/// `GET /v1/admin/invites` — every invite (newest first, capped),
+/// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
+/// Filters ride path segments: `Request` carries no query string and
+/// the M1 surface is API-only.
+async fn admin_invite_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Err(resp) = ctx.authenticate_admin(req, false).await {
+        return resp;
+    }
+    let (issuer, status) = if req.path == "/v1/admin/invites" {
+        (None, None)
+    } else if let Some(rest) = req.path.strip_prefix("/v1/admin/invites/") {
+        let Some((kind, value)) = rest.split_once('/') else {
+            return not_found();
+        };
+        if value.is_empty() || value.contains('/') {
+            return not_found();
+        }
+        match kind {
+            "status" => match value {
+                "active" | "expired" | "redeemed" | "revoked" => (None, Some(value)),
+                _ => return not_found(),
+            },
+            "issuer" => (Some(value), None),
+            _ => return not_found(),
+        }
+    } else {
+        return not_found();
+    };
+    let rows = match ctx
+        .store
+        .admin_list_invites(issuer, status, ctx.now, ADMIN_INVITE_LIST_LIMIT)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return internal(),
+    };
+    let invites: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|record| invite_admin_json(record, ctx.now))
+        .collect();
+    json_response(200, serde_json::json!({"invites": invites}))
+}
+
+/// `POST /v1/admin/invites/{id}/revoke` — revoke one unredeemed
+/// invite. Revocation wins redemption races (the store's conditional
+/// write); an already-revoked invite is an idempotent success, an
+/// already-redeemed one is a conflict — revocation never reaches
+/// back into a created account.
+async fn admin_invite_revoke<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let Some(rest) = req.path.strip_prefix("/v1/admin/invites/") else {
+        return not_found();
+    };
+    let Some((raw_id, "revoke")) = rest.split_once('/') else {
+        return not_found();
+    };
+    // Strict decimal id: no sign, no whitespace, no leading zeros.
+    let invite_id: i64 = if raw_id.is_empty()
+        || !raw_id.bytes().all(|b| b.is_ascii_digit())
+        || (raw_id.len() > 1 && raw_id.starts_with('0'))
+    {
+        return not_found();
+    } else {
+        match raw_id.parse() {
+            Ok(id) => id,
+            Err(_) => return not_found(),
+        }
+    };
+    match ctx
+        .store
+        .admin_revoke_invite(&claims.user_id, invite_id, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(AdminInviteRevokeOutcome::Revoked | AdminInviteRevokeOutcome::AlreadyRevoked) => {
+            json_response(
+                200,
+                serde_json::json!({"id": invite_id, "status": "revoked"}),
+            )
+        }
+        Ok(AdminInviteRevokeOutcome::AlreadyRedeemed) => {
+            validation_failed("invite already redeemed")
+        }
+        Ok(AdminInviteRevokeOutcome::Missing | AdminInviteRevokeOutcome::ActorNotAdmin) => {
+            not_found()
+        }
+        Err(_) => internal(),
+    }
+}
+
+// --- Play grant issuance -----------------------------------------------------------------
+//
+// `POST /v1/plays` is THE enforcement point: the stream Worker has no DB
+// binding, so subscription, the monthly hour cap, and the
+// one-concurrent-stream lease are all evaluated here before a grant is
+// minted (`crate::playback` documents the gate order and lease rules).
+// Cookie-session only for now: the scope map keeps `Bearer(PlaysWrite)`
+// on this path, so a presented native-rest bearer is gate-checked in
+// `handle()` (invalid keys plain-404 before dispatch, never rescued by a
+// cookie) but cannot mint until native bearer dispatch lands; the
+// heartbeat path is `Deny` in the scope map and never enters the gate.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayIssueBody {
+    track_id: String,
+    /// Client-generated playback session id (per tab/device): the lease
+    /// holder name. Distinct from the account session cookie — two
+    /// signed-in devices share one account but hold different holders.
+    session_id: String,
+    /// Continuation key only: present when refreshing a grant for the
+    /// caller's own current play. Never accepted as a fresh play id —
+    /// new starts always mint one server-side, so a replay cannot be
+    /// under-metered by reusing an old id.
+    play_id: Option<String>,
+    /// Explicit "play here instead": take the lease from the other
+    /// session now rather than waiting out its TTL.
+    #[serde(default)]
+    takeover: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayHeartbeatBody {
+    session_id: String,
+    play_id: String,
+    lease_epoch: u64,
+}
+
+/// Client session ids name the lease holder: bounded by the
+/// `playback_leases` length CHECK (1..=128), compared for equality only.
+/// The byte cap is at least as strict as the column's character cap.
+fn valid_client_session_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128
+}
+
+/// `402 subscription_required` with the paywall `reason` discriminator
+/// plus the upgrade pointer (`docs/api-errors.md`): the registered
+/// envelope extended by names-only fields, like the plan-limit body.
+fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Response {
+    let error = crate::api_error::ApiError::subscription_required("subscription required");
+    Response {
+        status: error.status,
+        body: serde_json::json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "reason": refusal.reason(),
+            (crate::plan_limits::UPGRADE_KEY): crate::plan_limits::UPGRADE_URL,
+        })
+        .to_string(),
+        set_cookie: None,
+        retry_after: None,
+        extra_headers: Vec::new(),
+    }
+}
+
+/// Mint the grant for an already-acquired lease hold and render the
+/// issuance body. The minter re-checks the identity field rule, so an
+/// unmeterable identity still cannot mint even though the handler
+/// validated earlier; `NotConfigured` is unreachable after the
+/// up-front secret check but stays a fail-closed 500, never a token.
+fn play_grant_response(
+    secret: &[u8],
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    epoch: u64,
+    now: u64,
+    lease_expires_at: u64,
+) -> Response {
+    match crate::play_grant::issue_v2_at(
+        user_id,
+        track_id,
+        play_id,
+        epoch,
+        now,
+        crate::play_grant::MAX_GRANT_TTL,
+        Some(secret),
+    ) {
+        Ok(issued) => json_response(
+            200,
+            serde_json::json!({
+                "grant": issued.token,
+                "play_id": play_id,
+                "lease_epoch": epoch,
+                "expires_at": issued.exp_unix,
+                "lease_expires_at": lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        ),
+        Err(crate::play_grant::MintError::NotConfigured) => internal(),
+        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+    }
+}
+
+async fn play_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
+    // answer the typed 409 up front rather than a lease 429/500 after
+    // the fence refuses the write.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // An unprovisioned (or too-short) secret fails closed before any
+    // lease write: an unmintable grant must never burn a lease epoch or
+    // displace the current holder.
+    let Some(secret) = ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+    else {
+        return internal();
+    };
+    let Some(body) = parse_body::<PlayIssueBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    // The track id must be meterable before any lease write: the
+    // ledger field rule is the single authority (probed with a
+    // placeholder play id — the same probe the minter runs with the
+    // real one). User ids are server-generated; an unmeterable one
+    // fails this same check rather than minting an unbillable grant.
+    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
+    {
+        return validation_failed("invalid track_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    // Continuation: the same client session refreshing the grant for
+    // its own current play (seek/resume/refresh ahead of grant
+    // expiry). Skips the subscription and cap gates — the track that
+    // crosses the cap, or whose subscription lapses mid-play,
+    // finishes; only the next NEW start is refused. The conditional
+    // touch either re-extends the same epoch or reports the caller
+    // lost the lease between the read and now, in which case this is
+    // simply a new start through the gates below.
+    if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
+                .is_err()
+            {
+                return validation_failed("invalid play_id");
+            }
+            let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+            match ctx
+                .store
+                .touch_playback_lease(
+                    &claims.user_id,
+                    &body.session_id,
+                    play_id,
+                    row.epoch,
+                    ctx.now,
+                    lease_expires_at,
+                )
+                .await
+            {
+                Ok(true) => {
+                    return play_grant_response(
+                        secret,
+                        &claims.user_id,
+                        &body.track_id,
+                        play_id,
+                        row.epoch,
+                        ctx.now,
+                        lease_expires_at,
+                    );
+                }
+                Ok(false) => {}
+                Err(_) => return internal(),
+            }
+        }
+    }
+    // New start, gate 1: subscription. `now` saturates into i64 rather
+    // than wrapping — an absurd clock reads as far-future (closed),
+    // never as the distant past (entitled forever).
+    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let effective = crate::billing::resolve_effective_plan(
+        subscription.as_ref().map(|row| row.as_view()),
+        i64::try_from(ctx.now).unwrap_or(i64::MAX),
+    );
+    if !effective.entitled {
+        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+            Ok(ever) => ever,
+            Err(_) => return internal(),
+        };
+        let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
+            .expect("an unentitled effective plan always refuses");
+        return subscription_refusal(refusal);
+    }
+    // Caps are plan DATA from the `plans` row; a missing row fails
+    // closed to the reserved `free` caps (0 h) — the 402 below, never
+    // a silently uncapped grant.
+    let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
+        Ok(Some(caps)) => caps,
+        Ok(None) => crate::plan_limits::PlanId::Free.caps(),
+        Err(_) => return internal(),
+    };
+    // Gate 2: the monthly hour cap. An unreadable meter refuses the
+    // new start (store default `Err`) rather than reading as zero.
+    let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
+    let used_seconds = match ctx
+        .store
+        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .await
+    {
+        Ok(seconds) => seconds,
+        Err(_) => return internal(),
+    };
+    if let Some(denial) =
+        crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
+    {
+        return plan_limit_refusal(denial);
+    }
+    // A zero concurrency allowance refuses with the lease 429 wire and
+    // the static retry: no lease exists to wait on. Allowances above
+    // one are still enforced as one — the lease table holds a single
+    // row per user by design (every seeded plan allows exactly one).
+    if caps.max_concurrent_streams == 0 {
+        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+            &caps,
+            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        ));
+    }
+    // Gate 3: the lease. The play id is minted here, never taken from
+    // the client (a client-chosen fresh id could replay an old play
+    // and under-meter). The atomic acquire bumps the epoch in the
+    // store; `Held` is the other-session 429 with the live TTL.
+    let play_id = match random_id::<16>() {
+        Ok(id) => id,
+        Err(_) => return unavailable(),
+    };
+    let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+    match ctx
+        .store
+        .acquire_playback_lease(
+            &claims.user_id,
+            &body.session_id,
+            &body.track_id,
+            &play_id,
+            ctx.now,
+            lease_expires_at,
+            body.takeover,
+        )
+        .await
+    {
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+            secret,
+            &claims.user_id,
+            &body.track_id,
+            &play_id,
+            epoch,
+            ctx.now,
+            lease_expires_at,
+        ),
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
+            // Zero rows back can also mean the deletion fence closed
+            // after the up-front check (the marker landed mid-request):
+            // re-read it so that race answers the typed 409, not a
+            // concurrent-streams 429.
+            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                account_deleting_response()
+            } else {
+                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+                    &caps,
+                    retry_after_secs,
+                ))
+            }
+        }
+        Err(_) => internal(),
+    }
+}
+
+/// Heartbeat: the holder's keepalive and the takeover signal in one.
+/// Always 200 for lease state (`active` extends, `superseded` tells the
+/// displaced player to pause, `expired` means no row) — lease state is
+/// an answer, not an error. No subscription or cap gates: a current
+/// play finishes even when a new start would be refused.
+async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Same fence as issuance (ADR 0002 rule 3): a deleting account's
+    // heartbeat is the typed 409, never an `active` extension.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // Same fail-closed secret gate as issuance: a misconfigured
+    // deployment must not let heartbeats keep a lease alive that no
+    // new grant could be minted against.
+    if ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+        .is_none()
+    {
+        return internal();
+    }
+    let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let epoch = lease.as_ref().map_or(body.lease_epoch, |row| row.epoch);
+    let state = crate::playback::LeaseHeartbeat::classify(
+        lease.as_ref(),
+        &body.session_id,
+        &body.play_id,
+        body.lease_epoch,
+    );
+    let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+        match ctx
+            .store
+            .touch_playback_lease(
+                &claims.user_id,
+                &body.session_id,
+                &body.play_id,
+                body.lease_epoch,
+                ctx.now,
+                expires,
+            )
+            .await
+        {
+            Ok(true) => (state, Some(expires)),
+            // Zero rows: a raced takeover landed between the read and
+            // the touch, or the deletion fence closed after the
+            // up-front check. Re-read deletion so the fence race
+            // answers the typed 409; otherwise report the truth, do
+            // not extend a lost lease.
+            Ok(false) => {
+                if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                    return account_deleting_response();
+                }
+                (crate::playback::LeaseHeartbeat::Superseded, None)
+            }
+            Err(_) => return internal(),
+        }
+    } else {
+        (state, None)
+    };
+    let mut body_json = serde_json::json!({"lease": state.as_str(), "lease_epoch": epoch});
+    if let Some(expires) = lease_expires_at {
+        body_json["lease_expires_at"] = serde_json::json!(expires);
+    }
+    json_response(200, body_json)
+}
+
+// --- Meter sink (internal) ---------------------------------------------------
+//
+// `POST /internal/v1/play-windows` is not a user route: only the
+// stream Worker's per-user Durable Objects call it, over their `API`
+// service binding, authenticating with the dedicated meter-sink HMAC
+// (crate::meter_sink). It takes no session, no bearer, and no origin
+// pin (there is no browser), and it is deliberately not in
+// `is_known_path` — preflights stay 404 and the browser surface never
+// learns it exists. Each accepted window derives its seconds
+// server-side from the delivered union and writes through the
+// monotonic ledger upsert; the ack dispositions tell the DO which
+// windows are terminal (crate::meter_sink module docs).
+
+/// Ingest one signed batch of cumulative play windows.
+async fn meter_sink_ingest<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::meter_sink::{PlayWindowOutcome, SinkError};
+    match crate::meter_sink::verify(
+        ctx.cfg.meter_sink_secret.as_deref(),
+        req.authorization.as_deref(),
+        &req.body,
+        ctx.now,
+    ) {
+        Ok(()) => {}
+        // Unprovisioned is a server misconfiguration, not a caller
+        // fault; the DO retries on its alarm either way.
+        Err(SinkError::NotConfigured) => return internal(),
+        Err(SinkError::Unauthorized) => {
+            let error = crate::api_error::ApiError::unauthorized("unauthorized");
+            return Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+                retry_after: None,
+                extra_headers: Vec::new(),
+            };
+        }
+        Err(SinkError::Malformed) => return internal(),
+    }
+    let windows = match crate::meter_sink::parse_batch(&req.body) {
+        Ok(windows) => windows,
+        Err(_) => return validation_failed("invalid request"),
+    };
+    let mut accepted = Vec::new();
+    let mut fenced = Vec::new();
+    let mut rejected = Vec::new();
+    // Sequential on purpose: a batch is one user's plays, and the DO
+    // retries the whole batch on a 500 — the upsert's monotonicity
+    // makes partially-applied retries converge.
+    for window in &windows {
+        let meta = match ctx
+            .store
+            .track_meter_meta(&window.user_id, &window.track_id)
+            .await
+        {
+            Ok(meta) => meta,
+            Err(_) => return internal(),
+        };
+        // The stream-reported blob length is the confirmed size of
+        // what was actually served; the cache row is the backup.
+        let file_bytes = window.file_bytes.or(meta.file_bytes).filter(|b| *b > 0);
+        let duration_ms = crate::ledger::resolve_duration_ms(
+            meta.track_duration_ms,
+            meta.mb_duration_ms,
+            meta.bitrate_kbps,
+            file_bytes,
+        );
+        let prepared = crate::ledger::prepare_play_window(
+            &window.user_id,
+            &window.track_id,
+            &window.play_id,
+            window.union_bytes,
+            file_bytes,
+            duration_ms,
+            window.started_at,
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            // Unpreparable windows never converge on retry: name them
+            // terminal so the DO drops them instead of alarming forever.
+            Err(_) => {
+                rejected.push(window.play_id.clone());
+                continue;
+            }
+        };
+        match ctx.store.record_play_window(&prepared).await {
+            Ok(PlayWindowOutcome::Written | PlayWindowOutcome::Covered) => {
+                accepted.push(window.play_id.clone());
+            }
+            Ok(PlayWindowOutcome::Fenced) => fenced.push(window.play_id.clone()),
+            Err(_) => return internal(),
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "accepted": accepted,
+            "fenced": fenced,
+            "rejected": rejected,
+        }),
+    )
+}
+
 // --- Dispatch ------------------------------------------------------------------------------
+
+/// `u64` handler time as Stripe-epoch `i64` (saturates only past the year
+/// 292 billion; production values always fit).
+fn billing_now_i64(now: u64) -> i64 {
+    i64::try_from(now).unwrap_or(i64::MAX)
+}
+
+/// Best-effort billing alert: recorded, never fatal. Audit write failure
+/// must not turn a stored reconcile pass into a 500 (which Stripe would
+/// retry into a duplicate-safe but noisy replay).
+async fn billing_alert<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, user_id: &str, action: &str)
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let _ = ctx
+        .store
+        .insert_audit(&crate::vault::audit_event(
+            user_id,
+            action,
+            false,
+            &ctx.source_ip,
+            ctx.now,
+        ))
+        .await;
+}
+
+/// Shared reconcile driver for one Stripe subscription: retrieve the
+/// remote subscription plus its paid invoices (every invoice read FULLY —
+/// line pagination is followed until exhausted, a first page is never
+/// the full invoice) and fold them into the store through the pure
+/// `billing_reconcile::reconcile_subscription`. `Err(())` is a Stripe or
+/// store failure (the caller 500s so the delivery retries); fail-closed
+/// passes still persist their observed row and return `Ok` with the
+/// marker set, so the caller can alert and disable.
+async fn reconcile_remote_subscription<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<crate::billing_reconcile::ReconcileOutcome, ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let subscription = ctx
+        .stripe
+        .retrieve_subscription(subscription_id.to_string())
+        .await
+        .map_err(|_| ())?;
+    let input = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| ())?;
+    let listed = ctx
+        .stripe
+        .list_invoices(crate::stripe::ListInvoices {
+            customer_id: subscription.customer.clone(),
+            subscription_id: Some(subscription.id.clone()),
+            paid_only: true,
+            limit: 100,
+            // The real transport pages the list envelope itself to
+            // exhaustion; the fakes answer the full filtered set.
+            starting_after: None,
+        })
+        .await
+        .map_err(|_| ())?;
+    let mut invoices = Vec::with_capacity(listed.len());
+    for mut invoice in listed {
+        loop {
+            let has_more = invoice
+                .lines
+                .as_ref()
+                .map(|lines| lines.has_more)
+                .unwrap_or(false);
+            if !has_more {
+                break;
+            }
+            let cursor = invoice
+                .lines
+                .as_ref()
+                .and_then(|lines| lines.data.last())
+                .map(|line| line.id.clone());
+            let page = ctx
+                .stripe
+                .list_invoice_lines(invoice.id.clone(), cursor, 100)
+                .await
+                .map_err(|_| ())?;
+            match invoice.lines.as_mut() {
+                Some(lines) => {
+                    lines.data.extend(page.data);
+                    lines.has_more = page.has_more;
+                }
+                None => {
+                    invoice.lines = Some(crate::stripe::InvoiceLines {
+                        data: page.data,
+                        has_more: page.has_more,
+                    });
+                }
+            }
+        }
+        invoices.push(invoice);
+    }
+    let outcome = crate::billing_reconcile::reconcile_subscription(
+        &input,
+        &crate::billing_reconcile::RemoteSubscription {
+            subscription,
+            invoices,
+        },
+        billing_now_i64(ctx.now),
+    );
+    ctx.store
+        .store_reconcile_outcome(user_id, &outcome)
+        .await
+        .map_err(|_| ())?;
+    Ok(outcome)
+}
+
+/// Reconcile one completed Checkout Session (the webhook's handoff):
+/// resolve the user — the session's operation binding first (`op id`
+/// from `client_reference_id`), the customer binding second — then fold
+/// the remote subscription into the store. Unknown users ack 200 with an
+/// alert and no state change. An unconfirmed or open session mints
+/// nothing: no subscription id, no store touch.
+async fn reconcile_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    session_id: &str,
+) -> Result<(), ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = ctx
+        .stripe
+        .retrieve_checkout_session(session_id.to_string())
+        .await
+        .map_err(|_| ())?;
+    if session.status.as_deref() != Some("complete")
+        || session.payment_status.as_deref() != Some("paid")
+    {
+        return Ok(());
+    }
+    let Some(subscription_id) = session.subscription.clone() else {
+        return Ok(());
+    };
+    let mut user_id: Option<String> = None;
+    let mut op: Option<crate::billing_reconcile::StoredCheckoutOp> = None;
+    if let Some(client_reference) = session.client_reference_id.as_deref() {
+        match ctx.store.checkout_operation_by_id(client_reference).await {
+            Ok(Some(found)) => {
+                user_id = Some(found.user_id.clone());
+                op = Some(found);
+            }
+            Ok(None) => {}
+            Err(_) => return Err(()),
+        }
+    }
+    if user_id.is_none() {
+        if let Some(customer) = session.customer.as_deref() {
+            user_id = ctx
+                .store
+                .user_for_stripe_customer(customer)
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    let Some(user_id) = user_id else {
+        billing_alert(
+            ctx,
+            "stripe:unknown-customer",
+            BILLING_UNKNOWN_CUSTOMER_ACTION,
+        )
+        .await;
+        return Ok(());
+    };
+    let outcome = reconcile_remote_subscription(ctx, &user_id, &subscription_id).await?;
+    // The operation that sourced this session resolves with it: clean
+    // passes succeed it, fail-closed passes park it for the hourly job.
+    // Best-effort (the reconcile itself already stored): a lost mark only
+    // leaves the flight open, never double-bills.
+    if let Some(op) = op {
+        let state = if outcome.disable_new_purchases() {
+            "needs_reconcile"
+        } else {
+            "succeeded"
+        };
+        let price_id = op.price_id.clone().unwrap_or_default();
+        let _ = ctx
+            .store
+            .update_checkout_operation(&op.id, state, &price_id, Some(session_id))
+            .await;
+    }
+    if outcome.disable_new_purchases() {
+        billing_alert(ctx, &user_id, BILLING_FAIL_CLOSED_ACTION).await;
+    }
+    Ok(())
+}
+
+async fn billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Unprovisioned secrets fail closed before any parse: Stripe retries
+    // the generic 500; an unverifiable webhook is never acked as
+    // received. The bearer key gates the Stripe calls below (the
+    // transport fails closed without it, same 500).
+    if ctx.cfg.stripe_secret_key.is_none() || ctx.cfg.stripe_webhook_secret.is_none() {
+        return internal();
+    }
+    let webhook_secret = ctx.cfg.stripe_webhook_secret.as_deref().unwrap_or_default();
+    // The signature is verified over the RAW body before any JSON
+    // parsing: every failure shares one sealed 400 (no verification
+    // oracle), and no state is touched on any failure.
+    let header = match req.stripe_signature.as_deref() {
+        Some(header) => header,
+        None => return invalid_request(),
+    };
+    let event = match crate::stripe::verify_webhook_signature(
+        &req.body,
+        header,
+        webhook_secret,
+        billing_now_i64(ctx.now),
+    ) {
+        Ok(event) => event,
+        Err(_) => return invalid_request(),
+    };
+    // First claim wins. Duplicates of a verified non-checkout event (or a
+    // live-mode event) still ack 200 with no state change — those paths
+    // never write state, so nothing can be lost. A duplicate
+    // `checkout.session.completed`, however, is REPROCESSED idempotently
+    // instead of acked: the release below is a same-DB DELETE, so a store
+    // outage that fails the release — or a worker death after the claim —
+    // would otherwise leave the paid event consumed and unprocessed.
+    // Reconciliation converges (monotonic upsert under the per-user lock,
+    // history idempotent on the invoice id, operation mark idempotent), so
+    // reprocessing a duplicate lands the same stored state, and a still-
+    // failing pass 500s so Stripe retries anyway. A store failure on the
+    // claim itself 500s so Stripe retries the delivery.
+    let _first_claim = match ctx.store.claim_webhook_event(&event.id).await {
+        Ok(first) => first,
+        Err(_) => return internal(),
+    };
+    if event.event_type != "checkout.session.completed" {
+        // Verified but not ours: ack, no state change. Live-mode events
+        // land here too — never Stripe-called, never stored.
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
+    if event.livemode {
+        // A live-mode event on a test-mode worker is misconfiguration or
+        // a probe: alert, ack, and never call Stripe or touch state.
+        billing_alert(
+            ctx,
+            &format!("stripe:{}", event.id),
+            BILLING_UNKNOWN_CUSTOMER_ACTION,
+        )
+        .await;
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
+    // The session object is verified JSON now; a missing id is a sender
+    // bug (400), not a retryable failure.
+    let session_id = match event.object.get("id").and_then(|id| id.as_str()) {
+        Some(id) => id.to_string(),
+        None => return invalid_request(),
+    };
+    match reconcile_checkout_session(ctx, &session_id).await {
+        Ok(()) => json_response(200, serde_json::json!({"ok": true})),
+        Err(()) => {
+            // The claim is released so the retried delivery reprocesses
+            // instead of acking 200 on a consumed claim. Best-effort: a
+            // failed release still 500s, so Stripe retries anyway — and a
+            // redelivery that finds the stale claim reprocesses it above
+            // rather than dropping the payment.
+            let _ = ctx.store.release_webhook_event(&event.id).await;
+            internal()
+        }
+    }
+}
+
+/// Fresh single-flight operation id: UUID v4 text (the store casts the
+/// id column). Secure-randomness failure fails the purchase closed —
+/// never with a predictable id.
+fn new_operation_id() -> Result<String, crate::random::CryptoError> {
+    let bytes = crate::random::secure_random_bytes::<16>()?;
+    let mut hex = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        let mut byte = *byte;
+        if index == 6 {
+            byte = (byte & 0x0f) | 0x40;
+        }
+        if index == 8 {
+            byte = (byte & 0x3f) | 0x80;
+        }
+        if matches!(index, 4 | 6 | 8 | 10) {
+            hex.push('-');
+        }
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
+}
+
+/// Free a held live slot (`incomplete` / `unpaid` / `paused`) before a
+/// replacement checkout mints its session. The held subscription is
+/// re-read from Stripe and the decision branches on the REMOTE status —
+/// the stored row may be stale (only `checkout.session.completed`
+/// webhooks reconcile, so a payment recovered since the last reconcile
+/// still reads `unpaid` locally). Terminal remote reconciles straight
+/// into the released slot; still-held remote cancels first and then
+/// reconciles. Only once the slot is free may the caller proceed —
+/// otherwise the replacement's reconcile would collide with the
+/// still-held row and fail a paid subscription closed. A remote that
+/// recovered to `active` / `past_due` reconciles (coverage and history
+/// land) but refuses the purchase: canceling it would destroy the newly
+/// paid subscription, and minting a second one double-bills. An unknown
+/// remote status fails closed with an alert: no cancel, no reconcile, no
+/// session — the held row stays reserved so later attempts keep failing
+/// closed the same way. `Failed` is retryable (Stripe or store failure);
+/// nothing is minted on any path but the freed slot.
+async fn release_held_subscription_slot<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let subscription = ctx
+        .stripe
+        .retrieve_subscription(subscription_id.to_string())
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    match subscription.status.as_str() {
+        // Still held: cancel first, then reconcile the terminal state out
+        // of the slot.
+        "incomplete" | "unpaid" | "paused" => {
+            ctx.stripe
+                .cancel_subscription(subscription_id.to_string())
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Already terminal remotely: nothing to cancel, reconcile it out
+        // of the slot.
+        status if crate::billing_reconcile::is_terminal_status(status) => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Recovered since the last reconcile: store the paid state, then
+        // refuse — the account is already subscribed, so no cancel and no
+        // second session.
+        "active" | "past_due" => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Err(EnsureCheckoutError::Unavailable)
+        }
+        // Unknown provider state: fail closed. No cancel (never destroy
+        // what we cannot classify), no reconcile (the stale held row stays
+        // reserved), no session — just the alert.
+        _ => {
+            billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+            Err(EnsureCheckoutError::Unavailable)
+        }
+    }
+}
+
+/// The customer id a converged purchase attempt must create its session
+/// under: the account binding re-read *after* the single-flight insert,
+/// never the snapshot taken before this caller's own customer create.
+/// Two racers that both start unbound each mint a Stripe customer; the
+/// insert converges them on the winner's operation, and the winner's bind
+/// owns the account. The op INSERT and the bind are separate statements,
+/// so a loser can converge before the winner's bind lands: with no bound
+/// customer yet the attempt fails retryable (the retry reads the winner's
+/// binding) instead of falling back to its orphan. A converged attempt
+/// never sessions on a customer that is not the account-bound one.
+async fn converged_session_customer<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    _snapshot_customer: Option<String>,
+    _created_customer: String,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let fresh = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+        .stripe_customer_id;
+    // No fallback to the snapshot or the freshly minted orphan: in the
+    // pre-bind window (op visible, winner bind not yet landed) there is no
+    // bound customer, so the attempt fails retryable and the retry reads
+    // the winner's binding. A converged attempt never sessions on a
+    // customer that is not the account-bound one.
+    fresh.ok_or(EnsureCheckoutError::Failed)
+}
+
+/// Create the Checkout Session under one operation id and record it, so
+/// the next attempt reuses instead of recreating. The Stripe idempotency
+/// key derives from the operation id, so even a lost `update` replays
+/// into the same session on retry.
+async fn create_session_under<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    operation_id: &str,
+    customer_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = ctx
+        .stripe
+        .create_checkout_session(crate::stripe::CreateCheckoutSession {
+            operation_id: operation_id.to_string(),
+            customer_id: customer_id.to_string(),
+            price_id: price_id.to_string(),
+            success_url: success_url.to_string(),
+            cancel_url: cancel_url.to_string(),
+        })
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    // Conditional mark: the session already exists under our idempotency
+    // key, so a lost mark only costs a retrieve on the next attempt — but
+    // a mark that lands after a deliberate supersede must not resurrect
+    // the retired row. A missed mark means the flight moved on (the
+    // replacer expired this very session before retiring the row), so the
+    // in-hand session is dead: fail retryable and let the retry converge
+    // onto the replacement instead of handing out an expired URL.
+    let marked = ctx
+        .store
+        .update_checkout_operation(operation_id, "submitted", price_id, Some(&session.id))
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
+    session.url.ok_or(EnsureCheckoutError::Failed)
+}
+
+/// Serialized purchase attempt (single flight): reuse the open Checkout
+/// Session while open, else create under the converged operation id. No
+/// user-facing route in this slice — the wiring card's routes call this.
+/// `test_clock` is the staging-proof seam (customer creation only, never
+/// a clock the worker manages).
+///
+/// `Unavailable` means the price is not a selectable test-mode mapping
+/// (or the binding is otherwise inconsistent), the account already holds
+/// a live subscription, or the stored row is an unknown provider state
+/// failing closed: no Stripe call is made, and new purchases stay
+/// disabled. An alert is raised except for the already-subscribed case.
+/// `Failed` means a Stripe or store failure (retryable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureCheckoutError {
+    Unavailable,
+    Failed,
+}
+
+/// What one retrieved flight session decides: reuse its URL, retire it so
+/// the caller mints a replacement, accept the completed purchase, or keep
+/// the flight without minting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlightSessionDecision {
+    /// Open, price-matched, with a URL: hand it over.
+    Reuse(String),
+    /// Deliberately retired (expired first while still open, or confirmed
+    /// dead): the caller mints the replacement under a fresh operation.
+    Replace,
+    /// Complete and paid: reconciled through the shared driver; the caller
+    /// refuses the duplicate purchase.
+    Completed,
+    /// Complete but unpaid, or any other unrecognized state: the flight
+    /// stays open for the real completion; the caller fails retryable
+    /// without minting beside unknown state.
+    Retained,
+}
+
+/// Branch on one flight session retrieved fresh from Stripe (never trusted
+/// from the row): reuse the open price-matched session, expire a still-open
+/// unusable one before its deliberate replacement, reconcile a completed
+/// paid session through the shared driver, or retain the flight without
+/// minting for anything else. Only `status == "expired"` deliberately
+/// replaces among the closed states: a `complete` session that is not paid
+/// (`unpaid` async processing, `no_payment_required` subscription already
+/// created) can still succeed, so a retry must never mint a second
+/// subscription checkout beside it. A Stripe-404 (past retention, never
+/// minted) replaces like a confirmed-expired session; any other retrieve
+/// failure fails retryable instead of minting beside unknown state.
+async fn handle_flight_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    session_id: &str,
+    price_id: &str,
+) -> Result<FlightSessionDecision, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let session = match ctx
+        .stripe
+        .retrieve_checkout_session(session_id.to_string())
+        .await
+    {
+        Ok(session) => session,
+        Err(err) if err.http_status == 404 => {
+            // Missing (past retention, never minted): same deliberate
+            // replacement as a confirmed-expired session.
+            replace_checkout_operation(ctx, op, None).await?;
+            return Ok(FlightSessionDecision::Replace);
+        }
+        Err(_) => return Err(EnsureCheckoutError::Failed),
+    };
+    if session.status.as_deref() == Some("open") {
+        if crate::billing_reconcile::checkout_price_matches(op, price_id) {
+            if let Some(url) = session.url {
+                return Ok(FlightSessionDecision::Reuse(url));
+            }
+        }
+        // Open but unusable for this attempt: price-mismatched (the flight
+        // belongs to another price) or URL-less. Expire it first — a
+        // replacement never mints beside a possibly-payable session — then
+        // replace deliberately.
+        replace_checkout_operation(ctx, op, Some(session_id)).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    if session.status.as_deref() == Some("complete")
+        && session.payment_status.as_deref() == Some("paid")
+    {
+        // The purchase completed but its webhook was lost (or lands after
+        // this retry): reconcile the paid session through the shared driver
+        // instead of minting a second payable session. Money already landed,
+        // whatever price it names — no replacement is minted on this path.
+        reconcile_checkout_session(ctx, session_id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        return Ok(FlightSessionDecision::Completed);
+    }
+    if session.status.as_deref() == Some("expired") {
+        // Confirmed dead without payment: no expiry call needed — Stripe
+        // converges the state itself — just supersede and replace.
+        replace_checkout_operation(ctx, op, None).await?;
+        return Ok(FlightSessionDecision::Replace);
+    }
+    // Complete but not paid, or any other unrecognized state: the flight
+    // stays open for the real completion and nothing mints beside it —
+    // retryable, never a blind replace.
+    Ok(FlightSessionDecision::Retained)
+}
+
+/// Recover the Stripe session for a session-less operation under its
+/// ORIGINAL operation id and recorded price, and carry the recovered id on
+/// the operation (best-effort mark repair — a lost mark only costs a
+/// re-resolve on the next attempt). A missing `session_id` does not mean
+/// Stripe has no session: the create mark is best-effort, so the same-key
+/// replay recovers the original create without duplicating, and when
+/// nothing was ever created the replay first-creates exactly one session
+/// under that key. Either way the caller retires the recovered session per
+/// its retrieved state before superseding — a replacement never mints
+/// beside a possibly-payable session. Any Stripe failure fails retryable
+/// with the flight untouched: nothing supersedes beside unknown state.
+async fn resolve_sessionless_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    mut op: crate::billing_reconcile::StoredCheckoutOp,
+    recorded_price_id: &str,
+    customer_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<crate::billing_reconcile::StoredCheckoutOp, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let recovered = ctx
+        .stripe
+        .create_checkout_session(crate::stripe::CreateCheckoutSession {
+            operation_id: op.id.clone(),
+            customer_id: customer_id.to_string(),
+            price_id: recorded_price_id.to_string(),
+            success_url: success_url.to_string(),
+            cancel_url: cancel_url.to_string(),
+        })
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    op.session_id = Some(recovered.id.clone());
+    // Conditional, like the create-path mark: the in-memory row already
+    // carries the recovered id for this attempt, so a lost mark only costs
+    // a re-resolve on the next one — never a duplicate session. A missed
+    // mark means the row retired while the replay was in flight (a
+    // concurrent replacer superseded it): fail retryable with the flight
+    // untouched instead of acting on the dead row.
+    let state = op.state.clone();
+    let marked = ctx
+        .store
+        .update_checkout_operation(&op.id, &state, recorded_price_id, op.session_id.as_deref())
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
+    Ok(op)
+}
+
+pub async fn ensure_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let input = ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    // Plan ids come only from `plan_prices`: an unmapped, unselectable,
+    // or live-mode price disables the purchase (alert, no Stripe call),
+    // it never mints a guess.
+    let selectable = input
+        .bindings
+        .iter()
+        .any(|binding| !binding.livemode && binding.selectable && binding.price_id == price_id);
+    if !selectable {
+        billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+        return Err(EnsureCheckoutError::Unavailable);
+    }
+    // No second subscription while the live slot is held: an
+    // active/past_due row means the account is subscribed (the
+    // webhook-before-response race lands here — the purchase is refused
+    // instead of minting a stray session), and any other stored status
+    // except the known held ones is an unknown provider state failing
+    // closed, which keeps new purchases disabled. Held (`incomplete`,
+    // `unpaid`, `paused`) rows reserve the slot but confer nothing, so a
+    // retry may still proceed below. Terminal rows sit outside the slot
+    // (`live` is `None`) and never reach this guard.
+    if let Some(live) = input.live.as_ref() {
+        if !matches!(live.status.as_str(), "incomplete" | "unpaid" | "paused") {
+            if !matches!(live.status.as_str(), "active" | "past_due") {
+                billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+            }
+            return Err(EnsureCheckoutError::Unavailable);
+        }
+        // Held (`incomplete` / `unpaid` / `paused`) rows reserve the slot
+        // but confer nothing: confirm the held subscription terminal (or
+        // cancel it) and reconcile it out of the slot before minting the
+        // replacement, so the replacement's reconcile never collides with
+        // the still-held row. A retryable failure mints nothing.
+        release_held_subscription_slot(ctx, user_id, &live.stripe_subscription_id).await?;
+    }
+    let open = ctx
+        .store
+        .open_checkout_operation(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if let Some(mut op) = open {
+        // A session-less operation whose recorded price no longer matches
+        // is resolved under its ORIGINAL operation id and price before
+        // anything retires it: a lost mark does not mean Stripe has no
+        // session, so the same-key replay recovers it first and the flight
+        // below retires it per its retrieved state. Only then does the
+        // flight supersede — a replacement never mints beside a
+        // possibly-payable session. A price-matched orphan still repairs
+        // under its own id further below (same key replays the lost create,
+        // never duplicates). An unresolvable flight (no bound customer to
+        // replay with, or any Stripe failure) fails retryable with the
+        // flight untouched: nothing supersedes beside unknown state.
+        if op.session_id.is_none()
+            && !crate::billing_reconcile::checkout_price_matches(&op, price_id)
+        {
+            let Some(customer_id) = input.stripe_customer_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            let recorded = op.price_id.clone().unwrap_or_else(|| price_id.to_string());
+            op = resolve_sessionless_operation(
+                ctx,
+                op,
+                &recorded,
+                &customer_id,
+                success_url,
+                cancel_url,
+            )
+            .await?;
+        }
+        if let Some(session_id) = op.session_id.clone() {
+            // An open session is verified fresh against Stripe before reuse,
+            // and its recorded price must match the newly requested one: a
+            // second attempt naming a different plan never inherits the first
+            // attempt's session. A confirmed-expired or Stripe-404-missing
+            // session is deliberately replaced — the dead operation is
+            // superseded (releasing the flight) and a fresh operation mints
+            // under a fresh Stripe idempotency key, so a repair can never
+            // replay a dead session inside Stripe's retention window. Lost
+            // responses and same-price concurrent attempts still converge
+            // here: no second session is minted for them.
+            return match handle_flight_session(ctx, &op, &session_id, price_id).await? {
+                FlightSessionDecision::Reuse(url) => Ok(url),
+                FlightSessionDecision::Replace => {
+                    create_fresh_checkout_session(
+                        ctx,
+                        user_id,
+                        input.stripe_customer_id.clone(),
+                        price_id,
+                        success_url,
+                        cancel_url,
+                        test_clock,
+                    )
+                    .await
+                }
+                FlightSessionDecision::Completed => Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => Err(EnsureCheckoutError::Failed),
+            };
+        }
+        // Orphan operation (no session recorded — either never created, or
+        // the mark was lost) whose price still matches: repair under its own
+        // id (same key replays the lost create, never duplicates).
+        // (Mismatched orphans resolved above and carry a session now.)
+        let Some(customer_id) = input.stripe_customer_id.clone() else {
+            billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
+            return Err(EnsureCheckoutError::Unavailable);
+        };
+        return create_session_under(ctx, &op.id, &customer_id, price_id, success_url, cancel_url)
+            .await;
+    }
+    create_fresh_checkout_session(
+        ctx,
+        user_id,
+        input.stripe_customer_id.clone(),
+        price_id,
+        success_url,
+        cancel_url,
+        test_clock,
+    )
+    .await
+}
+
+/// Fresh-operation purchase attempt (no usable open flight): mint the
+/// operation id, ensure the customer (with the test-clock seam), then
+/// insert single-flight — a racer converges on the winner's row below
+/// instead of minting a second subscription. The converged operation's
+/// recorded price is checked before minting: a single-flight loser that
+/// asked for a different price replaces deliberately instead of
+/// inheriting the winner's session.
+async fn create_fresh_checkout_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    snapshot_customer: Option<String>,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    test_clock: Option<&str>,
+) -> Result<String, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let operation_id = new_operation_id().map_err(|_| EnsureCheckoutError::Failed)?;
+    let mut snapshot_customer = snapshot_customer;
+    let mut minted_customer: Option<String> = None;
+    loop {
+        let customer_id = match snapshot_customer.clone() {
+            Some(customer_id) => customer_id,
+            None => match minted_customer.clone() {
+                Some(customer_id) => customer_id,
+                None => {
+                    let created = ctx
+                        .stripe
+                        .create_customer(crate::stripe::CreateCustomer {
+                            operation_id: operation_id.clone(),
+                            user_id: Some(user_id.to_string()),
+                            test_clock: test_clock.map(str::to_string),
+                        })
+                        .await
+                        .map_err(|_| EnsureCheckoutError::Failed)?;
+                    minted_customer = Some(created.id.clone());
+                    created.id
+                }
+            },
+        };
+        let outcome = ctx
+            .store
+            .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        let converged = outcome.op();
+        // A converged loser that named a different price must not inherit the
+        // winner's session (which keeps the first attempt's price). A
+        // session-less winner is still creating (or lost its mark): recover
+        // under the winner's key and price first, exactly like an orphan —
+        // otherwise the replace below would orphan a payable session.
+        // Either way the winner's session retires per its retrieved state
+        // before the retry mints under this attempt's fresh operation.
+        if !crate::billing_reconcile::checkout_price_matches(converged, price_id) {
+            let resolved = match converged.session_id.clone() {
+                Some(_) => converged.clone(),
+                None => {
+                    let customer_id = converged_session_customer(
+                        ctx,
+                        user_id,
+                        snapshot_customer.clone(),
+                        customer_id.clone(),
+                    )
+                    .await?;
+                    let recorded = converged
+                        .price_id
+                        .clone()
+                        .unwrap_or_else(|| price_id.to_string());
+                    resolve_sessionless_operation(
+                        ctx,
+                        converged.clone(),
+                        &recorded,
+                        &customer_id,
+                        success_url,
+                        cancel_url,
+                    )
+                    .await?
+                }
+            };
+            let Some(session_id) = resolved.session_id.clone() else {
+                return Err(EnsureCheckoutError::Failed);
+            };
+            match handle_flight_session(ctx, &resolved, &session_id, price_id).await? {
+                // Unreachable: the price mismatches by construction, so the
+                // winner's session is never reusable here. Fail safe — the
+                // retry heals it, and nothing mints beside unknown state.
+                FlightSessionDecision::Reuse(_) => return Err(EnsureCheckoutError::Failed),
+                FlightSessionDecision::Replace => {
+                    // Re-read the binding (the supersede released the flight, so the
+                    // retry sees whatever the winner bound). A still-unbound retry
+                    // reuses this attempt's already-minted customer instead of
+                    // minting a second orphan.
+                    snapshot_customer = snapshot_customer_fresh(ctx, user_id).await?;
+                    continue;
+                }
+                FlightSessionDecision::Completed => return Err(EnsureCheckoutError::Unavailable),
+                FlightSessionDecision::Retained => return Err(EnsureCheckoutError::Failed),
+            }
+        }
+        // Converge on the winner-bound customer: a racing loser that started
+        // unbound minted its own orphan customer before the insert, and the
+        // pre-insert snapshot still names nothing. Re-read the binding — the
+        // payable session must sit on the bound customer.
+        let customer_id =
+            converged_session_customer(ctx, user_id, snapshot_customer.clone(), customer_id)
+                .await?;
+        return create_session_under(
+            ctx,
+            &converged.id,
+            &customer_id,
+            price_id,
+            success_url,
+            cancel_url,
+        )
+        .await;
+    }
+}
+
+/// Re-read the account's bound customer after a deliberate replacement
+/// (the supersede released the flight, so the retry reads whatever the
+/// winner bound). `None` when still unbound — the caller then reuses its
+/// already-minted customer instead of minting a second orphan.
+async fn snapshot_customer_fresh<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+) -> Result<Option<String>, EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    Ok(ctx
+        .store
+        .load_reconcile_input(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+        .stripe_customer_id)
+}
+
+/// Deliberately retire an open flight: expire the still-open Stripe
+/// session when one is named (so no second payable session lingers
+/// beside its replacement), then mark the operation superseded — the
+/// flight releases, and the replacement inserts a fresh operation with a
+/// fresh Stripe idempotency key. Confirmed-dead sessions pass `None` (no
+/// expiry call: Stripe already converged the state). Any expiry or store
+/// failure fails the attempt retryable: a replacement never mints beside
+/// a possibly-payable session.
+async fn replace_checkout_operation<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    op: &crate::billing_reconcile::StoredCheckoutOp,
+    expire_session_id: Option<&str>,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if let Some(session_id) = expire_session_id {
+        ctx.stripe
+            .expire_checkout_session(session_id.to_string())
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+    }
+    // A supersede is idempotent retirement: the conditional mark may
+    // report `false` when the row already retired, which is success here.
+    ctx.store
+        .update_checkout_operation(
+            &op.id,
+            crate::billing_reconcile::SUPERSEDED_OP_STATE,
+            &op.price_id.clone().unwrap_or_default(),
+            op.session_id.as_deref(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| EnsureCheckoutError::Failed)
+}
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
 /// these paths — plus the single-segment dynamic revoke id and the
@@ -4180,7 +7047,10 @@ where
 /// deliberately absent: their POST arms match independently, and listing
 /// them here would answer `OPTIONS` with 204 in every posture — making the
 /// seams enumerable from production. `POST /api/ingest` IS listed: it is
-/// a real route (cap guard today, write path later), not a seam.
+/// a real route (cap guard today, write path later), not a seam. The
+/// admin routes are absent for the same non-enumerability reason
+/// (TWO-70 A-AC1): their callers are first-party and same-origin, so
+/// nothing needs a preflight answer, and log lines name them `unknown`.
 pub fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -4200,12 +7070,12 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | "/v1/plays"
+            | "/v1/plays/heartbeat"
             | "/v1/credentials"
-            | "/v1/library"
-            | "/api/library"
-            | "/v1/artists"
-            | "/v1/releases"
-            | "/v1/tracks"
+            | "/v1/plans"
+            | "/v1/me/usage"
+            | "/v1/me/subscription"
     )
 }
 
@@ -4217,7 +7087,20 @@ pub fn is_known_path(path: &str) -> bool {
 /// the API surface. A presented `Authorization` header never changes this
 /// posture (the OPTIONS method maps `Deny`, so the bearer gate is
 /// skipped): preflight answers the path, not the caller.
+///
+/// The `/v1/admin/` namespace is excluded wholesale (TWO-70 A-AC1): the
+/// admin guard answers every non-admin caller with the plain 404, and a
+/// 204 preflight would enumerate the surface the guard hides. Prefix,
+/// not shape: every path under the namespace — real, mistyped or
+/// imaginary — 404s identically, while lookalikes without the trailing
+/// slash (`/v1/adminx`) never enter the namespace and keep their normal
+/// (unserved) posture. The scope map still classifies the real admin
+/// operations `SessionOnly` for the bearer gate; preflight simply never
+/// consults it for these paths.
 fn options_preflight_served(path: &str) -> bool {
+    if path == "/v1/admin" || path.starts_with("/v1/admin/") {
+        return false;
+    }
     if is_known_path(path) {
         return true;
     }
@@ -4233,16 +7116,6 @@ fn options_preflight_served(path: &str) -> bool {
             return false;
         }
     }
-    // Release subpaths preflight only as single items for the same reason:
-    // the detail reader serves exactly one segment, and deeper shapes
-    // (including the reserved `/v1/releases/{mbid}/art` path, whose reader
-    // has not landed) 404 in dispatch. The art card revisits this when its
-    // reader lands.
-    if let Some(rest) = path.strip_prefix("/v1/releases/") {
-        if rest.is_empty() || rest.contains('/') {
-            return false;
-        }
-    }
     ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
         .iter()
         .any(|method| {
@@ -4250,6 +7123,41 @@ fn options_preflight_served(path: &str) -> bool {
                 != crate::native_rest::RouteDecision::Deny
         })
 }
+
+// --- Stripe billing: webhook + single-flight checkout -------------------------------
+//
+// Checkout shape only, test mode only (ADR 0005). The webhook route is a
+// signature carve-out: `Stripe-Signature` HMAC-SHA256 over the raw body
+// is the authentication, so no session cookie, bearer, or Access gate
+// applies here — and the scope map keeps the path `Deny` so bearer
+// credentials can never enter it. Staging Cloudflare Access bypass is
+// the wiring card's job, not this slice's. There is deliberately no
+// user-facing checkout/portal route here either: `ensure_checkout_session`
+// is the serialized purchase attempt those routes will call.
+//
+// Both the webhook and the inline/API paths reconcile through ONE
+// function (`reconcile_remote_subscription` below, pure core in
+// `billing_reconcile::reconcile_subscription`), so the same remote state
+// always lands the same stored state whichever path runs first
+// (webhook-before-response and lost-response races included).
+
+/// Stripe webhook route. Unauthenticated by design (the signature is the
+/// auth); stays out of `is_known_path` so browser preflight stays 404 and
+/// the served log line keeps the `unknown` template like other unlisted
+/// paths. Stripe retries non-2xx, so every failure here is either a 400
+/// (sender's fault: fix and resend) or a 500 (ours: retried).
+pub const BILLING_WEBHOOK_PATH: &str = "/v1/billing/webhook";
+
+/// Audit action for a fail-closed reconcile pass: observed state stored,
+/// nothing advanced, new purchases disabled.
+const BILLING_FAIL_CLOSED_ACTION: &str = "billing.reconcile_fail_closed";
+/// Audit action for a verified webhook that binds to no user (unknown or
+/// tombstoned customer): acked 200 without state change; live
+/// cancel-and-alert belongs to the account-deletion slice.
+const BILLING_UNKNOWN_CUSTOMER_ACTION: &str = "billing.webhook_unknown_customer";
+/// Audit action when a purchase cannot proceed (price unmapped or
+/// unselectable, binding inconsistent): no Stripe call made.
+const BILLING_PURCHASE_UNAVAILABLE_ACTION: &str = "billing.purchase_unavailable";
 
 /// Empty 204 for a preflight against a known path. Carries no ACA headers
 /// itself: the entry appends them exactly when the request `Origin` equals
@@ -4271,14 +7179,14 @@ pub(crate) fn preflight_response() -> Response {
 /// and never rescued by a session cookie (no session-cookie fallback for
 /// a presented credential); a request with NO `Authorization` header skips
 /// the bearer gate and falls through to the dispatch below, so session
-/// cookie holders see no behavior change (ADR 0010). The catalogue slice-1
-/// data routes (`/v1/library`, the `/api/library` alias, `/v1/artists`,
-/// `/v1/releases`, `/v1/tracks`, `/v1/releases/{mbid}`) run their
-/// session-or-bearer dispatch off the identity captured here; every other
-/// bearer-scope route still lands on the 404 below — default-deny holds
-/// until its route lands the same way. A presented-but-invalid bearer fails
-/// closed here with that same plain 404 — uniform posture, never a distinct
-/// 401 that would disclose route existence — and is never rescued by a cookie.
+/// cookie holders see no behavior change (ADR 0010). Data routes for the
+/// bearer scopes mostly do not exist yet, so an authorized bearer and a
+/// cookie-only caller land on the 404 below — default-deny holds until
+/// those routes land with their session-or-bearer dispatch. `POST
+/// /v1/plays` is the first exception: it landed as a cookie-session
+/// route behind the same gate, so a cookie-only caller is served by the
+/// handler while a gate-passing bearer still needs the session (native
+/// bearer issuance is a later slice).
 pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -4287,22 +7195,30 @@ where
     N: AsyncDns,
 {
     if req.body.len() > max_body_bytes(&req.method, &req.path) {
+        // Oversized admin uploads answer the 413 failure shape (with a
+        // null job: nothing was parsed, so no row and no audit), never
+        // the generic 400. This branch serves only direct-handle
+        // callers: the entry's collection gate answers the uniform 400
+        // instead, because it runs before authentication and a
+        // route-distinctive answer there would disclose the admin
+        // ingest path to unauthenticated callers.
+        if req.method == "POST" && req.path == "/v1/admin/ingest" {
+            return admin_ingest_oversized();
+        }
         return invalid_request();
     }
-    // Bearer identity for the catalogue arms. The gate already spent the
-    // lookup budgets, so the arms reuse this row — never a second
-    // `authorize_bearer` call, which would double-spend rate-limit budgets.
-    let mut bearer_user: Option<String> = None;
     if let crate::native_rest::RouteDecision::Bearer(required) =
         crate::native_rest::scope_for_operation(&req.method, &req.path)
     {
         // Only a presented Authorization header enters the bearer gate:
         // header-absent callers (session cookies, anonymous) fall through
-        // to the dispatch below.
+        // to the dispatch below (plain 404 until the data routes land).
+        // A presented-but-invalid bearer fails closed here with that same
+        // plain 404 — uniform posture, never a distinct 401 that would
+        // disclose route existence — and is never rescued by a cookie.
         if req.authorization.is_some() {
-            match authorize_bearer(ctx, req.authorization.as_deref(), required).await {
-                Ok(row) => bearer_user = Some(row.record.user_id.clone()),
-                Err(resp) => return resp,
+            if let Err(resp) = authorize_bearer(ctx, req.authorization.as_deref(), required).await {
+                return resp;
             }
         }
     }
@@ -4323,6 +7239,9 @@ where
         ("POST", "/v1/session/logout") => session_logout(ctx, req).await,
         ("POST", "/v1/session/revoke-all") => session_revoke_all(ctx, req).await,
         ("GET", "/v1/vault") => vault_get(ctx, req).await,
+        ("GET", "/v1/plans") => plans_list(ctx, req).await,
+        ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
+        ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("PUT", "/v1/vault") => vault_put(ctx, req).await,
         ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
@@ -4335,30 +7254,65 @@ where
         // map denies this path to bearer credentials, so the gate above
         // skips it and the guard owns session authentication.
         ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
+        // Play grant issuance + lease heartbeat: cookie-session handlers
+        // (see the section above). A presented native-rest bearer on
+        // `/v1/plays` is gate-checked above (invalid keys plain-404)
+        // but does not authenticate here; the heartbeat path is `Deny`
+        // in the scope map, so it never enters the gate.
+        ("POST", "/v1/plays") => play_issue(ctx, req).await,
+        ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        // Internal meter sink: HMAC-authenticated inside the handler
+        // (crate::meter_sink), no session/bearer surface. The scope
+        // map denies this path to bearer credentials, so the gate
+        // above never sees its Authorization header; it is absent
+        // from `is_known_path` on purpose (no browser preflight).
+        ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
-        // Catalogue slice 1 (TWO-1583): session-or-bearer reads over the
-        // ingest ledger plus the MusicBrainz mirror. `/api/library` is the
-        // legacy alias the M1 journey owns: it serves the same entries as
-        // `/v1/library`, never a reshaped contract.
-        ("GET", "/v1/library") | ("GET", "/api/library") => {
-            catalogue_library(ctx, req, bearer_user.as_deref()).await
-        }
-        ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
-        ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
-        ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
-        // Single-segment release ids only; deeper shapes (including the
-        // reserved `/v1/releases/{mbid}/art` path, whose reader has not
-        // landed) 404 inside the handler, and stay hidden on preflight too.
-        ("GET", path) if path.starts_with("/v1/releases/") => {
-            catalogue_release(ctx, req, bearer_user.as_deref()).await
-        }
+        // Stripe webhook carve-out: unauthenticated by design (the
+        // `Stripe-Signature` HMAC over the raw body is the auth), so it
+        // bypasses the bearer gate above like the cookie/session paths do
+        // — and the scope map keeps the path `Deny` so bearer credentials
+        // can never enter it. Deliberately outside `is_known_path`.
+        ("POST", BILLING_WEBHOOK_PATH) => billing_webhook(ctx, req).await,
         // Single-segment credential ids only; deeper shapes 404 inside
         // the handler. `options_preflight_served` keeps browser preflights
         // working for these dynamic paths (exact-path `is_known_path`
         // cannot name them).
         ("DELETE", path) if path.starts_with("/v1/credentials/") => {
             credentials_revoke(ctx, req).await
+        }
+        ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
+        ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
+        // The entry preserves the list query string for exactly this
+        // route (the runtime strips it everywhere else), so the status
+        // filter and window survive to the handler in production.
+        ("GET", path) if path == "/v1/admin/ingest" || path.starts_with("/v1/admin/ingest?") => {
+            admin_ingest_list(ctx, req).await
+        }
+        // Single-segment job ids only; deeper or malformed shapes 404
+        // inside the handler.
+        ("GET", path) if path.starts_with("/v1/admin/ingest/") => admin_ingest_get(ctx, req).await,
+        // Single-segment setting keys and `{id}/role` only; deeper or
+        // malformed shapes 404 inside the handlers. Neither path gets
+        // an `is_known_path` or preflight answer: the admin namespace
+        // is non-enumerable (see `options_preflight_served`).
+        ("PUT", path) if path.starts_with("/v1/admin/settings/") => {
+            admin_setting_put(ctx, req).await
+        }
+        ("PUT", path) if path.starts_with("/v1/admin/users/") => {
+            admin_user_role_put(ctx, req).await
+        }
+        // Admin invites (migration 0033): issue, list (with the
+        // `/status/{s}` and `/issuer/{id}` segment filters), revoke.
+        // Same non-enumerable posture as the rest of the namespace.
+        ("POST", "/v1/admin/invites") => admin_invite_issue(ctx, req).await,
+        ("GET", "/v1/admin/invites") => admin_invite_list(ctx, req).await,
+        ("GET", path) if path.starts_with("/v1/admin/invites/") => {
+            admin_invite_list(ctx, req).await
+        }
+        ("POST", path) if path.starts_with("/v1/admin/invites/") => {
+            admin_invite_revoke(ctx, req).await
         }
         // Preflight answers exactly the served paths (exact dispatch
         // paths, the single-segment revoke id, and the scope-map-served
@@ -4478,6 +7432,12 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        /// Next surrogate invite id to hand out (mirror of the
+        /// migration 0033 identity column).
+        next_invite_id: RefCell<i64>,
+        /// Mirror of `users.invited_by` (migration 0033), keyed by the
+        /// invited user's id.
+        invited_by: RefCell<HashMap<String, Option<String>>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
@@ -4494,6 +7454,12 @@ mod tests {
         /// outage without writing anything.
         fail_vault_saves: RefCell<bool>,
         audits: RefCell<Vec<AuditEvent>>,
+        /// Mirror of `users.role` (migration 0028): an absent entry is
+        /// the column default (`member`) for an existing user.
+        user_roles: RefCell<HashMap<String, String>>,
+        /// Mirror of `app_settings` (migration 0028), keyed by setting
+        /// key with the raw stored text.
+        app_settings_rows: RefCell<HashMap<String, String>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
         test_connection_leases: RefCell<HashMap<(String, u32), (String, u64)>>,
         delete_user_before_next_challenge: RefCell<Option<String>>,
@@ -4509,6 +7475,10 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
         fail_magic_audit: RefCell<bool>,
+        /// Role-read outage pin: `user_role` fails like a production
+        /// query error, which the admin guard must collapse to the
+        /// plain 404 (never a distinguishing 500).
+        fail_user_role_lookup: RefCell<bool>,
         /// Session-row lookup outage pin: `session_by_id` fails like a
         /// production query error, which `authenticate` maps to a 500.
         fail_session_lookup: RefCell<bool>,
@@ -4522,23 +7492,86 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
-        /// Mirror of the daily `usage_ledger` ingest aggregate, keyed by
+        /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
-        /// production `to_timestamp($2)::date` period boundary.
+        /// production UTC-day boundary over `ingest_jobs.accepted_at`.
         usage: RefCell<HashMap<(String, u64), u64>>,
-        /// Catalogue slice-1 fixtures: joined library rows by user id plus
-        /// the shared mirror collections and per-release track lists.
-        /// Tests seed these in store (query) order; the bound and the
-        /// ordering itself are pinned by the SQL regression test, not here.
-        catalogue_library: RefCell<HashMap<String, Vec<crate::catalogue::LibraryDbRow>>>,
-        catalogue_artists: RefCell<Vec<crate::catalogue::ArtistDbRow>>,
-        catalogue_releases: RefCell<Vec<crate::catalogue::ReleaseDbRow>>,
-        catalogue_tracks: RefCell<Vec<crate::catalogue::TrackDbRow>>,
-        catalogue_release_tracks:
-            RefCell<HashMap<String, Vec<crate::catalogue::ReleaseTrackDbRow>>>,
-        /// Catalogue store-error pin: when set, every catalogue read fails
-        /// like a production query outage (the handlers answer 500).
-        fail_catalogue_reads: RefCell<bool>,
+        /// Stripe billing mirror: bound customer per user, the stored
+        /// subscription row per user, and the full `plan_prices` map the
+        /// reconcile input loads whole.
+        billing_customers: RefCell<HashMap<String, String>>,
+        billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
+        /// Claimed webhook event ids (first claim wins, mirroring
+        /// `billing_webhook_events`).
+        webhook_events: RefCell<HashSet<String>>,
+        /// Single-flight checkout operations by id.
+        checkout_ops: RefCell<HashMap<String, crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Pre-bind window pin: when set, `create_checkout_operation`
+        /// inserts the winner's row WITHOUT binding the customer, mirroring
+        /// production where the op INSERT and the bind are separate
+        /// statements. A loser converging while the flag is set sees the op
+        /// but no binding.
+        defer_customer_bind: RefCell<bool>,
+        /// Race pin: when set, `create_checkout_operation` lands this
+        /// winner row just before its own insert, mirroring a racer that
+        /// wins the single flight between this attempt's open-flight read
+        /// and its insert. The attempt must converge onto (and, on a price
+        /// mismatch, deliberately replace) the winner.
+        plant_winner_on_next_create: RefCell<Option<crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Paid-invoice history by Stripe invoice id (idempotent on the id,
+        /// mirroring `paid_invoice_history`).
+        invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
+        /// Billing store-outage pin: when set, every billing method fails
+        /// like a production query outage instead of touching state.
+        fail_billing: RefCell<bool>,
+        /// Billing display reads: plan rows served verbatim, the live-slot
+        /// subscription per user, whether any subscription row ever
+        /// existed, and metered stream seconds keyed by
+        /// `(user_id, period_month)` mirroring the ledger SUM.
+        plans: RefCell<Vec<PlanRow>>,
+        subscriptions: RefCell<HashMap<String, SubscriptionRow>>,
+        ever_subscribed: RefCell<HashSet<String>>,
+        stream_seconds: RefCell<HashMap<(String, String), u64>>,
+        /// Billing-read outage pin: the three display reads fail like a
+        /// production query error (generic 500, never invented data).
+        fail_billing_reads: RefCell<bool>,
+        /// Mirror of the admin ingest ledger (migration 0034): stored
+        /// admin job rows by content-derived id. Pipeline rows never
+        /// live here — the readers fence on `source = 'admin'` in
+        /// production and this map holds admin rows only.
+        ingest_jobs: RefCell<HashMap<String, StoredAdminIngestJob>>,
+        /// Mirror of `ingest_originals`: the stored v2 envelope plus
+        /// the content hash and KEK version the AAD binds, keyed by job
+        /// id. Accepted uploads land exactly one entry; failed uploads
+        /// and duplicates land none (a duplicate keeps the first
+        /// envelope, like production's `ON CONFLICT DO NOTHING`).
+        ingest_originals:
+            RefCell<HashMap<String, (crate::admin_ingest::IngestOriginalEnvelope, String, u32)>>,
+        /// Live-slot subscription rows by user (the playback gate's
+        /// `resolve_effective_plan` input).
+        playback_subscriptions: RefCell<HashMap<String, crate::playback::SubscriptionRow>>,
+        /// Users whose history holds any paid coverage
+        /// (`ever_subscribed` → the `lapsed` discriminator).
+        ever_paid_users: RefCell<HashSet<String>>,
+        /// `plans` caps rows by plan id; an absent id is the
+        /// missing-row case the handler fails closed to free caps.
+        plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
+        /// One `playback_leases` row per user.
+        playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Deletion-marker race pin: when set, the next lease write
+        /// (`acquire_playback_lease` / `touch_playback_lease`) first
+        /// lands the named user in `deleting_users`, mirroring a marker
+        /// that arrives after the handler's up-front `account_deleting`
+        /// probe but before the statement's writer fence evaluates.
+        mark_deleting_before_next_lease_write: RefCell<Option<String>>,
+        /// Derivation metadata keyed by `(user_id, track_id)`; absent
+        /// pairs resolve to the all-`None` meta (the fallback rung),
+        /// mirroring the production zero-row answer.
+        meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
+        /// Stored play windows by idempotency key, mirroring the
+        /// monotonic upsert (see `record_play_window`).
+        play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
     }
 
     impl Store for FakeStore {
@@ -4617,6 +7650,7 @@ mod tests {
             challenge: &PasskeyChallenge,
             magic: &MagicLinkRecord,
             invite: Option<&InviteRecord>,
+            invite_audit: Option<&AuditEvent>,
             credential: &PasskeyCredential,
             now: u64,
         ) -> Result<(), StoreError> {
@@ -4625,6 +7659,8 @@ mod tests {
             let challenges_before = self.challenges.borrow().clone();
             let magic_before = self.magic.borrow().clone();
             let invites_before = self.invites.borrow().clone();
+            let audits_before = self.audits.borrow().len();
+            let invited_by_before = self.invited_by.borrow().clone();
             let result = async {
                 let mut claims = vec![
                     auth::SingleUseClaim::Challenge {
@@ -4641,6 +7677,24 @@ mod tests {
                         return Err(StoreError);
                     }
                 }
+                if let Some(record) = invite {
+                    // Mirror the production stamps + in-transaction
+                    // audit: `invited_by` comes from the CLAIMED stored
+                    // row, not the caller's pre-claim snapshot, so an
+                    // issuer deleted after `invite_by_hash` (stored
+                    // `issued_by` already nulled, ON DELETE SET NULL)
+                    // cannot break the enrollment.
+                    let claimed_issuer = self
+                        .invites
+                        .borrow()
+                        .get(&record.code_hash)
+                        .and_then(|claimed| claimed.issued_by.clone());
+                    self.invited_by
+                        .borrow_mut()
+                        .insert(credential.user_id.clone(), claimed_issuer);
+                    let audit = invite_audit.ok_or(StoreError)?;
+                    self.audits.borrow_mut().push(audit.clone());
+                }
                 self.insert_credential(credential).await
             }
             .await;
@@ -4648,6 +7702,8 @@ mod tests {
                 *self.challenges.borrow_mut() = challenges_before;
                 *self.magic.borrow_mut() = magic_before;
                 *self.invites.borrow_mut() = invites_before;
+                self.audits.borrow_mut().truncate(audits_before);
+                *self.invited_by.borrow_mut() = invited_by_before;
             }
             result
         }
@@ -4736,6 +7792,203 @@ mod tests {
                 .or_insert(0);
             *slot = (*slot).max(ingest_jobs);
             Ok(())
+        }
+        async fn plans(&self) -> Result<Vec<PlanRow>, StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.plans.borrow().clone())
+        }
+        async fn subscription_snapshot(
+            &self,
+            user_id: &str,
+        ) -> Result<(Option<SubscriptionRow>, bool), StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok((
+                self.subscriptions.borrow().get(user_id).cloned(),
+                self.ever_subscribed.borrow().contains(user_id),
+            ))
+        }
+        async fn stream_seconds_month(
+            &self,
+            user_id: &str,
+            period_month: &str,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .stream_seconds
+                .borrow()
+                .get(&(user_id.to_string(), period_month.to_string()))
+                .copied()
+                .unwrap_or(0))
+        }
+        async fn live_subscription(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
+            Ok(self.playback_subscriptions.borrow().get(user_id).cloned())
+        }
+        async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.ever_paid_users.borrow().contains(user_id))
+        }
+        async fn plan_caps(
+            &self,
+            plan_id: &str,
+        ) -> Result<Option<crate::plan_limits::PlanCaps>, StoreError> {
+            Ok(self.plan_caps_rows.borrow().get(plan_id).copied())
+        }
+        async fn monthly_stream_seconds(
+            &self,
+            user_id: &str,
+            period_month: &str,
+        ) -> Result<u64, StoreError> {
+            Ok(self
+                .stream_seconds
+                .borrow()
+                .get(&(user_id.to_string(), period_month.to_string()))
+                .copied()
+                .unwrap_or(0))
+        }
+        async fn playback_lease(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+            Ok(self.playback_leases.borrow().get(user_id).cloned())
+        }
+        async fn acquire_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            track_id: &str,
+            play_id: &str,
+            now: u64,
+            expires_at: u64,
+            takeover: bool,
+        ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+            // Mirror the conditional upsert: insert at epoch 1, or
+            // replace at epoch+1 when expired, same-session, or
+            // takeover — else Held with the remaining TTL. The
+            // statement's deletion fence writes nothing (zero rows,
+            // which the Pg glue reads back as Held), no epoch burned.
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(crate::playback::LeaseAcquire::Held {
+                    retry_after_secs: self
+                        .playback_leases
+                        .borrow()
+                        .get(user_id)
+                        .map_or(0, |row| row.retry_after_secs(now)),
+                });
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get(user_id) {
+                Some(existing)
+                    if existing.is_live(now) && existing.session_id != session_id && !takeover =>
+                {
+                    Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: existing.retry_after_secs(now),
+                    })
+                }
+                existing => {
+                    let epoch = existing.map_or(1, |row| row.epoch + 1);
+                    leases.insert(
+                        user_id.to_string(),
+                        crate::playback::LeaseRow {
+                            session_id: session_id.to_string(),
+                            track_id: track_id.to_string(),
+                            play_id: play_id.to_string(),
+                            epoch,
+                            expires_at,
+                        },
+                    );
+                    Ok(crate::playback::LeaseAcquire::Acquired { epoch })
+                }
+            }
+        }
+        async fn touch_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            play_id: &str,
+            epoch: u64,
+            _now: u64,
+            expires_at: u64,
+        ) -> Result<bool, StoreError> {
+            // Mirror the conditional UPDATE: only the exact
+            // (session, play, epoch) holder extends, monotonically
+            // (an out-of-order older deadline never shortens), and
+            // never for a deleting account (in-statement fence).
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get_mut(user_id) {
+                Some(row)
+                    if row.session_id == session_id
+                        && row.play_id == play_id
+                        && row.epoch == epoch =>
+                {
+                    row.expires_at = row.expires_at.max(expires_at);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn track_meter_meta(
+            &self,
+            user_id: &str,
+            track_id: &str,
+        ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            Ok(self
+                .meter_meta
+                .borrow()
+                .get(&(user_id.to_string(), track_id.to_string()))
+                .copied()
+                .unwrap_or_default())
+        }
+        async fn record_play_window(
+            &self,
+            window: &crate::ledger::PlayWindow,
+        ) -> Result<crate::meter_sink::PlayWindowOutcome, StoreError> {
+            use crate::meter_sink::PlayWindowOutcome;
+            // Mirror the production writer fence: the upsert's guard
+            // SELECT finds no row for a deleting or nonexistent user,
+            // so nothing writes and the sink acks `fenced`.
+            if self.deleting_users.borrow().contains(&window.user_id)
+                || !self.users.borrow().contains_key(&window.user_id)
+            {
+                return Ok(PlayWindowOutcome::Fenced);
+            }
+            // Mirror the monotonic upsert: a stored row already
+            // covering this union wins; otherwise the new snapshot
+            // replaces it and the monthly total moves by the delta.
+            let mut windows = self.play_windows.borrow_mut();
+            let previous = windows.get(&window.idempotency_key);
+            if let Some(existing) = previous {
+                if existing.bytes_served >= window.bytes_served {
+                    return Ok(PlayWindowOutcome::Covered);
+                }
+            }
+            let previous_seconds = previous.map_or(0, |w| w.stream_seconds);
+            windows.insert(window.idempotency_key.clone(), window.clone());
+            drop(windows);
+            let mut seconds = self.stream_seconds.borrow_mut();
+            let entry = seconds
+                .entry((window.user_id.clone(), window.period_month.clone()))
+                .or_insert(0);
+            *entry = entry
+                .saturating_sub(previous_seconds)
+                .saturating_add(window.stream_seconds);
+            Ok(PlayWindowOutcome::Written)
         }
         async fn reserve_rate_limit(
             &self,
@@ -4881,10 +8134,18 @@ mod tests {
                 .filter(|record| record.expires_at > now)
                 .map(|record| record.user_id.clone())
                 .collect();
+            let admins: HashSet<String> = self
+                .user_roles
+                .borrow()
+                .iter()
+                .filter(|(_, role)| crate::admin::is_admin_role(Some(role)))
+                .map(|(id, _)| id.clone())
+                .collect();
             let deleting_users = self.deleting_users.borrow();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
                     || deleting_users.contains(&user.id)
+                    || admins.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
                     || vault_owners.contains(&user.id)
@@ -4932,7 +8193,17 @@ mod tests {
             &self,
             code_hash: &str,
         ) -> Result<Option<InviteRecord>, StoreError> {
-            Ok(self.invites.borrow().get(code_hash).cloned())
+            // Mirror the production join: the issuer's current email
+            // rides the record so the pure prepare can refuse
+            // self-invites.
+            let mut record = self.invites.borrow().get(code_hash).cloned();
+            if let Some(record) = &mut record {
+                record.issuer_email = record
+                    .issued_by
+                    .as_deref()
+                    .and_then(|id| self.users.borrow().get(id).map(|u| u.email.clone()));
+            }
+            Ok(record)
         }
         async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
             if *self.fail_session_insert.borrow() {
@@ -5226,70 +8497,6 @@ mod tests {
             }
             Ok(())
         }
-        async fn catalogue_library(
-            &self,
-            user_id: &str,
-        ) -> Result<Vec<crate::catalogue::LibraryDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self
-                .catalogue_library
-                .borrow()
-                .get(user_id)
-                .cloned()
-                .unwrap_or_default())
-        }
-        async fn catalogue_artists(
-            &self,
-        ) -> Result<Vec<crate::catalogue::ArtistDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self.catalogue_artists.borrow().clone())
-        }
-        async fn catalogue_releases(
-            &self,
-        ) -> Result<Vec<crate::catalogue::ReleaseDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self.catalogue_releases.borrow().clone())
-        }
-        async fn catalogue_tracks(&self) -> Result<Vec<crate::catalogue::TrackDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self.catalogue_tracks.borrow().clone())
-        }
-        async fn catalogue_release(
-            &self,
-            mbid: &str,
-        ) -> Result<Option<crate::catalogue::ReleaseDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self
-                .catalogue_releases
-                .borrow()
-                .iter()
-                .find(|row| row.mbid == mbid)
-                .cloned())
-        }
-        async fn catalogue_release_tracks(
-            &self,
-            mbid: &str,
-        ) -> Result<Vec<crate::catalogue::ReleaseTrackDbRow>, StoreError> {
-            if *self.fail_catalogue_reads.borrow() {
-                return Err(StoreError);
-            }
-            Ok(self
-                .catalogue_release_tracks
-                .borrow()
-                .get(mbid)
-                .cloned()
-                .unwrap_or_default())
-        }
         async fn vault_by_user(&self, user_id: &str) -> Result<Option<VaultRow>, StoreError> {
             Ok(self.vaults.borrow().get(user_id).cloned())
         }
@@ -5306,6 +8513,28 @@ mod tests {
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))
+        }
+        async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
+            // Mirror the production EXISTS probe: credential, any
+            // session row, vault, or a non-member role (an absent
+            // `user_roles` entry is the `member` column default).
+            let admitted = self
+                .credentials
+                .borrow()
+                .values()
+                .any(|c| c.user_id == user_id)
+                || self
+                    .sessions
+                    .borrow()
+                    .values()
+                    .any(|s| s.user_id == user_id)
+                || self.vaults.borrow().contains_key(user_id)
+                || self
+                    .user_roles
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|role| role.as_str() != crate::admin::ROLE_MEMBER);
+            Ok(admitted)
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
@@ -5360,6 +8589,594 @@ mod tests {
             self.audits.borrow_mut().push(event.clone());
             Ok(())
         }
+        async fn user_role(&self, user_id: &str) -> Result<Option<String>, StoreError> {
+            if *self.fail_user_role_lookup.borrow() {
+                return Err(StoreError);
+            }
+            if !self.users.borrow().contains_key(user_id) {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.user_roles
+                    .borrow()
+                    .get(user_id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::admin::ROLE_MEMBER.to_string()),
+            ))
+        }
+        async fn admin_set_user_role(
+            &self,
+            actor_user_id: &str,
+            subject_user_id: &str,
+            new_role: &str,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminWriteOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminWriteOutcome::ActorNotAdmin),
+            }
+            if !self.users.borrow().contains_key(subject_user_id) {
+                return Ok(AdminWriteOutcome::SubjectMissing);
+            }
+            // Mirror the production fence: a subject scheduled for
+            // deletion takes no role write (and no audit row).
+            if self.deleting_users.borrow().contains(subject_user_id) {
+                return Ok(AdminWriteOutcome::AccountDeleting);
+            }
+            let previous = self
+                .user_roles
+                .borrow()
+                .get(subject_user_id)
+                .cloned()
+                .unwrap_or_else(|| crate::admin::ROLE_MEMBER.to_string());
+            self.user_roles
+                .borrow_mut()
+                .insert(subject_user_id.to_string(), new_role.to_string());
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                crate::admin::ROLE_CHANGED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                Some(subject_user_id),
+                serde_json::json!({"old": previous, "new": new_role}),
+            ));
+            Ok(AdminWriteOutcome::Applied(Some(previous)))
+        }
+        async fn app_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
+            Ok(self
+                .app_settings_rows
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        async fn admin_set_app_setting(
+            &self,
+            actor_user_id: &str,
+            key: &str,
+            new_value: &str,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminWriteOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminWriteOutcome::ActorNotAdmin),
+            }
+            let previous = self
+                .app_settings_rows
+                .borrow_mut()
+                .insert(key.to_string(), new_value.to_string());
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                crate::admin::SETTINGS_CHANGED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({"key": key, "old": previous, "new": new_value}),
+            ));
+            Ok(AdminWriteOutcome::Applied(previous))
+        }
+        async fn claim_webhook_event(&self, event_id: &str) -> Result<bool, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .webhook_events
+                .borrow_mut()
+                .insert(event_id.to_string()))
+        }
+        async fn release_webhook_event(&self, event_id: &str) -> Result<(), StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            self.webhook_events.borrow_mut().remove(event_id);
+            Ok(())
+        }
+        async fn load_reconcile_input(
+            &self,
+            user_id: &str,
+        ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            let live = self.billing_rows.borrow().get(user_id).map(|row| {
+                crate::billing_reconcile::LiveRow {
+                    stripe_subscription_id: row.stripe_subscription_id.clone(),
+                    stripe_customer_id: row.stripe_customer_id.clone(),
+                    stripe_item_id: row.stripe_item_id.clone(),
+                    stripe_price_id: row.stripe_price_id.clone(),
+                    plan_id: row.plan_id.clone(),
+                    status: row.status.clone(),
+                    paid_through_unix: row.paid_through_unix,
+                    paid_invoice_id: row.paid_invoice_id.clone(),
+                    grace_until_unix: row.grace_until_unix,
+                }
+            });
+            // A `trialing` or terminal row sits outside the live slot: the
+            // production predicate excludes it, so the fake does too.
+            let live = live.filter(|row| {
+                matches!(
+                    row.status.as_str(),
+                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                )
+            });
+            Ok(crate::billing_reconcile::ReconcileInput {
+                stripe_customer_id: self.billing_customers.borrow().get(user_id).cloned(),
+                live,
+                bindings: self.billing_bindings.borrow().clone(),
+            })
+        }
+        async fn user_for_stripe_customer(
+            &self,
+            customer_id: &str,
+        ) -> Result<Option<String>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .billing_customers
+                .borrow()
+                .iter()
+                .find(|(_, customer)| customer.as_str() == customer_id)
+                .map(|(user, _)| user.clone()))
+        }
+        async fn store_reconcile_outcome(
+            &self,
+            user_id: &str,
+            outcome: &crate::billing_reconcile::ReconcileOutcome,
+        ) -> Result<(), StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            // Mirrors the production upsert's monotonic coverage CASE: a
+            // pass that folded an older snapshot commits without
+            // regressing confirmed `paid_through_at` (or the plan and
+            // anchor tied to it). An equal-end pass carrying an anchor
+            // relabels the plan and anchor (the defined equal-end
+            // plan-switch outcome) — but only when the stored row still
+            // matches what the pass read — so a keep committing after a
+            // relabel, or an older relabel committing after a newer one,
+            // keeps the stored ones instead of reversing the newer
+            // plan/anchor. An anchor-less tie keeps the stored ones too.
+            // The same staleness predicate guards
+            // `status` and `grace_until`: strictly older money — or the
+            // anchor-less equal-end shape only the stale fold emits — keeps
+            // the stored verbatim fields instead of writing stale ones over
+            // a fresher pass. Bindings still update verbatim; history still
+            // converges on the invoice id.
+            let mut rows = self.billing_rows.borrow_mut();
+            let merged = match rows.get(user_id) {
+                Some(existing)
+                    if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
+                {
+                    let advances = outcome.row.paid_through_unix.is_some_and(|end| {
+                        existing
+                            .paid_through_unix
+                            .is_none_or(|previous| end > previous)
+                    });
+                    let relabels = !advances
+                        && outcome.row.paid_invoice_id.is_some()
+                        && matches!(
+                            (outcome.row.paid_through_unix, existing.paid_through_unix),
+                            (Some(end), Some(previous)) if end == previous
+                        )
+                        // Mirrors the tie arm (`subscriptions.plan_id =
+                        // $14 AND subscriptions.paid_invoice_id IS NOT
+                        // DISTINCT FROM $13`): only a pass whose read row
+                        // is still stored relabels — a late keep, or an
+                        // older relabel, committing after the row moved
+                        // keeps the stored plan/anchor. `None` read plan
+                        // never equals a stored plan, so an anchor-less
+                        // keep never relabels either.
+                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                        && existing.paid_invoice_id == outcome.read_anchor;
+                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                        (Some(end), Some(previous)) => {
+                            end < previous
+                                || (end == previous
+                                    && outcome.row.paid_invoice_id.is_none()
+                                    && existing.paid_invoice_id.is_some())
+                        }
+                        _ => false,
+                    };
+                    let mut row = outcome.row.clone();
+                    if !advances && !relabels {
+                        row.paid_through_unix = existing.paid_through_unix;
+                        row.plan_id = existing.plan_id.clone();
+                        row.paid_invoice_id = existing.paid_invoice_id.clone();
+                    }
+                    if stale {
+                        row.status = existing.status.clone();
+                        row.grace_until_unix = existing.grace_until_unix;
+                    }
+                    row
+                }
+                _ => outcome.row.clone(),
+            };
+            rows.insert(user_id.to_string(), merged);
+            let mut history = self.invoice_history.borrow_mut();
+            for row in &outcome.history {
+                history
+                    .entry(row.stripe_invoice_id.clone())
+                    .or_insert_with(|| row.clone());
+            }
+            Ok(())
+        }
+        async fn open_checkout_operation(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .checkout_ops
+                .borrow()
+                .values()
+                .find(|op| {
+                    op.user_id == user_id
+                        && crate::billing_reconcile::is_single_flight_state(&op.state)
+                })
+                .cloned())
+        }
+        async fn create_checkout_operation(
+            &self,
+            op_id: &str,
+            user_id: &str,
+            price_id: &str,
+            customer_id: Option<&str>,
+        ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            // Race pin: land the winner between the caller's open-flight
+            // read and this insert (consumed once).
+            if let Some(winner) = self.plant_winner_on_next_create.borrow_mut().take() {
+                self.checkout_ops
+                    .borrow_mut()
+                    .insert(winner.id.clone(), winner);
+            }
+            let mut ops = self.checkout_ops.borrow_mut();
+            // The partial unique admits at most one open flight per user:
+            // a racer converges on the winner's row below instead of
+            // minting a second subscription.
+            if let Some(winner) = ops.values().find(|op| {
+                op.user_id == user_id && crate::billing_reconcile::is_single_flight_state(&op.state)
+            }) {
+                return Ok(crate::billing_reconcile::CreateOpOutcome::Existing(
+                    winner.clone(),
+                ));
+            }
+            // Bind the Stripe customer to the account, but only when
+            // unbound — an existing binding is never overwritten by a
+            // racing second customer create. Skipped while the test holds
+            // the pre-bind window open (production binds in a separate
+            // statement after the op INSERT).
+            if let Some(customer) = customer_id {
+                // Skipped while the test holds the pre-bind window open
+                // (production binds in a separate statement after the op
+                // INSERT).
+                if !*self.defer_customer_bind.borrow() {
+                    self.billing_customers
+                        .borrow_mut()
+                        .entry(user_id.to_string())
+                        .or_insert_with(|| customer.to_string());
+                }
+            }
+            let op = crate::billing_reconcile::StoredCheckoutOp {
+                id: op_id.to_string(),
+                user_id: user_id.to_string(),
+                state: "pending".to_string(),
+                price_id: Some(price_id.to_string()),
+                session_id: None,
+                subscription_id: None,
+            };
+            ops.insert(op_id.to_string(), op.clone());
+            Ok(crate::billing_reconcile::CreateOpOutcome::Created(op))
+        }
+        async fn checkout_operation_by_id(
+            &self,
+            op_id: &str,
+        ) -> Result<Option<crate::billing_reconcile::StoredCheckoutOp>, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.checkout_ops.borrow().get(op_id).cloned())
+        }
+        async fn update_checkout_operation(
+            &self,
+            op_id: &str,
+            state: &str,
+            price_id: &str,
+            session_id: Option<&str>,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_billing.borrow() {
+                return Err(StoreError);
+            }
+            // Mirrors the production conditional mark: only an unresolved
+            // row takes the mark. A missing or already-retired row (lost
+            // mark, or superseded while its Stripe create was still in
+            // flight) reports `false` instead of resurrecting the flight.
+            let mut ops = self.checkout_ops.borrow_mut();
+            let Some(op) = ops.get_mut(op_id) else {
+                return Ok(false);
+            };
+            if !crate::billing_reconcile::is_single_flight_state(&op.state) {
+                return Ok(false);
+            }
+            op.state = state.to_string();
+            op.price_id = Some(price_id.to_string());
+            op.session_id = session_id.map(str::to_string);
+            Ok(true)
+        }
+        async fn admin_ingest_upload(
+            &self,
+            attempt: &AdminIngestAttempt,
+        ) -> Result<AdminIngestUploadOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write;
+            // a deleting actor is fenced like every other writer of
+            // user-owned state (ADR 0002 rule 3).
+            match self.user_role(&attempt.actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminIngestUploadOutcome::ActorNotAdmin),
+            }
+            if self
+                .deleting_users
+                .borrow()
+                .contains(&attempt.actor_user_id)
+            {
+                return Ok(AdminIngestUploadOutcome::AccountDeleting);
+            }
+            if let Some(job) = self.ingest_jobs.borrow().get(&attempt.job_id) {
+                // Convergent replay: the deterministic id already
+                // names a row (a second admin uploading the same bytes
+                // lands here too — identity is content-derived, never
+                // the uploader). The first envelope wins, like the
+                // production `ON CONFLICT DO NOTHING`.
+                let job = job.clone();
+                let mut details = serde_json::json!({"job_id": job.job_id, "outcome": "duplicate"});
+                if let Some(reason) = &job.failure_reason {
+                    details["reason_code"] = reason.clone().into();
+                }
+                self.audits.borrow_mut().push(vault::audit_event_extended(
+                    &attempt.actor_user_id,
+                    crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                    true,
+                    &attempt.source_ip,
+                    attempt.now,
+                    None,
+                    details,
+                ));
+                return Ok(AdminIngestUploadOutcome::Stored {
+                    job,
+                    deduplicated: true,
+                });
+            }
+            let db_status = if attempt.failure.is_some() {
+                "failed"
+            } else {
+                "queued"
+            };
+            let job = StoredAdminIngestJob {
+                job_id: attempt.job_id.clone(),
+                db_status: db_status.to_string(),
+                accepted_at: attempt.now,
+                nzb_bytes: attempt.nzb_bytes,
+                file_count: attempt.file_count,
+                segment_count: attempt.segment_count,
+                failure_reason: attempt.failure.map(|reason| reason.as_str().to_string()),
+                has_original: attempt.original.is_some(),
+                uploader_user_id: attempt.actor_user_id.clone(),
+            };
+            // The (failure, original) coupling the handler builds:
+            // failed attempts carry no envelope, accepted attempts
+            // always do.
+            debug_assert_eq!(job.has_original, attempt.failure.is_none());
+            if let Some(envelope) = &attempt.original {
+                self.ingest_originals.borrow_mut().insert(
+                    attempt.job_id.clone(),
+                    (
+                        envelope.clone(),
+                        attempt.content_sha256_hex.clone(),
+                        attempt.kek_version,
+                    ),
+                );
+            }
+            self.ingest_jobs
+                .borrow_mut()
+                .insert(attempt.job_id.clone(), job.clone());
+            let mut details = serde_json::json!({"job_id": job.job_id, "outcome": "accepted"});
+            if let Some(reason) = &job.failure_reason {
+                details["outcome"] = "rejected".into();
+                details["reason_code"] = reason.clone().into();
+            }
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                &attempt.actor_user_id,
+                crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                true,
+                &attempt.source_ip,
+                attempt.now,
+                None,
+                details,
+            ));
+            Ok(AdminIngestUploadOutcome::Stored {
+                job,
+                deduplicated: false,
+            })
+        }
+        async fn admin_ingest_get(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<StoredAdminIngestJob>, StoreError> {
+            Ok(self.ingest_jobs.borrow().get(job_id).cloned())
+        }
+        async fn admin_ingest_list(
+            &self,
+            status: Option<&str>,
+            limit: u64,
+            offset: u64,
+        ) -> Result<Vec<StoredAdminIngestJob>, StoreError> {
+            let mut jobs: Vec<StoredAdminIngestJob> = self
+                .ingest_jobs
+                .borrow()
+                .values()
+                .filter(|job| status.is_none_or(|want| job.db_status == want))
+                .cloned()
+                .collect();
+            jobs.sort_by(|a, b| {
+                b.accepted_at
+                    .cmp(&a.accepted_at)
+                    .then(a.job_id.cmp(&b.job_id))
+            });
+            Ok(jobs
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit.max(1) as usize)
+                .collect())
+        }
+        async fn admin_ingest_delete(
+            &self,
+            actor_user_id: &str,
+            job_id: &str,
+        ) -> Result<AdminIngestDeleteOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminIngestDeleteOutcome::ActorNotAdmin),
+            }
+            if !self.ingest_jobs.borrow().contains_key(job_id) {
+                return Ok(AdminIngestDeleteOutcome::Missing);
+            }
+            // The original goes first, then the job — the production
+            // `RESTRICT` order. No audit row: deletion writes no new
+            // observable state.
+            self.ingest_originals.borrow_mut().remove(job_id);
+            self.ingest_jobs.borrow_mut().remove(job_id);
+            Ok(AdminIngestDeleteOutcome::Deleted)
+        }
+        async fn admin_issue_invite(
+            &self,
+            actor_user_id: &str,
+            record: &InviteRecord,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminInviteIssueOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminInviteIssueOutcome::ActorNotAdmin),
+            }
+            let id = {
+                let mut next = self.next_invite_id.borrow_mut();
+                *next += 1;
+                *next
+            };
+            let mut stored = record.clone();
+            stored.id = id;
+            if self
+                .invites
+                .borrow_mut()
+                .insert(stored.code_hash.clone(), stored)
+                .is_some()
+            {
+                return Err(StoreError);
+            }
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                auth::INVITE_ISSUED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({
+                    "invite_id": id,
+                    "kind": record.kind,
+                    "email_bound": record.email.is_some(),
+                    "expires_at": record.expires_at,
+                }),
+            ));
+            Ok(AdminInviteIssueOutcome::Issued(id))
+        }
+        async fn admin_list_invites(
+            &self,
+            issuer: Option<&str>,
+            status: Option<&str>,
+            now: u64,
+            limit: usize,
+        ) -> Result<Vec<InviteRecord>, StoreError> {
+            let mut rows: Vec<InviteRecord> = self
+                .invites
+                .borrow()
+                .values()
+                .filter(|row| issuer.is_none_or(|id| row.issued_by.as_deref() == Some(id)))
+                .filter(|row| status.is_none_or(|wanted| row.status(now) == wanted))
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| b.id.cmp(&a.id).then(b.created_at.cmp(&a.created_at)));
+            rows.truncate(limit);
+            Ok(rows)
+        }
+        async fn admin_revoke_invite(
+            &self,
+            actor_user_id: &str,
+            invite_id: i64,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<AdminInviteRevokeOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminInviteRevokeOutcome::ActorNotAdmin),
+            }
+            let mut invites = self.invites.borrow_mut();
+            let Some(row) = invites.values_mut().find(|row| row.id == invite_id) else {
+                return Ok(AdminInviteRevokeOutcome::Missing);
+            };
+            if row.redeemed_at.is_some() || row.used {
+                return Ok(AdminInviteRevokeOutcome::AlreadyRedeemed);
+            }
+            if row.revoked_at.is_some() {
+                return Ok(AdminInviteRevokeOutcome::AlreadyRevoked);
+            }
+            row.revoked_at = Some(now);
+            row.revoked_by = Some(actor_user_id.to_string());
+            drop(invites);
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                actor_user_id,
+                auth::INVITE_REVOKED_AUDIT_ACTION,
+                true,
+                source_ip,
+                now,
+                None,
+                serde_json::json!({"invite_id": invite_id}),
+            ));
+            Ok(AdminInviteRevokeOutcome::Revoked)
+        }
     }
 
     /// Mirrors the conditional UPDATE/RETURNING semantics: one winner.
@@ -5399,10 +9216,41 @@ mod tests {
                     }
                 }
                 auth::SingleUseClaim::Invite { record } => {
+                    // Mirror the production conditional UPDATE: every
+                    // spend predicate is re-proven against the stored
+                    // row (and the redeemer's user row) at claim time.
+                    let redeemed_at = record.redeemed_at.unwrap_or(0);
+                    let redeemer_id = record.redeemed_by.clone().unwrap_or_default();
+                    let users = self.users.borrow();
+                    let redeemer_email = users.get(&redeemer_id).map(|u| u.email.clone());
                     let mut invites = self.invites.borrow_mut();
                     match invites.get_mut(&record.code_hash) {
-                        Some(row) if !row.used => {
+                        Some(row)
+                            if !row.used
+                                && row.redeemed_at.is_none()
+                                && row.revoked_at.is_none()
+                                && row.expires_at > redeemed_at
+                                && row.email.as_ref().is_none_or(|bound| {
+                                    redeemer_email
+                                        .as_ref()
+                                        .is_some_and(|email| email.eq_ignore_ascii_case(bound))
+                                })
+                                && !{
+                                    let issuer_email = row
+                                        .issued_by
+                                        .as_deref()
+                                        .and_then(|id| users.get(id))
+                                        .map(|u| u.email.clone());
+                                    matches!(
+                                        (&issuer_email, &redeemer_email),
+                                        (Some(issuer), Some(redeemer))
+                                            if issuer.eq_ignore_ascii_case(redeemer)
+                                    )
+                                } =>
+                        {
                             row.used = true;
+                            row.redeemed_by = record.redeemed_by.clone();
+                            row.redeemed_at = record.redeemed_at;
                             Ok(1)
                         }
                         _ => Ok(0),
@@ -5450,12 +9298,321 @@ mod tests {
         }
     }
 
+    /// Scripted Stripe fixture: sessions, subscriptions, and full invoices
+    /// by id, a customer-create log for the test-clock seam assert, and a
+    /// per-method failure pin for Stripe-outage paths. No network, no
+    /// secrets: every id is synthetic (`cs_test_*`, `sub_test_*`, ...).
+    #[derive(Default)]
+    struct FakeStripe {
+        sessions: RefCell<HashMap<String, crate::stripe::CheckoutSession>>,
+        subscriptions: RefCell<HashMap<String, crate::stripe::Subscription>>,
+        invoices: RefCell<HashMap<String, crate::stripe::Invoice>>,
+        /// Remainder line pages per invoice: `list_invoice_lines` answers
+        /// the next page from here, so tests pin the full-read follow-up
+        /// instead of trusting the first page.
+        line_pages: RefCell<HashMap<String, Vec<crate::stripe::InvoiceLine>>>,
+        /// Customer-create log `(user_id, test_clock)` for the seam assert.
+        customers_created: RefCell<Vec<(Option<String>, Option<String>)>>,
+        /// Checkout sessions minted through `create_checkout_session`.
+        sessions_created: RefCell<usize>,
+        /// Customers the minted sessions were bound to (proves a
+        /// converged attempt sessions on the winner-bound customer,
+        /// never a racing loser's orphan).
+        session_customers: RefCell<Vec<String>>,
+        /// Subscription ids passed to `cancel_subscription` (proves a
+        /// recovered or unknown remote is never canceled).
+        canceled: RefCell<Vec<String>>,
+        /// Session ids passed to `expire_checkout_session` (proves a
+        /// price-mismatched or dead session is deliberately retired
+        /// before its replacement mints).
+        expired: RefCell<Vec<String>>,
+        /// Operation ids that minted through `create_checkout_session`
+        /// (proves a replacement mints under a fresh operation — hence a
+        /// fresh Stripe idempotency key — never the dead session's).
+        /// Same-key replays are not mints and are not logged here.
+        session_create_ops: RefCell<Vec<String>>,
+        /// Session id minted per operation id: the production Stripe
+        /// replays a create under a seen idempotency key instead of
+        /// minting again, and the orphan-recovery path depends on it
+        /// (recover under the old key, then retire per the retrieved
+        /// state). Replays answer the stored session without bumping
+        /// `sessions_created`.
+        sessions_by_op: RefCell<HashMap<String, String>>,
+        /// Session ids that retrieve as Stripe 404s (proves a missing
+        /// session repairs under a fresh key instead of replaying).
+        missing_sessions: RefCell<HashSet<String>>,
+        /// Method names that fail like a Stripe outage.
+        fail: RefCell<HashSet<String>>,
+        /// Next customer id minted by `create_customer`.
+        next_customer: RefCell<Option<String>>,
+    }
+
+    impl FakeStripe {
+        fn fail(&self, method: &str) -> bool {
+            self.fail.borrow().contains(method)
+        }
+
+        fn err<T>(&self) -> crate::stripe::StripeResult<T> {
+            Err(crate::stripe::StripeError::transport())
+        }
+    }
+
+    impl crate::stripe::StripeTransport for FakeStripe {
+        fn create_customer(
+            &self,
+            req: crate::stripe::CreateCustomer,
+        ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Customer>> + '_>>
+        {
+            Box::pin(async move {
+                if self.fail("create_customer") {
+                    return self.err();
+                }
+                self.customers_created
+                    .borrow_mut()
+                    .push((req.user_id.clone(), req.test_clock.clone()));
+                let id = self
+                    .next_customer
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "cus_test_1".to_string());
+                Ok(crate::stripe::Customer {
+                    id,
+                    livemode: false,
+                    test_clock: req.test_clock,
+                    email: None,
+                })
+            })
+        }
+        fn create_checkout_session(
+            &self,
+            req: crate::stripe::CreateCheckoutSession,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("create_checkout_session") {
+                    return self.err();
+                }
+                // Same-key replay, like the real idempotency key: answer
+                // the stored session without minting again.
+                if let Some(id) = self.sessions_by_op.borrow().get(&req.operation_id).cloned() {
+                    if let Some(session) = self.sessions.borrow().get(&id).cloned() {
+                        return Ok(session);
+                    }
+                }
+                let mut created = self.sessions_created.borrow_mut();
+                *created += 1;
+                self.session_create_ops
+                    .borrow_mut()
+                    .push(req.operation_id.clone());
+                self.session_customers
+                    .borrow_mut()
+                    .push(req.customer_id.clone());
+                let id = format!("cs_test_{created}");
+                let url = format!("https://checkout.stripe.com/pay/{id}");
+                let session = crate::stripe::CheckoutSession {
+                    id: id.clone(),
+                    status: Some("open".to_string()),
+                    payment_status: Some("unpaid".to_string()),
+                    customer: Some(req.customer_id),
+                    subscription: None,
+                    url: Some(url),
+                    client_reference_id: Some(req.operation_id.clone()),
+                    livemode: false,
+                };
+                self.sessions_by_op
+                    .borrow_mut()
+                    .insert(req.operation_id, id.clone());
+                self.sessions.borrow_mut().insert(id, session.clone());
+                Ok(session)
+            })
+        }
+        fn retrieve_checkout_session(
+            &self,
+            session_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("retrieve_checkout_session") {
+                    return self.err();
+                }
+                if self.missing_sessions.borrow().contains(&session_id) {
+                    return Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    ));
+                }
+                self.sessions
+                    .borrow()
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn expire_checkout_session(
+            &self,
+            session_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>>
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if self.fail("expire_checkout_session") {
+                    return self.err();
+                }
+                self.expired.borrow_mut().push(session_id.clone());
+                // Like the real `POST /v1/checkout/sessions/{id}/expire`:
+                // the stored session transitions and the expired object
+                // comes back, so a follow-up retrieve observes it; an
+                // unknown id 404s.
+                let mut sessions = self.sessions.borrow_mut();
+                match sessions.get_mut(&session_id) {
+                    Some(session) => {
+                        session.status = Some("expired".to_string());
+                        session.url = None;
+                        Ok(session.clone())
+                    }
+                    None => Err(crate::stripe::StripeError::api(
+                        404,
+                        Some("resource_missing".to_string()),
+                        "No such checkout session".to_string(),
+                    )),
+                }
+            })
+        }
+        fn retrieve_subscription(
+            &self,
+            subscription_id: String,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("retrieve_subscription") {
+                    return self.err();
+                }
+                self.subscriptions
+                    .borrow()
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn retrieve_invoice(
+            &self,
+            invoice_id: String,
+        ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>>
+        {
+            Box::pin(async move {
+                if self.fail("retrieve_invoice") {
+                    return self.err();
+                }
+                self.invoices
+                    .borrow()
+                    .get(&invoice_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)
+            })
+        }
+        fn list_invoice_lines(
+            &self,
+            invoice_id: String,
+            _starting_after: Option<String>,
+            _limit: u8,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("list_invoice_lines") {
+                    return self.err();
+                }
+                let data = self
+                    .line_pages
+                    .borrow_mut()
+                    .remove(&invoice_id)
+                    .unwrap_or_default();
+                Ok(crate::stripe::InvoiceLines {
+                    data,
+                    has_more: false,
+                })
+            })
+        }
+        fn list_invoices(
+            &self,
+            req: crate::stripe::ListInvoices,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("list_invoices") {
+                    return self.err();
+                }
+                Ok(self
+                    .invoices
+                    .borrow()
+                    .values()
+                    .filter(|invoice| {
+                        if let Some(customer) = req.customer_id.as_deref() {
+                            if invoice.customer.as_deref() != Some(customer) {
+                                return false;
+                            }
+                        }
+                        if let Some(subscription) = req.subscription_id.as_deref() {
+                            if invoice.subscription.as_deref() != Some(subscription) {
+                                return false;
+                            }
+                        }
+                        if req.paid_only && invoice.status != "paid" {
+                            return false;
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+        fn cancel_subscription(
+            &self,
+            subscription_id: String,
+        ) -> Pin<
+            Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Subscription>> + '_>,
+        > {
+            Box::pin(async move {
+                if self.fail("cancel_subscription") {
+                    return self.err();
+                }
+                // Like the real `DELETE /v1/subscriptions/{id}`: the call
+                // transitions the subscription and returns the canceled
+                // object, so a follow-up retrieve observes terminal state.
+                self.canceled.borrow_mut().push(subscription_id.clone());
+                let mut subscriptions = self.subscriptions.borrow_mut();
+                let mut subscription = subscriptions
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(crate::stripe::StripeError::transport)?;
+                subscription.status = "canceled".to_string();
+                subscriptions.insert(subscription_id, subscription.clone());
+                Ok(subscription)
+            })
+        }
+    }
+
     struct Harness {
         config: Config,
         store: FakeStore,
         mailer: FakeMailer,
         dialer: FakeDialer,
         dns: FakeDns,
+        stripe: FakeStripe,
     }
 
     fn harness() -> Harness {
@@ -5473,7 +9630,20 @@ mod tests {
                     vec!["93.184.216.34".parse().unwrap()],
                 )]),
             },
+            stripe: FakeStripe::default(),
         }
+    }
+
+    fn stripe_harness() -> Harness {
+        // Webhook/ensure tests provision the Stripe secrets the handlers
+        // gate on (synthetic values — the transport is the fake, so no
+        // secret ever leaves the test).
+        let mut h = harness();
+        h.config = cfg().with_stripe(
+            Some("sk_test_synthetic".to_string()),
+            Some("whsec_synthetic".to_string()),
+        );
+        h
     }
 
     impl Harness {
@@ -5484,6 +9654,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: "198.51.100.9".to_string(),
             }
@@ -5506,6 +9677,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: source_ip.to_string(),
             };
@@ -5515,6 +9687,7 @@ mod tests {
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
                 authorization: None,
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&ctx, &req))
@@ -5534,6 +9707,7 @@ mod tests {
                 cookie,
                 origin: origin.map(str::to_string),
                 authorization: None,
+                stripe_signature: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5554,6 +9728,7 @@ mod tests {
                 mailer: &self.mailer,
                 dialer: &self.dialer,
                 dns: &self.dns,
+                stripe: &self.stripe,
                 now: NOW,
                 source_ip: source_ip.to_string(),
             };
@@ -5563,6 +9738,7 @@ mod tests {
                 cookie,
                 origin: origin.map(str::to_string),
                 authorization: None,
+                stripe_signature: None,
                 body: body.map(|b| b.into_bytes()).unwrap_or_default(),
             };
             block_on(handle(&ctx, &req))
@@ -5579,10 +9755,3152 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             block_on(handle(&self.ctx(), &req))
         }
+
+        /// Stripe webhook delivery: raw body bytes plus the
+        /// `Stripe-Signature` value, exactly as the Worker entry forwards
+        /// them (the signature covers the RAW body, never re-encoded JSON).
+        fn call_webhook(&self, raw_body: &[u8], signature: Option<String>) -> Response {
+            let req = Request {
+                method: "POST".to_string(),
+                path: BILLING_WEBHOOK_PATH.to_string(),
+                cookie: None,
+                origin: None,
+                authorization: None,
+                stripe_signature: signature,
+                body: raw_body.to_vec(),
+            };
+            block_on(handle(&self.ctx(), &req))
+        }
+    }
+
+    // --- Stripe billing fixtures -----------------------------------------------------
+    //
+    // Synthetic ids only (`*_test_*`); no secret material anywhere. Times
+    // are Stripe-epoch `i64` around `NOW`.
+
+    const BILLING_NOW: i64 = NOW as i64;
+    const PRICE_PLUS: &str = "price_plus_test";
+    const PRICE_PRO: &str = "price_pro_test";
+    const PLAN_PLUS: &str = "plus";
+    const PLAN_PRO: &str = "pro";
+    const BILLING_PERIOD: i64 = 30 * 24 * 3_600;
+
+    fn test_bindings() -> Vec<crate::billing_reconcile::PriceBinding> {
+        vec![
+            crate::billing_reconcile::PriceBinding {
+                price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                selectable: true,
+                livemode: false,
+            },
+            crate::billing_reconcile::PriceBinding {
+                price_id: PRICE_PRO.to_string(),
+                plan_id: PLAN_PRO.to_string(),
+                selectable: true,
+                livemode: false,
+            },
+        ]
+    }
+
+    fn seed_billing_user(h: &Harness, user_id: &str) {
+        seed_user(h, user_id, &format!("{user_id}@example.com"));
+        h.store
+            .billing_bindings
+            .borrow_mut()
+            .extend(test_bindings());
+    }
+
+    fn test_session(
+        id: &str,
+        status: &str,
+        payment_status: &str,
+        customer: Option<&str>,
+        subscription: Option<&str>,
+        client_reference: Option<&str>,
+    ) -> crate::stripe::CheckoutSession {
+        crate::stripe::CheckoutSession {
+            id: id.to_string(),
+            status: Some(status.to_string()),
+            payment_status: Some(payment_status.to_string()),
+            customer: customer.map(str::to_string),
+            subscription: subscription.map(str::to_string),
+            url: Some(format!("https://checkout.stripe.com/pay/{id}")),
+            client_reference_id: client_reference.map(str::to_string),
+            livemode: false,
+        }
+    }
+
+    fn test_subscription(
+        id: &str,
+        customer: &str,
+        status: &str,
+        price: &str,
+    ) -> crate::stripe::Subscription {
+        crate::stripe::Subscription {
+            id: id.to_string(),
+            customer: Some(customer.to_string()),
+            status: status.to_string(),
+            cancel_at_period_end: false,
+            current_period_end: Some(BILLING_NOW + BILLING_PERIOD),
+            items: Some(crate::stripe::SubscriptionItems {
+                data: vec![crate::stripe::SubscriptionItem {
+                    id: "si_test_1".to_string(),
+                    price: Some(price.to_string()),
+                }],
+            }),
+            livemode: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_invoice(
+        id: &str,
+        customer: &str,
+        subscription: &str,
+        price: &str,
+        period_start: i64,
+        period_end: i64,
+        paid_at: i64,
+    ) -> crate::stripe::Invoice {
+        crate::stripe::Invoice {
+            id: id.to_string(),
+            customer: Some(customer.to_string()),
+            subscription: Some(subscription.to_string()),
+            status: "paid".to_string(),
+            amount_paid: 1_000,
+            currency: Some("usd".to_string()),
+            status_transitions: Some(crate::stripe::InvoiceStatusTransitions {
+                paid_at: Some(paid_at),
+            }),
+            lines: Some(crate::stripe::InvoiceLines {
+                data: vec![crate::stripe::InvoiceLine {
+                    id: format!("{id}_line_1"),
+                    amount: 1_000,
+                    currency: Some("usd".to_string()),
+                    price: Some(price.to_string()),
+                    period: Some(crate::stripe::InvoiceLinePeriod {
+                        start: Some(period_start),
+                        end: Some(period_end),
+                    }),
+                }],
+                has_more: false,
+            }),
+            livemode: false,
+        }
+    }
+
+    /// Raw `checkout.session.completed` body: the session id rides
+    /// `data.object.id`, exactly the shape the webhook parses.
+    fn checkout_completed_body(event_id: &str, session_id: &str, livemode: bool) -> Vec<u8> {
+        serde_json::json!({
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "livemode": livemode,
+            "data": {"object": {"id": session_id}},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn other_event_body(event_id: &str, event_type: &str) -> Vec<u8> {
+        serde_json::json!({
+            "id": event_id,
+            "type": event_type,
+            "livemode": false,
+            "data": {"object": {"id": "in_test_9"}},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sign(body: &[u8], t: i64) -> String {
+        crate::stripe::test_signature_header(body, t, "whsec_synthetic")
+    }
+
+    fn webhook_ok(resp: &Response) {
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, r#"{"ok":true}"#);
+    }
+
+    fn audits_with(h: &Harness, action: &str) -> usize {
+        h.store
+            .audits
+            .borrow()
+            .iter()
+            .filter(|event| event.action == action)
+            .count()
+    }
+
+    fn live_for(h: &Harness, user_id: &str) -> Option<crate::billing_reconcile::LiveRow> {
+        block_on(h.store.load_reconcile_input(user_id))
+            .ok()
+            .and_then(|input| input.live)
+    }
+
+    /// Paid first period through the webhook: op-bound session, active
+    /// subscription, one qualifying invoice. Returns the event body for
+    /// redelivery tests.
+    fn deliver_first_period(h: &Harness, event_id: &str) -> Vec<u8> {
+        let period_start = BILLING_NOW;
+        let period_end = BILLING_NOW + BILLING_PERIOD;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                period_start,
+                period_end,
+                period_start + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body(event_id, "cs_test_1", false);
+        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+        webhook_ok(&resp);
+        body
+    }
+
+    #[test]
+    fn billing_webhook_valid_advances_and_records_history() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_test_1");
+        // Coverage advanced from the confirmed paid invoice only.
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(live.grace_until_unix, None);
+        // Exactly one history row, idempotent on the invoice id.
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        let row = &history["in_test_1"];
+        assert_eq!(row.stripe_subscription_id, "sub_test_1");
+        assert_eq!(row.plan_id, PLAN_PLUS);
+        assert_eq!(row.period_start_unix, BILLING_NOW);
+        assert_eq!(row.period_end_unix, BILLING_NOW + BILLING_PERIOD);
+        assert_eq!(row.amount_cents, 1_000);
+        assert_eq!(row.currency, "usd");
+        assert_eq!(row.paid_at_unix, BILLING_NOW + 60);
+        // The sourcing operation resolved with the subscription.
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, "succeeded");
+        assert_eq!(op.session_id.as_deref(), Some("cs_test_1"));
+        // No alerts on the clean path.
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 0);
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 0);
+    }
+
+    #[test]
+    fn billing_direct_retrieval_matches_webhook_state() {
+        // Reconcile WITHOUT any webhook delivery reaches the same stored
+        // state as the webhook path: the same fake remote subscription +
+        // paid invoices through `reconcile_remote_subscription` (the hourly
+        // `billing-reconcile` job's entry point) must converge on the
+        // identical live row and history. No session, no event, no
+        // operation exists on this harness — retrieval alone drives it.
+        let period_start = BILLING_NOW;
+        let period_end = BILLING_NOW + BILLING_PERIOD;
+        let direct = stripe_harness();
+        seed_billing_user(&direct, "u1");
+        direct.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        direct.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                period_start,
+                period_end,
+                period_start + 60,
+            ),
+        );
+        let outcome = block_on(reconcile_remote_subscription(
+            &direct.ctx(),
+            "u1",
+            "sub_test_1",
+        ))
+        .expect("direct retrieval reconciles");
+        assert!(outcome.fail_closed.is_none());
+        let direct_live = live_for(&direct, "u1").expect("direct live row stored");
+        assert_eq!(direct_live.status, "active");
+        assert_eq!(direct_live.plan_id, PLAN_PLUS);
+        assert_eq!(direct_live.paid_through_unix, Some(period_end));
+        assert_eq!(direct_live.grace_until_unix, None);
+
+        // The webhook path over the identical remote state, for comparison.
+        let webhook = stripe_harness();
+        seed_billing_user(&webhook, "u1");
+        deliver_first_period(&webhook, "evt_test_1");
+        let webhook_live = live_for(&webhook, "u1").expect("webhook live row stored");
+        assert_eq!(direct_live, webhook_live);
+        assert_eq!(
+            direct.store.invoice_history.borrow().clone(),
+            webhook.store.invoice_history.borrow().clone(),
+            "direct retrieval must record the same history as the webhook path"
+        );
+        assert_eq!(direct.store.invoice_history.borrow().len(), 1);
+        // No alerts on either clean path.
+        assert_eq!(audits_with(&direct, BILLING_FAIL_CLOSED_ACTION), 0);
+        assert_eq!(audits_with(&direct, BILLING_UNKNOWN_CUSTOMER_ACTION), 0);
+    }
+
+    #[test]
+    fn billing_webhook_rejects_tampered_bad_signature_and_stale() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                None,
+            ),
+        );
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        let good = sign(&body, BILLING_NOW);
+        // Tampered body under the good signature.
+        let mut tampered = body.clone();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'}' { b']' } else { b'}' };
+        assert_eq!(h.call_webhook(&tampered, Some(good.clone())).status, 400);
+        // Wrong-secret signature over the intact body.
+        let bad = crate::stripe::test_signature_header(&body, BILLING_NOW, "whsec_wrong");
+        assert_eq!(h.call_webhook(&body, Some(bad)).status, 400);
+        // Missing signature.
+        assert_eq!(h.call_webhook(&body, None).status, 400);
+        // Stale timestamp (past the 5-minute tolerance).
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW - 600)))
+                .status,
+            400
+        );
+        // Future timestamp past the same symmetric tolerance.
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW + 600)))
+                .status,
+            400
+        );
+        // No failure touched state or raised an alert.
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert!(h.store.webhook_events.borrow().is_empty());
+        assert!(h.store.audits.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_webhook_duplicate_checkout_reprocesses_idempotently() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let body = deliver_first_period(&h, "evt_test_1");
+        // Redelivery of the same event id reprocesses idempotently and
+        // still acks 200: coverage and history converge on the same stored
+        // state instead of dropping the payment on a consumed claim (this
+        // is what lets a claim orphaned by a store outage or a dead worker
+        // land on redelivery).
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+    }
+
+    #[test]
+    fn billing_webhook_out_of_order_invoices_never_regress() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // Two paid periods; the later one reconciles first.
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        for (id, start) in [
+            ("in_test_1", BILLING_NOW),
+            ("in_test_2", BILLING_NOW + BILLING_PERIOD),
+        ] {
+            h.stripe.invoices.borrow_mut().insert(
+                id.to_string(),
+                test_invoice(
+                    id,
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    start,
+                    start + BILLING_PERIOD,
+                    start + 60,
+                ),
+            );
+        }
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // Newer period first, then the older redelivery under a fresh id.
+        let first = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&first, Some(sign(&first, BILLING_NOW))));
+        let second = checkout_completed_body("evt_test_2", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&second, Some(sign(&second, BILLING_NOW))));
+        // Coverage sits at the later period; each invoice left exactly one
+        // history row; the duplicate pass regressed nothing.
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+        let third = checkout_completed_body("evt_test_3", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&third, Some(sign(&third, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+    }
+
+    #[test]
+    fn billing_webhook_transient_failure_redelivers_and_stores() {
+        // A transient failure AFTER the webhook claim must not consume the
+        // event: the first delivery races a Stripe 5xx mid-reconcile, the
+        // handler 500s (so Stripe retries) and releases the claim, and
+        // redelivery of the same event id processes and stores.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        h.stripe
+            .fail
+            .borrow_mut()
+            .insert("retrieve_subscription".to_string());
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "the failed pass stores nothing"
+        );
+        // The same event id redelivered: the released claim lets it
+        // reprocess instead of acking 200 on a consumed claim.
+        h.stripe.fail.borrow_mut().clear();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("redelivery stores");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_claimed_but_unprocessed_redelivers_and_stores() {
+        // A claim orphaned by a store outage (the same-DB release failed)
+        // or a worker death after the claim must not consume the event:
+        // redelivery of the same id finds the stale claim and reprocesses
+        // idempotently instead of acking 200 with nothing stored.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The worker died after the claim, before any Stripe call.
+        assert!(block_on(h.store.claim_webhook_event("evt_test_1")).expect("claim first wins"));
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("redelivery stores");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_non_checkout_and_livemode_ack_without_state() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // A verified non-checkout event acks 200 with no state change.
+        let other = other_event_body("evt_test_9", "invoice.payment_succeeded");
+        webhook_ok(&h.call_webhook(&other, Some(sign(&other, BILLING_NOW))));
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        // A live-mode event on this test-mode worker acks 200, alerts, and
+        // never calls Stripe or stores anything — even for a completed
+        // checkout shape.
+        let live_body = checkout_completed_body("evt_test_live", "cs_live_1", true);
+        webhook_ok(&h.call_webhook(&live_body, Some(sign(&live_body, BILLING_NOW))));
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 1);
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_webhook_unprovisioned_secrets_fail_closed() {
+        // No Stripe secrets provisioned: the same generic 500 as any store
+        // outage, so Stripe retries the delivery instead of losing it.
+        let h = harness();
+        seed_billing_user(&h, "u1");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_webhook_unknown_customer_acks_with_alert() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // No operation binding and no customer binding: the verified event
+        // acks 200 with an alert and no state change. (Live
+        // cancel-and-alert belongs to the account-deletion slice.)
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_ghost_1".to_string(),
+            test_session(
+                "cs_ghost_1",
+                "complete",
+                "paid",
+                Some("cus_ghost_1"),
+                Some("sub_ghost_1"),
+                None,
+            ),
+        );
+        let body = checkout_completed_body("evt_ghost_1", "cs_ghost_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(audits_with(&h, BILLING_UNKNOWN_CUSTOMER_ACTION), 1);
+        assert!(live_for(&h, "u1").is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_webhook_unconfirmed_session_mints_nothing() {
+        for (session_status, payment_status) in [
+            ("open", "unpaid"),
+            ("open", "no_payment_required"),
+            ("complete", "unpaid"),
+        ] {
+            let h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            h.stripe.sessions.borrow_mut().insert(
+                "cs_test_1".to_string(),
+                test_session(
+                    "cs_test_1",
+                    session_status,
+                    payment_status,
+                    Some("cus_test_1"),
+                    None,
+                    Some("op_test_1"),
+                ),
+            );
+            block_on(h.store.create_checkout_operation(
+                "op_test_1",
+                "u1",
+                PRICE_PLUS,
+                Some("cus_test_1"),
+            ))
+            .expect("op insert");
+            let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+            // No subscription id (unconfirmed or open): acked, no store
+            // touch, the flight stays open for the real completion.
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+            assert!(live_for(&h, "u1").is_none());
+            assert!(h.store.invoice_history.borrow().is_empty());
+            let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+                .expect("op lookup")
+                .expect("op stored");
+            assert_eq!(op.state, "pending");
+        }
+    }
+
+    #[test]
+    fn billing_webhook_store_outage_retries() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.store.fail_billing.borrow_mut() = true;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                None,
+            ),
+        );
+        // Claim itself fails: 500, so Stripe retries the delivery.
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+    }
+
+    #[test]
+    fn billing_fail_closed_unknown_price_trialing_and_unknown_status() {
+        // Unknown price: the applied item price has no test-mode mapping.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        let mut sub = test_subscription("sub_test_1", "cus_test_1", "active", "price_unknown");
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), sub.clone());
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                "price_unknown",
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // Observed state recorded verbatim, nothing advanced, purchases
+        // disabled, alert raised, flight parked for the hourly job.
+        let live = live_for(&h, "u1").expect("verbatim row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, None);
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, "needs_reconcile");
+        assert!(h.store.invoice_history.borrow().is_empty());
+        // A retry while fail-closed refuses the purchase (no Stripe call).
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+
+        // Trialing: an unknown provider state on the Checkout shape, same
+        // fail-closed landing.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        sub.status = "trialing".to_string();
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), sub);
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_2", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // `trialing` sits outside the live slot by design (the same
+        // five-status predicate as the read path), but the verbatim row
+        // is still recorded: fail-closed, alerted, nothing advanced.
+        let stored = h.store.billing_rows.borrow();
+        let row = stored.get("u1").expect("verbatim row stored");
+        assert_eq!(row.status, "trialing");
+        assert_eq!(row.paid_through_unix, None);
+        drop(stored);
+        assert!(live_for(&h, "u1").is_none(), "trialing holds no live slot");
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+
+        // Unknown status string: recorded verbatim, same fail-closed
+        // landing.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let mut weird =
+            test_subscription("sub_test_1", "cus_test_1", "weird_status_xyz", PRICE_PLUS);
+        weird.livemode = false;
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .insert("sub_test_1".to_string(), weird);
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_3", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // Unknown statuses sit outside the live slot by design (the same
+        // five-status predicate as the read path), but the verbatim row is
+        // still recorded: fail-closed, alerted, nothing advanced.
+        let stored = h.store.billing_rows.borrow();
+        assert_eq!(
+            stored.get("u1").map(|row| row.status.as_str()),
+            Some("weird_status_xyz")
+        );
+        drop(stored);
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_renewal_grace_set_once_kept_and_cleared() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_test_1");
+        let paid_end = BILLING_NOW + BILLING_PERIOD;
+        // First failed renewal: the subscription reads `past_due` with no
+        // new money, so the pass sets a fixed 7-day grace from the paid
+        // end. Delivered as a later completed session for the same
+        // subscription (the renewal attempt's own checkout).
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_2".to_string(),
+            test_session(
+                "cs_test_2",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_2"),
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_2",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_2", "cs_test_2", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "past_due");
+        assert_eq!(live.paid_through_unix, Some(paid_end));
+        assert_eq!(
+            live.grace_until_unix,
+            Some(paid_end + crate::billing_reconcile::RENEWAL_GRACE_SECS)
+        );
+        // A duplicate failed-renewal pass never extends the stored grace.
+        let body = checkout_completed_body("evt_test_3", "cs_test_2", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.grace_until_unix,
+            Some(paid_end + crate::billing_reconcile::RENEWAL_GRACE_SECS)
+        );
+        // Recovery: new money reconciled clears the grace and advances.
+        let recovered_end = paid_end + BILLING_PERIOD;
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_2".to_string(),
+            test_invoice(
+                "in_test_2",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                paid_end,
+                recovered_end,
+                paid_end + 60,
+            ),
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_3".to_string(),
+            test_session(
+                "cs_test_3",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_3"),
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_3",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_4", "cs_test_3", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, Some(recovered_end));
+        assert_eq!(live.grace_until_unix, None);
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+    }
+
+    #[test]
+    fn billing_concurrent_attempts_converge_on_one_session() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // Two attempts with no flight: the second converges on the
+        // winner's operation id (same idempotency key), so Stripe mints
+        // exactly one session and both callers share its URL.
+        let ctx = h.ctx();
+        let url_a = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("first attempt");
+        // Script the created session as still-open for the reuse check.
+        let created_id = url_a
+            .rsplit('/')
+            .next()
+            .expect("session url ends with the id");
+        h.stripe.sessions.borrow_mut().insert(
+            created_id.to_string(),
+            crate::stripe::CheckoutSession {
+                id: created_id.to_string(),
+                status: Some("open".to_string()),
+                payment_status: Some("unpaid".to_string()),
+                customer: Some("cus_test_1".to_string()),
+                subscription: None,
+                url: Some(url_a.clone()),
+                client_reference_id: None,
+                livemode: false,
+            },
+        );
+        // Point the winner's op at the created session (the mark the
+        // create path records).
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight open");
+        block_on(h.store.update_checkout_operation(
+            &open.id,
+            "submitted",
+            PRICE_PLUS,
+            Some(created_id),
+        ))
+        .expect("mark submitted");
+        let url_b = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("second attempt");
+        // Lost-response replay: same URL, one Stripe session, one flight.
+        assert_eq!(url_a, url_b);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        // The customer bound once (no overwrite by the racer).
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_converged_attempt_uses_winner_bound_customer() {
+        // Two first-purchase racers both start unbound, so each mints its
+        // own Stripe customer before the single-flight insert converges
+        // them on the winner's operation. The payable session must sit on
+        // the winner-bound customer, never the loser's orphan (which
+        // reconciliation would fail closed on customer mismatch for a user
+        // who paid). The session customer re-reads the binding after
+        // convergence instead of trusting the pre-insert snapshot.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_winner".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("winner attempt");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        // The loser already minted its orphan before converging on the
+        // winner's row (sequential stand-in for the interleave: its own
+        // snapshot still names no customer).
+        let outcome = block_on(h.store.create_checkout_operation(
+            "op_loser",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_orphan"),
+        ))
+        .expect("converge");
+        assert!(matches!(
+            outcome,
+            crate::billing_reconcile::CreateOpOutcome::Existing(_)
+        ));
+        let resolved = block_on(converged_session_customer(
+            &ctx,
+            "u1",
+            None,
+            "cus_orphan".to_string(),
+        ))
+        .expect("resolve");
+        assert_eq!(resolved, "cus_winner");
+        // The winner's own session sat on the bound customer too, and the
+        // orphan never touched the account binding.
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_winner".to_string()].as_slice()
+        );
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_winner".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_converged_attempt_before_bind_fails_retryable() {
+        // The pre-bind window: the winner's op INSERT is visible but its
+        // customer bind has not landed yet (production publishes them as
+        // separate statements; the fake holds the bind back on request). A
+        // loser converging here must fail retryable — never resolve to its
+        // own orphan — so the retry reads the winner's binding and the
+        // payable session never sits on an unbound customer.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.store.defer_customer_bind.borrow_mut() = true;
+        block_on(h.store.create_checkout_operation(
+            "op_winner",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_winner"),
+        ))
+        .expect("winner op visible, bind deferred");
+        *h.store.defer_customer_bind.borrow_mut() = false;
+        // The loser minted its orphan before converging on the winner's
+        // row; its own id never binds the account.
+        let outcome = block_on(h.store.create_checkout_operation(
+            "op_loser",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_orphan"),
+        ))
+        .expect("converge");
+        assert!(matches!(
+            outcome,
+            crate::billing_reconcile::CreateOpOutcome::Existing(_)
+        ));
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(converged_session_customer(
+                &ctx,
+                "u1",
+                None,
+                "cus_orphan".to_string(),
+            )),
+            Err(EnsureCheckoutError::Failed),
+            "no bound customer yet: retry, never the orphan"
+        );
+        assert!(
+            h.store.billing_customers.borrow().get("u1").is_none(),
+            "the orphan never binds the account"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session minted without a bound customer"
+        );
+    }
+
+    #[test]
+    fn billing_held_subscription_releases_before_replacement() {
+        // A held (`incomplete`) row reserves the live slot but confers
+        // nothing. A retry must confirm the held subscription terminal
+        // (canceling it here) and reconcile it out of the slot before
+        // minting the replacement — otherwise the replacement's
+        // reconcile would collide with the still-held row and fail a paid
+        // subscription closed.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "incomplete", PRICE_PLUS),
+        );
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("replacement proceeds");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        // The held subscription was canceled and reconciled terminal — the
+        // stored row sits outside the live slot, so the slot is free.
+        assert_eq!(
+            h.stripe.subscriptions.borrow()["sub_old"].status,
+            "canceled"
+        );
+        assert_eq!(h.store.billing_rows.borrow()["u1"].status, "canceled");
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "terminal row sits outside the live slot"
+        );
+    }
+
+    #[test]
+    fn billing_held_slot_with_recovered_remote_reconciles_and_refuses() {
+        // Stale-local/recovered-remote: the stored row is still
+        // `incomplete` but Stripe already shows `active` with a paid
+        // invoice (only checkout completions reconcile, so the local row
+        // can lag a recovered payment). The retry must NOT cancel the
+        // newly paid subscription: it reconciles the paid state in place
+        // (coverage + history land) and refuses the purchase as
+        // already-subscribed — no cancel call, no new session.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_old",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "a recovered subscription must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement session for an already-subscribed account"
+        );
+        let live = live_for(&h, "u1").expect("recovered coverage stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_held_slot_with_unknown_remote_fails_closed_without_cancel() {
+        // Unknown remote status: fail closed — alert, no cancel, no
+        // reconcile, no session. The stale held row stays reserved so later
+        // attempts keep failing closed instead of minting a second
+        // subscription against a state we cannot classify.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "past_due_unmapped", PRICE_PLUS),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "an unclassifiable remote must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session against an unknown remote state"
+        );
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let live = live_for(&h, "u1").expect("held row stays reserved");
+        assert_eq!(live.status, "incomplete");
+        assert!(live.paid_through_unix.is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
+    }
+
+    #[test]
+    fn billing_reconcile_outcome_never_regresses_coverage() {
+        // Two passes commit out of order: the fresher pass first, then a
+        // pass folded from an older snapshot. Coverage (`paid_through_at`
+        // and the plan/anchor tied to it) stays at the fresher values —
+        // the production upsert's monotonic CASE, mirrored by the fake —
+        // and the stale pass keeps the stored status/grace instead of
+        // writing older verbatim fields over the fresher pass. Both paid
+        // invoices still keep their history rows.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        let row = |paid: Option<i64>, anchor: Option<&str>, status: &str, grace: Option<i64>| {
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: status.to_string(),
+                current_period_end_unix: Some(BILLING_NOW + BILLING_PERIOD),
+                cancel_at_period_end: false,
+                paid_through_unix: paid,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            }
+        };
+        let history_row = |id: &str, end: i64| crate::billing_reconcile::PaidInvoiceRow {
+            stripe_invoice_id: id.to_string(),
+            stripe_subscription_id: "sub_test_1".to_string(),
+            plan_id: PLAN_PLUS.to_string(),
+            period_start_unix: BILLING_NOW,
+            period_end_unix: end,
+            amount_cents: 1_000,
+            currency: "usd".to_string(),
+            paid_at_unix: BILLING_NOW + 60,
+        };
+        let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
+        let fresh = crate::billing_reconcile::ReconcileOutcome {
+            row: row(
+                Some(BILLING_NOW + BILLING_PERIOD),
+                Some("in_test_2"),
+                "past_due",
+                Some(fresh_grace),
+            ),
+            history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
+            fail_closed: None,
+            // Inserts (no stored row yet), so the guard never reads this.
+            read_plan: None,
+            read_anchor: None,
+        };
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
+        let stale = crate::billing_reconcile::ReconcileOutcome {
+            row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
+            history: vec![history_row("in_test_1", BILLING_NOW)],
+            fail_closed: None,
+            // Read the fresh row: strictly-older money, so the stale arm
+            // fires on the ends regardless.
+            read_plan: Some(PLAN_PLUS.to_string()),
+            read_anchor: Some("in_test_2".to_string()),
+        };
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + BILLING_PERIOD),
+            "an older snapshot never regresses coverage"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_test_2"),
+            "the anchor stays with the advancing money"
+        );
+        assert_eq!(
+            live.status, "past_due",
+            "a stale snapshot never regresses status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(fresh_grace),
+            "a stale snapshot never clears a fresher grace"
+        );
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "both paid invoices keep their history rows"
+        );
+    }
+
+    /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
+    /// row plus the full price map, so `reconcile_subscription` runs the
+    /// real fold instead of a hand-built row.
+    fn fold_input(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        grace: Option<i64>,
+        anchor: Option<&str>,
+    ) -> crate::billing_reconcile::ReconcileInput {
+        crate::billing_reconcile::ReconcileInput {
+            stripe_customer_id: Some("cus_test_1".to_string()),
+            live: Some(crate::billing_reconcile::LiveRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            }),
+            bindings: test_bindings(),
+        }
+    }
+
+    fn stored_seed(
+        plan: &str,
+        status: &str,
+        paid_through: Option<i64>,
+        anchor: Option<&str>,
+        grace: Option<i64>,
+    ) -> crate::billing_reconcile::ReconcileOutcome {
+        crate::billing_reconcile::ReconcileOutcome {
+            row: crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_test_1".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: plan.to_string(),
+                status: status.to_string(),
+                current_period_end_unix: Some(BILLING_NOW + BILLING_PERIOD),
+                cancel_at_period_end: false,
+                paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
+                grace_until_unix: grace,
+            },
+            history: vec![],
+            fail_closed: None,
+            // Seeds commit as inserts (no stored row yet), so the
+            // equal-end adopt arm never reads this.
+            read_plan: None,
+            read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_equal_end_plan_switch_persists_through_store() {
+        // The pure fold relabels on an equal-end plan switch, and the
+        // production upsert's plan/anchor CASEs must persist that relabel:
+        // stored PLUS ending E, paid PRO invoice also ending E → the row
+        // becomes PRO anchored on the new invoice. A strict-greater guard
+        // would keep PLUS and the old anchor forever (no later money can
+        // fix a stuck plan), so this test folds the real snapshot and
+        // commits through the store instead of asserting the fold alone.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_old"), None),
+        ))
+        .expect("seed stores");
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        // The pass reads the stored row (anchor `in_old`, present in the
+        // snapshot): a real pass always folds what it read, and the write
+        // only trusts a relabel whose read row is still stored.
+        let outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_old")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(outcome.row.plan_id, PLAN_PRO, "the fold relabels");
+        assert_eq!(
+            outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the fold anchors on the new evidence"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("switch stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the equal-end relabel persists in the write"
+        );
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor follows the new evidence"
+        );
+        assert_eq!(live.status, "active");
+        assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_stale_fold_commit_race_keeps_fresher_status_and_grace() {
+        // Interleaving built from REAL fold outcomes (not hand-built
+        // rows): stale pass S folds an older snapshot (E1 money) over
+        // stored E2/active, fresh pass F folds the equal-E2 failed renewal
+        // (past_due + first grace). F commits first, S second — S must
+        // compare strictly older in the write guard and keep the stored
+        // status/grace instead of overwriting them with older verbatim
+        // fields. Hand-building S with the stored end would bypass the
+        // fold's normalization and miss exactly this.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        let e1 = BILLING_NOW;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        h.store.invoice_history.borrow_mut().insert(
+            "in_seed".to_string(),
+            crate::billing_reconcile::PaidInvoiceRow {
+                stripe_invoice_id: "in_seed".to_string(),
+                stripe_subscription_id: "sub_test_1".to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                period_start_unix: BILLING_NOW - BILLING_PERIOD,
+                period_end_unix: e2,
+                amount_cents: 1_000,
+                currency: "usd".to_string(),
+                paid_at_unix: BILLING_NOW,
+            },
+        );
+        // S reads stored E2/active with remote money E1 < E2: stale.
+        let older = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                e1 - BILLING_PERIOD,
+                e1,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, None),
+            &older,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e1),
+            "the stale fold carries its evidence end into the write guard"
+        );
+        // F reads the same stored row with the equal-E2 failed renewal. A
+        // real fresh listing still carries the stored anchor invoice (the
+        // failure adds no new invoice, it does not erase the paid one), so
+        // the snapshot contains in_seed and the keep re-pins it — an
+        // anchor-less equal-end row against an anchored stored row is the
+        // stale shape, and must not be mistaken for this fresh outcome.
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        assert_eq!(
+            fresh_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_seed"),
+            "the fresh keep re-pins the stored anchor it observed"
+        );
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "the second-committing stale pass keeps the fresher status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "the second-committing stale pass keeps the fresher grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "both the seed and the stale invoice keep history rows"
+        );
+    }
+
+    #[test]
+    fn billing_stale_without_item_plan_money_keeps_recovery() {
+        // The NULL-evidence stale shape, built from REAL fold outcomes:
+        // stale pass S reads stored E2/active anchored `in_seed`, but its
+        // snapshot lost the anchor AND holds no item-plan money at all
+        // (empty listing) — so the fold emits no evidence end. The write
+        // guard only fires on non-NULL evidence, so the fold falls back to
+        // the stored end with the anchor cleared: the anchor-less
+        // equal-end shape the guard already reads as stale. F (the
+        // equal-E2 failed renewal: `past_due` + first grace) commits first,
+        // S second — S must keep the recovery's status/grace instead of
+        // overwriting them with the older verbatim fields.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let e2 = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(e2), Some("in_seed"), None),
+        ))
+        .expect("seed stores");
+        let emptied = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let stale_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &emptied,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            stale_outcome.row.paid_through_unix,
+            Some(e2),
+            "a stale pass with no item-plan money carries the stored end so the guard can see it"
+        );
+        assert!(
+            stale_outcome.row.paid_invoice_id.is_none(),
+            "only the stale branch emits the anchor-less shape"
+        );
+        assert_eq!(
+            stale_outcome.read_anchor.as_deref(),
+            Some("in_seed"),
+            "the write needs the read anchor to tell keeps from relabels"
+        );
+        let failed = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
+        };
+        let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
+            &failed,
+            BILLING_NOW,
+        );
+        let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        assert_eq!(fresh_outcome.row.status, "past_due");
+        assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        // F commits first, S second.
+        block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
+        block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(e2), "coverage never regresses");
+        assert_eq!(
+            live.status, "past_due",
+            "a stale pass with no evidence money keeps the recovery status"
+        );
+        assert_eq!(
+            live.grace_until_unix,
+            Some(grace),
+            "a stale pass with no evidence money keeps the recovery grace"
+        );
+        assert_eq!(live.plan_id, PLAN_PLUS);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_seed"),
+            "the anchor stays with the recovery"
+        );
+    }
+
+    #[test]
+    fn billing_relabel_first_keep_second_keeps_new_plan() {
+        // Relabel-then-keep commit order, built from REAL fold outcomes:
+        // keep pass K folds the pre-switch snapshot (plus/E/`in_plus`) and
+        // re-pins the anchor it read; relabel pass R folds the switched
+        // snapshot (pro item, both invoices, the switch paid later) over
+        // the same stored row. R commits first, K second — the stored row
+        // no longer matches what K read, so the write keeps the relabeled
+        // plan/anchor instead of flipping the row back to plus until the
+        // next reconcile.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let plus_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+            invoices: vec![test_invoice(
+                "in_plus",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+        };
+        let keep_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &plus_view,
+            BILLING_NOW,
+        );
+        assert_eq!(keep_outcome.row.plan_id, PLAN_PLUS, "the keep folds plus");
+        assert_eq!(
+            keep_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_plus"),
+            "the keep re-pins the anchor it read"
+        );
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the relabel adopts the current item plan"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the relabel anchors on the new evidence"
+        );
+        assert_eq!(
+            relabel_outcome.read_plan.as_deref(),
+            Some(PLAN_PLUS),
+            "the relabel records the plan it read"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_plus"),
+            "the relabel records the anchor it read"
+        );
+        // R commits first, K second.
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        block_on(h.store.store_reconcile_outcome("u1", &keep_outcome)).expect("keep stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(end), "no advance");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "the late keep does not reverse the committed relabel"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "the anchor stays with the new evidence"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_shared_invoice_relabel_persists_through_store() {
+        // One paid invoice carrying qualifying lines for BOTH plans, same
+        // end: stored PLUS/E anchored on `in_shared`, the item now reports
+        // PRO. The fold relabels onto the shared invoice — emitted anchor
+        // equalling the read anchor — and the write must still persist it
+        // when nothing moved the row meanwhile: gating the adopt on
+        // emitted-vs-read difference would leave PLUS stuck forever (no
+        // later money can fix a same-invoice switch), so the arm compares
+        // stored-vs-read instead. Built from a REAL fold outcome.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_shared"), None),
+        ))
+        .expect("seed stores");
+        let mut shared = test_invoice(
+            "in_shared",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            end,
+            BILLING_NOW,
+        );
+        shared
+            .lines
+            .as_mut()
+            .expect("invoice lines")
+            .data
+            .push(crate::stripe::InvoiceLine {
+                id: "in_shared_line_2".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PRO.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(end),
+                }),
+            });
+        let switched = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![shared],
+        };
+        let relabel_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_shared")),
+            &switched,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            relabel_outcome.row.plan_id, PLAN_PRO,
+            "the fold relabels onto the shared invoice"
+        );
+        assert_eq!(
+            relabel_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_shared"),
+            "the shared invoice anchors both plans"
+        );
+        assert_eq!(
+            relabel_outcome.read_anchor.as_deref(),
+            Some("in_shared"),
+            "emitted and read anchors coincide here by construction"
+        );
+        block_on(h.store.store_reconcile_outcome("u1", &relabel_outcome)).expect("relabel stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(
+            live.plan_id, PLAN_PRO,
+            "a same-invoice relabel persists when the row never moved"
+        );
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_shared"),
+            "the anchor stays on the shared invoice"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_older_relabel_committing_second_keeps_newer_switch() {
+        // Two paid switches, same end, reverse commit order — built from
+        // REAL fold outcomes: older pass O reads stored plus/E/`in_plus`
+        // and relabels onto its own newer-paid evidence `in_old`; newer
+        // pass N relabels onto `in_new` (paid later still) and commits
+        // first. O commits second with a different anchor than it read, so
+        // an emitted-vs-read gate would revert the row to the older
+        // switch; the stored-vs-read arm keeps the newer plan/anchor.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let end = BILLING_NOW + BILLING_PERIOD;
+        block_on(h.store.store_reconcile_outcome(
+            "u1",
+            &stored_seed(PLAN_PLUS, "active", Some(end), Some("in_plus"), None),
+        ))
+        .expect("seed stores");
+        let older_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_old",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 60,
+                ),
+            ],
+        };
+        let older_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &older_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            older_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_old"),
+            "the older pass relabels onto its own evidence"
+        );
+        let newer_view = crate::billing_reconcile::RemoteSubscription {
+            subscription: test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+            invoices: vec![
+                test_invoice(
+                    "in_plus",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW,
+                ),
+                test_invoice(
+                    "in_new",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PRO,
+                    BILLING_NOW,
+                    end,
+                    BILLING_NOW + 120,
+                ),
+            ],
+        };
+        let newer_outcome = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_plus")),
+            &newer_view,
+            BILLING_NOW,
+        );
+        assert_eq!(
+            newer_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_new"),
+            "the newer pass relabels onto the later payment"
+        );
+        // Newer commits first, older second.
+        block_on(h.store.store_reconcile_outcome("u1", &newer_outcome)).expect("newer stores");
+        block_on(h.store.store_reconcile_outcome("u1", &older_outcome)).expect("older stores");
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"]
+                .paid_invoice_id
+                .as_deref(),
+            Some("in_new"),
+            "an older relabel committing second never reverts a newer switch"
+        );
+        assert_eq!(live.status, "active");
+    }
+
+    #[test]
+    fn billing_completed_session_under_open_op_reconciles_without_recreating() {
+        // The purchase completed but its webhook was lost: a retry finds
+        // the completed paid session under the still-open operation. It
+        // must reconcile through the shared driver — not mint a second
+        // payable session under the same idempotency key. Only a
+        // confirmed-expired or missing session repairs.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second session minted"
+        );
+        let live = live_for(&h, "u1").expect("reconciled");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_price_mismatched_open_session_expires_and_replaces() {
+        // The first attempt names PLUS and leaves its session open; the
+        // second attempt names PRO. The second attempt must not inherit the
+        // first attempt's session (which keeps the first attempt's price):
+        // the open session is expired first — a replacement never mints
+        // beside a possibly-payable session — the flight is superseded, and
+        // the replacement mints under a fresh operation id, hence a fresh
+        // Stripe idempotency key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_old_1".to_string(),
+            test_session(
+                "cs_old_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("price-mismatched attempt replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_old_1".to_string()].as_slice(),
+            "the mismatched open session is expired before replacement"
+        );
+        // The dead session transitioned, like the real expire endpoint.
+        let dead = &h.stripe.sessions.borrow()["cs_old_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        assert!(dead.url.is_none());
+        // The old flight is superseded (releasing the slot) with its price
+        // and session preserved for the audit trail.
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        // Exactly one new session, minted under a fresh operation id — a
+        // fresh idempotency key, never the dead session's — on the bound
+        // customer.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_test_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_session_mark_misses_retired_and_missing_rows() {
+        // The conditional mark only lands on unresolved rows: a mark that
+        // arrives after a deliberate supersede reports `false` and leaves
+        // the retired row untouched instead of resurrecting `submitted` on
+        // it; a missing row reports `false` the same way.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("mark"),
+            "unresolved row takes the mark"
+        );
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                crate::billing_reconcile::SUPERSEDED_OP_STATE,
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("retire"),
+            "open row retires"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("late mark"),
+            "retired row rejects the late mark"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_missing_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("missing mark"),
+            "missing row reports a miss"
+        );
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the late session id never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_late_create_mark_after_supersede_fails_without_reviving() {
+        // A replacer superseded op A while A's original Stripe create was
+        // still in flight. The late-arriving create must NOT resurrect
+        // `submitted` on the retired row (which would re-occupy the flight
+        // and hand out the now-expired session's URL): the conditional mark
+        // misses, the attempt fails retryable, and the flight stays free
+        // for the replacement.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let created = block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        block_on(replace_checkout_operation(&ctx, created.op(), None)).expect("supersede");
+        let open = block_on(h.store.open_checkout_operation("u1")).expect("open read");
+        assert_eq!(open, None, "supersede releases the flight");
+        // Late create under the retired id: Stripe replays the create (same
+        // key), but the mark misses the retired row.
+        let err = block_on(create_session_under(
+            &ctx,
+            "op_test_1",
+            "cus_test_1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Failed));
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id, None,
+            "late mark never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_converged_loser_with_different_price_replaces() {
+        // A racer wins the single flight between this attempt's open-flight
+        // read and its insert, naming a different price (the TOCTOU behind
+        // the converged-session price check). The loser must not inherit
+        // the winner's session: expire + supersede, then mint under its own
+        // fresh operation — reusing its already-minted customer instead of
+        // minting a second orphan.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_loser_1".to_string());
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_race_1".to_string(),
+            test_session(
+                "cs_race_1",
+                "open",
+                "unpaid",
+                Some("cus_winner_1"),
+                None,
+                Some("op_race_winner"),
+            ),
+        );
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: Some("cs_race_1".to_string()),
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser replaces");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_race_1".to_string()].as_slice(),
+            "the winner's open session is expired before replacement"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(winner.session_id.as_deref(), Some("cs_race_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        // One customer create: the retry reuses the loser's orphan once the
+        // winner's flight is retired and no binding exists yet.
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            [(Some("u1".to_string()), None)].as_slice()
+        );
+        assert_eq!(
+            h.stripe.session_customers.borrow().as_slice(),
+            ["cus_loser_1".to_string()].as_slice()
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_expired_session_repair_mints_under_fresh_key() {
+        // The recorded session is confirmed dead (expired without payment):
+        // no expiry call is needed — Stripe already converged the state —
+        // the dead operation is superseded and the repair mints under a
+        // fresh operation id, so the repair can never replay the dead
+        // session inside Stripe's retention window. Same price: the replace
+        // is about the dead session, not a plan switch.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_old_1"),
+        ))
+        .expect("mark submitted");
+        let mut dead = test_session(
+            "cs_old_1",
+            "expired",
+            "unpaid",
+            Some("cus_test_1"),
+            None,
+            Some("op_test_1"),
+        );
+        dead.url = None;
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .insert("cs_old_1".to_string(), dead);
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("expired repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a confirmed-dead session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.session_id.as_deref(), Some("cs_old_1"));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_missing_session_repair_mints_under_fresh_key() {
+        // The recorded session is gone from Stripe (404, past retention or
+        // never minted): the same deliberate replacement as a
+        // confirmed-expired session — supersede, then mint fresh.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_gone_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe
+            .missing_sessions
+            .borrow_mut()
+            .insert("cs_gone_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("missing-session repair mints");
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert!(
+            h.stripe.expired.borrow().is_empty(),
+            "a missing session needs no expiry call"
+        );
+        let old = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_test_1",
+            "the repair mints under a fresh operation id"
+        );
+    }
+
+    #[test]
+    fn billing_session_retrieve_outage_fails_without_replacement() {
+        // An unconfirmed retrieve (any non-404 Stripe failure) fails
+        // retryable: no replacement mints beside a session whose state is
+        // unknown, and the flight stays open for the retry.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe
+            .fail
+            .borrow_mut()
+            .insert("retrieve_checkout_session".to_string());
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement beside unknown state"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the retry");
+        assert_eq!(open.id, "op_test_1");
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_unpaid_session_retains_flight_without_minting() {
+        // A `complete`/`unpaid` session is still processing asynchronously
+        // (the create request does not restrict payment methods): a retry
+        // must not supersede it and mint a second subscription checkout
+        // while the first can still succeed. The flight stays open for the
+        // real completion and the attempt fails retryable — no supersede,
+        // no mint.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_unpaid_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_unpaid_1".to_string(),
+            test_session(
+                "cs_unpaid_1",
+                "complete",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second subscription checkout beside a completable session"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the real completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_unpaid_1"));
+        assert!(live_for(&h, "u1").is_none());
+    }
+
+    #[test]
+    fn billing_complete_no_payment_required_session_retains_flight_without_minting() {
+        // A `complete`/`no_payment_required` session already created its
+        // subscription: same deliberate-retention as `unpaid` — the flight
+        // stays open (the webhook reconciles the subscription out of the
+        // slot) and no second checkout mints.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_npr_1"),
+        ))
+        .expect("mark submitted");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_npr_1".to_string(),
+            test_session(
+                "cs_npr_1",
+                "complete",
+                "no_payment_required",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Failed)
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no second checkout beside the created subscription"
+        );
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.stripe.session_create_ops.borrow().is_empty());
+        let flight = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight stays open for the webhook completion");
+        assert_eq!(flight.id, "op_test_1");
+        assert_eq!(flight.session_id.as_deref(), Some("cs_npr_1"));
+    }
+
+    #[test]
+    fn billing_orphan_with_live_session_and_price_mismatch_expires_before_replacing() {
+        // A missing `session_id` does not mean Stripe has no session: the
+        // create mark is best-effort, and until the replay the same-key
+        // path was the only recovery. Here the orphan's PLUS session is
+        // still live in Stripe while the retry names PRO: the old flight
+        // must recover under its original key and price, expire the
+        // payable session, and only then supersede and mint fresh — never
+        // leave the first attempt's session payable beside the PRO one.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The mark was lost, but the session is live under the old key.
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_live_1".to_string(),
+            test_session(
+                "cs_live_1",
+                "open",
+                "unpaid",
+                Some("cus_test_1"),
+                None,
+                Some("op_old_1"),
+            ),
+        );
+        h.stripe
+            .sessions_by_op
+            .borrow_mut()
+            .insert("op_old_1".to_string(), "cs_live_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        // The replay recovered (not re-minted): exactly one mint, the
+        // replacement under its fresh operation id.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 1);
+        assert_ne!(
+            minted[0], "op_old_1",
+            "the replacement mints under a fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_1"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_live_1".to_string()].as_slice(),
+            "the recovered payable session expires before its replacement mints"
+        );
+        let dead = &h.stripe.sessions.borrow()["cs_live_1"];
+        assert_eq!(dead.status.as_deref(), Some("expired"));
+        let old = block_on(h.store.checkout_operation_by_id("op_old_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(old.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(old.price_id.as_deref(), Some(PRICE_PLUS));
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[0]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_1"));
+    }
+
+    #[test]
+    fn billing_orphan_mismatch_with_no_session_stillborn_expires_and_replaces() {
+        // The mismatched orphan never created anything: the same-key
+        // replay first-creates exactly one session under the old key, which
+        // is immediately expired (never payable) before the supersede and
+        // the fresh mint. No payable session lingers on either key.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        block_on(h.store.create_checkout_operation(
+            "op_old_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PRO,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched orphan resolves then replaces");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(
+            minted.as_slice(),
+            ["op_old_1".to_string(), minted[1].clone()].as_slice(),
+            "the replay recovers under the old key, the replacement under a fresh one"
+        );
+        assert_ne!(minted[1], "op_old_1");
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the stillborn session expires before the replacement mints"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_converged_sessionless_winner_with_price_mismatch_resolves_before_replacing() {
+        // A single-flight winner that has not recorded a session yet
+        // (still creating, or its mark was lost) while the loser names a
+        // different price: the loser must recover under the WINNER's key
+        // and price before retiring it — superseding blind would orphan a
+        // payable session the winner is about to mark.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        *h.store.plant_winner_on_next_create.borrow_mut() =
+            Some(crate::billing_reconcile::StoredCheckoutOp {
+                id: "op_race_winner".to_string(),
+                user_id: "u1".to_string(),
+                state: "pending".to_string(),
+                price_id: Some(PRICE_PRO.to_string()),
+                session_id: None,
+                subscription_id: None,
+            });
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("mismatched loser resolves the winner then replaces");
+        // One replay under the winner's key (expired), one fresh mint under
+        // the loser's own operation.
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        let minted = h.stripe.session_create_ops.borrow();
+        assert_eq!(minted.len(), 2);
+        assert_eq!(
+            minted[0], "op_race_winner",
+            "the recovery replays under the winner's key, never a fresh one"
+        );
+        assert_ne!(
+            minted[1], "op_race_winner",
+            "the loser mints under its own fresh operation id"
+        );
+        assert!(url.ends_with("cs_test_2"), "{url}");
+        assert_eq!(
+            h.stripe.expired.borrow().as_slice(),
+            ["cs_test_1".to_string()].as_slice(),
+            "the winner's recovered session expires before the replacement mints"
+        );
+        assert!(
+            h.stripe.customers_created.borrow().is_empty(),
+            "no orphan customer: the account was already bound"
+        );
+        let winner = block_on(h.store.checkout_operation_by_id("op_race_winner"))
+            .expect("op lookup")
+            .expect("winner stored");
+        assert_eq!(winner.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(winner.price_id.as_deref(), Some(PRICE_PRO));
+        assert_eq!(
+            winner.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the recovery repairs the winner's mark before retiring it"
+        );
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("replacement flight open");
+        assert_eq!(open.id, minted[1]);
+        assert_eq!(open.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_eq!(open.session_id.as_deref(), Some("cs_test_2"));
+    }
+
+    #[test]
+    fn billing_earlier_plan_invoices_keep_history_rows() {
+        // The subscription now sits on PRO after a plan change; the fold
+        // still writes one history row per confirmed paid invoice — the
+        // earlier PLUS invoice keeps its own plan label — while coverage
+        // follows the current item's plan. Redelivery stays idempotent on
+        // the invoice id.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PRO),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_plus_1".to_string(),
+            test_invoice(
+                "in_plus_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_pro_1".to_string(),
+            test_invoice(
+                "in_pro_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 2 * BILLING_PERIOD,
+                BILLING_NOW + BILLING_PERIOD + 60,
+            ),
+        );
+        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("reconciles");
+        assert!(outcome.fail_closed.is_none());
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.plan_id, PLAN_PRO);
+        assert_eq!(
+            live.paid_through_unix,
+            Some(BILLING_NOW + 2 * BILLING_PERIOD)
+        );
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history["in_plus_1"].plan_id, PLAN_PLUS);
+        assert_eq!(history["in_pro_1"].plan_id, PLAN_PRO);
+        assert_eq!(
+            history["in_plus_1"].period_end_unix,
+            BILLING_NOW + BILLING_PERIOD
+        );
+        assert_eq!(
+            history["in_pro_1"].period_end_unix,
+            BILLING_NOW + 2 * BILLING_PERIOD
+        );
+        drop(history);
+        // Redelivery of the same remote state: same two rows, no dupes.
+        block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1")).expect("reconciles");
+        assert_eq!(
+            h.store.invoice_history.borrow().len(),
+            2,
+            "history stays idempotent on the invoice id"
+        );
+    }
+
+    #[test]
+    fn billing_webhook_before_response_keeps_one_subscription() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // The purchase attempt mints the session; the completion webhook
+        // lands before the caller retries (lost response).
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ))
+        .expect("attempt");
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let created_id = url
+            .rsplit('/')
+            .next()
+            .expect("session url ends with the id");
+        let open = block_on(h.store.open_checkout_operation("u1"))
+            .expect("open lookup")
+            .expect("flight open");
+        // The user completes `created_id`; the webhook resolves it.
+        h.stripe.sessions.borrow_mut().insert(
+            created_id.to_string(),
+            test_session(
+                created_id,
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some(&open.id),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let body = checkout_completed_body("evt_test_1", created_id, false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        // The retried purchase refuses instead of minting a second
+        // subscription; the stored state is the webhook's single advance.
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_ensure_passes_through_test_clock_and_refuses_unmapped() {
+        // Fresh account with a staging test clock: the customer create
+        // carries the clock, and the session URL is returned.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.stripe.next_customer.borrow_mut() = Some("cus_clock_1".to_string());
+        let ctx = h.ctx();
+        let url = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            Some("test_clock_1"),
+        ))
+        .expect("clocked attempt");
+        assert!(url.starts_with("https://checkout.stripe.com/pay/"));
+        assert_eq!(
+            h.store.billing_customers.borrow().get("u1"),
+            Some(&"cus_clock_1".to_string())
+        );
+        // The clock rode the customer create, never anywhere else.
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            &[(Some("u1".to_string()), Some("test_clock_1".to_string()))]
+        );
+        // Unmapped price: alert, no Stripe call, no customer minted.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            "price_unknown",
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(audits_with(&h, BILLING_PURCHASE_UNAVAILABLE_ACTION), 1);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        assert!(h.store.billing_customers.borrow().get("u1").is_none());
+        // Unselectable (non-purchase) mapping: same refusal.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_bindings
+            .borrow_mut()
+            .push(crate::billing_reconcile::PriceBinding {
+                price_id: "price_legacy".to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                selectable: false,
+                livemode: false,
+            });
+        let ctx = h.ctx();
+        let err = block_on(ensure_checkout_session(
+            &ctx,
+            "u1",
+            "price_legacy",
+            "https://example.com/ok",
+            "https://example.com/cancel",
+            None,
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_invoice_line_pagination_reads_every_page() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        // First page carries no lines but `has_more`; the remainder
+        // arrives through the lines listing, and coverage still advances.
+        let mut first = test_invoice(
+            "in_test_1",
+            "cus_test_1",
+            "sub_test_1",
+            PRICE_PLUS,
+            BILLING_NOW,
+            BILLING_NOW + BILLING_PERIOD,
+            BILLING_NOW + 60,
+        );
+        first.lines = Some(crate::stripe::InvoiceLines {
+            data: Vec::new(),
+            has_more: true,
+        });
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert("in_test_1".to_string(), first);
+        h.stripe.line_pages.borrow_mut().insert(
+            "in_test_1".to_string(),
+            vec![crate::stripe::InvoiceLine {
+                id: "in_test_1_line_1".to_string(),
+                amount: 1_000,
+                currency: Some("usd".to_string()),
+                price: Some(PRICE_PLUS.to_string()),
+                period: Some(crate::stripe::InvoiceLinePeriod {
+                    start: Some(BILLING_NOW),
+                    end: Some(BILLING_NOW + BILLING_PERIOD),
+                }),
+            }],
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("live row stored");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }
 
     fn cookie_of(resp: &Response) -> String {
@@ -5616,6 +12934,838 @@ mod tests {
         cookie_of(&resp)
     }
 
+    const PLAY_SECRET: &[u8] = b"test-play-grant-secret-32-bytes-long!";
+
+    /// Harness with the play-grant secret provisioned (the default
+    /// `cfg()` leaves it unset — the fail-closed case below).
+    fn play_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(PLAY_SECRET.to_vec());
+        h
+    }
+
+    /// Seed a live entitled subscription for `user_id` on `plan_id`
+    /// plus its `plans`-row caps (hours converted like production).
+    fn seed_entitled(h: &Harness, user_id: &str, plan_id: &str, hours: u64) {
+        h.store.playback_subscriptions.borrow_mut().insert(
+            user_id.to_string(),
+            crate::playback::SubscriptionRow {
+                plan_id: plan_id.to_string(),
+                status: "active".to_string(),
+                cancel_at_period_end: false,
+                paid_through_at_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+                grace_until_unix: None,
+                current_period_end_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+            },
+        );
+        h.store.plan_caps_rows.borrow_mut().insert(
+            plan_id.to_string(),
+            crate::plan_limits::caps_from_plan_row(hours, 1),
+        );
+    }
+
+    fn play_call(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn play_user(h: &Harness) -> String {
+        seed_user(h, "user-plays-1", "plays@example.com");
+        magic_login(h, "plays@example.com")
+    }
+
+    #[test]
+    fn play_issue_mints_a_grant_for_an_entitled_user() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let play_id = body["play_id"].as_str().expect("server-minted play id");
+        assert!(!play_id.is_empty());
+        // The handler bound exactly (user, track, play, epoch 1) at NOW:
+        // re-minting through the vector-pinned minter reproduces it.
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            play_id,
+            1,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .expect("minter reproduces the handler grant");
+        assert_eq!(body["grant"], expected.token);
+        assert_eq!(body["lease_epoch"], 1);
+        assert_eq!(body["expires_at"], NOW + 900);
+        assert_eq!(body["lease_expires_at"], NOW + 45);
+        assert_eq!(body["heartbeat_interval_secs"], 15);
+        let lease = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(lease.session_id, "tab-a");
+        assert_eq!(lease.track_id, "track-9");
+        assert_eq!(lease.play_id, play_id);
+    }
+
+    #[test]
+    fn play_issue_refuses_unsubscribed_with_reasons_and_no_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "subscription_required");
+        assert_eq!(body["reason"], "never_subscribed");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["upgrade_url"], "/pricing");
+        // Once-paid history flips only the reason, never the refusal.
+        h.store
+            .ever_paid_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["reason"], "lapsed");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a refused start must not burn a lease epoch"
+        );
+    }
+
+    #[test]
+    fn play_issue_cap_refuses_new_starts_but_continuation_finishes() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        let started = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: serde_json::Value = serde_json::from_str(&started.body).unwrap();
+        let play_id = started["play_id"].as_str().unwrap().to_string();
+        // The play crosses the cap mid-track (3600 s = the 1 h cap).
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("user-plays-1".to_string(), period), 3600);
+        // Continuation (same session + play + track) still mints, and
+        // reuses the same play at the same epoch.
+        let resumed = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "play_id": play_id,
+            }),
+        );
+        assert_eq!(resumed.status, 200, "{}", resumed.body);
+        let resumed: serde_json::Value = serde_json::from_str(&resumed.body).unwrap();
+        assert_eq!(resumed["play_id"], play_id);
+        assert_eq!(resumed["lease_epoch"], 1);
+        // The NEXT new start (queue advance / repeat-one shape) is the
+        // one refused, with the plan-limit headers.
+        let next = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(next.status, 402, "{}", next.body);
+        let body: serde_json::Value = serde_json::from_str(&next.body).unwrap();
+        assert_eq!(body["code"], "plan_limit_exceeded");
+        assert!(next.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "stream_hours_month=1".to_string()
+        )));
+        assert!(next
+            .extra_headers
+            .contains(&("x-plan-reset".to_string(), "next-utc-month".to_string())));
+    }
+
+    #[test]
+    fn play_issue_lease_429_same_session_replace_and_takeover() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        let first: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        let first_play = first["play_id"].as_str().unwrap().to_string();
+        // A second client session is refused 429 with the live TTL, and
+        // `retry-after` appears exactly once (the rendered field), never
+        // duplicated inside extra_headers.
+        let held = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-b"}),
+        );
+        assert_eq!(held.status, 429, "{}", held.body);
+        assert_eq!(held.retry_after, Some(45));
+        assert!(
+            !held
+                .extra_headers
+                .iter()
+                .any(|(name, _)| name == "retry-after"),
+            "retry-after must not be duplicated: {:?}",
+            held.extra_headers
+        );
+        assert!(held.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "concurrent_streams=1".to_string()
+        )));
+        let body: serde_json::Value = serde_json::from_str(&held.body).unwrap();
+        assert_eq!(body["code"], "rate_limited");
+        // The holding session itself is never self-refused: a new track
+        // replaces the play and bumps the epoch.
+        let replaced = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(replaced.status, 200, "{}", replaced.body);
+        let replaced: serde_json::Value = serde_json::from_str(&replaced.body).unwrap();
+        assert_eq!(replaced["lease_epoch"], 2);
+        assert_ne!(replaced["play_id"], first_play);
+        // Explicit takeover: epoch bumps again; the displaced holder's
+        // heartbeat now reports superseded (it self-pauses), the new
+        // holder's reports active and extends.
+        let taken = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-11",
+                "session_id": "tab-b",
+                "takeover": true,
+            }),
+        );
+        assert_eq!(taken.status, 200, "{}", taken.body);
+        let taken: serde_json::Value = serde_json::from_str(&taken.body).unwrap();
+        assert_eq!(taken["lease_epoch"], 3);
+        let beat = |session: &str, play: &serde_json::Value, epoch: u64| {
+            h.call_full(
+                "POST",
+                "/v1/plays/heartbeat",
+                Some(
+                    serde_json::json!({
+                        "session_id": session,
+                        "play_id": play,
+                        "lease_epoch": epoch,
+                    })
+                    .to_string(),
+                ),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        let displaced = beat("tab-a", &replaced["play_id"], 2);
+        assert_eq!(displaced.status, 200, "{}", displaced.body);
+        let displaced: serde_json::Value = serde_json::from_str(&displaced.body).unwrap();
+        assert_eq!(displaced["lease"], "superseded");
+        let holder = beat("tab-b", &taken["play_id"], 3);
+        assert_eq!(holder.status, 200, "{}", holder.body);
+        let holder: serde_json::Value = serde_json::from_str(&holder.body).unwrap();
+        assert_eq!(holder["lease"], "active");
+        assert_eq!(holder["lease_expires_at"], NOW + 45);
+    }
+
+    #[test]
+    fn play_heartbeat_without_a_lease_reports_expired() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-none",
+                    "lease_epoch": 1,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["lease"], "expired");
+    }
+
+    #[test]
+    fn play_routes_answer_account_deleting_for_a_deleting_account() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        // Issuance: the typed 409, no lease written, no grant minted.
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a deleting account must not acquire a lease"
+        );
+        // Heartbeat: same 409, even for a lease row seeded directly —
+        // the touch must never extend a deleting account's lease.
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a deleting account's lease must not extend"
+        );
+        // The FakeStore mirrors the statement fences directly, so a
+        // handler regression that skipped the pre-check still could
+        // not write (acquire reads Held, touch reads false).
+        let acquired = block_on(h.store.acquire_playback_lease(
+            "user-plays-1",
+            "tab-b",
+            "track-9",
+            "play-x",
+            NOW,
+            NOW + 45,
+            true,
+        ))
+        .expect("store call succeeds");
+        assert!(matches!(
+            acquired,
+            crate::playback::LeaseAcquire::Held { .. }
+        ));
+        let touched = block_on(h.store.touch_playback_lease(
+            "user-plays-1",
+            "tab-a",
+            "play-seeded",
+            7,
+            NOW,
+            NOW + 45,
+        ))
+        .expect("store call succeeds");
+        assert!(!touched);
+    }
+
+    #[test]
+    fn play_issue_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        // The marker lands after the up-front probe, inside the lease
+        // write: the fenced acquire reads Held, and the post-write
+        // re-read — not the concurrency 429 — classifies the refusal.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "the fenced acquire writes nothing"
+        );
+    }
+
+    #[test]
+    fn play_heartbeat_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        // Same race on the touch: zero rows after the fence closes
+        // mid-request answers the typed 409, not `superseded`.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "the fenced touch must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_issue_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all.
+        let h = harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("v2."), "no token on a refused mint");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "an unmintable grant must not acquire the lease"
+        );
+        // A too-short secret is the same fail-closed 500.
+        let mut short = play_harness();
+        short.config = cfg().with_play_grant_secret(b"short".to_vec());
+        let cookie = play_user(&short);
+        seed_entitled(&short, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &short,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+    }
+
+    #[test]
+    fn play_heartbeat_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all. The heartbeat is
+        // gated like issuance, so a misconfigured deployment cannot
+        // keep extending a lease no grant could be minted against.
+        let h = harness();
+        let cookie = play_user(&h);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a refused heartbeat must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_routes_require_a_session_and_valid_identities() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let body = serde_json::json!({"track_id": "track-9", "session_id": "tab-a"});
+        // No cookie: generic 401 on both routes.
+        let anon = h.call("POST", "/v1/plays", body.clone());
+        assert_eq!(anon.status, 401);
+        let anon_beat = h.call(
+            "POST",
+            "/v1/plays/heartbeat",
+            serde_json::json!({"session_id": "tab-a", "play_id": "p", "lease_epoch": 1}),
+        );
+        assert_eq!(anon_beat.status, 401);
+        // Wrong origin: the mutation CSRF pin refuses before the handler.
+        let cross = h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.clone()),
+            Some("https://evil.example"),
+        );
+        assert_eq!(cross.status, 401);
+        // An unmeterable track id is a validation refusal and writes nothing.
+        let bad_track = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track.v1", "session_id": "tab-a"}),
+        );
+        assert_eq!(bad_track.status, 422, "{}", bad_track.body);
+        // Unknown fields and an empty client session id are refused too.
+        let unknown = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "epoch": 99,
+            }),
+        );
+        assert_eq!(unknown.status, 422);
+        let no_session = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": ""}),
+        );
+        assert_eq!(no_session.status, 422);
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_issue_presented_invalid_bearer_still_plain_404() {
+        // The bearer gate runs before dispatch on this path: a junk key
+        // (even alongside a valid session cookie) gets the plain 404 —
+        // the landed session route must not resurrect route disclosure
+        // or cookie rescue for presented credentials.
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/plays".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some(
+                "Bearer ntk_syntheticUnknownKey0000000000000000000000000".to_string(),
+            ),
+            stripe_signature: None,
+            body: serde_json::json!({"track_id": "track-9", "session_id": "tab-a"})
+                .to_string()
+                .into_bytes(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_paths_preflight_as_served_routes() {
+        let h = play_harness();
+        for path in ["/v1/plays", "/v1/plays/heartbeat"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "OPTIONS {path}");
+            assert!(resp.body.is_empty());
+        }
+        assert!(is_known_path("/v1/plays"));
+        assert!(is_known_path("/v1/plays/heartbeat"));
+    }
+
+    const SINK_SECRET: &[u8] = b"test-meter-sink-secret-32-bytes-long!!";
+    const SINK_USER: &str = "u-meter";
+    const SINK_TRACK: &str = "track-meter-1";
+
+    /// Harness with the meter-sink secret provisioned and the sink
+    /// user seeded (the writer fence refuses unknown users).
+    fn sink_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_meter_sink_secret(SINK_SECRET.to_vec());
+        seed_user(&h, SINK_USER, "meter@example.com");
+        h
+    }
+
+    fn sink_window(play_id: &str, union_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "user_id": SINK_USER,
+            "track_id": SINK_TRACK,
+            "play_id": play_id,
+            "union_bytes": union_bytes,
+            "file_bytes": 7_200_000u64,
+            "started_at": NOW,
+        })
+    }
+
+    /// POST a raw sink body with an optional precomputed header; `None`
+    /// signs with the harness secret at NOW (the happy path).
+    fn call_sink(h: &Harness, body: &str, authorization: Option<String>) -> Response {
+        let authorization = authorization.or_else(|| {
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+        });
+        let req = Request {
+            method: "POST".to_string(),
+            path: crate::meter_sink::SINK_PATH.to_string(),
+            cookie: None,
+            origin: None,
+            authorization,
+            stripe_signature: None,
+            body: body.as_bytes().to_vec(),
+        };
+        block_on(handle(&h.ctx(), &req))
+    }
+
+    fn ack_lists(resp: &Response) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let list = |key: &str| {
+            body[key]
+                .as_array()
+                .expect("ack list")
+                .iter()
+                .map(|v| v.as_str().expect("play id").to_string())
+                .collect()
+        };
+        (list("accepted"), list("fenced"), list("rejected"))
+    }
+
+    #[test]
+    fn meter_sink_writes_windows_and_acks_dispositions() {
+        let h = sink_harness();
+        // 180 s track; a half-file union derives 90 s proportionally.
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 90);
+        assert_eq!(window.bytes_served, 3_600_000);
+        assert_eq!(window.file_bytes, Some(7_200_000));
+        assert_eq!(window.duration_ms, Some(180_000));
+        assert!(!window.rate_fallback);
+        drop(stored);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_duplicate_and_stale_flushes_add_zero() {
+        let h = sink_harness();
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        assert_eq!(call_sink(&h, &body, None).status, 200);
+        // Exact redelivery: still accepted (converged), total unmoved.
+        let resp = call_sink(&h, &body, None);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        // A stale (smaller-union) flush likewise converges to zero.
+        let stale = serde_json::json!({"windows": [sink_window("play-1", 1_800_000)]}).to_string();
+        assert_eq!(call_sink(&h, &stale, None).status, 200);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_refuses_unsigned_and_forged_requests() {
+        let h = sink_harness();
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        // Empty Authorization header (the unit tests pin absent too).
+        let resp = call_sink(&h, &body, Some(String::new()));
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        // Signed with the wrong key.
+        let forged = crate::meter_sink::authorization_header(
+            Some(b"forged-meter-sink-secret-32-bytes!!"),
+            NOW,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(forged)).status, 401);
+        // Correctly signed but stale (replay into another window).
+        let stale = crate::meter_sink::authorization_header(
+            Some(SINK_SECRET),
+            NOW - crate::meter_sink::MAX_TIMESTAMP_SKEW_SECS - 1,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(stale)).status, 401);
+        // Correctly signed header, tampered body.
+        let good = crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+            .expect("signs");
+        let tampered = body.replace("3600000", "7200000");
+        assert_eq!(call_sink(&h, &tampered, Some(good)).status, 401);
+        assert!(
+            h.store.play_windows.borrow().is_empty(),
+            "refused requests write nothing"
+        );
+    }
+
+    #[test]
+    fn meter_sink_fails_closed_without_a_provisioned_secret() {
+        let h = harness(); // default cfg(): no sink secret.
+        seed_user(&h, SINK_USER, "meter@example.com");
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let header =
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+                .expect("signs");
+        let resp = call_sink(&h, &body, Some(header));
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_signed_but_malformed_batch_is_422() {
+        let h = sink_harness();
+        let resp = call_sink(&h, "not json", None);
+        assert_eq!(resp.status, 422, "{}", resp.body);
+        // A window shape the wire forbids (unknown field) refuses whole.
+        let extra = r#"{"windows":[{"user_id":"u-meter","track_id":"track-meter-1","play_id":"play-1","union_bytes":1,"file_bytes":null,"started_at":7,"seconds":9}]}"#;
+        assert_eq!(call_sink(&h, extra, None).status, 422);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_fenced_and_rejected_dispositions() {
+        let h = sink_harness();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert(SINK_USER.to_string());
+        let mut ghost = sink_window("play-ghost", 3_600_000);
+        ghost["user_id"] = serde_json::json!("u-ghost");
+        let body = serde_json::json!({"windows": [
+            sink_window("play-fenced", 3_600_000),
+            sink_window("play-zero", 0),
+            // Identity characters outside [A-Za-z0-9_-] never prepare.
+            sink_window("play bad", 3_600_000),
+            ghost,
+        ]})
+        .to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert!(accepted.is_empty());
+        // Deleting account and unknown user both fence (terminal).
+        assert_eq!(fenced, vec!["play-fenced", "play-ghost"]);
+        // Zero union and bad identity can never prepare (terminal).
+        assert_eq!(rejected, vec!["play-zero", "play bad"]);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_unknown_track_meters_on_the_fallback_rung() {
+        let h = sink_harness();
+        // No meta seeded and no file size on the wire: nominal-rate
+        // fallback derives ceil(96_000 / 48_000) = 2 s, snapshots NULL.
+        let mut window = sink_window("play-fallback", 96_000);
+        window["file_bytes"] = serde_json::Value::Null;
+        let body = serde_json::json!({"windows": [window]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 2);
+        assert!(window.rate_fallback);
+        assert_eq!(window.file_bytes, None);
+        assert_eq!(window.duration_ms, None);
+    }
+
+    #[test]
+    fn meter_sink_path_has_no_browser_surface() {
+        let h = sink_harness();
+        let resp = h.call_full(
+            "OPTIONS",
+            crate::meter_sink::SINK_PATH,
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 404, "no preflight maps the internal route");
+        assert!(!is_known_path(crate::meter_sink::SINK_PATH));
+        // No browser credential authenticates here either: without the
+        // sink HMAC the handler answers 401 and writes nothing.
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]});
+        let resp = h.call("POST", crate::meter_sink::SINK_PATH, body);
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
     const QA_TOKEN: &str = "test-qa-bearer-token";
 
     fn qa_harness() -> Harness {
@@ -5632,6 +13782,7 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization: bearer.map(|token| format!("Bearer {token}")),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5650,6 +13801,7 @@ mod tests {
                 cookie: None,
                 origin: Some(ORIGIN.to_string()),
                 authorization: authorization.map(str::to_string),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5757,6 +13909,7 @@ mod tests {
             cookie: None,
             origin: None,
             authorization: Some(format!("Token {QA_TOKEN}")),
+            stripe_signature: None,
             body: serde_json::json!({"email": "a@example.test"})
                 .to_string()
                 .into_bytes(),
@@ -5901,6 +14054,7 @@ mod tests {
                 cookie: None,
                 origin: None,
                 authorization: bearer.map(|token| format!("Bearer {token}")),
+                stripe_signature: None,
                 body: body.to_string().into_bytes(),
             };
             block_on(handle(&self.ctx(), &req))
@@ -5988,6 +14142,7 @@ mod tests {
                 cookie: Some(format!("{}={session}", session::COOKIE_NAME)),
                 origin: None,
                 authorization: None,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             let (claims, _) = block_on(h.ctx().authenticate(&req, false)).expect("authenticated");
@@ -6028,8 +14183,8 @@ mod tests {
     fn qa_mint_seam_mints_overlimit_with_seeded_ingest_usage() {
         let h = qa_harness();
         // The capped account mints as 201 like a free one, but today's
-        // ingest aggregate is pre-seeded to the free cap, so the intake
-        // guard refuses it without touching a real path.
+        // ingest count is pre-seeded to the fixed daily limit, so the
+        // intake guard refuses it without touching a real path.
         let resp = h.call_mint_seam(
             serde_json::json!({"email": "capped@example.test", "plan": "overlimit"}),
             Some(QA_TOKEN),
@@ -6043,10 +14198,7 @@ mod tests {
             .unwrap()
             .expect("minted user exists");
         let usage = block_on(h.store.ingest_jobs_today(&user.id, NOW)).unwrap();
-        assert_eq!(
-            usage,
-            u64::from(crate::plan_limits::PlanId::Free.caps().ingest_jobs_day)
-        );
+        assert_eq!(usage, u64::from(crate::plan_limits::DAILY_INGEST_LIMIT));
     }
 
     /// Mint through the seam and return the raw per-account session token.
@@ -6117,6 +14269,182 @@ mod tests {
             Some(format!("Bearer ntk_{}", "0".repeat(43))),
         );
         assert_eq!(resp.status, 401, "{}", resp.body);
+    }
+
+    // --- Billing/usage display reads (TWO-1675) ------------------------------
+    //
+    // NOW is 2023-11-14T22:13:20Z, so the usage period is `2023-11` and the
+    // reset instant is 2023-12-01T00:00:00Z.
+
+    fn seed_plans(h: &Harness) {
+        *h.store.plans.borrow_mut() = vec![
+            PlanRow {
+                id: "free".to_string(),
+                price_cents: 0,
+                stream_hours_month: 0,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "plus".to_string(),
+                price_cents: 800,
+                stream_hours_month: 100,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "pro".to_string(),
+                price_cents: 1500,
+                stream_hours_month: 300,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "max".to_string(),
+                price_cents: 2500,
+                stream_hours_month: 750,
+                max_concurrent_streams: 1,
+            },
+        ];
+    }
+
+    fn billing_get(h: &Harness, path: &str, cookie: Option<String>) -> Response {
+        h.call_full("GET", path, None, cookie, Some(ORIGIN))
+    }
+
+    #[test]
+    fn billing_reads_require_a_session() {
+        let h = harness();
+        seed_plans(&h);
+        for path in ["/v1/plans", "/v1/me/usage", "/v1/me/subscription"] {
+            // No cookie: the generic session 401, never plan/account data.
+            let resp = billing_get(&h, path, None);
+            assert_eq!(resp.status, 401, "{path}: {}", resp.body);
+            assert!(!resp.body.contains("plus"), "{path} leaked plan data");
+            // A native-REST bearer is not a session (scope map: these reads
+            // are SessionOnly): still the generic 401, never rescued.
+            let resp = h.call_bearer("GET", path, Some(format!("Bearer ntk_{}", "0".repeat(43))));
+            assert_eq!(resp.status, 401, "{path} bearer: {}", resp.body);
+        }
+    }
+
+    #[test]
+    fn plans_list_renders_rows_with_free_non_selectable() {
+        let h = harness();
+        seed_plans(&h);
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        let resp = billing_get(&h, "/v1/plans", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"plans": [
+                {"id": "free", "priceCents": 0, "streamHoursMonth": 0, "maxConcurrentStreams": 1, "selectable": false},
+                {"id": "plus", "priceCents": 800, "streamHoursMonth": 100, "maxConcurrentStreams": 1, "selectable": true},
+                {"id": "pro", "priceCents": 1500, "streamHoursMonth": 300, "maxConcurrentStreams": 1, "selectable": true},
+                {"id": "max", "priceCents": 2500, "streamHoursMonth": 750, "maxConcurrentStreams": 1, "selectable": true},
+            ]})
+        );
+    }
+
+    #[test]
+    fn usage_get_reports_the_ledger_fold_and_reset_instant() {
+        let h = harness();
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        // No metered plays yet: zeros, never an error or a missing field.
+        let resp = billing_get(&h, "/v1/me/usage", Some(cookie.clone()));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"period":"2023-11","resetsAt":"2023-12-01T00:00:00Z","streamSecondsMonth":0}"#
+        );
+        // The folded seconds for *this* period only: last month's plays do
+        // not leak into the current period's figure.
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("u-1".to_string(), "2023-11".to_string()), 90 * 3600);
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("u-1".to_string(), "2023-10".to_string()), 999 * 3600);
+        let resp = billing_get(&h, "/v1/me/usage", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["streamSecondsMonth"], 90 * 3600);
+        assert_eq!(body["resetsAt"], "2023-12-01T00:00:00Z");
+    }
+
+    #[test]
+    fn subscription_get_names_never_active_and_lapsed_states() {
+        let h = harness();
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        // Never subscribed: 200 with the explicit state, nulls elsewhere —
+        // a missing row is a state, not a 404.
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "state": "no_subscription",
+                "planId": null,
+                "status": null,
+                "currentPeriodEnd": null,
+                "graceUntil": null,
+                "cancelAtPeriodEnd": false,
+            })
+        );
+        // Terminal-only history (canceled released the live slot): lapsed.
+        h.store
+            .ever_subscribed
+            .borrow_mut()
+            .insert("u-1".to_string());
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["state"], "lapsed");
+        assert_eq!(body["planId"], serde_json::Value::Null);
+        // Live paid coverage: active, stored status verbatim, ISO dates,
+        // and no provider ids anywhere in the body.
+        h.store.subscriptions.borrow_mut().insert(
+            "u-1".to_string(),
+            SubscriptionRow {
+                plan_id: "pro".to_string(),
+                status: "active".to_string(),
+                cancel_at_period_end: true,
+                paid_through_at_unix: Some(NOW as i64 + 86_400),
+                grace_until_unix: None,
+                current_period_end_unix: Some(NOW as i64 + 86_400),
+            },
+        );
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "state": "active",
+                "planId": "pro",
+                "status": "active",
+                "currentPeriodEnd": "2023-11-15T22:13:20Z",
+                "graceUntil": null,
+                "cancelAtPeriodEnd": true,
+            })
+        );
+        assert!(!resp.body.contains("stripe"));
+    }
+
+    #[test]
+    fn billing_reads_fail_closed_on_store_error() {
+        let h = harness();
+        seed_plans(&h);
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        *h.store.fail_billing_reads.borrow_mut() = true;
+        for path in ["/v1/plans", "/v1/me/usage", "/v1/me/subscription"] {
+            let resp = billing_get(&h, path, Some(cookie.clone()));
+            assert_eq!(resp.status, 500, "{path}: {}", resp.body);
+        }
     }
 
     #[test]
@@ -6582,6 +14910,7 @@ mod tests {
             cookie: Some(format!("nameless; {}=token-value", session::COOKIE_NAME)),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         assert_eq!(session_cookie_value(&req).as_deref(), Some("token-value"));
@@ -6721,6 +15050,7 @@ mod tests {
             cookie: Some(cookie.into()),
             origin: origin.map(str::to_string),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"retry_key": key})
                 .to_string()
                 .into_bytes(),
@@ -6743,6 +15073,7 @@ mod tests {
             cookie: Some(cookie.into()),
             origin: Some(ORIGIN.into()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         block_on(crate::worker_entry::dispatch_collected(
@@ -7211,6 +15542,7 @@ mod tests {
             dns: &h2_dns,
             now: NOW,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: "PUT".to_string(),
@@ -7218,6 +15550,7 @@ mod tests {
             cookie: Some(cookie_a.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: put_body.to_string().into_bytes(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -7665,6 +15998,7 @@ mod tests {
             dns: &h.dns,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let stale_put_req = Request {
             method: "PUT".to_string(),
@@ -7672,6 +16006,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: put_body.to_string().into_bytes(),
         };
         let stale_put = block_on(handle(&stale_ctx, &stale_put_req));
@@ -7687,6 +16022,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_get = block_on(handle(&stale_ctx, &stale_get_req));
@@ -7698,6 +16034,7 @@ mod tests {
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_delete = block_on(handle(&stale_ctx, &stale_delete_req));
@@ -7836,6 +16173,7 @@ mod tests {
             dns: &h.dns,
             now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
 
         // Fresh issuance works (pins the 201 for the stale contrast below).
@@ -7856,6 +16194,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
                 .to_string()
                 .into_bytes(),
@@ -7877,6 +16216,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_revoke = block_on(handle(&stale_ctx, &stale_revoke_req));
@@ -7891,6 +16231,7 @@ mod tests {
             cookie: Some(cookie),
             origin: None,
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let stale_list = block_on(handle(&stale_ctx, &stale_list_req));
@@ -8007,6 +16348,2009 @@ mod tests {
         assert_eq!(rows[0].record.revoked_at, None);
     }
 
+    fn seed_admin(h: &Harness, id: &str, email: &str) -> String {
+        seed_user(h, id, email);
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert(id.to_string(), crate::admin::ROLE_ADMIN.to_string());
+        magic_login(h, email)
+    }
+
+    #[test]
+    fn admin_settings_requires_admin_session_and_serves_defaults() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // The admin surface is non-enumerable (TWO-70 A-AC1): no
+        // session, a garbage session and an authenticated non-admin
+        // session all get the plain 404 an unknown path gives — never
+        // a 401 or 403 that would confirm the route exists — and no
+        // settings leak.
+        let anon = h.call_full("GET", "/v1/admin/settings", None, None, None);
+        assert_eq!(anon.status, 404, "{}", anon.body);
+        let garbage = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some("__Host-nntune-session=not-a-token".to_string()),
+            None,
+        );
+        assert_eq!(garbage.status, 404, "{}", garbage.body);
+        let denied = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        // Byte-identical to the unknown-path answer: no oracle.
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        assert_eq!(denied.body, unknown.body);
+        assert_eq!(anon.body, unknown.body);
+
+        // A role-read outage is the same plain 404 for a member AND
+        // for an admin session: until the role is confirmed, the
+        // caller is not known to be an admin, so the guard never
+        // answers the 500 an unknown path cannot produce.
+        *h.store.fail_user_role_lookup.borrow_mut() = true;
+        for cookie in [member_cookie, admin_cookie.clone()] {
+            let resp = h.call_full("GET", "/v1/admin/settings", None, Some(cookie), None);
+            assert_eq!(resp.status, 404, "{}", resp.body);
+            assert_eq!(resp.body, unknown.body);
+        }
+        *h.store.fail_user_role_lookup.borrow_mut() = false;
+
+        // Admin: every typed key at its built-in default while no rows
+        // exist (the pre-seed posture).
+        let ok = h.call_full("GET", "/v1/admin/settings", None, Some(admin_cookie), None);
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        let body: serde_json::Value = serde_json::from_str(&ok.body).unwrap();
+        assert_eq!(body["settings"]["invite_default_expiry_days"], 7);
+        assert_eq!(body["settings"]["invite_member_min_paid_months"], 3);
+        assert_eq!(body["settings"]["invite_member_per_window"], 2);
+    }
+
+    #[test]
+    fn stale_sessions_hear_404_for_members_and_step_up_only_for_admins() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_put = |cookie: &str| {
+            let req = Request {
+                method: "PUT".to_string(),
+                path: "/v1/admin/settings/invite_default_expiry_days".to_string(),
+                cookie: Some(cookie.to_string()),
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: serde_json::json!({"value": 14}).to_string().into_bytes(),
+            };
+            block_on(handle(&stale_ctx, &req))
+        };
+
+        // A stale MEMBER session gets the plain 404, not the step-up
+        // prompt: reauthenticating could never authorize them.
+        let member = stale_put(&member_cookie);
+        assert_eq!(member.status, 404, "{}", member.body);
+
+        // A stale ADMIN session gets the step-up for a mutation...
+        let admin = stale_put(&admin_cookie);
+        assert_eq!(admin.status, 401, "{}", admin.body);
+        assert_eq!(
+            admin.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        // ...and neither stale write stored anything.
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+
+        // Reads never step up: the stale admin session still lists.
+        let get_req = Request {
+            method: "GET".to_string(),
+            path: "/v1/admin/settings".to_string(),
+            cookie: Some(admin_cookie),
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let list = block_on(handle(&stale_ctx, &get_req));
+        assert_eq!(list.status, 200, "{}", list.body);
+    }
+
+    #[test]
+    fn admin_routes_refuse_presented_bearer_credentials_with_404() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // Bearer only, no cookie: the plain 404, like every other
+        // non-admin probe of the namespace.
+        let bearer_only = h.call_bearer(
+            "GET",
+            "/v1/admin/settings",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_only.status, 404, "{}", bearer_only.body);
+        assert_eq!(
+            bearer_only.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+
+        // A valid admin cookie does not rescue a presented bearer header.
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/admin/settings".to_string(),
+            cookie: Some(admin_cookie),
+            origin: None,
+            authorization: Some("Bearer ntk_synthetic".to_string()),
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let both = block_on(handle(&h.ctx(), &req));
+        assert_eq!(both.status, 404, "{}", both.body);
+    }
+
+    // --- Admin ingest (migration 0034) -------------------------------------
+
+    /// Synthetic NZB with `file_count` files of `segments_per_file`
+    /// contiguous segments. Test-only content: the marker strings below
+    /// are what the redaction assertions hunt for in responses.
+    fn ingest_nzb(
+        file_count: usize,
+        segments_per_file: usize,
+        subject_pad: usize,
+        bytes_each: u64,
+    ) -> Vec<u8> {
+        let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n<head><meta type=\"title\">synthetic-ingest-fixture</meta></head>\n".to_vec();
+        for file in 0..file_count {
+            let pad = "x".repeat(subject_pad);
+            out.extend_from_slice(
+                format!(
+                    "<file poster=\"poster@example.invalid\" date=\"1700000000\" subject=\"file-{file}-{pad}\">\n<groups><group>alt.binaries.synthetic</group></groups>\n<segments>\n"
+                )
+                .as_bytes(),
+            );
+            for segment in 1..=segments_per_file {
+                out.extend_from_slice(
+                    format!(
+                        "<segment bytes=\"{bytes_each}\" number=\"{segment}\">mid-{file}-{segment}@example.invalid</segment>\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            out.extend_from_slice(b"</segments>\n</file>\n");
+        }
+        out.extend_from_slice(b"</nzb>\n");
+        out
+    }
+
+    fn minimal_ingest_nzb() -> Vec<u8> {
+        ingest_nzb(1, 2, 0, 100)
+    }
+
+    fn post_ingest(h: &Harness, cookie: &str, body: &[u8]) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/admin/ingest",
+            Some(String::from_utf8(body.to_vec()).expect("synthetic NZB is UTF-8")),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn ingest_audit_details(audit: &crate::vault::AuditEvent) -> serde_json::Value {
+        assert_eq!(
+            audit.action,
+            crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION
+        );
+        assert!(audit.subject_user_id.is_none());
+        serde_json::from_str(audit.details.as_ref().expect("details")).unwrap()
+    }
+
+    #[test]
+    fn admin_ingest_guard_collapses_to_byte_identical_404() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        assert_eq!(unknown.status, 404);
+
+        // Reads: anonymous, garbage session and member probes all hear
+        // the plain unknown-path 404 — byte-identical, never a distinct
+        // code that would confirm the route exists.
+        let anon = h.call_full("GET", "/v1/admin/ingest", None, None, None);
+        assert_eq!(anon.body, unknown.body);
+        let garbage = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some("__Host-nntune-session=not-a-token".to_string()),
+            None,
+        );
+        assert_eq!(garbage.status, 404, "{}", garbage.body);
+        assert_eq!(garbage.body, unknown.body);
+        let denied = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(denied.body, unknown.body);
+        // Unknown job ids and malformed shapes 404 the same way for an
+        // admin: the namespace never distinguishes miss reasons.
+        let miss = h.call_full(
+            "GET",
+            "/v1/admin/ingest/adm_nosuchjob00000000000000000000000000000",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(miss.body, unknown.body);
+        let deep = h.call_full(
+            "GET",
+            "/v1/admin/ingest/a/b",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(deep.body, unknown.body);
+        // The mutation also 404s for non-admins (and the body never
+        // varies with the payload: no size oracle).
+        let nzb = minimal_ingest_nzb();
+        let denied_post = post_ingest(&h, &member_cookie, &nzb);
+        assert_eq!(denied_post.status, 404, "{}", denied_post.body);
+        assert_eq!(denied_post.body, unknown.body);
+
+        // Presented bearer credentials are refused with the same 404 —
+        // the scope map keeps the admin namespace session-only — and a
+        // valid cookie does not rescue a presented header.
+        let bearer_only = h.call_bearer(
+            "GET",
+            "/v1/admin/ingest",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_only.body, unknown.body);
+        let bearer_post = h.call_bearer(
+            "POST",
+            "/v1/admin/ingest",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_post.body, unknown.body);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/admin/ingest".to_string(),
+            cookie: Some(admin_cookie.clone()),
+            origin: None,
+            authorization: Some("Bearer ntk_synthetic".to_string()),
+            stripe_signature: None,
+            body: nzb.clone(),
+        };
+        assert_eq!(block_on(handle(&h.ctx(), &req)).body, unknown.body);
+
+        // A stale member session hears 404 on the mutation; a stale
+        // admin session steps up (401) instead of writing.
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_post = |cookie: &str| {
+            let req = Request {
+                method: "POST".to_string(),
+                path: "/v1/admin/ingest".to_string(),
+                cookie: Some(cookie.to_string()),
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: nzb.clone(),
+            };
+            block_on(handle(&stale_ctx, &req))
+        };
+        assert_eq!(stale_post(&member_cookie).body, unknown.body);
+        let step_up = stale_post(&admin_cookie);
+        assert_eq!(step_up.status, 401, "{}", step_up.body);
+        assert_eq!(
+            step_up.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+
+        // A role-read outage is the same plain 404 for reads and the
+        // mutation alike: until the role is confirmed the caller is not
+        // known to be an admin.
+        *h.store.fail_user_role_lookup.borrow_mut() = true;
+        for resp in [
+            h.call_full("GET", "/v1/admin/ingest", None, Some(admin_cookie), None),
+            post_ingest(&h, &member_cookie, &nzb),
+        ] {
+            assert_eq!(resp.status, 404, "{}", resp.body);
+            assert_eq!(resp.body, unknown.body);
+        }
+        *h.store.fail_user_role_lookup.borrow_mut() = false;
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        // No guarded attempt ran, so no upload audit exists (the seeded
+        // sessions audited their own logins only).
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION));
+    }
+
+    #[test]
+    fn admin_ingest_accepts_and_dedupes_by_content() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+
+        let first = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(first.status, 201, "{}", first.body);
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        let job_id = body["job_id"].as_str().expect("job id").to_string();
+        assert!(job_id.starts_with("adm_"));
+        assert_eq!(body["nzb_bytes"], nzb.len() as u64);
+        assert_eq!(body["file_count"], 1);
+        assert_eq!(body["segment_count"], 2);
+        assert_eq!(body["has_original"], true);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        assert_eq!(body["deduplicated"], false);
+
+        // The stored row is redacted by construction: counts and the
+        // uploader only, no NZB text anywhere in the served body.
+        for marker in [
+            "poster@example",
+            "alt.binaries.synthetic",
+            "mid-0-1@",
+            "synthetic-ingest-fixture",
+        ] {
+            assert!(!first.body.contains(marker), "{marker}");
+        }
+        let stored = h.store.ingest_jobs.borrow();
+        let row = stored.get(&job_id).expect("stored row");
+        assert_eq!(row.db_status, "queued");
+        assert_eq!(row.accepted_at, NOW);
+        assert_eq!(row.failure_reason, None);
+        assert!(row.has_original);
+        assert!(h.store.ingest_originals.borrow().contains_key(&job_id));
+        drop(stored);
+
+        // The audit row names the actor and the accepted outcome, with
+        // no subject and no reason code. (Seeding the admin session
+        // audited the login, so the ingest row is found by action,
+        // never by index.)
+        let find_uploads = || {
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.action == crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION)
+                .map(|a| (a.user_id.clone(), a.at, ingest_audit_details(a)))
+                .collect::<Vec<_>>()
+        };
+        let uploads = find_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "admin1");
+        assert_eq!(uploads[0].1, NOW);
+        assert_eq!(uploads[0].2["job_id"], job_id);
+        assert_eq!(uploads[0].2["outcome"], "accepted");
+        assert!(uploads[0].2.get("reason_code").is_none());
+
+        // A replay converges: 200, same job, `deduplicated: true`, no
+        // second envelope, and the audit names the duplicate outcome.
+        let replay = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let body: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        let uploads = find_uploads();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[1].2["outcome"], "duplicate");
+
+        // A second admin uploading the same bytes lands on the same job:
+        // identity is content-derived, never the uploader.
+        let admin2_cookie = seed_admin(&h, "admin2", "admin2@example.com");
+        let second_admin = post_ingest(&h, &admin2_cookie, &nzb);
+        assert_eq!(second_admin.status, 200, "{}", second_admin.body);
+        let body: serde_json::Value = serde_json::from_str(&second_admin.body).unwrap();
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+
+        // Reads carry no `deduplicated` marker.
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{job_id}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+        let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+        assert!(body.get("deduplicated").is_none());
+        assert_eq!(body["status"], "accepted");
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert!(body["jobs"][0].get("deduplicated").is_none());
+
+        // A rejected upload converges the same way: same failed job id,
+        // same reason, `deduplicated: true` on the replay.
+        let bad = b"{\"not\": \"nzb\"}".to_vec();
+        let rejected = post_ingest(&h, &admin2_cookie, &bad);
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+        let body: serde_json::Value = serde_json::from_str(&rejected.body).unwrap();
+        let failed_id = body["job_id"].as_str().expect("failed job id").to_string();
+        assert_eq!(body["reason"], "not_nzb");
+        let replay_bad = post_ingest(&h, &admin_cookie, &bad);
+        assert_eq!(replay_bad.status, 200, "{}", replay_bad.body);
+        let body: serde_json::Value = serde_json::from_str(&replay_bad.body).unwrap();
+        assert_eq!(body["job_id"], failed_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["reason"], "not_nzb");
+    }
+
+    #[test]
+    fn admin_ingest_rejects_empty_without_row_or_audit() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let resp = post_ingest(&h, &admin_cookie, &[]);
+        assert_eq!(resp.status, 400, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"invalid_request","job_id":null,"reason":"empty","status":"failed"}"#
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert!(h.store.ingest_originals.borrow().is_empty());
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION));
+    }
+
+    #[test]
+    fn admin_ingest_rejection_legs_carry_fixed_vocabulary() {
+        // (case, body, status, wire code, reason). The oversized leg is
+        // built through `handle` so the in-handler pre-gate answers the
+        // 413 null-job shape; the entry's collection seam answers the
+        // uniform 400 instead (it runs before authentication).
+        let oversize = vec![b'a'; crate::admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES + 1];
+        let mut truncated = minimal_ingest_nzb();
+        truncated.truncate(truncated.len() / 2);
+        let legs: Vec<(&str, Vec<u8>, u16, &str, &str)> = vec![
+            ("malformed", truncated, 400, "invalid_request", "malformed"),
+            (
+                "not_nzb_json",
+                b"{\"not\": \"nzb\"}".to_vec(),
+                400,
+                "invalid_request",
+                "not_nzb",
+            ),
+            (
+                "not_nzb_xml",
+                b"<?xml version=\"1.0\"?><feed><entry/></feed>".to_vec(),
+                400,
+                "invalid_request",
+                "not_nzb",
+            ),
+            ("too_large", oversize, 413, "payload_too_large", "too_large"),
+            (
+                "too_many_files",
+                ingest_nzb(1025, 1, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_files",
+            ),
+            (
+                "too_many_segments_per_file",
+                ingest_nzb(1, 4097, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_segments",
+            ),
+            (
+                "too_many_segments_total",
+                ingest_nzb(61, 1000, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_segments",
+            ),
+            (
+                "declared_bytes_over_cap",
+                ingest_nzb(1, 1, 0, (64 << 30) + 1),
+                413,
+                "payload_too_large",
+                "declared_bytes_over_cap",
+            ),
+        ];
+        for (case, body, status, code, reason) in legs {
+            let h = harness();
+            let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+            let resp = post_ingest(&h, &admin_cookie, &body);
+            assert_eq!(resp.status, status, "{case}: {}", resp.body);
+            let view: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(view["status"], "failed", "{case}");
+            assert_eq!(view["code"], code, "{case}");
+            assert_eq!(view["reason"], reason, "{case}");
+            if reason == "too_large" {
+                // Nothing was parsed: no row, no audit, null job.
+                assert_eq!(view["job_id"], serde_json::Value::Null, "{case}");
+                assert!(h.store.ingest_jobs.borrow().is_empty(), "{case}");
+            } else {
+                // A rejected body still writes its failed job row (same
+                // transaction, same audit shape) with no original.
+                let job_id = view["job_id"].as_str().expect("job id").to_string();
+                let stored = h.store.ingest_jobs.borrow();
+                let row = stored.get(&job_id).expect("failed row");
+                assert_eq!(row.db_status, "failed", "{case}");
+                assert_eq!(row.failure_reason.as_deref(), Some(reason), "{case}");
+                assert!(!row.has_original, "{case}");
+                assert!(
+                    !h.store.ingest_originals.borrow().contains_key(&job_id),
+                    "{case}"
+                );
+                drop(stored);
+            }
+            // No NZB text or parser detail ever reaches the body.
+            for marker in ["poster@example", "alt.binaries", "mid-", "subject"] {
+                assert!(!resp.body.contains(marker), "{case}: {marker}");
+            }
+
+            // The audit row for the attempt names the rejected outcome
+            // plus the reason code; the oversized leg audits nothing.
+            // (The seeded admin login audited too, so the attempt row
+            // is found by action, never by index.)
+            let uploads: Vec<_> = h
+                .store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.action == crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION)
+                .map(ingest_audit_details)
+                .collect();
+            if reason == "too_large" {
+                assert!(uploads.is_empty(), "{case}");
+            } else {
+                assert_eq!(uploads.len(), 1, "{case}");
+                assert_eq!(uploads[0]["outcome"], "rejected", "{case}");
+                assert_eq!(uploads[0]["reason_code"], reason, "{case}");
+            }
+
+            // A second admin replaying the same bytes converges on the
+            // stored failure (or the oversized null shape again).
+            let admin2_cookie = seed_admin(&h, "admin2", "admin2@example.com");
+            let replay = post_ingest(&h, &admin2_cookie, &body);
+            if reason == "too_large" {
+                assert_eq!(replay.status, 413, "{case}: {}", replay.body);
+            } else {
+                assert_eq!(replay.status, 200, "{case}: {}", replay.body);
+                let view: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+                assert_eq!(view["deduplicated"], true, "{case}");
+                assert_eq!(view["reason"], reason, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn admin_ingest_accepts_synthetic_document_over_two_mib() {
+        // The admin cap (8 MiB) is deliberately above the user intake
+        // gate (2 MiB): a lawful 2 MiB-plus NZB the user surface would
+        // refuse must still ingest here.
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = ingest_nzb(1024, 1, 1900, 100);
+        assert!(
+            nzb.len() > 2 * 1024 * 1024,
+            "fixture must clear the user gate: {}",
+            nzb.len()
+        );
+        assert!(
+            nzb.len() <= crate::admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES,
+            "fixture must fit the admin cap: {}",
+            nzb.len()
+        );
+        let resp = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["file_count"], 1024);
+        assert_eq!(body["segment_count"], 1024);
+        assert_eq!(body["nzb_bytes"], nzb.len() as u64);
+    }
+
+    #[test]
+    fn admin_ingest_serves_redacted_list_and_get_views() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let accepted_id = {
+            let resp = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+            assert_eq!(resp.status, 201, "{}", resp.body);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let failed_id = {
+            let resp = post_ingest(&h, &admin_cookie, b"{\"not\": \"nzb\"}");
+            assert_eq!(resp.status, 400, "{}", resp.body);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The full list serves both rows, newest first, with the bounded
+        // default window — and no NZB text in any view.
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 0);
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        let ids: Vec<&str> = jobs
+            .iter()
+            .map(|job| job["job_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&accepted_id.as_str()));
+        assert!(ids.contains(&failed_id.as_str()));
+        for marker in [
+            "poster@example",
+            "alt.binaries.synthetic",
+            "mid-",
+            "@example.invalid",
+        ] {
+            assert!(!list.body.contains(marker), "{marker}");
+        }
+
+        // The status filter admits exactly the view vocabulary; anything
+        // else is a 422, never a filtered read.
+        for (query, want) in [
+            ("?status=accepted", vec![accepted_id.as_str()]),
+            ("?status=failed", vec![failed_id.as_str()]),
+        ] {
+            let resp = h.call_full(
+                "GET",
+                &format!("/v1/admin/ingest{query}"),
+                None,
+                Some(admin_cookie.clone()),
+                None,
+            );
+            assert_eq!(resp.status, 200, "{query}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            let ids: Vec<&str> = body["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|job| job["job_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, want, "{query}");
+        }
+        let bad_status = h.call_full(
+            "GET",
+            "/v1/admin/ingest?status=queued",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(bad_status.status, 422, "{}", bad_status.body);
+        assert_eq!(
+            bad_status.body,
+            r#"{"code":"validation_failed","message":"unknown status","retryable":false}"#
+        );
+
+        // The window clamps without erroring: unparsable falls back to
+        // the default, oversize clamps to the cap, unknown keys are
+        // ignored.
+        let window = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=1&offset=1",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&window.body).unwrap();
+        assert_eq!(body["limit"], 1);
+        assert_eq!(body["offset"], 1);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        let junk = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=junk&offset=junk&unknown=1",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&junk.body).unwrap();
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 0);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        let capped = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=9999",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&capped.body).unwrap();
+        assert_eq!(body["limit"], 100);
+
+        // Single reads: the accepted view carries counts, the failed
+        // view carries the fixed code and reason — neither carries NZB
+        // text or the deduplicated marker.
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{accepted_id}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+        let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["file_count"], 1);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        let get_failed = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{failed_id}"),
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(get_failed.status, 200, "{}", get_failed.body);
+        let body: serde_json::Value = serde_json::from_str(&get_failed.body).unwrap();
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["reason"], "not_nzb");
+        for marker in ["poster@example", "mid-", "@example.invalid"] {
+            assert!(!get_failed.body.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn admin_ingest_accepts_ten_independent_uploads() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let mut ids = Vec::new();
+        for pad in 0..10 {
+            let resp = post_ingest(&h, &admin_cookie, &ingest_nzb(1, 1, pad, 100));
+            assert_eq!(resp.status, 201, "upload {pad}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["deduplicated"], false, "upload {pad}");
+            ids.push(body["job_id"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 10);
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=100",
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn admin_ingest_delete_is_store_level_only() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let id_a = {
+            let resp = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let nzb_b = ingest_nzb(1, 1, 7, 100);
+        let id_b = {
+            let resp = post_ingest(&h, &admin_cookie, &nzb_b);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // No route serves deletion: every method on the job path that is
+        // not a read 404s.
+        for (method, path) in [
+            ("DELETE", format!("/v1/admin/ingest/{id_a}")),
+            ("PUT", format!("/v1/admin/ingest/{id_a}")),
+            ("POST", format!("/v1/admin/ingest/{id_a}")),
+        ] {
+            let resp = h.call_full(method, &path, None, Some(admin_cookie.clone()), None);
+            assert_eq!(resp.status, 404, "{method} {path}: {}", resp.body);
+        }
+
+        // The primitive deletes the original first, then the job, and
+        // reports the deletion.
+        assert_eq!(
+            block_on(h.store.admin_ingest_delete("admin1", &id_a)).unwrap(),
+            AdminIngestDeleteOutcome::Deleted
+        );
+        assert!(!h.store.ingest_originals.borrow().contains_key(&id_a));
+        assert!(!h.store.ingest_jobs.borrow().contains_key(&id_a));
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{id_a}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 404, "{}", get.body);
+
+        // A fresh upload of the same bytes lands a new row (200 becomes
+        // 201 again): the delete fully released the identity.
+        let fresh = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+        assert_eq!(fresh.status, 201, "{}", fresh.body);
+        let body: serde_json::Value = serde_json::from_str(&fresh.body).unwrap();
+        assert_eq!(body["job_id"], id_a);
+        assert_eq!(body["deduplicated"], false);
+        assert!(h.store.ingest_originals.borrow().contains_key(&id_a));
+
+        // Unknown ids (and pipeline-shaped ones, which the admin reads
+        // never expose) report `Missing`, never a row.
+        assert_eq!(
+            block_on(
+                h.store
+                    .admin_ingest_delete("admin1", "adm_nosuchjob00000000000000000000")
+            )
+            .unwrap(),
+            AdminIngestDeleteOutcome::Missing
+        );
+
+        // A demoted actor's delete is refused before any read: nothing
+        // is removed and nothing is audited.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let audits_before = h.store.audits.borrow().len();
+        assert_eq!(
+            block_on(h.store.admin_ingest_delete("admin1", &id_b)).unwrap(),
+            AdminIngestDeleteOutcome::ActorNotAdmin
+        );
+        assert!(h.store.ingest_jobs.borrow().contains_key(&id_b));
+        assert!(h.store.ingest_originals.borrow().contains_key(&id_b));
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        // The surviving job still reads and opens.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_ADMIN.to_string());
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{id_b}"),
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+    }
+
+    #[test]
+    fn admin_ingest_envelope_opens_only_under_row_identity() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        let resp = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let job_id = serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+        let job_id: &str = &job_id;
+
+        let stored = h.store.ingest_originals.borrow();
+        let (envelope, hex, kek_version) = stored.get(job_id).expect("original").clone();
+        drop(stored);
+        let kek = *h
+            .config
+            .kek_by_version(h.config.kek_version)
+            .expect("test KEK");
+        let open = |envelope: &crate::admin_ingest::IngestOriginalEnvelope,
+                    hex: &str,
+                    job_id: &str,
+                    version: i16,
+                    format: i16,
+                    kek_version: u32,
+                    kek: &[u8; 32]| {
+            crate::admin_ingest::decrypt_ingest_original(
+                kek,
+                hex,
+                job_id,
+                version,
+                format,
+                kek_version,
+                envelope,
+            )
+        };
+        assert_eq!(
+            open(&envelope, &hex, job_id, 2, 1, kek_version, &kek).unwrap(),
+            nzb
+        );
+
+        // A flipped ciphertext byte fails authentication — never
+        // partial plaintext — under the generic crypto error.
+        let mut tampered = envelope.clone();
+        tampered.ciphertext[0] ^= 1;
+        assert_eq!(
+            open(&tampered, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // A flipped wrapped-DEK byte fails the wrap check the same way.
+        let mut tampered_wrap = envelope.clone();
+        tampered_wrap.dek_wrapped[0] ^= 1;
+        assert_eq!(
+            open(&tampered_wrap, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // Rows do not open under each other's identity: the AAD binds
+        // the content hash and the job id.
+        assert_eq!(
+            open(
+                &envelope,
+                &hex,
+                "adm_otheridentity00000000000000000000000000",
+                2,
+                1,
+                kek_version,
+                &kek
+            )
+            .unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        assert!(open(&envelope, &"0".repeat(64), job_id, 2, 1, kek_version, &kek).is_err());
+        // A caller-selected version the row was not wrapped under fails
+        // the wrap check: no fallback loop.
+        assert_eq!(
+            open(&envelope, &hex, job_id, 2, 1, kek_version + 1, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // Stored-shape failures (a short wrapped DEK, a negative
+        // version) are corrupt-data errors, never crypto errors.
+        let mut short = envelope.clone();
+        short.dek_wrapped.truncate(47);
+        assert_eq!(
+            open(&short, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::CorruptStoredData
+        );
+        assert_eq!(
+            open(&envelope, &hex, job_id, -1, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::CorruptStoredData
+        );
+    }
+
+    #[test]
+    fn admin_ingest_demoted_actor_writes_nothing() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        let first = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(first.status, 201, "{}", first.body);
+
+        // Demoted after passing the guard once: the write-time
+        // re-check refuses with the plain non-admin 404 — no row, no
+        // audit — even for bytes that already name a stored job.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        let denied = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(denied.body, unknown.body);
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        let audits_before = h.store.audits.borrow().len();
+
+        // The store primitive reports the refusal directly: no row,
+        // no audit — even though the guard already passed for this
+        // session before the demotion.
+        let attempt = AdminIngestAttempt {
+            actor_user_id: "admin1".to_string(),
+            job_id: "adm_synthetic000000000000000000000000000".to_string(),
+            idempotency_key: "admin:synthetic".to_string(),
+            content_sha256_hex: "0".repeat(64),
+            nzb_bytes: 10,
+            file_count: None,
+            segment_count: None,
+            failure: Some(crate::admin_ingest::FailureReason::Malformed),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            block_on(h.store.admin_ingest_upload(&attempt)).unwrap(),
+            AdminIngestUploadOutcome::ActorNotAdmin
+        );
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
+    fn admin_ingest_deleting_actor_is_fenced() {
+        // ADR 0002 rule 3 fences every writer of user-owned state: the
+        // upload's job/original rows carry the actor's id under an
+        // ON DELETE RESTRICT FK, so a deleting actor's upload is refused
+        // with the typed `account_deleting` 409 — no job, no original,
+        // no audit — even though the session is still valid and the
+        // actor is still an admin through the grace window.
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("admin1".to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let denied = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(denied.status, 409, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#,
+            "{}",
+            denied.body
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert!(h.store.ingest_originals.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        // The store primitive reports the refusal directly.
+        let attempt = AdminIngestAttempt {
+            actor_user_id: "admin1".to_string(),
+            job_id: "adm_synthetic000000000000000000000000000".to_string(),
+            idempotency_key: "admin:synthetic".to_string(),
+            content_sha256_hex: "0".repeat(64),
+            nzb_bytes: 10,
+            file_count: None,
+            segment_count: None,
+            failure: Some(crate::admin_ingest::FailureReason::Malformed),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            block_on(h.store.admin_ingest_upload(&attempt)).unwrap(),
+            AdminIngestUploadOutcome::AccountDeleting
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
+    fn admin_preflight_never_maps_the_admin_namespace() {
+        // Non-enumerability must hold on preflight too (TWO-70 A-AC1):
+        // every path in the `/v1/admin` namespace — real, dynamic,
+        // mistyped — answers OPTIONS with the plain 404, never the
+        // empty 204 a served path gets.
+        let h = harness();
+        for path in [
+            "/v1/admin",
+            "/v1/admin/",
+            "/v1/admin/settings",
+            "/v1/admin/settings/invite_default_expiry_days",
+            "/v1/admin/users/u_1/role",
+            "/v1/admin/no-such-thing",
+        ] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+            assert_eq!(
+                resp.body, r#"{"code":"not_found","message":"not found","retryable":false}"#,
+                "{path}"
+            );
+        }
+        // The lookalike outside the namespace is simply unserved.
+        let resp = h.call_full("OPTIONS", "/v1/adminx", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 404);
+        // And a genuinely served session path still clears preflight:
+        // the exclusion is the namespace, not SessionOnly paths.
+        let resp = h.call_full("OPTIONS", "/v1/me", None, None, Some(ORIGIN));
+        assert_eq!(resp.status, 204);
+    }
+
+    #[test]
+    fn admin_write_store_recheck_refuses_a_demoted_actor() {
+        // The write transactions re-read the actor's role under their
+        // locks (production) / at write time (this fake): an actor
+        // demoted after passing the guard writes and audits nothing.
+        let h = harness();
+        let _admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        seed_user(&h, "member1", "member@example.com");
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let role = block_on(h.store.admin_set_user_role(
+            "admin1",
+            "member1",
+            "admin",
+            "198.51.100.9",
+            NOW,
+        ))
+        .unwrap();
+        assert_eq!(role, AdminWriteOutcome::ActorNotAdmin);
+        let setting = block_on(h.store.admin_set_app_setting(
+            "admin1",
+            "invite_default_expiry_days",
+            "14",
+            "198.51.100.9",
+            NOW,
+        ))
+        .unwrap();
+        assert_eq!(setting, AdminWriteOutcome::ActorNotAdmin);
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
+    fn admin_setting_write_is_typed_bounded_and_audited() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let path = "/v1/admin/settings/invite_default_expiry_days";
+
+        // A member write is refused before anything is stored or audited.
+        let denied = h.call_full(
+            "PUT",
+            path,
+            Some(serde_json::json!({"value": 14}).to_string()),
+            Some(member_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert!(h.store.app_settings_rows.borrow().is_empty());
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin::SETTINGS_CHANGED_AUDIT_ACTION));
+
+        // First admin write: the default was in force.
+        let put = |cookie: &str, p: &str, v: serde_json::Value| {
+            h.call_full(
+                "PUT",
+                p,
+                Some(v.to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+        let first = put(&admin_cookie, path, serde_json::json!({"value": 14}));
+        assert_eq!(first.status, 200, "{}", first.body);
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["value"], 14);
+        assert_eq!(body["previous_value"], 7);
+
+        // The audit row names the actor and the old-to-new values, with
+        // no subject (a settings write acts on no user).
+        let audits = h.store.audits.borrow();
+        let row = audits
+            .iter()
+            .find(|a| a.action == crate::admin::SETTINGS_CHANGED_AUDIT_ACTION)
+            .expect("settings.changed audit row");
+        assert_eq!(row.user_id, "admin1");
+        assert_eq!(row.subject_user_id, None);
+        let details: serde_json::Value =
+            serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["key"], "invite_default_expiry_days");
+        assert_eq!(details["old"], serde_json::Value::Null);
+        assert_eq!(details["new"], "14");
+        drop(audits);
+
+        // A second write reports the stored previous value.
+        let second = put(&admin_cookie, path, serde_json::json!({"value": 30}));
+        assert_eq!(second.status, 200, "{}", second.body);
+        let body: serde_json::Value = serde_json::from_str(&second.body).unwrap();
+        assert_eq!(body["previous_value"], 14);
+
+        // Out-of-bounds and unknown keys write nothing.
+        let audit_count = h.store.audits.borrow().len();
+        let too_big = put(&admin_cookie, path, serde_json::json!({"value": 31}));
+        assert_eq!(too_big.status, 422, "{}", too_big.body);
+        let unknown = put(
+            &admin_cookie,
+            "/v1/admin/settings/not_a_setting",
+            serde_json::json!({"value": 1}),
+        );
+        assert_eq!(unknown.status, 404, "{}", unknown.body);
+        assert_eq!(
+            h.store
+                .app_settings_rows
+                .borrow()
+                .get("invite_default_expiry_days")
+                .map(String::as_str),
+            Some("30")
+        );
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+    }
+
+    #[test]
+    fn admin_role_change_is_audited_and_never_self_served() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let put_role = |cookie: &str, subject: &str, role: &str| {
+            h.call_full(
+                "PUT",
+                &format!("/v1/admin/users/{subject}/role"),
+                Some(serde_json::json!({"role": role}).to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+
+        // Self-promotion by a member never reaches the store.
+        let self_serve = put_role(&member_cookie, "member1", "admin");
+        assert_eq!(self_serve.status, 404, "{}", self_serve.body);
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+
+        // An admin promotes the member; the audit row carries actor,
+        // subject and the old-to-new roles.
+        let promoted = put_role(&admin_cookie, "member1", "admin");
+        assert_eq!(promoted.status, 200, "{}", promoted.body);
+        let body: serde_json::Value = serde_json::from_str(&promoted.body).unwrap();
+        assert_eq!(body["previous_role"], "member");
+        assert_eq!(body["role"], "admin");
+        let audits = h.store.audits.borrow();
+        let row = audits
+            .iter()
+            .find(|a| a.action == crate::admin::ROLE_CHANGED_AUDIT_ACTION)
+            .expect("user.role_changed audit row");
+        assert_eq!(row.user_id, "admin1");
+        assert_eq!(row.subject_user_id.as_deref(), Some("member1"));
+        let details: serde_json::Value =
+            serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["old"], "member");
+        assert_eq!(details["new"], "admin");
+        drop(audits);
+
+        // The role is read fresh per request: the member's existing
+        // cookie is an admin session from the next call on.
+        let now_admin = h.call_full(
+            "GET",
+            "/v1/admin/settings",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(now_admin.status, 200, "{}", now_admin.body);
+
+        // Self-demotion is refused, unknown roles 422, unknown subjects 404.
+        let audit_count = h.store.audits.borrow().len();
+        let self_demote = put_role(&admin_cookie, "admin1", "member");
+        assert_eq!(self_demote.status, 422, "{}", self_demote.body);
+        let bogus = put_role(&admin_cookie, "member1", "owner");
+        assert_eq!(bogus.status, 422, "{}", bogus.body);
+        let ghost = put_role(&admin_cookie, "no-such-user", "member");
+        assert_eq!(ghost.status, 404, "{}", ghost.body);
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+        assert_eq!(
+            block_on(h.store.user_role("admin1")).unwrap().as_deref(),
+            Some("admin")
+        );
+
+        // Demotion by another admin takes effect on the very next call.
+        let demoted = put_role(&admin_cookie, "member1", "member");
+        assert_eq!(demoted.status, 200, "{}", demoted.body);
+        let no_longer = h.call_full("GET", "/v1/admin/settings", None, Some(member_cookie), None);
+        assert_eq!(no_longer.status, 404, "{}", no_longer.body);
+    }
+
+    #[test]
+    fn admin_role_write_on_a_deleting_subject_is_fenced() {
+        // ADR 0002 rule 3 fences every writer once `deleting_at` is
+        // set, and the admin role write is not exempt: a grant would
+        // stay effective (roles are read fresh per request) until
+        // erasure. The fenced write answers the typed
+        // `account_deleting` 409 and writes/audits nothing.
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("member1".to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let fenced = h.call_full(
+            "PUT",
+            "/v1/admin/users/member1/role",
+            Some(serde_json::json!({"role": "admin"}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(fenced.status, 409, "{}", fenced.body);
+        assert_eq!(
+            fenced.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    /// One full passkey signup (start + finish) presenting `invite_code`
+    /// at finish only, mirroring the signup page's code step. Returns
+    /// the finish response and the user id minted at start.
+    fn signup_with_invite(
+        h: &Harness,
+        email: &str,
+        cred_id: &[u8],
+        cose_seed: u8,
+        invite_code: Option<&str>,
+    ) -> (Response, String) {
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": email}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
+        let challenge = start["challenge"].as_str().unwrap().to_string();
+        let user_id = start["user_id"].as_str().unwrap().to_string();
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let att = fx_none_attestation(cred_id, &fx_es256_cose(cose_seed));
+        let resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(cred_id),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": invite_code,
+            }),
+        );
+        (resp, user_id)
+    }
+
+    fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {
+        h.store
+            .audits
+            .borrow()
+            .iter()
+            .filter(|event| event.action == action)
+            .cloned()
+            .collect()
+    }
+
+    /// No audit row may ever carry invite code material, plaintext or
+    /// hash — rows reference invites by surrogate id only.
+    fn assert_no_code_material_in_audits(h: &Harness, code: &str, code_hash: &str) {
+        for event in h.store.audits.borrow().iter() {
+            let details = event.details.clone().unwrap_or_default();
+            assert!(
+                !details.contains(code) && !details.contains(code_hash),
+                "audit {} leaked code material: {details}",
+                event.action
+            );
+        }
+    }
+
+    #[test]
+    fn admin_invite_issue_list_revoke_round_trip_without_code_material() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+
+        // Non-admin probes of every invite route hear the plain 404 and
+        // store nothing (AC-I3).
+        for (method, path, cookie) in [
+            ("POST", "/v1/admin/invites", Some(member_cookie.clone())),
+            ("POST", "/v1/admin/invites", None),
+            ("GET", "/v1/admin/invites", Some(member_cookie.clone())),
+            (
+                "POST",
+                "/v1/admin/invites/1/revoke",
+                Some(member_cookie.clone()),
+            ),
+        ] {
+            let resp = h.call_full(
+                method,
+                path,
+                Some(serde_json::json!({}).to_string()),
+                cookie,
+                Some(ORIGIN),
+            );
+            assert_eq!(resp.status, 404, "{method} {path}: {}", resp.body);
+        }
+        let bearer = h.call_bearer(
+            "GET",
+            "/v1/admin/invites",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer.status, 404, "{}", bearer.body);
+        assert!(h.store.invites.borrow().is_empty());
+
+        // Issue: the plaintext code is in this response exactly once.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(
+                serde_json::json!({"email": "Invited@Example.com", "expires_in_days": 3})
+                    .to_string(),
+            ),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.body);
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        assert!(!code.is_empty());
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        assert_eq!(body["invite"]["status"], "active");
+        assert_eq!(body["invite"]["kind"], "admin");
+        assert_eq!(body["invite"]["email"], "invited@example.com");
+        assert_eq!(body["invite"]["issued_by"], "admin1");
+        assert_eq!(
+            body["invite"]["expires_at"].as_u64().unwrap(),
+            NOW + 3 * 86_400
+        );
+        // The hash is never in the response that carries the plaintext.
+        let code_hash = auth::hash_invite_code(&code);
+        assert!(!issued.body.contains(&code_hash));
+        assert!(h.store.invites.borrow().contains_key(&code_hash));
+
+        // The issue audit references the row id only.
+        let issued_audits = audits_with_action(&h, auth::INVITE_ISSUED_AUDIT_ACTION);
+        assert_eq!(issued_audits.len(), 1);
+        assert_eq!(issued_audits[0].user_id, "admin1");
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+
+        // Out-of-range per-invite expiry is refused and stores nothing.
+        let refused = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({"expires_in_days": 31}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(refused.status, 422, "{}", refused.body);
+        assert_eq!(h.store.invites.borrow().len(), 1);
+
+        // List + filters: lifecycle fields only, never code material.
+        for (path, expected) in [
+            ("/v1/admin/invites".to_string(), 1),
+            ("/v1/admin/invites/status/active".to_string(), 1),
+            ("/v1/admin/invites/status/revoked".to_string(), 0),
+            ("/v1/admin/invites/issuer/admin1".to_string(), 1),
+            ("/v1/admin/invites/issuer/nobody".to_string(), 0),
+        ] {
+            let resp = h.call_full("GET", &path, None, Some(admin_cookie.clone()), None);
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(
+                body["invites"].as_array().unwrap().len(),
+                expected,
+                "{path}"
+            );
+            assert!(!resp.body.contains(&code), "{path} leaked the code");
+            assert!(!resp.body.contains(&code_hash), "{path} leaked the hash");
+        }
+        let bogus = h.call_full(
+            "GET",
+            "/v1/admin/invites/status/bogus",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(bogus.status, 404, "{}", bogus.body);
+
+        // Revoke: audited, idempotent, and unknown ids are a plain 404.
+        let revoke_path = format!("/v1/admin/invites/{invite_id}/revoke");
+        let revoked = h.call_full(
+            "POST",
+            &revoke_path,
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(revoked.status, 200, "{}", revoked.body);
+        let again = h.call_full(
+            "POST",
+            &revoke_path,
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(again.status, 200, "{}", again.body);
+        assert_eq!(
+            audits_with_action(&h, auth::INVITE_REVOKED_AUDIT_ACTION).len(),
+            1,
+            "the idempotent re-revoke must not audit twice"
+        );
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+        let missing = h.call_full(
+            "POST",
+            "/v1/admin/invites/999/revoke",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(missing.status, 404, "{}", missing.body);
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/invites/status/revoked",
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["invites"].as_array().unwrap().len(), 1);
+        assert_eq!(body["invites"][0]["revoked_by"], "admin1");
+    }
+
+    #[test]
+    fn invite_redemption_enrolls_once_and_stamps_invited_by() {
+        let mut h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.config.invites_required = true;
+
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({"email": "new@example.com"}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(issued.status, 201, "{}", issued.body);
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        // No per-invite expiry: the typed default (7 days) applies.
+        assert_eq!(
+            body["invite"]["expires_at"].as_u64().unwrap(),
+            NOW + 7 * 86_400
+        );
+
+        let (resp, user_id) =
+            signup_with_invite(&h, "new@example.com", b"invited-cred-1", 81, Some(&code));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(resp.set_cookie.is_some());
+
+        let code_hash = auth::hash_invite_code(&code);
+        {
+            let invites = h.store.invites.borrow();
+            let row = &invites[&code_hash];
+            assert!(row.used);
+            assert_eq!(row.redeemed_by.as_deref(), Some(user_id.as_str()));
+            assert_eq!(row.redeemed_at, Some(NOW));
+        }
+        assert_eq!(
+            h.store.invited_by.borrow().get(&user_id),
+            Some(&Some("admin1".to_string()))
+        );
+        let redeemed = audits_with_action(&h, auth::INVITE_REDEEMED_AUDIT_ACTION);
+        assert_eq!(redeemed.len(), 1);
+        assert_eq!(
+            redeemed[0].subject_user_id.as_deref(),
+            Some(user_id.as_str())
+        );
+        assert_no_code_material_in_audits(&h, &code, &code_hash);
+
+        // A redeemed invite cannot be revoked after the fact.
+        let conflict = h.call_full(
+            "POST",
+            &format!("/v1/admin/invites/{invite_id}/revoke"),
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(conflict.status, 422, "{}", conflict.body);
+
+        // Exactly once: a second signup with a spent (unbound) code
+        // enrolls nothing and audits no second redemption.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let shared = body["code"].as_str().unwrap().to_string();
+        let (first, _) = signup_with_invite(
+            &h,
+            "first@example.com",
+            b"invited-cred-2",
+            82,
+            Some(&shared),
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        let (second, second_user) = signup_with_invite(
+            &h,
+            "second@example.com",
+            b"invited-cred-3",
+            83,
+            Some(&shared),
+        );
+        assert_eq!(second.status, 401, "{}", second.body);
+        assert!(second.set_cookie.is_none());
+        assert!(
+            block_on(h.store.credentials_for_user(&second_user))
+                .unwrap()
+                .is_empty(),
+            "the losing signup must not enroll a credential"
+        );
+        assert_eq!(
+            audits_with_action(&h, auth::INVITE_REDEEMED_AUDIT_ACTION).len(),
+            2,
+            "one redemption audit per successful signup, no more"
+        );
+    }
+
+    #[test]
+    fn invite_invalid_classes_share_one_generic_error_at_signup_start() {
+        let mut h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.config.invites_required = true;
+
+        // One stored invite per invalid class (AC-I1).
+        let seed_code = |code: &str, mutate: &dyn Fn(&mut InviteRecord)| {
+            let hash = auth::hash_invite_code(code);
+            let mut record = InviteRecord::new_issued(
+                hash.clone(),
+                Some("admin1".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW - 1_000,
+                NOW + 604_800,
+            );
+            mutate(&mut record);
+            h.store.invites.borrow_mut().insert(hash, record);
+        };
+        seed_code("expired-code", &|r| r.expires_at = NOW - 1);
+        seed_code("revoked-code", &|r| r.revoked_at = Some(NOW - 10));
+        seed_code("spent-code", &|r| {
+            r.used = true;
+            r.redeemed_at = Some(NOW - 10);
+        });
+        seed_code("bound-code", &|r| {
+            r.email = Some("someone-else@example.com".to_string())
+        });
+        seed_code("self-code", &|_| {});
+
+        let mail_before = h.mailer.sent.borrow().len();
+        let mut bodies = Vec::new();
+        for (index, code) in [
+            "unknown-code",
+            "expired-code",
+            "revoked-code",
+            "spent-code",
+            "bound-code",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let resp = h.call(
+                "POST",
+                "/v1/auth/passkey/register/start",
+                serde_json::json!({
+                    "email": format!("probe-{index}@example.com"),
+                    "invite_code": code,
+                }),
+            );
+            assert_eq!(resp.status, 401, "{code}: {}", resp.body);
+            assert!(resp.set_cookie.is_none());
+            bodies.push(resp.body);
+        }
+        // Self-invite: the issuer's own email is refused the same way.
+        let self_resp = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "admin@example.com", "invite_code": "self-code"}),
+        );
+        assert_eq!(self_resp.status, 401, "{}", self_resp.body);
+        bodies.push(self_resp.body);
+        assert!(
+            bodies.iter().all(|body| body == &bodies[0]),
+            "every invalid class must be byte-identical: {bodies:?}"
+        );
+        assert_eq!(
+            h.mailer.sent.borrow().len(),
+            mail_before,
+            "a refused pre-check mints no signup and sends no mail"
+        );
+
+        // A valid code passes the pre-check WITHOUT being consumed:
+        // abandoning this signup leaves it redeemable, and finishing a
+        // later signup with it succeeds. Revoking it in between a start
+        // and its finish makes that finish fail generically instead.
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie.clone()),
+            Some(ORIGIN),
+        );
+        let body: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let invite_id = body["invite"]["id"].as_i64().unwrap();
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/register/start",
+            serde_json::json!({"email": "racer@example.com", "invite_code": code}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start_body: serde_json::Value = serde_json::from_str(&start.body).unwrap();
+        let challenge = start_body["challenge"].as_str().unwrap().to_string();
+        let racer_id = start_body["user_id"].as_str().unwrap().to_string();
+        let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let code_hash = auth::hash_invite_code(&code);
+        assert!(
+            !h.store.invites.borrow()[&code_hash].used,
+            "the pre-check must never consume the code"
+        );
+        let revoked = h.call_full(
+            "POST",
+            &format!("/v1/admin/invites/{invite_id}/revoke"),
+            Some(serde_json::json!({}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(revoked.status, 200, "{}", revoked.body);
+        let att = fx_none_attestation(b"racer-cred", &fx_es256_cose(84));
+        let finish = h.call(
+            "POST",
+            "/v1/auth/passkey/register/finish",
+            serde_json::json!({
+                "challenge": challenge,
+                "credential_id": b64url_encode(b"racer-cred"),
+                "attestation_object": b64url_encode(&att),
+                "client_data_json": b64url_encode(
+                    fx_client_json("webauthn.create", &challenge).as_bytes()
+                ),
+                "magic_token": emailed,
+                "invite_code": code,
+            }),
+        );
+        assert_eq!(finish.status, 401, "{}", finish.body);
+        assert_eq!(finish.body, bodies[0]);
+        assert!(block_on(h.store.credentials_for_user(&racer_id))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn invite_per_email_budget_denies_sixth_attempt_generically() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let good_hash = auth::hash_invite_code("email-budget-code");
+        h.store.invites.borrow_mut().insert(
+            good_hash.clone(),
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
+        );
+        let finish_with_code = |code: &str| {
+            let challenge = auth::new_registration_challenge("example.com", ORIGIN, NOW).unwrap();
+            let challenge_id = challenge.id.clone();
+            block_on(
+                h.store
+                    .insert_challenge(&challenge, Some("u1"), PURPOSE_REGISTER),
+            )
+            .unwrap();
+            let (token, record) =
+                auth::issue_magic_link("u1", "a@example.com", NOW).expect("issue");
+            block_on(h.store.insert_magic(&record)).unwrap();
+            let att = fx_none_attestation(b"email-budget-cred", &fx_es256_cose(85));
+            h.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                serde_json::json!({
+                    "challenge": challenge_id,
+                    "credential_id": b64url_encode(b"email-budget-cred"),
+                    "attestation_object": b64url_encode(&att),
+                    "client_data_json": b64url_encode(
+                        fx_client_json("webauthn.create", &challenge_id).as_bytes()
+                    ),
+                    "magic_token": token,
+                    "invite_code": code,
+                }),
+            )
+        };
+        // Five wrong guesses spend the per-email budget (5/hour) while
+        // the per-client budget (10/300s) still has room...
+        for _ in 0..auth::INVITE_EMAIL_MAX_ATTEMPTS {
+            assert_eq!(finish_with_code("wrong-code").status, 401);
+        }
+        // ...so the sixth attempt is denied generically even with the
+        // correct code, and the code stays unspent.
+        let denied = finish_with_code("email-budget-code");
+        assert_eq!(denied.status, 401, "{}", denied.body);
+        assert!(denied.set_cookie.is_none());
+        assert!(!h.store.invites.borrow()[&good_hash].used);
+        assert!(block_on(h.store.credentials_for_user("u1"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn magic_finish_cannot_bypass_invite_gate_for_credentialless_account() {
+        let mut h = harness();
+        h.config.invites_required = true;
+        seed_user(&h, "u-nocred", "nocred@example.com");
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "nocred@example.com"}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let token_hash = auth::hash_magic_token(&token);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.magic.borrow()[&token_hash].used,
+            "the refused finish must not spend the token"
+        );
+        assert!(h.store.sessions.borrow().is_empty());
+
+        // An established member (has a credential) is unaffected: the
+        // gate is on account creation, not on sign-in.
+        seed_user(&h, "u-member", "member2@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"member2-cred"),
+            user_id: "u-member".to_string(),
+            public_key: fx_es256_cose(86),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let cookie = magic_login(&h, "member2@example.com");
+        assert!(!cookie.is_empty());
+    }
+
+    #[test]
+    fn magic_finish_invite_gate_keeps_established_magic_only_members_signed_in() {
+        // Regression (review round 1): the gate must refuse only
+        // never-admitted accounts. A magic-only member — no passkey,
+        // but a prior session or a vault, the states the reaper
+        // protects — keeps signing in by email once invites are
+        // required; gating on credential-lessness alone locked them
+        // out at the flip with no way back in.
+        let mut h = harness();
+        h.config.invites_required = true;
+
+        // Established via a prior session (even a revoked one: a
+        // completed sign-in happened, which is the admission proof).
+        seed_user(&h, "u-magic-session", "magic-session@example.com");
+        block_on(h.store.insert_session(&SessionRecord {
+            id: "sess-prior".to_string(),
+            user_id: "u-magic-session".to_string(),
+            created_at: NOW,
+            expires_at: NOW + 3600,
+            rotation_counter: 0,
+            revoked: true,
+        }))
+        .unwrap();
+        let cookie = magic_login(&h, "magic-session@example.com");
+        assert!(!cookie.is_empty());
+
+        // Established via a vault, with no credential and no session.
+        seed_user(&h, "u-magic-vault", "magic-vault@example.com");
+        h.store.vaults.borrow_mut().insert(
+            "u-magic-vault".to_string(),
+            VaultRow {
+                blob: crate::vault::VaultBlob {
+                    kek_version: 1,
+                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    dek_wrapped_b64url: "AA".to_string(),
+                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    payload_b64url: "AA".to_string(),
+                },
+                indexer_configured: false,
+                updated_at: NOW,
+            },
+        );
+        let cookie = magic_login(&h, "magic-vault@example.com");
+        assert!(!cookie.is_empty());
+
+        // The bypass stays closed in the same posture: a fresh
+        // account with none of credential/session/vault is still
+        // refused generically and its token stays unspent.
+        seed_user(&h, "u-fresh", "fresh-signup@example.com");
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "fresh-signup@example.com"}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let token_hash = auth::hash_magic_token(&token);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.magic.borrow()[&token_hash].used,
+            "the refused finish must not spend the token"
+        );
+    }
+
     #[test]
     fn bearer_gate_enforces_scope_without_session_fallback() {
         let h = peppered_harness();
@@ -8101,6 +18445,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: Some("Bearer ntk_definitely-not-a-key".to_string()),
+            stripe_signature: None,
             body: Vec::new(),
         };
         let no_rescue = block_on(handle(&h.ctx(), &no_rescue));
@@ -8113,6 +18458,7 @@ mod tests {
             cookie: None,
             origin: Some(ORIGIN.to_string()),
             authorization: Some(format!("Bearer {library_secret}")),
+            stripe_signature: None,
             body: serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60})
                 .to_string()
                 .into_bytes(),
@@ -9241,11 +19587,14 @@ mod tests {
         let invite_hash = auth::hash_invite_code("retry-invite");
         h.store.invites.borrow_mut().insert(
             invite_hash.clone(),
-            InviteRecord {
-                code_hash: invite_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                invite_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let start = h.call(
             "POST",
@@ -9322,11 +19671,14 @@ mod tests {
         let good_hash = auth::hash_invite_code("right-invite");
         h.store.invites.borrow_mut().insert(
             good_hash.clone(),
-            InviteRecord {
-                code_hash: good_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let resp = h.call(
             "POST",
@@ -9456,6 +19808,7 @@ mod tests {
             dns: &h.dns,
             now,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: method.to_string(),
@@ -9463,6 +19816,7 @@ mod tests {
             cookie: Some(cookie),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         block_on(handle(&ctx, &req))
@@ -10503,6 +20857,7 @@ mod tests {
             ("resumed", "resume@example.com"),
             ("active", "active@example.com"),
             ("deleting", "deleting@example.com"),
+            ("admin-stub", "admin-stub@example.com"),
             ("abandoned", "abandoned@example.com"),
         ] {
             block_on(h.store.insert_user(&UserRecord {
@@ -10526,6 +20881,13 @@ mod tests {
             .deleting_users
             .borrow_mut()
             .insert("deleting".to_string());
+        // A promoted stub account (admin role, but no credential,
+        // session, vault or live proof) is never unverified-signup
+        // garbage: reaping it would delete an admin.
+        h.store.user_roles.borrow_mut().insert(
+            "admin-stub".to_string(),
+            crate::admin::ROLE_ADMIN.to_string(),
+        );
 
         let resp = h.call(
             "POST",
@@ -10542,6 +20904,12 @@ mod tests {
         assert!(block_on(h.store.user_by_email("deleting@example.com"))
             .unwrap()
             .is_some());
+        assert!(
+            block_on(h.store.user_by_email("admin-stub@example.com"))
+                .unwrap()
+                .is_some(),
+            "an admin account must survive the unverified-user reaper"
+        );
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
             .unwrap()
             .is_none());
@@ -10565,6 +20933,10 @@ mod tests {
             sql.contains("deleting_at IS NULL"),
             "reap must never delete an account already scheduled for \
              deletion (its delete_operations RESTRICT FK owns it)"
+        );
+        assert!(
+            sql.contains("users.role = 'member'"),
+            "reap must never delete an admin account, however stub-like"
         );
         assert!(sql.contains("auth_challenges.purpose = 'register'"));
         assert!(sql.contains("auth_challenges.expires_at > $3"));
@@ -11195,6 +21567,7 @@ mod tests {
                 dns: &h.dns,
                 now: NOW,
                 source_ip: "198.51.100.9".to_string(),
+                stripe: &h.stripe,
             };
             let req = Request {
                 method: "GET".to_string(),
@@ -11202,6 +21575,7 @@ mod tests {
                 cookie: Some(cookie.clone()),
                 origin: None,
                 authorization: None,
+                stripe_signature: None,
                 body: Vec::new(),
             };
             block_on(handle(&ctx, &req))
@@ -11217,6 +21591,7 @@ mod tests {
             dns: &h.dns,
             now: NOW,
             source_ip: "198.51.100.9".to_string(),
+            stripe: &h.stripe,
         };
         let req = Request {
             method: "POST".to_string(),
@@ -11224,6 +21599,7 @@ mod tests {
             cookie: Some(cookie.clone()),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: Vec::new(),
         };
         let resp = block_on(handle(&ctx, &req));
@@ -11313,11 +21689,14 @@ mod tests {
         let good_hash = auth::hash_invite_code("correct-code-1");
         h.store.invites.borrow_mut().insert(
             good_hash.clone(),
-            InviteRecord {
-                code_hash: good_hash.clone(),
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash.clone(),
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         // Ten wrong guesses: admitted by the throttle, denied on the code.
         for _ in 0..auth::INVITE_REDEMPTION_MAX_ATTEMPTS {
@@ -11344,11 +21723,14 @@ mod tests {
         let good_hash_2 = auth::hash_invite_code("correct-code-2");
         h.store.invites.borrow_mut().insert(
             good_hash_2.clone(),
-            InviteRecord {
-                code_hash: good_hash_2,
-                used: false,
-                created_at: NOW,
-            },
+            InviteRecord::new_issued(
+                good_hash_2,
+                Some("issuer-admin".to_string()),
+                auth::INVITE_KIND_ADMIN,
+                None,
+                NOW,
+                NOW + 604_800,
+            ),
         );
         let resp = finish_with_code("u2", "b@example.com", b"throttle-cred-2", "correct-code-2");
         assert_eq!(resp.status, 200, "{}", resp.body);
@@ -11569,335 +21951,6 @@ mod tests {
         }
     }
 
-    const CAT_REC_A: &str = "11111111-2222-3333-4444-555555555555";
-    const CAT_REC_B: &str = "11111111-2222-3333-4444-555555555556";
-    const CAT_RELEASE: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    const CAT_ARTIST: &str = "ffffffff-1111-2222-3333-444444444444";
-
-    fn matched_library_row(job: &str, rec: &str, ord: i64) -> crate::catalogue::LibraryDbRow {
-        crate::catalogue::LibraryDbRow {
-            job_id: job.to_string(),
-            release_mbid: Some(CAT_RELEASE.to_string()),
-            recording_mbids: vec![CAT_REC_A.to_string(), CAT_REC_B.to_string()],
-            recording_mbid: Some(rec.to_string()),
-            recording_ord: ord,
-            recording_title: Some(format!("Track {ord}")),
-            duration_ms: Some(200_000),
-            medium_no: Some(1),
-            track_no: Some(ord as i16),
-            release_title: Some("Catalogue Fixture".to_string()),
-            artist_mbid: Some(CAT_ARTIST.to_string()),
-            artist_name: Some("Fixture Artist".to_string()),
-        }
-    }
-
-    fn unmatched_library_row(job: &str) -> crate::catalogue::LibraryDbRow {
-        crate::catalogue::LibraryDbRow {
-            job_id: job.to_string(),
-            release_mbid: None,
-            recording_mbids: Vec::new(),
-            recording_mbid: None,
-            recording_ord: 0,
-            recording_title: None,
-            duration_ms: None,
-            medium_no: None,
-            track_no: None,
-            release_title: None,
-            artist_mbid: None,
-            artist_name: None,
-        }
-    }
-
-    fn seed_catalogue(h: &Harness) {
-        h.store
-            .catalogue_artists
-            .borrow_mut()
-            .push(crate::catalogue::ArtistDbRow {
-                mbid: CAT_ARTIST.to_string(),
-                name: "Fixture Artist".to_string(),
-                sort_name: "Artist, Fixture".to_string(),
-                artist_type: Some("Group".to_string()),
-                country: Some("GB".to_string()),
-            });
-        h.store
-            .catalogue_releases
-            .borrow_mut()
-            .push(crate::catalogue::ReleaseDbRow {
-                mbid: CAT_RELEASE.to_string(),
-                title: "Catalogue Fixture".to_string(),
-                release_type: Some("Album".to_string()),
-                year: Some(1983),
-                artist_mbid: Some(CAT_ARTIST.to_string()),
-                artist_name: Some("Fixture Artist".to_string()),
-            });
-        h.store
-            .catalogue_tracks
-            .borrow_mut()
-            .push(crate::catalogue::TrackDbRow {
-                release_mbid: CAT_RELEASE.to_string(),
-                recording_mbid: CAT_REC_A.to_string(),
-                title: "Track 1".to_string(),
-                duration_ms: Some(200_000),
-                medium_no: Some(1),
-                track_no: Some(1),
-                release_title: "Catalogue Fixture".to_string(),
-                artist_mbid: Some(CAT_ARTIST.to_string()),
-                artist_name: Some("Fixture Artist".to_string()),
-            });
-        h.store.catalogue_release_tracks.borrow_mut().insert(
-            CAT_RELEASE.to_string(),
-            vec![crate::catalogue::ReleaseTrackDbRow {
-                recording_mbid: CAT_REC_A.to_string(),
-                title: "Track 1".to_string(),
-                duration_ms: Some(200_000),
-                medium_no: Some(1),
-                track_no: Some(1),
-            }],
-        );
-    }
-
-    fn seed_library(h: &Harness, user: &str) {
-        h.store.catalogue_library.borrow_mut().insert(
-            user.to_string(),
-            vec![
-                matched_library_row("job-1", CAT_REC_A, 1),
-                matched_library_row("job-1", CAT_REC_B, 2),
-                unmatched_library_row("job-2"),
-            ],
-        );
-    }
-
-    #[test]
-    fn catalogue_library_serves_m1_row_for_session_caller() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        seed_library(&h, "u1");
-        let resp = h.call_full("GET", "/v1/library", None, Some(cookie), Some(ORIGIN));
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
-        assert_eq!(items.len(), 3);
-        // M1 row: string id, non-empty recording_mbids, release_mbid, plus
-        // the rich enrichment the web library renders.
-        assert_eq!(items[0]["id"], CAT_REC_A);
-        assert_eq!(
-            items[0]["recording_mbids"],
-            serde_json::json!([CAT_REC_A, CAT_REC_B])
-        );
-        assert_eq!(items[0]["release_mbid"], CAT_RELEASE);
-        assert_eq!(items[0]["title"], "Track 1");
-        assert_eq!(items[0]["artist"], "Fixture Artist");
-        // The unmatched upload stays visible under its job id with the
-        // by-design empty array.
-        assert_eq!(items[2]["id"], "job-2");
-        assert_eq!(items[2]["recording_mbids"], serde_json::json!([]));
-        assert!(items[2].get("release_mbid").is_none_or(|v| v.is_null()));
-    }
-
-    #[test]
-    fn catalogue_library_alias_serves_identical_entries() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        seed_library(&h, "u1");
-        let v1 = h.call_full(
-            "GET",
-            "/v1/library",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        let alias = h.call_full("GET", "/api/library", None, Some(cookie), Some(ORIGIN));
-        assert_eq!(v1.status, 200, "{}", v1.body);
-        assert_eq!(alias.status, 200, "{}", alias.body);
-        assert_eq!(
-            alias.body, v1.body,
-            "alias must never reshape the M1 contract"
-        );
-    }
-
-    #[test]
-    fn catalogue_routes_require_authentication() {
-        let h = harness();
-        for path in [
-            "/v1/library",
-            "/api/library",
-            "/v1/artists",
-            "/v1/releases",
-            "/v1/tracks",
-            &format!("/v1/releases/{CAT_RELEASE}"),
-        ] {
-            let resp = h.call_full("GET", path, None, None, Some(ORIGIN));
-            assert_eq!(resp.status, 401, "{path}");
-            assert_eq!(
-                resp.body, r#"{"error":"check your email and try again"}"#,
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn catalogue_library_bearer_serves_without_cookie() {
-        let h = peppered_harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        let minted = mint_call(
-            &h,
-            &cookie,
-            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 3600}),
-        );
-        assert_eq!(minted.status, 201, "{}", minted.body);
-        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
-        seed_library(&h, "u1");
-        // The gate-authorized bearer reaches the data route with no session
-        // cookie and no second gate spend.
-        for path in ["/v1/library", "/api/library"] {
-            let resp = h.call_bearer("GET", path, Some(format!("Bearer {secret}")));
-            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
-            let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
-            assert_eq!(items.len(), 3, "{path}");
-            assert_eq!(items[0]["id"], CAT_REC_A, "{path}");
-        }
-        // Wrong scope stays the names-only 403 (the gate owns it).
-        let stream_minted = mint_call(
-            &h,
-            &cookie,
-            serde_json::json!({"scopes": ["stream:read"], "ttl_secs": 3600}),
-        );
-        let stream_secret = mint_secret(&serde_json::from_str(&stream_minted.body).unwrap());
-        let forbidden = h.call_bearer(
-            "GET",
-            "/v1/library",
-            Some(format!("Bearer {stream_secret}")),
-        );
-        assert_eq!(forbidden.status, 403, "{}", forbidden.body);
-    }
-
-    #[test]
-    fn catalogue_library_is_per_user() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        seed_user(&h, "u2", "b@example.com");
-        let cookie_b = magic_login(&h, "b@example.com");
-        seed_library(&h, "u1");
-        let resp = h.call_full("GET", "/v1/library", None, Some(cookie_b), Some(ORIGIN));
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let items: Vec<serde_json::Value> = serde_json::from_str(&resp.body).unwrap();
-        assert!(
-            items.is_empty(),
-            "u1 rows must never reach u2: {}",
-            resp.body
-        );
-    }
-
-    #[test]
-    fn catalogue_collections_serve_rich_entries() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        seed_catalogue(&h);
-        let artists = h.call_full(
-            "GET",
-            "/v1/artists",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(artists.status, 200, "{}", artists.body);
-        let artists: Vec<serde_json::Value> = serde_json::from_str(&artists.body).unwrap();
-        assert_eq!(artists.len(), 1);
-        assert_eq!(artists[0]["mbid"], CAT_ARTIST);
-        assert_eq!(artists[0]["type"], "Group");
-        let releases = h.call_full(
-            "GET",
-            "/v1/releases",
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(releases.status, 200, "{}", releases.body);
-        let releases: Vec<serde_json::Value> = serde_json::from_str(&releases.body).unwrap();
-        assert_eq!(releases.len(), 1);
-        assert_eq!(releases[0]["mbid"], CAT_RELEASE);
-        assert_eq!(releases[0]["artist"], "Fixture Artist");
-        assert_eq!(
-            releases[0]["art_url"],
-            format!("/v1/releases/{CAT_RELEASE}/art")
-        );
-        let tracks = h.call_full("GET", "/v1/tracks", None, Some(cookie), Some(ORIGIN));
-        assert_eq!(tracks.status, 200, "{}", tracks.body);
-        let tracks: Vec<serde_json::Value> = serde_json::from_str(&tracks.body).unwrap();
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0]["mbid"], CAT_REC_A);
-        assert_eq!(tracks[0]["track_no"], 1);
-        assert_eq!(tracks[0]["medium_no"], 1);
-        assert_eq!(tracks[0]["duration_ms"], 200_000);
-        // Own-origin art only: no third-party URL may ever serialize.
-        for body in [&releases, &tracks] {
-            assert!(
-                !body[0].to_string().contains("http"),
-                "art URL must stay own-origin: {}",
-                body[0]
-            );
-        }
-    }
-
-    #[test]
-    fn catalogue_release_detail_round_trip_and_404s() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        seed_catalogue(&h);
-        let resp = h.call_full(
-            "GET",
-            &format!("/v1/releases/{CAT_RELEASE}"),
-            None,
-            Some(cookie.clone()),
-            Some(ORIGIN),
-        );
-        assert_eq!(resp.status, 200, "{}", resp.body);
-        let detail: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-        assert_eq!(detail["release"]["mbid"], CAT_RELEASE);
-        assert_eq!(detail["tracks"].as_array().unwrap().len(), 1);
-        assert_eq!(detail["tracks"][0]["mbid"], CAT_REC_A);
-        // Unknown, malformed, empty, and nested shapes are one plain 404 —
-        // no oracle distinguishes them.
-        for path in [
-            "/v1/releases/22222222-3333-4444-5555-666666666666".to_string(),
-            "/v1/releases/not-an-mbid".to_string(),
-            "/v1/releases/".to_string(),
-            format!("/v1/releases/{CAT_RELEASE}/art"),
-            format!("/v1/releases/{CAT_RELEASE}/tracks/extra"),
-        ] {
-            let resp = h.call_full("GET", &path, None, Some(cookie.clone()), Some(ORIGIN));
-            assert_eq!(resp.status, 404, "{path}: {}", resp.body);
-            assert_eq!(
-                resp.body, r#"{"code":"not_found","message":"not found","retryable":false}"#,
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn catalogue_store_outage_is_500() {
-        let h = harness();
-        seed_user(&h, "u1", "a@example.com");
-        let cookie = magic_login(&h, "a@example.com");
-        *h.store.fail_catalogue_reads.borrow_mut() = true;
-        for path in [
-            "/v1/library",
-            "/api/library",
-            "/v1/artists",
-            "/v1/releases",
-            "/v1/tracks",
-            &format!("/v1/releases/{CAT_RELEASE}"),
-        ] {
-            let resp = h.call_full("GET", path, None, Some(cookie.clone()), Some(ORIGIN));
-            assert_eq!(resp.status, 500, "{path}");
-            assert_eq!(resp.body, r#"{"error":"internal error"}"#, "{path}");
-        }
-    }
-
     #[test]
     fn options_preflight_only_for_known_routes() {
         let h = harness();
@@ -11917,33 +21970,12 @@ mod tests {
             "/v1/session/revoke-all",
             "/v1/vault",
             "/v1/vault/test-connection",
-            "/v1/library",
-            "/api/library",
-            "/v1/artists",
-            "/v1/releases",
-            "/v1/tracks",
         ] {
             assert!(is_known_path(path), "{path}");
             let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
             assert_eq!(resp.status, 204, "{path}");
             assert!(resp.body.is_empty(), "{path}");
             assert!(resp.set_cookie.is_none(), "{path}");
-        }
-        // Dynamic release-detail paths preflight through the scope map
-        // (like the single-segment credential revoke id): exact-path
-        // `is_known_path` cannot name them, but a lawful bearer GET must
-        // still clear preflight. Nested shapes stay hidden (they 404 in
-        // dispatch, including the reserved art path).
-        let detail = format!("/v1/releases/{CAT_RELEASE}");
-        assert!(!is_known_path(&detail));
-        let resp = h.call_full("OPTIONS", &detail, None, None, Some(ORIGIN));
-        assert_eq!(resp.status, 204, "{detail}");
-        for hidden in [
-            "/v1/releases/".to_string(),
-            format!("/v1/releases/{CAT_RELEASE}/art"),
-        ] {
-            let resp = h.call_full("OPTIONS", &hidden, None, None, Some(ORIGIN));
-            assert_eq!(resp.status, 404, "{hidden}");
         }
         // Unknown paths still 404 on preflight: no surface mapping.
         assert!(!is_known_path("/v1/auth/magic-link"));
