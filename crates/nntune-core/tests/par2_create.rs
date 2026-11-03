@@ -43,7 +43,9 @@ fn data_slices_padded(data: &[u8], slice: usize) -> Vec<Vec<u8>> {
 
 /// Splits `data` into slices and drops `erase` (by index), returning
 /// `(present, original_padded_slices)`.
-fn erase_slices(data: &[u8], slice: usize, erase: &[u32]) -> (Vec<(u32, Vec<u8>)>, Vec<Vec<u8>>) {
+type ErasedSlices = (Vec<(u32, Vec<u8>)>, Vec<Vec<u8>>);
+
+fn erase_slices(data: &[u8], slice: usize, erase: &[u32]) -> ErasedSlices {
     let all = data_slices_padded(data, slice);
     let present = all
         .iter()
@@ -328,7 +330,7 @@ fn roundtrip_multi_slice_loss_up_to_redundancy() {
 fn roundtrip_corrupt_then_erase_mirrors_production_flow() {
     // Corrupt bytes in place: verify (existing path) rejects, the slice is
     // declared lost, recovery restores it, verify accepts.
-    let data = pseudorandom(20_000, 0xfee1_dead_beef_42);
+    let data = pseudorandom(20_000, 0x00fe_e1de_adbe_ef42);
     let slice = 2048u64;
     let set = create_single_file(FILENAME, &data, slice).unwrap();
     let name = std::str::from_utf8(FILENAME).unwrap();

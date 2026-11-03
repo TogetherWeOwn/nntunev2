@@ -594,8 +594,8 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:436-460`) and
-`fixture-check` (`.github/workflows/ci.yml:65-74`); `fmt` takes no
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:445-505`) and
+`fixture-check` (`.github/workflows/ci.yml:80-89`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under
 `rust-test --workspace`.)
