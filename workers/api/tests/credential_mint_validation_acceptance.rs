@@ -549,6 +549,7 @@ mod surface_acceptance {
                 cookie: cookie.map(str::to_string),
                 origin: Some(ORIGIN.to_string()),
                 authorization: authorization.map(str::to_string),
+                stripe_signature: None,
                 body: Vec::new(),
             },
         ))
@@ -948,6 +949,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -964,6 +966,7 @@ impl Harness {
             cookie: cookie.map(str::to_string),
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: body
                 .map(|value| value.to_string().into_bytes())
                 .unwrap_or_default(),

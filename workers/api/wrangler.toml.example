@@ -169,3 +169,16 @@ SESSION_TTL_SECS = "86400"
 #                                 e2e-staging QA_AUTH_TOKEN secret. Staged only
 #                                 together with QA_CODE_SEAM=1 (staging env);
 #                                 never on prod.
+#   STRIPE_SECRET_KEY             Stripe bearer secret, TEST MODE ONLY
+#                                 (`sk_test_...`). Operator-provisioned; the
+#                                 Worker never hardcodes it. `sk_live_` or any
+#                                 other shape refuses startup (fail closed).
+#                                 Unset, Stripe-touching paths fail closed
+#                                 per-request (the webhook 500s so Stripe
+#                                 retries it) while every other route keeps
+#                                 serving.
+#   STRIPE_WEBHOOK_SECRET         Stripe webhook signing secret (`whsec_...`)
+#                                 for `POST /v1/billing/webhook`. Unset, the
+#                                 webhook fails closed per-request (500)
+#                                 before any signature verification — an
+#                                 unverifiable webhook is never acked.

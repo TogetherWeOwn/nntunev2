@@ -76,3 +76,9 @@ rand = "0.8"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+
+# Standalone crate (also excluded in the parent workspace manifest): declaring
+# itself a workspace root keeps the upward workspace walk from escaping into
+# whatever checkout happens to contain this directory (cargo's own suggested
+# fix). No behavior change at a repo-root checkout.
+[workspace]
