@@ -3,6 +3,16 @@
 Container image for the two batch jobs behind `nntunev2-mb`
 (ADR 0007). Interactive traffic never runs here.
 
+> **Decision changed (2026-11-03):** [ADR 0012 §5](../../docs/adr/0012-compliant-youtube-video-and-brainz-data.md)
+> and the amended [ADR 0007](../../docs/adr/0007-mb-mirror.md) drop the
+> hourly Live Data Feed: the mirror is CC0-only on twice-weekly core
+> dumps with a ≤4-day freshness target, and no MetaBrainz supporter
+> tier, account or token is held. The replication job, its packet
+> ledger and the <2 h SLO below describe the superseded hourly design
+> that is still in the tree — do not configure schedules or
+> monitoring against them for the CC0 mirror. Retiring/replacing
+> them is part of the follow-on mirror build change, not done here.
+
 ## Jobs
 
 | Job | Trigger | Script | SLO |

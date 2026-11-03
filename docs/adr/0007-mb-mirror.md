@@ -27,8 +27,8 @@ serverless; batch runs in Containers.
    dumps → Postgres `COPY`). It is idempotent and resumable by line-range
    chunk (`mb_import_cursor`), with poison rows in `mb_import_dlq`.
 3. **Twice-weekly CC0 core dumps** keep the mirror current (plus the
-   CC0 canonical dumps on the 1st/15th if useful). Freshness SLO:
-   **dump age ≤4 days**, monitored per import. The hourly Live Data
+   CC0 canonical dumps on the 1st/15th if useful). Freshness target:
+   **dump age ≤4 days**. The hourly Live Data
    Feed this point originally specified is dropped: its replication
    packets are CC BY-NC-SA 3.0, and the owner chose the free
    CC0-only path with no MetaBrainz supporter tier, account or token
@@ -61,5 +61,7 @@ serverless; batch runs in Containers.
   schema, including `pg_trgm` indexes for search.
 - `workers/mb` documents its lookup + search p95 methodology; numbers land
   in its README once staging measures exist.
-- Dump freshness (≤4 days) is a monitored SLO; a missed or stale
-  dump pages, it never silently skips.
+- Dump freshness (≤4 days) is a target, not a live monitored SLO:
+  no dump-age monitor or pager exists yet. When they are built, a
+  missed or stale dump must page — never silently skip. Until then
+  nothing here claims alerting coverage.

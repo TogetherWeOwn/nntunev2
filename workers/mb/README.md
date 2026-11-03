@@ -141,6 +141,15 @@ once staging measures exist.)
 
 ### Replication SLO
 
+> **Superseded decision (2026-11-03):** [ADR 0012 §5](../../docs/adr/0012-compliant-youtube-video-and-brainz-data.md)
+> and the amended [ADR 0007](../../docs/adr/0007-mb-mirror.md) replace
+> hourly replication with twice-weekly CC0 core dumps (freshness
+> target ≤4 days; no supporter tier, account or token). The
+> per-packet contract below documents the ledger/evaluator as built
+> for the old hourly design — do not configure monitoring against
+> the 2-hour rule for the CC0 mirror. Retiring or replacing this
+> evaluator is part of the follow-on mirror build change.
+
 The SLO contract is the per-packet rule from ADR 0007: **each packet must
 be applied within 2 hours of publication**. The evaluator does not calculate
 or report a replication-lag p95. The **p95 source**, if a manual p95

@@ -226,12 +226,23 @@ with `X-RateLimit-*` headers respected:
 - ListenBrainz dumps are CC0; commercial use is allowed with
   financial support strongly urged (a request, not a licence term).
   MLHD+ is non-commercial only and is never used.
-- A user's ListenBrainz token is a credential: stored via the
-  existing vault/credentials mechanism
-  ([0010-native-rest-credentials.md](0010-native-rest-credentials.md)),
-  never logged, sent only to ListenBrainz. Account linking asks for
-  username + token explicitly; every ListenBrainz feature degrades
-  to a signed-out empty state without one.
+- A user's ListenBrainz token is a retrievable upstream credential,
+  so it is stored in the BYOP vault
+  ([0008-auth-vault-sessions.md](0008-auth-vault-sessions.md):
+  AES-256-GCM envelope, per-user DEK, versioned KEK) — the same
+  treatment as the user's Usenet provider password. It is
+  explicitly **not** an
+  [0010-native-rest-credentials.md](0010-native-rest-credentials.md)
+  credential: those are server-issued keys kept only as one-way
+  HMACs, which cannot be presented upstream. Contract for the
+  account-link build: the token is decrypted only server-side to
+  call ListenBrainz, is never returned to the client after saving
+  and never logged; unlinking the account deletes the vault entry
+  in the same operation, and re-linking replaces it (rotation is
+  delete-then-store, never an in-place edit of a second copy).
+  Account linking asks for username + token explicitly; every
+  ListenBrainz feature degrades to a signed-out empty state
+  without one.
 - ListenBrainz is not a source of curated video links (§2 order 3 is
   listen-observed IDs only). Anyone proposing "import the
   ListenBrainz MBID→YouTube map" is proposing something that does
@@ -253,7 +264,9 @@ quietly relitigated. The mirror therefore runs CC0-only:
 - The mirror uses the twice-weekly CC0 core dumps (plus the CC0
   canonical dumps on the 1st/15th if useful); the hourly Live Data
   Feed is dropped from ADR 0007's mirror design, and ADR 0007's
-  <2 h lag SLO is replaced by dump freshness (≤4 days).
+  <2 h lag SLO is replaced by a dump-freshness target (≤4 days;
+  no dump-age monitor or pager exists yet, so nothing may claim it
+  is a monitored SLO until they are built).
 - NC data is excluded at import: no tags/genre associations,
   ratings, annotations, or derived statistics built from them.
 - Browse-by-genre needs a CC0 source. Wikidata (P136) is the
@@ -425,7 +438,9 @@ arbitrary track.
   the YouTube policy revision history — these policies change, and
   this ADR cites the revisions read above.
 - Follow-on build work, each its own change: mirror schema
-  extension (§2); `PlayableSource` + `YouTubeEmbedSource` + video
+  extension and retirement of the superseded hourly-replication
+  path (import runbook, packet ledger/evaluator) (§2, §5);
+  `PlayableSource` + `YouTubeEmbedSource` + video
   surfaces (§1); curation job + moderated submissions (§2);
   ListenBrainz account link (§4); the BrainzPlayer study (REA
   angle) as build input; and, only after embeds work, the §7 spike
