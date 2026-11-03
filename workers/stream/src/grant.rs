@@ -1,13 +1,25 @@
 //! Signed play grants: the `api` Worker issues them, the `stream` Worker
 //! verifies one per play before touching the pool or R2.
 //!
-//! Token shape: `v1.<base64url(payload)>.<base64url(hmac-sha256)>` where the
-//! payload is `user_id|track_id|exp_unix`. Crypto is dependency-free
-//! (minimal SHA-256 + HMAC below) so `cargo test` runs anywhere; the Worker
-//! uses the same byte-exact scheme.
+//! Token shape: `v<n>.<base64url(payload)>.<base64url(hmac-sha256)>` where
+//! the HMAC covers the base64url payload segment exactly as spelled (never
+//! the version prefix). Two payload versions exist:
 //!
-//! Note: `user_id` and `track_id` must not contain `|` (our IDs never do);
-//! anything else that fails to parse is rejected as [`GrantError::Malformed`].
+//! - `v1`: `user_id|track_id|exp_unix` (the original play authorization).
+//! - `v2`: `user_id|track_id|play_id|lease_epoch|exp_unix` — adds the play
+//!   id the hour meter keys delivered-byte intervals by, and the
+//!   concurrency-lease epoch (replan spec §3.1/§3.4). `play_id` must pass
+//!   the persisted-ledger field rule (`[A-Za-z0-9_-]`, 1..=512 bytes) so a
+//!   grant that verifies here can always be metered; anything else is
+//!   [`GrantError::Malformed`]. The public play route requires `v2`.
+//!
+//! This module is the byte-exact format definition: the `api` Worker
+//! mirrors [`issue_v2_at`] when it mints grants at its issuance gate.
+//! Crypto is dependency-free (minimal SHA-256 + HMAC below) so `cargo
+//! test` runs anywhere; the Worker uses the same scheme.
+//!
+//! Note: id fields must not contain `|` (our IDs never do); anything else
+//! that fails to parse is rejected as [`GrantError::Malformed`].
 //!
 //! Grants are short-lived: [`MAX_GRANT_TTL`] caps the lifetime at 15 minutes
 //! (900 s). The production issuer [`issue_at`] clamps longer requests to the
@@ -32,6 +44,13 @@ pub const CLOCK_SKEW_SECS: u64 = 60;
 pub struct Grant {
     pub user_id: String,
     pub track_id: String,
+    /// `v2` only: the play this grant authorizes (meter idempotency input).
+    /// `None` for a `v1` grant, which the public play route refuses.
+    pub play_id: Option<String>,
+    /// `v2` only: the concurrency-lease epoch at issuance. Verified and
+    /// carried for the enforcement card; the stream Worker itself keeps no
+    /// lease state. `None` for a `v1` grant.
+    pub lease_epoch: Option<u64>,
     pub exp_unix: u64,
 }
 
@@ -78,6 +97,41 @@ pub fn issue_at(
     issue(user_id, track_id, exp_unix, secret)
 }
 
+/// Issue a `v2` grant expiring at `exp_unix` (the raw signer, like
+/// [`issue`]; production issuance clamps through [`issue_v2_at`]).
+///
+/// `play_id` must be nonempty, contain no `|`, and pass the ledger field
+/// rule or [`verify`] rejects the minted token as malformed.
+pub fn issue_v2(
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    lease_epoch: u64,
+    exp_unix: u64,
+    secret: &[u8],
+) -> String {
+    let payload = format!("{user_id}|{track_id}|{play_id}|{lease_epoch}|{exp_unix}");
+    let payload_b64 = base64url_encode(payload.as_bytes());
+    let sig = hmac_sha256(secret, payload_b64.as_bytes());
+    format!("v2.{payload_b64}.{}", base64url_encode(&sig))
+}
+
+/// Issue a `v2` grant with a requested lifetime of `ttl_secs` seconds from
+/// `now_unix`, clamped to [`MAX_GRANT_TTL`] exactly like [`issue_at`].
+/// This is the shape the `api` Worker's issuance gate mirrors.
+pub fn issue_v2_at(
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    lease_epoch: u64,
+    now_unix: u64,
+    ttl_secs: u64,
+    secret: &[u8],
+) -> String {
+    let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
+    issue_v2(user_id, track_id, play_id, lease_epoch, exp_unix, secret)
+}
+
 /// Verify `token` against `secret` at time `now_unix`.
 pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Grant, GrantError> {
     verify_with_user(token, secret, now_unix).map_err(|(err, _)| err)
@@ -92,9 +146,18 @@ pub(crate) fn verify_with_user(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<Grant, (GrantError, Option<String>)> {
-    let rest = token
+    // The version prefix selects the payload grammar. The signature covers
+    // only the payload segment, but relabeling cannot smuggle a payload
+    // across versions: each grammar demands its exact field count, so a
+    // `v1` payload under a `v2.` prefix (or the reverse) is malformed.
+    let (version, rest) = match token
         .strip_prefix("v1.")
-        .ok_or((GrantError::Malformed, None))?;
+        .map(|r| (1u8, r))
+        .or_else(|| token.strip_prefix("v2.").map(|r| (2u8, r)))
+    {
+        Some(pair) => pair,
+        None => return Err((GrantError::Malformed, None)),
+    };
     let (payload_b64, sig_b64) = rest.split_once('.').ok_or((GrantError::Malformed, None))?;
     if payload_b64.is_empty() || sig_b64.is_empty() {
         return Err((GrantError::Malformed, None));
@@ -107,9 +170,28 @@ pub(crate) fn verify_with_user(
     let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
     let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
     let mut parts = payload.split('|');
-    let (user_id, track_id, exp) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(u), Some(t), Some(e), None) => (u, t, e),
-        _ => return Err((GrantError::Malformed, None)),
+    let (user_id, track_id, play_id, lease_epoch, exp) = match version {
+        1 => match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(u), Some(t), Some(e), None) => (u, t, None, None, e),
+            _ => return Err((GrantError::Malformed, None)),
+        },
+        _ => match (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
+            (Some(u), Some(t), Some(p), Some(epoch), Some(e), None) => {
+                if !crate::meter::is_valid_key_field(p, 512) {
+                    return Err((GrantError::Malformed, None));
+                }
+                let epoch: u64 = epoch.parse().map_err(|_| (GrantError::Malformed, None))?;
+                (u, t, Some(p.to_string()), Some(epoch), e)
+            }
+            _ => return Err((GrantError::Malformed, None)),
+        },
     };
     let exp_unix: u64 = exp.parse().map_err(|_| (GrantError::Malformed, None))?;
     let user_id = user_id.to_string();
@@ -125,6 +207,8 @@ pub(crate) fn verify_with_user(
     Ok(Grant {
         user_id,
         track_id: track_id.to_string(),
+        play_id,
+        lease_epoch,
         exp_unix,
     })
 }
@@ -351,9 +435,83 @@ mod tests {
             Grant {
                 user_id: "user-1".to_string(),
                 track_id: "track-9".to_string(),
+                play_id: None,
+                lease_epoch: None,
                 exp_unix: 1_700_000_000,
             }
         );
+    }
+
+    #[test]
+    fn v2_round_trip_carries_play_and_lease_epoch() {
+        let token = issue_v2("user-1", "track-9", "play-7", 42, 1_700_000_000, SECRET);
+        assert!(token.starts_with("v2."), "{token}");
+        let grant = verify(&token, SECRET, 1_699_999_999).expect("verify v2");
+        assert_eq!(
+            grant,
+            Grant {
+                user_id: "user-1".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: Some("play-7".to_string()),
+                lease_epoch: Some(42),
+                exp_unix: 1_700_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn v2_issuance_clamps_to_the_ttl_cap() {
+        let token = issue_v2_at(
+            "user-1",
+            "track-9",
+            "play-7",
+            1,
+            1_700_000_000,
+            86_400,
+            SECRET,
+        );
+        let grant = verify(&token, SECRET, 1_700_000_000).expect("clamped v2 verifies");
+        assert_eq!(grant.exp_unix, 1_700_000_000 + MAX_GRANT_TTL);
+    }
+
+    #[test]
+    fn v2_rejects_unmeterable_play_ids_and_bad_epochs() {
+        // A play id outside the ledger alphabet could never be metered, so
+        // the grant must not verify at all (fail closed before any bytes).
+        for bad_play in ["", "play:7", "play 7", "pläy", &"p".repeat(513)] {
+            let token = issue_v2("user-1", "track-9", bad_play, 1, 1_700_000_000, SECRET);
+            assert_eq!(
+                verify(&token, SECRET, 1_699_999_999),
+                Err(GrantError::Malformed),
+                "play id {bad_play:?}"
+            );
+        }
+        // Hand-mint a token whose epoch is not a number (issue_v2 cannot).
+        let payload_b64 = base64url_encode(b"user-1|track-9|play-7|soon|1700000000");
+        let sig = hmac_sha256(SECRET, payload_b64.as_bytes());
+        let token = format!("v2.{payload_b64}.{}", base64url_encode(&sig));
+        assert_eq!(
+            verify(&token, SECRET, 1_699_999_999),
+            Err(GrantError::Malformed)
+        );
+    }
+
+    #[test]
+    fn payloads_cannot_be_relabeled_across_versions() {
+        let v1 = issue("user-1", "track-9", 1_700_000_000, SECRET);
+        let v2 = issue_v2("user-1", "track-9", "play-7", 1, 1_700_000_000, SECRET);
+        let relabeled_v1 = format!("v2.{}", v1.strip_prefix("v1.").unwrap());
+        let relabeled_v2 = format!("v1.{}", v2.strip_prefix("v2.").unwrap());
+        assert_eq!(
+            verify(&relabeled_v1, SECRET, 1_699_999_999),
+            Err(GrantError::Malformed)
+        );
+        assert_eq!(
+            verify(&relabeled_v2, SECRET, 1_699_999_999),
+            Err(GrantError::Malformed)
+        );
+        // Unknown versions are malformed, never a signature oracle.
+        assert_eq!(verify("v3.abc.def", SECRET, 1), Err(GrantError::Malformed));
     }
 
     #[test]
