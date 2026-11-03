@@ -102,7 +102,11 @@ pub fn extract_video_id(url: &str) -> Option<String> {
         return None;
     }
     if host == "youtu.be" {
-        let id = rest.split(['?', '#', '/']).next().unwrap_or("");
+        let id = rest
+            .trim_start_matches('/')
+            .split(['?', '#', '/'])
+            .next()
+            .unwrap_or("");
         return valid_id(id);
     }
     // Path forms: /embed/<id>, /shorts/<id>, /live/<id>.
@@ -180,13 +184,11 @@ pub fn validation_batches(ids: &[String]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Query parameters for one `videos.list` batch call, minus the API key
-/// (callers append `&key=` from runtime config at the edge).
-///
-/// Only the parts needed for validation are requested: `status` (privacy
-/// + embeddable), `contentDetails` (duration/region) and `snippet`
-/// (title/channel for the moderation display). No search endpoint is
-/// ever addressed from this module.
+/// Query parameters for one `videos.list` batch call. The API key is not
+/// included here; callers append it from runtime config at the edge.
+/// Only validation parts are requested (`status`, `contentDetails`,
+/// `snippet` for the moderation display). No search endpoint is ever
+/// addressed from this module.
 pub fn videos_list_query(ids: &[String]) -> String {
     format!(
         "part=status%2CcontentDetails%2Csnippet&id={}&maxResults=50",
