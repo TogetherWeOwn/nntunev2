@@ -70,7 +70,7 @@ pub const MAX_SEARCH_OFFSET: u32 = 1_000;
 /// Upper bound on `q` length, in chars. Bounds trigram work and KV keys.
 const MAX_QUERY_CHARS: usize = 100;
 
-/// Hyperdrive / KV binding names: must match `wrangler.toml.example`.
+/// Hyperdrive / KV binding names: must match `wrangler.toml`.
 const MB_DB_BINDING: &str = "MB_DB";
 const MB_CACHE_BINDING: &str = "MB_CACHE";
 
@@ -1230,7 +1230,7 @@ mod http_layer {
     }
 
     /// Read a deploy-time plain var, ignoring empty values. `BUILD_SHA` is
-    /// public build identity (see `wrangler.toml.example`): a secret binding
+    /// public build identity (see `wrangler.toml`): a secret binding
     /// is tried first so an operator-supplied value wins, then a plain var,
     /// mirroring the api/ingest workers' reader.
     fn env_string(env: &Env, name: &str) -> Option<String> {

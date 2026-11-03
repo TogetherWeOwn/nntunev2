@@ -3,7 +3,7 @@
 //! Billing truth lives with the metering card; these events are the ingest
 //! pipeline's usage signal (stage entered, outcome, attempt). The worker
 //! writes them through the `INGEST_METER` dataset binding (see
-//! `wrangler.toml.example`; the runtime write is `EdgeMeterSink` in
+//! `wrangler.toml`; the runtime write is `EdgeMeterSink` in
 //! `lib.rs`) while this module owns the event shape.
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::queue::{QueueMsg, WORKFLOW_STEPS};
 
 /// Analytics Engine binding name: must match `[analytics_engine_datasets]`
-/// in `wrangler.toml.example`.
+/// in `wrangler.toml`.
 pub const METER_DATASET_BINDING: &str = "INGEST_METER";
 /// Analytics Engine dataset receiving ingest usage events.
 pub const METER_DATASET: &str = "nntune_ingest_meter";

@@ -42,6 +42,12 @@ reconciliation table in ``docs/ops.md``) is recorded in the manifest as
 is fixed the entry goes stale and this check fails until it is removed.
 Known-drift entries are rejected for id-typed bindings (KV, Hyperdrive).
 
+A manifest binding may declare ``absent_in = ["staging"]`` (or ``"prod"``)
+for bindings that must not exist in that environment (e.g. a service
+binding whose target is not deployed there). Absence is enforced strictly
+in both directions, and the staging/prod skew check ignores exactly the
+manifest-declared absences.
+
 This script checks binding *presence, shape, resource values and inventory
 membership*, and not KV keys. For real configs, top-level bindings are also
 checked against production because a default ``wrangler deploy`` uses them.
@@ -542,7 +548,7 @@ def load_manifest(path):
             path, worker, "binding", f"worker {name}: [[worker.binding]]"
         ):
             where = f"worker {name}: binding"
-            extra = set(binding) - {"binding", "type", *ENVS}
+            extra = set(binding) - {"binding", "type", "absent_in", *ENVS}
             if extra:
                 raise ParityError(f"{path}: {where} has unknown keys {sorted(extra)}")
             type_name = _manifest_str(path, where, binding, "type")
@@ -554,14 +560,40 @@ def load_manifest(path):
                 raise ParityError(f"{path}: worker {name}: duplicate binding {key}")
             seen_bindings.add(key)
             where = f"worker {name}: binding {binding_name}"
+            absent_in = binding.get("absent_in", [])
+            if absent_in is None:
+                absent_in = []
+            if not isinstance(absent_in, list) or not all(
+                isinstance(env, str) for env in absent_in
+            ):
+                raise ParityError(f"{path}: {where}: absent_in must be an array of strings")
+            if len(set(absent_in)) != len(absent_in):
+                raise ParityError(f"{path}: {where}: absent_in lists a duplicate environment")
+            for env in absent_in:
+                if env not in ENVS:
+                    raise ParityError(
+                        f"{path}: {where}: absent_in names an unknown environment {env!r}"
+                    )
+            if len(absent_in) >= len(ENVS):
+                raise ParityError(
+                    f"{path}: {where}: absent_in must leave at least one environment"
+                )
+            expected = {
+                env: _manifest_str(path, where, binding, env, required=False)
+                for env in ENVS
+            }
+            for env in absent_in:
+                if expected[env] is not None:
+                    raise ParityError(
+                        f"{path}: {where}: absent_in lists {env} but an expected "
+                        f"resource is set for it"
+                    )
             bindings.append(
                 {
                     "type": type_name,
                     "binding": binding_name,
-                    "expected": {
-                        env: _manifest_str(path, where, binding, env, required=False)
-                        for env in ENVS
-                    },
+                    "expected": expected,
+                    "absent_in": set(absent_in),
                 }
             )
         workers.append({"name": name, "config": config, "bindings": bindings})
@@ -710,9 +742,18 @@ def check(root, manifest_path, ops_path):
                         )
                     )
                 elif key in required and item["type"] != "assets":
-                    # A default wrangler deploy uses the top-level production
-                    # bindings, independently of [env.production].
-                    check_resource(required[key], "prod", item)
+                    if "prod" in required[key]["absent_in"]:
+                        drifts.append(
+                            _fmt(
+                                name, "prod", item["binding"], item["type"],
+                                "top-level binding is declared but the manifest "
+                                "requires it to be absent in prod (absent_in)",
+                            )
+                        )
+                    else:
+                        # A default wrangler deploy uses the top-level production
+                        # bindings, independently of [env.production].
+                        check_resource(required[key], "prod", item)
 
         for binding in worker["bindings"]:
             for env in ENVS:
@@ -742,6 +783,16 @@ def check(root, manifest_path, ops_path):
             for key, binding in sorted(required.items()):
                 type_name, binding_name = key
                 actual = present.get(key)
+                if env in binding["absent_in"]:
+                    if actual is not None:
+                        drifts.append(
+                            _fmt(
+                                name, env, binding_name, type_name,
+                                "binding is declared but the manifest requires it "
+                                "to be absent here (absent_in)",
+                            )
+                        )
+                    continue
                 if actual is None:
                     drifts.append(
                         _fmt(name, env, binding_name, type_name, "missing required binding")
@@ -760,6 +811,9 @@ def check(root, manifest_path, ops_path):
         staging_keys = set(effective["staging"])
         prod_keys = set(effective["prod"])
         for type_name, binding_name in sorted(staging_keys - prod_keys):
+            key = (type_name, binding_name)
+            if key in required and "prod" in required[key]["absent_in"]:
+                continue
             drifts.append(
                 _fmt(
                     name, "prod", binding_name, type_name,
@@ -767,6 +821,9 @@ def check(root, manifest_path, ops_path):
                 )
             )
         for type_name, binding_name in sorted(prod_keys - staging_keys):
+            key = (type_name, binding_name)
+            if key in required and "staging" in required[key]["absent_in"]:
+                continue
             drifts.append(
                 _fmt(
                     name, "staging", binding_name, type_name,
