@@ -393,6 +393,16 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     secrets/hostnames/binding material, and the health endpoint still
     reports exactly `{ ok, version }` (regression guard).
 
+- CC0 fixture-audio helper (`e2e/tests/cc0-fixture.spec.ts:22`
+  "unconfigured environment skips with a reason, never fails", plus the
+  manifest-error pin at `e2e/tests/cc0-fixture.spec.ts:30`) is offline
+  test infrastructure for the CC0-only fixture rule
+  (`docs/fixture-audio-licences.md`): it proves the TS fetch-by-key
+  helper reports a skip — not a failure — when R2 read access is not
+  configured, which is the CI default. It exercises no product surface
+  and is not M1 coverage; specs that later fetch real CC0 audio through
+  it cite their own rows.
+
 ## Re-verifying this matrix
 
 ```sh

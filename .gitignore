@@ -90,3 +90,8 @@ test-results/
 
 # The e2e harness pins its own lockfile for reproducible CI installs.
 !e2e/package-lock.json
+
+# CC0 fixture audio fetched from R2 by fixtures/cc0/fetch_fixture.py
+# (manifests are committed; audio bytes never are — see
+# docs/fixture-audio-licences.md).
+/.fixture-cache/
