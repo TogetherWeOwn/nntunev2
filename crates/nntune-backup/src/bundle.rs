@@ -6,7 +6,8 @@
 //! the manifest, so `verify_bundle` detects truncation or tampering
 //! before any restore. The bundle carries ciphertext and wrapped keys
 //! only: KEK values never appear here (keyring entries are version
-//! numbers + dates, never material).
+//! numbers only, never material; date ranges live in the operator
+//! manifest, not the bundle).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,10 @@ pub struct TableCount {
 }
 
 /// Keyring coverage metadata: which KEK versions the backed-up rows
-/// reference. Versions only — never key material.
+/// reference. Version numbers only — never key material, and no date
+/// ranges: the active date ranges live in the operator keyring
+/// manifest (`docs/offsite-backup-runbook.md` §1), which this bundle
+/// manifest only mirrors by version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeyringCoverage {
     pub versions: Vec<u32>,
@@ -184,9 +188,19 @@ impl BundleWriter {
 }
 
 /// Read the manifest without trusting it: unknown format versions
-/// refuse fail-closed before any restore.
+/// refuse fail-closed before any restore. A symlinked manifest is
+/// refused outright: it could point outside the bundle boundary.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
-    let raw = std::fs::read(dir.join(MANIFEST_FILE)).map_err(|_| BundleError::MissingFile {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let meta = std::fs::symlink_metadata(&manifest_path).map_err(|_| BundleError::MissingFile {
+        path: MANIFEST_FILE.to_string(),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(BundleError::Io(format!(
+            "refuses symlink: {MANIFEST_FILE}"
+        )));
+    }
+    let raw = std::fs::read(&manifest_path).map_err(|_| BundleError::MissingFile {
         path: MANIFEST_FILE.to_string(),
     })?;
     let manifest: Manifest =
@@ -198,14 +212,23 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
 }
 
 /// Verify every manifest-listed file exists with the recorded hash.
-/// Returns the manifest on success.
+/// Returns the manifest on success. Symlinks are refused: `fs::read`
+/// follows them, so without this check a crafted bundle could verify
+/// bytes from outside the bundle boundary.
 pub fn verify_bundle(dir: &Path) -> Result<Manifest, BundleError> {
     let manifest = read_manifest(dir)?;
     for f in &manifest.files {
         if f.path.is_empty() || f.path.starts_with('/') || f.path.split('/').any(|p| p == "..") {
             return Err(BundleError::Io(format!("unsafe bundle path: {}", f.path)));
         }
-        let bytes = std::fs::read(dir.join(&f.path)).map_err(|_| BundleError::MissingFile {
+        let full = dir.join(&f.path);
+        let meta = std::fs::symlink_metadata(&full).map_err(|_| BundleError::MissingFile {
+            path: f.path.clone(),
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(BundleError::Io(format!("refuses symlink: {}", f.path)));
+        }
+        let bytes = std::fs::read(&full).map_err(|_| BundleError::MissingFile {
             path: f.path.clone(),
         })?;
         if bytes.len() as u64 != f.bytes || sha256_hex(&bytes) != f.sha256_hex {
@@ -255,6 +278,31 @@ mod tests {
             Err(BundleError::HashMismatch { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinks_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-{}", std::process::id(), 4));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = writer_in(&dir);
+        w.stage_file("blobs/x.bin", b"secretbox-bytes").unwrap();
+        w.finish().unwrap();
+        // Swap a verified file for a symlink to bytes outside the
+        // bundle: verification must refuse, not follow.
+        let outside = std::env::temp_dir().join(format!("nntune-backup-test-{}-outside", std::process::id()));
+        std::fs::write(&outside, b"secretbox-bytes").unwrap();
+        std::fs::remove_file(dir.join("blobs/x.bin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("blobs/x.bin")).unwrap();
+        #[cfg(unix)]
+        assert!(matches!(
+            verify_bundle(&dir),
+            Err(BundleError::Io(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
     }
 
     #[test]

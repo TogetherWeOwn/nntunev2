@@ -8,7 +8,7 @@ use nntune_backup::drill;
 
 #[test]
 fn evidence_field_set_is_pinned() {
-    let pt: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
+    let pt: Vec<u8> = (0..drill::MIN_FIXTURE_BYTES as usize).map(|i| (i % 251) as u8).collect();
     let (ev, bundle_dir, _) = drill::run_synthetic_drill(&pt, "contract-test").unwrap();
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
     let got: BTreeSet<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -40,7 +40,7 @@ fn evidence_field_set_is_pinned() {
 
 #[test]
 fn evidence_never_carries_article_or_key_references() {
-    let pt: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
+    let pt: Vec<u8> = (0..drill::MIN_FIXTURE_BYTES as usize).map(|i| (i % 251) as u8).collect();
     let (ev, bundle_dir, _) = drill::run_synthetic_drill(&pt, "contract-test").unwrap();
     let json = serde_json::to_string(&ev).unwrap().to_lowercase();
     for forbidden in [

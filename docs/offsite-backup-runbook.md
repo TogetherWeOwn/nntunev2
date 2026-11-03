@@ -84,7 +84,9 @@ python3 scripts/cargo_cache.py run -- build -p nntune-backup
 What it does (`crates/nntune-backup/src/drill.rs`): seals a random
 fixture (ephemeral KEK → random per-file media key → rclone-crypt
 ciphertext via `nntune-core` → v2 envelope row), writes the bundle,
-wipes every live copy, restores the bundle into an isolated directory,
+wipes every drill-owned copy (KEK, media key, derived — the caller's
+fixture buffer is kept only for the final hash comparison), restores
+the bundle into an isolated directory,
 re-verifies it there, opens the envelope with the recovered keyring
 only, decrypts the full plaintext through two ranged reads
 (article-window shaped), and compares SHA-256. Exit 0 prints the
@@ -111,19 +113,36 @@ serialization cannot leak one.
 3. Restore the dump; run the KEK re-wrap pass first if the backup
    predates a rotation (`docs/security/kek-rotation.md`,
    `docs/database-restore-runbook.md`).
-4. Verify every envelope row opens — authentication only, no
-   plaintext is printed:
+4. Verify every `track_sources` envelope row opens — authentication
+   only, no plaintext is printed. `track_sources` is the wrapped
+   per-file-key table that gates library recovery; provider credential
+   envelopes use a different table/AAD binding and are verified by
+   their own open path when first used post-restore. Presence of every
+   backed-up table is still covered by the dump restore plus the
+   per-table row counts recorded in step 5.
    ```sh
-   psql "$RESTORE_DSN" -c "COPY (SELECT user_id, row_key, nzb_ref_envelope_version AS envelope_version, \
+   umask 077
+   SCRATCH="$(mktemp -d)"
+   trap 'shred -u "$SCRATCH/rows.jsonl" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+   psql "$RESTORE_DSN" -c "COPY (SELECT 'global' AS user_id, track_id::text AS row_key, \
+     nzb_ref_envelope_version AS envelope_version, \
      nzb_ref_payload_format AS payload_format, nzb_ref_kek_version AS kek_version, \
      encode(nzb_ref_dek_wrapped_nonce,'hex') AS dek_wrapped_nonce_hex, \
      encode(nzb_ref_dek_wrapped,'hex') AS dek_wrapped_hex, \
      encode(nzb_ref_payload_nonce,'hex') AS payload_nonce_hex, \
-     encode(nzb_ref_ciphertext,'hex') AS ciphertext_hex \
-     FROM track_sources) TO STDOUT" > /tmp/rows.jsonl
+     encode(nzb_ref_encrypted,'hex') AS ciphertext_hex \
+     FROM track_sources) TO STDOUT" > "$SCRATCH/rows.jsonl"
    BACKUP_DRILL_KEK_V1="$(op read …)" BACKUP_DRILL_KEK_V2="$(op read …)" \
-     ./target/debug/backup-drill verify --rows /tmp/rows.jsonl > /tmp/verify-report.json
+     ./target/debug/backup-drill verify --rows "$SCRATCH/rows.jsonl" > "$SCRATCH/verify-report.json"
    ```
+   Post-migration-0027 notes: `track_sources` has no `user_id` column
+   (one global slot per `track_id`), no `row_key` column, and the
+   ciphertext column is `nzb_ref_encrypted`. `'global'` is the sealer's
+   tagged global `owner_scope` per ADR 0002 and `track_id::text` the
+   `row_key`; both must equal the seal-time AAD inputs (pinned where
+   the pipeline seals) — any mismatch fails closed as failed rows,
+   never as a silent pass. The export lives in a `0700` scratch dir,
+   never world-readable `/tmp` files, and is shredded on exit.
    KEKs arrive as 64 hex chars via environment (operator-store read,
    never a file, never a log); exit 2 on any failure, including zero
    rows. The report carries `rows`, `ok`, `failed` and

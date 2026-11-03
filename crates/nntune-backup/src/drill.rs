@@ -31,6 +31,15 @@ const RCLONE_MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
 const HEADER_NONCE_LEN: usize = 24;
 const PLAIN_BLOCK: usize = 64 * 1024;
 const DERIVED_LEN: usize = 80;
+/// First ranged-read length (article-window shaped). The fixture must
+/// exceed it so *both* ranged reads authenticate ciphertext, and it
+/// already exceeds one 64 KiB rclone block, so the drill also proves
+/// decrypt across a block boundary.
+const FIRST_READ_LEN: u64 = 70_000;
+/// Minimum fixture size: anything smaller would report success without
+/// authenticating a ciphertext block (`--bytes 0` is the degenerate
+/// case: two zero-length reads, matching empty hashes).
+pub const MIN_FIXTURE_BYTES: u64 = FIRST_READ_LEN + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrillError {
@@ -39,6 +48,7 @@ pub enum DrillError {
     Crypto(String),
     KeyringMissingVersion(u32),
     HashMismatch,
+    FixtureTooSmall,
 }
 
 impl core::fmt::Display for DrillError {
@@ -51,6 +61,10 @@ impl core::fmt::Display for DrillError {
                 write!(f, "drill keyring missing version: {v}")
             }
             DrillError::HashMismatch => write!(f, "drill hash mismatch"),
+            DrillError::FixtureTooSmall => write!(
+                f,
+                "drill fixture too small: must exceed {FIRST_READ_LEN} bytes"
+            ),
         }
     }
 }
@@ -287,7 +301,7 @@ pub fn restore_and_decrypt(
     // the row: try sizes by block arithmetic from the ciphertext
     // length (last block may be partial).
     let plaintext_size = plaintext_size_from_blob(blob.len() as u64);
-    let mut first = vec![0u8; plaintext_size.min(70_000) as usize];
+    let mut first = vec![0u8; plaintext_size.min(FIRST_READ_LEN) as usize];
     let n1 = nntune_core::decrypt::rclone::read_at(&blob, &derived, plaintext_size, &mut first, 0)
         .map_err(|e| DrillError::Crypto(e.to_string()))?;
     first.truncate(n1);
@@ -345,9 +359,16 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
         let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
+            // `file_type` does not follow links (unlike `is_dir` on the
+            // path): an offsite bundle containing a symlink refuses the
+            // restore instead of traversing outside the bundle boundary.
+            let ftype = entry.file_type().map_err(|e| e.to_string())?;
+            if ftype.is_symlink() {
+                return Err(format!("refuses symlink: {}", entry.path().display()));
+            }
             let path = entry.path();
             let rel = path.strip_prefix(src).map_err(|e| e.to_string())?;
-            if path.is_dir() {
+            if ftype.is_dir() {
                 stack.push(path);
             } else {
                 std::fs::copy(&path, dst.join(rel)).map_err(|e| e.to_string())?;
@@ -386,6 +407,12 @@ pub fn run_synthetic_drill(
     plaintext: &[u8],
     tool: &str,
 ) -> Result<(DrillEvidence, PathBuf, PathBuf), DrillError> {
+    // Fail closed on fixtures that would pass without authenticating a
+    // ciphertext block: empty or sub-`FIRST_READ_LEN` plaintexts leave
+    // one ranged read empty and never cross a block boundary.
+    if (plaintext.len() as u64) < MIN_FIXTURE_BYTES {
+        return Err(DrillError::FixtureTooSmall);
+    }
     let seq = DRILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tag = format!("{}-{}-{seq}", std::process::id(), now_unix());
     let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
@@ -469,6 +496,45 @@ mod tests {
             err,
             DrillError::Bundle(BundleError::HashMismatch { .. })
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn undersized_fixture_fails_closed() {
+        // Empty and sub-`FIRST_READ_LEN` fixtures must not report
+        // success: they authenticate no ciphertext block.
+        assert_eq!(
+            run_synthetic_drill(&[], "test").unwrap_err(),
+            DrillError::FixtureTooSmall
+        );
+        let small = vec![0u8; FIRST_READ_LEN as usize];
+        assert_eq!(
+            run_synthetic_drill(&small, "test").unwrap_err(),
+            DrillError::FixtureTooSmall
+        );
+        // Exactly one byte over the first-read length passes admission
+        // (and crosses a 64 KiB block boundary).
+        let pt: Vec<u8> = (0..MIN_FIXTURE_BYTES).map(|i| (i % 251) as u8).collect();
+        let (ev, bundle_dir, restore_dir) = run_synthetic_drill(&pt, "test").unwrap();
+        assert!(ev.hash_match);
+        let _ = std::fs::remove_dir_all(bundle_dir.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&restore_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_dir_refuses_symlink() {
+        let tag = format!("{}-symlink", std::process::id());
+        let base = std::env::temp_dir().join(format!("nntune-drill-{tag}"));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.bin"), b"real").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(src.join("real.bin"), src.join("link.bin")).unwrap();
+        let err = copy_dir(&src, &dst).unwrap_err();
+        assert!(err.contains("symlink"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
