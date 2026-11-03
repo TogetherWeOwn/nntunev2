@@ -166,8 +166,13 @@ done
 if [[ -n "$phase2_present" ]]; then
   for table in $phase2_tables; do
     tsv="$dump_dir/mbdump-$table.tsv"
-    if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
-      echo "import: refusing $tsv (phase-2 tables import as a group: present, readable and nonempty required)" >&2
+    # Present and readable, but possibly empty: the ETL publishes a
+    # zero-row file when a projection is legitimately empty (every
+    # recording-recording link is a music-video link, so the song-relation
+    # file is empty). Empty phase-2 files import as a no-op below; only a
+    # missing or unreadable file refuses the group.
+    if [[ ! -f "$tsv" || ! -r "$tsv" ]]; then
+      echo "import: refusing $tsv (phase-2 tables import as a group: present and readable required)" >&2
       exit 1
     fi
   done
@@ -194,6 +199,17 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$script_dir/pg-env.sh"
 configure_pg_env_from_database_url
 
+# A phase-2 snapshot against a database without migration 0035 would commit
+# every base chunk and then fail at the first phase-2 table. Refuse before
+# any table changes when any of the fifteen phase-2 tables is missing.
+if [[ -n "$phase2_present" ]]; then
+  phase2_tables_present="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN (SELECT 'mb_' || t FROM unnest(string_to_array('$phase2_tables', ' ')) AS t);")"
+  if [[ "$phase2_tables_present" != "15" ]]; then
+    echo "import: refusing phase-2 snapshot ($phase2_tables_present/15 phase-2 tables present; apply migration 0035 first)" >&2
+    exit 1
+  fi
+fi
+
 # Chunk scratch lives here for the whole run (one rm at the end). A kill -9
 # skips the EXIT trap and leaks this directory; chunk files are disposable
 # (the cursor is the resume state, never these files) and the platform GCs
@@ -214,7 +230,8 @@ refuse_all_poison_dump() {
   fi
 }
 
-# shellcheck disable=SC2086 -- intentional word-splitting of the table lists.
+# Intentional word-splitting of the table lists.
+# shellcheck disable=SC2086
 for table in $base_tables$phase2_present; do
   tsv="$dump_dir/mbdump-$table.tsv"
   prune_sql=""
@@ -287,6 +304,16 @@ for table in $base_tables$phase2_present; do
     # Phase-2 tables below, in FK order: entity tables first (work, label),
     # then relations, credits, aliases, and release_label last. Entity
     # tables carry no prune (same as artist/url): rows are keyed by MBID.
+    # Phase-2 child tables prune as complete snapshots: every row of one
+    # dump carries that dump's timestamp, so after the upsert the table max
+    # is the newest dump's timestamp and anything older predates it. A
+    # parent the newer dump dropped entirely leaves only older rows, which
+    # the table-wide max still catches (a per-parent max would equal the
+    # old rows' own timestamp and keep them). Unlike mb_track, a parent
+    # absent from the dump loses its rows: the file lists every edge.
+    # Empty tables max to NULL (no-op), and an older-dump rerun keeps the
+    # newer max, so resurrected rows are pruned again instead of rolling
+    # state back.
     work)
       columns="mbid, name, work_type, updated_at"
       upsert="name = EXCLUDED.name, work_type = EXCLUDED.work_type, updated_at = EXCLUDED.updated_at"
@@ -301,89 +328,89 @@ for table in $base_tables$phase2_present; do
       columns="artist_mbid, recording_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(artist_mbid, recording_mbid, link_name)"
-      # Per-artist newest-dump prune (see artist_url above): a newer dump
-      # that drops one of this artist's relation links would otherwise keep
-      # serving the deleted relation.
-      final_prune_sql="DELETE FROM mb_artist_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_recording x WHERE x.artist_mbid = old.artist_mbid);"
+      # Complete-snapshot prune (see the phase-2 note above): the dump
+      # lists every edge, so a dropped relation dies with the table max,
+      # even when its artist vanished from the newer dump entirely.
+      final_prune_sql="DELETE FROM mb_artist_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_recording x);"
       ;;
     artist_release)
       columns="artist_mbid, release_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(artist_mbid, release_mbid, link_name)"
-      final_prune_sql="DELETE FROM mb_artist_release old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_release x WHERE x.artist_mbid = old.artist_mbid);"
+      final_prune_sql="DELETE FROM mb_artist_release old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_release x);"
       ;;
     artist_work)
       columns="artist_mbid, work_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(artist_mbid, work_mbid, link_name)"
-      final_prune_sql="DELETE FROM mb_artist_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_work x WHERE x.artist_mbid = old.artist_mbid);"
+      final_prune_sql="DELETE FROM mb_artist_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_work x);"
       ;;
     recording_work)
       columns="recording_mbid, work_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(recording_mbid, work_mbid, link_name)"
-      final_prune_sql="DELETE FROM mb_recording_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_work x WHERE x.recording_mbid = old.recording_mbid);"
+      final_prune_sql="DELETE FROM mb_recording_work old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_work x);"
       ;;
     recording_recording)
       columns="recording_a_mbid, recording_b_mbid, link_name, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(recording_a_mbid, recording_b_mbid, link_name)"
-      # Per-endpoint newest-dump prune (see recording_music_video above):
-      # song relations are directed rows, so an old row dies once either
-      # endpoint has a newer row under any link name.
-      final_prune_sql="DELETE FROM mb_recording_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_recording x WHERE x.recording_a_mbid IN (old.recording_a_mbid, old.recording_b_mbid) OR x.recording_b_mbid IN (old.recording_a_mbid, old.recording_b_mbid));"
+      # Complete-snapshot prune (see the phase-2 note above): song
+      # relations are directed rows, and the table max retires any pair
+      # the newer dump no longer lists, whatever its endpoints carry.
+      final_prune_sql="DELETE FROM mb_recording_recording old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_recording x);"
       ;;
     release_credit)
       columns="release_mbid, position, artist_mbid, name, join_phrase, updated_at"
       upsert="artist_mbid = EXCLUDED.artist_mbid, name = EXCLUDED.name, join_phrase = EXCLUDED.join_phrase, updated_at = EXCLUDED.updated_at"
       conflict="(release_mbid, position)"
-      # Per-release newest-dump prune (see track above, without the
-      # straddling caveat: one credit row is one row): a newer dump that
-      # drops or reorders this release's credits would otherwise keep
-      # serving the deleted positions.
-      final_prune_sql="DELETE FROM mb_release_credit old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_credit x WHERE x.release_mbid = old.release_mbid);"
+      # Complete-snapshot prune (see the phase-2 note above; one credit
+      # row is one row, so no straddling caveat as with track): a newer
+      # dump that drops or reorders credits stops serving the deleted
+      # positions, even for a release with no rows left in the newer dump.
+      final_prune_sql="DELETE FROM mb_release_credit old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_credit x);"
       ;;
     artist_alias)
       columns="artist_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(artist_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_artist_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_alias x WHERE x.artist_mbid = old.artist_mbid);"
+      final_prune_sql="DELETE FROM mb_artist_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_alias x);"
       ;;
     release_alias)
       columns="release_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(release_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_release_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_alias x WHERE x.release_mbid = old.release_mbid);"
+      final_prune_sql="DELETE FROM mb_release_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_alias x);"
       ;;
     recording_alias)
       columns="recording_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(recording_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_recording_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_alias x WHERE x.recording_mbid = old.recording_mbid);"
+      final_prune_sql="DELETE FROM mb_recording_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_alias x);"
       ;;
     release_group_alias)
       columns="release_group_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(release_group_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_release_group_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_group_alias x WHERE x.release_group_mbid = old.release_group_mbid);"
+      final_prune_sql="DELETE FROM mb_release_group_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_group_alias x);"
       ;;
     work_alias)
       columns="work_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(work_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_work_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_work_alias x WHERE x.work_mbid = old.work_mbid);"
+      final_prune_sql="DELETE FROM mb_work_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_work_alias x);"
       ;;
     label_alias)
       columns="label_mbid, name, locale, sort_name, primary_for_locale, updated_at"
       upsert="sort_name = EXCLUDED.sort_name, primary_for_locale = EXCLUDED.primary_for_locale, updated_at = EXCLUDED.updated_at"
       conflict="(label_mbid, name, locale)"
-      final_prune_sql="DELETE FROM mb_label_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_label_alias x WHERE x.label_mbid = old.label_mbid);"
+      final_prune_sql="DELETE FROM mb_label_alias old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_label_alias x);"
       ;;
     release_label)
       columns="release_mbid, label_mbid, catalog_number, updated_at"
       upsert="updated_at = EXCLUDED.updated_at"
       conflict="(release_mbid, label_mbid, catalog_number)"
-      final_prune_sql="DELETE FROM mb_release_label old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_label x WHERE x.release_mbid = old.release_mbid);"
+      final_prune_sql="DELETE FROM mb_release_label old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_release_label x);"
       ;;
     track)
       columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
@@ -419,6 +446,16 @@ for table in $base_tables$phase2_present; do
   # way, so cursor line numbers and part-file ranges agree on every shape.
   total="$(awk 'END { print NR+0 }' "$tsv")"
   if (( 10#$total == 0 )); then
+    if [[ " $phase2_tables " == *" $table "* ]]; then
+      # Zero-row phase-2 projection (see the group preflight above): the
+      # snapshot carries no edges for this table, so there is nothing to
+      # load and no cursor to advance. This deliberately skips the
+      # newest-dump prune for the table: an empty file carries no dump
+      # timestamp to prune against, so rows stay at worst stale, never
+      # truncated.
+      echo "import: $table dump is empty (zero-row phase-2 projection); skipping"
+      continue
+    fi
     echo "import: refusing empty $table dump; replication state remains unchanged" >&2
     exit 1
   fi

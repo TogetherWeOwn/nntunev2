@@ -1001,10 +1001,13 @@ d = sys.argv[1]
 def eid(n): return str(uuid.UUID(int=n))
 with open(f'{d}/mbdump-artist.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1\t1, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
+    f.write(f'{eid(2)}\tBand 2\t2, Band\tGroup\tUS\t2024-05-01T12:00:00Z\n')
 with open(f'{d}/mbdump-release_group.tsv', 'w') as f:
     f.write(f'{eid(400001)}\tGroup 1\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(400002)}\tGroup 2\t{eid(1)}\tAlbum\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-release.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t{eid(1)}\tAlbum\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(2)}\tAlbum 2\tAlbum\t2024\t\\N\t{eid(400001)}\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-recording.tsv', 'w') as f:
     for i in range(1, 4):
         f.write(f'{eid(200000+i)}\t{eid(100001)}\tTrack {i}\t{i}\t180000\t2024-05-03T00:00:00Z\n')
@@ -1023,63 +1026,96 @@ with open(f'{d}/mbdump-recording_isrc.tsv', 'w') as f:
     f.write(f'{eid(200001)}\tUSABC2400001\t2024-05-02T00:00:00Z\n')
 with open(f'{d}/mbdump-work.tsv', 'w') as f:
     f.write(f'{eid(700001)}\tWork 1\tSong\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(700002)}\tWork 2\tSong\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-label.tsv', 'w') as f:
     f.write(f'{eid(800001)}\tLabel 1\t1903\tProduction\t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(800002)}\tLabel 2\t1904\tProduction\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
     f.write(f'{eid(1)}\t{eid(200001)}\tcomposer\t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(1)}\t{eid(200002)}\tproducer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(200003)}\tperformer\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
     f.write(f'{eid(1)}\t{eid(100001)}\tproducer\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(100002)}\tproducer\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
     f.write(f'{eid(1)}\t{eid(700001)}\tlyricist\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\t{eid(700001)}\tcomposer\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
     f.write(f'{eid(200001)}\t{eid(700001)}\tperformance\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(700001)}\tarrangement\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
     f.write(f'{eid(200001)}\t{eid(200002)}\tcover\t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(200001)}\t{eid(200003)}\tcover\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\t{eid(200003)}\tmedley\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t0\t{eid(1)}\tCredit 1\t & \t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(100001)}\t1\t{eid(1)}\tCredit 2\t & \t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t0\t{eid(2)}\tCredit 9\t & \t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(1)}\tB1\ten\tB1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(2)}\tBand 2 Alt\ten\tAlt, Band 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
     f.write(f'{eid(100001)}\tAlbum Alt\ten\tAlt, Album\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\tAlbum 2 Alt\ten\tAlt, Album 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
     f.write(f'{eid(200001)}\tTrack 1 Alt\ten\tAlt, Track 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(200002)}\tTrack 2 Alt\ten\tAlt, Track 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
     f.write(f'{eid(400001)}\tGroup 1 Alt\ten\tAlt, Group 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(400002)}\tGroup 2 Alt\ten\tAlt, Group 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
     f.write(f'{eid(700001)}\tWork 1 Alt\ten\tAlt, Work 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(700002)}\tWork 2 Alt\ten\tAlt, Work 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
     f.write(f'{eid(800001)}\tLabel 1 Alt\ten\tAlt, Label 1\tfalse\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(800002)}\tLabel 2 Alt\ten\tAlt, Label 2\tfalse\t2024-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t{eid(800001)}\tCAT-001\t2024-05-04T00:00:00Z\n')
     f.write(f'{eid(100001)}\t{eid(800002)}\tCAT-002\t2024-05-04T00:00:00Z\n')
+    f.write(f'{eid(100002)}\t{eid(800001)}\tCAT-009\t2024-05-04T00:00:00Z\n')
 EOF
 bash "$SELF_DIR/import.sh" "$REL2" >/dev/null
-check "rel2: artist recordings before" "2" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
-check "rel2: song relations before" "2" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
-check "rel2: release credits before" "2" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
-check "rel2: artist aliases before" "2" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
-check "rel2: release labels before" "2" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
+check "rel2: artist recordings before" "3" "$(db -c 'SELECT count(*) FROM mb_artist_recording;')"
+check "rel2: song relations before" "3" "$(db -c 'SELECT count(*) FROM mb_recording_recording;')"
+check "rel2: release credits before" "3" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
+check "rel2: artist aliases before" "3" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
+check "rel2: release labels before" "3" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
 cp -R "$REL2" "$REL2-newer"
 python3 - "$REL2-newer" <<'EOF'
 import sys, uuid
 d = sys.argv[1]
 def eid(n): return str(uuid.UUID(int=n))
-# The producer link, the (200001, 200002) pair, credit position 1, the
-# B1 alias and the CAT-002 edge are all dropped; every surviving row
-# carries a newer timestamp so the per-parent prunes fire.
+# Full newer snapshot: the producer link, the (200001, 200002) pair,
+# credit position 1, the B1 alias and the CAT-002 edge are dropped, and one
+# parent per phase-2 table loses every edge (artist 2, release 100002,
+# recording 200002, group 400002, work 700002, label 800002 and the
+# (200002, 200003) pair whose both endpoints vanish). Every surviving row
+# carries a newer timestamp so the snapshot prunes fire.
 with open(f'{d}/mbdump-artist_recording.tsv', 'w') as f:
     f.write(f'{eid(1)}\t{eid(200001)}\tcomposer\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_release.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(100001)}\tproducer\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-artist_work.tsv', 'w') as f:
+    f.write(f'{eid(1)}\t{eid(700001)}\tlyricist\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_work.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\t{eid(700001)}\tperformance\t2025-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-recording_recording.tsv', 'w') as f:
     f.write(f'{eid(200001)}\t{eid(200003)}\tcover\t2025-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_credit.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t0\t{eid(1)}\tCredit 1\t & \t2025-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-artist_alias.tsv', 'w') as f:
     f.write(f'{eid(1)}\tBand 1 Alt\ten\t1 Alt, Band\ttrue\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_alias.tsv', 'w') as f:
+    f.write(f'{eid(100001)}\tAlbum Alt\ten\tAlt, Album\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-recording_alias.tsv', 'w') as f:
+    f.write(f'{eid(200001)}\tTrack 1 Alt\ten\tAlt, Track 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-release_group_alias.tsv', 'w') as f:
+    f.write(f'{eid(400001)}\tGroup 1 Alt\ten\tAlt, Group 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-work_alias.tsv', 'w') as f:
+    f.write(f'{eid(700001)}\tWork 1 Alt\ten\tAlt, Work 1\tfalse\t2025-05-04T00:00:00Z\n')
+with open(f'{d}/mbdump-label_alias.tsv', 'w') as f:
+    f.write(f'{eid(800001)}\tLabel 1 Alt\ten\tAlt, Label 1\tfalse\t2025-05-04T00:00:00Z\n')
 with open(f'{d}/mbdump-release_label.tsv', 'w') as f:
     f.write(f'{eid(100001)}\t{eid(800001)}\tCAT-001\t2025-05-04T00:00:00Z\n')
 EOF
@@ -1094,9 +1130,32 @@ check "rel2: dropped alias pruned" "1" "$(db -c 'SELECT count(*) FROM mb_artist_
 check "rel2: surviving alias kept" "Band 1 Alt" "$(db -c "SELECT name FROM mb_artist_alias WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=1))')';")"
 check "rel2: dropped label edge pruned" "1" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
 check "rel2: surviving label edge kept" "CAT-001" "$(db -c "SELECT catalog_number FROM mb_release_label WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100001))')';")"
+# A parent the newer snapshot drops entirely must lose its old rows too:
+# the snapshot prune keys on the table max, not on the parent's own rows.
+check "rel2: vanished artist loses relation links" "0" "$(db -c "SELECT count(*) FROM mb_artist_recording WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving artist release link kept" "1" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "rel2: vanished artist loses release links" "0" "$(db -c "SELECT count(*) FROM mb_artist_release WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving artist work link kept" "1" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "rel2: vanished artist loses work links" "0" "$(db -c "SELECT count(*) FROM mb_artist_work WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving recording work link kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "rel2: vanished recording loses work links" "0" "$(db -c "SELECT count(*) FROM mb_recording_work WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')';")"
+check "rel2: pair with both endpoints vanished pruned" "0" "$(db -c "SELECT count(*) FROM mb_recording_recording WHERE recording_a_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')' AND recording_b_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200003))')';")"
+check "rel2: vanished release loses credits" "0" "$(db -c "SELECT count(*) FROM mb_release_credit WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
+check "rel2: vanished artist loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_artist_alias WHERE artist_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=2))')';")"
+check "rel2: surviving release alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "rel2: vanished release loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_release_alias WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
+check "rel2: surviving recording alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "rel2: vanished recording loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_recording_alias WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200002))')';")"
+check "rel2: surviving group alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "rel2: vanished group loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_release_group_alias WHERE release_group_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=400002))')';")"
+check "rel2: surviving work alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "rel2: vanished work loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_work_alias WHERE work_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=700002))')';")"
+check "rel2: surviving label alias kept" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
+check "rel2: vanished label loses aliases" "0" "$(db -c "SELECT count(*) FROM mb_label_alias WHERE label_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=800002))')';")"
+check "rel2: vanished release loses label edges" "0" "$(db -c "SELECT count(*) FROM mb_release_label WHERE release_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=100002))')';")"
 # An older dump (new bytes, older timestamps) must neither roll rows back
 # nor resurrect pruned rows: the forward-only upsert guard and the
-# per-parent prunes both refuse to move backwards.
+# snapshot prunes both refuse to move backwards.
 cp -R "$REL2" "$REL2-old"
 python3 - "$REL2-old" <<'EOF'
 import sys
@@ -1114,6 +1173,14 @@ check "rel2: older dump leaves pairs alone" "1" "$(db -c 'SELECT count(*) FROM m
 check "rel2: older dump leaves credits alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_credit;')"
 check "rel2: older dump leaves aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_alias;')"
 check "rel2: older dump leaves label edges alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_label;')"
+check "rel2: older dump leaves release links alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_release;')"
+check "rel2: older dump leaves work links alone" "1" "$(db -c 'SELECT count(*) FROM mb_artist_work;')"
+check "rel2: older dump leaves recording work links alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_work;')"
+check "rel2: older dump leaves release aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_alias;')"
+check "rel2: older dump leaves recording aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_recording_alias;')"
+check "rel2: older dump leaves group aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_release_group_alias;')"
+check "rel2: older dump leaves work aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_work_alias;')"
+check "rel2: older dump leaves label aliases alone" "1" "$(db -c 'SELECT count(*) FROM mb_label_alias;')"
 
 rm -rf "$FIX" "$DUPE" "$NEWER" "$FKDIR" "$POISON" "$CHG" "$CHG-newer" "$CHG-old" "$SPLIT" "$SPLITN" "$SPLITTOOLS" "$REL" "$REL-newer" "$REL-old" "$REL2" "$REL2-newer" "$REL2-old"
 if (( fail != 0 )); then
