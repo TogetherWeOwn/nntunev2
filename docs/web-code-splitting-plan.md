@@ -7,7 +7,7 @@ follow, and the order to apply them in.
 
 ## The constraint
 
-CI fails the build when total client JS exceeds 337,920 raw bytes
+CI fails the build when total client JS exceeds 368,640 raw bytes
 (`.github/scripts/check_web_bundle_budget.py`, run by the `web-build`
 job; see the Bundle budget section of `apps/web/README.md`). Measured
 2026-11-03 on this branch: 314,730 B across 37 files, leaving 23,190 B
