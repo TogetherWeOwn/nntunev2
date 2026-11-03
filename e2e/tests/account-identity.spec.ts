@@ -502,8 +502,9 @@ test.describe('applyAccountToPage browser credential scoping', () => {
       // A re-applied null must not inherit an earlier identity's cookie.
       await applyAccountToPage(page, sessionAccount(), BASE);
       expect(cookies).toHaveLength(1);
+      const clearsBeforeReapply = cleared();
       await applyAccountToPage(page, null, BASE);
-      expect(cleared(), 'null re-apply must clear the planted session cookie').toBeGreaterThan(0);
+      expect(cleared(), 'null re-apply must clear the planted session cookie').toBeGreaterThan(clearsBeforeReapply);
 
       const staging = fakeRoute(`${BASE}/signup`);
       await routeHandler!(staging.route);

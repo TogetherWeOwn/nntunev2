@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::types::Type;
@@ -446,6 +447,25 @@ async fn delete_expired_rate_limit_slots(
     Ok(())
 }
 
+/// Claimed-slot attempts per [`claim_rate_limit_slot`] call. Each attempt
+/// is one statement; a retry only happens when a concurrent claim stole
+/// the selected slot between our snapshot and the insert (the conflict
+/// clause then matches nothing). Past this bound the caller fails closed
+/// as exhausted, so a contended pool degrades to denials, never to a
+/// hung gate: every attempt shares the caller's `TOTAL_TIMEOUT_MS`
+/// deadline via `Self::bounded`.
+const RATE_LIMIT_CLAIM_ATTEMPTS: u32 = 4;
+
+/// Per-attempt dispersal for [`claim_rate_limit_slot`]: successive attempts
+/// start their free-slot search at successive offsets, so K overlapping
+/// claims on one scope (parallel page loads sharing an IP budget on a
+/// fresh hourly pool) aim at K distinct slots instead of all colliding on
+/// slot 0 and spending the [`RATE_LIMIT_CLAIM_ATTEMPTS`] budget on each
+/// other. Monotonic, not random: decorrelation is all the anti-join
+/// needs, and a 32-bit counter keeps wasm32 (no OS RNG at this layer)
+/// and unit fakes deterministic.
+static CLAIM_DISPERSAL: AtomicU32 = AtomicU32::new(0);
+
 /// Claim one slot of `budget` on `client`; `Ok(Some(slot))` is the
 /// claimed slot index (the pair path needs it for its compensating
 /// release), `Ok(None)` is an exhausted budget. Caller has already
@@ -460,10 +480,8 @@ async fn claim_rate_limit_slot(
     // O(1) fast-fail on the exhausted path (single source of truth:
     // `handlers::RATE_LIMIT_EXHAUSTED_SQL`, pinned by statement-shape
     // test): without this guard every denied request pays one DELETE
-    // plus `limit` conflicting upserts (~101 statements with 100 row
-    // locks for the 100-slot finish lookup budget). The slot loop below
-    // still claims atomically, so a concurrent race that passes this
-    // snapshot simply fails closed there.
+    // plus a full-pool anti-join claim that finds nothing. A concurrent
+    // race that passes this snapshot simply fails closed below.
     let exhausted = client
         .query_typed(
             handlers::RATE_LIMIT_EXHAUSTED_SQL,
@@ -482,12 +500,30 @@ async fn claim_rate_limit_slot(
     if exhausted >= i64::try_from(budget.limit).map_err(|_| StoreError)? {
         return Ok(None);
     }
-    for slot in 0..budget.limit {
-        let slot = i32::try_from(slot).map_err(|_| StoreError)?;
+    // One statement per attempt, never one per occupied slot: the
+    // `generate_series` anti-join selects a free-or-expired slot pool-wide
+    // from a per-attempt rotated start, so an admitted request costs O(1)
+    // round trips no matter how full the pool is. A sequential per-slot
+    // loop would make the Nth admitted request pay N conflicting upserts
+    // inside one transaction (up to ~3300 for the bearer pair near the
+    // hourly cap), hitting the store deadline as a 404 before the budget
+    // is used up.
+    let limit_hi = i32::try_from(budget.limit.saturating_sub(1)).map_err(|_| StoreError)?;
+    for _ in 0..RATE_LIMIT_CLAIM_ATTEMPTS {
+        // Fresh offset per attempt, not per call: a loser re-enters at a
+        // different start instead of queueing behind the winner's slot.
+        // Masked to the budget so the modulo below always lands in range
+        // (the exhausted fast-fail above already returned for limit 0).
+        let start =
+            u64::from(CLAIM_DISPERSAL.fetch_add(1, Ordering::Relaxed)) % budget.limit.max(1);
+        let start_i = i64_of(start)?;
         let rows = client
             .query_typed(
                 "INSERT INTO auth_rate_limit_slots (scope_key, action, slot, expires_at) \
-                 VALUES ($1, $2, $3, $4) \
+                 SELECT $1, $2, s, $3 FROM generate_series(0, $4) AS s \
+                 LEFT JOIN auth_rate_limit_slots AS t \
+                 ON t.scope_key = $1 AND t.action = $2 AND t.slot = s AND t.expires_at > $5 \
+                 WHERE t.slot IS NULL ORDER BY ((s::BIGINT + $6) % ($4::BIGINT + 1)) LIMIT 1 \
                  ON CONFLICT (scope_key, action, slot) DO UPDATE \
                  SET expires_at = EXCLUDED.expires_at \
                  WHERE auth_rate_limit_slots.expires_at <= $5 \
@@ -495,15 +531,16 @@ async fn claim_rate_limit_slot(
                 &[
                     (&budget.scope_key, Type::TEXT),
                     (&budget.action, Type::TEXT),
-                    (&slot, Type::INT4),
                     (&expires_at, Type::INT8),
+                    (&limit_hi, Type::INT4),
                     (&now_i, Type::INT8),
+                    (&start_i, Type::INT8),
                 ],
             )
             .await
             .map_err(|_| StoreError)?;
-        if !rows.is_empty() {
-            return Ok(Some(slot));
+        if let Some(row) = rows.first() {
+            return Ok(Some(row.try_get::<_, i32>(0).map_err(|_| StoreError)?));
         }
     }
     Ok(None)
@@ -4231,6 +4268,37 @@ mod tests {
         // Every name in the const list is one of the five pinned above:
         // growing the list without a field pin fails this count.
         assert_eq!(RATE_LIMIT_VAR_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn bearer_lookup_budgets_pass_the_store_admissibility_gate() {
+        // Regression: the bearer gate's hardcoded pools (300/min, 3000/hr)
+        // once exceeded MAX_BUDGET_SLOTS (then 100), so the production
+        // pair claim denied EVERY bearer before any credential lookup —
+        // uniform 404, never the 403 the scope check returns — while the
+        // FakeStore-based unit tests (no cap) stayed green and staging
+        // showed mint-201 plus all-404 bearers. Pin the real gate against
+        // the real consts so the two can never drift apart again.
+        let min = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_min",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_MIN,
+            window_secs: crate::handlers::BEARER_LOOKUP_WINDOW_SECS,
+        };
+        let hour = RateLimitBudget {
+            scope_key: "198.51.100.9",
+            action: "native_rest.bearer_lookup_ip_hour",
+            limit: crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR,
+            window_secs: crate::handlers::BEARER_LOOKUP_HOUR_WINDOW_SECS,
+        };
+        assert!(rate_limit_budget_admissible(&min));
+        assert!(rate_limit_budget_admissible(&hour));
+        // And the cap still bounds the slot scan: the largest live budget
+        // is the hourly pool above.
+        assert_eq!(
+            u64::from(crate::rate_limit::MAX_BUDGET_SLOTS),
+            crate::handlers::BEARER_LOOKUP_ATTEMPTS_PER_IP_PER_HOUR
+        );
     }
 
     #[test]
