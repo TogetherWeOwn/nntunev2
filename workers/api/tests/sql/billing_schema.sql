@@ -298,6 +298,39 @@ BEGIN
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;
+
+    -- PgStore daily ingest count + QA seed (worker_entry.rs): the count
+    -- derives from accepted rows on the BIGINT epoch-day boundary
+    -- (accepted_at / 86400, the 0022 converged shape), and the seed's
+    -- deterministic QA keys make a reseed a no-op that never lowers the
+    -- count. Fixed far-future epoch day (1893456000 = 2030-01-01) on
+    -- user-bil-2, who has no other ingest rows.
+    INSERT INTO ingest_jobs (user_id, idempotency_key, accepted_at, status)
+    SELECT 'user-bil-2', 'qa-seed:' || g, 1893456000, 'done'
+    FROM generate_series(1, 5::bigint) AS g
+    ON CONFLICT (user_id, idempotency_key) DO NOTHING;
+    IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
+        WHERE user_id = 'user-bil-2' AND accepted_at / 86400 = 1893456000 / 86400) <> 5 THEN
+        RAISE EXCEPTION 'daily ingest count must see the five seeded rows';
+    END IF;
+    INSERT INTO ingest_jobs (user_id, idempotency_key, accepted_at, status)
+    SELECT 'user-bil-2', 'qa-seed:' || g, 1893456000, 'done'
+    FROM generate_series(1, 5::bigint) AS g
+    ON CONFLICT (user_id, idempotency_key) DO NOTHING;
+    IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
+        WHERE user_id = 'user-bil-2' AND accepted_at / 86400 = 1893456000 / 86400) <> 5 THEN
+        RAISE EXCEPTION 'QA reseed must be a no-op, never a double count';
+    END IF;
+    IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
+        WHERE user_id = 'user-bil-2'
+          AND accepted_at / 86400 = (1893456000 + 86400) / 86400) <> 0 THEN
+        RAISE EXCEPTION 'epoch-day boundary leaked into the next day';
+    END IF;
+    IF (SELECT COUNT(*)::BIGINT FROM ingest_jobs
+        WHERE user_id = 'user-bil-2'
+          AND accepted_at / 86400 = (1893456000 + 86399) / 86400) <> 5 THEN
+        RAISE EXCEPTION 'last second of the UTC day must still count';
+    END IF;
 END
 $$;
 
