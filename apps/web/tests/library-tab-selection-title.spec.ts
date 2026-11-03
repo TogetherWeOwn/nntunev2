@@ -264,11 +264,12 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
 	// User NZB import retired: the SPA leg runs through Account
 	// billing instead of the deleted /library/import route.
-	const navigation = page.getByRole('navigation', { name: 'Primary' });
-	await navigation.getByRole('link', { name: 'Account', exact: true }).click();
+	const primary = page.getByRole('navigation', { name: 'Primary' });
+	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();
 	await expect(page).toHaveURL(/\/account\/billing$/); await settle(page);
 	const destination = await page.title();
-	await navigation.getByRole('link', { name: 'Library', exact: true }).click();
+	await primary.getByRole('link', { name: 'Your Library', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0); await settle(page);
 	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', BASELINE], marker: 'same-document' }, {

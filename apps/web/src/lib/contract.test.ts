@@ -41,7 +41,15 @@ const routeForTestId: Record<ActiveTestId, string> = {
 	nowPlaying: '../routes/demo/player/+page.svelte',
 	playerNext: '../routes/demo/player/+page.svelte',
 	queuePanel: '../routes/demo/player/+page.svelte',
-	planLimitNotice: '../routes/library/+page.svelte'
+	planLimitNotice: '../routes/library/+page.svelte',
+	// The W10 app shell declares all four in the root layout: the top bar
+	// renders in both shells (app + public header), the rail/tab bar render
+	// one per breakpoint, and the mini-player renders while a selection
+	// hint is set.
+	shellTopbar: '../routes/+layout.svelte',
+	shellRail: '../routes/+layout.svelte',
+	shellTabbar: '../routes/+layout.svelte',
+	miniPlayer: '../routes/+layout.svelte'
 };
 
 describe('retired user NZB import', () => {

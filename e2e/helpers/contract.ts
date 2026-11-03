@@ -39,25 +39,26 @@ export const TESTIDS = {
   playerNext: 'player-next',
   queuePanel: 'queue-panel',
   planLimitNotice: 'plan-limit-notice',
+  // App-shell hooks (design spec v1, W10 build): the top bar exists in both
+  // shells (app + public header); the rail, tab bar and mini-player are
+  // app-shell only, all declared in the root layout.
+  shellTopbar: 'shell-topbar',
+  shellRail: 'shell-rail',
+  shellTabbar: 'shell-tabbar',
+  miniPlayer: 'mini-player',
 } as const;
 
-// UI hooks the app-shell and player-bar builds (design spec v1) must
-// render; declared now so the dual-generation drivers can target them the
-// moment they exist. Deliberately NOT in TESTIDS yet: the web contract
-// test (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to
-// be declared in route markup, and these land with their builds — move
-// each key into TESTIDS (and map its route there) in the PR that renders
-// it. `shell-topbar` exists in both shells (app + public header); the rest
-// are app-shell/player-bar only.
+// UI hooks the player-bar build (design spec v1) must render; declared now
+// so the dual-generation drivers can target them the moment they exist.
+// Deliberately NOT in TESTIDS yet: the web contract test
+// (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to be
+// declared in route markup, and these land with their build — move each key
+// into TESTIDS (and map its route there) in the PR that renders it.
 export const PENDING_TESTIDS = {
   playerBar: 'player-bar',
   playerPlayPause: 'player-play-pause',
   playerSeek: 'player-seek',
   playerVolume: 'player-volume',
-  shellTopbar: 'shell-topbar',
-  shellRail: 'shell-rail',
-  shellTabbar: 'shell-tabbar',
-  miniPlayer: 'mini-player',
 } as const;
 
 // API endpoints (relative to STAGING_BASE_URL).

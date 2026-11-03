@@ -49,6 +49,7 @@
 		toggleSelected
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
+	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import SelectionExport from '#lib/library/SelectionExport.svelte';
 	import QueueExport from '#lib/player/QueueExport.svelte';
@@ -824,6 +825,26 @@
 		resetRestartOnSourceChange(before, after);
 		queue = next;
 		queueAnnouncement = '';
+		syncMiniPlayerHint(next);
+	}
+
+	/**
+	 * Mirror the queue's current selection into the mobile mini-player hint.
+	 * Direct-assign queue edits bypass replaceQueue, so each of them calls
+	 * this after mutating the queue; an emptied queue clears the hint.
+	 * Metadata only — display title/artist, never audio or playback state.
+	 */
+	function syncMiniPlayerHint(next: QueueState): void {
+		const current = queueCurrentTrack(next);
+		if (current) {
+			setMiniPlayerHint({
+				trackId: current.id,
+				title: displayTitle(current),
+				artist: displayArtist(current)
+			});
+		} else {
+			clearMiniPlayerHint();
+		}
 	}
 
 	function clearShareFeedback(): void {
@@ -1172,6 +1193,7 @@
 		if (reordered === queue) return;
 		playEpoch += 1;
 		queue = reordered;
+		syncMiniPlayerHint(reordered);
 		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
 	}
 
@@ -1188,6 +1210,7 @@
 		// outcome for the removed track must not carry onto its successor.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(next));
 		queue = next;
+		syncMiniPlayerHint(next);
 		queueAnnouncement = `${title} removed from the queue.`;
 		queueAnnouncementVersion += 1;
 	}
@@ -1199,6 +1222,7 @@
 		if (next === queue) return;
 		playEpoch += 1;
 		queue = next;
+		syncMiniPlayerHint(next);
 		queueAnnouncement = 'Queue cleared.';
 		queueAnnouncementVersion += 1;
 	}
@@ -1222,6 +1246,7 @@
 		// the current row returned above), so restart state resets here.
 		resetRestartOnSourceChange(queueCurrentTrack(queue), queueCurrentTrack(selected));
 		queue = selected;
+		syncMiniPlayerHint(selected);
 		const title = target.title?.trim() ? target.title : target.id;
 		queueAnnouncement = `Selected ${title}`;
 	}
@@ -1235,6 +1260,7 @@
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		playEpoch += 1;
 		queue = trimmed;
+		syncMiniPlayerHint(trimmed);
 		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
 	}
 
@@ -1246,6 +1272,7 @@
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		playEpoch += 1;
 		queue = trimmed;
+		syncMiniPlayerHint(trimmed);
 		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
 	}
 
@@ -1707,6 +1734,10 @@
 			pendingShareSeek = null;
 			restartSupersededSources.clear();
 			refresher.dispose();
+			// The queue is page state but the mini-player hint is shell
+			// state: leaving the library empties the queue's visible hint
+			// until the player arrival moves the queue into the shell.
+			clearMiniPlayerHint();
 			// Client-side navigation away with the query applied.
 			recordFindQuery();
 			unsubscribeLocal();
