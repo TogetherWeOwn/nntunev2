@@ -6158,12 +6158,12 @@ mod tests {
                     grace_until_unix: row.grace_until_unix,
                 }
             });
-            // A terminal row sits outside the live slot: the production
-            // predicate excludes it, so the fake does too.
+            // A `trialing` or terminal row sits outside the live slot: the
+            // production predicate excludes it, so the fake does too.
             let live = live.filter(|row| {
                 matches!(
                     row.status.as_str(),
-                    "incomplete" | "trialing" | "active" | "past_due" | "unpaid" | "paused"
+                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
                 )
             });
             Ok(crate::billing_reconcile::ReconcileInput {
@@ -7427,9 +7427,15 @@ mod tests {
         .expect("op insert");
         let body = checkout_completed_body("evt_test_2", "cs_test_1", false);
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
-        let live = live_for(&h, "u1").expect("verbatim row stored");
-        assert_eq!(live.status, "trialing");
-        assert_eq!(live.paid_through_unix, None);
+        // `trialing` sits outside the live slot by design (the same
+        // five-status predicate as the read path), but the verbatim row
+        // is still recorded: fail-closed, alerted, nothing advanced.
+        let stored = h.store.billing_rows.borrow();
+        let row = stored.get("u1").expect("verbatim row stored");
+        assert_eq!(row.status, "trialing");
+        assert_eq!(row.paid_through_unix, None);
+        drop(stored);
+        assert!(live_for(&h, "u1").is_none(), "trialing holds no live slot");
         assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
 
         // Unknown status string: recorded verbatim, same fail-closed
@@ -7464,7 +7470,7 @@ mod tests {
         let body = checkout_completed_body("evt_test_3", "cs_test_1", false);
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         // Unknown statuses sit outside the live slot by design (the same
-        // six-status predicate as the read path), but the verbatim row is
+        // five-status predicate as the read path), but the verbatim row is
         // still recorded: fail-closed, alerted, nothing advanced.
         let stored = h.store.billing_rows.borrow();
         assert_eq!(

@@ -386,7 +386,6 @@ mod tests {
             "plus",
             "active",
             false,
-            None,
             Some(NOW - (RENEWAL_SETTLEMENT_ALLOWANCE_SECS - 1)),
             None,
         );
@@ -402,7 +401,6 @@ mod tests {
             "plus",
             "active",
             false,
-            None,
             Some(NOW - RENEWAL_SETTLEMENT_ALLOWANCE_SECS),
             None,
         );
@@ -412,7 +410,6 @@ mod tests {
             "plus",
             "active",
             false,
-            None,
             Some(NOW - (RENEWAL_SETTLEMENT_ALLOWANCE_SECS + 1)),
             None,
         );

@@ -669,11 +669,12 @@ pub fn price_bindings_select_statement() -> &'static str {
 }
 
 /// Parameters: user_id. The live-slot subscription row, if any (the same
-/// six nonterminal statuses as `billing.rs`: terminal rows sit outside
-/// the predicate). Unknown statuses stored verbatim by design (no DB
-/// CHECK) fail closed in `reconcile_subscription`, never here.
+/// five nonterminal statuses as `billing.rs` and the reseeded partial
+/// unique index: `trialing` and terminal rows sit outside the predicate).
+/// Unknown statuses stored verbatim by design (no DB CHECK) fail closed
+/// in `reconcile_subscription`, never here.
 pub fn reconcile_live_select_statement() -> &'static str {
-    "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')"
+    "SELECT stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
 }
 
 /// Parameters: event_id. First claim wins (`true`); duplicates ack 200
@@ -1289,7 +1290,7 @@ mod tests {
     fn statements_bind_positionally_and_stay_pinned() {
         assert!(
             reconcile_live_select_statement().contains(
-                "status IN ('incomplete', 'trialing', 'active', 'past_due', 'unpaid', 'paused')"
+                "status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
             ),
             "live slot matches the read path predicate",
         );
