@@ -60,10 +60,11 @@ while not visible (§1).
 **REA angle:** study ListenBrainz's BrainzPlayer to learn how its
 YouTube source behaves in a mixed queue (visibility, end/error
 advance, fallback) — open source first, REA on the shipped web
-bundle only for gaps. That study is input to the §1 build, not a
-blocker for this record; if it changes the contract, it lands as a
-follow-up amendment. The same study-first rule applies to the §7
-proxy question before any proxy workaround is bought.
+bundle only for gaps. That study is done (2026-11-03) and its
+findings are folded into §1 (adopted / not-adopted list) and §3
+(server-side key); it was input to the §1 build, not a blocker for
+this record. The same study-first rule applies to the §7 proxy
+question before any proxy workaround is bought.
 
 ## Decision
 
@@ -77,11 +78,37 @@ through one interface: `kind`, `canPlay(track)`, `play`, `pause`,
 default whenever YouTube plays; the kept extraction spike may only
 ever become a third implementation under §7's gates.)
 
-- **`NntpSource`** — audio from the user's own provider. The default.
-  Background play, gapless, offline and Media Session are allowed:
-  none of YouTube's rules apply to it.
-- **`YouTubeEmbedSource`** — video only, through the official IFrame
-  Player API, always visible. Hard rules, each testable:
+**Resolver order (owner decision, 2026-11-03).** For a track the
+resolver tries, in order:
+
+1. **Curated FLAC over NNTP** (`NntpSource`) — the NNTP step itself
+   resolves the R2 popularity cache first, then the backend
+   provider pool (ADR 0013/0014, landing separately).
+2. **YouTube embed** (`YouTubeEmbedSource`), when a validated video
+   ID exists (§2).
+3. **Unavailable** — hidden by default. An admin setting may show
+   unavailable tracks greyed, with a future "request this song"
+   action instead of Play; neither changes the resolver.
+
+Users never see NNTP or providers: surfaces say only whether a
+track plays. Separately from the audio resolver, **YouTube is the
+music-video source for all tracks**, NNTP-streamed ones included:
+watching the video is its own visible playback of that video (no
+mid-track switch — see the muted-sync ban below), not a mode of
+the audio player.
+
+- **`NntpSource`** — audio from the curated collection over NNTP,
+  served through backend provider accounts. The default. There is
+  no user provider anymore. Background play, gapless and Media
+  Session are allowed: none of YouTube's rules apply to it.
+  Offline download is not offered at launch on any source.
+- **`YouTubeEmbedSource`** — official videos through the official
+  IFrame Player API, always visible. It serves both resolver step
+  2 and the all-tracks music-video rule above, and in both roles it
+  is presented as watching that video on a visible video surface —
+  as the audio fallback it is still that video playing visibly,
+  never a hidden or audio-only presentation. Hard rules, each
+  testable:
   - Player viewport at least 200×200, target 480×270; no overlays,
     frames or elements in front of any part of it; YouTube controls,
     ads and branding untouched; `origin` set.
@@ -95,9 +122,15 @@ ever become a third implementation under §7's gates.)
     NNTP audio is an alternate audio track and is banned (III.I.7).
     There is therefore no "switch to video mid-track" continuity;
     watching the video is a separate playback of that video.
-  - Not behind a paywall: YouTube playback must work on the free
-    plan (III.F.3.a); no gating step beyond the play click except
-    login/age checks (III.F.3.b); no rewards for watching.
+  - No separate charge or gate for YouTube playback: there is no
+    free plan at launch — the whole service is invite-only and
+    subscription-gated — so III.F.3.a is restated for that shape:
+    YouTube playback is not separately charged for, upsold or
+    gated beyond access to the service itself; no gating step
+    beyond the play click except login/age checks (III.F.3.b);
+    no rewards for watching. Whether that reading satisfies
+    III.F.3.a stays a launch-gate legal item; this record does not
+    assert a free-plan path.
   - Our terms bind users to the YouTube Terms of Service, and the
     privacy policy references the Google Privacy Policy and
     discloses API data use (III.A), before the feature is used.
@@ -109,11 +142,33 @@ ever become a third implementation under §7's gates.)
   visibility reading is the conservative one and is listed for
   re-check at every policy revision.
 - Present YouTube as a *video* feature, never as an audio source.
-  III.I.1 (substitute for a YouTube application) and III.E.1
-  (facilitating infringement) are residual audit risks for a
-  Usenet-based app; a visible, clearly-attributed video surface
-  is the mitigation available to us. This stays a launch-gate legal
-  item, not a settled permission.
+  Resolver step 2 does not change that presentation: the fallback
+  is the visible video playing on the video surface, labelled as
+  YouTube, with no hidden, minimised or audio-only mode. III.I.1
+  (substitute for a YouTube application) and III.E.1 (facilitating
+  infringement) are residual audit risks for a Usenet-based app;
+  a visible, clearly-attributed video surface is the mitigation
+  available to us, and the III.I.1 reading of the fallback role is
+  kept on the launch-gate legal list. This stays a launch-gate
+  legal item, not a settled permission.
+- BrainzPlayer study (done 2026-11-03), adopted as build input:
+  per-track source fall-through in resolver order with a 3 s
+  ready time-out; one reused player instance; embed errors
+  2/5/100/101/150 → toast and skip; the played watch URL written
+  back onto the recorded listen; initial window sizing (floating,
+  bottom-right, 10 px above the 60 px bar; default and minimum
+  350×200; expanded min(1280, available) wide at 16:9 plus a 30 px
+  button row, capped at viewport − 120 px tall). Not adopted:
+  play-time `search.list` (§2); close-as-hide-and-pause (close
+  stops the playback); keeping the player hidden while YouTube is
+  not the current source; cover art over the video on mobile
+  full-screen (the no-overlay rule above); no pause on a hidden
+  tab (we pause, above); the standard embed host (§3 uses
+  no-cookie); thumbnails over http (v1 shows none, §3);
+  fall-through that skips sources before the starting one (ours
+  always starts at resolver step 1); and native-controls-off
+  player chrome — §1's controls/branding-untouched rule stands,
+  and any `controls` change needs its own RMF check at build time.
 
 ### 2. Recording MBID → YouTube video join and curation
 
@@ -145,6 +200,10 @@ order:
 
 Validation and storage:
 
+- MusicBrainz, Wikidata, ListenBrainz and user-submitted URLs are
+  crowd-sourced input: the embed URL is constructed only from a
+  validated video ID (strict 11-char `[A-Za-z0-9_-]` form), and a
+  source URL is never passed through into the iframe `src`.
 - Every candidate ID is batch-validated with
   `videos.list?part=status,contentDetails` (≤50 IDs per call, 1
   quota unit; 10,000 units/day project quota) checking
@@ -209,10 +268,23 @@ and the security review must approve before any build lands:
   needs its own review.
 - Workers never fetch YouTube media. The only server-side YouTube
   calls are `videos.list` validation from the curation job.
-- The YouTube Data API key is a new scoped credential (free quota),
-  minted and stored through the existing scoped-credentials path,
-  referenced only by the curation job. It is never shipped to the
-  browser.
+- The YouTube Data API key (free quota) is a retrievable outbound
+  credential, so it is **not** an
+  [0010-native-rest-credentials.md](0010-native-rest-credentials.md)
+  scoped credential — those are inbound bearer keys stored only as
+  one-way HMACs and cannot hold a key we must present to Google.
+  The key lives as a Cloudflare Worker secret (the pattern
+  [0008-auth-vault-sessions.md](0008-auth-vault-sessions.md)
+  already uses for the vault KEK), is restricted in Google Cloud
+  to the YouTube Data API v3 only, and is referenced only by the
+  curation job. It is never shipped to the browser: the embed
+  itself needs no key, and ListenBrainz's approach of putting one
+  project key into every page — logged-out visitors included, all
+  sharing one quota — is explicitly not copied. Creating the
+  Google Cloud project and key is a credential-creation step that
+  needs its own owner/operator route at build time; app code never
+  mints it, and this record authorizes neither the account nor
+  the key.
 
 ### 4. ListenBrainz uses
 
@@ -424,10 +496,13 @@ arbitrary track.
 ## Consequences
 
 - The player gains a source abstraction whose compliant branch is
-  visible-video-only; audio features (background, gapless, offline)
-  stay NNTP-only, permanently. UX must not blur that line.
+  visible-video-only; audio features (background, gapless, Media
+  Session) stay NNTP-only, permanently, and offline download is
+  not offered at launch on any source. UX must not blur that line.
 - Video ships as an opportunistic, attribution-labelled surface
-  (free plan included), gated on: the §3 CSP security review,
+  (not separately charged or gated beyond service access — the
+  III.F.3.a reading in §1, kept a launch-gate legal item), gated
+  on: the §3 CSP security review,
   terms/privacy updates (III.A), and the 30-day TTL job. (The two
   owner decisions that gated this record closed 2026-11-03: §5, §7.)
   The CI guardrails (grep gate over the new video/curation paths —
@@ -443,7 +518,8 @@ arbitrary track.
   `PlayableSource` + `YouTubeEmbedSource` + video
   surfaces (§1); curation job + moderated submissions (§2);
   ListenBrainz account link (§4); the BrainzPlayer study (REA
-  angle) as build input; and, only after embeds work, the §7 spike
+  angle, done 2026-11-03) as build input to the §1 build; and,
+  only after embeds work, the §7 spike
   track behind its flag with its proxy A/B/C measurement — any
   proxy spend and any production flag-on each need their own owner
   decision first.
