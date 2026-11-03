@@ -490,7 +490,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/operations/", path) {
                 return SessionOnly;
             }
-            // Admin surface (migration 0027): session + fresh DB role,
+            // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
             if path == "/v1/admin/settings" {
                 return SessionOnly;
@@ -554,7 +554,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" || path == "/v1/vault" {
                 return SessionOnly;
             }
-            // Admin writes (migration 0027): one setting key, or one
+            // Admin writes (migration 0028): one setting key, or one
             // user's role. Deeper shapes deny here, before any spend.
             if one_segment_after("/v1/admin/settings/", path) {
                 return SessionOnly;

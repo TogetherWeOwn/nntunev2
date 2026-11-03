@@ -129,6 +129,6 @@ target = "app"
 sha256 = "b3668efdfd27bd81d9a9f86441c29925963943c30ed969303bd518af91f30b0c"
 
 [[migration]]
-file = "0027_admin_foundation.sql"
+file = "0028_admin_foundation.sql"
 target = "app"
 sha256 = "20fafb4309a6829c07a679efd052000f7711398ff22bbe346203ba1522e68754"

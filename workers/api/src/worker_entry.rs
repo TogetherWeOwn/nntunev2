@@ -1010,7 +1010,7 @@ async fn prune_expired_challenges_on(
     Ok(())
 }
 
-/// Admin role write (migration 0027): serialize every admin write,
+/// Admin role write (migration 0028): serialize every admin write,
 /// re-read the actor's role locked, lock the subject row, then the
 /// UPDATE and its extended audit row commit together or not at all.
 /// The subject lock is what makes the audited old value the value
@@ -1121,7 +1121,7 @@ async fn admin_set_user_role_on(
     Ok(AdminWriteOutcome::Applied(Some(previous)))
 }
 
-/// Admin settings write (migration 0027): one transaction, like the
+/// Admin settings write (migration 0028): one transaction, like the
 /// role write, under the same fixed lock order — the shared
 /// `admin_writes` serialization lock first (so a demotion committed
 /// before this write holds the lock is visible to the actor re-check,
@@ -1558,7 +1558,7 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 // Daily count derived from accepted `ingest_jobs` rows
-                // (the daily fold table was dropped in migration 0027).
+                // (the daily fold table was dropped in migration 0026).
                 // `accepted_at` is BIGINT epoch seconds (the 0022 converged
                 // shape), so the UTC day is epoch/86400 — exactly the
                 // fake's epoch-day key; no local-time skew is possible.

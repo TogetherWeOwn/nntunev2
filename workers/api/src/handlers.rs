@@ -447,7 +447,7 @@ impl Config {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreError;
 
-/// Outcome of one admin write transaction (migration 0027). The
+/// Outcome of one admin write transaction (migration 0028). The
 /// transaction serializes every admin write and re-reads the actor's
 /// role under its locks, so a write authorized by the guard can still
 /// lose the race to a demotion that committed first.
@@ -937,7 +937,7 @@ pub trait Store {
     }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
     /// The stored `users.role` for the admin guard, read fresh per
-    /// request (migration 0027). Fail-closed default is absent — and
+    /// request (migration 0028). Fail-closed default is absent — and
     /// absent is never admin — so an unprovisioned store grants nothing;
     /// production and the test fake override it.
     fn user_role(
@@ -964,7 +964,7 @@ pub trait Store {
         async { Err(StoreError) }
     }
     /// Every `app_settings` row as `(key, value)` pairs (migration
-    /// 0027). Fail-closed default is empty — the typed accessors then
+    /// 0028). Fail-closed default is empty — the typed accessors then
     /// resolve their built-in defaults; production and the test fake
     /// override it.
     fn app_settings(&self) -> impl Future<Output = Result<Vec<(String, String)>, StoreError>> {
@@ -1652,7 +1652,7 @@ where
         Ok((claims, token.to_string()))
     }
 
-    /// The admin guard (migration 0027): a cookie session whose
+    /// The admin guard (migration 0028): a cookie session whose
     /// `users.role` — read fresh from the store on every call, never a
     /// session claim — is exactly `admin`. Mutations additionally
     /// require the fresh-session step-up, like credential minting.
@@ -4070,7 +4070,7 @@ where
     }
 }
 
-// --- Admin surface (migration 0027) ---------------------------------------------------------
+// --- Admin surface (migration 0028) ---------------------------------------------------------
 //
 // Session-only, role-gated by `authenticate_admin`, and non-enumerable
 // (TWO-70 A-AC1): the scope map marks every path below `SessionOnly`,
@@ -4588,10 +4588,10 @@ mod tests {
         /// outage without writing anything.
         fail_vault_saves: RefCell<bool>,
         audits: RefCell<Vec<AuditEvent>>,
-        /// Mirror of `users.role` (migration 0027): an absent entry is
+        /// Mirror of `users.role` (migration 0028): an absent entry is
         /// the column default (`member`) for an existing user.
         user_roles: RefCell<HashMap<String, String>>,
-        /// Mirror of `app_settings` (migration 0027), keyed by setting
+        /// Mirror of `app_settings` (migration 0028), keyed by setting
         /// key with the raw stored text.
         app_settings_rows: RefCell<HashMap<String, String>>,
         rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
