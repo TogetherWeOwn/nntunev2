@@ -70,7 +70,8 @@ pub struct ArticleSpan {
     /// Byte offset of this article's first cipher byte in the sealed
     /// stream (header included, so article 0 starts at [`HEADER_SIZE`]).
     pub ciphertext_offset: u64,
-    /// Cipher bytes in this article (a whole number of cipher blocks).
+    /// Cipher bytes in this article (whole cipher blocks, except the stream's
+    /// final block, which seals short when the plaintext has a tail).
     pub ciphertext_len: u64,
 }
 

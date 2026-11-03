@@ -183,7 +183,7 @@ pub mod rclone {
     /// Ciphertext bytes per block.
     pub const CIPHER_BLOCK_SIZE: u64 = PLAIN_BLOCK_SIZE + CIPHER_OVERHEAD;
 
-    const MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
+    pub(crate) const MAGIC: [u8; 8] = *b"RCLONE\x00\x00";
 
     /// Authenticates and decrypts an arbitrary plaintext range from an
     /// rclone-crypt file. `derived` must be the 80-byte scrypt output; only
