@@ -95,6 +95,9 @@ pub struct SubscriptionRow {
     pub cancel_at_period_end: bool,
     pub paid_through_at_unix: Option<i64>,
     pub grace_until_unix: Option<i64>,
+    /// Carried for `SubscriptionView` parity (display-only there);
+    /// never an entitlement input at the gate.
+    pub current_period_end_unix: Option<i64>,
 }
 
 impl SubscriptionRow {
@@ -105,6 +108,7 @@ impl SubscriptionRow {
             cancel_at_period_end: self.cancel_at_period_end,
             paid_through_at_unix: self.paid_through_at_unix,
             grace_until_unix: self.grace_until_unix,
+            current_period_end_unix: self.current_period_end_unix,
         }
     }
 }
@@ -370,9 +374,11 @@ mod tests {
             cancel_at_period_end: false,
             paid_through_at_unix: Some(42),
             grace_until_unix: None,
+            current_period_end_unix: Some(84),
         };
         let view = row.as_view();
         assert_eq!(view.plan_id, "pro");
         assert_eq!(view.paid_through_at_unix, Some(42));
+        assert_eq!(view.current_period_end_unix, Some(84));
     }
 }
