@@ -267,7 +267,7 @@ old row, leaving a visible gap rather than a stale recording. No
 data-destroying migrations in this path; 0014/0016 swap constraints in
 place (cursor PK, DLQ unique, `table_name` checks), and 0030 adds its six
 tables the same way (extending the cursor/DLQ `table_name` checks in
-place). (Sources: `import.sh:214-239`
+place), as does 0033 with its fifteen phase-2 tables. (Sources: `import.sh:214-239`
 (prune, DLQ gap), `:618-636` (single transaction, forward-only
 guard, final-chunk prune); `test-import.sh:555-565` (older dump leaves rows alone);
 `migrations/0016_mb_track.sql:38-43` (check swaps);
