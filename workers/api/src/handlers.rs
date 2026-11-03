@@ -11093,6 +11093,7 @@ mod tests {
             cookie: None,
             origin: None,
             authorization,
+            stripe_signature: None,
             body: body.as_bytes().to_vec(),
         };
         block_on(handle(&h.ctx(), &req))
