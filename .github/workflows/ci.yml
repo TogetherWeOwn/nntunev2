@@ -55,6 +55,14 @@ jobs:
       # tests and lint every target so stream regressions stay on the gate.
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Reference PAR2 binary for the creator interop test
+      # (`interop_repair_with_reference_binary_when_available`, which repairs
+      # a creator-emitted set through the existing repair path and skips when
+      # no binary is present). Distro par2cmdline proves spec-level interop of
+      # the emitted bytes; production repair stays on the pinned
+      # par2cmdline-turbo image (see containers/repair/Dockerfile).
+      - name: Install reference par2 binary for creator interop test
+        run: sudo apt-get update && sudo apt-get install -y par2
       - run: cargo test --workspace
       - name: Check ETL timestamps through the native importer validator
         run: bash containers/mb-import/tests/test_etl_timestamp_contract.sh

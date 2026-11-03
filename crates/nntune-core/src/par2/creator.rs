@@ -265,7 +265,8 @@ impl Par2Creator {
             pushed: 0,
             whole_md5: md5::Context::new(),
             first16k_md5: md5::Context::new(),
-            first16k_remaining: FIRST_16K_SPAN.min(usize::try_from(total_len).unwrap_or(usize::MAX)),
+            first16k_remaining: FIRST_16K_SPAN
+                .min(usize::try_from(total_len).unwrap_or(usize::MAX)),
             slice_md5: md5::Context::new(),
             slice_crc: crc32fast::Hasher::new(),
             ifsc: Vec::with_capacity(data_usize),
@@ -301,8 +302,7 @@ impl Par2Creator {
         }
         while !chunk.is_empty() {
             let take = (self.slice_size - self.slice_fill).min(chunk.len());
-            self.slice_buf[self.slice_fill..self.slice_fill + take]
-                .copy_from_slice(&chunk[..take]);
+            self.slice_buf[self.slice_fill..self.slice_fill + take].copy_from_slice(&chunk[..take]);
             self.slice_md5.consume(&chunk[..take]);
             self.slice_crc.update(&chunk[..take]);
             self.slice_fill += take;
@@ -359,8 +359,7 @@ impl Par2Creator {
             if factor == 0 {
                 continue;
             }
-            let acc_e =
-                &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
+            let acc_e = &mut self.acc[e * self.slice_words..(e + 1) * self.slice_words];
             gf16::madd(acc_e, &self.slice_scratch, factor);
         }
 
@@ -458,7 +457,10 @@ pub fn create_single_file(filename: &[u8], data: &[u8], slice_size: u64) -> Resu
 ///   [`gf16::input_bases`]);
 /// - `present` maps data-slice index → surviving bytes;
 /// - `recovery` maps recovery exponent → recovery-slice bytes (see
-///   [`CreatedSet::recovery_pairs`]);
+///   [`CreatedSet::recovery_pairs`]), in exponent-ascending order: the first
+///   `m` pairs cover the `m` missing slices, and exponents `0..m` keep the
+///   coefficient matrix a classical Vandermonde (always invertible for
+///   distinct non-zero bases);
 ///
 /// Returns the reconstructed `(index, bytes)` pairs in index order. Errors
 /// when more slices are missing than recovery slices cover, on size or index
@@ -545,7 +547,7 @@ pub fn recover_slices(
 
     Ok(missing
         .into_iter()
-        .zip(out.into_iter())
+        .zip(out)
         .map(|(i, w)| (i as u32, words_to_bytes(&w)))
         .collect())
 }
