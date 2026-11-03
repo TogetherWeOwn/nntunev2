@@ -10668,6 +10668,7 @@ mod tests {
             authorization: Some(
                 "Bearer ntk_syntheticUnknownKey0000000000000000000000000".to_string(),
             ),
+            stripe_signature: None,
             body: serde_json::json!({"track_id": "track-9", "session_id": "tab-a"})
                 .to_string()
                 .into_bytes(),
