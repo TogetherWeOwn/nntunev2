@@ -136,6 +136,66 @@ def select_track(manifest: dict, file_arg: str | None, position: int | None) -> 
     raise FetchError("give a manifest file path or --position")
 
 
+def _is_safe_track_file(file) -> bool:
+    """A track `file` must stay a relative sub-path of the cache key dir.
+
+    Absolute paths, backslashes and empty/`.`/`..` segments would let a
+    manifest write outside the fixture cache; refuse them outright.
+    """
+    if not isinstance(file, str) or not file or "\\" in file:
+        return False
+    if file.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in file.split("/"))
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _require_secure_url(url: str, env_var: str) -> None:
+    """Transports are HTTPS; plaintext HTTP is allowed only on loopback
+    (local test servers). Anything else is a misconfiguration, not a skip."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and (parsed.hostname or "") in _LOOPBACK_HOSTS:
+        return
+    raise FetchError(
+        f"{env_var} must be an https URL (http is allowed only for "
+        f"loopback test servers), got scheme {parsed.scheme!r}"
+    )
+
+
+class _NoCrossHostAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip signed headers when a redirect leaves the original host.
+
+    urllib's default handler copies custom headers onto the redirect
+    request, which would forward the SigV4 `Authorization` header (and
+    the `x-amz-*` headers it covers) to a foreign host. Same-host
+    redirects keep them; cross-host redirects go out unsigned.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        if urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(
+            req.full_url
+        ).netloc:
+            for header in list(new.headers):
+                if header.lower() == "authorization" or header.lower().startswith(
+                    "x-amz-"
+                ):
+                    del new.headers[header]
+            # add_header() on the original may have used unredirected_hdrs.
+            for header in list(new.unredirected_hdrs):
+                if header.lower() == "authorization" or header.lower().startswith(
+                    "x-amz-"
+                ):
+                    del new.unredirected_hdrs[header]
+        return new
+
+
 def verify(path: Path, track: dict) -> bool:
     """True iff `path` exists and matches the manifest bytes + sha256."""
     try:
@@ -206,6 +266,7 @@ def s3_get_url(
 def build_request(key: str, env: dict) -> urllib.request.Request:
     base_url = env.get(ENV_BASE_URL, "").strip()
     if base_url:
+        _require_secure_url(base_url, ENV_BASE_URL)
         url = base_url.rstrip("/") + "/" + urllib.parse.quote(key, safe="/~")
         return urllib.request.Request(url, method="GET")
     access_key = env.get(ENV_ACCESS_KEY, "").strip()
@@ -215,6 +276,7 @@ def build_request(key: str, env: dict) -> urllib.request.Request:
     if not endpoint and account_id:
         endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
     if access_key and secret_key and endpoint:
+        _require_secure_url(endpoint, ENV_ENDPOINT)
         bucket = env.get(ENV_BUCKET, "").strip() or DEFAULT_BUCKET
         return s3_get_url(endpoint, bucket, key, access_key, secret_key)
     raise SkipFetch(
@@ -227,8 +289,9 @@ def build_request(key: str, env: dict) -> urllib.request.Request:
 def download(request: urllib.request.Request, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f"{dest.name}.part-{os.getpid()}")
+    opener = urllib.request.build_opener(_NoCrossHostAuthRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with opener.open(request, timeout=300) as response:
             with tmp.open("wb") as handle:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     handle.write(chunk)
@@ -249,10 +312,21 @@ def fetch(
     for field in ("file", "bytes", "sha256"):
         if field not in track:
             raise FetchError(f"manifest track is missing {field!r}")
+    if not _is_safe_track_file(track["file"]):
+        raise FetchError(
+            f"manifest track file {track['file']!r} is not a safe relative "
+            "path; refusing to fetch outside the fixture cache"
+        )
     key = f"{prefix}/{track['file']}"
     cache_dir = env.get(ENV_CACHE_DIR, "").strip()
-    cache_root = Path(cache_dir) if cache_dir else repo_root() / ".fixture-cache"
+    # Always absolute: callers run from other directories and the printed
+    # path is the contract (see the module docstring).
+    cache_root = (
+        Path(cache_dir).resolve() if cache_dir else repo_root() / ".fixture-cache"
+    )
     dest = cache_root / key
+    if not dest.resolve().is_relative_to(cache_root.resolve()):
+        raise FetchError(f"fixture key {key!r} escapes the cache directory")
     if verify(dest, track):
         return dest
     request = build_request(key, env)

@@ -76,6 +76,13 @@ class TestManifest(unittest.TestCase):
             self.assertIn((1, "manifest-shape"), violations, tracks)
             self.assertEqual(set(), keys, tracks)
 
+    def test_track_file_path_traversal_is_a_shape_error(self):
+        for bad in ("../x.flac", "flac/../../x.flac", "/x.flac", "flac//x.flac"):
+            tracks = [{"file": bad, "bytes": 1, "sha256": SHA}]
+            violations, keys = check_manifest(MANIFEST_PATH, manifest(tracks=tracks))
+            self.assertIn((1, "manifest-shape"), violations, bad)
+            self.assertEqual(set(), keys, bad)
+
     def test_empty_tracks_is_a_shape_error(self):
         violations, _ = check_manifest(MANIFEST_PATH, manifest(tracks=[]))
         self.assertIn((1, "manifest-shape"), violations)
@@ -97,6 +104,27 @@ class TestTrackedFiles(unittest.TestCase):
     def test_tracked_nzb_fails(self):
         files = {MANIFEST_PATH: manifest(), "fixtures/x/release.nzb": "<nzb/>"}
         self.assertEqual(["tracked-audio-unlisted"], rules(scan(files)))
+
+    def test_manifest_listed_nzb_still_fails(self):
+        # NZBs get no manifest exception (docs/fixture-audio-licences.md):
+        # listing one in a valid CC0 manifest must not cover it.
+        files = {
+            MANIFEST_PATH: manifest(
+                tracks=[{"file": "release.nzb", "bytes": 123, "sha256": SHA}]
+            ),
+            "fixtures/cc0/album/release.nzb": "<nzb/>",
+        }
+        self.assertEqual(["tracked-audio-unlisted"], rules(scan(files)))
+
+    def test_listed_aiff_key_reference_passes(self):
+        # AUDIO_KEY_RE must not truncate .aiff to .aif.
+        files = {
+            MANIFEST_PATH: manifest(
+                tracks=[{"file": "flac/01.aiff", "bytes": 123, "sha256": SHA}]
+            ),
+            "crates/x/tests/t.rs": 'let p = "fixtures/cc0/album/flac/01.aiff";',
+        }
+        self.assertEqual([], scan(files))
 
     def test_manifest_listed_audio_may_be_tracked(self):
         files = {

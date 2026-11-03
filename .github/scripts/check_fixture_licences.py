@@ -12,7 +12,8 @@ Rules (rule id -> shape):
 
   tracked-audio-unlisted
     A git-tracked audio/NZB file (AUDIO_EXTENSIONS) that is not listed
-    by a valid licence manifest in its own fixture directory. In
+    by a valid licence manifest in its own fixture directory — and any
+    tracked `.nzb` at all, listed or not (NZBs get no exception). In
     practice fixture audio lives in R2 and only manifests are
     committed, so any tracked audio file should make a reviewer ask
     why; a small CC0 clip may be committed only when its manifest
@@ -86,10 +87,14 @@ KEY_SCAN_EXCLUSIONS = {
 }
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Longest extension first: `aif` must not shadow `aiff` (a listed
+# `x.aiff` key would otherwise match as `x.aif` and false-positive).
 AUDIO_KEY_RE = re.compile(
     r"fixtures/cc0/[A-Za-z0-9._\-/ ()]+\.(?:"
-    + "|".join(sorted(ext[1:] for ext in AUDIO_EXTENSIONS))
-    + r")",
+    + "|".join(
+        sorted((ext[1:] for ext in AUDIO_EXTENSIONS), key=lambda e: (-len(e), e))
+    )
+    + r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 MANIFEST_RE = re.compile(r"^fixtures/(?:.+/)?manifest\.json$")
@@ -97,6 +102,19 @@ MANIFEST_RE = re.compile(r"^fixtures/(?:.+/)?manifest\.json$")
 
 def _is_positive_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_safe_track_file(file) -> bool:
+    """A track `file` is a relative sub-path of its manifest directory.
+
+    Absolute paths, backslashes and empty/`.`/`..` segments could make
+    the fetch helper write outside its cache, so they are shape errors.
+    """
+    if not isinstance(file, str) or not file or "\\" in file:
+        return False
+    if file.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in file.split("/"))
 
 
 def check_manifest(path: str, text: str) -> tuple[list[tuple[int, str]], set[str]]:
@@ -135,8 +153,7 @@ def check_manifest(path: str, text: str) -> tuple[list[tuple[int, str]], set[str
             continue
         file = track.get("file")
         ok = (
-            isinstance(file, str)
-            and bool(file)
+            _is_safe_track_file(file)
             and _is_positive_int(track.get("bytes"))
             and isinstance(track.get("sha256"), str)
             and bool(SHA256_RE.match(track["sha256"]))
@@ -163,7 +180,11 @@ def check_tracked_files(
 
     for path in tracked:
         suffix = Path(path).suffix.lower()
-        if suffix in AUDIO_EXTENSIONS and path not in listed_keys:
+        # NZB fixtures get no manifest exception (see the doc): a
+        # tracked .nzb fails even when a valid manifest lists it.
+        if suffix in AUDIO_EXTENSIONS and (
+            suffix == ".nzb" or path not in listed_keys
+        ):
             violations.append((path, 1, "tracked-audio-unlisted"))
 
     for path in tracked:

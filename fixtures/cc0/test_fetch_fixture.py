@@ -133,6 +133,72 @@ class FetchFixtureTest(unittest.TestCase):
         self.assertEqual(BODY, dest.read_bytes())
 
 
+    def test_relative_cache_dir_still_returns_absolute_path(self):
+        env = self.env(NNTUNE_FIXTURE_BASE_URL=self.base_url)
+        env["NNTUNE_FIXTURE_CACHE_DIR"] = "relcache"
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            path = fetch_fixture.fetch(None, 1, str(self.manifest), env)
+        finally:
+            os.chdir(cwd)
+        self.assertTrue(path.is_absolute(), path)
+        self.assertEqual(BODY, path.read_bytes())
+
+    def test_track_file_traversal_is_refused(self):
+        album = self.root / "fixtures/cc0/evil-album"
+        album.mkdir(parents=True)
+        manifest = {
+            "license": "CC0-1.0",
+            "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+            "source": "https://example.org/evil",
+            "tracks": [
+                {
+                    "position": 1,
+                    "file": "../../../evil.flac",
+                    "bytes": len(BODY),
+                    "sha256": hashlib.sha256(BODY).hexdigest(),
+                }
+            ],
+        }
+        path = album / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        env = self.env(NNTUNE_FIXTURE_BASE_URL=self.base_url)
+        self.assertEqual(
+            EXIT_FAIL, main(["--manifest", str(path), "--position", "1"], env=env)
+        )
+        self.assertEqual(0, Handler.hits)
+        self.assertFalse((self.root / "evil.flac").exists())
+
+    def test_plaintext_http_base_url_is_refused(self):
+        # Loopback http (self.base_url) stays allowed for test servers;
+        # any other http base URL is a misconfiguration, not a skip.
+        env = self.env(NNTUNE_FIXTURE_BASE_URL="http://example.com/fixtures")
+        self.assertEqual(EXIT_FAIL, main(self.args("--position", "1"), env=env))
+
+
+class RedirectHandlerTest(unittest.TestCase):
+    def _redirect(self, newurl):
+        handler = fetch_fixture._NoCrossHostAuthRedirectHandler()
+        req = fetch_fixture.urllib.request.Request(
+            "https://acct.r2.cloudflarestorage.com/bucket/key", method="GET"
+        )
+        req.add_header("Authorization", "AWS4-HMAC-SHA256 Credential=k/...")
+        req.add_header("x-amz-date", "20261103T000000Z")
+        return handler.redirect_request(req, None, 302, "Found", {}, newurl)
+
+    def test_cross_host_redirect_strips_signed_headers(self):
+        new = self._redirect("https://evil.example.net/key")
+        self.assertIsNone(new.get_header("Authorization"))
+        self.assertIsNone(new.get_header("X-amz-date"))
+
+    def test_same_host_redirect_keeps_signed_headers(self):
+        new = self._redirect(
+            "https://acct.r2.cloudflarestorage.com/bucket/key2"
+        )
+        self.assertIsNotNone(new.get_header("Authorization"))
+
+
 class S3SignerTest(unittest.TestCase):
     def test_signed_request_shape(self):
         req = s3_get_url(
