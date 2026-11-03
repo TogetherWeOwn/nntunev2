@@ -696,16 +696,19 @@ pub fn release_webhook_event_statement() -> &'static str {
 }
 
 /// Parameters: user_id. The unresolved single-flight operation, if any
-/// (at most one: `uq_billing_operations_single_flight`).
+/// (at most one: `uq_billing_operations_single_flight`). The payload
+/// projects `::text`: the column is JSONB and the store reads it as
+/// `String`, which rejects the JSONB binary form.
 pub fn open_checkout_operation_select_statement() -> &'static str {
-    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
+    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
 }
 
 /// Parameters: op_id. Operation lookup by id (the webhook's
 /// `client_reference_id` binding). UUID cast failure is a store error —
-/// a verified Stripe event never carries a malformed id.
+/// a verified Stripe event never carries a malformed id. Same `::text`
+/// payload cast as the open-flight select (JSONB column, `String` read).
 pub fn checkout_operation_by_id_select_statement() -> &'static str {
-    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload FROM billing_operations WHERE id = $1::uuid"
+    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE id = $1::uuid"
 }
 
 /// Parameters: op_id, user_id, request_key, payload. Single-flight insert:
@@ -1334,5 +1337,19 @@ mod tests {
                 .contains("DELETE FROM billing_webhook_events WHERE stripe_event_id = $1"),
             "a failed handling releases the claim so the retry reprocesses",
         );
+        // `request_payload` is the only JSONB column the billing reads
+        // project (every other select carries TEXT/BOOL/BIGINT, which the
+        // `String`/`bool`/`i64` reads accept): both operation lookups must
+        // cast it to text, or every stored-operation read fails in
+        // production while the struct fakes keep passing.
+        for select in [
+            open_checkout_operation_select_statement(),
+            checkout_operation_by_id_select_statement(),
+        ] {
+            assert!(
+                select.contains("request_payload::text"),
+                "operation lookup must read the JSONB payload as text, got: {select}",
+            );
+        }
     }
 }

@@ -1014,7 +1014,8 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<AdminWriteOutcome, StoreError>> {
         async { Err(StoreError) }
-    // --- Stripe billing reconciliation (migrations 0021/0028) ------------------
+    }
+    // --- Stripe billing reconciliation (migrations 0021/0029) ------------------
     //
     // The webhook and the inline/API paths share one reconciliation
     // function (`billing_reconcile::reconcile_subscription`); these are
@@ -4650,13 +4651,22 @@ where
         Ok(event) => event,
         Err(_) => return invalid_request(),
     };
-    // First claim wins; duplicates ack 200 with no state change. A store
-    // failure 500s so Stripe retries the delivery.
-    match ctx.store.claim_webhook_event(&event.id).await {
-        Ok(true) => {}
-        Ok(false) => return json_response(200, serde_json::json!({"ok": true})),
+    // First claim wins. Duplicates of a verified non-checkout event (or a
+    // live-mode event) still ack 200 with no state change — those paths
+    // never write state, so nothing can be lost. A duplicate
+    // `checkout.session.completed`, however, is REPROCESSED idempotently
+    // instead of acked: the release below is a same-DB DELETE, so a store
+    // outage that fails the release — or a worker death after the claim —
+    // would otherwise leave the paid event consumed and unprocessed.
+    // Reconciliation converges (monotonic upsert under the per-user lock,
+    // history idempotent on the invoice id, operation mark idempotent), so
+    // reprocessing a duplicate lands the same stored state, and a still-
+    // failing pass 500s so Stripe retries anyway. A store failure on the
+    // claim itself 500s so Stripe retries the delivery.
+    let _first_claim = match ctx.store.claim_webhook_event(&event.id).await {
+        Ok(first) => first,
         Err(_) => return internal(),
-    }
+    };
     if event.event_type != "checkout.session.completed" {
         // Verified but not ours: ack, no state change. Live-mode events
         // land here too — never Stripe-called, never stored.
@@ -4684,7 +4694,9 @@ where
         Err(()) => {
             // The claim is released so the retried delivery reprocesses
             // instead of acking 200 on a consumed claim. Best-effort: a
-            // failed release still 500s, so Stripe retries anyway.
+            // failed release still 500s, so Stripe retries anyway — and a
+            // redelivery that finds the stale claim reprocesses it above
+            // rather than dropping the payment.
             let _ = ctx.store.release_webhook_event(&event.id).await;
             internal()
         }
@@ -4715,12 +4727,21 @@ fn new_operation_id() -> Result<String, crate::random::CryptoError> {
 
 /// Free a held live slot (`incomplete` / `unpaid` / `paused`) before a
 /// replacement checkout mints its session. The held subscription is
-/// re-read from Stripe: a terminal remote state reconciles straight into
-/// the released slot, otherwise the held subscription is canceled first
-/// and the canceled state reconciled. Only once the slot is free may the
-/// caller proceed — otherwise the replacement's reconcile would collide
-/// with the still-held row and fail a paid subscription closed.
-/// `Err` is retryable (Stripe or store failure); nothing is minted.
+/// re-read from Stripe and the decision branches on the REMOTE status —
+/// the stored row may be stale (only `checkout.session.completed`
+/// webhooks reconcile, so a payment recovered since the last reconcile
+/// still reads `unpaid` locally). Terminal remote reconciles straight
+/// into the released slot; still-held remote cancels first and then
+/// reconciles. Only once the slot is free may the caller proceed —
+/// otherwise the replacement's reconcile would collide with the
+/// still-held row and fail a paid subscription closed. A remote that
+/// recovered to `active` / `past_due` reconciles (coverage and history
+/// land) but refuses the purchase: canceling it would destroy the newly
+/// paid subscription, and minting a second one double-bills. An unknown
+/// remote status fails closed with an alert: no cancel, no reconcile, no
+/// session — the held row stays reserved so later attempts keep failing
+/// closed the same way. `Failed` is retryable (Stripe or store failure);
+/// nothing is minted on any path but the freed slot.
 async fn release_held_subscription_slot<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
@@ -4737,31 +4758,61 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    if !crate::billing_reconcile::is_terminal_status(&subscription.status) {
-        ctx.stripe
-            .cancel_subscription(subscription_id.to_string())
-            .await
-            .map_err(|_| EnsureCheckoutError::Failed)?;
+    match subscription.status.as_str() {
+        // Still held: cancel first, then reconcile the terminal state out
+        // of the slot.
+        "incomplete" | "unpaid" | "paused" => {
+            ctx.stripe
+                .cancel_subscription(subscription_id.to_string())
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Already terminal remotely: nothing to cancel, reconcile it out
+        // of the slot.
+        status if crate::billing_reconcile::is_terminal_status(status) => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Ok(())
+        }
+        // Recovered since the last reconcile: store the paid state, then
+        // refuse — the account is already subscribed, so no cancel and no
+        // second session.
+        "active" | "past_due" => {
+            reconcile_remote_subscription(ctx, user_id, subscription_id)
+                .await
+                .map_err(|_| EnsureCheckoutError::Failed)?;
+            Err(EnsureCheckoutError::Unavailable)
+        }
+        // Unknown provider state: fail closed. No cancel (never destroy
+        // what we cannot classify), no reconcile (the stale held row stays
+        // reserved), no session — just the alert.
+        _ => {
+            billing_alert(ctx, user_id, BILLING_FAIL_CLOSED_ACTION).await;
+            Err(EnsureCheckoutError::Unavailable)
+        }
     }
-    reconcile_remote_subscription(ctx, user_id, subscription_id)
-        .await
-        .map_err(|_| EnsureCheckoutError::Failed)?;
-    Ok(())
 }
 
 /// The customer id a converged purchase attempt must create its session
 /// under: the account binding re-read *after* the single-flight insert,
 /// never the snapshot taken before this caller's own customer create.
 /// Two racers that both start unbound each mint a Stripe customer; the
-/// insert converges them on the winner's operation, and the winner's
-/// bind owns the account — the loser's id is an orphan that must never
-/// carry the payable session (reconciliation would fail it closed on
-/// customer mismatch for a user who paid).
+/// insert converges them on the winner's operation, and the winner's bind
+/// owns the account. The op INSERT and the bind are separate statements,
+/// so a loser can converge before the winner's bind lands: with no bound
+/// customer yet the attempt fails retryable (the retry reads the winner's
+/// binding) instead of falling back to its orphan. A converged attempt
+/// never sessions on a customer that is not the account-bound one.
 async fn converged_session_customer<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
-    snapshot_customer: Option<String>,
-    created_customer: String,
+    _snapshot_customer: Option<String>,
+    _created_customer: String,
 ) -> Result<String, EnsureCheckoutError>
 where
     S: Store + SingleUseStore,
@@ -4775,7 +4826,12 @@ where
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?
         .stripe_customer_id;
-    Ok(fresh.or(snapshot_customer).unwrap_or(created_customer))
+    // No fallback to the snapshot or the freshly minted orphan: in the
+    // pre-bind window (op visible, winner bind not yet landed) there is no
+    // bound customer, so the attempt fails retryable and the retry reads
+    // the winner's binding. A converged attempt never sessions on a
+    // customer that is not the account-bound one.
+    fresh.ok_or(EnsureCheckoutError::Failed)
 }
 
 /// Create the Checkout Session under one operation id and record it, so
@@ -5382,6 +5438,12 @@ mod tests {
         webhook_events: RefCell<HashSet<String>>,
         /// Single-flight checkout operations by id.
         checkout_ops: RefCell<HashMap<String, crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Pre-bind window pin: when set, `create_checkout_operation`
+        /// inserts the winner's row WITHOUT binding the customer, mirroring
+        /// production where the op INSERT and the bind are separate
+        /// statements. A loser converging while the flag is set sees the op
+        /// but no binding.
+        defer_customer_bind: RefCell<bool>,
         /// Paid-invoice history by Stripe invoice id (idempotent on the id,
         /// mirroring `paid_invoice_history`).
         invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
@@ -6389,12 +6451,19 @@ mod tests {
             }
             // Bind the Stripe customer to the account, but only when
             // unbound — an existing binding is never overwritten by a
-            // racing second customer create.
+            // racing second customer create. Skipped while the test holds
+            // the pre-bind window open (production binds in a separate
+            // statement after the op INSERT).
             if let Some(customer) = customer_id {
-                self.billing_customers
-                    .borrow_mut()
-                    .entry(user_id.to_string())
-                    .or_insert_with(|| customer.to_string());
+                // Skipped while the test holds the pre-bind window open
+                // (production binds in a separate statement after the op
+                // INSERT).
+                if !*self.defer_customer_bind.borrow() {
+                    self.billing_customers
+                        .borrow_mut()
+                        .entry(user_id.to_string())
+                        .or_insert_with(|| customer.to_string());
+                }
             }
             let op = crate::billing_reconcile::StoredCheckoutOp {
                 id: op_id.to_string(),
@@ -6546,6 +6615,9 @@ mod tests {
         /// converged attempt sessions on the winner-bound customer,
         /// never a racing loser's orphan).
         session_customers: RefCell<Vec<String>>,
+        /// Subscription ids passed to `cancel_subscription` (proves a
+        /// recovered or unknown remote is never canceled).
+        canceled: RefCell<Vec<String>>,
         /// Method names that fail like a Stripe outage.
         fail: RefCell<HashSet<String>>,
         /// Next customer id minted by `create_customer`.
@@ -6743,6 +6815,7 @@ mod tests {
                 // Like the real `DELETE /v1/subscriptions/{id}`: the call
                 // transitions the subscription and returns the canceled
                 // object, so a follow-up retrieve observes terminal state.
+                self.canceled.borrow_mut().push(subscription_id.clone());
                 let mut subscriptions = self.subscriptions.borrow_mut();
                 let mut subscription = subscriptions
                     .get(&subscription_id)
@@ -7275,12 +7348,15 @@ mod tests {
     }
 
     #[test]
-    fn billing_webhook_duplicate_claim_acks_without_change() {
+    fn billing_webhook_duplicate_checkout_reprocesses_idempotently() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         let body = deliver_first_period(&h, "evt_test_1");
-        // Redelivery of the same event id acks 200 before any Stripe call
-        // or store write: coverage and history converge.
+        // Redelivery of the same event id reprocesses idempotently and
+        // still acks 200: coverage and history converge on the same stored
+        // state instead of dropping the payment on a consumed claim (this
+        // is what lets a claim orphaned by a store outage or a dead worker
+        // land on redelivery).
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         assert_eq!(h.store.invoice_history.borrow().len(), 1);
         let live = live_for(&h, "u1").expect("live row stored");
@@ -7412,6 +7488,57 @@ mod tests {
         // The same event id redelivered: the released claim lets it
         // reprocess instead of acking 200 on a consumed claim.
         h.stripe.fail.borrow_mut().clear();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        let live = live_for(&h, "u1").expect("redelivery stores");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_webhook_claimed_but_unprocessed_redelivers_and_stores() {
+        // A claim orphaned by a store outage (the same-DB release failed)
+        // or a worker death after the claim must not consume the event:
+        // redelivery of the same id finds the stale claim and reprocesses
+        // idempotently instead of acking 200 with nothing stored.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".to_string(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".to_string(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        // The worker died after the claim, before any Stripe call.
+        assert!(block_on(h.store.claim_webhook_event("evt_test_1")).expect("claim first wins"));
+        let body = checkout_completed_body("evt_test_1", "cs_test_1", false);
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         let live = live_for(&h, "u1").expect("redelivery stores");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
@@ -7921,6 +8048,60 @@ mod tests {
     }
 
     #[test]
+    fn billing_converged_attempt_before_bind_fails_retryable() {
+        // The pre-bind window: the winner's op INSERT is visible but its
+        // customer bind has not landed yet (production publishes them as
+        // separate statements; the fake holds the bind back on request). A
+        // loser converging here must fail retryable — never resolve to its
+        // own orphan — so the retry reads the winner's binding and the
+        // payable session never sits on an unbound customer.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        *h.store.defer_customer_bind.borrow_mut() = true;
+        block_on(h.store.create_checkout_operation(
+            "op_winner",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_winner"),
+        ))
+        .expect("winner op visible, bind deferred");
+        *h.store.defer_customer_bind.borrow_mut() = false;
+        // The loser minted its orphan before converging on the winner's
+        // row; its own id never binds the account.
+        let outcome = block_on(h.store.create_checkout_operation(
+            "op_loser",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_orphan"),
+        ))
+        .expect("converge");
+        assert!(matches!(
+            outcome,
+            crate::billing_reconcile::CreateOpOutcome::Existing(_)
+        ));
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(converged_session_customer(
+                &ctx,
+                "u1",
+                None,
+                "cus_orphan".to_string(),
+            )),
+            Err(EnsureCheckoutError::Failed),
+            "no bound customer yet: retry, never the orphan"
+        );
+        assert!(
+            h.store.billing_customers.borrow().get("u1").is_none(),
+            "the orphan never binds the account"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session minted without a bound customer"
+        );
+    }
+
+    #[test]
     fn billing_held_subscription_releases_before_replacement() {
         // A held (`incomplete`) row reserves the live slot but confers
         // nothing. A retry must confirm the held subscription terminal
@@ -7977,6 +8158,140 @@ mod tests {
             live_for(&h, "u1").is_none(),
             "terminal row sits outside the live slot"
         );
+    }
+
+    #[test]
+    fn billing_held_slot_with_recovered_remote_reconciles_and_refuses() {
+        // Stale-local/recovered-remote: the stored row is still
+        // `incomplete` but Stripe already shows `active` with a paid
+        // invoice (only checkout completions reconcile, so the local row
+        // can lag a recovered payment). The retry must NOT cancel the
+        // newly paid subscription: it reconciles the paid state in place
+        // (coverage + history land) and refuses the purchase as
+        // already-subscribed — no cancel call, no new session.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "active", PRICE_PLUS),
+        );
+        h.stripe.invoices.borrow_mut().insert(
+            "in_test_1".to_string(),
+            test_invoice(
+                "in_test_1",
+                "cus_test_1",
+                "sub_old",
+                PRICE_PLUS,
+                BILLING_NOW,
+                BILLING_NOW + BILLING_PERIOD,
+                BILLING_NOW + 60,
+            ),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "a recovered subscription must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no replacement session for an already-subscribed account"
+        );
+        let live = live_for(&h, "u1").expect("recovered coverage stored");
+        assert_eq!(live.status, "active");
+        assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn billing_held_slot_with_unknown_remote_fails_closed_without_cancel() {
+        // Unknown remote status: fail closed — alert, no cancel, no
+        // reconcile, no session. The stale held row stays reserved so later
+        // attempts keep failing closed instead of minting a second
+        // subscription against a state we cannot classify.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        h.store
+            .billing_customers
+            .borrow_mut()
+            .insert("u1".to_string(), "cus_test_1".to_string());
+        h.store.billing_rows.borrow_mut().insert(
+            "u1".to_string(),
+            crate::billing_reconcile::ReconciledRow {
+                stripe_subscription_id: "sub_old".to_string(),
+                stripe_customer_id: "cus_test_1".to_string(),
+                stripe_item_id: "si_test_1".to_string(),
+                stripe_price_id: PRICE_PLUS.to_string(),
+                plan_id: PLAN_PLUS.to_string(),
+                status: "incomplete".to_string(),
+                current_period_end_unix: None,
+                cancel_at_period_end: false,
+                paid_through_unix: None,
+                paid_invoice_id: None,
+                grace_until_unix: None,
+            },
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_old".to_string(),
+            test_subscription("sub_old", "cus_test_1", "past_due_unmapped", PRICE_PLUS),
+        );
+        let ctx = h.ctx();
+        assert_eq!(
+            block_on(ensure_checkout_session(
+                &ctx,
+                "u1",
+                PRICE_PLUS,
+                "https://example.com/ok",
+                "https://example.com/cancel",
+                None,
+            )),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        assert!(
+            h.stripe.canceled.borrow().is_empty(),
+            "an unclassifiable remote must never be canceled"
+        );
+        assert_eq!(
+            *h.stripe.sessions_created.borrow(),
+            0,
+            "no session against an unknown remote state"
+        );
+        assert_eq!(audits_with(&h, BILLING_FAIL_CLOSED_ACTION), 1);
+        let live = live_for(&h, "u1").expect("held row stays reserved");
+        assert_eq!(live.status, "incomplete");
+        assert!(live.paid_through_unix.is_none());
+        assert!(h.store.invoice_history.borrow().is_empty());
     }
 
     #[test]
