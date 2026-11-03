@@ -6,7 +6,6 @@ import {
   annotateSignupPath,
   apiGet,
   applyAccountToPage,
-  completeByopWizard,
   requireApiAccount,
   submitPublicUiSignup,
   tryMintTestAccount,
@@ -21,19 +20,22 @@ import {
   requireRealNzbFixture,
 } from '../helpers/real-nzb-fixture.js';
 
-// Queue-order journey: ingest the secret-held real NZB, queue the library in
-// selection order, and require the player queue to advance in that same
-// order. The offline `apps/web/tests/player-queue.spec.ts` pins queue
-// mechanics with mocked audio; this spec is the staging side — a real
+// Queue-order journey (parked under TWO-1635): user NZB ingest is retired
+// (TWO-1630), so both legs — ingest plus queue-order — skip by name (see
+// USER_NZB_RETIRED_SKIP plus the journey gate allow-list in
+// e2e/scripts/enforce-journey-evidence.mjs). The assertions stay in the file
+// and return via admin-ingested tracks once admin ingest can seed curated
+// tracks on staging. The offline `apps/web/tests/player-queue.spec.ts` pins
+// queue mechanics with mocked audio; this spec is the staging side — a real
 // ingested library, real selection order.
 //
 // The real NZB is a RAR set the pipeline cannot complete (no RAR read — an
 // RAR-only subset fails permanent at transcode before any library row), so
-// both the ingest leg and the queue-order leg skip by name in real-NZB mode
-// until RAR-set playback + multi-track staging land and un-park under
-// TWO-1174. There are no checked-in NZB fixtures (TWO-1169 deleted them
-// all): the ingest path resolves lazily inside the test so a missing
-// staging fails the run red, never silently.
+// both legs additionally keep their real-NZB-mode skips by name until
+// RAR-set playback + multi-track staging land and un-park under TWO-1174.
+// There are no checked-in NZB fixtures (TWO-1169 deleted them all): the
+// ingest path resolves lazily inside the test so a missing staging fails
+// the run red, never silently.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -49,6 +51,20 @@ const QUEUE_ITEM = 'queue-item';
 const NOW_PLAYING = 'now-playing';
 const PLAYER_NEXT = 'player-next';
 
+// TWO-1635: user NZB ingest retired (TWO-1630). Both legs below carry this
+// skip; the journey gate allow-lists each parked title by name
+// (e2e/scripts/enforce-journey-evidence.mjs). Un-park (remove the guard here
+// and the allow-list entry there) once admin ingest can seed curated tracks
+// on staging. The predicate stays a call (rather than inlining
+// `test.skip(true, ...)` plus `return`) so the retained assertions below stay
+// reachable and keep typechecking.
+const USER_NZB_RETIRED_SKIP =
+  'user NZB ingest retired (TWO-1630); reseeds when admin ingest can seed a curated track on staging';
+
+function userNzbIngestRetired(): boolean {
+  return true;
+}
+
 test.describe.serial('player queue follows library-selection order', () => {
   // The ingest job (queue + NNTP fetch + verify) can take minutes.
   test.describe.configure({ timeout: 600_000 });
@@ -61,6 +77,11 @@ test.describe.serial('player queue follows library-selection order', () => {
     const baseURL = stagingBaseUrl('skip', 'queue-order-ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
       return;
     }
     // No completable ingest exists in real-NZB mode (RAR set, no RAR read),
@@ -89,12 +110,6 @@ test.describe.serial('player queue follows library-selection order', () => {
       sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
 
-    // The ingest worker probes through the user's authenticated provider
-    // connection, so the ingesting identity completes the BYOP wizard first
-    // (shared helper with the signup spec). Fails closed without the NNTP
-    // password rather than ingesting into a provider-less account.
-    await completeByopWizard(page, baseURL);
-
     await page.goto(`${baseURL}/library/import`, {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
@@ -115,14 +130,20 @@ test.describe.serial('player queue follows library-selection order', () => {
     ).toBeVisible({ timeout: 60_000 });
   });
 
-  // Parked until RAR-set playback + multi-track staging land
-  // (RAR_PLAYBACK_FOLLOW_UP): the real NZB yields a single library row, so
-  // the ≥2-track queue assertion has nothing to run against. Skips by name —
-  // the evidence gate allow-lists this title in real-NZB mode.
+  // Parked under TWO-1635 (user NZB ingest retired — see the guard below),
+  // on top of the RAR-set park: until RAR-set playback + multi-track staging
+  // land (RAR_PLAYBACK_FOLLOW_UP) the real NZB yields a single library row,
+  // so the ≥2-track queue assertion has nothing to run against. Skips by
+  // name — the evidence gate allow-lists this title.
   test('player queue advances in library-selection order', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'queue-order');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
       return;
     }
     if (realNzbActive()) {
