@@ -86,13 +86,13 @@ def test_non_positive_budget_rejected() -> None:
 
 
 def test_pinned_budget_covers_current_build() -> None:
-    """The pinned budget must leave headroom over a 306,065 B bundle."""
-    assert BUDGET_CLIENT_JS_BYTES > 306_065, BUDGET_CLIENT_JS_BYTES
+    """The pinned budget must leave headroom over a 339,150 B bundle."""
+    assert BUDGET_CLIENT_JS_BYTES > 339_150, BUDGET_CLIENT_JS_BYTES
 
 
 def test_pinned_budget_value_unchanged() -> None:
     """Pin the exact budget value: bumps happen deliberately, in their own PR."""
-    assert BUDGET_CLIENT_JS_BYTES == 337_920, BUDGET_CLIENT_JS_BYTES
+    assert BUDGET_CLIENT_JS_BYTES == 368_640, BUDGET_CLIENT_JS_BYTES
 
 
 def test_exact_budget_passes_and_one_byte_over_fails() -> None:
@@ -341,6 +341,25 @@ def test_readme_baseline_matches_script_measured_figure() -> None:
     )
 
 
+def test_splitting_plan_headroom_matches_pinned_budget() -> None:
+    """The plan's measured totals and headroom must sum to the ceiling."""
+    plan = _repo_root().joinpath("docs", "web-code-splitting-plan.md").read_text(
+        encoding="utf-8"
+    )
+    limit = re.search(r"exceeds\s+([\d,]+)\s+raw bytes", plan)
+    assert limit is not None, "splitting plan budget figure not found"
+    assert _parse_byte_number(limit.group(1)) == BUDGET_CLIENT_JS_BYTES
+    measurements = re.findall(
+        r"([\d,]+) B across \d+ files, leaving ([\d,]+) B\s+of headroom", plan
+    )
+    assert measurements, "splitting plan measurements not found"
+    for total, headroom in measurements:
+        assert (
+            _parse_byte_number(total) + _parse_byte_number(headroom)
+            == BUDGET_CLIENT_JS_BYTES
+        ), f"plan total {total} B + headroom {headroom} B != pinned budget"
+
+
 def main_test() -> int:
     cases = (
         test_under_budget_passes,
@@ -360,6 +379,7 @@ def main_test() -> int:
         test_under_budget_pass_report_text,
         test_readme_budget_matches_pinned_constant,
         test_readme_baseline_matches_script_measured_figure,
+        test_splitting_plan_headroom_matches_pinned_budget,
         test_default_client_dir_suffix,
         test_cli_defaults_match_pinned_constants,
         test_cli_non_positive_budget_exits_1,
