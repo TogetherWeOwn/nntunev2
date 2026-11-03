@@ -468,11 +468,20 @@ async function tabUntilFocused(page: Page, target: Locator, maxTabs = 60): Promi
 /** Focus some shell link by keyboard traversal from the page start. */
 async function focusShellLink(page: Page): Promise<void> {
 	await page.keyboard.press('Tab'); // skip link
-	const reached =
-		(await tabUntilFocused(page, libraryDestinationLink(page), 30)) ||
+	// Probe presence first (the goToImport/goToAccount pattern): evaluating
+	// an absent locator inside tabUntilFocused waits out the timeout on
+	// every tab, so on public-header routes (no Primary landmark, e.g.
+	// /demo/player in v2) the fallback must be chosen up front, not after
+	// 30 timed-out probes.
+	let reached = false;
+	if ((await libraryDestinationLink(page).count()) > 0) {
+		reached = await tabUntilFocused(page, libraryDestinationLink(page), 30);
+	}
+	if (!reached) {
 		// Public header (no Primary nav): its first link serves the same
 		// "a focused shell link is not a typing target" purpose.
-		(await tabUntilFocused(page, page.locator('header a[href]').first(), 30));
+		reached = await tabUntilFocused(page, page.locator('header a[href]').first(), 30);
+	}
 	expect(reached, 'expected keyboard traversal to reach a shell link').toBe(true);
 }
 
@@ -1920,6 +1929,15 @@ test.fixme('[NAV-15 v2] player shortcuts work on the real player with the shell 
 	await expect(page.getByTestId('now-playing')).toContainText('Shell Song 1', {
 		timeout: PRESENCE_TIMEOUT
 	});
+	// One row click queues ONE track (append-only selection: selectTrack →
+	// addTrack keeps the current index), so queue the second track
+	// explicitly — "n" must have a next track to advance to. Queueing it
+	// must not steal current: now-playing stays on Shell Song 1 until "n".
+	await page.getByTestId('library-item').nth(1).click();
+	await expect(page.getByTestId('library-queued-badge')).toHaveCount(2, {
+		timeout: PRESENCE_TIMEOUT
+	});
+	await expect(page.getByTestId('now-playing')).toContainText('Shell Song 1');
 
 	// A focused shell link is not a typing target: global transport keys stay live.
 	await libraryDestinationLink(page).focus();

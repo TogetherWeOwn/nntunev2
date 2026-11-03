@@ -208,6 +208,10 @@ export async function togglePlayViaPlayerUi(page: Page, player: Locator): Promis
   if (!hasControls) {
     throw new Error(seekSurfaceFailure(false, false));
   }
+  // page.mouse.click never scrolls (locator.click did): the player renders
+  // below the library list, off-viewport, so bring it into view before
+  // taking viewport-relative coordinates from boundingBox().
+  await player.scrollIntoViewIfNeeded();
   const box = await player.boundingBox();
   if (!box) {
     throw new Error('The audio element has no bounding box — native transport controls are not rendered');
@@ -239,7 +243,10 @@ export async function seekViaPlayerUi(
     throw new Error(seekSurfaceFailure(sliderVisible, hasControls));
   }
   const target: SeekTarget = { fraction, surface };
-  const box = await (surface === 'custom' ? slider : player).boundingBox();
+  const seekControl = surface === 'custom' ? slider : player;
+  // Same off-viewport rule as the toggle: scroll before boundingBox().
+  await seekControl.scrollIntoViewIfNeeded();
+  const box = await seekControl.boundingBox();
   if (!box) {
     throw new Error(`The ${surface} seek control has no bounding box — it is not rendered`);
   }

@@ -7,6 +7,8 @@ import {
   seekProofFailure,
   seekProofRegion,
   seekSurfaceFailure,
+  seekViaPlayerUi,
+  togglePlayViaPlayerUi,
   type TimedPlayer,
 } from '../helpers/player-ui.js';
 
@@ -110,5 +112,104 @@ test.describe('click points (pointer geometry for both surfaces)', () => {
 
   test('the native toggle point is 16px in, vertically centred', () => {
     expect(nativeToggleClickPoint(box)).toEqual({ x: 116, y: 210 });
+  });
+});
+
+/** A few seconds of silent PCM WAV as a data URI (no fixture file needed). */
+function silentWavDataUri(seconds = 30): string {
+  const sampleRate = 8000;
+  const samples = sampleRate * seconds;
+  const buffer = Buffer.alloc(44 + samples * 2);
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + samples * 2, 4);
+  buffer.write('WAVEfmt ', 8);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // PCM
+  buffer.writeUInt16LE(1, 22); // mono
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(samples * 2, 40);
+  return `data:audio/wav;base64,${buffer.toString('base64')}`;
+}
+
+test.describe('DOM driver (off-viewport player still receives the clicks)', () => {
+  // The library page renders the audio element below the track list, so on
+  // a 720px-tall viewport it starts off-screen. `page.mouse.click` on raw
+  // boundingBox() coordinates never scrolls (the old locator.click did),
+  // so the driver must scroll the control into view first — otherwise the
+  // live play/seek legs click empty space and time out. These cases pin
+  // the driver itself, not just the pure verdict above. Clicks on native
+  // media controls are not observable as DOM click events (internal
+  // shadow tree), so the proof is the media state itself: the toggle must
+  // start/stop playback and the seek must fire `seeked` and move the
+  // position — none of which happens when the click misses.
+  test('toggle and seek clicks land on a player rendered below the viewport', async ({
+    page,
+  }) => {
+    await page.setContent(
+      `<div style="height:3000px"></div>` +
+        `<audio controls data-testid="audio-player" src="${silentWavDataUri()}"></audio>`,
+    );
+    const player = page.getByTestId('audio-player');
+    const state = () =>
+      player.evaluate((el) => {
+        const a = el as HTMLAudioElement & { __sawSeeked?: boolean };
+        return {
+          currentTime: a.currentTime,
+          duration: a.duration,
+          paused: a.paused,
+          readyState: a.readyState,
+          sawSeeked: a.__sawSeeked === true,
+        };
+      });
+    await expect
+      .poll(async () => (await state()).readyState, {
+        message: 'expected the fixture audio metadata to load',
+      })
+      .toBeGreaterThanOrEqual(1);
+
+    // Non-vacuity: the player really does start outside the viewport.
+    const box = await player.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.y).toBeGreaterThan(page.viewportSize()!.height);
+    expect((await state()).paused).toBe(true);
+
+    await togglePlayViaPlayerUi(page, player);
+    await expect
+      .poll(async () => (await state()).paused, {
+        message: 'expected the off-viewport toggle click to start playback',
+      })
+      .toBe(false);
+
+    await togglePlayViaPlayerUi(page, player);
+    await expect
+      .poll(async () => (await state()).paused, {
+        message: 'expected the second toggle click to pause playback again',
+      })
+      .toBe(true);
+
+    await player.evaluate((el) => {
+      const a = el as HTMLAudioElement & { __sawSeeked?: boolean };
+      a.__sawSeeked = false;
+      a.addEventListener('seeked', () => {
+        a.__sawSeeked = true;
+      });
+    });
+    const target = await seekViaPlayerUi(page, player, 0.55);
+    expect(target).toEqual({ fraction: 0.55, surface: 'native' });
+    await expect
+      .poll(async () => (await state()).sawSeeked, {
+        message: 'expected the off-viewport seek click to fire "seeked"',
+      })
+      .toBe(true);
+    const afterSeek = await state();
+    expect(afterSeek.paused).toBe(true);
+    expect(
+      seekProofFailure(afterSeek, 0.55, afterSeek.sawSeeked),
+      'expected the DOM-driven seek to satisfy the same proof as the live milestone',
+    ).toBeNull();
   });
 });
