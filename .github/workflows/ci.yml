@@ -393,9 +393,9 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
     env:
-      MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -403,8 +403,20 @@ jobs:
           persist-credentials: false
       - name: Verify Python version
         run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
+      # Keep the default PR integration checkout. Its first parent pairs
+      # with that exact tree; the payload's base.sha can be stale. Pushes
+      # still compare event.before, including pushes of merge commits.
+      - name: Select migration comparison base
+        id: migrations-base
+        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
+        env:
+          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
+      - name: Test migration comparison selection and workflow wiring
+        run: python3 .github/scripts/test_migrations_base.py
+      - name: Test migration comparison workflow
+        run: python3 .github/scripts/test_ci_migrations_base.py
       - name: Run migration gate self-tests
         run: |
           python3 .github/scripts/test_migrations_gate.py
