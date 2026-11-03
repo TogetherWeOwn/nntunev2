@@ -743,11 +743,13 @@ check "rel: superseded pair pruned" "0" "$(db -c "SELECT count(*) FROM mb_record
 check "rel: replacement pair kept" "1" "$(db -c 'SELECT count(*) FROM mb_recording_music_video;')"
 check "rel: dropped isrc pruned" "1" "$(db -c "SELECT count(*) FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
 check "rel: surviving isrc kept" "USABC2400001" "$(db -c "SELECT isrc FROM mb_recording_isrc WHERE recording_mbid='$(python3 -c 'import uuid; print(uuid.UUID(int=200001))')';")"
-# The videos read union (direct video-marked URLs plus pair-reached
-# video URLs): recording 200001 keeps only its direct video, 200002
-# resolves both its direct video and 200003's through the new pair, and
-# 200003 (never in a pair with a video-marked other side in the old
-# dump) resolves its direct video.
+# The videos read union mirrors the production RECORDING_VIDEOS_SQL in
+# workers/mb/src/lib.rs (direct video-marked URLs plus pair-reached
+# video URLs; the worker's w6b_sql pin asserts the UNION and both legs
+# so a reverted direct leg fails that suite): recording 200001 keeps
+# only its direct video, 200002 resolves both its direct video and
+# 200003's through the new pair, and 200003 (never in a pair with a
+# video-marked other side in the old dump) resolves its direct video.
 videos_for() {
   db -c "SELECT recording_mbid::text || '|' || url || '|' || link_name FROM (
     SELECT ru.recording_mbid AS recording_mbid, u.url AS url, ru.link_name AS link_name

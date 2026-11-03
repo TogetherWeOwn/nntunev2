@@ -3747,9 +3747,21 @@ mod tests {
         assert!(ARTIST_URLS_SQL.contains("LIMIT 100"), "{ARTIST_URLS_SQL}");
         assert_eq!(ARTIST_URLS_LIMIT, 100);
         // The video join is symmetric (either side of the pair) and only
-        // follows video-marked links to stream URLs.
+        // follows video-marked links to stream URLs. Both union legs are
+        // pinned: the recording's own direct video-marked URLs, and the
+        // pair-reached video URLs. Dropping the direct leg must fail this
+        // pin — test-import §13 asserts a direct-only recording resolves
+        // end to end, and that suite mirrors this union.
         assert!(
             RECORDING_VIDEOS_SQL.contains("FROM mb_recording_music_video mv"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("FROM mb_recording_url ru"),
+            "{RECORDING_VIDEOS_SQL}"
+        );
+        assert!(
+            RECORDING_VIDEOS_SQL.contains("UNION"),
             "{RECORDING_VIDEOS_SQL}"
         );
         assert!(
