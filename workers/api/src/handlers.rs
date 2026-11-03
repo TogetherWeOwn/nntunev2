@@ -1408,14 +1408,18 @@ pub trait Store {
         async move { Ok(None) }
     }
     /// Record the created session (and later terminal marks) on the
-    /// operation row. Default `Err` (fail closed).
+    /// operation row — but only while the row still holds the single
+    /// flight. Reports whether the mark landed: a mark that arrives after
+    /// a deliberate supersede must not resurrect the retired row, so the
+    /// caller retries into the replacement instead. Default `Err` (fail
+    /// closed).
     fn update_checkout_operation(
         &self,
         _op_id: &str,
         _state: &str,
         _price_id: &str,
         _session_id: Option<&str>,
-    ) -> impl Future<Output = Result<(), StoreError>> {
+    ) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Err(StoreError) }
     }
     /// One guarded admin NZB upload attempt (migration 0034): validate
@@ -6526,12 +6530,21 @@ where
         })
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
-    // Best-effort mark: the session already exists under our idempotency
-    // key, so a lost mark only costs a retrieve on the next attempt.
-    let _ = ctx
+    // Conditional mark: the session already exists under our idempotency
+    // key, so a lost mark only costs a retrieve on the next attempt — but
+    // a mark that lands after a deliberate supersede must not resurrect
+    // the retired row. A missed mark means the flight moved on (the
+    // replacer expired this very session before retiring the row), so the
+    // in-hand session is dead: fail retryable and let the retry converge
+    // onto the replacement instead of handing out an expired URL.
+    let marked = ctx
         .store
         .update_checkout_operation(operation_id, "submitted", price_id, Some(&session.id))
-        .await;
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
     session.url.ok_or(EnsureCheckoutError::Failed)
 }
 
@@ -6683,14 +6696,21 @@ where
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
     op.session_id = Some(recovered.id.clone());
-    // Best-effort, like the create-path mark: the in-memory row already
+    // Conditional, like the create-path mark: the in-memory row already
     // carries the recovered id for this attempt, so a lost mark only costs
-    // a re-resolve on the next one — never a duplicate session.
+    // a re-resolve on the next one — never a duplicate session. A missed
+    // mark means the row retired while the replay was in flight (a
+    // concurrent replacer superseded it): fail retryable with the flight
+    // untouched instead of acting on the dead row.
     let state = op.state.clone();
-    let _ = ctx
+    let marked = ctx
         .store
         .update_checkout_operation(&op.id, &state, recorded_price_id, op.session_id.as_deref())
-        .await;
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    if !marked {
+        return Err(EnsureCheckoutError::Failed);
+    }
     Ok(op)
 }
 
@@ -7003,6 +7023,8 @@ where
             .await
             .map_err(|_| EnsureCheckoutError::Failed)?;
     }
+    // A supersede is idempotent retirement: the conditional mark may
+    // report `false` when the row already retired, which is success here.
     ctx.store
         .update_checkout_operation(
             &op.id,
@@ -7011,6 +7033,7 @@ where
             op.session_id.as_deref(),
         )
         .await
+        .map(|_| ())
         .map_err(|_| EnsureCheckoutError::Failed)
 }
 
@@ -8690,6 +8713,7 @@ mod tests {
                     plan_id: row.plan_id.clone(),
                     status: row.status.clone(),
                     paid_through_unix: row.paid_through_unix,
+                    paid_invoice_id: row.paid_invoice_id.clone(),
                     grace_until_unix: row.grace_until_unix,
                 }
             });
@@ -8736,10 +8760,11 @@ mod tests {
             // anchor still relabels the plan and anchor (the defined
             // equal-end plan-switch outcome); anchor-less ties keep the
             // stored ones. The same staleness predicate guards `status` and
-            // `grace_until`: strictly older money keeps the stored verbatim
-            // fields instead of writing stale ones over a fresher pass.
-            // Bindings still update verbatim; history still converges on
-            // the invoice id.
+            // `grace_until`: strictly older money — or the anchor-less
+            // equal-end shape only the stale fold emits — keeps the stored
+            // verbatim fields instead of writing stale ones over a fresher
+            // pass. Bindings still update verbatim; history still converges
+            // on the invoice id.
             let mut rows = self.billing_rows.borrow_mut();
             let merged = match rows.get(user_id) {
                 Some(existing)
@@ -8757,7 +8782,12 @@ mod tests {
                             (Some(end), Some(previous)) if end == previous
                         );
                     let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
-                        (Some(end), Some(previous)) => end < previous,
+                        (Some(end), Some(previous)) => {
+                            end < previous
+                                || (end == previous
+                                    && outcome.row.paid_invoice_id.is_none()
+                                    && existing.paid_invoice_id.is_some())
+                        }
                         _ => false,
                     };
                     let mut row = outcome.row.clone();
@@ -8870,18 +8900,25 @@ mod tests {
             state: &str,
             price_id: &str,
             session_id: Option<&str>,
-        ) -> Result<(), StoreError> {
+        ) -> Result<bool, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Best-effort mark like production: a missing row (already
-            // resolved elsewhere) still answers `Ok`.
-            if let Some(op) = self.checkout_ops.borrow_mut().get_mut(op_id) {
-                op.state = state.to_string();
-                op.price_id = Some(price_id.to_string());
-                op.session_id = session_id.map(str::to_string);
+            // Mirrors the production conditional mark: only an unresolved
+            // row takes the mark. A missing or already-retired row (lost
+            // mark, or superseded while its Stripe create was still in
+            // flight) reports `false` instead of resurrecting the flight.
+            let mut ops = self.checkout_ops.borrow_mut();
+            let Some(op) = ops.get_mut(op_id) else {
+                return Ok(false);
+            };
+            if !crate::billing_reconcile::is_single_flight_state(&op.state) {
+                return Ok(false);
             }
-            Ok(())
+            op.state = state.to_string();
+            op.price_id = Some(price_id.to_string());
+            op.session_id = session_id.map(str::to_string);
+            Ok(true)
         }
         async fn admin_ingest_upload(
             &self,
@@ -11117,6 +11154,7 @@ mod tests {
         status: &str,
         paid_through: Option<i64>,
         grace: Option<i64>,
+        anchor: Option<&str>,
     ) -> crate::billing_reconcile::ReconcileInput {
         crate::billing_reconcile::ReconcileInput {
             stripe_customer_id: Some("cus_test_1".to_string()),
@@ -11128,6 +11166,7 @@ mod tests {
                 plan_id: plan.to_string(),
                 status: status.to_string(),
                 paid_through_unix: paid_through,
+                paid_invoice_id: anchor.map(str::to_string),
                 grace_until_unix: grace,
             }),
             bindings: test_bindings(),
@@ -11190,7 +11229,7 @@ mod tests {
             )],
         };
         let outcome = crate::billing_reconcile::reconcile_subscription(
-            &fold_input(PLAN_PLUS, "active", Some(end), None),
+            &fold_input(PLAN_PLUS, "active", Some(end), None, None),
             &switched,
             BILLING_NOW,
         );
@@ -11264,7 +11303,7 @@ mod tests {
             )],
         };
         let stale_outcome = crate::billing_reconcile::reconcile_subscription(
-            &fold_input(PLAN_PLUS, "active", Some(e2), None),
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, None),
             &older,
             BILLING_NOW,
         );
@@ -11273,20 +11312,37 @@ mod tests {
             Some(e1),
             "the stale fold carries its evidence end into the write guard"
         );
-        // F reads the same stored row with the equal-E2 failed renewal: no
-        // new invoice, past_due with the first grace.
+        // F reads the same stored row with the equal-E2 failed renewal. A
+        // real fresh listing still carries the stored anchor invoice (the
+        // failure adds no new invoice, it does not erase the paid one), so
+        // the snapshot contains in_seed and the keep re-pins it — an
+        // anchor-less equal-end row against an anchored stored row is the
+        // stale shape, and must not be mistaken for this fresh outcome.
         let failed = crate::billing_reconcile::RemoteSubscription {
             subscription: test_subscription("sub_test_1", "cus_test_1", "past_due", PRICE_PLUS),
-            invoices: vec![],
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                e2,
+                BILLING_NOW,
+            )],
         };
         let fresh_outcome = crate::billing_reconcile::reconcile_subscription(
-            &fold_input(PLAN_PLUS, "active", Some(e2), None),
+            &fold_input(PLAN_PLUS, "active", Some(e2), None, Some("in_seed")),
             &failed,
             BILLING_NOW,
         );
         let grace = e2 + crate::billing_reconcile::RENEWAL_GRACE_SECS;
         assert_eq!(fresh_outcome.row.status, "past_due");
         assert_eq!(fresh_outcome.row.grace_until_unix, Some(grace));
+        assert_eq!(
+            fresh_outcome.row.paid_invoice_id.as_deref(),
+            Some("in_seed"),
+            "the fresh keep re-pins the stored anchor it observed"
+        );
         // F commits first, S second.
         block_on(h.store.store_reconcile_outcome("u1", &fresh_outcome)).expect("fresh stores");
         block_on(h.store.store_reconcile_outcome("u1", &stale_outcome)).expect("stale stores");
@@ -11466,6 +11522,114 @@ mod tests {
         assert_eq!(
             h.store.billing_customers.borrow().get("u1"),
             Some(&"cus_test_1".to_string())
+        );
+    }
+
+    #[test]
+    fn billing_session_mark_misses_retired_and_missing_rows() {
+        // The conditional mark only lands on unresolved rows: a mark that
+        // arrives after a deliberate supersede reports `false` and leaves
+        // the retired row untouched instead of resurrecting `submitted` on
+        // it; a missing row reports `false` the same way.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("mark"),
+            "unresolved row takes the mark"
+        );
+        assert!(
+            block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                crate::billing_reconcile::SUPERSEDED_OP_STATE,
+                PRICE_PLUS,
+                Some("cs_test_1"),
+            ))
+            .expect("retire"),
+            "open row retires"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_test_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("late mark"),
+            "retired row rejects the late mark"
+        );
+        assert!(
+            !block_on(h.store.update_checkout_operation(
+                "op_missing_1",
+                "submitted",
+                PRICE_PLUS,
+                Some("cs_late_1"),
+            ))
+            .expect("missing mark"),
+            "missing row reports a miss"
+        );
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id.as_deref(),
+            Some("cs_test_1"),
+            "the late session id never lands on the retired row"
+        );
+    }
+
+    #[test]
+    fn billing_late_create_mark_after_supersede_fails_without_reviving() {
+        // A replacer superseded op A while A's original Stripe create was
+        // still in flight. The late-arriving create must NOT resurrect
+        // `submitted` on the retired row (which would re-occupy the flight
+        // and hand out the now-expired session's URL): the conditional mark
+        // misses, the attempt fails retryable, and the flight stays free
+        // for the replacement.
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let created = block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("op insert");
+        let ctx = h.ctx();
+        block_on(replace_checkout_operation(&ctx, created.op(), None)).expect("supersede");
+        let open = block_on(h.store.open_checkout_operation("u1")).expect("open read");
+        assert_eq!(open, None, "supersede releases the flight");
+        // Late create under the retired id: Stripe replays the create (same
+        // key), but the mark misses the retired row.
+        let err = block_on(create_session_under(
+            &ctx,
+            "op_test_1",
+            "cus_test_1",
+            PRICE_PLUS,
+            "https://example.com/ok",
+            "https://example.com/cancel",
+        ));
+        assert_eq!(err, Err(EnsureCheckoutError::Failed));
+        let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
+            .expect("op lookup")
+            .expect("op stored");
+        assert_eq!(op.state, crate::billing_reconcile::SUPERSEDED_OP_STATE);
+        assert_eq!(
+            op.session_id, None,
+            "late mark never lands on the retired row"
         );
     }
 
