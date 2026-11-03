@@ -70,11 +70,15 @@ glyphs, status dots and the liked heart. Hosts render through `Icon`:
   standalone icons only: inside an already-named button or link the icon
   stays decorative, otherwise screen readers announce the action twice.
 
-Script budget: the three icon files hold 8 KB of content at most
-(`icons.test.ts` enforces it; production minification and tree-shaking
-only shrink further). Deferred stencils for later surfaces — radio,
-devices, share, link, picture-in-picture, captions — land with their
-screens by adding one name, one stencil and one label row each.
+Script budget: the three icon files compile to at most 8 KiB of
+uncompressed, minified client JavaScript (`icons.test.ts` enforces it
+with the pinned Svelte/TypeScript compilers and Terser). Each module is
+measured independently with all exports retained, including component
+runtime imports, but not the shared Svelte runtime already in the app.
+No gzip or route tree-shaking discount is applied. Deferred stencils for
+later surfaces — radio, devices, share, link, picture-in-picture,
+captions — land with their screens by adding one name, one stencil and
+one label row each.
 
 ## Strings (`strings.ts`)
 

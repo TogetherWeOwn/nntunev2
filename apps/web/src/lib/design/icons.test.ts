@@ -1,4 +1,7 @@
+import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
+import { minify } from 'terser';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import Icon from './Icon.svelte';
 import { ICON_NAMES, ICON_PATHS } from './icons.js';
@@ -14,21 +17,24 @@ const sources = import.meta.glob('./{icons.ts,strings.ts,Icon.svelte}', {
  * component renders an honest svg in both modes, and the added script
  * stays inside the 8 KB budget.
  *
- * Budget method: comment-stripped, whitespace-collapsed source bytes of
- * the three icon files. Production minification only shrinks further
- * (types erased, strings compressed), and tree-shaking drops whatever
- * no route imports — so this is the fail-closed upper bound.
+ * Budget method: compile the three modules for the client and minify
+ * each independently, retaining every export. Count uncompressed UTF-8
+ * bytes, including the component's runtime imports; the shared Svelte
+ * runtime is already part of the app. No gzip or route tree-shaking
+ * discount, and no source-text comment stripping that could eat strings.
  */
 
 const BUDGET_BYTES = 8192;
 
-function contentBytes(path: string): number {
-	const src = sources[path];
-	return src
-		.replace(/\/\*[\s\S]*?\*\//g, '')
-		.replace(/<!--[\s\S]*?-->/g, '')
-		.replace(/\s+/g, ' ')
-		.trim().length;
+async function scriptBytes(source: string, filename: string): Promise<number> {
+	const code = filename.endsWith('.svelte')
+		? compile(source, { filename, generate: 'client', dev: false }).js.code
+		: ts.transpileModule(source, {
+				compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext }
+			}).outputText;
+	const result = await minify(code, { module: true, format: { comments: false } });
+	if (!result.code) throw new Error(`No compiled script for ${filename}`);
+	return new TextEncoder().encode(result.code).byteLength;
 }
 
 describe('icon subset: manifest', () => {
@@ -90,9 +96,34 @@ describe('icon subset: component', () => {
 });
 
 describe('icon subset: budget', () => {
-	it('added script content stays within 8 KB', () => {
+	it('counts comment markers and repeated whitespace inside exported strings', async () => {
+		const value = '<!-- visible --> /* literal */' + ' '.repeat(BUDGET_BYTES);
+		const source = `export const stencil = ${JSON.stringify(value)};`;
+		const expected = new TextEncoder().encode(`export const stencil=${JSON.stringify(value)};`);
+		// Minification may escape HTML delimiters, but must not erase string content.
+		expect(await scriptBytes(source, 'literal.ts')).toBeGreaterThanOrEqual(expected.byteLength);
+	});
+
+	it('counts UTF-8 bytes rather than UTF-16 code units', async () => {
+		const ascii = await scriptBytes('export const label = "ab";', 'ascii.ts');
+		const unicode = await scriptBytes('export const label = "音楽";', 'unicode.ts');
+		expect(unicode - ascii).toBe(4);
+	});
+
+	it('includes oversized exported data even when no route imports it', async () => {
+		const source = `export const extra = ${JSON.stringify('x'.repeat(BUDGET_BYTES + 1))};`;
+		expect(await scriptBytes(source, 'oversized.ts')).toBeGreaterThan(BUDGET_BYTES);
+	});
+
+	it('rejects empty script output instead of counting it as zero bytes', async () => {
+		await expect(scriptBytes('/* no script */', 'empty.ts')).rejects.toThrow('No compiled script');
+	});
+
+	it('added script content stays within 8 KB', async () => {
 		const files = ['./icons.ts', './strings.ts', './Icon.svelte'];
-		const sizes = files.map((f) => [f, contentBytes(f)] as const);
+		const sizes = await Promise.all(
+			files.map(async (f) => [f, await scriptBytes(sources[f], f)] as const)
+		);
 		const total = sizes.reduce((sum, [, n]) => sum + n, 0);
 		const report = sizes.map(([f, n]) => `${f}=${n}B`).join(' ');
 		expect(total, `icon set content ${report} total=${total}B <= ${BUDGET_BYTES}B`).toBeLessThanOrEqual(
