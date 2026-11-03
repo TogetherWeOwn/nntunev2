@@ -124,7 +124,7 @@ Hyperdrive-only reads `lib.rs:816-895`.)
   (Sources: buckets `workers/mb/src/lib.rs:62-66`;
   `workers/mb/wrangler.toml.example:21-26,38-52`;
   `docs/ops.md:63-64,330,373`;
-  `docs/adr/0003-cache-scope.md:38-44`; JSON-only routes `lib.rs:1132-1159`.)
+  `docs/adr/0003-cache-scope.md:69-77`; JSON-only routes `lib.rs:1132-1159`.)
 
 ## p95 methodology (acceptance input)
 

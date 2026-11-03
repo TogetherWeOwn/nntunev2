@@ -84,16 +84,26 @@ no longer the re-wrap signal) and per-version counts drive the retire gate.
 
 ## 5. Signed stream grants (STRIDE)
 
-Stream Worker serves Range requests with R2 cache; grants authorize fetches.
+Stream Worker serves Range requests over one shared, curated collection
+(R2 popularity cache first, then NNTP through the backend provider pool;
+ADR 0013/0014). The signed grant is the only serve authorization: it is
+minted at the API issuance gate only after entitlement
+(plan/subscription) checks, binds user + track (the v2 payload also
+carries the play id and lease epoch), and is verified before any source
+is touched. Cache presence is never authorization and its absence is
+never a denial. Collection bytes are shared and content-addressed, not
+per-user — ADR 0013 superseded ADR 0003's per-user own-provider grant
+layer on 2026-11-03 — so the per-user security state is the metering
+key: delivered-byte intervals keyed `(user, track, play)`.
 
 | Threat | Attack | Mitigation (required) |
 |---|---|---|
-| Spoofing | Forged or replayed grant | Grants are MAC-signed (server key) and bound to `user_id` + content id. **F-GRANT-01 status (implemented in the merged grant module, `workers/stream/src/grant.rs`):** the production-intended issuer `issue_at` clamps the requested lifetime to 900 s (`MAX_GRANT_TTL`); the raw signer `issue` intentionally accepts an arbitrary expiry for tests and offline tooling and does not clamp. `verify` rejects a validly signed, unexpired grant whose remaining lifetime (`exp - now`) exceeds 900 s + 60 s skew (`CLOCK_SKEW_SECS`; 960 s total) as `TtlTooLong`; `now >= exp` remains `Expired`, and skew never revives an expired grant. Contract coverage: `workers/stream/tests/grant_ttl_contract_acceptance.rs`. This states merged module behavior only — it is not evidence of deployed end-to-end enforcement, a staging/production pass, or that every caller uses `issue_at`; applicable implementation PRs still pass §8 |
+| Spoofing | Forged or replayed grant | Grants are MAC-signed (server key) and bound to `user_id` + track id (v2 payload: also `play_id` + lease epoch, landing with the play route). **F-GRANT-01 status (implemented in the merged grant module, `workers/stream/src/grant.rs`):** the production-intended issuer `issue_at` clamps the requested lifetime to 900 s (`MAX_GRANT_TTL`); the raw signer `issue` intentionally accepts an arbitrary expiry for tests and offline tooling and does not clamp. `verify` rejects a validly signed, unexpired grant whose remaining lifetime (`exp - now`) exceeds 900 s + 60 s skew (`CLOCK_SKEW_SECS`; 960 s total) as `TtlTooLong`; `now >= exp` remains `Expired`, and skew never revives an expired grant. Contract coverage: `workers/stream/tests/grant_ttl_contract_acceptance.rs`. This states merged module behavior only — it is not evidence of deployed end-to-end enforcement, a staging/production pass, or that every caller uses `issue_at`; applicable implementation PRs still pass §8 |
 | Tampering | Grant edited to another track/user | MAC covers ALL grant fields; any field change invalidates |
-| Repudiation | Disputed fetches for metering | Metering events keyed to authenticated grant (Analytics Engine carries ids, never secrets) |
-| Information disclosure | Grant URL leaks (logs, Referer) | Grants travel in `Authorization` header or POST body, never query strings; cache keys namespaced per user — NEVER serve user A's bytes for user B's grant (cache-poisoning = cross-user disclosure). **Browser media elements** (plain GET + Range, no custom headers): playback auth uses EITHER a fetch/MSE player sending the `Authorization` header, OR a path-scoped, short-TTL, `HttpOnly`/`Secure`/`SameSite=Lax` grant cookie minted alongside the signed grant — never a signed query-string grant; `Referrer-Policy: no-referrer`; logs scrub grant bytes |
+| Repudiation | Disputed fetches for metering | Metering events keyed to authenticated grant (Analytics Engine carries ids, never secrets); delivered-byte intervals are reported per range response and accounted under `(user, track, play)`, so a disputed fetch resolves to one authenticated play, not to shared-cache state |
+| Information disclosure | Grant URL leaks (logs, Referer) | Grants travel in `Authorization` header or POST body, never query strings. Collection cache keys are shared and content-addressed, never namespaced per user (ADR 0013 superseded the per-user rule on 2026-11-03): the invariant is NEVER serve bytes without a verified grant, and NEVER serve bytes for any track other than the one the verified grant binds. Cached bytes carry no per-user provenance to leak — every object was fetched by the service from a curated source and hash-verified before publication — so the cross-user risk is an unentitled or wrong-track serve, carried by entitlement checks at issuance and grant/track equality at verification; a poisoned global mapping would reach every listener, so ingest match/verify gates plus pre-publication hash verification are the poisoning controls. **Browser media elements** (plain GET + Range, no custom headers): playback auth uses EITHER a fetch/MSE player sending the `Authorization` header, OR a path-scoped, short-TTL, `HttpOnly`/`Secure`/`SameSite=Lax` grant cookie minted alongside the signed grant — never a signed query-string grant; `Referrer-Policy: no-referrer`; logs scrub grant bytes |
 | Denial of service | Grant minting loop; Range-abuse on origin | Mint rate-limited; Range clamped; R2 absorbs repeats; per-user concurrency cap in pool |
-| Elevation | Grant for track X used against pool/account Y | Grant audience binds worker + user; pool DO re-validates grant before dialing provider |
+| Elevation | Grant for track X used to fetch track Y, or to drive the backend pool beyond the entitled play | Grant audience binds worker + user; grant/track equality is verified before any R2 or NNTP source contact, and the backend pool (ADR 0014) fetches only the grant-bound track's curated source — a grant never selects a provider account or another track's source |
 
 ## 6. Multi-tenant pool isolation (STRIDE)
 

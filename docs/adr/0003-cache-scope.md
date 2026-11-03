@@ -13,6 +13,10 @@
 - **Revised:** 2026-11-03 — per-plan cache budget/retention/priority dimensions
   retired with ADR 0004's revision (columns dropped in migration 0026); see the
   supersession note under Accounting and collection.
+- **Revised:** 2026-11-03 — the superseded per-user audio serve passages are
+  marked inline (Decision, R2 layout, Writers and refetch, Alternatives,
+  Consequences) and the current grant-gated rule is stated under Decision.
+  The original text is retained as history, not silently rewritten.
 
 ## Context
 
@@ -22,6 +26,27 @@ per-user authorization. Provisioned per-environment buckets are
 `nntunev2-{audio,art,archive}-{staging,prod}`; this ADR adopts those names.
 
 ## Decision
+
+> **Supersession note (2026-11-03, ADR 0013):** the per-user audio serve
+> rule in this section — a per-user `track_media` mapping plus a
+> `user_cache_grants` row proving the bytes came through that user's own
+> provider — is superseded for collection audio and retained below only
+> as history. The current rule: the catalogue is one shared, curated
+> collection (no user providers); a play is authorized by a signed,
+> track-bound stream grant minted at the API issuance gate only after
+> entitlement (plan/subscription) checks; the stream Worker verifies the
+> grant before touching any source, then serves shared collection
+> bytes — an R2 popularity-cache hit, or an NNTP fetch through the
+> backend provider pool (ADR 0014). Cache presence is never
+> authorization and its absence is never a denial. `track_media`
+> becomes a global track → content-hash mapping (ADR 0013 "What is
+> removed"; the schema alignment is listed there as follow-up work, not
+> shipped state). Metering stays per-user: delivered-byte intervals
+> keyed by `(user, track, play)`. A `cache_objects` row is still a
+> storage index, never authorization, and the no-hit-oracle rules below
+> stand. The artwork model in this record is retained by ADR 0013 with
+> "the caller's library membership" read as catalogue availability plus
+> entitlement.
 
 **Shared content-addressed storage with per-user audio serve grants.** A global
 `cache_objects` row is a storage index, never authorization. Serving **audio**
@@ -64,6 +89,14 @@ the content-addressed path above. The bucket, not the prefix, is the environment
 boundary. A prefix is not a tenant or user scope and authorizes nothing; the
 audio and art authorization rules above apply unchanged.
 
+> **Supersession note (2026-11-03):** this layout is retained in full by
+> ADR 0013; only the authorization reference ages out. Audio
+> authorization is now the verified track-bound signed grant (see the
+> Decision note), not the per-user mapping and grant rules this section
+> originally pointed back to; the art rule is retained as restated in
+> ADR 0013. A prefix still authorizes nothing, and no key is namespaced
+> per user.
+
 Audio/art objects are immutable and hash-verified. Archive buckets stay reserved
 with no Worker consumer. This ADR activates no scratch storage for ingest repair
 or MB dumps and decides neither its placement nor its lifecycle; a separate ops
@@ -72,6 +105,20 @@ MB implementation must use the environment-qualified art bucket, not an invented
 unsuffixed bucket.
 
 ### Writers and refetch
+
+> **Supersession note (2026-11-03, ADR 0013):** steps 3–4 below are the
+> BYOP publication/refetch path and are superseded for collection
+> audio. Under ADR 0013 a popularity fill (or an admin pin) fetches
+> through the backend provider pool, hash-verifies the complete object,
+> then publishes `cache_objects` plus the global `track_media` mapping
+> under the same per-hash serialization; a serve miss fetches through
+> the pool from the track's curated source — never through a user
+> provider, and no `user_cache_grants` row is created or checked.
+> Eviction still never deletes the curated source, so an evicted track
+> can re-fill. Where the deletion paragraphs below name
+> `track_media`/`user_cache_grants` cleanup, that cleanup retires with
+> the schema follow-ups ADR 0013 lists; the membership, playlist and
+> account deletion fence itself is unaffected by this supersession.
 
 1. **Accept:** the API inserts an idempotent `ingest_jobs` row and increments
    the day's accepted-job count. No track id or media hash is available yet.
@@ -301,14 +348,29 @@ and indexed `(user_id, played_at)` / `(track_id)` access paths.
   the added grant machinery is not worthwhile.
 - **Global mapping without grants:** rejected; permits cross-tenant content
   redistribution and cache poisoning.
+  *Superseded 2026-11-03:* ADR 0013 adopts the global mapping for the
+  shared curated collection, with authorization moved to entitlement
+  checks at grant issuance instead of per-user byte proof — every cached
+  byte is fetched by the service itself, so there is no tenant content
+  to redistribute. The poisoning concern is carried by ingest's
+  match/verify gates and pre-publication hash verification, not by
+  per-user isolation.
 - **No cache:** rejected; repeat plays unnecessarily consume provider quota.
 
 ## Consequences and implementation alignment
 
-Stream and Subsonic cache readers must replace global `track/<track_id>` or bare
-hash lookups with the per-user mapping and grant checks. The merged ingest
+**Superseded (2026-11-03, ADR 0013):** the original requirement here —
+stream and Subsonic cache readers replace global `track/<track_id>` or
+bare hash lookups with per-user mapping and grant checks — retired with
+the per-user grant layer. The current acceptance requirements are
+ADR 0013's: readers verify the track-bound signed grant before touching
+any source, serve shared collection bytes through the global
+`track_media` mapping (the in-memory `track/<id>` pointer cache retires
+in favour of `track_media`-backed lookups), and a miss fetches through
+the backend provider pool. The merged ingest
 pipeline needs a follow-up `write` transaction for normalized library rows and
 sources, not audio publication. These are implementation acceptance requirements,
 not claims that current main already implements them. Tests must cover shared
-hashes, final versus non-final membership removal, eviction/refetch, budget and
-retention boundaries, and publication racing a sweep.
+hashes, popularity admission and global cap boundaries, eviction/refetch,
+publication racing a sweep (ADR 0013), and final versus non-final membership
+removal for the library rules that remain in force.
