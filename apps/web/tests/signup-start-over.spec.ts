@@ -182,7 +182,7 @@ test('signup: Start over from code-sent sends nothing; the next start finishes w
 
 	await code.fill('fresh-code');
 	await page.getByRole('button', { name: /finish creating account/i }).click();
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 
 	// The finish used the fresh challenge and code — never the discarded ones.
 	expect(traffic.finishPosts).toBe(1);

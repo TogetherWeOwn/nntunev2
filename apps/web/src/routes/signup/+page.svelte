@@ -150,7 +150,7 @@
 			invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
-			window.location.href = '/onboarding/byop';
+			window.location.href = '/library';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {

@@ -283,7 +283,7 @@ const HEALTHY_JOBS: JobRow[] = [
   { name: 'staging-web', conclusion: 'success' },
   { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
   {
-    name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
+    name: 'post-deploy-e2e / full journey (signup → library → meter → limits)',
     conclusion: 'success',
   },
 ];
@@ -365,7 +365,7 @@ test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
         conclusion: 'success',
       },
       {
-        name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
+        name: 'post-deploy-e2e / full journey (signup → library → meter → limits)',
         conclusion: 'failure',
       },
     ]);

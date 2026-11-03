@@ -162,7 +162,7 @@ test('login: email cannot be edited while a passkey ceremony is in flight, and t
 	// Releasing the ceremony signs in and labels the sign-in with the
 	// attempted email — the only address ever sent to login/start.
 	await page.evaluate(() => window.__releasePasskey?.());
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(traffic.startBodies).toEqual([{ email: ATTEMPTED }]);
 	expect(traffic.finishPosts).toBe(1);
 	await expect.poll(() => storedLabel(page)).toBe(ATTEMPTED);
@@ -194,7 +194,7 @@ test('login: a programmatic mid-flight mutation of the email field cannot relabe
 	await expect(input).toHaveValue(RELABEL);
 
 	await page.evaluate(() => window.__releasePasskey?.());
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 
 	// The request and the display label both stay with the attempted
 	// email; the mutated field value was never adopted.
@@ -213,7 +213,7 @@ test('login: the trimmed attempted email is the snapshot sent to login/start and
 	expect(traffic.startBodies).toEqual([{ email: ATTEMPTED }]);
 
 	await page.evaluate(() => window.__releasePasskey?.());
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(traffic.finishPosts).toBe(1);
 	await expect.poll(() => storedLabel(page)).toBe(ATTEMPTED);
 });
@@ -303,7 +303,7 @@ test('login: duplicate clicks during a held ceremony stay a no-op and the comple
 	expect(traffic.finishPosts).toBe(0);
 
 	await page.evaluate(() => window.__releasePasskey?.());
-	await page.waitForURL('/onboarding/byop');
+	await page.waitForURL('/library');
 	expect(traffic.startBodies).toEqual([{ email: ATTEMPTED }]);
 	expect(traffic.finishPosts).toBe(1);
 	await expect.poll(() => storedLabel(page)).toBe(ATTEMPTED);
