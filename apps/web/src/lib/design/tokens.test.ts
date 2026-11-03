@@ -11,9 +11,9 @@ import { describe, expect, it } from 'vitest';
  *
  * Second half: every documented text pair meets WCAG AA (4.5:1) and every
  * focus pair meets 3:1, computed from the shipped file — not from copies
- * of the values. The one known exception (light good on the pane) is
- * pinned as a fence: semantic text there uses the foreground color plus
- * an icon, never the good token alone.
+ * of the values. Semantic status text uses the `-text` tokens, never the
+ * plain good/bad tokens alone; good/bad on their own are graphic and icon
+ * colour held to 3:1.
  */
 
 // The shipped stylesheet bytes: this workspace's Vite 8 pipeline resolves
@@ -159,6 +159,26 @@ describe('design tokens: new layer presence', () => {
 		});
 	}
 
+	it('semantic text and focus tokens resolve in both themes', () => {
+		for (const name of [
+			'--nt-good-text',
+			'--nt-bad-text',
+			'--nt-focus-ring',
+			'--nt-focus-ring-width',
+			'--nt-focus-ring-offset'
+		]) {
+			expect(dark.get(name), `dark ${name}`).toMatch(/\S/);
+			expect(light.get(name), `light ${name}`).toMatch(/\S/);
+		}
+	});
+
+	it('focus ring resolves to the accent color with fixed geometry', () => {
+		expect(dark.get('--nt-focus-ring')).toBe(dark.get('--nt-accent'));
+		expect(light.get('--nt-focus-ring')).toBe(light.get('--nt-accent'));
+		expect(dark.get('--nt-focus-ring-width')).toBe('2px');
+		expect(dark.get('--nt-focus-ring-offset')).toBe('2px');
+	});
+
 	it('type scale, space aliases, radii, sizes and motion resolve', () => {
 		const names = [
 			'--nt-text-2xs',
@@ -261,8 +281,10 @@ describe('design tokens: contrast gates', () => {
 		['dark muted on pane', '--nt-fg-muted', '--nt-surface-pane'],
 		['dark subtle on pane', '--nt-fg-subtle', '--nt-surface-pane'],
 		['dark button text', '--nt-accent-fg', '--nt-accent'],
-		['dark good on pane', '--nt-good', '--nt-surface-pane'],
-		['dark bad on pane', '--nt-bad', '--nt-surface-pane'],
+		['dark good text on bg', '--nt-good-text', '--nt-bg'],
+		['dark good text on pane', '--nt-good-text', '--nt-surface-pane'],
+		['dark bad text on bg', '--nt-bad-text', '--nt-bg'],
+		['dark bad text on pane', '--nt-bad-text', '--nt-surface-pane'],
 		['light fg on bg', '--nt-fg', '--nt-bg'],
 		['light fg on pane', '--nt-fg', '--nt-surface-pane'],
 		['light fg on hover', '--nt-fg', '--nt-surface-hover'],
@@ -270,7 +292,10 @@ describe('design tokens: contrast gates', () => {
 		['light muted on pane', '--nt-fg-muted', '--nt-surface-pane'],
 		['light subtle on pane', '--nt-fg-subtle', '--nt-surface-pane'],
 		['light button text', '--nt-accent-fg', '--nt-accent'],
-		['light bad on pane', '--nt-bad', '--nt-surface-pane']
+		['light good text on bg', '--nt-good-text', '--nt-bg'],
+		['light good text on pane', '--nt-good-text', '--nt-surface-pane'],
+		['light bad text on bg', '--nt-bad-text', '--nt-bg'],
+		['light bad text on pane', '--nt-bad-text', '--nt-surface-pane']
 	];
 	for (const [label, fg, bg] of textPairs) {
 		it(`text ${label} meets 4.5:1`, () => {
@@ -283,10 +308,14 @@ describe('design tokens: contrast gates', () => {
 	}
 
 	const focusPairs: Array<[string, string, string]> = [
-		['dark focus on bg', '--nt-accent', '--nt-bg'],
-		['dark focus on pane', '--nt-accent', '--nt-surface-pane'],
-		['light focus on bg', '--nt-accent', '--nt-bg'],
-		['light focus on pane', '--nt-accent', '--nt-surface-pane']
+		['dark focus on bg', '--nt-focus-ring', '--nt-bg'],
+		['dark focus on pane', '--nt-focus-ring', '--nt-surface-pane'],
+		['dark focus on raised', '--nt-focus-ring', '--nt-surface-raised'],
+		['dark focus on hover', '--nt-focus-ring', '--nt-surface-hover'],
+		['light focus on bg', '--nt-focus-ring', '--nt-bg'],
+		['light focus on pane', '--nt-focus-ring', '--nt-surface-pane'],
+		['light focus on raised', '--nt-focus-ring', '--nt-surface-raised'],
+		['light focus on hover', '--nt-focus-ring', '--nt-surface-hover']
 	];
 	for (const [label, fg, bg] of focusPairs) {
 		it(`focus ${label} meets 3:1`, () => {
@@ -298,8 +327,23 @@ describe('design tokens: contrast gates', () => {
 		});
 	}
 
-	it('fence: light good on the pane stays below 4.5, so text there never uses it alone', () => {
-		const ratio = contrast(light.get('--nt-good')!, light.get('--nt-surface-pane')!);
-		expect(ratio, `light good on pane = ${ratio.toFixed(2)} (fenced, not a text pair)`).toBeLessThan(4.5);
-	});
+	const graphicPairs: Array<[string, string, string]> = [
+		['dark good on bg', '--nt-good', '--nt-bg'],
+		['dark good on pane', '--nt-good', '--nt-surface-pane'],
+		['dark bad on bg', '--nt-bad', '--nt-bg'],
+		['dark bad on pane', '--nt-bad', '--nt-surface-pane'],
+		['light good on bg', '--nt-good', '--nt-bg'],
+		['light good on pane', '--nt-good', '--nt-surface-pane'],
+		['light bad on bg', '--nt-bad', '--nt-bg'],
+		['light bad on pane', '--nt-bad', '--nt-surface-pane']
+	];
+	for (const [label, fg, bg] of graphicPairs) {
+		it(`graphic ${label} meets 3:1 (never body text alone)`, () => {
+			const theme = label.startsWith('dark') ? dark : light;
+			const ratio = contrast(theme.get(fg)!, theme.get(bg)!);
+			expect(ratio, `${label}: ${theme.get(fg)} on ${theme.get(bg)} = ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(
+				3
+			);
+		});
+	}
 });

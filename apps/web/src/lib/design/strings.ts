@@ -6,7 +6,7 @@ import type { IconName } from './icons.js';
  * dotted path, each value below is the English default.
  *
  * Icon entries are fallback accessible names only. Actionable hosts pass
- * the visible action name (Play, Next track, Save to Liked Songs) as the
+ * the visible action name (Play, Next track, Save to Favorites) as the
  * label prop instead; the table keeps decorative-but-named uses and
  * automated checks honest in the meantime.
  */
@@ -20,8 +20,8 @@ export const DESIGN_STRINGS_EN: Record<DesignStringKey, string> = {
 	'design.icon.shuffle': 'Shuffle',
 	'design.icon.repeat': 'Repeat',
 	'design.icon.repeat-1': 'Repeat one',
-	'design.icon.heart': 'Save to Liked Songs',
-	'design.icon.heart-filled': 'Remove from Liked Songs',
+	'design.icon.heart': 'Save to Favorites',
+	'design.icon.heart-filled': 'Remove from Favorites',
 	'design.icon.plus': 'Add',
 	'design.icon.check': 'Confirm',
 	'design.icon.x': 'Close',

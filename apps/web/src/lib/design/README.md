@@ -19,24 +19,37 @@ The second layer adds, never renames:
   `--nt-shadow-overlay`, `--nt-hero-scrim`). Raised surfaces alias
   `--nt-bg-raised` so cards track the palette.
 - **Type scale** (`--nt-text-2xs` … `--nt-text-display`, `--nt-leading-*`,
-  `--nt-weight-body/strong/display`). Body copy stays on the existing
-  `--nt-line`; display clamps below the measured shell maximum.
+  `--nt-weight-body/strong/display`). Pairings: `2xs`/`xs`/`sm` with
+  `--nt-leading-sm`; `base`/`lg`/`xl`/`2xl` with `--nt-leading-base`;
+  `3xl`/`4xl`/display with their matching
+  `--nt-leading-3xl`/`4xl`/display. Only 400/700/800 ship, deliberately
+  — no mid-weight, so hosts must not synthesize one. Body copy stays on
+  the existing `--nt-line` until migrated; new text uses
+  `--nt-leading-base`. Display clamps below the measured shell maximum.
 - **Space** (`--nt-space-px-2` … `--nt-space-px-64`, pixel-true; the
   `space-1..5` steps stay canonical: 4/8/16/24/40 px at default size).
 - **Radii, sizes, z-order, motion** (`--nt-radius-*`, `--nt-control-*`,
   `--nt-rail-w`/`--nt-panel-w` families, `--nt-z-*`, `--nt-dur-*`,
   `--nt-ease-*`). Entries stay slower than exits; motion tokens pair
-  with the reduced-motion rule in `app.css`.
+  with the reduced-motion rule in `app.css`. `--nt-control-sm` (32px)
+  sits below the `--nt-target-coarse` (40px) floor: it is fine-pointer
+  only, and touch targets still keep the coarse minimum.
 
 ### Contrast contract
 
-Text pairs hold 4.5:1, the focus ring 3:1 — both computed from the
-shipped file in `tokens.test.ts`, not copied from a table.
+Text pairs hold 4.5:1, graphics and the focus ring 3:1 — all computed
+from the shipped file in `tokens.test.ts`, not copied from a table.
 
-One fence: **light `--nt-good` on the pane is 4.42**, so semantic text
-there uses `--nt-fg` plus a good/bad icon, never the good token alone.
-Darkening the value instead is a test-author-flow change, not a silent
-tweak.
+- Semantic status text uses `--nt-good-text` / `--nt-bad-text`, never
+  the plain `--nt-good` / `--nt-bad` tokens alone. The `-text` tokens
+  equal good/bad in dark and darken in light to hold 4.5:1 on both the
+  page background and the pane with headroom.
+- Plain good/bad are graphic and icon colour (3:1 floor).
+- The focus ring is `--nt-focus-ring` (the accent) with
+  `--nt-focus-ring-width` (2px) and `--nt-focus-ring-offset` (2px); it
+  holds 3:1 everywhere controls sit — page, pane, raised and hover
+  surfaces. Never reach for `--nt-border` as a ring: it fails 3:1 in
+  the light palette.
 
 ### Motion rule
 
@@ -53,7 +66,9 @@ glyphs, status dots and the liked heart. Hosts render through `Icon`:
 - Decorative: `<Icon name="search" />` renders `aria-hidden`.
 - Actionable: pass the visible action name —
   `<Icon name="play" label="Play" />`. The name describes the action or
-  state, never the file name.
+  state, never the file name. Labelled (`role="img"`) mode is for
+  standalone icons only: inside an already-named button or link the icon
+  stays decorative, otherwise screen readers announce the action twice.
 
 Script budget: the three icon files hold 8 KB of content at most
 (`icons.test.ts` enforces it; production minification and tree-shaking

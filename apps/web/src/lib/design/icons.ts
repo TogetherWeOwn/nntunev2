@@ -90,7 +90,7 @@ export const ICON_PATHS: Record<IconName, string> = {
 	'arrow-right': '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
 	search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/>',
 	house: '<path d="m4 11 8-7 8 7"/><path d="M6 9.5V20h12V9.5"/>',
-	library: '<path d="M4 3.5h16V20H4z"/><path d="M4 16.5h16"/><path d="M9 3.5V10"/>',
+	library: '<path d="M4 3.5h16V21H4z"/><path d="M4 17.5h16"/><path d="M8.5 3.5V17.5M12.5 3.5V17.5"/><path d="M15.5 7v10.5"/>',
 	'list-music':
 		'<path d="M3.5 6h11M3.5 10h7M3.5 14h11M3.5 18h7"/><path d="M18 14v6"/><circle cx="16" cy="20" r="2"/>',
 	'disc-3': '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2"/>',
@@ -98,12 +98,12 @@ export const ICON_PATHS: Record<IconName, string> = {
 		'<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/>',
 	user: '<circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>',
 	settings:
-		'<circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.8 1.8M16.7 16.7l1.8 1.8M18.5 5.5l-1.8 1.8M7.3 16.7l-1.8 1.8"/>',
+		'<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2.2"/><circle cx="15" cy="12" r="2.2"/><circle cx="8" cy="17" r="2.2"/>',
 	bell: '<path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6"/><path d="M10 20a2 2 0 0 0 4 0"/>',
 	'volume-1': `${SPK}<path d="M15.5 9.5a4 4 0 0 1 0 5"/>`,
 	'volume-2': `${SPK}<path d="M15.5 9.5a4 4 0 0 1 0 5"/><path d="M18 7a7.5 7.5 0 0 1 0 10"/>`,
 	'volume-x': `${SPK}<path d="m16 9.5 5 5M21 9.5l-5 5"/>`,
-	'list-video': '<path d="M3.5 6H13M3.5 10H13M3.5 14h6"/><path d="M15.5 13v8l7-4z"/>',
+	'list-video': `<path d="M9.5 6h11M9.5 10.5h11M9.5 15h11M9.5 19.5h11"/><path d="M3.5 4.8v4.4L7.5 7z"${F}/>`,
 	lyrics: '<path d="M4 6h16M4 10h16M4 14h10M4 18h7"/>',
 	maximize: '<path d="M8 3.5H3.5V8M16 3.5h4.5V8M8 20.5H3.5V16M16 20.5h4.5V16"/>',
 	minimize: '<path d="M3.5 8H8V3.5M16 3.5V8h4.5M3.5 16H8v4.5M16 20.5V16h4.5"/>',
