@@ -1,9 +1,8 @@
 # ADR 0012: Compliant YouTube video and Brainz data (PlayableSource, MBID-to-video join, licence corrections)
 
-- **Status:** Proposed — two owner decisions are pending (spike
-  retirement, §7; MetaBrainz supporter tier, §5). Both branches of each
-  decision are drafted below. This record becomes Accepted only when
-  those decisions close and the losing branches are struck.
+- **Status:** Accepted — both owner decisions closed 2026-11-03:
+  the spike is kept as a follow-on track with embeds first (§7), and
+  MetaBrainz data is free/CC0-only with no supporter tier (§5).
 - **Date:** 2026-11-03
 - **Amends:** the licence terms in
   [0007-mb-mirror.md](0007-mb-mirror.md) (§5, §6 here; the companion
@@ -14,18 +13,23 @@
 The product wants music videos and richer catalogue data. Three facts
 constrain how:
 
-1. **The existing `workers/youtube` spike cannot ship.** It extracts
-   audio streams yt-dlp-style (Innertube client, stream-URL parsing,
-   Range passthrough, planned residential proxy and signature
-   solving). That breaks the YouTube API Services Developer Policies:
-   III.I.7–8 (no separating audio/video), III.I.9 (no background
-   player), III.I.14 (no access via other technology), III.E.1.a–b (no
-   caching/offline copies), III.E.6 (no scraping), and the YouTube
-   Terms of Service (no circumvention, no automated access). Policy
-   texts read 2026-11-03; per the YouTube revision history the latest
-   Developer Policies revisions are 2026-06-01 / 2026-05-04 and the
-   Required Minimum Functionality (RMF) last changed 2025-07-07.
-   Compliant use is the visible official IFrame player only.
+1. **The existing `workers/youtube` spike is not a compliant
+   shipping path.** It extracts audio streams yt-dlp-style (Innertube
+   client, stream-URL parsing, Range passthrough, planned residential
+   proxy and signature solving). That breaks the YouTube API Services
+   Developer Policies: III.I.7–8 (no separating audio/video),
+   III.I.9 (no background player), III.I.14 (no access via other
+   technology), III.E.1.a–b (no caching/offline copies), III.E.6 (no
+   scraping), and the YouTube Terms of Service (no circumvention, no
+   automated access). Policy texts read 2026-11-03; per the YouTube
+   revision history the latest Developer Policies revisions are
+   2026-06-01 / 2026-05-04 and the Required Minimum Functionality
+   (RMF) last changed 2025-07-07. The compliant path — and the only
+   YouTube playback path this record authorizes for users — is the
+   visible official IFrame player. The owner has nevertheless kept
+   the spike as a later track (§7): that decision carries the
+   policy/ToS risk above as an accepted owner risk behind the §7
+   gates; it does not make extraction compliant.
 2. **The mirror's licence story is wrong.** ADR 0007 assumes hourly
    MusicBrainz replication under "core data is CC0". In fact Live Data
    Feed replication packets are CC BY-NC-SA 3.0, and so are tags
@@ -33,8 +37,11 @@ constrain how:
    list itself is CC0 core; genre assignments to entities are not).
    Core data — artists, recordings, releases, release groups,
    relationships, URLs, ISRCs — is CC0, so YouTube URL relationships
-   are free to use under either branch in §5. NNTune is a paid
-   product, so non-commercial terms cannot be waved through.
+   are free to use. The owner (2026-11-03) framed NNTune as a
+   private, invite-only, non-commercial hobby service and chose the
+   free CC0-only path (§5): no supporter tier, no account or token,
+   and no reliance on the service's non-commercial framing to use
+   NC-licensed data.
 3. **There is no curated MBID→YouTube dataset to import.**
    ListenBrainz keeps no MBID→YouTube mapping (verified in its code:
    YouTube IDs there come from individual listens or from play-time
@@ -50,6 +57,14 @@ code. Two of its behaviours are explicitly not adopted: play-time
 `search.list` (§2), and any player mode that keeps YouTube playing
 while not visible (§1).
 
+**REA angle:** study ListenBrainz's BrainzPlayer to learn how its
+YouTube source behaves in a mixed queue (visibility, end/error
+advance, fallback) — open source first, REA on the shipped web
+bundle only for gaps. That study is input to the §1 build, not a
+blocker for this record; if it changes the contract, it lands as a
+follow-up amendment. The same study-first rule applies to the §7
+proxy question before any proxy workaround is bought.
+
 ## Decision
 
 ### 1. `PlayableSource` abstraction
@@ -57,7 +72,10 @@ while not visible (§1).
 A track is keyed by recording MBID (ISRC secondary). Playback goes
 through one interface: `kind`, `canPlay(track)`, `play`, `pause`,
 `seek`, `onEnd`, `onError` (advances to the next playable source),
-`recordsListens`. Two implementations:
+`recordsListens`. Two implementations ship under this record.
+(`YouTubeEmbedSource` is the first YouTube path built and the
+default whenever YouTube plays; the kept extraction spike may only
+ever become a third implementation under §7's gates.)
 
 - **`NntpSource`** — audio from the user's own provider. The default.
   Background play, gapless, offline and Media Session are allowed:
@@ -93,7 +111,7 @@ through one interface: `kind`, `canPlay(track)`, `play`, `pause`,
 - Present YouTube as a *video* feature, never as an audio source.
   III.I.1 (substitute for a YouTube application) and III.E.1
   (facilitating infringement) are residual audit risks for a
-  Usenet-based paid app; a visible, clearly-attributed video surface
+  Usenet-based app; a visible, clearly-attributed video surface
   is the mitigation available to us. This stays a launch-gate legal
   item, not a settled permission.
 
@@ -219,36 +237,45 @@ with `X-RateLimit-*` headers respected:
   ListenBrainz MBID→YouTube map" is proposing something that does
   not exist.
 
-### 5. MetaBrainz licence correction — owner decision, both branches
+### 5. MetaBrainz licence correction — free, CC0-only (owner decision, 2026-11-03)
 
-Fact (both branches): hourly replication packets and
+Fact: hourly replication packets and
 tags/genre-associations/ratings/annotations are CC BY-NC-SA 3.0;
 core data including URL relationships is CC0. ADR 0007's terms are
-corrected in the companion edit regardless of branch.
+corrected in the companion edit.
 
-- **Branch A — supporter tier approved.** Stealth Start-Up ($0)
-  while the product is not public; Bronze ($100/month and up) from
-  public launch, which licenses the commercial use. Hourly
-  replication (ADR 0007 point 3, lag SLO <2 h) and tags/genres may
-  be used under that agreement. The tier is an operating cost of
-  the mirror, reviewed at launch and on tier changes.
-- **Branch B — no tier (CC0-only mirror).** The mirror switches to
-  the twice-weekly CC0 core dumps (plus the CC0 canonical dumps on
-  the 1st/15th if useful); hourly replication stops, and with it
-  ADR 0007's <2 h lag SLO is replaced by dump freshness (≤4 days).
-  NC data is excluded at import: no tags/genre associations,
+**Decision (owner, 2026-11-03): free only — no MetaBrainz supporter
+tier, no MetaBrainz account, and no token.** NNTune is a private,
+invite-only, non-commercial hobby service; that framing is the
+reason for the choice, and it is recorded here so the choice is not
+quietly relitigated. The mirror therefore runs CC0-only:
+
+- The mirror uses the twice-weekly CC0 core dumps (plus the CC0
+  canonical dumps on the 1st/15th if useful); the hourly Live Data
+  Feed is dropped from ADR 0007's mirror design, and ADR 0007's
+  <2 h lag SLO is replaced by dump freshness (≤4 days).
+- NC data is excluded at import: no tags/genre associations,
   ratings, annotations, or derived statistics built from them.
-  Browse-by-genre then needs another source (Wikidata P136, CC0,
-  coverage unmeasured) or is deferred. Everything §2 needs is CC0
-  core, so video is unaffected by this branch.
+- Browse-by-genre needs a CC0 source. Wikidata (P136) is the
+  candidate but its coverage is unmeasured — an **open question**,
+  not a commitment; genre browsing is deferred until it is answered.
+- Everything §2 needs is CC0 core, so video is unaffected.
+- **Re-open trigger:** the service starts earning real revenue and
+  the benefits justify paying. That is a new owner `Money:`
+  decision at that time; nothing here plans for it.
+- **Open question (not decided, kept out of this decision):**
+  whether a non-commercial service may use NC-licensed data — and
+  the free non-commercial feed token — under CC BY-NC-SA. That is a
+  legal question and the token would be a credential; this record
+  takes no position and authorizes neither.
 
-Either branch: CritiqueBrainz reviews are filtered per-review to
-CC BY-SA only (pre-2022 imports may be NC); AcousticBrainz (frozen
-2022) may supply static features but is never a dependency;
-Wikipedia summaries are CC BY-SA 4.0 and carry attribution; synced
-lyrics stay feature-flagged **off** (no stated licence at the free
-source; publisher rights are the blocker) pending a separate
-licensing decision.
+Also: CritiqueBrainz reviews are filtered per-review to CC BY-SA
+only (pre-2022 imports may be NC); AcousticBrainz (frozen 2022)
+may supply static features but is never a dependency; Wikipedia
+summaries are CC BY-SA 4.0 and carry attribution; synced lyrics
+stay feature-flagged **off** (no stated licence at the free source;
+publisher rights are the blocker) pending a separate licensing
+decision.
 
 ### 6. Cover-art rights flag
 
@@ -257,10 +284,11 @@ per image". No such per-image licences exist: the Cover Art Archive
 states images are copyrighted by their respective owners and grants
 no licence. Corrected position, recorded here and in ADR 0007:
 
-- Caching CAA art in R2 and serving it inside a **paid** product is
-  common industry practice but is **not licensed**. This is an open
-  legal risk, explicitly on the pre-launch legal-review list; it is
-  not cleared by this ADR.
+- Caching CAA art in R2 and serving it in the product is common
+  industry practice but is **not licensed** — the service's private,
+  non-commercial framing (§5) does not create a licence either.
+  This is an open legal risk, explicitly on the pre-launch
+  legal-review list; it is not cleared by this ADR.
 - Until that review: art is cached unchanged (no relicensing claims,
   no use in marketing), the mirror stores CAA URLs/hashes, and a
   takedown path (drop the cached object and the URL) must exist
@@ -268,35 +296,55 @@ no licence. Corrected position, recorded here and in ADR 0007:
 - This flag is about CAA only. YouTube thumbnails are dealt with in
   §3 (never stored at all).
 
-### 7. Retiring the `workers/youtube` extraction spike — owner decision, both branches
+### 7. The `workers/youtube` extraction spike is kept — embeds first (owner decision, 2026-11-03)
 
 The spike was approved 2026-10-21. It is non-compliant (Context 1).
-Neither branch of this ADR authorizes extraction as a
-`PlayableSource`, a deployed service, or a fallback: the only
-question the owner decision settles is disposal.
+The owner (2026-11-03) declined to retire it: embeds are built and
+shipped first, and the spike stays as the follow-on track toward
+playback that does not depend on embeds forever. This record is
+precise about what that does and does not authorize:
 
-- **Branch A — retirement approved.** Retire plan, one change set:
-  1. Remove `workers/youtube` (code, `wrangler.toml.example`
-     contract, corpus) and `docs/youtube-backend-spike.md`; remove
-     any deployed spike worker, its KV namespaces (`YT_CONFIG`,
-     `YT_PLAYER_CACHE`) and Durable Object, and cancel the
-     residential-proxy arrangement (~$4/GB).
-  2. Preserve, rewritten fresh if retained, only the pure curation
-     logic in `select.rs` that §2 still uses (duration match,
-     denylist, official-video preference). Drop anything derived
-     from Innertube (e.g. `musicVideoType`).
-  3. The CI grep gate (no `googlevideo`, `/youtubei/`, `yt-dlp`,
-     `youtubei` references) must pass on the removal and stay green.
-  4. Git history keeps the spike; that is a record, not a live path.
-     No history rewrite.
-- **Branch B — retirement declined (for now).** The spike is frozen
-  in place and quarantined: no deploys, no wiring into
-  `PlayableSource` or any user-facing route, no new proxy spend,
-  and its README/spec carry a "non-compliant, do not ship" banner
-  pointing here. The compliant embed design (§1–§4) proceeds
-  unchanged. Revisit at public launch at the latest; a public
-  launch with a live extraction path is out of bounds under this
-  ADR under either branch.
+- **Embed first and default.** `YouTubeEmbedSource` (§1) is the
+  first YouTube path built and remains the default. The spike does
+  not gate, delay, or shape the embed work.
+- **Kept, behind a flag, off in production.** If the spike is ever
+  wired in, it is as a later third `PlayableSource` behind a
+  feature flag that is off in production. Until the gates below
+  close it is not deployed as a user-facing path, not a fallback
+  when the embed fails, and not reachable from any user route.
+- **The policy/ToS risk is an accepted owner risk, recorded, not
+  retired.** Context 1 stands unchanged: extraction breaks the
+  YouTube API Services Developer Policies and the YouTube Terms of
+  Service. Keeping the spike accepts that exposure at owner level;
+  it does not make the technique compliant, and no build change may
+  cite this section as compliance cover. Turning the flag on for
+  users needs a fresh owner decision made against the policy texts
+  current at that time.
+- **No residential proxy is approved.** The owner kept the spike,
+  not the spend: the ~$4/GB residential arrangement is not
+  authorized by this record or by the keep decision. Any proxy use
+  needs its own owner `Money:` card with a monthly cap, and the
+  owner's proxy order of preference (2026-11-03) applies when that
+  card is written:
+  - **A (preferred):** no residential proxy at all;
+  - **B:** proxy only for auth/extraction (`/player`), never for
+    media bytes — already the spike's design (`workers/youtube`
+    README: proxy only for `/player` when the extraction IP is
+    bot-walled). Its GO/NO-GO gate is the measure: if more than 5%
+    of byte fetches from Worker egress fail, bytes would need the
+    proxy too, which is uneconomic — a NO-GO for this option;
+  - **C:** a much cheaper proxy, only if bytes demonstrably need
+    one.
+  Measuring whether A or B holds is follow-on research that starts
+  only after embeds work; per the REA angle above, the study comes
+  before any spend.
+- **Hygiene while kept:** the pure curation logic §2 still uses
+  (duration match, denylist, official-video preference) may be
+  reused, rewritten fresh where it is entangled with Innertube
+  (e.g. `musicVideoType` is dropped, not carried over). Nothing in
+  the kept spike weakens §3: the curation job's `videos.list` calls
+  remain the only server-side YouTube calls this record authorizes
+  while the flag is off.
 
 ## Measurement: MusicBrainz video-link coverage (2026-11-03)
 
@@ -340,9 +388,11 @@ arbitrary track.
 
 ## Rejected alternatives
 
-1. **Ship the extraction spike as a source.** Non-compliant
-   (Context 1) regardless of its earlier approval; an ADR cannot
-   launder a terms breach.
+1. **Ship the extraction spike now, as the YouTube path.**
+   Non-compliant (Context 1) regardless of its earlier approval; an
+   ADR cannot launder a terms breach. The owner kept the spike as a
+   later, flag-off track (§7) — shipping it as the path now was not
+   chosen, and retiring it outright was also declined.
 2. **Play-time YouTube search** (the BrainzPlayer fallback). Dies on
    the 100-calls/day `search.list` bucket and makes playback depend
    on quota.
@@ -350,8 +400,11 @@ arbitrary track.
    search-at-play behaviour is rejected above. Interface shape only.
 4. **Proxy/cache YouTube thumbnails or media via R2/Workers.**
    Banned (III.E.1.a, III.I.4); §3 instead.
-5. **Keep claiming the hourly feed is CC0.** Factually wrong (§5);
-   the choice is to license it (A) or stop using it (B).
+5. **Keep claiming the hourly feed is CC0**, and **license it via a
+   supporter tier** (Stealth now, Bronze at launch). The first is
+   factually wrong (§5); the second was put to the owner and
+   rejected — free/CC0-only is the decision, re-openable only on
+   real revenue (§5).
 6. **Hide-the-player audio mode / muted synced video.** III.I.9 /
    III.I.7. Not a design option at any price.
 
@@ -361,17 +414,26 @@ arbitrary track.
   visible-video-only; audio features (background, gapless, offline)
   stay NNTP-only, permanently. UX must not blur that line.
 - Video ships as an opportunistic, attribution-labelled surface
-  (free plan included), gated on: the §3 CSP security review, the
-  two owner decisions, terms/privacy updates (III.A), and the
-  30-day TTL job. The CI guardrails (grep gate; no `search.list` on
-  the play path) are acceptance criteria for the build changes,
-  which also re-check the YouTube policy revision history — these
-  policies change, and this ADR cites the revisions read above.
+  (free plan included), gated on: the §3 CSP security review,
+  terms/privacy updates (III.A), and the 30-day TTL job. (The two
+  owner decisions that gated this record closed 2026-11-03: §5, §7.)
+  The CI guardrails (grep gate over the new video/curation paths —
+  no `googlevideo`, `/youtubei/` or `yt-dlp` references there; the
+  kept, flag-off `workers/youtube` spike directory is the one
+  exclusion, per §7; no `search.list` on the play path) are
+  acceptance criteria for the build changes, which also re-check
+  the YouTube policy revision history — these policies change, and
+  this ADR cites the revisions read above.
 - Follow-on build work, each its own change: mirror schema
   extension (§2); `PlayableSource` + `YouTubeEmbedSource` + video
   surfaces (§1); curation job + moderated submissions (§2);
-  ListenBrainz account link (§4); spike disposal (§7 branch A) or
-  quarantine banner (§7 branch B).
+  ListenBrainz account link (§4); the BrainzPlayer study (REA
+  angle) as build input; and, only after embeds work, the §7 spike
+  track behind its flag with its proxy A/B/C measurement — any
+  proxy spend and any production flag-on each need their own owner
+  decision first.
 - Open risks carried, not closed: III.I.1/III.E.1 audit exposure
-  (§1), unlicensed CAA art in a paid product (§6), Wikidata P136
-  genre coverage (§5 branch B). All three are pre-launch items.
+  (§1), the accepted owner policy/ToS risk on the kept spike (§7),
+  unlicensed CAA art (§6), Wikidata P136 genre coverage and the
+  NC-data legal question (§5 open questions). All are pre-launch
+  items.
