@@ -1,4 +1,4 @@
--- 0031_mb_mirror_phase2_relations.sql: artist/recording/release relations
+-- 0033_mb_mirror_phase2_relations.sql: artist/recording/release relations
 -- (credits, song relations), aliases, labels + catalogue numbers, works.
 BEGIN;
 --
