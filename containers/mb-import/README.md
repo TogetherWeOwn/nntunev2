@@ -67,11 +67,11 @@ missing, unreadable or empty later file therefore leaves entities,
 cursors, DLQ and replication state untouched. The fifteen phase-2 TSVs
 are optional as a group: a snapshot predating phase 2 (none of the
 fifteen present) imports its base tables unchanged, while any snapshot
-carrying at least one phase-2 file must carry all fifteen, regular,
-readable and nonempty. An empty `release_credit` file beside a nonempty
-release dump is refused as a truncated snapshot — every release carries
-at least one credit row — while other empty phase-2 projections import
-as a no-op (`import.sh:182-185`). This is admission, **not whole-import atomicity**: subsequent
+carrying at least one phase-2 file must carry all fifteen, regular and
+readable. Empty phase-2 files import as a no-op skip, except an empty
+`release_credit` file beside a nonempty release dump, which is refused
+as a truncated snapshot — every release carries at least one credit row
+(`import.sh:177-185`; per-table skip `import.sh:456-474`). This is admission, **not whole-import atomicity**: subsequent
 row validation, duplicate detection or runtime failures can still leave earlier
 chunks committed, with existing resume/DLQ and final-track-prune semantics.
 
