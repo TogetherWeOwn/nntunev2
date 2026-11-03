@@ -1,5 +1,6 @@
--- 0034_mb_mirror_phase2_relations.sql: artist/recording/release relations
+-- 0035_mb_mirror_phase2_relations.sql: artist/recording/release relations
 -- (credits, song relations), aliases, labels + catalogue numbers, works.
+SET search_path = public, pg_catalog;
 BEGIN;
 --
 -- Phase-2 slice of the CC0-only mirror (ADR 0007): the importer/ETL learn
@@ -41,7 +42,7 @@ BEGIN;
 -- release-label tables below reference them. work_type / label_type are
 -- the denormalized type names; label_code is the numeric code printed on
 -- releases, NULL when the label has none.
-CREATE TABLE IF NOT EXISTS mb_work (
+CREATE TABLE IF NOT EXISTS public.mb_work (
     mbid       UUID PRIMARY KEY,
     name       TEXT NOT NULL,
     work_type  TEXT,
@@ -50,9 +51,9 @@ CREATE TABLE IF NOT EXISTS mb_work (
 );
 
 CREATE INDEX IF NOT EXISTS mb_work_name_trgm_idx
-    ON mb_work USING gin (name gin_trgm_ops);
+    ON public.mb_work USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_label (
+CREATE TABLE IF NOT EXISTS public.mb_label (
     mbid       UUID PRIMARY KEY,
     name       TEXT NOT NULL,
     label_code INTEGER,
@@ -62,41 +63,41 @@ CREATE TABLE IF NOT EXISTS mb_label (
 );
 
 CREATE INDEX IF NOT EXISTS mb_label_name_trgm_idx
-    ON mb_label USING gin (name gin_trgm_ops);
+    ON public.mb_label USING gin (name gin_trgm_ops);
 
 -- Artist <-> recording / release / work and recording <-> work/song
 -- relations. The key is the triple: one entity pair links under several
 -- relationship types.
-CREATE TABLE IF NOT EXISTS mb_artist_recording (
-    artist_mbid UUID NOT NULL REFERENCES mb_artist (mbid) ON DELETE CASCADE,
-    recording_mbid UUID NOT NULL REFERENCES mb_recording (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_artist_recording (
+    artist_mbid UUID NOT NULL REFERENCES public.mb_artist (mbid) ON DELETE CASCADE,
+    recording_mbid UUID NOT NULL REFERENCES public.mb_recording (mbid) ON DELETE CASCADE,
     link_name   TEXT NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no     BIGINT,
     PRIMARY KEY (artist_mbid, recording_mbid, link_name)
 );
 
-CREATE TABLE IF NOT EXISTS mb_artist_release (
-    artist_mbid UUID NOT NULL REFERENCES mb_artist (mbid) ON DELETE CASCADE,
-    release_mbid UUID NOT NULL REFERENCES mb_release (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_artist_release (
+    artist_mbid UUID NOT NULL REFERENCES public.mb_artist (mbid) ON DELETE CASCADE,
+    release_mbid UUID NOT NULL REFERENCES public.mb_release (mbid) ON DELETE CASCADE,
     link_name   TEXT NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no     BIGINT,
     PRIMARY KEY (artist_mbid, release_mbid, link_name)
 );
 
-CREATE TABLE IF NOT EXISTS mb_artist_work (
-    artist_mbid UUID NOT NULL REFERENCES mb_artist (mbid) ON DELETE CASCADE,
-    work_mbid   UUID NOT NULL REFERENCES mb_work (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_artist_work (
+    artist_mbid UUID NOT NULL REFERENCES public.mb_artist (mbid) ON DELETE CASCADE,
+    work_mbid   UUID NOT NULL REFERENCES public.mb_work (mbid) ON DELETE CASCADE,
     link_name   TEXT NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no     BIGINT,
     PRIMARY KEY (artist_mbid, work_mbid, link_name)
 );
 
-CREATE TABLE IF NOT EXISTS mb_recording_work (
-    recording_mbid UUID NOT NULL REFERENCES mb_recording (mbid) ON DELETE CASCADE,
-    work_mbid      UUID NOT NULL REFERENCES mb_work (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_recording_work (
+    recording_mbid UUID NOT NULL REFERENCES public.mb_recording (mbid) ON DELETE CASCADE,
+    work_mbid      UUID NOT NULL REFERENCES public.mb_work (mbid) ON DELETE CASCADE,
     link_name      TEXT NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no        BIGINT,
@@ -106,9 +107,9 @@ CREATE TABLE IF NOT EXISTS mb_recording_work (
 -- Directed song relations (both listing directions are rows); the
 -- music-video link type is excluded here and stays in
 -- mb_recording_music_video, so a video pair never lands in both tables.
-CREATE TABLE IF NOT EXISTS mb_recording_recording (
-    recording_a_mbid UUID NOT NULL REFERENCES mb_recording (mbid) ON DELETE CASCADE,
-    recording_b_mbid UUID NOT NULL REFERENCES mb_recording (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_recording_recording (
+    recording_a_mbid UUID NOT NULL REFERENCES public.mb_recording (mbid) ON DELETE CASCADE,
+    recording_b_mbid UUID NOT NULL REFERENCES public.mb_recording (mbid) ON DELETE CASCADE,
     link_name        TEXT NOT NULL,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no          BIGINT,
@@ -116,14 +117,14 @@ CREATE TABLE IF NOT EXISTS mb_recording_recording (
 );
 
 CREATE INDEX IF NOT EXISTS mb_recording_recording_b_idx
-    ON mb_recording_recording (recording_b_mbid);
+    ON public.mb_recording_recording (recording_b_mbid);
 
 -- Full release credits: every artist-credit position on the release, in
 -- order, with the credited name and join phrase as printed on the release.
-CREATE TABLE IF NOT EXISTS mb_release_credit (
-    release_mbid UUID NOT NULL REFERENCES mb_release (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_release_credit (
+    release_mbid UUID NOT NULL REFERENCES public.mb_release (mbid) ON DELETE CASCADE,
     position     SMALLINT NOT NULL CHECK (position >= 0),
-    artist_mbid  UUID NOT NULL REFERENCES mb_artist (mbid) ON DELETE CASCADE,
+    artist_mbid  UUID NOT NULL REFERENCES public.mb_artist (mbid) ON DELETE CASCADE,
     name         TEXT NOT NULL,
     join_phrase  TEXT NOT NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -133,9 +134,9 @@ CREATE TABLE IF NOT EXISTS mb_release_credit (
 
 -- Release <-> label edges with catalogue numbers. The key is the triple:
 -- one release lists the same label under several catalogue numbers.
-CREATE TABLE IF NOT EXISTS mb_release_label (
-    release_mbid   UUID NOT NULL REFERENCES mb_release (mbid) ON DELETE CASCADE,
-    label_mbid     UUID NOT NULL REFERENCES mb_label (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_release_label (
+    release_mbid   UUID NOT NULL REFERENCES public.mb_release (mbid) ON DELETE CASCADE,
+    label_mbid     UUID NOT NULL REFERENCES public.mb_label (mbid) ON DELETE CASCADE,
     catalog_number TEXT NOT NULL,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     line_no        BIGINT,
@@ -146,8 +147,8 @@ CREATE TABLE IF NOT EXISTS mb_release_label (
 -- rewrites NULL locales to '' and collapses duplicate spellings, so the
 -- natural key holds within a dump. Trigram indexes serve the future
 -- alias-search reads (SR-06).
-CREATE TABLE IF NOT EXISTS mb_artist_alias (
-    artist_mbid        UUID NOT NULL REFERENCES mb_artist (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_artist_alias (
+    artist_mbid        UUID NOT NULL REFERENCES public.mb_artist (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -158,10 +159,10 @@ CREATE TABLE IF NOT EXISTS mb_artist_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_artist_alias_name_trgm_idx
-    ON mb_artist_alias USING gin (name gin_trgm_ops);
+    ON public.mb_artist_alias USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_release_alias (
-    release_mbid       UUID NOT NULL REFERENCES mb_release (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_release_alias (
+    release_mbid       UUID NOT NULL REFERENCES public.mb_release (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -172,10 +173,10 @@ CREATE TABLE IF NOT EXISTS mb_release_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_release_alias_name_trgm_idx
-    ON mb_release_alias USING gin (name gin_trgm_ops);
+    ON public.mb_release_alias USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_recording_alias (
-    recording_mbid     UUID NOT NULL REFERENCES mb_recording (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_recording_alias (
+    recording_mbid     UUID NOT NULL REFERENCES public.mb_recording (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -186,10 +187,10 @@ CREATE TABLE IF NOT EXISTS mb_recording_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_recording_alias_name_trgm_idx
-    ON mb_recording_alias USING gin (name gin_trgm_ops);
+    ON public.mb_recording_alias USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_release_group_alias (
-    release_group_mbid UUID NOT NULL REFERENCES mb_release_group (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_release_group_alias (
+    release_group_mbid UUID NOT NULL REFERENCES public.mb_release_group (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -200,10 +201,10 @@ CREATE TABLE IF NOT EXISTS mb_release_group_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_release_group_alias_name_trgm_idx
-    ON mb_release_group_alias USING gin (name gin_trgm_ops);
+    ON public.mb_release_group_alias USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_work_alias (
-    work_mbid          UUID NOT NULL REFERENCES mb_work (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_work_alias (
+    work_mbid          UUID NOT NULL REFERENCES public.mb_work (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -214,10 +215,10 @@ CREATE TABLE IF NOT EXISTS mb_work_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_work_alias_name_trgm_idx
-    ON mb_work_alias USING gin (name gin_trgm_ops);
+    ON public.mb_work_alias USING gin (name gin_trgm_ops);
 
-CREATE TABLE IF NOT EXISTS mb_label_alias (
-    label_mbid         UUID NOT NULL REFERENCES mb_label (mbid) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS public.mb_label_alias (
+    label_mbid         UUID NOT NULL REFERENCES public.mb_label (mbid) ON DELETE CASCADE,
     name               TEXT NOT NULL,
     locale             TEXT NOT NULL,
     sort_name          TEXT NOT NULL,
@@ -228,12 +229,12 @@ CREATE TABLE IF NOT EXISTS mb_label_alias (
 );
 
 CREATE INDEX IF NOT EXISTS mb_label_alias_name_trgm_idx
-    ON mb_label_alias USING gin (name gin_trgm_ops);
+    ON public.mb_label_alias USING gin (name gin_trgm_ops);
 
 -- The import cursor/DLQ table_name checks (migrations 0014, 0016, 0030;
 -- Postgres auto-named column checks) learn the fifteen phase-2 tables.
-ALTER TABLE mb_import_cursor DROP CONSTRAINT IF EXISTS mb_import_cursor_table_name_check;
-ALTER TABLE mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_check
+ALTER TABLE public.mb_import_cursor DROP CONSTRAINT IF EXISTS mb_import_cursor_table_name_check;
+ALTER TABLE public.mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_check
     CHECK (table_name IN ('artist', 'release', 'recording', 'track',
                           'release_group', 'url', 'artist_url', 'recording_url',
                           'recording_music_video', 'recording_isrc',
@@ -244,8 +245,8 @@ ALTER TABLE mb_import_cursor ADD CONSTRAINT mb_import_cursor_table_name_check
                           'artist_alias', 'release_alias', 'recording_alias',
                           'release_group_alias', 'work_alias', 'label_alias',
                           'release_label'));
-ALTER TABLE mb_import_dlq DROP CONSTRAINT IF EXISTS mb_import_dlq_table_name_check;
-ALTER TABLE mb_import_dlq ADD CONSTRAINT mb_import_dlq_table_name_check
+ALTER TABLE public.mb_import_dlq DROP CONSTRAINT IF EXISTS mb_import_dlq_table_name_check;
+ALTER TABLE public.mb_import_dlq ADD CONSTRAINT mb_import_dlq_table_name_check
     CHECK (table_name IN ('artist', 'release', 'recording', 'track',
                           'release_group', 'url', 'artist_url', 'recording_url',
                           'recording_music_video', 'recording_isrc',

@@ -44,6 +44,10 @@ use crate::auth::{
 };
 // Single unpadded-base64url codec (F-HARD-01): `crate::b64` over the
 // `base64` crate. The aliased names keep wire-format call sites unchanged.
+use crate::admin_ingest::{
+    self, AdminIngestAttempt, AdminIngestDeleteOutcome, AdminIngestUploadOutcome,
+    StoredAdminIngestJob,
+};
 use crate::b64::{decode as b64url_decode, encode as b64url_encode};
 use crate::providers::{self, ProviderMintRow};
 use crate::session::{self, SessionClaims, SessionRecord};
@@ -65,13 +69,15 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route accepts document
-/// uploads, every other route takes API-sized bodies. Both the entry's
-/// collection gate and the pre-routing size check call this, so the two
-/// caps cannot drift apart.
+/// Per-route request-body bound: the NZB intake route and the admin NZB
+/// upload route accept document uploads, every other route takes
+/// API-sized bodies. Both the entry's collection gate and the pre-routing
+/// size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
     if method == "POST" && path == "/api/ingest" {
         INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/admin/ingest" {
+        admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
     } else {
         MAX_BODY_BYTES
     }
@@ -265,6 +271,23 @@ pub struct Config {
     /// fails closed per-request (generic 500) before signature verification
     /// — an unverifiable webhook is never parsed, never acked.
     pub stripe_webhook_secret: Option<String>,
+    /// Play-grant HMAC secret shared with the stream Worker
+    /// (`PLAY_GRANT_SECRET`, [`crate::play_grant`]): the RAW string
+    /// bytes, never base64-decoded — the stream side keys its verifier
+    /// with the secret string's bytes, so both sides must agree byte
+    /// for byte. `None` until the operator provisions it; unprovisioned
+    /// (or under the 32-byte minimum, enforced at mint time) the play
+    /// routes fail closed per-request with a generic 500 while every
+    /// other route keeps serving.
+    pub play_grant_secret: Option<Vec<u8>>,
+    /// Meter-sink HMAC secret shared with the stream Worker
+    /// (`METER_SINK_SECRET`, [`crate::meter_sink`]): the RAW string
+    /// bytes, never base64-decoded, for the same reason as the
+    /// play-grant secret. `None` until provisioned; unprovisioned
+    /// (or under the 32-byte minimum) the internal sink route fails
+    /// closed per-request with a generic 500 while every other
+    /// route keeps serving.
+    pub meter_sink_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -334,6 +357,8 @@ impl Config {
             native_rest_pepper_version: 0,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
+            play_grant_secret: None,
+            meter_sink_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -407,6 +432,25 @@ impl Config {
     ) -> Self {
         self.stripe_secret_key = secret_key;
         self.stripe_webhook_secret = webhook_secret;
+        self
+    }
+
+    /// Provision the play-grant HMAC secret (raw bytes of the
+    /// `PLAY_GRANT_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by the minter per request (fail closed), so this
+    /// setter accepts whatever the entry staged; native tests pass
+    /// synthetic secrets directly.
+    pub fn with_play_grant_secret(mut self, secret: Vec<u8>) -> Self {
+        self.play_grant_secret = Some(secret);
+        self
+    }
+
+    /// Provision the meter-sink HMAC secret (raw bytes of the
+    /// `METER_SINK_SECRET` Worker secret). The 32-byte minimum is
+    /// enforced by [`crate::meter_sink::verify`] per request (fail
+    /// closed), so this setter accepts whatever the entry staged.
+    pub fn with_meter_sink_secret(mut self, secret: Vec<u8>) -> Self {
+        self.meter_sink_secret = Some(secret);
         self
     }
 
@@ -805,6 +849,20 @@ pub trait Store {
             Err(StoreError)
         }
     }
+    /// The live-slot subscription row (`billing::subscription_live_
+    /// select_statement`) feeding `resolve_effective_plan` at the
+    /// playback gate. Default `Err` fails closed: a store that cannot
+    /// read subscriptions must refuse grant issuance (generic 500),
+    /// never invent entitlement. Production and the test fake override.
+    fn live_subscription(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::SubscriptionRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
     /// Stream seconds metered for `(user_id, period_month)` — the monthly
     /// `SUM` over `stream_play_ledger`
     /// (`ledger::ledger_monthly_total_statement`), 0 when no plays are
@@ -817,6 +875,127 @@ pub trait Store {
     ) -> impl Future<Output = Result<u64, StoreError>> {
         async move {
             let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// Whether any subscription row ever reached paid coverage
+    /// (`billing::subscription_ever_paid_statement`): the
+    /// `lapsed` vs `never_subscribed` discriminator. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
+    fn ever_subscribed(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Runtime caps from the `plans` row
+    /// (`plan_limits::plan_caps_select_statement`): `None` when the id
+    /// has no row (the gate fails closed to the reserved `free` caps).
+    /// Default `Err` fails closed like [`Store::live_subscription`].
+    fn plan_caps(
+        &self,
+        plan_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::plan_limits::PlanCaps>, StoreError>> {
+        async move {
+            let _ = plan_id;
+            Err(StoreError)
+        }
+    }
+    /// Billed stream seconds for (`user_id`, `period_month`) — the
+    /// single monthly-usage authority
+    /// (`ledger::ledger_monthly_total_statement`). Default `Err` fails
+    /// closed: an unreadable meter refuses new playback rather than
+    /// reading as zero usage.
+    fn monthly_stream_seconds(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, period_month);
+            Err(StoreError)
+        }
+    }
+    /// The user's `playback_leases` row, if any. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn playback_lease(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::playback::LeaseRow>, StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Atomically acquire/replace the user's lease for a NEW play
+    /// (`playback::playback_lease_acquire_statement`): succeeds when
+    /// no row exists, the stored lease has expired at `now`, the same
+    /// client session re-acquires, or `takeover` is set; the epoch
+    /// increments in the store, never from a caller value. Otherwise
+    /// `Held` with the live lease's remaining TTL. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn acquire_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: &str,
+        now: u64,
+        expires_at: u64,
+        takeover: bool,
+    ) -> impl Future<Output = Result<crate::playback::LeaseAcquire, StoreError>> {
+        async move {
+            let _ = (
+                user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            );
+            Err(StoreError)
+        }
+    }
+    /// Extend the exact holder's lease (`playback::playback_lease_
+    /// touch_statement`): true iff the (`session_id`, `play_id`,
+    /// `epoch`) triple still names the stored row. Default `Err` fails
+    /// closed like [`Store::live_subscription`].
+    fn touch_playback_lease(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (user_id, session_id, play_id, epoch, now, expires_at);
+            Err(StoreError)
+        }
+    }
+    /// Derivation metadata for one (user, track) pair
+    /// (`meter_sink::track_meter_meta_statement`); unknown or
+    /// non-UUID tracks resolve to the all-`None` meta (the fallback
+    /// rung), never an error — only a store failure errors. Default
+    /// `Err` fails closed like [`Store::live_subscription`] (the sink
+    /// answers 500 and the DO retries; nothing meters on a guess).
+    fn track_meter_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        async move {
+            let _ = (user_id, track_id);
+            Err(StoreError)
+        }
+    }
+    /// Write one cumulative play window through the monotonic upsert
+    /// (`ledger::ledger_play_window_upsert_statement`): which
+    /// disposition the write converged to is reported for the sink
+    /// ack. Default `Err` fails closed like
+    /// [`Store::live_subscription`].
+    fn record_play_window(
+        &self,
+        window: &crate::ledger::PlayWindow,
+    ) -> impl Future<Output = Result<crate::meter_sink::PlayWindowOutcome, StoreError>> {
+        async move {
+            let _ = window;
             Err(StoreError)
         }
     }
@@ -1238,6 +1417,56 @@ pub trait Store {
         _session_id: Option<&str>,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move { Err(StoreError) }
+    }
+    /// One guarded admin NZB upload attempt (migration 0034): validate
+    /// the attempt, converge duplicates on the content-derived id, and
+    /// write the job row, the encrypted original (accepted attempts
+    /// only) and the `ingest.uploaded` audit row in one transaction,
+    /// revalidating the actor's role under the write serialization lock
+    /// (see `AdminWriteOutcome`). Fail-closed default; production and
+    /// the test fake override it.
+    fn admin_ingest_upload(
+        &self,
+        _attempt: &AdminIngestAttempt,
+    ) -> impl Future<Output = Result<AdminIngestUploadOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// One stored admin job row by id, or `None` for unknown ids and
+    /// pipeline rows (the admin reads never expose the pipeline
+    /// ledger). Never carries NZB bytes or parse detail: the row type
+    /// is redacted by construction. Fail-closed default is absent;
+    /// production and the test fake override it.
+    fn admin_ingest_get(
+        &self,
+        _job_id: &str,
+    ) -> impl Future<Output = Result<Option<StoredAdminIngestJob>, StoreError>> {
+        async { Ok(None) }
+    }
+    /// Stored admin job rows, newest first: `status` admits exactly one
+    /// view status (`accepted`/`failed`) or `None` for every admin job;
+    /// `limit`/`offset` are already bounded by the handler. Pipeline
+    /// rows never appear. Fail-closed default is empty; production and
+    /// the test fake override it.
+    fn admin_ingest_list(
+        &self,
+        _status: Option<&str>,
+        _limit: u64,
+        _offset: u64,
+    ) -> impl Future<Output = Result<Vec<StoredAdminIngestJob>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
+    /// Store-level delete primitive (no route serves it): the original
+    /// goes first, then the job, under the actor re-check. A deleted
+    /// actor's attempt reports `ActorNotAdmin`; an unknown id (or a
+    /// pipeline row) reports `Missing`. No audit row: deletion writes
+    /// no new observable state. Fail-closed default; production and the
+    /// test fake override it.
+    fn admin_ingest_delete(
+        &self,
+        _actor_user_id: &str,
+        _job_id: &str,
+    ) -> impl Future<Output = Result<AdminIngestDeleteOutcome, StoreError>> {
+        async { Err(StoreError) }
     }
     /// Issue one invite and write its `invite.issued` audit row in one
     /// transaction, revalidating the actor's role under the write
@@ -4593,17 +4822,23 @@ where
 /// Render a plan-limit denial on the wire (`docs/api-errors.md` 402 /
 /// 429 rows): status, names-only body, and the limit + reset headers (plus
 /// `retry-after` on 429) the client needs to render the upgrade path.
-/// Note: both `retry_after` and `Denial::headers()` render `retry-after`
-/// on a 429, so the first 429-shaped denial on a path using this helper
-/// must dedupe one of them. Every denial on the ingest path today is a
-/// 402 (no `retry-after`), so no duplication exists yet.
+/// `Response.retry_after` is rendered by the entry as the wire
+/// `retry-after` header, so the copy inside `Denial::headers()` is
+/// dropped when the field is set — a 429 never carries the header twice.
 fn plan_limit_refusal(denial: crate::plan_limits::Denial) -> Response {
+    let extra_headers = denial
+        .headers()
+        .into_iter()
+        .filter(|(name, _)| {
+            denial.retry_after_secs.is_none() || name != crate::plan_limits::RETRY_AFTER_HEADER
+        })
+        .collect();
     Response {
         status: denial.status,
         body: denial.body_json(),
         set_cookie: None,
         retry_after: denial.retry_after_secs,
-        extra_headers: denial.headers(),
+        extra_headers,
     }
 }
 
@@ -4841,6 +5076,285 @@ where
     )
 }
 
+// --- Admin ingest (migration 0034) ---------------------------------------------------------
+
+/// 413 for an admin NZB upload whose body breached the collection cap:
+/// the in-handler pre-gate answers oversized admin uploads this way,
+/// with the null-job failure shape — no row, no audit, no parse. This
+/// shape serves direct-`handle` callers only: the production entry gate
+/// (`dispatch_collected` in `worker_entry.rs`) answers `Oversized` with
+/// the route-blind uniform 400 (`invalid_request`) before auth, never
+/// dispatching, so an oversized body through the entry never reaches
+/// this arm.
+pub(crate) fn admin_ingest_oversized() -> Response {
+    admin_ingest_failure(413, "payload_too_large", "too_large", None)
+}
+
+/// One admin ingest failure body: `{job_id, status, code, reason}` —
+/// the registry wire code for the status plus the fixed vocabulary
+/// reason. Carries no NZB bytes and no parser detail; `job_id` is null
+/// exactly when no content was parsed (empty or oversized bodies).
+fn admin_ingest_failure(status: u16, code: &str, reason: &str, job_id: Option<&str>) -> Response {
+    json_response(
+        status,
+        serde_json::json!({
+            "job_id": job_id,
+            "status": "failed",
+            "code": code,
+            "reason": reason,
+        }),
+    )
+}
+
+/// Redacted job view for a stored admin row: counts and the failure
+/// reason only. `deduplicated` marks a POST that converged on a
+/// pre-existing row (list/get views never carry it).
+fn admin_ingest_view(job: &StoredAdminIngestJob, deduplicated: Option<bool>) -> serde_json::Value {
+    match admin_ingest::view_status(&job.db_status) {
+        Some("accepted") => {
+            let mut view = serde_json::json!({
+                "job_id": job.job_id,
+                "status": "accepted",
+                "accepted_at": job.accepted_at,
+                "nzb_bytes": job.nzb_bytes,
+                "file_count": job.file_count,
+                "segment_count": job.segment_count,
+                "has_original": job.has_original,
+                "uploader_user_id": job.uploader_user_id,
+            });
+            if let Some(deduplicated) = deduplicated {
+                view["deduplicated"] = deduplicated.into();
+            }
+            view
+        }
+        _ => {
+            let mut view = serde_json::json!({
+                "job_id": job.job_id,
+                "status": "failed",
+                "code": job
+                    .failure_reason
+                    .as_deref()
+                    .and_then(admin_ingest::FailureReason::parse)
+                    .map(|reason| reason.wire_code())
+                    .unwrap_or("invalid_request"),
+                "reason": job.failure_reason,
+            });
+            if let Some(deduplicated) = deduplicated {
+                view["deduplicated"] = deduplicated.into();
+            }
+            view
+        }
+    }
+}
+
+/// `POST /v1/admin/ingest` — accept one raw NZB upload. The guard runs
+/// first (mutation, so a stale admin session steps up); the body then
+/// classifies in intake order (empty, too large, not-NZB heuristic,
+/// real core parse, total-segment cap). Accepted bytes are encrypted
+/// into the no-expiry original and everything commits in one guarded
+/// store transaction; a rejected body still writes its failed job row
+/// (same transaction, same audit shape). Empty and oversized bodies
+/// write nothing and audit nothing — there is no parsed content to
+/// name. Randomness failure is the existing 503 `unavailable`
+/// envelope, like every other envelope fill.
+async fn admin_ingest_upload<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    match admin_ingest::classify_upload(&req.body) {
+        Err(reason) => {
+            if reason == admin_ingest::FailureReason::Empty {
+                return admin_ingest_failure(400, reason.wire_code(), reason.as_str(), None);
+            }
+            let hex = admin_ingest::content_sha256_hex(&req.body);
+            let attempt = AdminIngestAttempt {
+                actor_user_id: claims.user_id.clone(),
+                job_id: admin_ingest::derive_job_id(&req.body),
+                idempotency_key: admin_ingest::idempotency_key(&hex),
+                content_sha256_hex: hex,
+                nzb_bytes: req.body.len() as u64,
+                file_count: None,
+                segment_count: None,
+                failure: Some(reason),
+                original: None,
+                kek_version: ctx.cfg.kek_version,
+                source_ip: ctx.source_ip.clone(),
+                now: ctx.now,
+            };
+            match ctx.store.admin_ingest_upload(&attempt).await {
+                // A fresh rejection answers the reason's own status;
+                // a replay converges on the stored failed row (200).
+                Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    let status = if deduplicated {
+                        200
+                    } else {
+                        reason.http_status()
+                    };
+                    let view = admin_ingest_view(&job, Some(deduplicated));
+                    json_response(status, view)
+                }
+                // The actor lost admin between the guard and the write
+                // transaction's re-check: answer as any non-admin is.
+                Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                // The actor scheduled account deletion: ADR 0002 rule 3
+                // fences the write, answered with the typed 409.
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
+                Err(_) => internal(),
+            }
+        }
+        Ok(valid) => {
+            let hex = admin_ingest::content_sha256_hex(&req.body);
+            let job_id = admin_ingest::derive_job_id(&req.body);
+            let current_kek = match ctx.cfg.kek_by_version(ctx.cfg.kek_version) {
+                Some(kek) => kek,
+                None => return internal(),
+            };
+            let envelope = match admin_ingest::encrypt_ingest_original(
+                current_kek,
+                ctx.cfg.kek_version,
+                &hex,
+                &job_id,
+                &req.body,
+            ) {
+                Ok(envelope) => envelope,
+                Err(crate::vault::VaultError::RandomnessUnavailable) => return unavailable(),
+                Err(_) => return internal(),
+            };
+            let attempt = AdminIngestAttempt {
+                actor_user_id: claims.user_id.clone(),
+                job_id,
+                idempotency_key: admin_ingest::idempotency_key(&hex),
+                content_sha256_hex: hex,
+                nzb_bytes: req.body.len() as u64,
+                file_count: Some(valid.file_count),
+                segment_count: Some(valid.segment_count),
+                failure: None,
+                original: Some(envelope),
+                kek_version: ctx.cfg.kek_version,
+                source_ip: ctx.source_ip.clone(),
+                now: ctx.now,
+            };
+            match ctx.store.admin_ingest_upload(&attempt).await {
+                // Fresh acceptance is 201; a replay converges on the
+                // stored row (200 with `deduplicated: true`).
+                Ok(AdminIngestUploadOutcome::Stored { job, deduplicated }) => {
+                    let status = if deduplicated { 200 } else { 201 };
+                    let view = admin_ingest_view(&job, Some(deduplicated));
+                    json_response(status, view)
+                }
+                Ok(AdminIngestUploadOutcome::ActorNotAdmin) => not_found(),
+                Ok(AdminIngestUploadOutcome::AccountDeleting) => account_deleting_response(),
+                Err(_) => internal(),
+            }
+        }
+    }
+}
+
+/// `GET /v1/admin/ingest/{id}` — one stored admin job, redacted.
+/// Unknown ids, pipeline rows and malformed shapes are the plain 404.
+async fn admin_ingest_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if ctx.authenticate_admin(req, false).await.is_err() {
+        return not_found();
+    }
+    let Some(rest) = req.path.strip_prefix("/v1/admin/ingest/") else {
+        return not_found();
+    };
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') {
+        return not_found();
+    }
+    match ctx.store.admin_ingest_get(rest).await {
+        Ok(Some(job)) => {
+            if admin_ingest::view_status(&job.db_status).is_none() {
+                return internal();
+            }
+            json_response(200, admin_ingest_view(&job, None))
+        }
+        Ok(None) => not_found(),
+        Err(_) => internal(),
+    }
+}
+
+/// `GET /v1/admin/ingest` — stored admin jobs, newest first, redacted.
+/// The runtime strips the query string before handlers run; the entry
+/// preserves it for exactly this route, so `?status=&limit=&offset=`
+/// filters apply in production and in tests alike. An unknown status
+/// is the 422 `validation_failed` envelope; unparsable windows fall
+/// back to the bounded default, never an error.
+async fn admin_ingest_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if ctx.authenticate_admin(req, false).await.is_err() {
+        return not_found();
+    }
+    let (bare, query) = match req.path.split_once('?') {
+        Some((bare, query)) => (bare, query),
+        None => (req.path.as_str(), ""),
+    };
+    if bare != "/v1/admin/ingest" {
+        return not_found();
+    }
+    let mut status_raw: Option<&str> = None;
+    let mut limit_raw: Option<&str> = None;
+    let mut offset_raw: Option<&str> = None;
+    for pair in query.split('&') {
+        let (key, value) = match pair.split_once('=') {
+            Some(split) => split,
+            None => continue,
+        };
+        match key {
+            "status" => status_raw = Some(value),
+            "limit" => limit_raw = Some(value),
+            "offset" => offset_raw = Some(value),
+            _ => {}
+        }
+    }
+    let Some(status) = admin_ingest::parse_status_filter(status_raw) else {
+        return validation_failed("unknown status");
+    };
+    // The store filters on the ledger status; the view names it
+    // `accepted` while the row stays `queued` for the future dispatch
+    // slice (the source discriminator keeps the pipeline off it).
+    let db_status = match status {
+        None => None,
+        Some("accepted") => Some("queued"),
+        Some("failed") => Some("failed"),
+        Some(_) => return internal(),
+    };
+    let (limit, offset) = admin_ingest::parse_list_window(limit_raw, offset_raw);
+    match ctx.store.admin_ingest_list(db_status, limit, offset).await {
+        Ok(jobs) => {
+            let mut views = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                if admin_ingest::view_status(&job.db_status).is_none() {
+                    return internal();
+                }
+                views.push(admin_ingest_view(job, None));
+            }
+            json_response(
+                200,
+                serde_json::json!({"jobs": views, "limit": limit, "offset": offset}),
+            )
+        }
+        Err(_) => internal(),
+    }
+}
 // --- Admin invites (migration 0033) --------------------------------------------------------
 //
 // API-only in M1: issue (plaintext shown once in the response, hash
@@ -5066,6 +5580,502 @@ where
         }
         Err(_) => internal(),
     }
+}
+
+// --- Play grant issuance -----------------------------------------------------------------
+//
+// `POST /v1/plays` is THE enforcement point: the stream Worker has no DB
+// binding, so subscription, the monthly hour cap, and the
+// one-concurrent-stream lease are all evaluated here before a grant is
+// minted (`crate::playback` documents the gate order and lease rules).
+// Cookie-session only for now: the scope map keeps `Bearer(PlaysWrite)`
+// on this path, so a presented native-rest bearer is gate-checked in
+// `handle()` (invalid keys plain-404 before dispatch, never rescued by a
+// cookie) but cannot mint until native bearer dispatch lands; the
+// heartbeat path is `Deny` in the scope map and never enters the gate.
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayIssueBody {
+    track_id: String,
+    /// Client-generated playback session id (per tab/device): the lease
+    /// holder name. Distinct from the account session cookie — two
+    /// signed-in devices share one account but hold different holders.
+    session_id: String,
+    /// Continuation key only: present when refreshing a grant for the
+    /// caller's own current play. Never accepted as a fresh play id —
+    /// new starts always mint one server-side, so a replay cannot be
+    /// under-metered by reusing an old id.
+    play_id: Option<String>,
+    /// Explicit "play here instead": take the lease from the other
+    /// session now rather than waiting out its TTL.
+    #[serde(default)]
+    takeover: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayHeartbeatBody {
+    session_id: String,
+    play_id: String,
+    lease_epoch: u64,
+}
+
+/// Client session ids name the lease holder: bounded by the
+/// `playback_leases` length CHECK (1..=128), compared for equality only.
+/// The byte cap is at least as strict as the column's character cap.
+fn valid_client_session_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128
+}
+
+/// `402 subscription_required` with the paywall `reason` discriminator
+/// plus the upgrade pointer (`docs/api-errors.md`): the registered
+/// envelope extended by names-only fields, like the plan-limit body.
+fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Response {
+    let error = crate::api_error::ApiError::subscription_required("subscription required");
+    Response {
+        status: error.status,
+        body: serde_json::json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "reason": refusal.reason(),
+            (crate::plan_limits::UPGRADE_KEY): crate::plan_limits::UPGRADE_URL,
+        })
+        .to_string(),
+        set_cookie: None,
+        retry_after: None,
+        extra_headers: Vec::new(),
+    }
+}
+
+/// Mint the grant for an already-acquired lease hold and render the
+/// issuance body. The minter re-checks the identity field rule, so an
+/// unmeterable identity still cannot mint even though the handler
+/// validated earlier; `NotConfigured` is unreachable after the
+/// up-front secret check but stays a fail-closed 500, never a token.
+fn play_grant_response(
+    secret: &[u8],
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    epoch: u64,
+    now: u64,
+    lease_expires_at: u64,
+) -> Response {
+    match crate::play_grant::issue_v2_at(
+        user_id,
+        track_id,
+        play_id,
+        epoch,
+        now,
+        crate::play_grant::MAX_GRANT_TTL,
+        Some(secret),
+    ) {
+        Ok(issued) => json_response(
+            200,
+            serde_json::json!({
+                "grant": issued.token,
+                "play_id": play_id,
+                "lease_epoch": epoch,
+                "expires_at": issued.exp_unix,
+                "lease_expires_at": lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        ),
+        Err(crate::play_grant::MintError::NotConfigured) => internal(),
+        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+    }
+}
+
+async fn play_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
+    // answer the typed 409 up front rather than a lease 429/500 after
+    // the fence refuses the write.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // An unprovisioned (or too-short) secret fails closed before any
+    // lease write: an unmintable grant must never burn a lease epoch or
+    // displace the current holder.
+    let Some(secret) = ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+    else {
+        return internal();
+    };
+    let Some(body) = parse_body::<PlayIssueBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    // The track id must be meterable before any lease write: the
+    // ledger field rule is the single authority (probed with a
+    // placeholder play id — the same probe the minter runs with the
+    // real one). User ids are server-generated; an unmeterable one
+    // fails this same check rather than minting an unbillable grant.
+    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
+    {
+        return validation_failed("invalid track_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    // Continuation: the same client session refreshing the grant for
+    // its own current play (seek/resume/refresh ahead of grant
+    // expiry). Skips the subscription and cap gates — the track that
+    // crosses the cap, or whose subscription lapses mid-play,
+    // finishes; only the next NEW start is refused. The conditional
+    // touch either re-extends the same epoch or reports the caller
+    // lost the lease between the read and now, in which case this is
+    // simply a new start through the gates below.
+    if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
+                .is_err()
+            {
+                return validation_failed("invalid play_id");
+            }
+            let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+            match ctx
+                .store
+                .touch_playback_lease(
+                    &claims.user_id,
+                    &body.session_id,
+                    play_id,
+                    row.epoch,
+                    ctx.now,
+                    lease_expires_at,
+                )
+                .await
+            {
+                Ok(true) => {
+                    return play_grant_response(
+                        secret,
+                        &claims.user_id,
+                        &body.track_id,
+                        play_id,
+                        row.epoch,
+                        ctx.now,
+                        lease_expires_at,
+                    );
+                }
+                Ok(false) => {}
+                Err(_) => return internal(),
+            }
+        }
+    }
+    // New start, gate 1: subscription. `now` saturates into i64 rather
+    // than wrapping — an absurd clock reads as far-future (closed),
+    // never as the distant past (entitled forever).
+    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let effective = crate::billing::resolve_effective_plan(
+        subscription.as_ref().map(|row| row.as_view()),
+        i64::try_from(ctx.now).unwrap_or(i64::MAX),
+    );
+    if !effective.entitled {
+        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+            Ok(ever) => ever,
+            Err(_) => return internal(),
+        };
+        let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
+            .expect("an unentitled effective plan always refuses");
+        return subscription_refusal(refusal);
+    }
+    // Caps are plan DATA from the `plans` row; a missing row fails
+    // closed to the reserved `free` caps (0 h) — the 402 below, never
+    // a silently uncapped grant.
+    let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
+        Ok(Some(caps)) => caps,
+        Ok(None) => crate::plan_limits::PlanId::Free.caps(),
+        Err(_) => return internal(),
+    };
+    // Gate 2: the monthly hour cap. An unreadable meter refuses the
+    // new start (store default `Err`) rather than reading as zero.
+    let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
+    let used_seconds = match ctx
+        .store
+        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .await
+    {
+        Ok(seconds) => seconds,
+        Err(_) => return internal(),
+    };
+    if let Some(denial) =
+        crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
+    {
+        return plan_limit_refusal(denial);
+    }
+    // A zero concurrency allowance refuses with the lease 429 wire and
+    // the static retry: no lease exists to wait on. Allowances above
+    // one are still enforced as one — the lease table holds a single
+    // row per user by design (every seeded plan allows exactly one).
+    if caps.max_concurrent_streams == 0 {
+        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+            &caps,
+            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        ));
+    }
+    // Gate 3: the lease. The play id is minted here, never taken from
+    // the client (a client-chosen fresh id could replay an old play
+    // and under-meter). The atomic acquire bumps the epoch in the
+    // store; `Held` is the other-session 429 with the live TTL.
+    let play_id = match random_id::<16>() {
+        Ok(id) => id,
+        Err(_) => return unavailable(),
+    };
+    let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+    match ctx
+        .store
+        .acquire_playback_lease(
+            &claims.user_id,
+            &body.session_id,
+            &body.track_id,
+            &play_id,
+            ctx.now,
+            lease_expires_at,
+            body.takeover,
+        )
+        .await
+    {
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+            secret,
+            &claims.user_id,
+            &body.track_id,
+            &play_id,
+            epoch,
+            ctx.now,
+            lease_expires_at,
+        ),
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
+            // Zero rows back can also mean the deletion fence closed
+            // after the up-front check (the marker landed mid-request):
+            // re-read it so that race answers the typed 409, not a
+            // concurrent-streams 429.
+            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                account_deleting_response()
+            } else {
+                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+                    &caps,
+                    retry_after_secs,
+                ))
+            }
+        }
+        Err(_) => internal(),
+    }
+}
+
+/// Heartbeat: the holder's keepalive and the takeover signal in one.
+/// Always 200 for lease state (`active` extends, `superseded` tells the
+/// displaced player to pause, `expired` means no row) — lease state is
+/// an answer, not an error. No subscription or cap gates: a current
+/// play finishes even when a new start would be refused.
+async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Same fence as issuance (ADR 0002 rule 3): a deleting account's
+    // heartbeat is the typed 409, never an `active` extension.
+    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+        return account_deleting_response();
+    }
+    // Same fail-closed secret gate as issuance: a misconfigured
+    // deployment must not let heartbeats keep a lease alive that no
+    // new grant could be minted against.
+    if ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+        .is_none()
+    {
+        return internal();
+    }
+    let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !valid_client_session_id(&body.session_id) {
+        return validation_failed("invalid session_id");
+    }
+    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+        Ok(row) => row,
+        Err(_) => return internal(),
+    };
+    let epoch = lease.as_ref().map_or(body.lease_epoch, |row| row.epoch);
+    let state = crate::playback::LeaseHeartbeat::classify(
+        lease.as_ref(),
+        &body.session_id,
+        &body.play_id,
+        body.lease_epoch,
+    );
+    let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+        match ctx
+            .store
+            .touch_playback_lease(
+                &claims.user_id,
+                &body.session_id,
+                &body.play_id,
+                body.lease_epoch,
+                ctx.now,
+                expires,
+            )
+            .await
+        {
+            Ok(true) => (state, Some(expires)),
+            // Zero rows: a raced takeover landed between the read and
+            // the touch, or the deletion fence closed after the
+            // up-front check. Re-read deletion so the fence race
+            // answers the typed 409; otherwise report the truth, do
+            // not extend a lost lease.
+            Ok(false) => {
+                if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                    return account_deleting_response();
+                }
+                (crate::playback::LeaseHeartbeat::Superseded, None)
+            }
+            Err(_) => return internal(),
+        }
+    } else {
+        (state, None)
+    };
+    let mut body_json = serde_json::json!({"lease": state.as_str(), "lease_epoch": epoch});
+    if let Some(expires) = lease_expires_at {
+        body_json["lease_expires_at"] = serde_json::json!(expires);
+    }
+    json_response(200, body_json)
+}
+
+// --- Meter sink (internal) ---------------------------------------------------
+//
+// `POST /internal/v1/play-windows` is not a user route: only the
+// stream Worker's per-user Durable Objects call it, over their `API`
+// service binding, authenticating with the dedicated meter-sink HMAC
+// (crate::meter_sink). It takes no session, no bearer, and no origin
+// pin (there is no browser), and it is deliberately not in
+// `is_known_path` — preflights stay 404 and the browser surface never
+// learns it exists. Each accepted window derives its seconds
+// server-side from the delivered union and writes through the
+// monotonic ledger upsert; the ack dispositions tell the DO which
+// windows are terminal (crate::meter_sink module docs).
+
+/// Ingest one signed batch of cumulative play windows.
+async fn meter_sink_ingest<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::meter_sink::{PlayWindowOutcome, SinkError};
+    match crate::meter_sink::verify(
+        ctx.cfg.meter_sink_secret.as_deref(),
+        req.authorization.as_deref(),
+        &req.body,
+        ctx.now,
+    ) {
+        Ok(()) => {}
+        // Unprovisioned is a server misconfiguration, not a caller
+        // fault; the DO retries on its alarm either way.
+        Err(SinkError::NotConfigured) => return internal(),
+        Err(SinkError::Unauthorized) => {
+            let error = crate::api_error::ApiError::unauthorized("unauthorized");
+            return Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+                retry_after: None,
+                extra_headers: Vec::new(),
+            };
+        }
+        Err(SinkError::Malformed) => return internal(),
+    }
+    let windows = match crate::meter_sink::parse_batch(&req.body) {
+        Ok(windows) => windows,
+        Err(_) => return validation_failed("invalid request"),
+    };
+    let mut accepted = Vec::new();
+    let mut fenced = Vec::new();
+    let mut rejected = Vec::new();
+    // Sequential on purpose: a batch is one user's plays, and the DO
+    // retries the whole batch on a 500 — the upsert's monotonicity
+    // makes partially-applied retries converge.
+    for window in &windows {
+        let meta = match ctx
+            .store
+            .track_meter_meta(&window.user_id, &window.track_id)
+            .await
+        {
+            Ok(meta) => meta,
+            Err(_) => return internal(),
+        };
+        // The stream-reported blob length is the confirmed size of
+        // what was actually served; the cache row is the backup.
+        let file_bytes = window.file_bytes.or(meta.file_bytes).filter(|b| *b > 0);
+        let duration_ms = crate::ledger::resolve_duration_ms(
+            meta.track_duration_ms,
+            meta.mb_duration_ms,
+            meta.bitrate_kbps,
+            file_bytes,
+        );
+        let prepared = crate::ledger::prepare_play_window(
+            &window.user_id,
+            &window.track_id,
+            &window.play_id,
+            window.union_bytes,
+            file_bytes,
+            duration_ms,
+            window.started_at,
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            // Unpreparable windows never converge on retry: name them
+            // terminal so the DO drops them instead of alarming forever.
+            Err(_) => {
+                rejected.push(window.play_id.clone());
+                continue;
+            }
+        };
+        match ctx.store.record_play_window(&prepared).await {
+            Ok(PlayWindowOutcome::Written | PlayWindowOutcome::Covered) => {
+                accepted.push(window.play_id.clone());
+            }
+            Ok(PlayWindowOutcome::Fenced) => fenced.push(window.play_id.clone()),
+            Err(_) => return internal(),
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({
+            "accepted": accepted,
+            "fenced": fenced,
+            "rejected": rejected,
+        }),
+    )
 }
 
 // --- Dispatch ------------------------------------------------------------------------------
@@ -5716,6 +6726,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault"
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
+            | "/v1/plays"
+            | "/v1/plays/heartbeat"
             | "/v1/credentials"
             | "/v1/plans"
             | "/v1/me/usage"
@@ -5824,9 +6836,13 @@ pub(crate) fn preflight_response() -> Response {
 /// a presented credential); a request with NO `Authorization` header skips
 /// the bearer gate and falls through to the dispatch below, so session
 /// cookie holders see no behavior change (ADR 0010). Data routes for the
-/// bearer scopes do not exist yet, so both an authorized bearer and a
+/// bearer scopes mostly do not exist yet, so an authorized bearer and a
 /// cookie-only caller land on the 404 below — default-deny holds until
-/// those routes land with their session-or-bearer dispatch.
+/// those routes land with their session-or-bearer dispatch. `POST
+/// /v1/plays` is the first exception: it landed as a cookie-session
+/// route behind the same gate, so a cookie-only caller is served by the
+/// handler while a gate-passing bearer still needs the session (native
+/// bearer issuance is a later slice).
 pub async fn handle<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -5835,6 +6851,16 @@ where
     N: AsyncDns,
 {
     if req.body.len() > max_body_bytes(&req.method, &req.path) {
+        // Oversized admin uploads answer the 413 failure shape (with a
+        // null job: nothing was parsed, so no row and no audit), never
+        // the generic 400. This branch serves only direct-handle
+        // callers: the entry's collection gate answers the uniform 400
+        // instead, because it runs before authentication and a
+        // route-distinctive answer there would disclose the admin
+        // ingest path to unauthenticated callers.
+        if req.method == "POST" && req.path == "/v1/admin/ingest" {
+            return admin_ingest_oversized();
+        }
         return invalid_request();
     }
     if let crate::native_rest::RouteDecision::Bearer(required) =
@@ -5884,6 +6910,19 @@ where
         // map denies this path to bearer credentials, so the gate above
         // skips it and the guard owns session authentication.
         ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
+        // Play grant issuance + lease heartbeat: cookie-session handlers
+        // (see the section above). A presented native-rest bearer on
+        // `/v1/plays` is gate-checked above (invalid keys plain-404)
+        // but does not authenticate here; the heartbeat path is `Deny`
+        // in the scope map, so it never enters the gate.
+        ("POST", "/v1/plays") => play_issue(ctx, req).await,
+        ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        // Internal meter sink: HMAC-authenticated inside the handler
+        // (crate::meter_sink), no session/bearer surface. The scope
+        // map denies this path to bearer credentials, so the gate
+        // above never sees its Authorization header; it is absent
+        // from `is_known_path` on purpose (no browser preflight).
+        ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -5900,6 +6939,16 @@ where
             credentials_revoke(ctx, req).await
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
+        ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
+        // The entry preserves the list query string for exactly this
+        // route (the runtime strips it everywhere else), so the status
+        // filter and window survive to the handler in production.
+        ("GET", path) if path == "/v1/admin/ingest" || path.starts_with("/v1/admin/ingest?") => {
+            admin_ingest_list(ctx, req).await
+        }
+        // Single-segment job ids only; deeper or malformed shapes 404
+        // inside the handler.
+        ("GET", path) if path.starts_with("/v1/admin/ingest/") => admin_ingest_get(ctx, req).await,
         // Single-segment setting keys and `{id}/role` only; deeper or
         // malformed shapes 404 inside the handlers. Neither path gets
         // an `is_known_path` or preflight answer: the admin namespace
@@ -6137,6 +7186,42 @@ mod tests {
         /// Billing-read outage pin: the three display reads fail like a
         /// production query error (generic 500, never invented data).
         fail_billing_reads: RefCell<bool>,
+        /// Mirror of the admin ingest ledger (migration 0034): stored
+        /// admin job rows by content-derived id. Pipeline rows never
+        /// live here — the readers fence on `source = 'admin'` in
+        /// production and this map holds admin rows only.
+        ingest_jobs: RefCell<HashMap<String, StoredAdminIngestJob>>,
+        /// Mirror of `ingest_originals`: the stored v2 envelope plus
+        /// the content hash and KEK version the AAD binds, keyed by job
+        /// id. Accepted uploads land exactly one entry; failed uploads
+        /// and duplicates land none (a duplicate keeps the first
+        /// envelope, like production's `ON CONFLICT DO NOTHING`).
+        ingest_originals:
+            RefCell<HashMap<String, (crate::admin_ingest::IngestOriginalEnvelope, String, u32)>>,
+        /// Live-slot subscription rows by user (the playback gate's
+        /// `resolve_effective_plan` input).
+        playback_subscriptions: RefCell<HashMap<String, crate::playback::SubscriptionRow>>,
+        /// Users whose history holds any paid coverage
+        /// (`ever_subscribed` → the `lapsed` discriminator).
+        ever_paid_users: RefCell<HashSet<String>>,
+        /// `plans` caps rows by plan id; an absent id is the
+        /// missing-row case the handler fails closed to free caps.
+        plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
+        /// One `playback_leases` row per user.
+        playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Deletion-marker race pin: when set, the next lease write
+        /// (`acquire_playback_lease` / `touch_playback_lease`) first
+        /// lands the named user in `deleting_users`, mirroring a marker
+        /// that arrives after the handler's up-front `account_deleting`
+        /// probe but before the statement's writer fence evaluates.
+        mark_deleting_before_next_lease_write: RefCell<Option<String>>,
+        /// Derivation metadata keyed by `(user_id, track_id)`; absent
+        /// pairs resolve to the all-`None` meta (the fallback rung),
+        /// mirroring the production zero-row answer.
+        meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
+        /// Stored play windows by idempotency key, mirroring the
+        /// monotonic upsert (see `record_play_window`).
+        play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
     }
 
     impl Store for FakeStore {
@@ -6390,6 +7475,170 @@ mod tests {
                 .get(&(user_id.to_string(), period_month.to_string()))
                 .copied()
                 .unwrap_or(0))
+        }
+        async fn live_subscription(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
+            Ok(self.playback_subscriptions.borrow().get(user_id).cloned())
+        }
+        async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
+            Ok(self.ever_paid_users.borrow().contains(user_id))
+        }
+        async fn plan_caps(
+            &self,
+            plan_id: &str,
+        ) -> Result<Option<crate::plan_limits::PlanCaps>, StoreError> {
+            Ok(self.plan_caps_rows.borrow().get(plan_id).copied())
+        }
+        async fn monthly_stream_seconds(
+            &self,
+            user_id: &str,
+            period_month: &str,
+        ) -> Result<u64, StoreError> {
+            Ok(self
+                .stream_seconds
+                .borrow()
+                .get(&(user_id.to_string(), period_month.to_string()))
+                .copied()
+                .unwrap_or(0))
+        }
+        async fn playback_lease(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
+            Ok(self.playback_leases.borrow().get(user_id).cloned())
+        }
+        async fn acquire_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            track_id: &str,
+            play_id: &str,
+            now: u64,
+            expires_at: u64,
+            takeover: bool,
+        ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+            // Mirror the conditional upsert: insert at epoch 1, or
+            // replace at epoch+1 when expired, same-session, or
+            // takeover — else Held with the remaining TTL. The
+            // statement's deletion fence writes nothing (zero rows,
+            // which the Pg glue reads back as Held), no epoch burned.
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(crate::playback::LeaseAcquire::Held {
+                    retry_after_secs: self
+                        .playback_leases
+                        .borrow()
+                        .get(user_id)
+                        .map_or(0, |row| row.retry_after_secs(now)),
+                });
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get(user_id) {
+                Some(existing)
+                    if existing.is_live(now) && existing.session_id != session_id && !takeover =>
+                {
+                    Ok(crate::playback::LeaseAcquire::Held {
+                        retry_after_secs: existing.retry_after_secs(now),
+                    })
+                }
+                existing => {
+                    let epoch = existing.map_or(1, |row| row.epoch + 1);
+                    leases.insert(
+                        user_id.to_string(),
+                        crate::playback::LeaseRow {
+                            session_id: session_id.to_string(),
+                            track_id: track_id.to_string(),
+                            play_id: play_id.to_string(),
+                            epoch,
+                            expires_at,
+                        },
+                    );
+                    Ok(crate::playback::LeaseAcquire::Acquired { epoch })
+                }
+            }
+        }
+        async fn touch_playback_lease(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            play_id: &str,
+            epoch: u64,
+            _now: u64,
+            expires_at: u64,
+        ) -> Result<bool, StoreError> {
+            // Mirror the conditional UPDATE: only the exact
+            // (session, play, epoch) holder extends, monotonically
+            // (an out-of-order older deadline never shortens), and
+            // never for a deleting account (in-statement fence).
+            if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
+                self.deleting_users.borrow_mut().insert(marker);
+            }
+            if self.deleting_users.borrow().contains(user_id) {
+                return Ok(false);
+            }
+            let mut leases = self.playback_leases.borrow_mut();
+            match leases.get_mut(user_id) {
+                Some(row)
+                    if row.session_id == session_id
+                        && row.play_id == play_id
+                        && row.epoch == epoch =>
+                {
+                    row.expires_at = row.expires_at.max(expires_at);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+        async fn track_meter_meta(
+            &self,
+            user_id: &str,
+            track_id: &str,
+        ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            Ok(self
+                .meter_meta
+                .borrow()
+                .get(&(user_id.to_string(), track_id.to_string()))
+                .copied()
+                .unwrap_or_default())
+        }
+        async fn record_play_window(
+            &self,
+            window: &crate::ledger::PlayWindow,
+        ) -> Result<crate::meter_sink::PlayWindowOutcome, StoreError> {
+            use crate::meter_sink::PlayWindowOutcome;
+            // Mirror the production writer fence: the upsert's guard
+            // SELECT finds no row for a deleting or nonexistent user,
+            // so nothing writes and the sink acks `fenced`.
+            if self.deleting_users.borrow().contains(&window.user_id)
+                || !self.users.borrow().contains_key(&window.user_id)
+            {
+                return Ok(PlayWindowOutcome::Fenced);
+            }
+            // Mirror the monotonic upsert: a stored row already
+            // covering this union wins; otherwise the new snapshot
+            // replaces it and the monthly total moves by the delta.
+            let mut windows = self.play_windows.borrow_mut();
+            let previous = windows.get(&window.idempotency_key);
+            if let Some(existing) = previous {
+                if existing.bytes_served >= window.bytes_served {
+                    return Ok(PlayWindowOutcome::Covered);
+                }
+            }
+            let previous_seconds = previous.map_or(0, |w| w.stream_seconds);
+            windows.insert(window.idempotency_key.clone(), window.clone());
+            drop(windows);
+            let mut seconds = self.stream_seconds.borrow_mut();
+            let entry = seconds
+                .entry((window.user_id.clone(), window.period_month.clone()))
+                .or_insert(0);
+            *entry = entry
+                .saturating_sub(previous_seconds)
+                .saturating_add(window.stream_seconds);
+            Ok(PlayWindowOutcome::Written)
         }
         async fn reserve_rate_limit(
             &self,
@@ -7279,6 +8528,151 @@ mod tests {
                 op.session_id = session_id.map(str::to_string);
             }
             Ok(())
+        }
+        async fn admin_ingest_upload(
+            &self,
+            attempt: &AdminIngestAttempt,
+        ) -> Result<AdminIngestUploadOutcome, StoreError> {
+            // Mirror the production transaction: re-read the actor's
+            // role at write time and refuse a demoted actor's write;
+            // a deleting actor is fenced like every other writer of
+            // user-owned state (ADR 0002 rule 3).
+            match self.user_role(&attempt.actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminIngestUploadOutcome::ActorNotAdmin),
+            }
+            if self
+                .deleting_users
+                .borrow()
+                .contains(&attempt.actor_user_id)
+            {
+                return Ok(AdminIngestUploadOutcome::AccountDeleting);
+            }
+            if let Some(job) = self.ingest_jobs.borrow().get(&attempt.job_id) {
+                // Convergent replay: the deterministic id already
+                // names a row (a second admin uploading the same bytes
+                // lands here too — identity is content-derived, never
+                // the uploader). The first envelope wins, like the
+                // production `ON CONFLICT DO NOTHING`.
+                let job = job.clone();
+                let mut details = serde_json::json!({"job_id": job.job_id, "outcome": "duplicate"});
+                if let Some(reason) = &job.failure_reason {
+                    details["reason_code"] = reason.clone().into();
+                }
+                self.audits.borrow_mut().push(vault::audit_event_extended(
+                    &attempt.actor_user_id,
+                    crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                    true,
+                    &attempt.source_ip,
+                    attempt.now,
+                    None,
+                    details,
+                ));
+                return Ok(AdminIngestUploadOutcome::Stored {
+                    job,
+                    deduplicated: true,
+                });
+            }
+            let db_status = if attempt.failure.is_some() {
+                "failed"
+            } else {
+                "queued"
+            };
+            let job = StoredAdminIngestJob {
+                job_id: attempt.job_id.clone(),
+                db_status: db_status.to_string(),
+                accepted_at: attempt.now,
+                nzb_bytes: attempt.nzb_bytes,
+                file_count: attempt.file_count,
+                segment_count: attempt.segment_count,
+                failure_reason: attempt.failure.map(|reason| reason.as_str().to_string()),
+                has_original: attempt.original.is_some(),
+                uploader_user_id: attempt.actor_user_id.clone(),
+            };
+            // The (failure, original) coupling the handler builds:
+            // failed attempts carry no envelope, accepted attempts
+            // always do.
+            debug_assert_eq!(job.has_original, attempt.failure.is_none());
+            if let Some(envelope) = &attempt.original {
+                self.ingest_originals.borrow_mut().insert(
+                    attempt.job_id.clone(),
+                    (
+                        envelope.clone(),
+                        attempt.content_sha256_hex.clone(),
+                        attempt.kek_version,
+                    ),
+                );
+            }
+            self.ingest_jobs
+                .borrow_mut()
+                .insert(attempt.job_id.clone(), job.clone());
+            let mut details = serde_json::json!({"job_id": job.job_id, "outcome": "accepted"});
+            if let Some(reason) = &job.failure_reason {
+                details["outcome"] = "rejected".into();
+                details["reason_code"] = reason.clone().into();
+            }
+            self.audits.borrow_mut().push(vault::audit_event_extended(
+                &attempt.actor_user_id,
+                crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION,
+                true,
+                &attempt.source_ip,
+                attempt.now,
+                None,
+                details,
+            ));
+            Ok(AdminIngestUploadOutcome::Stored {
+                job,
+                deduplicated: false,
+            })
+        }
+        async fn admin_ingest_get(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<StoredAdminIngestJob>, StoreError> {
+            Ok(self.ingest_jobs.borrow().get(job_id).cloned())
+        }
+        async fn admin_ingest_list(
+            &self,
+            status: Option<&str>,
+            limit: u64,
+            offset: u64,
+        ) -> Result<Vec<StoredAdminIngestJob>, StoreError> {
+            let mut jobs: Vec<StoredAdminIngestJob> = self
+                .ingest_jobs
+                .borrow()
+                .values()
+                .filter(|job| status.is_none_or(|want| job.db_status == want))
+                .cloned()
+                .collect();
+            jobs.sort_by(|a, b| {
+                b.accepted_at
+                    .cmp(&a.accepted_at)
+                    .then(a.job_id.cmp(&b.job_id))
+            });
+            Ok(jobs
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit.max(1) as usize)
+                .collect())
+        }
+        async fn admin_ingest_delete(
+            &self,
+            actor_user_id: &str,
+            job_id: &str,
+        ) -> Result<AdminIngestDeleteOutcome, StoreError> {
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref()) => {}
+                _ => return Ok(AdminIngestDeleteOutcome::ActorNotAdmin),
+            }
+            if !self.ingest_jobs.borrow().contains_key(job_id) {
+                return Ok(AdminIngestDeleteOutcome::Missing);
+            }
+            // The original goes first, then the job — the production
+            // `RESTRICT` order. No audit row: deletion writes no new
+            // observable state.
+            self.ingest_originals.borrow_mut().remove(job_id);
+            self.ingest_jobs.borrow_mut().remove(job_id);
+            Ok(AdminIngestDeleteOutcome::Deleted)
         }
         async fn admin_issue_invite(
             &self,
@@ -9579,6 +10973,838 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         cookie_of(&resp)
+    }
+
+    const PLAY_SECRET: &[u8] = b"test-play-grant-secret-32-bytes-long!";
+
+    /// Harness with the play-grant secret provisioned (the default
+    /// `cfg()` leaves it unset — the fail-closed case below).
+    fn play_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(PLAY_SECRET.to_vec());
+        h
+    }
+
+    /// Seed a live entitled subscription for `user_id` on `plan_id`
+    /// plus its `plans`-row caps (hours converted like production).
+    fn seed_entitled(h: &Harness, user_id: &str, plan_id: &str, hours: u64) {
+        h.store.playback_subscriptions.borrow_mut().insert(
+            user_id.to_string(),
+            crate::playback::SubscriptionRow {
+                plan_id: plan_id.to_string(),
+                status: "active".to_string(),
+                cancel_at_period_end: false,
+                paid_through_at_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+                grace_until_unix: None,
+                current_period_end_unix: Some(i64::try_from(NOW).unwrap() + 3600),
+            },
+        );
+        h.store.plan_caps_rows.borrow_mut().insert(
+            plan_id.to_string(),
+            crate::plan_limits::caps_from_plan_row(hours, 1),
+        );
+    }
+
+    fn play_call(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn play_user(h: &Harness) -> String {
+        seed_user(h, "user-plays-1", "plays@example.com");
+        magic_login(h, "plays@example.com")
+    }
+
+    #[test]
+    fn play_issue_mints_a_grant_for_an_entitled_user() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let play_id = body["play_id"].as_str().expect("server-minted play id");
+        assert!(!play_id.is_empty());
+        // The handler bound exactly (user, track, play, epoch 1) at NOW:
+        // re-minting through the vector-pinned minter reproduces it.
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            play_id,
+            1,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .expect("minter reproduces the handler grant");
+        assert_eq!(body["grant"], expected.token);
+        assert_eq!(body["lease_epoch"], 1);
+        assert_eq!(body["expires_at"], NOW + 900);
+        assert_eq!(body["lease_expires_at"], NOW + 45);
+        assert_eq!(body["heartbeat_interval_secs"], 15);
+        let lease = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(lease.session_id, "tab-a");
+        assert_eq!(lease.track_id, "track-9");
+        assert_eq!(lease.play_id, play_id);
+    }
+
+    #[test]
+    fn play_issue_refuses_unsubscribed_with_reasons_and_no_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "subscription_required");
+        assert_eq!(body["reason"], "never_subscribed");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["upgrade_url"], "/pricing");
+        // Once-paid history flips only the reason, never the refusal.
+        h.store
+            .ever_paid_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 402);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["reason"], "lapsed");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a refused start must not burn a lease epoch"
+        );
+    }
+
+    #[test]
+    fn play_issue_cap_refuses_new_starts_but_continuation_finishes() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        let started = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: serde_json::Value = serde_json::from_str(&started.body).unwrap();
+        let play_id = started["play_id"].as_str().unwrap().to_string();
+        // The play crosses the cap mid-track (3600 s = the 1 h cap).
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("user-plays-1".to_string(), period), 3600);
+        // Continuation (same session + play + track) still mints, and
+        // reuses the same play at the same epoch.
+        let resumed = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "play_id": play_id,
+            }),
+        );
+        assert_eq!(resumed.status, 200, "{}", resumed.body);
+        let resumed: serde_json::Value = serde_json::from_str(&resumed.body).unwrap();
+        assert_eq!(resumed["play_id"], play_id);
+        assert_eq!(resumed["lease_epoch"], 1);
+        // The NEXT new start (queue advance / repeat-one shape) is the
+        // one refused, with the plan-limit headers.
+        let next = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(next.status, 402, "{}", next.body);
+        let body: serde_json::Value = serde_json::from_str(&next.body).unwrap();
+        assert_eq!(body["code"], "plan_limit_exceeded");
+        assert!(next.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "stream_hours_month=1".to_string()
+        )));
+        assert!(next
+            .extra_headers
+            .contains(&("x-plan-reset".to_string(), "next-utc-month".to_string())));
+    }
+
+    #[test]
+    fn play_issue_lease_429_same_session_replace_and_takeover() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(first.status, 200, "{}", first.body);
+        let first: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        let first_play = first["play_id"].as_str().unwrap().to_string();
+        // A second client session is refused 429 with the live TTL, and
+        // `retry-after` appears exactly once (the rendered field), never
+        // duplicated inside extra_headers.
+        let held = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-b"}),
+        );
+        assert_eq!(held.status, 429, "{}", held.body);
+        assert_eq!(held.retry_after, Some(45));
+        assert!(
+            !held
+                .extra_headers
+                .iter()
+                .any(|(name, _)| name == "retry-after"),
+            "retry-after must not be duplicated: {:?}",
+            held.extra_headers
+        );
+        assert!(held.extra_headers.contains(&(
+            "x-plan-limit".to_string(),
+            "concurrent_streams=1".to_string()
+        )));
+        let body: serde_json::Value = serde_json::from_str(&held.body).unwrap();
+        assert_eq!(body["code"], "rate_limited");
+        // The holding session itself is never self-refused: a new track
+        // replaces the play and bumps the epoch.
+        let replaced = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-10", "session_id": "tab-a"}),
+        );
+        assert_eq!(replaced.status, 200, "{}", replaced.body);
+        let replaced: serde_json::Value = serde_json::from_str(&replaced.body).unwrap();
+        assert_eq!(replaced["lease_epoch"], 2);
+        assert_ne!(replaced["play_id"], first_play);
+        // Explicit takeover: epoch bumps again; the displaced holder's
+        // heartbeat now reports superseded (it self-pauses), the new
+        // holder's reports active and extends.
+        let taken = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-11",
+                "session_id": "tab-b",
+                "takeover": true,
+            }),
+        );
+        assert_eq!(taken.status, 200, "{}", taken.body);
+        let taken: serde_json::Value = serde_json::from_str(&taken.body).unwrap();
+        assert_eq!(taken["lease_epoch"], 3);
+        let beat = |session: &str, play: &serde_json::Value, epoch: u64| {
+            h.call_full(
+                "POST",
+                "/v1/plays/heartbeat",
+                Some(
+                    serde_json::json!({
+                        "session_id": session,
+                        "play_id": play,
+                        "lease_epoch": epoch,
+                    })
+                    .to_string(),
+                ),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        let displaced = beat("tab-a", &replaced["play_id"], 2);
+        assert_eq!(displaced.status, 200, "{}", displaced.body);
+        let displaced: serde_json::Value = serde_json::from_str(&displaced.body).unwrap();
+        assert_eq!(displaced["lease"], "superseded");
+        let holder = beat("tab-b", &taken["play_id"], 3);
+        assert_eq!(holder.status, 200, "{}", holder.body);
+        let holder: serde_json::Value = serde_json::from_str(&holder.body).unwrap();
+        assert_eq!(holder["lease"], "active");
+        assert_eq!(holder["lease_expires_at"], NOW + 45);
+    }
+
+    #[test]
+    fn play_heartbeat_without_a_lease_reports_expired() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-none",
+                    "lease_epoch": 1,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["lease"], "expired");
+    }
+
+    #[test]
+    fn play_routes_answer_account_deleting_for_a_deleting_account() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        // Issuance: the typed 409, no lease written, no grant minted.
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "a deleting account must not acquire a lease"
+        );
+        // Heartbeat: same 409, even for a lease row seeded directly —
+        // the touch must never extend a deleting account's lease.
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a deleting account's lease must not extend"
+        );
+        // The FakeStore mirrors the statement fences directly, so a
+        // handler regression that skipped the pre-check still could
+        // not write (acquire reads Held, touch reads false).
+        let acquired = block_on(h.store.acquire_playback_lease(
+            "user-plays-1",
+            "tab-b",
+            "track-9",
+            "play-x",
+            NOW,
+            NOW + 45,
+            true,
+        ))
+        .expect("store call succeeds");
+        assert!(matches!(
+            acquired,
+            crate::playback::LeaseAcquire::Held { .. }
+        ));
+        let touched = block_on(h.store.touch_playback_lease(
+            "user-plays-1",
+            "tab-a",
+            "play-seeded",
+            7,
+            NOW,
+            NOW + 45,
+        ))
+        .expect("store call succeeds");
+        assert!(!touched);
+    }
+
+    #[test]
+    fn play_issue_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        // The marker lands after the up-front probe, inside the lease
+        // write: the fenced acquire reads Held, and the post-write
+        // re-read — not the concurrency 429 — classifies the refusal.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "the fenced acquire writes nothing"
+        );
+    }
+
+    #[test]
+    fn play_heartbeat_answers_account_deleting_when_the_marker_lands_mid_request() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        // Same race on the touch: zero rows after the fence closes
+        // mid-request answers the typed 409, not `superseded`.
+        *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
+            Some("user-plays-1".to_string());
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["code"], "account_deleting");
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "the fenced touch must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_issue_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all.
+        let h = harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("v2."), "no token on a refused mint");
+        assert!(
+            h.store.playback_leases.borrow().is_empty(),
+            "an unmintable grant must not acquire the lease"
+        );
+        // A too-short secret is the same fail-closed 500.
+        let mut short = play_harness();
+        short.config = cfg().with_play_grant_secret(b"short".to_vec());
+        let cookie = play_user(&short);
+        seed_entitled(&short, "user-plays-1", "plus", 100);
+        let resp = play_call(
+            &short,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+    }
+
+    #[test]
+    fn play_heartbeat_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all. The heartbeat is
+        // gated like issuance, so a misconfigured deployment cannot
+        // keep extending a lease no grant could be minted against.
+        let h = harness();
+        let cookie = play_user(&h);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a refused heartbeat must not extend the lease"
+        );
+    }
+
+    #[test]
+    fn play_routes_require_a_session_and_valid_identities() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let body = serde_json::json!({"track_id": "track-9", "session_id": "tab-a"});
+        // No cookie: generic 401 on both routes.
+        let anon = h.call("POST", "/v1/plays", body.clone());
+        assert_eq!(anon.status, 401);
+        let anon_beat = h.call(
+            "POST",
+            "/v1/plays/heartbeat",
+            serde_json::json!({"session_id": "tab-a", "play_id": "p", "lease_epoch": 1}),
+        );
+        assert_eq!(anon_beat.status, 401);
+        // Wrong origin: the mutation CSRF pin refuses before the handler.
+        let cross = h.call_full(
+            "POST",
+            "/v1/plays",
+            Some(body.to_string()),
+            Some(cookie.clone()),
+            Some("https://evil.example"),
+        );
+        assert_eq!(cross.status, 401);
+        // An unmeterable track id is a validation refusal and writes nothing.
+        let bad_track = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track.v1", "session_id": "tab-a"}),
+        );
+        assert_eq!(bad_track.status, 422, "{}", bad_track.body);
+        // Unknown fields and an empty client session id are refused too.
+        let unknown = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-9",
+                "session_id": "tab-a",
+                "epoch": 99,
+            }),
+        );
+        assert_eq!(unknown.status, 422);
+        let no_session = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": ""}),
+        );
+        assert_eq!(no_session.status, 422);
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_issue_presented_invalid_bearer_still_plain_404() {
+        // The bearer gate runs before dispatch on this path: a junk key
+        // (even alongside a valid session cookie) gets the plain 404 —
+        // the landed session route must not resurrect route disclosure
+        // or cookie rescue for presented credentials.
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/plays".to_string(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.to_string()),
+            authorization: Some(
+                "Bearer ntk_syntheticUnknownKey0000000000000000000000000".to_string(),
+            ),
+            stripe_signature: None,
+            body: serde_json::json!({"track_id": "track-9", "session_id": "tab-a"})
+                .to_string()
+                .into_bytes(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    #[test]
+    fn play_paths_preflight_as_served_routes() {
+        let h = play_harness();
+        for path in ["/v1/plays", "/v1/plays/heartbeat"] {
+            let resp = h.call_full("OPTIONS", path, None, None, Some(ORIGIN));
+            assert_eq!(resp.status, 204, "OPTIONS {path}");
+            assert!(resp.body.is_empty());
+        }
+        assert!(is_known_path("/v1/plays"));
+        assert!(is_known_path("/v1/plays/heartbeat"));
+    }
+
+    const SINK_SECRET: &[u8] = b"test-meter-sink-secret-32-bytes-long!!";
+    const SINK_USER: &str = "u-meter";
+    const SINK_TRACK: &str = "track-meter-1";
+
+    /// Harness with the meter-sink secret provisioned and the sink
+    /// user seeded (the writer fence refuses unknown users).
+    fn sink_harness() -> Harness {
+        let mut h = harness();
+        h.config = cfg().with_meter_sink_secret(SINK_SECRET.to_vec());
+        seed_user(&h, SINK_USER, "meter@example.com");
+        h
+    }
+
+    fn sink_window(play_id: &str, union_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "user_id": SINK_USER,
+            "track_id": SINK_TRACK,
+            "play_id": play_id,
+            "union_bytes": union_bytes,
+            "file_bytes": 7_200_000u64,
+            "started_at": NOW,
+        })
+    }
+
+    /// POST a raw sink body with an optional precomputed header; `None`
+    /// signs with the harness secret at NOW (the happy path).
+    fn call_sink(h: &Harness, body: &str, authorization: Option<String>) -> Response {
+        let authorization = authorization.or_else(|| {
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+        });
+        let req = Request {
+            method: "POST".to_string(),
+            path: crate::meter_sink::SINK_PATH.to_string(),
+            cookie: None,
+            origin: None,
+            authorization,
+            stripe_signature: None,
+            body: body.as_bytes().to_vec(),
+        };
+        block_on(handle(&h.ctx(), &req))
+    }
+
+    fn ack_lists(resp: &Response) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let list = |key: &str| {
+            body[key]
+                .as_array()
+                .expect("ack list")
+                .iter()
+                .map(|v| v.as_str().expect("play id").to_string())
+                .collect()
+        };
+        (list("accepted"), list("fenced"), list("rejected"))
+    }
+
+    #[test]
+    fn meter_sink_writes_windows_and_acks_dispositions() {
+        let h = sink_harness();
+        // 180 s track; a half-file union derives 90 s proportionally.
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 90);
+        assert_eq!(window.bytes_served, 3_600_000);
+        assert_eq!(window.file_bytes, Some(7_200_000));
+        assert_eq!(window.duration_ms, Some(180_000));
+        assert!(!window.rate_fallback);
+        drop(stored);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_duplicate_and_stale_flushes_add_zero() {
+        let h = sink_harness();
+        h.store.meter_meta.borrow_mut().insert(
+            (SINK_USER.to_string(), SINK_TRACK.to_string()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_000),
+                ..Default::default()
+            },
+        );
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        assert_eq!(call_sink(&h, &body, None).status, 200);
+        // Exact redelivery: still accepted (converged), total unmoved.
+        let resp = call_sink(&h, &body, None);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert_eq!(accepted, vec!["play-1"]);
+        assert!(fenced.is_empty() && rejected.is_empty());
+        // A stale (smaller-union) flush likewise converges to zero.
+        let stale = serde_json::json!({"windows": [sink_window("play-1", 1_800_000)]}).to_string();
+        assert_eq!(call_sink(&h, &stale, None).status, 200);
+        let period = crate::ledger::period_month_for_timestamp(NOW);
+        assert_eq!(
+            h.store.stream_seconds.borrow()[&(SINK_USER.to_string(), period)],
+            90
+        );
+    }
+
+    #[test]
+    fn meter_sink_refuses_unsigned_and_forged_requests() {
+        let h = sink_harness();
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        // Empty Authorization header (the unit tests pin absent too).
+        let resp = call_sink(&h, &body, Some(String::new()));
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        // Signed with the wrong key.
+        let forged = crate::meter_sink::authorization_header(
+            Some(b"forged-meter-sink-secret-32-bytes!!"),
+            NOW,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(forged)).status, 401);
+        // Correctly signed but stale (replay into another window).
+        let stale = crate::meter_sink::authorization_header(
+            Some(SINK_SECRET),
+            NOW - crate::meter_sink::MAX_TIMESTAMP_SKEW_SECS - 1,
+            body.as_bytes(),
+        )
+        .expect("signs");
+        assert_eq!(call_sink(&h, &body, Some(stale)).status, 401);
+        // Correctly signed header, tampered body.
+        let good = crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+            .expect("signs");
+        let tampered = body.replace("3600000", "7200000");
+        assert_eq!(call_sink(&h, &tampered, Some(good)).status, 401);
+        assert!(
+            h.store.play_windows.borrow().is_empty(),
+            "refused requests write nothing"
+        );
+    }
+
+    #[test]
+    fn meter_sink_fails_closed_without_a_provisioned_secret() {
+        let h = harness(); // default cfg(): no sink secret.
+        seed_user(&h, SINK_USER, "meter@example.com");
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]}).to_string();
+        let header =
+            crate::meter_sink::authorization_header(Some(SINK_SECRET), NOW, body.as_bytes())
+                .expect("signs");
+        let resp = call_sink(&h, &body, Some(header));
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_signed_but_malformed_batch_is_422() {
+        let h = sink_harness();
+        let resp = call_sink(&h, "not json", None);
+        assert_eq!(resp.status, 422, "{}", resp.body);
+        // A window shape the wire forbids (unknown field) refuses whole.
+        let extra = r#"{"windows":[{"user_id":"u-meter","track_id":"track-meter-1","play_id":"play-1","union_bytes":1,"file_bytes":null,"started_at":7,"seconds":9}]}"#;
+        assert_eq!(call_sink(&h, extra, None).status, 422);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_fenced_and_rejected_dispositions() {
+        let h = sink_harness();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert(SINK_USER.to_string());
+        let mut ghost = sink_window("play-ghost", 3_600_000);
+        ghost["user_id"] = serde_json::json!("u-ghost");
+        let body = serde_json::json!({"windows": [
+            sink_window("play-fenced", 3_600_000),
+            sink_window("play-zero", 0),
+            // Identity characters outside [A-Za-z0-9_-] never prepare.
+            sink_window("play bad", 3_600_000),
+            ghost,
+        ]})
+        .to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let (accepted, fenced, rejected) = ack_lists(&resp);
+        assert!(accepted.is_empty());
+        // Deleting account and unknown user both fence (terminal).
+        assert_eq!(fenced, vec!["play-fenced", "play-ghost"]);
+        // Zero union and bad identity can never prepare (terminal).
+        assert_eq!(rejected, vec!["play-zero", "play bad"]);
+        assert!(h.store.play_windows.borrow().is_empty());
+    }
+
+    #[test]
+    fn meter_sink_unknown_track_meters_on_the_fallback_rung() {
+        let h = sink_harness();
+        // No meta seeded and no file size on the wire: nominal-rate
+        // fallback derives ceil(96_000 / 48_000) = 2 s, snapshots NULL.
+        let mut window = sink_window("play-fallback", 96_000);
+        window["file_bytes"] = serde_json::Value::Null;
+        let body = serde_json::json!({"windows": [window]}).to_string();
+        let resp = call_sink(&h, &body, None);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let stored = h.store.play_windows.borrow();
+        let window = stored.values().next().expect("one stored window");
+        assert_eq!(window.stream_seconds, 2);
+        assert!(window.rate_fallback);
+        assert_eq!(window.file_bytes, None);
+        assert_eq!(window.duration_ms, None);
+    }
+
+    #[test]
+    fn meter_sink_path_has_no_browser_surface() {
+        let h = sink_harness();
+        let resp = h.call_full(
+            "OPTIONS",
+            crate::meter_sink::SINK_PATH,
+            None,
+            None,
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 404, "no preflight maps the internal route");
+        assert!(!is_known_path(crate::meter_sink::SINK_PATH));
+        // No browser credential authenticates here either: without the
+        // sink HMAC the handler answers 401 and writes nothing.
+        let body = serde_json::json!({"windows": [sink_window("play-1", 3_600_000)]});
+        let resp = h.call("POST", crate::meter_sink::SINK_PATH, body);
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(h.store.play_windows.borrow().is_empty());
     }
 
     const QA_TOKEN: &str = "test-qa-bearer-token";
@@ -12321,6 +14547,967 @@ mod tests {
         };
         let both = block_on(handle(&h.ctx(), &req));
         assert_eq!(both.status, 404, "{}", both.body);
+    }
+
+    // --- Admin ingest (migration 0034) -------------------------------------
+
+    /// Synthetic NZB with `file_count` files of `segments_per_file`
+    /// contiguous segments. Test-only content: the marker strings below
+    /// are what the redaction assertions hunt for in responses.
+    fn ingest_nzb(
+        file_count: usize,
+        segments_per_file: usize,
+        subject_pad: usize,
+        bytes_each: u64,
+    ) -> Vec<u8> {
+        let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n<head><meta type=\"title\">synthetic-ingest-fixture</meta></head>\n".to_vec();
+        for file in 0..file_count {
+            let pad = "x".repeat(subject_pad);
+            out.extend_from_slice(
+                format!(
+                    "<file poster=\"poster@example.invalid\" date=\"1700000000\" subject=\"file-{file}-{pad}\">\n<groups><group>alt.binaries.synthetic</group></groups>\n<segments>\n"
+                )
+                .as_bytes(),
+            );
+            for segment in 1..=segments_per_file {
+                out.extend_from_slice(
+                    format!(
+                        "<segment bytes=\"{bytes_each}\" number=\"{segment}\">mid-{file}-{segment}@example.invalid</segment>\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            out.extend_from_slice(b"</segments>\n</file>\n");
+        }
+        out.extend_from_slice(b"</nzb>\n");
+        out
+    }
+
+    fn minimal_ingest_nzb() -> Vec<u8> {
+        ingest_nzb(1, 2, 0, 100)
+    }
+
+    fn post_ingest(h: &Harness, cookie: &str, body: &[u8]) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/admin/ingest",
+            Some(String::from_utf8(body.to_vec()).expect("synthetic NZB is UTF-8")),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    fn ingest_audit_details(audit: &crate::vault::AuditEvent) -> serde_json::Value {
+        assert_eq!(
+            audit.action,
+            crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION
+        );
+        assert!(audit.subject_user_id.is_none());
+        serde_json::from_str(audit.details.as_ref().expect("details")).unwrap()
+    }
+
+    #[test]
+    fn admin_ingest_guard_collapses_to_byte_identical_404() {
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member_cookie = magic_login(&h, "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        assert_eq!(unknown.status, 404);
+
+        // Reads: anonymous, garbage session and member probes all hear
+        // the plain unknown-path 404 — byte-identical, never a distinct
+        // code that would confirm the route exists.
+        let anon = h.call_full("GET", "/v1/admin/ingest", None, None, None);
+        assert_eq!(anon.body, unknown.body);
+        let garbage = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some("__Host-nntune-session=not-a-token".to_string()),
+            None,
+        );
+        assert_eq!(garbage.status, 404, "{}", garbage.body);
+        assert_eq!(garbage.body, unknown.body);
+        let denied = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(member_cookie.clone()),
+            None,
+        );
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(denied.body, unknown.body);
+        // Unknown job ids and malformed shapes 404 the same way for an
+        // admin: the namespace never distinguishes miss reasons.
+        let miss = h.call_full(
+            "GET",
+            "/v1/admin/ingest/adm_nosuchjob00000000000000000000000000000",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(miss.body, unknown.body);
+        let deep = h.call_full(
+            "GET",
+            "/v1/admin/ingest/a/b",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(deep.body, unknown.body);
+        // The mutation also 404s for non-admins (and the body never
+        // varies with the payload: no size oracle).
+        let nzb = minimal_ingest_nzb();
+        let denied_post = post_ingest(&h, &member_cookie, &nzb);
+        assert_eq!(denied_post.status, 404, "{}", denied_post.body);
+        assert_eq!(denied_post.body, unknown.body);
+
+        // Presented bearer credentials are refused with the same 404 —
+        // the scope map keeps the admin namespace session-only — and a
+        // valid cookie does not rescue a presented header.
+        let bearer_only = h.call_bearer(
+            "GET",
+            "/v1/admin/ingest",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_only.body, unknown.body);
+        let bearer_post = h.call_bearer(
+            "POST",
+            "/v1/admin/ingest",
+            Some("Bearer ntk_synthetic".to_string()),
+        );
+        assert_eq!(bearer_post.body, unknown.body);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/admin/ingest".to_string(),
+            cookie: Some(admin_cookie.clone()),
+            origin: None,
+            authorization: Some("Bearer ntk_synthetic".to_string()),
+            stripe_signature: None,
+            body: nzb.clone(),
+        };
+        assert_eq!(block_on(handle(&h.ctx(), &req)).body, unknown.body);
+
+        // A stale member session hears 404 on the mutation; a stale
+        // admin session steps up (401) instead of writing.
+        let stale_ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".to_string(),
+        };
+        let stale_post = |cookie: &str| {
+            let req = Request {
+                method: "POST".to_string(),
+                path: "/v1/admin/ingest".to_string(),
+                cookie: Some(cookie.to_string()),
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: nzb.clone(),
+            };
+            block_on(handle(&stale_ctx, &req))
+        };
+        assert_eq!(stale_post(&member_cookie).body, unknown.body);
+        let step_up = stale_post(&admin_cookie);
+        assert_eq!(step_up.status, 401, "{}", step_up.body);
+        assert_eq!(
+            step_up.body,
+            r#"{"code":"reauth_required","message":"reauth required","retryable":false}"#
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+
+        // A role-read outage is the same plain 404 for reads and the
+        // mutation alike: until the role is confirmed the caller is not
+        // known to be an admin.
+        *h.store.fail_user_role_lookup.borrow_mut() = true;
+        for resp in [
+            h.call_full("GET", "/v1/admin/ingest", None, Some(admin_cookie), None),
+            post_ingest(&h, &member_cookie, &nzb),
+        ] {
+            assert_eq!(resp.status, 404, "{}", resp.body);
+            assert_eq!(resp.body, unknown.body);
+        }
+        *h.store.fail_user_role_lookup.borrow_mut() = false;
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        // No guarded attempt ran, so no upload audit exists (the seeded
+        // sessions audited their own logins only).
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION));
+    }
+
+    #[test]
+    fn admin_ingest_accepts_and_dedupes_by_content() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+
+        let first = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(first.status, 201, "{}", first.body);
+        let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        let job_id = body["job_id"].as_str().expect("job id").to_string();
+        assert!(job_id.starts_with("adm_"));
+        assert_eq!(body["nzb_bytes"], nzb.len() as u64);
+        assert_eq!(body["file_count"], 1);
+        assert_eq!(body["segment_count"], 2);
+        assert_eq!(body["has_original"], true);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        assert_eq!(body["deduplicated"], false);
+
+        // The stored row is redacted by construction: counts and the
+        // uploader only, no NZB text anywhere in the served body.
+        for marker in [
+            "poster@example",
+            "alt.binaries.synthetic",
+            "mid-0-1@",
+            "synthetic-ingest-fixture",
+        ] {
+            assert!(!first.body.contains(marker), "{marker}");
+        }
+        let stored = h.store.ingest_jobs.borrow();
+        let row = stored.get(&job_id).expect("stored row");
+        assert_eq!(row.db_status, "queued");
+        assert_eq!(row.accepted_at, NOW);
+        assert_eq!(row.failure_reason, None);
+        assert!(row.has_original);
+        assert!(h.store.ingest_originals.borrow().contains_key(&job_id));
+        drop(stored);
+
+        // The audit row names the actor and the accepted outcome, with
+        // no subject and no reason code. (Seeding the admin session
+        // audited the login, so the ingest row is found by action,
+        // never by index.)
+        let find_uploads = || {
+            h.store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.action == crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION)
+                .map(|a| (a.user_id.clone(), a.at, ingest_audit_details(a)))
+                .collect::<Vec<_>>()
+        };
+        let uploads = find_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "admin1");
+        assert_eq!(uploads[0].1, NOW);
+        assert_eq!(uploads[0].2["job_id"], job_id);
+        assert_eq!(uploads[0].2["outcome"], "accepted");
+        assert!(uploads[0].2.get("reason_code").is_none());
+
+        // A replay converges: 200, same job, `deduplicated: true`, no
+        // second envelope, and the audit names the duplicate outcome.
+        let replay = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let body: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        let uploads = find_uploads();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[1].2["outcome"], "duplicate");
+
+        // A second admin uploading the same bytes lands on the same job:
+        // identity is content-derived, never the uploader.
+        let admin2_cookie = seed_admin(&h, "admin2", "admin2@example.com");
+        let second_admin = post_ingest(&h, &admin2_cookie, &nzb);
+        assert_eq!(second_admin.status, 200, "{}", second_admin.body);
+        let body: serde_json::Value = serde_json::from_str(&second_admin.body).unwrap();
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+
+        // Reads carry no `deduplicated` marker.
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{job_id}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+        let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+        assert!(body.get("deduplicated").is_none());
+        assert_eq!(body["status"], "accepted");
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert!(body["jobs"][0].get("deduplicated").is_none());
+
+        // A rejected upload converges the same way: same failed job id,
+        // same reason, `deduplicated: true` on the replay.
+        let bad = b"{\"not\": \"nzb\"}".to_vec();
+        let rejected = post_ingest(&h, &admin2_cookie, &bad);
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+        let body: serde_json::Value = serde_json::from_str(&rejected.body).unwrap();
+        let failed_id = body["job_id"].as_str().expect("failed job id").to_string();
+        assert_eq!(body["reason"], "not_nzb");
+        let replay_bad = post_ingest(&h, &admin_cookie, &bad);
+        assert_eq!(replay_bad.status, 200, "{}", replay_bad.body);
+        let body: serde_json::Value = serde_json::from_str(&replay_bad.body).unwrap();
+        assert_eq!(body["job_id"], failed_id);
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["reason"], "not_nzb");
+    }
+
+    #[test]
+    fn admin_ingest_rejects_empty_without_row_or_audit() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let resp = post_ingest(&h, &admin_cookie, &[]);
+        assert_eq!(resp.status, 400, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"code":"invalid_request","job_id":null,"reason":"empty","status":"failed"}"#
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert!(h.store.ingest_originals.borrow().is_empty());
+        assert!(h
+            .store
+            .audits
+            .borrow()
+            .iter()
+            .all(|a| a.action != crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION));
+    }
+
+    #[test]
+    fn admin_ingest_rejection_legs_carry_fixed_vocabulary() {
+        // (case, body, status, wire code, reason). The oversized leg is
+        // built through `handle` so the in-handler pre-gate answers the
+        // 413 null-job shape; the entry's collection seam answers the
+        // uniform 400 instead (it runs before authentication).
+        let oversize = vec![b'a'; crate::admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES + 1];
+        let mut truncated = minimal_ingest_nzb();
+        truncated.truncate(truncated.len() / 2);
+        let legs: Vec<(&str, Vec<u8>, u16, &str, &str)> = vec![
+            ("malformed", truncated, 400, "invalid_request", "malformed"),
+            (
+                "not_nzb_json",
+                b"{\"not\": \"nzb\"}".to_vec(),
+                400,
+                "invalid_request",
+                "not_nzb",
+            ),
+            (
+                "not_nzb_xml",
+                b"<?xml version=\"1.0\"?><feed><entry/></feed>".to_vec(),
+                400,
+                "invalid_request",
+                "not_nzb",
+            ),
+            ("too_large", oversize, 413, "payload_too_large", "too_large"),
+            (
+                "too_many_files",
+                ingest_nzb(1025, 1, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_files",
+            ),
+            (
+                "too_many_segments_per_file",
+                ingest_nzb(1, 4097, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_segments",
+            ),
+            (
+                "too_many_segments_total",
+                ingest_nzb(61, 1000, 0, 100),
+                413,
+                "payload_too_large",
+                "too_many_segments",
+            ),
+            (
+                "declared_bytes_over_cap",
+                ingest_nzb(1, 1, 0, (64 << 30) + 1),
+                413,
+                "payload_too_large",
+                "declared_bytes_over_cap",
+            ),
+        ];
+        for (case, body, status, code, reason) in legs {
+            let h = harness();
+            let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+            let resp = post_ingest(&h, &admin_cookie, &body);
+            assert_eq!(resp.status, status, "{case}: {}", resp.body);
+            let view: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(view["status"], "failed", "{case}");
+            assert_eq!(view["code"], code, "{case}");
+            assert_eq!(view["reason"], reason, "{case}");
+            if reason == "too_large" {
+                // Nothing was parsed: no row, no audit, null job.
+                assert_eq!(view["job_id"], serde_json::Value::Null, "{case}");
+                assert!(h.store.ingest_jobs.borrow().is_empty(), "{case}");
+            } else {
+                // A rejected body still writes its failed job row (same
+                // transaction, same audit shape) with no original.
+                let job_id = view["job_id"].as_str().expect("job id").to_string();
+                let stored = h.store.ingest_jobs.borrow();
+                let row = stored.get(&job_id).expect("failed row");
+                assert_eq!(row.db_status, "failed", "{case}");
+                assert_eq!(row.failure_reason.as_deref(), Some(reason), "{case}");
+                assert!(!row.has_original, "{case}");
+                assert!(
+                    !h.store.ingest_originals.borrow().contains_key(&job_id),
+                    "{case}"
+                );
+                drop(stored);
+            }
+            // No NZB text or parser detail ever reaches the body.
+            for marker in ["poster@example", "alt.binaries", "mid-", "subject"] {
+                assert!(!resp.body.contains(marker), "{case}: {marker}");
+            }
+
+            // The audit row for the attempt names the rejected outcome
+            // plus the reason code; the oversized leg audits nothing.
+            // (The seeded admin login audited too, so the attempt row
+            // is found by action, never by index.)
+            let uploads: Vec<_> = h
+                .store
+                .audits
+                .borrow()
+                .iter()
+                .filter(|a| a.action == crate::admin_ingest::INGEST_UPLOAD_AUDIT_ACTION)
+                .map(ingest_audit_details)
+                .collect();
+            if reason == "too_large" {
+                assert!(uploads.is_empty(), "{case}");
+            } else {
+                assert_eq!(uploads.len(), 1, "{case}");
+                assert_eq!(uploads[0]["outcome"], "rejected", "{case}");
+                assert_eq!(uploads[0]["reason_code"], reason, "{case}");
+            }
+
+            // A second admin replaying the same bytes converges on the
+            // stored failure (or the oversized null shape again).
+            let admin2_cookie = seed_admin(&h, "admin2", "admin2@example.com");
+            let replay = post_ingest(&h, &admin2_cookie, &body);
+            if reason == "too_large" {
+                assert_eq!(replay.status, 413, "{case}: {}", replay.body);
+            } else {
+                assert_eq!(replay.status, 200, "{case}: {}", replay.body);
+                let view: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+                assert_eq!(view["deduplicated"], true, "{case}");
+                assert_eq!(view["reason"], reason, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn admin_ingest_accepts_synthetic_document_over_two_mib() {
+        // The admin cap (8 MiB) is deliberately above the user intake
+        // gate (2 MiB): a lawful 2 MiB-plus NZB the user surface would
+        // refuse must still ingest here.
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = ingest_nzb(1024, 1, 1900, 100);
+        assert!(
+            nzb.len() > 2 * 1024 * 1024,
+            "fixture must clear the user gate: {}",
+            nzb.len()
+        );
+        assert!(
+            nzb.len() <= crate::admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES,
+            "fixture must fit the admin cap: {}",
+            nzb.len()
+        );
+        let resp = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["file_count"], 1024);
+        assert_eq!(body["segment_count"], 1024);
+        assert_eq!(body["nzb_bytes"], nzb.len() as u64);
+    }
+
+    #[test]
+    fn admin_ingest_serves_redacted_list_and_get_views() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let accepted_id = {
+            let resp = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+            assert_eq!(resp.status, 201, "{}", resp.body);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let failed_id = {
+            let resp = post_ingest(&h, &admin_cookie, b"{\"not\": \"nzb\"}");
+            assert_eq!(resp.status, 400, "{}", resp.body);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The full list serves both rows, newest first, with the bounded
+        // default window — and no NZB text in any view.
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 0);
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        let ids: Vec<&str> = jobs
+            .iter()
+            .map(|job| job["job_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&accepted_id.as_str()));
+        assert!(ids.contains(&failed_id.as_str()));
+        for marker in [
+            "poster@example",
+            "alt.binaries.synthetic",
+            "mid-",
+            "@example.invalid",
+        ] {
+            assert!(!list.body.contains(marker), "{marker}");
+        }
+
+        // The status filter admits exactly the view vocabulary; anything
+        // else is a 422, never a filtered read.
+        for (query, want) in [
+            ("?status=accepted", vec![accepted_id.as_str()]),
+            ("?status=failed", vec![failed_id.as_str()]),
+        ] {
+            let resp = h.call_full(
+                "GET",
+                &format!("/v1/admin/ingest{query}"),
+                None,
+                Some(admin_cookie.clone()),
+                None,
+            );
+            assert_eq!(resp.status, 200, "{query}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            let ids: Vec<&str> = body["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|job| job["job_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, want, "{query}");
+        }
+        let bad_status = h.call_full(
+            "GET",
+            "/v1/admin/ingest?status=queued",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(bad_status.status, 422, "{}", bad_status.body);
+        assert_eq!(
+            bad_status.body,
+            r#"{"code":"validation_failed","message":"unknown status","retryable":false}"#
+        );
+
+        // The window clamps without erroring: unparsable falls back to
+        // the default, oversize clamps to the cap, unknown keys are
+        // ignored.
+        let window = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=1&offset=1",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&window.body).unwrap();
+        assert_eq!(body["limit"], 1);
+        assert_eq!(body["offset"], 1);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        let junk = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=junk&offset=junk&unknown=1",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&junk.body).unwrap();
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["offset"], 0);
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        let capped = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=9999",
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        let body: serde_json::Value = serde_json::from_str(&capped.body).unwrap();
+        assert_eq!(body["limit"], 100);
+
+        // Single reads: the accepted view carries counts, the failed
+        // view carries the fixed code and reason — neither carries NZB
+        // text or the deduplicated marker.
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{accepted_id}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+        let body: serde_json::Value = serde_json::from_str(&get.body).unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["file_count"], 1);
+        assert_eq!(body["uploader_user_id"], "admin1");
+        let get_failed = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{failed_id}"),
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(get_failed.status, 200, "{}", get_failed.body);
+        let body: serde_json::Value = serde_json::from_str(&get_failed.body).unwrap();
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["reason"], "not_nzb");
+        for marker in ["poster@example", "mid-", "@example.invalid"] {
+            assert!(!get_failed.body.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn admin_ingest_accepts_ten_independent_uploads() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let mut ids = Vec::new();
+        for pad in 0..10 {
+            let resp = post_ingest(&h, &admin_cookie, &ingest_nzb(1, 1, pad, 100));
+            assert_eq!(resp.status, 201, "upload {pad}: {}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["deduplicated"], false, "upload {pad}");
+            ids.push(body["job_id"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 10);
+        let list = h.call_full(
+            "GET",
+            "/v1/admin/ingest?limit=100",
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn admin_ingest_delete_is_store_level_only() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let id_a = {
+            let resp = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let nzb_b = ingest_nzb(1, 1, 7, 100);
+        let id_b = {
+            let resp = post_ingest(&h, &admin_cookie, &nzb_b);
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // No route serves deletion: every method on the job path that is
+        // not a read 404s.
+        for (method, path) in [
+            ("DELETE", format!("/v1/admin/ingest/{id_a}")),
+            ("PUT", format!("/v1/admin/ingest/{id_a}")),
+            ("POST", format!("/v1/admin/ingest/{id_a}")),
+        ] {
+            let resp = h.call_full(method, &path, None, Some(admin_cookie.clone()), None);
+            assert_eq!(resp.status, 404, "{method} {path}: {}", resp.body);
+        }
+
+        // The primitive deletes the original first, then the job, and
+        // reports the deletion.
+        assert_eq!(
+            block_on(h.store.admin_ingest_delete("admin1", &id_a)).unwrap(),
+            AdminIngestDeleteOutcome::Deleted
+        );
+        assert!(!h.store.ingest_originals.borrow().contains_key(&id_a));
+        assert!(!h.store.ingest_jobs.borrow().contains_key(&id_a));
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{id_a}"),
+            None,
+            Some(admin_cookie.clone()),
+            None,
+        );
+        assert_eq!(get.status, 404, "{}", get.body);
+
+        // A fresh upload of the same bytes lands a new row (200 becomes
+        // 201 again): the delete fully released the identity.
+        let fresh = post_ingest(&h, &admin_cookie, &minimal_ingest_nzb());
+        assert_eq!(fresh.status, 201, "{}", fresh.body);
+        let body: serde_json::Value = serde_json::from_str(&fresh.body).unwrap();
+        assert_eq!(body["job_id"], id_a);
+        assert_eq!(body["deduplicated"], false);
+        assert!(h.store.ingest_originals.borrow().contains_key(&id_a));
+
+        // Unknown ids (and pipeline-shaped ones, which the admin reads
+        // never expose) report `Missing`, never a row.
+        assert_eq!(
+            block_on(
+                h.store
+                    .admin_ingest_delete("admin1", "adm_nosuchjob00000000000000000000")
+            )
+            .unwrap(),
+            AdminIngestDeleteOutcome::Missing
+        );
+
+        // A demoted actor's delete is refused before any read: nothing
+        // is removed and nothing is audited.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let audits_before = h.store.audits.borrow().len();
+        assert_eq!(
+            block_on(h.store.admin_ingest_delete("admin1", &id_b)).unwrap(),
+            AdminIngestDeleteOutcome::ActorNotAdmin
+        );
+        assert!(h.store.ingest_jobs.borrow().contains_key(&id_b));
+        assert!(h.store.ingest_originals.borrow().contains_key(&id_b));
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        // The surviving job still reads and opens.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_ADMIN.to_string());
+        let get = h.call_full(
+            "GET",
+            &format!("/v1/admin/ingest/{id_b}"),
+            None,
+            Some(admin_cookie),
+            None,
+        );
+        assert_eq!(get.status, 200, "{}", get.body);
+    }
+
+    #[test]
+    fn admin_ingest_envelope_opens_only_under_row_identity() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        let resp = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(resp.status, 201, "{}", resp.body);
+        let job_id = serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()["job_id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+        let job_id: &str = &job_id;
+
+        let stored = h.store.ingest_originals.borrow();
+        let (envelope, hex, kek_version) = stored.get(job_id).expect("original").clone();
+        drop(stored);
+        let kek = *h
+            .config
+            .kek_by_version(h.config.kek_version)
+            .expect("test KEK");
+        let open = |envelope: &crate::admin_ingest::IngestOriginalEnvelope,
+                    hex: &str,
+                    job_id: &str,
+                    version: i16,
+                    format: i16,
+                    kek_version: u32,
+                    kek: &[u8; 32]| {
+            crate::admin_ingest::decrypt_ingest_original(
+                kek,
+                hex,
+                job_id,
+                version,
+                format,
+                kek_version,
+                envelope,
+            )
+        };
+        assert_eq!(
+            open(&envelope, &hex, job_id, 2, 1, kek_version, &kek).unwrap(),
+            nzb
+        );
+
+        // A flipped ciphertext byte fails authentication — never
+        // partial plaintext — under the generic crypto error.
+        let mut tampered = envelope.clone();
+        tampered.ciphertext[0] ^= 1;
+        assert_eq!(
+            open(&tampered, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // A flipped wrapped-DEK byte fails the wrap check the same way.
+        let mut tampered_wrap = envelope.clone();
+        tampered_wrap.dek_wrapped[0] ^= 1;
+        assert_eq!(
+            open(&tampered_wrap, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // Rows do not open under each other's identity: the AAD binds
+        // the content hash and the job id.
+        assert_eq!(
+            open(
+                &envelope,
+                &hex,
+                "adm_otheridentity00000000000000000000000000",
+                2,
+                1,
+                kek_version,
+                &kek
+            )
+            .unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        assert!(open(&envelope, &"0".repeat(64), job_id, 2, 1, kek_version, &kek).is_err());
+        // A caller-selected version the row was not wrapped under fails
+        // the wrap check: no fallback loop.
+        assert_eq!(
+            open(&envelope, &hex, job_id, 2, 1, kek_version + 1, &kek).unwrap_err(),
+            crate::vault::VaultError::Crypto
+        );
+        // Stored-shape failures (a short wrapped DEK, a negative
+        // version) are corrupt-data errors, never crypto errors.
+        let mut short = envelope.clone();
+        short.dek_wrapped.truncate(47);
+        assert_eq!(
+            open(&short, &hex, job_id, 2, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::CorruptStoredData
+        );
+        assert_eq!(
+            open(&envelope, &hex, job_id, -1, 1, kek_version, &kek).unwrap_err(),
+            crate::vault::VaultError::CorruptStoredData
+        );
+    }
+
+    #[test]
+    fn admin_ingest_demoted_actor_writes_nothing() {
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        let first = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(first.status, 201, "{}", first.body);
+
+        // Demoted after passing the guard once: the write-time
+        // re-check refuses with the plain non-admin 404 — no row, no
+        // audit — even for bytes that already name a stored job.
+        h.store
+            .user_roles
+            .borrow_mut()
+            .insert("admin1".to_string(), crate::admin::ROLE_MEMBER.to_string());
+        let unknown = h.call_full("GET", "/v1/no-such-route", None, None, None);
+        let denied = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(denied.status, 404, "{}", denied.body);
+        assert_eq!(denied.body, unknown.body);
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        let audits_before = h.store.audits.borrow().len();
+
+        // The store primitive reports the refusal directly: no row,
+        // no audit — even though the guard already passed for this
+        // session before the demotion.
+        let attempt = AdminIngestAttempt {
+            actor_user_id: "admin1".to_string(),
+            job_id: "adm_synthetic000000000000000000000000000".to_string(),
+            idempotency_key: "admin:synthetic".to_string(),
+            content_sha256_hex: "0".repeat(64),
+            nzb_bytes: 10,
+            file_count: None,
+            segment_count: None,
+            failure: Some(crate::admin_ingest::FailureReason::Malformed),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            block_on(h.store.admin_ingest_upload(&attempt)).unwrap(),
+            AdminIngestUploadOutcome::ActorNotAdmin
+        );
+        assert_eq!(h.store.ingest_jobs.borrow().len(), 1);
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
+    fn admin_ingest_deleting_actor_is_fenced() {
+        // ADR 0002 rule 3 fences every writer of user-owned state: the
+        // upload's job/original rows carry the actor's id under an
+        // ON DELETE RESTRICT FK, so a deleting actor's upload is refused
+        // with the typed `account_deleting` 409 — no job, no original,
+        // no audit — even though the session is still valid and the
+        // actor is still an admin through the grace window.
+        let h = harness();
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        let nzb = minimal_ingest_nzb();
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("admin1".to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let denied = post_ingest(&h, &admin_cookie, &nzb);
+        assert_eq!(denied.status, 409, "{}", denied.body);
+        assert_eq!(
+            denied.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#,
+            "{}",
+            denied.body
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert!(h.store.ingest_originals.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+
+        // The store primitive reports the refusal directly.
+        let attempt = AdminIngestAttempt {
+            actor_user_id: "admin1".to_string(),
+            job_id: "adm_synthetic000000000000000000000000000".to_string(),
+            idempotency_key: "admin:synthetic".to_string(),
+            content_sha256_hex: "0".repeat(64),
+            nzb_bytes: 10,
+            file_count: None,
+            segment_count: None,
+            failure: Some(crate::admin_ingest::FailureReason::Malformed),
+            original: None,
+            kek_version: 1,
+            source_ip: "198.51.100.9".to_string(),
+            now: NOW,
+        };
+        assert_eq!(
+            block_on(h.store.admin_ingest_upload(&attempt)).unwrap(),
+            AdminIngestUploadOutcome::AccountDeleting
+        );
+        assert!(h.store.ingest_jobs.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
     #[test]

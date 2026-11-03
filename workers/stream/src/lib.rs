@@ -53,6 +53,7 @@ pub mod delivered;
 pub mod grant;
 pub mod loader;
 pub mod meter;
+pub mod meter_sink;
 pub mod nntp;
 pub mod observability;
 pub mod play;

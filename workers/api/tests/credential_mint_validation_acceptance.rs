@@ -590,7 +590,13 @@ mod surface_acceptance {
             ("GET", "/v1/playlists"),
             ("POST", "/v1/playlists"),
             ("PATCH", "/v1/playlists/synthetic"),
-            ("POST", "/v1/plays"),
+            // `POST /v1/plays` left this list when the session-served
+            // grant-issuance route landed: header-absent callers now
+            // reach the cookie handler (401/402/200), so the absent
+            // posture is no longer the plain 404. The surviving gate
+            // invariant — a PRESENTED invalid bearer still plain-404s
+            // with no cookie rescue — is pinned by the handlers suite
+            // (`play_issue_presented_invalid_bearer_still_plain_404`).
             ("GET", "/v1/stream"),
             ("POST", "/v1/ingest"),
             ("GET", "/v1/not-a-route"),
