@@ -65,6 +65,43 @@ the activation checklist is accurate:
   still depend on their venture slices; the journey specs expose those missing
   backend behaviors directly.
 
+## Player contract migration (app-shell redesign, design spec v1)
+
+The custom player bar replaces the native `<audio controls>` timeline this
+suite used to click. The migration is already done on the test side, so the
+player-bar build changes product code only:
+
+- **Kept hooks** (`helpers/contract.ts` `TESTIDS`): `library-item`,
+  `audio-player` (the `<audio>` element — it loses its native `controls`),
+  `usage-meter` (rail footer XOR library page — never two in the DOM at
+  once).
+- **Mapped hooks**: `now-playing` and `player-next` move from the demo/queue
+  UI to the player bar's identity cluster and Next transport; the library
+  page's `library-now-playing` readout retires into `now-playing`.
+- **New hooks**: `player-bar`, `player-play-pause`, `player-seek` (a native
+  `input[type=range]` with slider semantics and an `aria-valuetext` like
+  "1:23 of 3:45"), `player-volume`, plus shell hooks `shell-topbar` (both
+  shells), `shell-rail`, `shell-tabbar`, `mini-player`. They are declared
+  as `PENDING_TESTIDS` in `helpers/contract.ts` until their builds render
+  them, then move into `TESTIDS` (the web contract test requires every
+  `TESTIDS` hook in route markup, so the move happens in the PR that
+  renders the hook).
+- **Dual-generation driver** (`helpers/player-ui.ts`): seeks press the
+  `player-seek` slider at the proportional position when it is visible and
+  fall back to the native timeline while `controls` are still rendered;
+  play/pause uses `player-play-pause` or the native toggle. Neither path
+  ever assigns `currentTime`. The pure verdict (surface choice, proof
+  region, resume floor, pointer geometry) is pinned offline by
+  `tests/player-ui.spec.ts`. The Media Session helper needed no change — it
+  was already player-agnostic; the library page must keep applying Media
+  Session metadata when the real player graduates, which the live spec
+  already pins.
+- **Staging journey impact**: none until the bar ships — the fallback is
+  the exact native path the M1 journey uses today. When the bar ships, the
+  same journey drives the slider with the same proofs (paused seek +
+  `seeked` event + resume floor), so row 4 of `docs/m1-exit-traceability.md`
+  keeps its meaning.
+
 ## Bot-contract conformance vectors (feeds B8)
 
 The TWO-bot consumption contract (spec section 5) is banked as a JSON

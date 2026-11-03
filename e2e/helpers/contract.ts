@@ -27,9 +27,37 @@ export const TESTIDS = {
   libraryItem: 'library-item',
   libraryList: 'library-list',
   libraryStaleBadge: 'library-stale-badge',
+  // Player contract across the app-shell redesign (design spec v1): the
+  // audio element keeps this hook (its native `controls` go away), the
+  // usage meter keeps its hook (rail footer XOR library page, never
+  // both), and the identity/transport hooks below (today in the demo
+  // player) move to the persistent player bar. See helpers/player-ui.ts
+  // and e2e/README.md ("Player contract migration").
   audioPlayer: 'audio-player',
   usageMeter: 'usage-meter',
+  nowPlaying: 'now-playing',
+  playerNext: 'player-next',
+  queuePanel: 'queue-panel',
   planLimitNotice: 'plan-limit-notice',
+} as const;
+
+// UI hooks the app-shell and player-bar builds (design spec v1) must
+// render; declared now so the dual-generation drivers can target them the
+// moment they exist. Deliberately NOT in TESTIDS yet: the web contract
+// test (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to
+// be declared in route markup, and these land with their builds — move
+// each key into TESTIDS (and map its route there) in the PR that renders
+// it. `shell-topbar` exists in both shells (app + public header); the rest
+// are app-shell/player-bar only.
+export const PENDING_TESTIDS = {
+  playerBar: 'player-bar',
+  playerPlayPause: 'player-play-pause',
+  playerSeek: 'player-seek',
+  playerVolume: 'player-volume',
+  shellTopbar: 'shell-topbar',
+  shellRail: 'shell-rail',
+  shellTabbar: 'shell-tabbar',
+  miniPlayer: 'mini-player',
 } as const;
 
 // API endpoints (relative to STAGING_BASE_URL).

@@ -148,3 +148,22 @@ with computed visibility, so `display:none`, `visibility:hidden`, zero
 opacity and near-zero font sizes all fail it.
 
 Skills used: paperclip, test-driven-development, verification-before-completion.
+
+## App-shell renegotiation note (test-author, design spec v1)
+
+The app-shell redesign changes no density pin in this contract:
+
+- The Density native select stays on the **library page view-options
+  toolbar** (it does not migrate into the rail or top bar), so DEN-00
+  through DEN-08 keep as written. DEN-02's geometry assertions compare
+  the same rows before and after the switch, so they re-baseline onto
+  the new row heights on their own; Compact still never shrinks a
+  target (the DEN-00/DEN-02 target-size pins are unchanged).
+- One addition, **DEN-09** in `library-density.acceptance.spec.ts`
+  (`test.fixme`, activates with the app shell build): the left rail's
+  "Sort & view" menu may offer the same Comfortable/Compact choice as
+  **menu radios** writing the same raw enum under `nntune:density:v1`,
+  but it must never create a second combobox named "Density" — the
+  page select stays the single combobox and reflects whichever writer
+  chose last. A rail menu that instead rendered a second select would
+  fail DEN-01's one-combobox pin; that is intentional.
