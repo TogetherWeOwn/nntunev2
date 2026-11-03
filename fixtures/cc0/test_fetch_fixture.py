@@ -53,6 +53,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 (stdlib handler name)
         type(self).hits += 1
         key = urllib.parse.unquote(self.path.lstrip("/"))
+        if key == "s3-error":
+            xml = (
+                b'<?xml version="1.0" encoding="UTF-8"?>'
+                b"<Error><Code>NoSuchKey</Code>"
+                b"<Message>The specified key does not exist.</Message></Error>"
+            )
+            self.send_response(404)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(xml)))
+            self.end_headers()
+            self.wfile.write(xml)
+            return
         if key != f"fixtures/cc0/test-album/{FILE}":
             self.send_error(404)
             return
@@ -170,6 +182,16 @@ class FetchFixtureTest(unittest.TestCase):
         self.assertEqual(0, Handler.hits)
         self.assertFalse((self.root / "evil.flac").exists())
 
+    def test_http_error_surfaces_the_s3_error_code(self):
+        # A bare "HTTP Error 404" cannot tell a missing key from a
+        # missing bucket; the failure must name the S3 error code.
+        req = fetch_fixture.urllib.request.Request(
+            f"{self.base_url}/s3-error", method="GET"
+        )
+        with self.assertRaises(fetch_fixture.FetchError) as ctx:
+            fetch_fixture.download(req, self.cache / "nope.flac")
+        self.assertIn("NoSuchKey", str(ctx.exception))
+
     def test_plaintext_http_base_url_is_refused(self):
         # Loopback http (self.base_url) stays allowed for test servers;
         # any other http base URL is a misconfiguration, not a skip.
@@ -201,6 +223,9 @@ class RedirectHandlerTest(unittest.TestCase):
 
 class S3SignerTest(unittest.TestCase):
     def test_signed_request_shape(self):
+        # R2 endpoints use virtual-hosted addressing (bucket as a host
+        # label), matching the AWS SDKs; path-style against the account
+        # endpoint 404s in CI.
         req = s3_get_url(
             "https://acct.r2.cloudflarestorage.com",
             "nntunev2-audio-staging",
@@ -209,7 +234,7 @@ class S3SignerTest(unittest.TestCase):
             "secret",
         )
         self.assertEqual(
-            "https://acct.r2.cloudflarestorage.com/nntunev2-audio-staging/"
+            "https://nntunev2-audio-staging.acct.r2.cloudflarestorage.com/"
             "fixtures/cc0/test-album/flac/01%20-%20tone.flac",
             req.full_url,
         )
@@ -233,8 +258,20 @@ class S3SignerTest(unittest.TestCase):
         )
         self.assertTrue(
             req.full_url.startswith(
-                "https://acct123.r2.cloudflarestorage.com/nntunev2-audio-staging/"
+                "https://nntunev2-audio-staging.acct123.r2.cloudflarestorage.com/"
             )
+        )
+
+    def test_non_r2_endpoint_keeps_path_style(self):
+        req = s3_get_url(
+            "http://127.0.0.1:9000",
+            "some-bucket",
+            f"fixtures/cc0/test-album/{FILE}",
+            "AKIDEXAMPLE",
+            "secret",
+        )
+        self.assertTrue(
+            req.full_url.startswith("http://127.0.0.1:9000/some-bucket/")
         )
 
 

@@ -50,6 +50,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -223,10 +224,24 @@ def _signing_key(secret: str, date_stamp: str, region: str, service: str) -> byt
 def s3_get_url(
     endpoint: str, bucket: str, key: str, access_key: str, secret_key: str
 ) -> urllib.request.Request:
-    """Build a SigV4-signed path-style GET request (R2 is S3-compatible)."""
+    """Build a SigV4-signed GET request (R2 is S3-compatible).
+
+    R2 endpoints (`*.r2.cloudflarestorage.com`) use virtual-hosted style
+    (`<bucket>.<account-endpoint>/<key>`), the addressing the AWS SDKs
+    use with R2 by default; path-style requests against the account
+    endpoint 404 in CI. Any other endpoint (e.g. a loopback test server)
+    keeps path-style (`<endpoint>/<bucket>/<key>`).
+    """
     region, service = "auto", "s3"
-    host = urllib.parse.urlparse(endpoint).netloc
-    canonical_uri = "/" + urllib.parse.quote(f"{bucket}/{key}", safe="/~")
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.netloc
+    if (parsed.hostname or "").endswith(".r2.cloudflarestorage.com"):
+        host = f"{bucket}.{host}"
+        base = f"{parsed.scheme}://{host}"
+        canonical_uri = "/" + urllib.parse.quote(key, safe="/~")
+    else:
+        base = endpoint.rstrip("/")
+        canonical_uri = "/" + urllib.parse.quote(f"{bucket}/{key}", safe="/~")
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = now.strftime("%Y%m%d")
@@ -251,7 +266,7 @@ def s3_get_url(
         hashlib.sha256,
     ).hexdigest()
     request = urllib.request.Request(
-        endpoint.rstrip("/") + canonical_uri, method="GET"
+        base + canonical_uri, method="GET"
     )
     request.add_header("x-amz-content-sha256", payload_hash)
     request.add_header("x-amz-date", amz_date)
@@ -286,6 +301,25 @@ def build_request(key: str, env: dict) -> urllib.request.Request:
     )
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Extract the S3 `<Code>: <Message>` from an HTTP error body.
+
+    A bare "HTTP Error 404" cannot distinguish a missing key from a
+    missing bucket; the S3 error code can, and it carries no secrets.
+    """
+    try:
+        body = exc.read(65536).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    code = re.search(r"<Code>([^<]+)</Code>", body)
+    message = re.search(r"<Message>([^<]+)</Message>", body)
+    if code and message:
+        return f" ({code.group(1)}: {message.group(1)})"
+    if code:
+        return f" ({code.group(1)})"
+    return ""
+
+
 def download(request: urllib.request.Request, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f"{dest.name}.part-{os.getpid()}")
@@ -296,6 +330,11 @@ def download(request: urllib.request.Request, dest: Path) -> None:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     handle.write(chunk)
         os.replace(tmp, dest)
+    except urllib.error.HTTPError as exc:
+        tmp.unlink(missing_ok=True)
+        raise FetchError(
+            f"download failed: {exc}{_http_error_detail(exc)}"
+        ) from exc
     except (urllib.error.URLError, OSError) as exc:
         tmp.unlink(missing_ok=True)
         raise FetchError(f"download failed: {exc}") from exc

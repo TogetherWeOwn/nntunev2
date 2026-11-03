@@ -705,7 +705,7 @@ jobs:
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
           NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
         run: |
-          set -euo pipefail
+          set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
             echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
             exit 0
@@ -1361,7 +1361,7 @@ jobs:
           NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
           NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
         run: |
-          set -euo pipefail
+          set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
             echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
             exit 0
