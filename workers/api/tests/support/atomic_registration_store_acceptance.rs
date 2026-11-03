@@ -2296,3 +2296,71 @@ fn postgres_registration_invite_claim_stamps_spend_and_invited_by() {
         );
     });
 }
+
+// Regression (review round 1): deleting the issuer between the
+// `invite_by_hash` snapshot and the enrollment commit must not break
+// an otherwise valid invite. The issued_by FK nulls the stored row
+// (ON DELETE SET NULL), so the stamp derives `invited_by` from the
+// claimed row in-transaction and lands NULL; stamping the stale
+// snapshot id instead violated the `users.invited_by` FK and rolled
+// the enrollment back forever.
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_registration_invite_claim_survives_issuer_deletion() {
+    run_test(async {
+        let mut client = connect().await;
+        let (issuer, _subject) = seed_admin_test_users(&client).await;
+        let mut fixture = Fixture::seed(&client).await;
+        fixture.invite.issued_by = Some(issuer.clone());
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1 WHERE code_hash = $2",
+                &[&issuer, &fixture.invite.code_hash],
+            )
+            .await
+            .expect("attribute the seeded invite to its issuer");
+        // The issuer disappears after the snapshot was taken; the
+        // fixture's invite record still carries the stale id.
+        client
+            .execute("DELETE FROM users WHERE id = $1", &[&issuer])
+            .await
+            .expect("delete the issuer between lookup and claim");
+        complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await
+        .expect("registration with an orphaned invite still commits");
+        fixture.assert_state(&client, (true, true, true, 1)).await;
+
+        let row = client
+            .query_one(
+                "SELECT i.redeemed_by, i.issued_by, u.invited_by \
+                 FROM invite_codes i, users u \
+                 WHERE i.code_hash = $1 AND u.id = $2",
+                &[&fixture.invite.code_hash, &fixture.credential.user_id],
+            )
+            .await
+            .expect("read spend stamps after issuer deletion");
+        assert_eq!(
+            row.get::<_, String>(0),
+            fixture.credential.user_id,
+            "the orphaned invite is still spent by the new account"
+        );
+        assert_eq!(
+            row.get::<_, Option<String>>(1),
+            None,
+            "the stored issuer was nulled by ON DELETE SET NULL"
+        );
+        assert_eq!(
+            row.get::<_, Option<String>>(2),
+            None,
+            "users.invited_by derives from the claimed row, not the stale snapshot"
+        );
+    });
+}

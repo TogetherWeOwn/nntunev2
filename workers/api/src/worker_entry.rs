@@ -1020,13 +1020,18 @@ async fn complete_registration_on(
         // Stamp the invite tree on the new account and write the
         // `invite.redeemed` audit in this same transaction: an audit
         // failure rolls the claims back, leaving the invite unspent
-        // and the signup retryable.
+        // and the signup retryable. `invited_by` is read from the
+        // CLAIMED invite row inside this transaction, never from the
+        // pre-claim snapshot: if the issuer was deleted after
+        // `invite_by_hash`, the row's `issued_by` is already NULL
+        // (ON DELETE SET NULL), while the snapshot still names the
+        // deleted user and the `users.invited_by` FK would reject it,
+        // rolling back an otherwise valid enrollment forever.
         transaction
             .query_typed(
-                "UPDATE users SET invited_by = $2, invite_code_hash = $3 WHERE id = $1",
+                "UPDATE users SET invited_by = (SELECT issued_by FROM invite_codes WHERE code_hash = $2), invite_code_hash = $2 WHERE id = $1",
                 &[
                     (&credential.user_id, Type::TEXT),
-                    (&record.issued_by, Type::TEXT),
                     (&record.code_hash, Type::TEXT),
                 ],
             )
@@ -3177,6 +3182,37 @@ impl Store for PgStore {
                         self.statement_failed("api.db.statement_failed.update_checkout_operation")
                     })?;
                 Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                // One EXISTS probe over the same established states
+                // the reaper protects (`unverified_user_filter`):
+                // credential, any session row (a completed sign-in
+                // leaves one, revoked or not), vault, or a promoted
+                // (non-member) role. A missing user row is simply
+                // never-admitted.
+                let sql = format!(
+                    "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM sessions WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM provider_vaults WHERE user_id = $1) \
+                     OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND role <> '{member}') AS admitted",
+                    member = crate::admin::ROLE_MEMBER
+                );
+                let rows = client
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
+                    .await
+                    .map_err(|_| StoreError)?;
+                if rows.len() != 1 {
+                    return Err(StoreError);
+                }
+                rows[0].try_get("admitted").map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )

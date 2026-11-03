@@ -1065,6 +1065,26 @@ pub trait Store {
     fn account_deleting(&self, _user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
     }
+    /// Whether the account was ever admitted past signup: it holds a
+    /// passkey credential, a session row (current or revoked — a
+    /// completed sign-in leaves one), or a provider vault, or it
+    /// carries a non-member role (promotion is an admission act; the
+    /// reaper's `unverified_user_filter` protects the same states).
+    /// The magic-finish invite gate refuses only accounts for which
+    /// this is false — a never-admitted signup in progress — so
+    /// established magic-only members keep signing in after
+    /// `INVITES_REQUIRED` flips. The default composes the credential
+    /// and vault reads only, keeping out-of-tree `Store` impls
+    /// compiling; production and the test fake override it with the
+    /// full predicate (sessions and role included).
+    fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            if !self.credentials_for_user(user_id).await?.is_empty() {
+                return Ok(true);
+            }
+            Ok(self.vault_by_user(user_id).await?.is_some())
+        }
+    }
     fn insert_audit(&self, event: &AuditEvent) -> impl Future<Output = Result<(), StoreError>>;
     /// The stored `users.role` for the admin guard, read fresh per
     /// request (migration 0028). Fail-closed default is absent — and
@@ -3180,17 +3200,22 @@ where
             Err(_) => {}
         }
     }
-    // Invite-required posture: a credential-less account is a signup
+    // Invite-required posture: a never-admitted account is a signup
     // in progress, and its emailed token (sent by register/start as
     // the inbox proof) must not mint a session on this route — that
     // would complete a signup with no invite consumed. Refuse
     // generically WITHOUT spending the token, so the legitimate
-    // enrollment at register/finish can still use it. Credentialed
-    // accounts keep the ordinary magic sign-in.
+    // enrollment at register/finish can still use it. "Never
+    // admitted" is the full reaper-protected predicate (no
+    // credential AND no prior session AND no vault AND member role),
+    // NOT mere credential-lessness: magic-only accounts are an
+    // established state, and gating on credentials alone would lock
+    // those members out the moment invites flip on, with
+    // register/finish demanding an invite they never needed.
     if ctx.cfg.invites_required {
-        match ctx.store.credentials_for_user(&record.user_id).await {
-            Ok(creds) if creds.is_empty() => return generic_auth(),
-            Ok(_) => {}
+        match ctx.store.account_admitted(&record.user_id).await {
+            Ok(false) => return generic_auth(),
+            Ok(true) => {}
             Err(_) => return internal(),
         }
     }
@@ -6218,10 +6243,20 @@ mod tests {
                     }
                 }
                 if let Some(record) = invite {
-                    // Mirror the production stamps + in-transaction audit.
+                    // Mirror the production stamps + in-transaction
+                    // audit: `invited_by` comes from the CLAIMED stored
+                    // row, not the caller's pre-claim snapshot, so an
+                    // issuer deleted after `invite_by_hash` (stored
+                    // `issued_by` already nulled, ON DELETE SET NULL)
+                    // cannot break the enrollment.
+                    let claimed_issuer = self
+                        .invites
+                        .borrow()
+                        .get(&record.code_hash)
+                        .and_then(|claimed| claimed.issued_by.clone());
                     self.invited_by
                         .borrow_mut()
-                        .insert(credential.user_id.clone(), record.issued_by.clone());
+                        .insert(credential.user_id.clone(), claimed_issuer);
                     let audit = invite_audit.ok_or(StoreError)?;
                     self.audits.borrow_mut().push(audit.clone());
                 }
@@ -6879,6 +6914,28 @@ mod tests {
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
             Ok(self.deleting_users.borrow().contains(user_id))
+        }
+        async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
+            // Mirror the production EXISTS probe: credential, any
+            // session row, vault, or a non-member role (an absent
+            // `user_roles` entry is the `member` column default).
+            let admitted = self
+                .credentials
+                .borrow()
+                .values()
+                .any(|c| c.user_id == user_id)
+                || self
+                    .sessions
+                    .borrow()
+                    .values()
+                    .any(|s| s.user_id == user_id)
+                || self.vaults.borrow().contains_key(user_id)
+                || self
+                    .user_roles
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|role| role.as_str() != crate::admin::ROLE_MEMBER);
+            Ok(admitted)
         }
         async fn delete_vault(&self, user_id: &str) -> Result<(), StoreError> {
             self.vaults.borrow_mut().remove(user_id);
@@ -13076,6 +13133,76 @@ mod tests {
         .unwrap();
         let cookie = magic_login(&h, "member2@example.com");
         assert!(!cookie.is_empty());
+    }
+
+    #[test]
+    fn magic_finish_invite_gate_keeps_established_magic_only_members_signed_in() {
+        // Regression (review round 1): the gate must refuse only
+        // never-admitted accounts. A magic-only member — no passkey,
+        // but a prior session or a vault, the states the reaper
+        // protects — keeps signing in by email once invites are
+        // required; gating on credential-lessness alone locked them
+        // out at the flip with no way back in.
+        let mut h = harness();
+        h.config.invites_required = true;
+
+        // Established via a prior session (even a revoked one: a
+        // completed sign-in happened, which is the admission proof).
+        seed_user(&h, "u-magic-session", "magic-session@example.com");
+        block_on(h.store.insert_session(&SessionRecord {
+            id: "sess-prior".to_string(),
+            user_id: "u-magic-session".to_string(),
+            created_at: NOW,
+            expires_at: NOW + 3600,
+            rotation_counter: 0,
+            revoked: true,
+        }))
+        .unwrap();
+        let cookie = magic_login(&h, "magic-session@example.com");
+        assert!(!cookie.is_empty());
+
+        // Established via a vault, with no credential and no session.
+        seed_user(&h, "u-magic-vault", "magic-vault@example.com");
+        h.store.vaults.borrow_mut().insert(
+            "u-magic-vault".to_string(),
+            VaultRow {
+                blob: crate::vault::VaultBlob {
+                    kek_version: 1,
+                    dek_wrapped_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    dek_wrapped_b64url: "AA".to_string(),
+                    payload_nonce_b64url: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    payload_b64url: "AA".to_string(),
+                },
+                indexer_configured: false,
+                updated_at: NOW,
+            },
+        );
+        let cookie = magic_login(&h, "magic-vault@example.com");
+        assert!(!cookie.is_empty());
+
+        // The bypass stays closed in the same posture: a fresh
+        // account with none of credential/session/vault is still
+        // refused generically and its token stays unspent.
+        seed_user(&h, "u-fresh", "fresh-signup@example.com");
+        let start = h.call(
+            "POST",
+            "/v1/auth/magic/start",
+            serde_json::json!({"email": "fresh-signup@example.com"}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let token = h.mailer.sent.borrow().last().unwrap().1.clone();
+        let token_hash = auth::hash_magic_token(&token);
+        let resp = h.call(
+            "POST",
+            "/v1/auth/magic/finish",
+            serde_json::json!({"token": token}),
+        );
+        assert_eq!(resp.status, 401, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert!(
+            !h.store.magic.borrow()[&token_hash].used,
+            "the refused finish must not spend the token"
+        );
     }
 
     #[test]
