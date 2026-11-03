@@ -107,8 +107,8 @@ export const ICON_PATHS: Record<IconName, string> = {
 	lyrics: '<path d="M4 6h16M4 10h16M4 14h10M4 18h7"/>',
 	maximize: '<path d="M8 3.5H3.5V8M16 3.5h4.5V8M8 20.5H3.5V16M16 20.5h4.5V16"/>',
 	minimize: '<path d="M3.5 8H8V3.5M16 3.5V8h4.5M3.5 16H8v4.5M16 20.5V16h4.5"/>',
-	'more-horizontal': `<path d="M5.5 12h.01M12 12h.01M18.5 12h.01" stroke-width="2.8"${F}/>`,
-	'more-vertical': `<path d="M12 5.5h.01M12 12h.01M12 18.5h.01" stroke-width="2.8"${F}/>`,
+	'more-horizontal': `<path d="M5.5 12h.01M12 12h.01M18.5 12h.01" stroke-width="2.8"/>`,
+	'more-vertical': `<path d="M12 5.5h.01M12 12h.01M12 18.5h.01" stroke-width="2.8"/>`,
 	download: '<path d="M12 3.5V15"/><path d="m7 10.5 5 5 5-5"/><path d="M4.5 20.5h15"/>',
 	upload: '<path d="M12 15V3.5"/><path d="m7 8 5-5 5 5"/><path d="M4.5 20.5h15"/>',
 	clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
@@ -125,6 +125,6 @@ export const ICON_PATHS: Record<IconName, string> = {
 		'<path d="M5 10a11 11 0 0 1 4.5-2.4M12 5.5c2.4 0 4.7.8 6.5 2M8.5 13.5a6.5 6.5 0 0 1 5-1.6M12 18.5v.5"/><path d="m4 4 16 16"/>',
 	'refresh-cw':
 		'<path d="M20 12a8 8 0 0 1-14.2 5M4 12a8 8 0 0 1 14.2-5"/><path d="M18.5 3.5v4h-4M5.5 20.5v-4h4"/>',
-	'grip-vertical': `<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" stroke-width="2.6"${F}/>`,
+	'grip-vertical': `<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" stroke-width="2.6"/>`,
 	video: '<rect x="2.5" y="6.5" width="13" height="11" rx="2"/><path d="m15.5 10.5 6-3v9l-6-3"/>'
 };

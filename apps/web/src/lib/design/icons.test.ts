@@ -63,6 +63,27 @@ describe('icon subset: manifest', () => {
 			}
 		}
 	});
+
+	it('single-segment subpaths retain a visible stroke instead of relying on fill', () => {
+		const number = String.raw`[+-]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][+-]?\d+)?`;
+		const segments = new RegExp(
+			String.raw`^(?:\s*[Mm]\s*${number}[\s,]+${number}\s*[hHvV]\s*${number}\s*)+$`
+		);
+		let checked = 0;
+		for (const name of ICON_NAMES) {
+			for (const [path] of ICON_PATHS[name].matchAll(/<path\b[^>]*>/g)) {
+				const data = path.match(/\bd="([^"]+)"/)?.[1];
+				if (!data || !segments.test(data)) continue;
+				// A straight segment has no fill area, even when fill is currentColor.
+				const stroke = path.match(/\bstroke="([^"]+)"/)?.[1] ?? 'currentColor';
+				expect(stroke, `${name} open segments retain the visible inherited stroke`).toBe(
+					'currentColor'
+				);
+				checked++;
+			}
+		}
+		expect(checked).toBeGreaterThanOrEqual(3);
+	});
 });
 
 describe('icon subset: component', () => {
@@ -70,6 +91,7 @@ describe('icon subset: component', () => {
 		const { body } = render(Icon, { props: { name: 'search' } as never });
 		expect(body).toMatch(/<svg\b[^>]*viewBox="0 0 24 24"[^>]*>/);
 		expect(body).toMatch(/stroke="currentColor"/);
+		expect(body).toMatch(/stroke-linecap="round"/);
 		expect(body).toMatch(/aria-hidden="true"/);
 		expect(body).not.toMatch(/role="img"/);
 	});
