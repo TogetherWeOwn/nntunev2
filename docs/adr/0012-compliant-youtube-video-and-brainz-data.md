@@ -91,7 +91,12 @@ resolver tries, in order:
    action instead of Play; neither changes the resolver.
 
 Users never see NNTP or providers: surfaces say only whether a
-track plays. Separately from the audio resolver, **YouTube is the
+track plays. Implementing this resolver is gated on ADR 0013/0014
+landing and reconciling the BYOP-era contracts they supersede
+(the README's bring-your-own-provider vision and ADR 0003's
+per-user serve grants, both still in the tree); until then this
+section describes the target model, not today's build.
+Separately from the audio resolver, **YouTube is the
 music-video source for all tracks**, NNTP-streamed ones included:
 watching the video is its own visible playback of that video (no
 mid-track switch — see the muted-sync ban below), not a mode of
