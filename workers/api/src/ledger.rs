@@ -53,8 +53,9 @@
 //! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes and
 //!   [`MAX_STREAM_SECONDS_PER_ROW`] seconds — decoupled sanity caps since
 //!   migration 0029 (the byte cap keeps its historical value); zero-byte
-//!   rows are rejected — an empty row bills nothing and only widens the
-//!   table.
+//!   and zero-second rows are rejected — an empty row bills nothing and
+//!   only widens the table, and no derivation of positive bytes yields
+//!   zero seconds (migration 0030 mirrors the floor in the schema).
 
 use std::collections::BTreeMap;
 
@@ -306,8 +307,12 @@ fn check_key(value: &str) -> Result<String, LedgerError> {
 
 /// Build the ledger intent for one billed service window. The caller
 /// derives `stream_seconds` (play windows via [`derive_stream_seconds`]);
-/// this gate bounds it to [`MAX_STREAM_SECONDS_PER_ROW`] rather than
-/// recomputing a derivation it lacks the duration/file inputs for.
+/// this gate bounds it to `[1, MAX_STREAM_SECONDS_PER_ROW]` rather than
+/// recomputing a derivation it lacks the duration/file inputs for. The
+/// floor restores the retired rate equality's implicit guarantee: every
+/// derivation bills a positive byte count at least one second, so a
+/// zero-second row can never be a faithful derivation of its bytes (and
+/// migration 0030 enforces the same floor in the schema).
 /// Until migration 0029 it also required the nominal-rate equality
 /// `seconds == ceil(bytes / STREAM_BYTES_PER_SEC)`; that coupling is
 /// retired with the rate CHECK it mirrored.
@@ -336,7 +341,7 @@ pub fn prepare_ledger_row(
     if bytes_served == 0 || bytes_served > MAX_BYTES_PER_ROW {
         return Err(LedgerError::Invalid);
     }
-    if stream_seconds > MAX_STREAM_SECONDS_PER_ROW {
+    if stream_seconds == 0 || stream_seconds > MAX_STREAM_SECONDS_PER_ROW {
         return Err(LedgerError::Invalid);
     }
     if recorded_at > MAX_RECORDED_AT {
@@ -676,9 +681,13 @@ pub fn ledger_insert_statement() -> &'static str {
 ///
 /// Unlike [`ledger_insert_statement`]'s first-write-wins, sink snapshots
 /// converge: the same play flushes repeatedly as its union grows, and
-/// only a strictly larger union advances the row (seconds were derived
-/// from that union by [`prepare_play_window`], so the pair always moves
-/// together; snapshot columns keep the latest non-NULL inputs).
+/// only a strictly larger union advances the row. The advancing flush
+/// replaces the snapshot columns AS A PAIR (no per-column COALESCE):
+/// the stored seconds must always recompute from the stored inputs, so
+/// a fallback flush (NULL snapshots, nominal-rate seconds —
+/// [`prepare_play_window`]) must clear snapshots an earlier
+/// proportional flush left behind rather than advertise proportional
+/// inputs beside fallback-derived seconds.
 /// Redelivering the same or an older snapshot affects zero rows — as
 /// does a closed writer fence — so the Worker disambiguates a zero-row
 /// outcome with [`ledger_select_by_key_statement`] plus the fence probe,
@@ -686,7 +695,7 @@ pub fn ledger_insert_statement() -> &'static str {
 /// intentionally stay at the first flush: a play crossing a month
 /// boundary bills to its starting month.
 pub fn ledger_play_window_upsert_statement() -> &'static str {
-    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = COALESCE(EXCLUDED.file_bytes, stream_play_ledger.file_bytes), duration_ms = COALESCE(EXCLUDED.duration_ms, stream_play_ledger.duration_ms) WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served"
+    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served"
 }
 
 /// Parameters: idempotency_key. Fetches the stored row after a zero-row
@@ -832,17 +841,31 @@ mod tests {
         // Since migration 0029 the prepare gate bounds caller-derived
         // seconds instead of recomputing the nominal rate: a FLAC window
         // whose proportional seconds sit far below ceil(bytes / 48_000)
-        // prepares fine, and only the per-row sanity cap refuses.
+        // prepares fine. The floor stays: zero seconds for positive
+        // bytes is no faithful derivation (both derivation paths bill
+        // at least one second) and must fail closed, like the cap.
+        assert_eq!(
+            prepare_ledger_row(
+                "user-alice",
+                "track-1",
+                &new_idempotency_key().expect("mint with working RNG"),
+                48_001,
+                0,
+                1_767_225_600,
+            ),
+            Err(LedgerError::Invalid),
+            "zero seconds for positive bytes must fail closed"
+        );
         let row = prepare_ledger_row(
             "user-alice",
             "track-1",
             &new_idempotency_key().expect("mint with working RNG"),
             48_001,
-            0,
+            1,
             1_767_225_600,
         )
         .unwrap();
-        assert_eq!(row.stream_seconds, 0);
+        assert_eq!(row.stream_seconds, 1);
         assert_eq!(row.period_month, "2026-01");
         let row = prepare_ledger_row(
             "user-alice",
@@ -1073,7 +1096,7 @@ mod tests {
         );
         assert_eq!(
             ledger_play_window_upsert_statement(),
-            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = COALESCE(EXCLUDED.file_bytes, stream_play_ledger.file_bytes), duration_ms = COALESCE(EXCLUDED.duration_ms, stream_play_ledger.duration_ms) WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served",
+            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served",
             "play window upsert"
         );
         assert_eq!(

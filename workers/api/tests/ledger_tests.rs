@@ -368,6 +368,18 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
         upsert.contains("WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served"),
         "monotonic advance only: {upsert}"
     );
+    // Snapshots replace AS A PAIR on an advancing flush: a per-column
+    // COALESCE would strand a fallback flush's zero-input seconds beside
+    // the previous proportional snapshots, and the stored row would no
+    // longer recompute to its own seconds.
+    assert!(
+        upsert.contains("file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms"),
+        "snapshot pair replaced together: {upsert}"
+    );
+    assert!(
+        !upsert.contains("COALESCE"),
+        "no per-column snapshot retention: {upsert}"
+    );
     for sql in [insert, select, upsert, ledger_monthly_total_statement()] {
         assert!(!sql.contains('{'), "no interpolation: {sql}");
         assert!(!sql.contains("%s"), "no interpolation: {sql}");
@@ -478,6 +490,21 @@ fn migration_pins_rate_retirement_and_persisted_caps() {
     assert!(
         DERIVATION.contains("CREATE TABLE IF NOT EXISTS playback_leases ("),
         "0029 must create the playback lease table"
+    );
+    // 0029 restores the floor the retired rate CHECK implied: the
+    // schema must refuse the zero-second rows `prepare_ledger_row`
+    // refuses, or a non-prepare writer could persist unbilled plays.
+    const FLOOR: &str = include_str!("../../../migrations/0029_ledger_seconds_floor.sql");
+    assert!(
+        FLOOR.contains("'%stream_seconds >= 0%'"),
+        "0029 must find the zero-allowing range CHECK by its definition"
+    );
+    assert!(
+        FLOOR.contains(&format!(
+            "CHECK (stream_seconds >= 1 AND stream_seconds <= {})",
+            ledger::MAX_STREAM_SECONDS_PER_ROW
+        )),
+        "0029 must bound stream_seconds to [1, MAX_STREAM_SECONDS_PER_ROW]"
     );
     // Literal pin: the fallback rate re-bills history, so drift is
     // deliberate only.

@@ -1,14 +1,17 @@
--- Regression test for migration 0029 (meter derivation snapshots +
--- playback leases). Run after ALL migrations are applied (see
--- ../run_migration_tests.sh). Everything happens inside one transaction
--- that is rolled back, so it leaves no rows; any broken expectation
--- RAISEs and (with ON_ERROR_STOP) fails the run.
+-- Regression test for migrations 0029 (meter derivation snapshots +
+-- playback leases) and 0030 (ledger seconds floor). Run after ALL
+-- migrations are applied (see ../run_migration_tests.sh). Everything
+-- happens inside one transaction that is rolled back, so it leaves no
+-- rows; any broken expectation RAISEs and (with ON_ERROR_STOP) fails
+-- the run.
 --
 -- Scope: the 0020 nominal-rate CHECK is gone (a row whose seconds do
 -- not equal ceil(bytes / 48000) is accepted), the decoupled range
--- CHECKs stay, the nullable `file_bytes` / `duration_ms` snapshot
--- columns exist and reject negatives, and `playback_leases` exists with
--- its one-row-per-user primary key, cascading user FK, and bounds.
+-- CHECKs stay (with 0030's `>= 1` seconds floor), the nullable
+-- `file_bytes` / `duration_ms` snapshot columns exist and reject
+-- negatives, the sink upsert replaces the snapshot pair per advancing
+-- flush (stored rows always recompute), and `playback_leases` exists
+-- with its one-row-per-user primary key, cascading user FK, and bounds.
 
 BEGIN;
 
@@ -89,6 +92,90 @@ BEGIN
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;
+
+    -- Migration 0030: the seconds floor the retired rate CHECK used to
+    -- imply. Zero seconds for positive bytes is rejected at the schema,
+    -- exactly as prepare_ledger_row rejects it at the writer boundary.
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.stream_play_ledger'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%stream_seconds >= 0%'
+    ) THEN
+        RAISE EXCEPTION 'pre-0030 zero-allowing seconds CHECK survived';
+    END IF;
+    BEGIN
+        INSERT INTO stream_play_ledger
+            (idempotency_key, user_id, track_id, period_month,
+             stream_seconds, bytes_served, recorded_at)
+        VALUES ('play:mdl-user:track-5:play-5', 'mdl-user', 'track-5',
+                '2026-11', 0, 48000, 1761955200);
+        RAISE EXCEPTION 'zero stream_seconds was accepted after 0030';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+END $$;
+
+-- The sink upsert (ledger_play_window_upsert_statement, literals
+-- inlined as in playback_lease_statements.sql) replaces the snapshot
+-- pair on every advancing flush: stored seconds must always recompute
+-- from stored inputs, so a fallback flush (NULL snapshots) must clear
+-- the proportional snapshots an earlier flush left behind — a
+-- per-column COALESCE would strand fallback seconds beside
+-- proportional inputs.
+INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT 'play:mdl-user:track-6:play-6', 'mdl-user', 'track-6', '2026-11', 120, 15000000, 1761955200, 30000000, 240000 FROM (SELECT id FROM users WHERE id = 'mdl-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served;
+-- A larger-union FALLBACK flush: ceil(16_000_000 / 48_000) = 334 s.
+INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT 'play:mdl-user:track-6:play-6', 'mdl-user', 'track-6', '2026-11', 334, 16000000, 1761955200, NULL, NULL FROM (SELECT id FROM users WHERE id = 'mdl-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served;
+-- An older (smaller-union) redelivery never rewinds the row.
+INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT 'play:mdl-user:track-6:play-6', 'mdl-user', 'track-6', '2026-11', 124, 15500000, 1761955200, 30000000, 240000 FROM (SELECT id FROM users WHERE id = 'mdl-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served;
+
+DO $$
+DECLARE
+    row_seconds BIGINT;
+    row_bytes BIGINT;
+    row_file BIGINT;
+    row_duration BIGINT;
+BEGIN
+    SELECT stream_seconds, bytes_served, file_bytes, duration_ms
+      INTO row_seconds, row_bytes, row_file, row_duration
+      FROM stream_play_ledger
+     WHERE idempotency_key = 'play:mdl-user:track-6:play-6';
+    -- Fallback flush won and cleared the snapshot pair; the older
+    -- redelivery changed nothing. The row recomputes as a fallback row.
+    IF row_seconds <> 334 OR row_bytes <> 16000000 THEN
+        RAISE EXCEPTION 'upsert kept % s / % bytes, expected 334 / 16000000',
+            row_seconds, row_bytes;
+    END IF;
+    IF row_file IS NOT NULL OR row_duration IS NOT NULL THEN
+        RAISE EXCEPTION 'fallback flush stranded proportional snapshots (% / %)',
+            row_file, row_duration;
+    END IF;
+    IF row_seconds <> ceil(row_bytes::numeric / 48000) THEN
+        RAISE EXCEPTION 'fallback row does not recompute from bytes alone';
+    END IF;
+END $$;
+
+-- A later proportional flush (the full file) restores the pair, and the
+-- row recomputes as ceil(union * duration / file) once more.
+INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT 'play:mdl-user:track-6:play-6', 'mdl-user', 'track-6', '2026-11', 240, 30000000, 1761955200, 30000000, 240000 FROM (SELECT id FROM users WHERE id = 'mdl-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = EXCLUDED.file_bytes, duration_ms = EXCLUDED.duration_ms WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served;
+
+DO $$
+DECLARE
+    row_seconds BIGINT;
+    row_bytes BIGINT;
+    row_file BIGINT;
+    row_duration BIGINT;
+BEGIN
+    SELECT stream_seconds, bytes_served, file_bytes, duration_ms
+      INTO row_seconds, row_bytes, row_file, row_duration
+      FROM stream_play_ledger
+     WHERE idempotency_key = 'play:mdl-user:track-6:play-6';
+    IF row_seconds <> 240 OR row_file <> 30000000 OR row_duration <> 240000 THEN
+        RAISE EXCEPTION 'proportional flush did not restore the snapshot pair';
+    END IF;
+    IF row_seconds <> ceil(row_bytes::numeric * row_duration / (row_file * 1000)) THEN
+        RAISE EXCEPTION 'proportional row does not recompute from its snapshots';
+    END IF;
 END $$;
 
 -- One lease row per user; a second insert for the same user conflicts
