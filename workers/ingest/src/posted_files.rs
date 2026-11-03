@@ -614,6 +614,6 @@ mod tests {
         let rendered = format!("{:?}", p);
         assert!(!rendered.contains("MARKER"));
         assert!(rendered.contains("file_key_encrypted_len"));
-        assert!(rendered.contains(&p.plaintext_sha256));
+        assert!(rendered.contains(p.plaintext_sha256));
     }
 }
