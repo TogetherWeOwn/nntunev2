@@ -167,12 +167,12 @@ SESSION_TTL_SECS = "86400"
 #                                 the stream Worker (same value on both).
 #                                 NOT base64 — unlike every secret above, the
 #                                 raw string bytes are the key on both sides,
-#                                 so stage a plain random string of 32+
-#                                 characters (e.g.
+#                                 so stage a plain random string of at
+#                                 least 32 bytes (UTF-8; e.g.
 #                                 `openssl rand -hex 32`); base64-looking
 #                                 values are still used verbatim, which is
 #                                 consistent as long as both Workers hold the
-#                                 identical string. Unset or under 32 chars:
+#                                 identical string. Unset or under 32 bytes:
 #                                 the play routes fail closed per-request,
 #                                 every other route keeps serving.
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)

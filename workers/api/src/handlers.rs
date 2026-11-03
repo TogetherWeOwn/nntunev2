@@ -5481,9 +5481,20 @@ where
             ctx.now,
             lease_expires_at,
         ),
-        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => plan_limit_refusal(
-            crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
-        ),
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
+            // Zero rows back can also mean the deletion fence closed
+            // after the up-front check (the marker landed mid-request):
+            // re-read it so that race answers the typed 409, not a
+            // concurrent-streams 429.
+            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                account_deleting_response()
+            } else {
+                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
+                    &caps,
+                    retry_after_secs,
+                ))
+            }
+        }
         Err(_) => internal(),
     }
 }
@@ -5508,6 +5519,18 @@ where
     // heartbeat is the typed 409, never an `active` extension.
     if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
         return account_deleting_response();
+    }
+    // Same fail-closed secret gate as issuance: a misconfigured
+    // deployment must not let heartbeats keep a lease alive that no
+    // new grant could be minted against.
+    if ctx
+        .cfg
+        .play_grant_secret
+        .as_deref()
+        .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
+        .is_none()
+    {
+        return internal();
     }
     let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
         return validation_failed("invalid request");
@@ -5541,9 +5564,17 @@ where
             .await
         {
             Ok(true) => (state, Some(expires)),
-            // A raced takeover landed between the read and the touch:
-            // report the truth, do not extend a lost lease.
-            Ok(false) => (crate::playback::LeaseHeartbeat::Superseded, None),
+            // Zero rows: a raced takeover landed between the read and
+            // the touch, or the deletion fence closed after the
+            // up-front check. Re-read deletion so the fence race
+            // answers the typed 409; otherwise report the truth, do
+            // not extend a lost lease.
+            Ok(false) => {
+                if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
+                    return account_deleting_response();
+                }
+                (crate::playback::LeaseHeartbeat::Superseded, None)
+            }
             Err(_) => return internal(),
         }
     } else {
@@ -10599,6 +10630,45 @@ mod tests {
             serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
         );
         assert_eq!(resp.status, 500, "{}", resp.body);
+    }
+
+    #[test]
+    fn play_heartbeat_fails_closed_without_a_provisioned_secret() {
+        // Default cfg(): no play-grant secret at all. The heartbeat is
+        // gated like issuance, so a misconfigured deployment cannot
+        // keep extending a lease no grant could be minted against.
+        let h = harness();
+        let cookie = play_user(&h);
+        h.store.playback_leases.borrow_mut().insert(
+            "user-plays-1".to_string(),
+            crate::playback::LeaseRow {
+                session_id: "tab-a".to_string(),
+                track_id: "track-9".to_string(),
+                play_id: "play-seeded".to_string(),
+                epoch: 7,
+                expires_at: NOW + 10,
+            },
+        );
+        let resp = h.call_full(
+            "POST",
+            "/v1/plays/heartbeat",
+            Some(
+                serde_json::json!({
+                    "session_id": "tab-a",
+                    "play_id": "play-seeded",
+                    "lease_epoch": 7,
+                })
+                .to_string(),
+            ),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert_eq!(
+            h.store.playback_leases.borrow()["user-plays-1"].expires_at,
+            NOW + 10,
+            "a refused heartbeat must not extend the lease"
+        );
     }
 
     #[test]
