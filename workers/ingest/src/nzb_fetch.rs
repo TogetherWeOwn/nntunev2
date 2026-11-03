@@ -1,9 +1,13 @@
-//! Library-only NZB URL policy validation and buffered fetch simulation.
+//! Library-only NZB URL policy validation and buffered fetch simulation
+//! for the admin-ingest path.
 //!
 //! **Not a production fetcher or a runtime SSRF boundary.** No ingest route
 //! calls this module; it has no real DNS/HTTPS implementation, environment
-//! read or decision-log emission. Runtime wiring is tracked in
-//! <https://github.com/TogetherWeOwn/nntunev2/issues/84>.
+//! read or decision-log emission. Any future wiring is admin-gated with an
+//! operator-configured allowlist (see below): user-supplied URLs must never
+//! reach this module, and no user-authenticated route may cause a
+//! server-side fetch of a user-supplied URL through it. Runtime wiring is
+//! tracked in <https://github.com/TogetherWeOwn/nntunev2/issues/84>.
 //!
 //! [`validate_fetch_url`] checks HTTPS, credentials, port 443, an exact
 //! case-insensitive host allowlist, and every address returned by the supplied
@@ -26,13 +30,14 @@
 //! TLS, headers, body and all redirects. Keep URL fetching unavailable until
 //! those properties are demonstrated; exporting this module is not wiring it.
 //!
-//! ## Policy configuration (not read from the Worker environment)
+//! ## Policy configuration (operator-supplied, never user input)
 //!
-//! [`FetchConfig::allowlist_from_env`] parses a caller-supplied string; it does
-//! not read `NZB_FETCH_ALLOWLIST`. That future variable is a comma-separated
-//! list of exact hostnames (e.g. `nzb.example,cdn.example`); subdomains are not
-//! implied. [`FetchConfig::default`] denies every host. The library returns
-//! `HostNotAllowlisted`; no route currently converts it to an HTTP response.
+//! [`FetchConfig::allowlist_from_env`] parses an operator-supplied string from
+//! the admin-ingest wiring; it does not read `NZB_FETCH_ALLOWLIST` itself.
+//! That future variable is a comma-separated list of exact hostnames (e.g.
+//! `nzb.example,cdn.example`); subdomains are never implied. [`FetchConfig::default`]
+//! denies every host. The library returns `HostNotAllowlisted`; only a future
+//! admin-gated route may convert it to an HTTP response.
 //!
 //! ## Model defaults (not enforced network limits)
 //!
@@ -122,8 +127,8 @@ impl FetchConfig {
     }
 }
 
-/// Library rejection reasons with proposed HTTP mappings for future wiring.
-/// No route currently emits these codes or statuses.
+/// Library rejection reasons with proposed HTTP mappings for future
+/// admin-gated wiring. No route currently emits these codes or statuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchRejection {
     BadScheme,
@@ -404,7 +409,8 @@ fn is_redirect(status: u16) -> bool {
 /// Revalidates 301/302/303/307/308 locations and follows at most
 /// `config.max_redirects` hops. A missing Location or other non-2xx status
 /// becomes UpstreamStatus(status). See the module's runtime follow-up before
-/// connecting this model to any caller-supplied URL-fetch route.
+/// connecting this model to any URL-fetch route: only the admin-gated
+/// ingest path may call it, and only with operator-configured URLs.
 pub fn fetch_nzb(
     url: &str,
     config: &FetchConfig,
