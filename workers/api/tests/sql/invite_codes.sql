@@ -22,15 +22,15 @@ BEGIN
     IF (SELECT a.attname
         FROM pg_index i
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
-        WHERE i.indrelid = 'invite_codes'::regclass AND i.indisprimary) <> 'id' THEN
+        WHERE i.indrelid = 'invite_codes'::regclass AND i.indisprimary) IS DISTINCT FROM 'id' THEN
         RAISE EXCEPTION 'invite_codes primary key is not the surrogate id';
     END IF;
     IF (SELECT is_nullable FROM information_schema.columns
-        WHERE table_name = 'invite_codes' AND column_name = 'expires_at') <> 'NO' THEN
+        WHERE table_name = 'invite_codes' AND column_name = 'expires_at') IS DISTINCT FROM 'NO' THEN
         RAISE EXCEPTION 'invite_codes.expires_at is not NOT NULL';
     END IF;
     IF (SELECT is_nullable FROM information_schema.columns
-        WHERE table_name = 'users' AND column_name = 'invited_by') <> 'YES' THEN
+        WHERE table_name = 'users' AND column_name = 'invited_by') IS DISTINCT FROM 'YES' THEN
         RAISE EXCEPTION 'users.invited_by missing or NOT NULL';
     END IF;
 
