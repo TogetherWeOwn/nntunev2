@@ -11,7 +11,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 GATE_SCRIPT = ".github/scripts/migrations_gate.py"
 
 
-class MigrationGateRegressionTests(unittest.TestCase):
+class MigrationGateCase(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp_dir.name)
@@ -57,6 +57,8 @@ class MigrationGateRegressionTests(unittest.TestCase):
         self.git("commit", "-qm", "base migrations")
         return self.git("rev-parse", "HEAD").stdout.strip()
 
+
+class MigrationGateRegressionTests(MigrationGateCase):
     def test_new_number_must_exceed_base_maximum(self):
         for added in ("0000_first.sql", "0002_inserted.sql"):
             with self.subTest(added=added):
@@ -245,6 +247,65 @@ class MigrationGateRegressionTests(unittest.TestCase):
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertIn("migrations-gate: unlisted: 0002_UP.SQL: ", result.stdout)
         self.assertIn("migrations-gate: unlisted: sub/0009_nested.sql: ", result.stdout)
+
+
+class TestSearchPathHeader(MigrationGateCase):
+    HEADER = "SET search_path = public, pg_catalog;\n"
+
+    def add_numbered(self, base_files, filename, content):
+        base_ref = self.make_base(base_files)
+        self.write_migration(filename, content)
+        self.write_manifest([(name, "app") for name in base_files + [filename]])
+        return base_ref
+
+    def test_new_migration_above_cutoff_without_header_fails(self):
+        base_ref = self.add_numbered(
+            ["0030_base.sql"],
+            "0031_new.sql",
+            "CREATE TABLE public.example (id integer PRIMARY KEY);\n",
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn(
+            "migrations-gate: missing-search-path: 0031_new.sql: "
+            "new migration must open with SET search_path = public, pg_catalog;",
+            result.stdout,
+        )
+
+    def test_header_after_executable_statement_fails(self):
+        base_ref = self.add_numbered(
+            ["0030_base.sql"],
+            "0031_new.sql",
+            "SELECT 1;\n" + self.HEADER,
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("migrations-gate: missing-search-path: 0031_new.sql: ", result.stdout)
+
+    def test_new_migration_above_cutoff_with_header_passes(self):
+        base_ref = self.add_numbered(
+            ["0030_base.sql"],
+            "0031_new.sql",
+            "-- Leading comments and blank lines may precede the header.\n\n" + self.HEADER + "CREATE TABLE public.example (id integer PRIMARY KEY);\n",
+        )
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("", result.stdout)
+
+    def test_new_migration_at_or_below_cutoff_needs_no_header(self):
+        base_ref = self.make_base(["0001_first.sql"])
+        self.write_migration("0002_second.sql", "CREATE TABLE example (id integer PRIMARY KEY);\n")
+        self.write_manifest([("0001_first.sql", "app"), ("0002_second.sql", "app")])
+
+        result = self.run_gate("--base-ref", base_ref)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
