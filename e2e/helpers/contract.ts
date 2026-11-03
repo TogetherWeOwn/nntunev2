@@ -115,8 +115,16 @@ export const API = {
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
 export const PLAN_LIMIT_STATUSES = [402, 429] as const;
 
-/** Server limit codes that satisfy a plan-limit refusal (docs/api-errors.md). */
-export const PLAN_LIMIT_CODES = ['plan_limit_exceeded', 'rate_limited'] as const;
+/**
+ * Server codes that satisfy a plan-limit/play-gate refusal
+ * (docs/api-errors.md): the monthly-cap code, the rate-limit/concurrency
+ * code, and the spec §4 subscription gate code.
+ */
+export const PLAN_LIMIT_CODES = [
+  'plan_limit_exceeded',
+  'rate_limited',
+  'subscription_required',
+] as const;
 
 /**
  * A named secret that must never appear in a plan-limit response body.

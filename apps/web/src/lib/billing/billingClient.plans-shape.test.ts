@@ -19,22 +19,18 @@ import { BillingApiError, fetchPlans, type PlanDTO } from './billingClient';
 
 const PLUS: PlanDTO = {
 	id: 'plus',
-	priceCents: 900,
+	priceCents: 800,
 	streamHoursMonth: 100,
-	maxConcurrentStreams: 2,
-	maxLibraryTracks: 5000,
-	ingestJobsDay: 50,
-	cachePriority: 'standard'
+	maxConcurrentStreams: 1,
+	selectable: true
 };
 
 const PRO: PlanDTO = {
 	id: 'pro',
-	priceCents: 1900,
-	streamHoursMonth: 500,
-	maxConcurrentStreams: 5,
-	maxLibraryTracks: 25000,
-	ingestJobsDay: 250,
-	cachePriority: 'priority'
+	priceCents: 1500,
+	streamHoursMonth: 300,
+	maxConcurrentStreams: 1,
+	selectable: true
 };
 
 /** HTTP 200 with a JSON-serialized body, as a real endpoint would send. */

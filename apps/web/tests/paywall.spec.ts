@@ -109,8 +109,10 @@ test('402 limit shows terminal paywall with usage and upgrade CTA, no countdown'
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
-	await expect(dialog).toContainText(/reached your plan limit/i);
-	await expect(dialog).toContainText(/2\D*048 of 2\D*048/);
+	// A coded plan_limit_exceeded is the at-cap surface (spec §3.3); the
+	// byte figures belong to the uncoded generic surface and do not render.
+	await expect(dialog).toContainText(/used all your listening hours/i);
+	await expect(dialog).toContainText(/track already playing finishes/i);
 	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
 	await expect(page.getByTestId('paywall-countdown')).toHaveCount(0);
 

@@ -1,7 +1,6 @@
 import { expect, test } from '@playwright/test';
 
 const PERIOD_END = '2026-11-15T12:00:00Z';
-const TRIAL_END = '2099-11-01T12:00:00Z';
 
 for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
 	test.describe(`${viewport.width}px billing period-end copy`, () => {
@@ -11,20 +10,23 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 			for (const currentPeriodEnd of [PERIOD_END, null]) {
 				test(`${status} with ${currentPeriodEnd ? 'dated' : 'null'} period end`, async ({ page }, testInfo) => {
 					const calls: Array<{ path: string; method: string }> = [];
-					const confirmed = status === 'active' || status === 'trialing';
+					// Only a stored `active` folds to the server's active state;
+					// every other stored status (trialing included) is lapsed.
+					const confirmed = status === 'active';
 					await page.route('**/v1/**', (route) => {
 						const path = new URL(route.request().url()).pathname;
 						calls.push({ path, method: route.request().method() });
 						if (path === '/v1/me/subscription') {
 							return route.fulfill({ json: {
-								planId: 'pro-5x', status, currentPeriodEnd,
-								trialEndsAt: status === 'trialing' ? TRIAL_END : null
+								state: confirmed ? 'active' : 'lapsed',
+								planId: 'pro', status, currentPeriodEnd,
+								graceUntil: null, cancelAtPeriodEnd: false
 							} });
 						}
 						if (path === '/v1/me/usage') {
 							return route.fulfill({ json: {
 								period: '2026-10', streamSecondsMonth: 50 * 3600,
-								concurrentNow: 0, libraryTracks: 40000, ingestToday: 0
+								resetsAt: '2026-11-01T00:00:00Z'
 							} });
 						}
 						// Keep every API request local, including an unexpected checkout.
@@ -32,7 +34,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					});
 
 					await page.goto('/account/billing');
-					const plan = page.getByRole('region', { name: 'Current plan: Pro 5x', exact: true });
+					const plan = page.getByRole('region', { name: 'Current plan: Pro', exact: true });
 					await expect(plan).toContainText(`Status: ${status}`);
 					const screenshot = testInfo.outputPath('billing-page.png');
 					await page.screenshot({ path: screenshot, fullPage: true });
@@ -43,13 +45,11 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					} else {
 						await expect(plan).not.toContainText('period ends');
 					}
-					if (status === 'trialing') {
-						await expect(plan).toContainText('trial ends 11/1/2099');
-					} else {
-						await expect(plan).not.toContainText('trial ends');
-					}
+					// No trial product state exists: trial wording never renders,
+					// including for a legacy stored `trialing`.
+					await expect(plan).not.toContainText('trial ends');
 					await expect(page.getByRole('heading', { name: 'Usage for 2026-10' })).toHaveCount(confirmed ? 1 : 0);
-					await expect(page.getByRole('button', { name: 'Upgrade to pro-20x' })).toHaveCount(confirmed ? 1 : 0);
+					await expect(page.getByRole('button', { name: 'Upgrade to max' })).toHaveCount(confirmed ? 1 : 0);
 					const manage = page.getByRole('button', {
 						name: confirmed ? 'Manage billing' : 'Manage billing to resolve', exact: true
 					});

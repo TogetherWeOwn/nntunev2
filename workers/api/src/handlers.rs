@@ -542,6 +542,30 @@ pub struct VaultRow {
     pub updated_at: u64,
 }
 
+/// One `plans` row (migration 0021 as reseeded by 0026). Plan prices and
+/// quotas are data: the `GET /v1/plans` handler renders these rows, never
+/// a second hard-coded copy (the `PlanId` enum stays the parity mirror).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRow {
+    pub id: String,
+    pub price_cents: u64,
+    pub stream_hours_month: u64,
+    pub max_concurrent_streams: u64,
+}
+
+/// Owned live-slot subscription row for the billing display reads; feeds
+/// [`crate::billing::SubscriptionView`] by reference. Timestamps are Unix
+/// seconds, `None` where the DB column is NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRow {
+    pub plan_id: String,
+    pub status: String,
+    pub cancel_at_period_end: bool,
+    pub paid_through_at_unix: Option<i64>,
+    pub grace_until_unix: Option<i64>,
+    pub current_period_end_unix: Option<i64>,
+}
+
 /// Stored native REST credential (ADR 0010, migration 0019): the core
 /// [`crate::native_rest::NativeRestRecord`] (HMAC-only, never the secret)
 /// plus HTTP-layer metadata. `Clone`; manual `Debug` reuses the record's
@@ -717,6 +741,42 @@ pub trait Store {
         async move {
             let _ = (user_id, now, ingest_jobs);
             Ok(())
+        }
+    }
+    /// Every plan row, cheapest first (`billing::plans_select_statement`).
+    /// Default `Err` keeps out-of-tree `Store` impls compiling while
+    /// failing closed: a billing display must never invent plan data.
+    /// Production and the test fake override it.
+    fn plans(&self) -> impl Future<Output = Result<Vec<PlanRow>, StoreError>> {
+        async move { Err(StoreError) }
+    }
+    /// The live-slot subscription row plus whether any subscription row
+    /// ever existed (`billing::subscription_live_select_statement` +
+    /// `billing::subscription_any_select_statement`): the two reads
+    /// `billing::account_state` needs. Default `Err` fails closed like
+    /// [`Store::plans`]; production and the test fake override it.
+    fn subscription_snapshot(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<(Option<SubscriptionRow>, bool), StoreError>> {
+        async move {
+            let _ = user_id;
+            Err(StoreError)
+        }
+    }
+    /// Stream seconds metered for `(user_id, period_month)` — the monthly
+    /// `SUM` over `stream_play_ledger`
+    /// (`ledger::ledger_monthly_total_statement`), 0 when no plays are
+    /// metered. Default `Err` fails closed like [`Store::plans`];
+    /// production and the test fake override it.
+    fn stream_seconds_month(
+        &self,
+        user_id: &str,
+        period_month: &str,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async move {
+            let _ = (user_id, period_month);
+            Err(StoreError)
         }
     }
     /// Atomically reserve one of `limit` per-key slots until `now + window_secs`.
@@ -3233,6 +3293,130 @@ where
     }
 }
 
+/// `GET /v1/plans`: every plan row for pricing display. Prices/quotas are
+/// plan *data* read from the `plans` table (the one runtime source, ADR
+/// 0004); the reserved `free` row (and any unrecognised id, fail-closed)
+/// is marked non-selectable so no client offers it at checkout. Session
+/// only: the signed-out pricing page renders its static fallback mirror.
+async fn plans_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (_claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.plans().await {
+        Ok(rows) => {
+            let plans: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let selectable = crate::plan_limits::PlanId::parse_id(&row.id)
+                        .is_some_and(|plan| plan != crate::plan_limits::PlanId::Free);
+                    serde_json::json!({
+                        "id": row.id,
+                        "priceCents": row.price_cents,
+                        "streamHoursMonth": row.stream_hours_month,
+                        "maxConcurrentStreams": row.max_concurrent_streams,
+                        "selectable": selectable,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({ "plans": plans }))
+        }
+        Err(_) => internal(),
+    }
+}
+
+/// `GET /v1/me/usage`: this UTC calendar month's metered stream seconds
+/// (the ledger `SUM`, the single authority) plus the reset instant the
+/// UI must show wherever usage appears (spec §3.2). Display only —
+/// enforcement reads the same fold server-side at grant issuance.
+async fn usage_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let period = crate::ledger::period_month_for_timestamp(ctx.now);
+    match ctx
+        .store
+        .stream_seconds_month(&claims.user_id, &period)
+        .await
+    {
+        Ok(stream_seconds) => json_response(
+            200,
+            serde_json::json!({
+                "period": period,
+                "streamSecondsMonth": stream_seconds,
+                "resetsAt": crate::ledger::iso8601_utc(
+                    crate::ledger::next_month_start_unix(ctx.now) as i64
+                ),
+            }),
+        ),
+        Err(_) => internal(),
+    }
+}
+
+/// `GET /v1/me/subscription`: the caller's subscription display state.
+/// Always 200 for a session (a missing row is the `no_subscription`
+/// state, not a 404): `state` is derived server-side from the ADR 0005
+/// effective-plan predicate, `status` is the stored provider status
+/// verbatim (null when no live row), and no Stripe ids ever leave the
+/// server. Display only — the gate re-derives entitlement at grant
+/// issuance and never trusts this DTO.
+async fn subscription_get<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _token) = match ctx.authenticate(req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let (row, ever_subscribed) = match ctx.store.subscription_snapshot(&claims.user_id).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return internal(),
+    };
+    let view = row.as_ref().map(|row| crate::billing::SubscriptionView {
+        plan_id: &row.plan_id,
+        status: &row.status,
+        cancel_at_period_end: row.cancel_at_period_end,
+        paid_through_at_unix: row.paid_through_at_unix,
+        grace_until_unix: row.grace_until_unix,
+        current_period_end_unix: row.current_period_end_unix,
+    });
+    let now_unix = i64::try_from(ctx.now).unwrap_or(i64::MAX);
+    let state = crate::billing::account_state(view, ever_subscribed, now_unix);
+    json_response(
+        200,
+        serde_json::json!({
+            "state": state.as_str(),
+            "planId": row.as_ref().map(|row| row.plan_id.as_str()),
+            "status": row.as_ref().map(|row| row.status.as_str()),
+            "currentPeriodEnd": row
+                .as_ref()
+                .and_then(|row| row.current_period_end_unix)
+                .map(crate::ledger::iso8601_utc),
+            "graceUntil": row
+                .as_ref()
+                .and_then(|row| row.grace_until_unix)
+                .map(crate::ledger::iso8601_utc),
+            "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
+        }),
+    )
+}
+
 /// Failure of one [`build_provider_mint_row`] call: the OS RNG was
 /// unavailable (retryable 503), or the mint inputs were invalid (a
 /// faulty caller clock — classified downstream through
@@ -5064,6 +5248,9 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/vault/test"
             | "/v1/vault/test-connection"
             | "/v1/credentials"
+            | "/v1/plans"
+            | "/v1/me/usage"
+            | "/v1/me/subscription"
     )
 }
 
@@ -5213,6 +5400,9 @@ where
         ("POST", "/v1/session/logout") => session_logout(ctx, req).await,
         ("POST", "/v1/session/revoke-all") => session_revoke_all(ctx, req).await,
         ("GET", "/v1/vault") => vault_get(ctx, req).await,
+        ("GET", "/v1/plans") => plans_list(ctx, req).await,
+        ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
+        ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("PUT", "/v1/vault") => vault_put(ctx, req).await,
         ("DELETE", "/v1/vault") => vault_delete(ctx, req).await,
         ("POST", "/v1/vault/test") | ("POST", "/v1/vault/test-connection") => {
@@ -5450,6 +5640,17 @@ mod tests {
         /// Billing store-outage pin: when set, every billing method fails
         /// like a production query outage instead of touching state.
         fail_billing: RefCell<bool>,
+        /// Billing display reads: plan rows served verbatim, the live-slot
+        /// subscription per user, whether any subscription row ever
+        /// existed, and metered stream seconds keyed by
+        /// `(user_id, period_month)` mirroring the ledger SUM.
+        plans: RefCell<Vec<PlanRow>>,
+        subscriptions: RefCell<HashMap<String, SubscriptionRow>>,
+        ever_subscribed: RefCell<HashSet<String>>,
+        stream_seconds: RefCell<HashMap<(String, String), u64>>,
+        /// Billing-read outage pin: the three display reads fail like a
+        /// production query error (generic 500, never invented data).
+        fail_billing_reads: RefCell<bool>,
     }
 
     impl Store for FakeStore {
@@ -5647,6 +5848,39 @@ mod tests {
                 .or_insert(0);
             *slot = (*slot).max(ingest_jobs);
             Ok(())
+        }
+        async fn plans(&self) -> Result<Vec<PlanRow>, StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self.plans.borrow().clone())
+        }
+        async fn subscription_snapshot(
+            &self,
+            user_id: &str,
+        ) -> Result<(Option<SubscriptionRow>, bool), StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok((
+                self.subscriptions.borrow().get(user_id).cloned(),
+                self.ever_subscribed.borrow().contains(user_id),
+            ))
+        }
+        async fn stream_seconds_month(
+            &self,
+            user_id: &str,
+            period_month: &str,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_billing_reads.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .stream_seconds
+                .borrow()
+                .get(&(user_id.to_string(), period_month.to_string()))
+                .copied()
+                .unwrap_or(0))
         }
         async fn reserve_rate_limit(
             &self,
@@ -9180,6 +9414,182 @@ mod tests {
             Some(format!("Bearer ntk_{}", "0".repeat(43))),
         );
         assert_eq!(resp.status, 401, "{}", resp.body);
+    }
+
+    // --- Billing/usage display reads (TWO-1675) ------------------------------
+    //
+    // NOW is 2023-11-14T22:13:20Z, so the usage period is `2023-11` and the
+    // reset instant is 2023-12-01T00:00:00Z.
+
+    fn seed_plans(h: &Harness) {
+        *h.store.plans.borrow_mut() = vec![
+            PlanRow {
+                id: "free".to_string(),
+                price_cents: 0,
+                stream_hours_month: 0,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "plus".to_string(),
+                price_cents: 800,
+                stream_hours_month: 100,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "pro".to_string(),
+                price_cents: 1500,
+                stream_hours_month: 300,
+                max_concurrent_streams: 1,
+            },
+            PlanRow {
+                id: "max".to_string(),
+                price_cents: 2500,
+                stream_hours_month: 750,
+                max_concurrent_streams: 1,
+            },
+        ];
+    }
+
+    fn billing_get(h: &Harness, path: &str, cookie: Option<String>) -> Response {
+        h.call_full("GET", path, None, cookie, Some(ORIGIN))
+    }
+
+    #[test]
+    fn billing_reads_require_a_session() {
+        let h = harness();
+        seed_plans(&h);
+        for path in ["/v1/plans", "/v1/me/usage", "/v1/me/subscription"] {
+            // No cookie: the generic session 401, never plan/account data.
+            let resp = billing_get(&h, path, None);
+            assert_eq!(resp.status, 401, "{path}: {}", resp.body);
+            assert!(!resp.body.contains("plus"), "{path} leaked plan data");
+            // A native-REST bearer is not a session (scope map: these reads
+            // are SessionOnly): still the generic 401, never rescued.
+            let resp = h.call_bearer("GET", path, Some(format!("Bearer ntk_{}", "0".repeat(43))));
+            assert_eq!(resp.status, 401, "{path} bearer: {}", resp.body);
+        }
+    }
+
+    #[test]
+    fn plans_list_renders_rows_with_free_non_selectable() {
+        let h = harness();
+        seed_plans(&h);
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        let resp = billing_get(&h, "/v1/plans", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"plans": [
+                {"id": "free", "priceCents": 0, "streamHoursMonth": 0, "maxConcurrentStreams": 1, "selectable": false},
+                {"id": "plus", "priceCents": 800, "streamHoursMonth": 100, "maxConcurrentStreams": 1, "selectable": true},
+                {"id": "pro", "priceCents": 1500, "streamHoursMonth": 300, "maxConcurrentStreams": 1, "selectable": true},
+                {"id": "max", "priceCents": 2500, "streamHoursMonth": 750, "maxConcurrentStreams": 1, "selectable": true},
+            ]})
+        );
+    }
+
+    #[test]
+    fn usage_get_reports_the_ledger_fold_and_reset_instant() {
+        let h = harness();
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        // No metered plays yet: zeros, never an error or a missing field.
+        let resp = billing_get(&h, "/v1/me/usage", Some(cookie.clone()));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            resp.body,
+            r#"{"period":"2023-11","resetsAt":"2023-12-01T00:00:00Z","streamSecondsMonth":0}"#
+        );
+        // The folded seconds for *this* period only: last month's plays do
+        // not leak into the current period's figure.
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("u-1".to_string(), "2023-11".to_string()), 90 * 3600);
+        h.store
+            .stream_seconds
+            .borrow_mut()
+            .insert(("u-1".to_string(), "2023-10".to_string()), 999 * 3600);
+        let resp = billing_get(&h, "/v1/me/usage", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["streamSecondsMonth"], 90 * 3600);
+        assert_eq!(body["resetsAt"], "2023-12-01T00:00:00Z");
+    }
+
+    #[test]
+    fn subscription_get_names_never_active_and_lapsed_states() {
+        let h = harness();
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        // Never subscribed: 200 with the explicit state, nulls elsewhere —
+        // a missing row is a state, not a 404.
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "state": "no_subscription",
+                "planId": null,
+                "status": null,
+                "currentPeriodEnd": null,
+                "graceUntil": null,
+                "cancelAtPeriodEnd": false,
+            })
+        );
+        // Terminal-only history (canceled released the live slot): lapsed.
+        h.store
+            .ever_subscribed
+            .borrow_mut()
+            .insert("u-1".to_string());
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["state"], "lapsed");
+        assert_eq!(body["planId"], serde_json::Value::Null);
+        // Live paid coverage: active, stored status verbatim, ISO dates,
+        // and no provider ids anywhere in the body.
+        h.store.subscriptions.borrow_mut().insert(
+            "u-1".to_string(),
+            SubscriptionRow {
+                plan_id: "pro".to_string(),
+                status: "active".to_string(),
+                cancel_at_period_end: true,
+                paid_through_at_unix: Some(NOW as i64 + 86_400),
+                grace_until_unix: None,
+                current_period_end_unix: Some(NOW as i64 + 86_400),
+            },
+        );
+        let resp = billing_get(&h, "/v1/me/subscription", Some(cookie));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "state": "active",
+                "planId": "pro",
+                "status": "active",
+                "currentPeriodEnd": "2023-11-15T22:13:20Z",
+                "graceUntil": null,
+                "cancelAtPeriodEnd": true,
+            })
+        );
+        assert!(!resp.body.contains("stripe"));
+    }
+
+    #[test]
+    fn billing_reads_fail_closed_on_store_error() {
+        let h = harness();
+        seed_plans(&h);
+        seed_user(&h, "u-1", "listener@example.com");
+        let cookie = magic_login(&h, "listener@example.com");
+        *h.store.fail_billing_reads.borrow_mut() = true;
+        for path in ["/v1/plans", "/v1/me/usage", "/v1/me/subscription"] {
+            let resp = billing_get(&h, path, Some(cookie.clone()));
+            assert_eq!(resp.status, 500, "{path}: {}", resp.body);
+        }
     }
 
     #[test]

@@ -33,23 +33,20 @@ const PLAN = {
 	priceCents: 1200,
 	streamHoursMonth: 100,
 	maxConcurrentStreams: 2,
-	maxLibraryTracks: 5000,
-	ingestJobsDay: 20,
-	cachePriority: 'standard'
+	selectable: true
 };
 const USAGE = {
 	period: '2026-10',
 	streamSecondsMonth: 3661,
-	concurrentNow: 1,
-	libraryTracks: 42,
-	ingestToday: 3
+	resetsAt: '2026-11-01T00:00:00Z'
 };
 const SUBSCRIPTION = {
+	state: 'active',
 	planId: 'plus',
 	status: 'active',
 	currentPeriodEnd: '2026-11-01T00:00:00Z',
-	trialEndsAt: null,
-	graceUntil: null
+	graceUntil: null,
+	cancelAtPeriodEnd: false
 };
 
 interface Operation {

@@ -16,6 +16,7 @@ export const KNOWN_ERROR_CODES = new Set([
 	'reauth_required',
 	'provider_auth_expired',
 	'plan_limit_exceeded',
+	'subscription_required',
 	'forbidden',
 	'not_found',
 	'conflict',

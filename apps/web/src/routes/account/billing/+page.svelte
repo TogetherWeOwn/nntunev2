@@ -3,6 +3,11 @@
 	import { invalidateAll } from '$app/navigation';
 	import { BillingApiError } from '#lib/billing/billingClient.js';
 	import { getPlan } from '#lib/billing/plans.js';
+	import { formatResetInstant } from '#lib/billing/usage.js';
+	import {
+		markUsageWarningsShown,
+		pendingUsageWarnings
+	} from '#lib/billing/usageWarnings.js';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -11,18 +16,30 @@
 	// so the page can never promote an unknown state to a paid tier.
 	const plan = $derived(getPlan(data.planId) ?? getPlan('free')!);
 	// A lapsed subscriber still owns their plan: name it with its status
-	// instead of printing "Free trial" above a past_due line. The
+	// instead of printing "No plan" above a past_due line. The
 	// "couldn't confirm" wording is reserved for no-subscription-at-all.
 	const headingPlan = $derived(
 		!data.planUnknown || data.signedOut
 			? plan
-			: data.subscription
+			: data.subscription?.planId
 				? (getPlan(data.subscription.planId) ?? plan)
 				: plan
 	);
 	// usageStatus is null unless the plan is confirmed AND usage loaded: no
 	// usage-vs-cap alert or upgrade button is rendered otherwise.
 	const status = $derived(data.usageStatus);
+
+	// 80% / 95% warnings fire once per threshold per month (spec §3.2):
+	// pending thresholds are read from localStorage, the highest is shown,
+	// and all of them are marked shown so a lower one never fires late.
+	let warningThreshold = $state<number | null>(null);
+	$effect(() => {
+		if (!data.usage || !status) return;
+		const pending = pendingUsageWarnings(data.usage.period, status.streamFraction);
+		if (pending.length === 0) return;
+		warningThreshold = pending[pending.length - 1];
+		markUsageWarningsShown(data.usage.period, pending);
+	});
 
 	let actionError: string | null = $state(null);
 	let busy: 'checkout' | 'portal' | null = $state(null);
@@ -89,7 +106,7 @@
 	{/if}
 
 	{#if data.planUnknown && !data.signedOut}
-		<p role="status">We couldn&apos;t confirm your plan — showing trial defaults.</p>
+		<p role="status">We couldn&apos;t confirm an active plan — showing no-plan defaults.</p>
 	{/if}
 
 	{#if data.signedOut}
@@ -102,14 +119,14 @@
 
 	<section aria-labelledby="plan">
 		<h2 id="plan">Current plan: {headingPlan.name}</h2>
-		{#if data.subscription}
+		{#if data.subscription?.status}
 			<p>
 				Status: {data.subscription.status}
 				{#if data.subscription.currentPeriodEnd}
 					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
 				{/if}
-				{#if data.subscription.trialEndsAt}
-					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
+				{#if data.subscription.cancelAtPeriodEnd}
+					· cancels at period end
 				{/if}
 			</p>
 		{/if}
@@ -121,6 +138,7 @@
 			<ul>
 				<li>
 					Streaming: {(data.usage.streamSecondsMonth / 3600).toFixed(1)} / {plan.streamHoursMonth} hrs
+					({Math.round(status.streamFraction * 100)}%)
 					<progress
 						aria-label="Monthly streaming usage"
 						aria-valuetext={`${(data.usage.streamSecondsMonth / 3600).toFixed(1)} of ${plan.streamHoursMonth} hours used this month`}
@@ -130,12 +148,14 @@
 						{Math.round(status.streamFraction * 100)}%
 					</progress>
 				</li>
-				<li>Concurrent streams: {data.usage.concurrentNow} / {plan.maxConcurrentStreams}</li>
-				<li>
-					Library: {data.usage.libraryTracks.toLocaleString()} / {plan.maxLibraryTracks.toLocaleString()}
-				</li>
-				<li>Ingest today: {data.usage.ingestToday} / {plan.ingestJobsDay}</li>
 			</ul>
+			<p>{formatResetInstant(data.usage.resetsAt)}</p>
+
+			{#if warningThreshold !== null}
+				<p role="status">
+					You&apos;ve crossed {warningThreshold}% of your {plan.name} listening hours this month.
+				</p>
+			{/if}
 
 			{#if status.state !== 'ok'}
 				<div role={status.state === 'hard' ? 'alert' : 'status'}>

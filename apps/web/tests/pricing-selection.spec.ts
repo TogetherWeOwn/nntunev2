@@ -164,11 +164,13 @@ function planButton(page: Page, rowName: RegExp): Locator {
 	return page.getByRole('row', { name: rowName }).getByRole('button');
 }
 
-function paidPlanButtons(page: Page): Record<'plus' | 'pro5x' | 'pro20x', Locator> {
+function paidPlanButtons(page: Page): Record<'plus' | 'pro' | 'max', Locator> {
 	return {
-		plus: planButton(page, /Plus/),
-		pro5x: planButton(page, /Pro 5x/),
-		pro20x: planButton(page, /Pro 20x/)
+		plus: planButton(page, /^Plus /),
+		// ^ anchors keep the Pro row distinct now that plan names share a
+		// prefix shape (Plus / Pro / Max) instead of the old 5x/20x names.
+		pro: planButton(page, /^Pro /),
+		max: planButton(page, /^Max /)
 	};
 }
 
@@ -207,14 +209,14 @@ test('held checkout: mouse activation of another plan issues no second request',
 	// Pending identity is on Plus, and every paid-plan action is disabled.
 	await expect(buttons.plus).toHaveText('Starting…');
 	await expect(buttons.plus).toBeDisabled();
-	await expect(buttons.pro5x, 'other paid plans disable while a selection is pending').toBeDisabled();
-	await expect(buttons.pro20x, 'other paid plans disable while a selection is pending').toBeDisabled();
-	await expect(buttons.pro5x).toHaveText('Choose');
-	await expect(buttons.pro20x).toHaveText('Choose');
+	await expect(buttons.pro, 'other paid plans disable while a selection is pending').toBeDisabled();
+	await expect(buttons.max, 'other paid plans disable while a selection is pending').toBeDisabled();
+	await expect(buttons.pro).toHaveText('Choose');
+	await expect(buttons.max).toHaveText('Choose');
 
 	// A further mouse activation must not start another checkout.
-	await buttons.pro5x.click({ force: true }).catch(() => {});
-	await buttons.pro20x.click({ force: true }).catch(() => {});
+	await buttons.pro.click({ force: true }).catch(() => {});
+	await buttons.max.click({ force: true }).catch(() => {});
 	await expectExactlyOneRequestAfterSettling(page, held.requests);
 	await expect(buttons.plus, 'pending identity stays on the first plan').toHaveText('Starting…');
 	await expect(page.getByRole('button', { name: 'Starting Plus…' })).toHaveCount(1);
@@ -237,16 +239,16 @@ test('held checkout: keyboard activation of another plan issues no second reques
 	await expect(buttons.plus).toHaveText('Starting…');
 
 	// Try to move focus to another plan and activate it from the keyboard.
-	await buttons.pro5x.evaluate((el) => (el as HTMLElement).focus());
+	await buttons.pro.evaluate((el) => (el as HTMLElement).focus());
 	await page.keyboard.press('Enter');
 	await page.keyboard.press('Space');
 
 	await expectExactlyOneRequestAfterSettling(page, held.requests);
 	expect(held.requests[0]?.body).toEqual({ planId: 'plus' });
 	await expect(buttons.plus, 'pending identity stays on the first plan').toHaveText('Starting…');
-	await expect(buttons.pro5x).toHaveText('Choose');
-	await expect(buttons.pro5x).toBeDisabled();
-	await expect(buttons.pro20x).toBeDisabled();
+	await expect(buttons.pro).toHaveText('Choose');
+	await expect(buttons.pro).toBeDisabled();
+	await expect(buttons.max).toBeDisabled();
 
 	held.release(ORDINARY_FAILURE);
 	await expect(page.getByRole('alert')).toContainText('Start checkout failed (500)');
@@ -267,7 +269,7 @@ test('held checkout: handler refuses re-entry even if a button is re-enabled pro
 
 	// Bypass the disabled attribute the way a pre-render race or a
 	// programmatic click could: the handler guard alone must serialize.
-	for (const button of [buttons.pro5x, buttons.plus]) {
+	for (const button of [buttons.pro, buttons.plus]) {
 		await button.evaluate((el) => {
 			el.removeAttribute('disabled');
 			(el as HTMLButtonElement).click();
@@ -277,7 +279,7 @@ test('held checkout: handler refuses re-entry even if a button is re-enabled pro
 	await expectExactlyOneRequestAfterSettling(page, held.requests);
 	expect(held.requests[0]?.body).toEqual({ planId: 'plus' });
 	await expect(buttons.plus, 'pending identity stays on the first plan').toHaveText('Starting…');
-	await expect(buttons.pro5x).toHaveText('Choose');
+	await expect(buttons.pro).toHaveText('Choose');
 
 	held.release(ORDINARY_FAILURE);
 	await expect(page.getByRole('alert')).toContainText('Start checkout failed (500)');
@@ -303,13 +305,13 @@ test('ordinary failure restores choices and a later different selection succeeds
 	await expectAllChoicesRestored(page);
 
 	held.setResponse(SUCCESS);
-	await buttons.pro5x.click();
+	await buttons.pro.click();
 
 	await expect(page).toHaveURL(MOCKED_CHECKOUT_URL);
 	await expect(page.getByRole('heading', { name: 'Mocked checkout' })).toBeVisible();
 	expect(held.requests).toEqual([
 		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'plus' } },
-		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'pro-5x' } }
+		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'pro' } }
 	]);
 });
 
@@ -320,12 +322,12 @@ test('successful selection navigates to the returned checkout URL with one exact
 	const stub = await stubCheckout(page, SUCCESS);
 
 	await page.goto('/pricing');
-	await paidPlanButtons(page).pro20x.click();
+	await paidPlanButtons(page).max.click();
 
 	await expect(page).toHaveURL(MOCKED_CHECKOUT_URL);
 	await expect(page.getByRole('heading', { name: 'Mocked checkout' })).toBeVisible();
 	expect(stub.requests).toEqual([
-		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'pro-20x' } }
+		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'max' } }
 	]);
 });
 
@@ -341,8 +343,8 @@ test('held checkout destination: success keeps the lock until navigation commits
 	// starts, locator and evaluate calls block on the pending navigation,
 	// but raw mouse input still reaches the still-interactive page —
 	// exactly like a real user's click in that window.
-	const pro5xBox = await buttons.pro5x.boundingBox();
-	expect(pro5xBox, 'Pro 5x button is laid out before selection').not.toBeNull();
+	const proBox = await buttons.pro.boundingBox();
+	expect(proBox, 'Pro button is laid out before selection').not.toBeNull();
 	// The destination stays held until this test releases it, and that
 	// release is sequenced after this click returns. Skip only the
 	// post-click navigation barrier; the pointer activation itself is
@@ -355,7 +357,7 @@ test('held checkout destination: success keeps the lock until navigation commits
 	// activation must not start a second checkout whose navigation
 	// would replace the first.
 	await destination.waitForArrival();
-	await page.mouse.click(pro5xBox!.x + pro5xBox!.width / 2, pro5xBox!.y + pro5xBox!.height / 2);
+	await page.mouse.click(proBox!.x + proBox!.width / 2, proBox!.y + proBox!.height / 2);
 	// Give any wrongly-issued second request a chance to arrive, then
 	// count. (A test-process delay: the page itself is mid-navigation.)
 	await new Promise((resolve) => setTimeout(resolve, 300));
@@ -396,7 +398,8 @@ test('402 selection shows the paywall, no inline alert, and restores choices', a
 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
-	await expect(dialog.getByRole('heading')).toHaveText("You've reached your plan limit");
+	// A coded plan_limit_exceeded is the at-cap surface (spec §3.3).
+	await expect(dialog.getByRole('heading')).toHaveText("You've used all your listening hours");
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	expect(stub.requests).toEqual([
 		{ method: 'POST', pathname: '/v1/billing/checkout', body: { planId: 'plus' } }

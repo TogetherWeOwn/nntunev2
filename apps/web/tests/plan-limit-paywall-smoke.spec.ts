@@ -4,9 +4,9 @@ import { expect, test, type Page } from '@playwright/test';
  * Plan-limit paywall smoke.
  *
  * Drives the pricing/upgrade CTA against mocked 402 and 429 checkout
- * responses and asserts the trial and usage links resolve to real routes
- * (no 404, no placeholder href). Runs in CI with mocked routes only —
- * no staging dependency.
+ * responses and asserts the usage link resolves to a real route (no 404,
+ * no placeholder href). Runs in CI with mocked routes only — no staging
+ * dependency.
  */
 
 const PLACEHOLDER_PATTERNS = ['placeholder', 'todo', 'example.com', 'javascript:'];
@@ -22,10 +22,11 @@ async function collectPaywallEvents(page: Page): Promise<void> {
 }
 
 async function assertPricingActionsResolve(page: Page): Promise<void> {
-	// The pricing page must always offer a way forward (trial signup,
-	// current-usage check) even when checkout itself is limit-blocked.
+	// The pricing page must always offer a way forward (the current-usage
+	// check) even when checkout itself is limit-blocked. No trial exists:
+	// there is no trial-signup link to resolve.
+	await expect(page.getByRole('link', { name: 'Start trial' })).toHaveCount(0);
 	for (const { name, expectedHref } of [
-		{ name: 'Start trial', expectedHref: '/signup?plan=free' },
 		{ name: 'Check your current usage', expectedHref: '/account/billing' }
 	]) {
 		const link = page.getByRole('link', { name, exact: true });
@@ -74,7 +75,8 @@ test('mocked 402 checkout keeps pricing actions reachable', async ({ page }) => 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
-	await expect(dialog.getByRole('heading')).toHaveText("You've reached your plan limit");
+	// A coded plan_limit_exceeded is the at-cap surface (spec §3.3).
+	await expect(dialog.getByRole('heading')).toHaveText("You've used all your listening hours");
 	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
 	expect(checkoutRequests, 'checkout mock must intercept the request').toBeGreaterThan(0);
 	await dialog.getByRole('button', { name: /not now/i }).click();

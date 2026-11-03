@@ -77,7 +77,8 @@ emit the code.
 | `unauthorized` | 401 | false | api, ingest, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
 | `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
-| `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
+| `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (monthly stream hours; the fixed daily ingest guard) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
+| `subscription_required` | 402 | false | api | Playback requires an active subscription and the account has none current. The body carries `reason`: `never_subscribed` (no subscription ever; → `/pricing`) or `lapsed` (a subscription exists but confers no entitlement; → billing portal), plus `upgrade_url`. Defined ahead of grant-issuance enforcement so clients can build the paywall states now. Browsing, search, and library remain available in both states — only playback refuses. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
@@ -246,6 +247,21 @@ dead-end error — asserted end to end by the over-limit e2e legs
 Refusal bodies stay names-only: no account, credential, or provider
 material — the e2e legs fail a refusal that echoes the capped account's
 email/session or carries credential-shaped keys.
+
+The subscription gate refuses playback (never browsing) with the same
+names-only discipline — one code plus a `reason` so clients can route
+never-subscribed listeners to pricing and lapsed subscribers to the
+billing portal (`/account/billing`) without a second code:
+
+```json
+{
+  "code": "subscription_required",
+  "message": "subscription required",
+  "retryable": false,
+  "reason": "never_subscribed",
+  "upgrade_url": "/pricing"
+}
+```
 
 ## Sources
 

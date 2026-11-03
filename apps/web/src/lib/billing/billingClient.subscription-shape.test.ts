@@ -8,11 +8,14 @@ import { BillingApiError, fetchSubscription } from './billingClient';
  *
  * Contract under test (ADR 0002 §4 and ADR 0005 status/entitlement table):
  * - Body is a plain object (never null/array/scalar).
- * - `planId` is a required non-empty string.
+ * - `state` is required and one of `no_subscription`, `active`, `lapsed`.
+ * - `planId` is null (no live row) or a non-empty string; absent rejects.
  * - All eight verbatim Stripe statuses are valid, including `unpaid`,
  *   `paused` and `incomplete_expired`. Local `expired`, unknown statuses,
- *   misspellings and non-strings reject; validation is not entitlement.
- * - `currentPeriodEnd` and `trialEndsAt` are required and are either
+ *   misspellings and non-strings reject; `status` may also be null (no
+ *   live row). Validation is not entitlement.
+ * - `cancelAtPeriodEnd` is a required boolean.
+ * - `currentPeriodEnd` is required and is either
  *   null or real ISO calendar dates / zoned timestamps. Impossible dates,
  *   loose Date.parse strings and malformed times reject, not normalize.
  * - `graceUntil` may be absent; when present it follows the same nullable
@@ -22,13 +25,24 @@ import { BillingApiError, fetchSubscription } from './billingClient';
  */
 
 const VALID = {
+	state: 'active',
 	planId: 'plus',
 	status: 'active',
 	currentPeriodEnd: '2026-11-15T12:30:00Z',
-	trialEndsAt: null
+	graceUntil: null,
+	cancelAtPeriodEnd: false
 };
 
-const DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt', 'graceUntil'] as const;
+const NO_SUBSCRIPTION = {
+	state: 'no_subscription',
+	planId: null,
+	status: null,
+	currentPeriodEnd: null,
+	graceUntil: null,
+	cancelAtPeriodEnd: false
+};
+
+const DATE_FIELDS = ['currentPeriodEnd', 'graceUntil'] as const;
 
 /** HTTP 200 with a JSON-serialized body, as a real endpoint would send. */
 function jsonOk(body: unknown): typeof fetch {
@@ -69,8 +83,22 @@ describe('fetchSubscription accepts well-formed successful payloads', () => {
 		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
 	});
 
-	it('accepts null renewal and trial dates', async () => {
-		const body = { ...VALID, currentPeriodEnd: null, trialEndsAt: null };
+	it('accepts a null renewal date', async () => {
+		const body = { ...VALID, currentPeriodEnd: null };
+		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
+	});
+
+	it('resolves a no_subscription payload with null planId and status', async () => {
+		await expect(fetchSubscription(jsonOk(NO_SUBSCRIPTION))).resolves.toEqual(NO_SUBSCRIPTION);
+	});
+
+	it.each(['no_subscription', 'active', 'lapsed'] as const)('accepts state %s', async (state) => {
+		const body = { ...VALID, state };
+		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
+	});
+
+	it.each([true, false])('accepts cancelAtPeriodEnd %s', async (cancelAtPeriodEnd) => {
+		const body = { ...VALID, cancelAtPeriodEnd };
 		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
 	});
 
@@ -93,11 +121,12 @@ describe('fetchSubscription accepts well-formed successful payloads', () => {
 
 	it('accepts ISO timestamps in every date field, including graceUntil', async () => {
 		const body = {
-			planId: 'pro-5x',
+			state: 'lapsed',
+			planId: 'pro',
 			status: 'past_due',
 			currentPeriodEnd: '2026-11-15T12:30:00.000Z',
-			trialEndsAt: '2026-10-01T00:00:00Z',
-			graceUntil: '2026-11-22T12:30:00Z'
+			graceUntil: '2026-11-22T12:30:00Z',
+			cancelAtPeriodEnd: true
 		};
 		await expect(fetchSubscription(jsonOk(body))).resolves.toEqual(body);
 	});
@@ -110,7 +139,12 @@ describe('fetchSubscription accepts well-formed successful payloads', () => {
 	});
 
 	it('allows unknown extra fields alongside the required ones', async () => {
-		const withExtra = { ...VALID, futureField: 'anything', another: { nested: true } };
+		const withExtra = {
+			...VALID,
+			trialEndsAt: null,
+			futureField: 'anything',
+			another: { nested: true }
+		};
 		const result = await fetchSubscription(jsonOk(withExtra));
 		expect(result).toMatchObject(VALID);
 	});
@@ -137,7 +171,6 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 		['mixed case', 'Active'],
 		['trailing whitespace', 'active '],
 		['empty string', ''],
-		['null', null],
 		['number', 1],
 		['boolean', true],
 		['object', { value: 'active' }],
@@ -197,7 +230,7 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 		await expectMalformedRejection(jsonOk({ ...VALID, [field]: ['2026-11-15'] }));
 	});
 
-	it.each(['planId', 'status', 'currentPeriodEnd', 'trialEndsAt'])(
+	it.each(['state', 'planId', 'status', 'currentPeriodEnd', 'cancelAtPeriodEnd'])(
 		'rejects a payload missing %s',
 		async (field) => {
 			await expectMalformedRejection(jsonOk(without(field)));
@@ -206,13 +239,35 @@ describe('fetchSubscription rejects malformed successful payloads', () => {
 
 	it.each([
 		['empty string', ''],
-		['null', null],
 		['number', 7],
 		['boolean', true],
 		['object', { id: 'plus' }],
 		['array', ['plus']]
 	])('rejects a planId that is %s', async (_label, planId) => {
 		await expectMalformedRejection(jsonOk({ ...VALID, planId }));
+	});
+
+	it.each([
+		['unknown word', 'banana'],
+		['empty string', ''],
+		['uppercase', 'ACTIVE'],
+		['a Stripe status in the state slot', 'past_due'],
+		['null', null],
+		['number', 1],
+		['object', { value: 'active' }]
+	])('rejects a state that is %s', async (_label, state) => {
+		await expectMalformedRejection(jsonOk({ ...VALID, state }));
+	});
+
+	it.each([
+		['string true', 'true'],
+		['number 1', 1],
+		['number 0', 0],
+		['null', null],
+		['object', {}],
+		['array', [false]]
+	])('rejects a cancelAtPeriodEnd that is %s', async (_label, cancelAtPeriodEnd) => {
+		await expectMalformedRejection(jsonOk({ ...VALID, cancelAtPeriodEnd }));
 	});
 
 	it('does not fabricate a free subscription for an empty object', async () => {

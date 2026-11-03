@@ -1,4 +1,5 @@
 import { KNOWN_ERROR_CODES } from '../api/errors.js';
+import { formatResetInstant } from './usage';
 
 /**
  * Plan-limit (402/429) handling: turn a limit response into a paywall model
@@ -11,9 +12,17 @@ import { KNOWN_ERROR_CODES } from '../api/errors.js';
  * - 402 -> terminal: the plan limit is exhausted for the period. The only
  *   way forward is an upgrade, so the paywall shows current usage and an
  *   upgrade CTA to `/pricing`.
+ * - 402 `subscription_required` (spec §4): playback-only gate — browsing,
+ *   search and library stay usable. `reason: never_subscribed` routes to
+ *   `/pricing`; `reason: lapsed` routes to `/account/billing` (portal).
+ * - 402 `plan_limit_exceeded` (spec §3.3): the monthly cap surface, with
+ *   the `x-plan-reset` instant when present and the upgrade path.
  * - 429 -> retryable: the same paywall, plus a retry countdown parsed from
  *   the `Retry-After` header (delta-seconds or HTTP-date). The user can wait
- *   out the countdown or upgrade immediately.
+ *   out the countdown or upgrade immediately. `x-plan-limit:
+ *   concurrent_streams` names the other-device surface (spec §3.4's
+ *   two-level truth: the other device pauses itself within ~15 s, its
+ *   next track is refused, already-delivered audio is not recalled).
  *
  * Analytics: when the paywall is displayed, `trackPaywallShown` fires the
  * event {@link PAYWALL_SHOWN_EVENT} (`usage_limit_paywall_shown`) exactly
@@ -33,17 +42,22 @@ import { KNOWN_ERROR_CODES } from '../api/errors.js';
 /** Documented analytics event fired once per paywall display. No PII. */
 export const PAYWALL_SHOWN_EVENT = 'usage_limit_paywall_shown';
 
-/** The upgrade CTA always lands on pricing; the page owns plan selection. */
+/** The upgrade CTA lands on pricing; the page owns plan selection. */
 export const PRICING_HREF = '/pricing';
+
+/** Lapsed subscriptions manage payment on the billing page (portal). */
+export const BILLING_HREF = '/account/billing';
 
 export interface PaywallModel {
 	/** `terminal` (402: upgrade is the only path) or `retryable` (429: wait or upgrade). */
 	kind: 'terminal' | 'retryable';
 	/** HTTP status that produced this model (402 or 429). */
 	status: number;
-	/** Server limit code (`plan_limit_exceeded`, `rate_limited`, ...) when the body named one. */
+	/** Server limit code (`plan_limit_exceeded`, `subscription_required`, `rate_limited`, ...) when the body named one. */
 	code: string | null;
-	ctaHref: '/pricing';
+	ctaHref: '/pricing' | '/account/billing';
+	/** CTA link text; the modal falls back to its upgrade wording when omitted. */
+	ctaLabel?: string;
 	headline: string;
 	/** Names the current usage (exact figures when the body carried them). */
 	detail: string;
@@ -110,6 +124,37 @@ function bodyCode(body: unknown): string | null {
 	const nested = pickString(asRecord(record.error) ?? {}, ['code']);
 	return nested && isKnownErrorCode(nested) ? nested : null;
 }
+
+/** One named string field from the error body (`reason`), tolerated in any shape. */
+function bodyField(body: unknown, key: string): string | null {
+	const record = asRecord(body);
+	return record ? pickString(record, [key]) : null;
+}
+
+/**
+ * At-cap detail (spec §3.3): new playback pauses until the reset instant
+ * from `x-plan-reset` (the next UTC month start) — rendered via the §3.2
+ * reset formatter — or until an upgrade; a track already playing finishes.
+ */
+function atCapDetail(headers: Headers): string {
+	const reset = formatResetInstant(headers.get('x-plan-reset'));
+	const resetClause = reset ? ` Your hours ${reset.replace(/^Resets/, 'reset')}.` : '';
+	return (
+		`New playback pauses until your hours reset or you upgrade — ` +
+		`a track already playing finishes.${resetClause}`
+	);
+}
+
+/**
+ * Other-device detail (spec §3.4, two-level truth — never promise an
+ * instant stop): the web player on the other device pauses itself within
+ * about 15 s via its heartbeat; the hard guarantee is that its next track
+ * cannot start; audio already delivered to it cannot be recalled.
+ */
+const OTHER_DEVICE_DETAIL =
+	`Give it a moment: the other device pauses itself within about 15 seconds. ` +
+	`If it can't check in, its next track can't start — audio already delivered ` +
+	`to it can't be recalled.`;
 
 /**
  * "Current usage: X of Y on the Free plan." when the body carried figures
@@ -180,20 +225,74 @@ export function formatCountdown(totalSeconds: number): string {
  * Build the paywall model for a 402/429 limit response, or null for any
  * other status (those keep their existing error handling). A limit status
  * always yields a model — never null, never a dead-end toast.
+ *
+ * The registered billing codes pick the surface (spec §4/§3.3/§3.4):
+ * `subscription_required` distinguishes never-subscribed (→ pricing) from
+ * lapsed (→ billing page / portal); `plan_limit_exceeded` is the at-cap
+ * surface; a 429 naming `concurrent_streams` is the other-device
+ * surface. Uncoded limit responses keep the generic copy.
  */
 export function toPaywallModel(res: LimitResponseLike): PaywallModel | null {
 	if (res.status !== 402 && res.status !== 429) return null;
 	const terminal = res.status === 402;
 	const retryAfterSeconds = terminal ? null : parseRetryAfter(res.headers);
-	return {
+	const code = bodyCode(res.body);
+	const base: Omit<PaywallModel, 'ctaHref' | 'headline' | 'detail'> = {
 		kind: terminal ? 'terminal' : 'retryable',
 		status: res.status,
-		code: bodyCode(res.body),
-		ctaHref: PRICING_HREF,
-		headline: terminal ? "You've reached your plan limit" : 'Please slow down a little',
-		detail: usageDetail(res.body, terminal),
+		code,
 		retryAfterSeconds,
 		countdownText: retryAfterSeconds === null ? null : formatCountdown(retryAfterSeconds)
+	};
+
+	if (code === 'subscription_required') {
+		if (bodyField(res.body, 'reason') === 'lapsed') {
+			return {
+				...base,
+				ctaHref: BILLING_HREF,
+				ctaLabel: 'Manage billing',
+				headline: 'Your subscription has lapsed',
+				detail:
+					'Playback is paused until your subscription is active again. ' +
+					'Browsing and your library are unaffected.'
+			};
+		}
+		// `never_subscribed` — and any future/unknown reason — lands on the
+		// subscribe surface: pricing is the only way forward either way.
+		return {
+			...base,
+			ctaHref: PRICING_HREF,
+			ctaLabel: 'See plans',
+			headline: 'Subscribe to start listening',
+			detail:
+				'Browsing and your library are free to use — playback needs a plan.'
+		};
+	}
+
+	if (code === 'plan_limit_exceeded') {
+		return {
+			...base,
+			ctaHref: PRICING_HREF,
+			headline: "You've used all your listening hours",
+			detail: atCapDetail(res.headers)
+		};
+	}
+
+	if (!terminal && res.headers.get('x-plan-limit') === 'concurrent_streams') {
+		return {
+			...base,
+			ctaHref: PRICING_HREF,
+			ctaLabel: 'See plans',
+			headline: 'Playing on another device',
+			detail: OTHER_DEVICE_DETAIL
+		};
+	}
+
+	return {
+		...base,
+		ctaHref: PRICING_HREF,
+		headline: terminal ? "You've reached your plan limit" : 'Please slow down a little',
+		detail: usageDetail(res.body, terminal)
 	};
 }
 

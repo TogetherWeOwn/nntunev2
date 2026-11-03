@@ -1,19 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const NOW = '2026-10-20T12:00:00Z';
-const TRIAL_END = '2026-10-21T12:00:00Z';
-
-test.beforeEach(async ({ page }) => {
-	await page.clock.setFixedTime(new Date(NOW));
-});
-
 async function mockBilling(
 	page: Page,
 	{
 		streamSecondsMonth = 0,
-		planId = 'plus',
-		status = 'active',
-		trialEndsAt = status === 'trialing' ? TRIAL_END : null,
+		planId = 'plus' as string | null,
+		status = 'active' as string | null,
+		state = status === 'active' ? 'active' : 'lapsed',
+		currentPeriodEnd = null as string | null,
 		subscriptionStatus = 200,
 		usageStatus = 200
 	} = {}
@@ -24,7 +18,14 @@ async function mockBilling(
 		route.fulfill({
 			status: subscriptionStatus,
 			contentType: 'application/json',
-			body: JSON.stringify({ planId, status, currentPeriodEnd: null, trialEndsAt })
+			body: JSON.stringify({
+				state,
+				planId,
+				status,
+				currentPeriodEnd,
+				graceUntil: null,
+				cancelAtPeriodEnd: false
+			})
 		})
 	);
 	await page.route('**/v1/me/usage', (route) =>
@@ -34,23 +35,20 @@ async function mockBilling(
 			body: JSON.stringify({
 				period: '2026-10',
 				streamSecondsMonth,
-				concurrentNow: 0,
-				libraryTracks: 0,
-				ingestToday: 0
+				resetsAt: '2026-11-01T00:00:00Z'
 			})
 		})
 	);
 }
 
-for (const { label, usedHours, capHours, planId, status = 'active' } of [
-	{ label: 'zero', usedHours: 0, capHours: 100, planId: 'plus' },
-	{ label: 'partial', usedHours: 25, capHours: 100, planId: 'plus' },
-	{ label: 'at cap', usedHours: 100, capHours: 100, planId: 'plus' },
-	{ label: 'over cap', usedHours: 125, capHours: 100, planId: 'plus' },
-	{ label: 'confirmed free trial', usedHours: 2.5, capHours: 10, planId: 'free', status: 'trialing' }
+for (const { label, usedHours, capHours } of [
+	{ label: 'zero', usedHours: 0, capHours: 100 },
+	{ label: 'partial', usedHours: 25, capHours: 100 },
+	{ label: 'at cap', usedHours: 100, capHours: 100 },
+	{ label: 'over cap', usedHours: 125, capHours: 100 }
 ]) {
 	test(`monthly streaming meter exposes its name and hours for ${label} usage`, async ({ page }) => {
-		await mockBilling(page, { streamSecondsMonth: usedHours * 3600, planId, status });
+		await mockBilling(page, { streamSecondsMonth: usedHours * 3600 });
 		await page.goto('/account/billing');
 
 		const meter = page.getByRole('progressbar', { name: 'Monthly streaming usage', exact: true });
@@ -67,6 +65,7 @@ for (const { label, usedHours, capHours, planId, status = 'active' } of [
 		await expect(page.getByRole('listitem').filter({ has: meter })).toContainText(
 			`Streaming: ${usedHours.toFixed(1)} / ${capHours} hrs`
 		);
+		await expect(page.locator('main')).toContainText('Resets 1 Nov, 00:00 UTC');
 	});
 }
 
@@ -79,12 +78,12 @@ for (const { label, options, notice } of [
 	{
 		label: 'unconfirmed subscription',
 		options: { subscriptionStatus: 503 },
-		notice: "We couldn't confirm your plan"
+		notice: "We couldn't confirm an active plan"
 	},
 	{
 		label: 'unknown plan',
 		options: { planId: 'unknown-plan' },
-		notice: "We couldn't confirm your plan"
+		notice: "We couldn't confirm an active plan"
 	},
 	{
 		label: 'paused subscription',
@@ -92,23 +91,23 @@ for (const { label, options, notice } of [
 		notice: 'Subscription is paused'
 	},
 	{
-		label: 'active free plan without a confirmed trial',
+		label: 'active free plan (reserved row never entitled)',
 		options: { planId: 'free' },
-		notice: 'Your trial has ended or could not be confirmed'
+		notice: 'Subscription is active'
 	},
 	{
-		label: 'trial at its deadline',
-		options: { planId: 'free', status: 'trialing', trialEndsAt: NOW },
-		notice: 'Your trial has ended or could not be confirmed'
+		label: 'never subscribed',
+		options: { planId: null, status: null, state: 'no_subscription' },
+		notice: "You don't have a subscription yet"
 	},
 	{
-		label: 'trial without a deadline',
-		options: { planId: 'free', status: 'trialing', trialEndsAt: null },
-		notice: 'Your trial has ended or could not be confirmed'
+		label: 'legacy stored trialing (folds to lapsed)',
+		options: { status: 'trialing' },
+		notice: 'Subscription is trialing'
 	},
 	{
-		label: 'trial with an invalid deadline',
-		options: { planId: 'free', status: 'trialing', trialEndsAt: 'not-a-date' },
+		label: 'malformed subscription payload',
+		options: { currentPeriodEnd: 'not-a-date' },
 		notice: 'Could not load your subscription'
 	},
 	{

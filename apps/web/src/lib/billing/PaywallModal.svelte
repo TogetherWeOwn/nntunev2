@@ -180,7 +180,7 @@
 	<p class="paywall-announcement" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
 
 	<div class="paywall-actions">
-		<a class="nt-button" href={model.ctaHref} onclick={upgrade}>Upgrade your plan</a>
+		<a class="nt-button" href={model.ctaHref} onclick={upgrade}>{model.ctaLabel ?? 'Upgrade your plan'}</a>
 		{#if model.kind === 'retryable'}
 			<button type="button" class="nt-button nt-button--ghost" onclick={retry}
 				disabled={remaining !== null && remaining > 0}>Retry</button>

@@ -484,6 +484,11 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/me" || path == "/v1/indexers" || path == "/v1/vault" {
                 return SessionOnly;
             }
+            // Billing/usage display reads: session-only like checkout —
+            // API keys never see plan, usage, or subscription state.
+            if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
+                return SessionOnly;
+            }
             if path == "/v1/credentials" {
                 return SessionOnly;
             }
