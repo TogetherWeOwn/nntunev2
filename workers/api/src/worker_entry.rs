@@ -1027,7 +1027,10 @@ async fn prune_expired_challenges_on(
 /// second then re-reads its actor role as `member` and applies
 /// nothing. The actor row lock additionally fences against any other
 /// writer of the actor's role until commit. A missing subject writes
-/// and audits nothing.
+/// and audits nothing, and so does a subject scheduled for deletion:
+/// ADR 0002 rule 3 fences every writer once `deleting_at` is set, and
+/// a role granted here would stay effective (the admin guard reads
+/// the role fresh per request) until erasure.
 async fn admin_set_user_role_on(
     client: &mut tokio_postgres::Client,
     actor_user_id: &str,
@@ -1063,7 +1066,8 @@ async fn admin_set_user_role_on(
     }
     let locked = transaction
         .query_typed(
-            "SELECT role FROM users WHERE id = $1 FOR UPDATE",
+            "SELECT role, deleting_at IS NOT NULL AS deleting \
+             FROM users WHERE id = $1 FOR UPDATE",
             &[(&subject_user_id, Type::TEXT)],
         )
         .await
@@ -1078,6 +1082,15 @@ async fn admin_set_user_role_on(
     else {
         return Ok(AdminWriteOutcome::SubjectMissing);
     };
+    // The fence is read under the subject row lock, so a deletion
+    // scheduled concurrently either committed first (and is seen
+    // here) or waits behind this transaction.
+    if locked[0]
+        .try_get::<_, bool>("deleting")
+        .map_err(|_| StoreError)?
+    {
+        return Ok(AdminWriteOutcome::AccountDeleting);
+    }
     transaction
         .query_typed(
             "UPDATE users SET role = $2 WHERE id = $1",

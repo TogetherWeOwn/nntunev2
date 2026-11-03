@@ -363,13 +363,19 @@ Run in one transaction (replace the email; epoch seconds for `at`):
 BEGIN;
 -- Precondition: exactly one row, currently a member.
 SELECT id, role FROM users WHERE email = '<owner-email>';
-UPDATE users SET role = 'admin'
-WHERE email = '<owner-email>' AND role = 'member';
--- Exactly one row must have updated; otherwise ROLLBACK and investigate.
+-- The audit insert reads from the promotion itself, so no promotion
+-- (zero rows updated: already an admin, or no such account) means no
+-- audit row — the log can never record a change that did not happen.
+-- Exactly one row must be inserted; otherwise ROLLBACK and investigate.
+WITH promoted AS (
+  UPDATE users SET role = 'admin'
+  WHERE email = '<owner-email>' AND role = 'member'
+  RETURNING id
+)
 INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details)
 SELECT id, 'user.role_changed', TRUE, 'ops-bootstrap', <epoch-seconds>, id,
        jsonb_build_object('old', 'member', 'new', 'admin', 'via', 'ops-bootstrap')
-FROM users WHERE email = '<owner-email>';
+FROM promoted;
 COMMIT;
 ```
 

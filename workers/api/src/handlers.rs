@@ -155,11 +155,17 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
 /// are owned by the deletion executor, and their `delete_operations`
 /// row's `ON DELETE RESTRICT` FK would otherwise abort the whole reap
-/// (`FakeStore` mirrors this through `deleting_users`).
+/// (`FakeStore` mirrors this through `deleting_users`). Admin accounts
+/// are exempt too: a promoted stub (the operator bootstrap promotes an
+/// existing account, which may hold no credential, session, vault or
+/// live proof yet) is never unverified-signup garbage, and reaping it
+/// would silently delete an admin (`FakeStore` mirrors this through
+/// `user_roles`).
 fn unverified_user_filter() -> String {
     format!(
         "created_at <= $1 \
          AND deleting_at IS NULL \
+         AND users.role = '{member}' \
          AND ($2::TEXT IS NULL OR users.id <> $2) \
          AND NOT EXISTS (SELECT 1 FROM webauthn_credentials \
                          WHERE webauthn_credentials.user_id = users.id) \
@@ -173,7 +179,8 @@ fn unverified_user_filter() -> String {
                          WHERE sessions.user_id = users.id) \
          AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
                          WHERE magic_link_tokens.user_id = users.id \
-                           AND magic_link_tokens.expires_at > $3)"
+                           AND magic_link_tokens.expires_at > $3)",
+        member = crate::admin::ROLE_MEMBER
     )
 }
 
@@ -456,6 +463,11 @@ pub enum AdminWriteOutcome {
     /// re-read their role; nothing was written or audited. The handler
     /// answers the plain 404, as for any non-admin caller.
     ActorNotAdmin,
+    /// The subject's account is scheduled for deletion (`deleting_at`
+    /// set; role writes only). ADR 0002 rule 3 fences every writer
+    /// from that moment, so nothing was written or audited; the
+    /// handler answers the typed `account_deleting` 409.
+    AccountDeleting,
 }
 
 impl From<auth::AuthError> for StoreError {
@@ -4163,6 +4175,9 @@ where
         Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
             return not_found();
         }
+        // A settings write has no subject user, so a store reporting
+        // the role-write fence here is broken, never a client answer.
+        Ok(AdminWriteOutcome::AccountDeleting) => return internal(),
         Err(_) => return internal(),
     };
     // The previous value is reported at its effective resolution: no
@@ -4233,6 +4248,11 @@ where
         // both are the plain 404.
         Ok(AdminWriteOutcome::ActorNotAdmin | AdminWriteOutcome::SubjectMissing) => {
             return not_found();
+        }
+        // The subject is scheduled for deletion: ADR 0002 rule 3
+        // fences the write, answered with the typed 409.
+        Ok(AdminWriteOutcome::AccountDeleting) => {
+            return account_deleting_response();
         }
         Err(_) => return internal(),
     };
@@ -4952,10 +4972,18 @@ mod tests {
                 .filter(|record| record.expires_at > now)
                 .map(|record| record.user_id.clone())
                 .collect();
+            let admins: HashSet<String> = self
+                .user_roles
+                .borrow()
+                .iter()
+                .filter(|(_, role)| crate::admin::is_admin_role(Some(role)))
+                .map(|(id, _)| id.clone())
+                .collect();
             let deleting_users = self.deleting_users.borrow();
             self.users.borrow_mut().retain(|_, user| {
                 user.created_at > cutoff
                     || deleting_users.contains(&user.id)
+                    || admins.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
                     || vault_owners.contains(&user.id)
@@ -5398,6 +5426,11 @@ mod tests {
             }
             if !self.users.borrow().contains_key(subject_user_id) {
                 return Ok(AdminWriteOutcome::SubjectMissing);
+            }
+            // Mirror the production fence: a subject scheduled for
+            // deletion takes no role write (and no audit row).
+            if self.deleting_users.borrow().contains(subject_user_id) {
+                return Ok(AdminWriteOutcome::AccountDeleting);
             }
             let previous = self
                 .user_roles
@@ -8486,6 +8519,41 @@ mod tests {
     }
 
     #[test]
+    fn admin_role_write_on_a_deleting_subject_is_fenced() {
+        // ADR 0002 rule 3 fences every writer once `deleting_at` is
+        // set, and the admin role write is not exempt: a grant would
+        // stay effective (roles are read fresh per request) until
+        // erasure. The fenced write answers the typed
+        // `account_deleting` 409 and writes/audits nothing.
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let admin_cookie = seed_admin(&h, "admin1", "admin@example.com");
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("member1".to_string());
+        let audits_before = h.store.audits.borrow().len();
+
+        let fenced = h.call_full(
+            "PUT",
+            "/v1/admin/users/member1/role",
+            Some(serde_json::json!({"role": "admin"}).to_string()),
+            Some(admin_cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(fenced.status, 409, "{}", fenced.body);
+        assert_eq!(
+            fenced.body,
+            r#"{"code":"account_deleting","message":"account is being deleted","retryable":false}"#
+        );
+        assert_eq!(
+            block_on(h.store.user_role("member1")).unwrap().as_deref(),
+            Some("member")
+        );
+        assert_eq!(h.store.audits.borrow().len(), audits_before);
+    }
+
+    #[test]
     fn bearer_gate_enforces_scope_without_session_fallback() {
         let h = peppered_harness();
         seed_user(&h, "u1", "a@example.com");
@@ -10981,6 +11049,7 @@ mod tests {
             ("resumed", "resume@example.com"),
             ("active", "active@example.com"),
             ("deleting", "deleting@example.com"),
+            ("admin-stub", "admin-stub@example.com"),
             ("abandoned", "abandoned@example.com"),
         ] {
             block_on(h.store.insert_user(&UserRecord {
@@ -11004,6 +11073,13 @@ mod tests {
             .deleting_users
             .borrow_mut()
             .insert("deleting".to_string());
+        // A promoted stub account (admin role, but no credential,
+        // session, vault or live proof) is never unverified-signup
+        // garbage: reaping it would delete an admin.
+        h.store.user_roles.borrow_mut().insert(
+            "admin-stub".to_string(),
+            crate::admin::ROLE_ADMIN.to_string(),
+        );
 
         let resp = h.call(
             "POST",
@@ -11020,6 +11096,12 @@ mod tests {
         assert!(block_on(h.store.user_by_email("deleting@example.com"))
             .unwrap()
             .is_some());
+        assert!(
+            block_on(h.store.user_by_email("admin-stub@example.com"))
+                .unwrap()
+                .is_some(),
+            "an admin account must survive the unverified-user reaper"
+        );
         assert!(block_on(h.store.user_by_email("abandoned@example.com"))
             .unwrap()
             .is_none());
@@ -11043,6 +11125,10 @@ mod tests {
             sql.contains("deleting_at IS NULL"),
             "reap must never delete an account already scheduled for \
              deletion (its delete_operations RESTRICT FK owns it)"
+        );
+        assert!(
+            sql.contains("users.role = 'member'"),
+            "reap must never delete an admin account, however stub-like"
         );
         assert!(sql.contains("auth_challenges.purpose = 'register'"));
         assert!(sql.contains("auth_challenges.expires_at > $3"));

@@ -1575,6 +1575,141 @@ fn postgres_admin_role_change_audits_each_replaced_value() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_reap_preserves_admin_stub_accounts() {
+    run_test(async {
+        let mut cleanup = connect().await;
+        let mut other_rows = connect().await;
+        let isolation = other_rows
+            .transaction()
+            .await
+            .expect("isolate prior fixtures");
+        isolation
+            .query("SELECT id FROM users FOR UPDATE SKIP LOCKED", &[])
+            .await
+            .expect("protect prior disposable fixtures from this case");
+
+        // Two aged stubs with no credential, session, vault or live
+        // proof: identical but for the role. Only the member is
+        // unverified-signup garbage; the admin (e.g. an operator
+        // bootstrap promotion that never completed enrollment) must
+        // survive the production reaper.
+        let prefix = format!("reap-role-{:016x}", rand::random::<u64>());
+        let member_id = format!("{prefix}-member");
+        let admin_id = format!("{prefix}-admin");
+        for (id, role) in [(&member_id, "member"), (&admin_id, "admin")] {
+            cleanup
+                .execute(
+                    "INSERT INTO users (id, email, created_at, role) VALUES ($1, $2, $3, $4)",
+                    &[
+                        id,
+                        &format!("{id}@example.com"),
+                        &((NOW - 2 * REAP_TTL) as i64),
+                        &role,
+                    ],
+                )
+                .await
+                .expect("seed aged stub user");
+        }
+
+        reap_unverified_users_on(&mut cleanup, REAP_NOW, REAP_TTL, None)
+            .await
+            .expect("run the real reaper");
+        assert_eq!(
+            user_count(&cleanup, &member_id).await,
+            0,
+            "the aged member stub must be reaped"
+        );
+        assert_eq!(
+            user_count(&cleanup, &admin_id).await,
+            1,
+            "the aged admin stub must survive the reaper"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_role_change_on_a_deleting_subject_writes_nothing() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, subject) = seed_admin_test_users(&client).await;
+        client
+            .execute(
+                "UPDATE users SET deleting_at = now() WHERE id = $1",
+                &[&subject],
+            )
+            .await
+            .expect("schedule the subject for deletion");
+
+        // ADR 0002 rule 3 fences the write once `deleting_at` is set:
+        // the distinct outcome comes back, the role is untouched and
+        // no audit row claims a change that never happened.
+        let outcome =
+            admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
+                .await
+                .expect("a deleting subject is not a store error");
+        assert_eq!(outcome, AdminWriteOutcome::AccountDeleting);
+        assert_eq!(role_of(&client, &subject).await, "member");
+        assert!(role_audit_chain(&client, &subject).await.is_empty());
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_role_change_rolls_back_when_the_audit_insert_fails() {
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, subject) = seed_admin_test_users(&client).await;
+
+        // Force every audit insert naming this test's subject to fail.
+        // The names and the WHEN clause are scoped to the test's random
+        // subject id, so a concurrent test's audit rows are untouched.
+        let tag = format!("{:016x}", rand::random::<u64>());
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION reject_audit_{tag}() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN \
+                 RAISE EXCEPTION 'forced audit failure'; END $$; \
+                 CREATE TRIGGER reject_audit_{tag} BEFORE INSERT ON audit_log \
+                 FOR EACH ROW WHEN (NEW.subject_user_id = '{subject}') \
+                 EXECUTE FUNCTION reject_audit_{tag}()"
+            ))
+            .await
+            .expect("install the audit-rejecting trigger");
+
+        // The role UPDATE and its audit row commit together or not at
+        // all: the failed insert aborts the transaction, so the write
+        // errors and the stored role is the pre-write value.
+        let outcome =
+            admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
+                .await;
+        assert!(
+            outcome.is_err(),
+            "a failed audit insert must fail the whole write"
+        );
+        assert_eq!(role_of(&client, &subject).await, "member");
+        assert!(role_audit_chain(&client, &subject).await.is_empty());
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER reject_audit_{tag} ON audit_log; \
+                 DROP FUNCTION reject_audit_{tag}()"
+            ))
+            .await
+            .expect("remove the audit-rejecting trigger");
+        let outcome =
+            admin_set_user_role_on(&mut client, &actor, &subject, "admin", "198.51.100.9", NOW)
+                .await
+                .expect("the same write succeeds once the trigger is gone");
+        assert_eq!(
+            outcome,
+            AdminWriteOutcome::Applied(Some("member".to_string()))
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value() {
     run_test(async {
         let holder = connect().await;
