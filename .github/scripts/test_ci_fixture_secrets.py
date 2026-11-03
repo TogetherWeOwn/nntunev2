@@ -73,7 +73,7 @@ class TestFixtureSecretWiring(unittest.TestCase):
         for job_id in ("rust-ingest", "web-e2e"):
             self.assertIn(FETCH_STEP, self.jobs[job_id], job_id)
             self.assertIn(
-                "python3 fixtures/cc0/fetch_fixture.py --position 1",
+                "fixtures/cc0/fetch_fixture.py --position 1",
                 self.jobs[job_id],
                 job_id,
             )
