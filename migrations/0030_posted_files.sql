@@ -1,4 +1,4 @@
--- NNTune v2 migration 0028: two-spool posted-file ledger (TWO-1768).
+-- NNTune v2 migration 0030: two-spool posted-file ledger (TWO-1768).
 --
 -- One content-global row per tagged plaintext sha256, recording the
 -- first-spool post and the second-spool (stage B2.5) verification state.
