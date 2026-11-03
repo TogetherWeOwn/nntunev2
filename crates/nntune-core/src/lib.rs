@@ -16,7 +16,9 @@
 //! - [`yenc`]: yEnc encode/decode with an explicit SIMD fast path (x86_64 SSE2,
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
+//! - [`nzb_writer`]: NZB emit side used by the poster (output always parses).
 //! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
+//! - [`encrypt`]: encrypt-on-write for the rclone-crypt layout.
 //! - [`par2`]: PAR2 recovery-set parsing and verification, plus the creator
 //!   (GF(2^16) Reed-Solomon, one set per file at 10%). Repair is native-only
 //!   (it shells out to `par2cmdline-turbo` in a Container).
@@ -33,9 +35,11 @@
 
 pub mod article;
 pub mod decrypt;
+pub mod encrypt;
 pub mod error;
 pub mod nntp;
 pub mod nzb;
+pub mod nzb_writer;
 pub mod par2;
 pub mod pinned_transport;
 pub mod rng;
