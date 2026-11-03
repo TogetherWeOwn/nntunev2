@@ -22,11 +22,45 @@
   (`period DATE`, `ingest_jobs`, `UNIQUE (user_id, period)`); a later slice folds these windows
   into that daily aggregate. The distinct name keeps the future daily `CREATE TABLE IF NOT
   EXISTS usage_ledger` from colliding.
+- **Revised:** 2026-11-03 — post-BYOP alignment; see the revision section
+  directly below. Where the original text conflicts with it, the revision,
+  [ADR 0013](0013-shared-popularity-cache.md) and
+  [ADR 0014](0014-backend-provider-pool.md) win.
 - **Baseline inspected:** main `553902652cc8f5bea149c3a1bfbc55725ce5f757`
   (includes `migrations/0001_mb_mirror.sql`, `0002_auth_vault.sql` and
   `0003_library.sql` via #28 plus `workers/api/src/library.rs` playlist
   statements). Auth, ingest, core, scaffold and MB work are merged,
   not in-flight assumptions.
+
+## Revision 2026-11-03 — post-BYOP alignment
+
+Users no longer bring providers or NZBs. There is one shared, curated
+catalogue: an admin ingests content, NNTP fetching uses service backend
+accounts (ADR 0014), and the cache is one shared popularity cache
+(ADR 0013). Every per-user provider/source/grant construction below was
+designed to prove *a user's own provider* fetched the bytes; that premise
+is gone. This section is normative for target behaviour. Applied migrations
+are unchanged — every change here lands as a forward migration, and stored
+user credentials are purged, never migrated into the pool.
+
+| Original (BYOP-era) model | Target after this revision |
+|---|---|
+| `provider_vaults` (one envelope row per user) and additive per-user `providers` rows | Retired. Replaced by `pool_providers` (ADR 0014 registry: `id`, `label`, `host`, `port`, `tls`, `username`, `secret_ref`, `can_read`, `can_post`, `max_connections`, `backbone`, `tier`, `enabled`); the envelope crypto of rule 1 and ADR 0008 homes pool rows with the pool account id as AAD owner. Ingest/stream attribution `provider_id` re-points at `pool_providers.id`. |
+| Per-user `indexers` rows (user-supplied Newznab URL + key) | Retired as user data. No user supplies an indexer URL or key; any indexer use is service/admin configuration under the admin-ingest SSRF boundary. |
+| `user_cache_grants` + own-provider byte proof (rules 3 and 6, sweep/GC grant steps, the `(user_id, provider_id)` FK discipline) | Retired (ADR 0013). Serving authorization is: authenticated caller, active entitlement, track available in the shared catalogue. Cache presence is never authorization; ADR 0013's no-oracle and publication/sweep rules still bind. |
+| Per-user `track_media` (`user_id` in the PK, per-user bad-match isolation) | Global: one curated track → content-hash mapping per track, published by the service (ingest verification or ADR 0013 cache fill). A bad admin match is corrected for everyone by republishing — the deliberate trade recorded in ADR 0013. |
+| Per-user `track_sources` (PK `(user_id, track_id)`, retained only while that user holds library/playlist references) | Curated source: one service-owned source per track (PK `(track_id)`), written by admin ingest. Retention follows catalogue lifecycle, not any user's membership; removing a track from libraries/playlists never deletes it. The encrypted NZB/manifest payload and envelope rules are unchanged. |
+| `plans.cache_bytes_budget`, `cache_retention_days`, `cache_priority`; the per-user `cache_bytes` gauge (rule 3, ADR 0004) | Retired. One global gauge against ADR 0013's `popcache.cap_bytes`; columns dropped once no reader remains. |
+| Rule 3 writers: user-scoped `ingest_jobs` accept; stream worker publishing per-user media/grants "after full own-provider fetch" | Ingest is admin-initiated (`ingest_jobs.user_id` records the acting admin; per-user ingest caps are flagged in ADR 0004, not redesigned here). The stream worker publishes no per-user rows: on a cache miss it fetches through the pool, and ADR 0013 fills publish the global mapping asynchronously. Eviction deletes mappings/objects per ADR 0013, never sources. |
+| Rule 3 deletion / §6 predicates keyed on own source, own grants, own media (both-counts-zero source cleanup, grant batches, "own source proves the caller's import", playlist source predicate, restore via retained own source + own-provider rebuild, local-row owner = ingesting user) | Superseded. Account/library/playlist deletion removes only user-owned rows (memberships, playlist entries, plays, credentials, the legacy vault row). It never deletes curated sources, global media mappings or cache objects. Library/playlist writes still require the caller's own membership (ADR 0006 gate), but no own source: playability needs a curated source for the track, and entry-keyed restore resolves through the entry plus that curated source. Local catalogue rows are owned by the ingest job/catalogue, not by an end user. |
+
+What does **not** change: catalog identity, matching and the manifest
+producer (§6 mechanics now run for admin ingest into the shared catalogue),
+the envelope format (rule 1), Subsonic credentials (rule 2), entitlement
+(rule 4), flows/partitions (rule 5), the fenced-deletion machinery for
+user-owned data, and library-scoped read gating as the launch access rule.
+Whether catalogue browsing stays library-scoped once the catalogue is
+shared is the catalogue/playback records' call, not this revision's.
 
 ## Context and compatibility boundary
 
@@ -97,8 +131,9 @@ subsonic_credentials  id PK, user_id FK, label,
                       scope TEXT DEFAULT 'subsonic', created_at, last_used_at, revoked_at
 plans                 id TEXT PK ('free','plus','pro-5x','pro-20x'), price_cents,
                       stream_hours_month, max_concurrent_streams, max_library_tracks,
-                      ingest_jobs_day, cache_priority,
-                      cache_bytes_budget BIGINT, cache_retention_days INTEGER
+                      ingest_jobs_day
+                      -- cache_priority / cache_bytes_budget / cache_retention_days
+                      -- retired 2026-11-03 (ADR 0013); dropped when reader-less
 plan_prices           stripe_price_id TEXT PK, plan_id FK → plans NOT NULL,
                       currency TEXT NOT NULL, price_cents INTEGER NOT NULL,
                       billing_interval TEXT NOT NULL, livemode BOOLEAN NOT NULL,
@@ -132,12 +167,15 @@ usage_ledger          id BIGSERIAL PK, user_id FK, period DATE (UTC day),
 ingest_jobs           id PK, user_id FK, idempotency_key TEXT, accepted_at,
                       status TEXT ('queued'|'running'|'done'|'failed'),
                       UNIQUE (user_id, idempotency_key)
-providers             id PK, user_id FK, label,
-                      encrypted_creds BYTEA + creds_* envelope fields,
-                      created_at, last_verified_at, UNIQUE (user_id, id)
-indexers              id PK, user_id TEXT FK NULL (NULL means global),
-                      name, base_url, api_key_encrypted BYTEA NULL
-                      + api_key_* envelope fields, enabled BOOLEAN
+pool_providers        id PK, label, host, port, tls, username,
+                      secret_ref (envelope ciphertext, rule 1; never plaintext),
+                      can_read BOOLEAN, can_post BOOLEAN,
+                      max_connections INTEGER, backbone TEXT, tier INTEGER,
+                      enabled BOOLEAN, created_at, last_verified_at
+                      -- service-owned accounts (ADR 0014); replaces the retired
+                      -- per-user `providers` table. No user FK.
+indexers              retired as user data 2026-11-03: no per-user rows;
+                      any indexer is service/admin configuration only
 libraries             id UUID PK, user_id FK, name, created_at, deleting_at NULL
 artists               id PK, mbid UUID NULL (MB artist), local_key TEXT UNIQUE NULL,
                       local_job_id UUID NULL FK → ingest_jobs (indexed owner path;
@@ -169,23 +207,22 @@ release_art           release_id FK → releases ON DELETE CASCADE,
                         -- sweep step 5 mark test
 library_tracks        library_id FK, track_id FK, added_at, PK (library_id, track_id),
                       INDEX (track_id) -- GC reference test + track-delete RI path
-track_sources         user_id FK, track_id FK, source_job_id FK → ingest_jobs,
-                      indexer_id FK NULL, nzb_ref_encrypted BYTEA
-                      + nzb_ref_* envelope fields, PK (user_id, track_id),
-                      INDEX (track_id), -- cross-user track-delete RI path
+track_sources         track_id FK, source_job_id FK → ingest_jobs,
+                      nzb_ref_encrypted BYTEA + nzb_ref_* envelope fields,
+                      PK (track_id), -- curated source, one per track (2026-11-03;
+                      -- was per-user PK (user_id, track_id) in the applied schema)
                       INDEX (source_job_id) -- ingest_jobs-delete RI path
-track_media           user_id FK, track_id FK, source_job_id FK → ingest_jobs,
+track_media           track_id FK, source_job_id FK → ingest_jobs,
                       content_hash FK → cache_objects, format TEXT, bitrate INTEGER,
                       verified_at, last_served_at,
-                      PK (user_id, track_id, source_job_id, content_hash),
+                      PK (track_id, source_job_id, content_hash),
+                      -- global mapping (ADR 0013; was per-user in applied schema)
                       INDEX (track_id), -- GC/track-delete RI path
                       INDEX (source_job_id), -- ingest_jobs-delete RI path
                       INDEX (content_hash) -- sweep step 5 mark test
-user_cache_grants     user_id FK, content_hash FK → cache_objects,
-                      provider_id UUID NOT NULL,
-                      FK (user_id, provider_id) → providers(user_id, id) ON DELETE RESTRICT,
-                      verified_at, last_served_at, PK (user_id, content_hash),
-                      INDEX (content_hash) -- sweep step 5 mark test
+user_cache_grants     retired 2026-11-03 (ADR 0013): exists only in the applied
+                      schema until the forward drop migration; no target
+                      reader or writer may depend on it
 cache_objects         content_hash TEXT PK (sha256 hex), byte_size BIGINT,
                       r2_bucket TEXT, r2_key TEXT,
                       ref_count BIGINT (advisory), created_at, last_verified_at
@@ -436,19 +473,18 @@ FOR SHARE) AS writer_fence`, with zero-row disambiguation through the fence prob
 
 ```text
 users ──< webauthn_credentials / magic_link_tokens / sessions
-users ──1 provider_vaults (existing, retained)
+users ──1 provider_vaults (existing applied schema; legacy — purge migration, 2026-11-03 revision)
 users ──< auth_challenges / audit_log (logical ownership)
 invite_codes ──< users (invite_code_hash, logical reference)
 users ──1 billing_accounts ──< billing_operations
 users ──< subscriptions >── plans ──< plan_prices
-users ──< subsonic_credentials / providers / indexers
+users ──< subsonic_credentials
+pool_providers (service-owned, ADR 0014; no user FK) ──< ingest/stream attribution
 users ──< usage_ledger / ingest_jobs / play_event_outbox / play_events / delete_operations
 users ──< libraries ──< library_tracks >── tracks >── releases >── artists
-users ──< track_sources >── tracks
-users ──< track_media >── tracks
-track_media >── cache_objects <── user_cache_grants >── users
+tracks ──1 track_sources (curated, service-owned)
+tracks ──< track_media (global) >── cache_objects
 releases ──< release_art >── cache_objects
-providers ──< user_cache_grants
 users ──< playlists ──< playlist_tracks >── tracks
 ```
 
@@ -546,18 +582,20 @@ native REST (ADR 0006).
 - **Post-write `art` stage / cover-art cache refill:** acquire/validate art and put
   R2 bytes outside SQL, then publish the cache pointer in a short transaction
   (ADR 0003). Art is authorized by library membership, not audio grants.
-- **Stream worker, after full own-provider fetch and hash verification:**
-  `cache_objects`, per-user `track_media`, and `user_cache_grants`. Initialize
-  both `last_served_at` columns and refresh the grant/served mapping on serve.
+- **Cache fill (ADR 0013), after a pool fetch and full hash verification:**
+  `cache_objects` and the global `track_media` mapping, published under the
+  per-hash serialization. (Replaces the BYOP-era stream-worker writer that
+  published per-user `track_media` + `user_cache_grants` after an
+  own-provider fetch; the stream worker itself writes no media rows.)
+  Refresh `track_media.last_served_at` on serve.
 
-Audio eviction removes grants, then orphaned mappings, then unreferenced objects
-(ADR 0003); it never removes sources. Final removal from all of a user's libraries
-removes that user's media mappings and unneeded grants, not other users' copies.
-Retain the encrypted `track_sources` while **any own library membership OR own
-playlist entry** references that track. Delete the source only when both counts
-are zero, including after playlist-entry/playlist deletion. Serialize membership,
-playlist and source cleanup for `(user_id, track_id)` in one transaction; a
-concurrent re-add must not lose its source. For a local release, every source
+Audio eviction removes global mappings, then unreferenced objects (ADR 0013
+watermark eviction); it never removes curated sources. Removing a track from
+a user's libraries or playlists removes only that user's membership/entry
+rows — never the curated `track_sources` row, the global mapping or other
+users' access. Curated sources are deleted only by catalogue lifecycle
+decisions (track/catalogue removal), serialized per `track_id` against
+concurrent ingest replacement; membership churn cannot lose a source. For a local release, every source
 insert/delete/replace and every membership change takes the release serializer
 first (ADR 0003), computes the selected art source (lowest track id among
 current member tracks with `embedded_art_selector`) before and after inside
@@ -590,13 +628,13 @@ batch, together with `state`, `heartbeat_at`, `consecutive_failures` and
 played_at, event_id)` for `play_events`/`play_event_outbox` via their
 `(user_id, played_at)` indexes; `(library_id, track_id)` via
 `libraries(user_id)` for membership batches; `(playlist_id, entry_id UUID)`
-for playlist-entry batches; `(user_id, content_hash)` for grant batches; `track_id`
+for playlist-entry batches; `track_id`
 via the `library_tracks(track_id)`, `playlist_tracks(track_id)`,
 `track_sources(track_id)` and `track_media(track_id)` indexes for the GC
 reference test and every `DELETE FROM tracks` RI check;
 `(source_job_id)` on `track_sources`/`track_media` for every `DELETE FROM
-ingest_jobs` RI check; `(content_hash)` on `track_media`,
-`user_cache_grants`, and partial `release_art` for the sweep step-5 mark test;
+ingest_jobs` RI check; `(content_hash)` on `track_media`
+and partial `release_art` for the sweep step-5 mark test;
 and `local_job_id` for
 owner-local catalog rows. A repeat DELETE of the same account/container is
 idempotent: while its operation row exists the API returns the existing
@@ -615,8 +653,9 @@ Every writer that can create or restore user-owned state first takes
 `SELECT ... FOR SHARE` on the user's `users` row and rejects a non-NULL
 `deleting_at`; library/playlist mutations also take `FOR SHARE` on the target
 container and reject its marker. This includes ingest `write`, membership and
-playlist edits/restores, stream publication of `track_media`/grants (including
-play-event/outbox writes), and art descriptor/pointer publication. The delete
+playlist edits/restores, play-event/outbox writes, and art descriptor/pointer
+publication. (Global `track_media` publication by cache fill is service work,
+not user-owned state, and is not fenced by a user's deletion marker.) The delete
 executor's own billing reconcile (account gate below) and its cursor/state
 writes are exempt from this fence. The auth/session writers needed to
 cancel during grace — new `sessions` login rows,
@@ -649,17 +688,17 @@ UPDATE (conflicting with writer locks), waiting for already-started writers; no
 writer can pass a marker check and commit after the marker. Publication holds
 these locks through its inserts. Stream hash serialization and the release
 serializer remain additional locks, not substitutes for the user/container
-fence. Re-enumerate memberships, grants, and media under the relevant serializers
-until empty before deleting providers or jobs; the fence prevents late
-publication from repopulating any of them. FKs on `library_tracks`/`playlist_tracks`
+fence. Re-enumerate memberships and entries under the relevant serializers
+until empty before deleting containers or the user's ingest-job records; the
+fence prevents late writes from repopulating any of them. FKs on `library_tracks`/`playlist_tracks`
 remain RESTRICT/non-cascading.
 
 For library/playlist batches, enumerate affected pairs and local release ids,
 take serializers in ascending release id, then `(user_id, track_id)`, then hash
 order (release-then-hash per ADR 0003). In each transaction, delete the target
-membership/entry rows, delete `track_media` only for tracks with no remaining
-library membership, delete grants no other current mapping for that user/hash
-needs, run both-counts-zero source cleanup, and conditionally invalidate local
+membership/entry rows only — global `track_media`, curated sources and cache
+objects are catalogue data and survive (2026-11-03 revision) — and
+conditionally invalidate local
 `release_art` only when its selected source changes. Re-enumerate until the
 container is empty before removing its marker/container; the persisted cursor is
 a resume hint, not authority to skip rechecking.
@@ -681,7 +720,8 @@ the user's monthly `play_events`, `stream_play_ledger` rows, and
 `usage_ledger` rows before deleting referenced tracks or the user; account
 erasure is the first explicit exception to append-only event retention
 (rule 5). Then remove playlist entries and
-library memberships, media, grants and sources. Remove owner-local catalog rows
+library memberships. Global media mappings, curated sources and cache
+objects are not user data and are never removed by account erasure. Remove owner-local catalog rows
 and `release_art` descriptors with no remaining library/playlist references
 under the release serializer. Billing is deleted only after remote termination is gated. The gate runs under
 the same per-user serialized reconcile as ADR 0005 (exempt from the fence
@@ -709,7 +749,8 @@ live remote subscription cancels it immediately and alerts, otherwise it
 reconciles debt without recreating a user and alerts. This preserves ADR 0005
 trial single-use (`trial_started_at` survives as the tombstone copy) and the
 rule 4 ban on freeing a slot while remote billing can still collect. Then remove ingest
-jobs and empty library/playlist containers, providers/indexers/vaults, Subsonic
+jobs and empty library/playlist containers, the legacy vault row (credential
+purge), Subsonic
 credentials, sessions, magic-link/WebAuthn rows and other user-FK children;
 then, in the same transaction as the final `DELETE FROM users` after taking
 `SELECT ... FOR UPDATE` on the users row (auth writers hold `FOR SHARE`, so
@@ -746,13 +787,17 @@ consolidation remaps `play_event_outbox`/`play_events` (plus memberships,
 playlists and sources) to the surviving track before retiring a duplicate.
 This covers rows orphaned by earlier final-membership removal as well as
 interrupted account deletion, and runs before those jobs are eligible for
-cleanup. Periodic orphan-source reconciliation (ADR 0003 GC) removes
-`track_sources` with neither library nor playlist references. A retained
-source is recovery data, not read/stream authorization: dormant entries still
-fail the library gate. A live audio grant is required even when an object or
-track id is known.
-`cache_bytes` is a live SUM of object sizes across that user's unique audio grants,
-not a daily/monthly flow; artwork uses the separate lifecycle in ADR 0003.
+cleanup. Curated `track_sources` rows are catalogue data: periodic GC never
+removes one for lacking library/playlist references (that BYOP-era
+reconciliation is retired); a source is removed only with its track under
+catalogue lifecycle. A curated source is fetch data, not read/stream
+authorization: dormant entries still fail the library gate, and serving
+always requires authentication, active entitlement and catalogue
+availability even when an object hash or track id is known (ADR 0013).
+Cache occupancy is the single global gauge of ADR 0013
+(`SUM(byte_size)` over audio objects referenced by `track_media` against
+`popcache.cap_bytes`), never a per-user sum; artwork uses the separate
+lifecycle restated in ADR 0013.
 
 ### 4. Subscription slots are not the same as entitlement
 
@@ -823,7 +868,8 @@ do not replay dropped partitions into the live ledger without a separate rebuild
 
 Ingest counts increment at acceptance. Only stream seconds sum across days for a
 monthly cap; ingest uses today's row.
-Cache bytes are the live grant gauge; concurrent streams are pool-DO leases;
+Cache occupancy is ADR 0013's single global gauge, never a per-user flow or
+gauge; concurrent streams are per-user stream leases;
 library size is distinct per-user membership (ADR 0004). Analytics Engine is
 observability only. Duplicate queue delivery must not increment any flow twice.
 Acceptance must cover concurrent duplicate delivery, crash before/after commit,
@@ -1015,7 +1061,7 @@ key, and is retained for later explicit reconciliation.
 The ingest `write` transaction upserts artist, release, then tracks in ascending
 `(medium_no, track_no)` order; every multi-row statement orders its input rows by
 that same key. It uses their **returned local ids**, including on conflicts, for
-membership and per-user sources. Different jobs/users matching the same verified
+membership and the curated source. Different ingest jobs matching the same verified
 release position converge to one track; `(library_id, track_id)` makes repeated
 membership a no-op. Tenant claims cannot overwrite shared metadata on conflict.
 If a claimed recording MBID contradicts the mirror, or an existing shared row's
@@ -1029,20 +1075,20 @@ Retry the entire idempotent write transaction on SQLSTATE `40P01` or `40001`, wi
 bounded maximum of three attempts and backoff; after exhaustion fail the job for
 normal retry/dead-letter handling.
 
-For a user's second import of the same shared track, `track_sources` remains one
-slot per `(user_id, track_id)`. Compare jobs by `(ingest_jobs.accepted_at,
+For a second admin ingest of the same shared track, `track_sources` remains
+one slot per `track_id` (2026-11-03 revision: the curated source is
+service-owned, not per-user). Compare jobs by `(ingest_jobs.accepted_at,
 source_job_id)`; under the source-row conflict lock, only a newer accepted job
-may replace the encrypted source. In that same transaction, superseding the source
-makes older `track_media` rows ineligible
-for serving and removes that user's stale media mapping; remove its cache grant
-only when no other current `track_media` mapping for that user/hash needs it. Shared
-cache objects remain while any grant references them. Associate each verified media
-mapping with its `source_job_id`. Serve only mappings for the current source job
-that also have the user's grant; when several hashes exist for that job, choose
-latest `verified_at`, then ascending `content_hash` as a deterministic tie-break.
-This preserves a usable source and an unambiguous media choice after retries or
-re-imports. Local-to-MB consolidation is separate transactional work: preserve/remap
-membership, playlists and user sources before retiring a duplicate; don't mutate
+may replace the encrypted source. In that same transaction, superseding the
+source makes older `track_media` rows ineligible for serving and removes the
+stale global media mapping; shared cache objects remain while any mapping or
+`release_art` row references them. Associate each verified media mapping with
+its `source_job_id`. Serve only the mapping for the current source job; when
+several hashes exist for that job, choose latest `verified_at`, then ascending
+`content_hash` as a deterministic tie-break. This preserves a usable source
+and an unambiguous media choice after retries or re-ingests. Local-to-MB
+consolidation is separate transactional work: preserve/remap membership,
+playlists and the curated source before retiring a duplicate; don't mutate
 keys on conflict or discard data. An MBID is never a local track id/source FK.
 
 Catalog access is library-scoped by default. Every read or write that takes or
@@ -1083,20 +1129,23 @@ design; the implementing PR's acceptance asserts post-backfill count equals
 the pre-freeze `items` length for fully-resolvable playlists. The legacy `items` column is readable by the playlist owner
 only during transition (opaque refs, never guessed into track rows), never by a
 non-owner. An owner read resolves embedded rows through the owner's own
-memberships exactly like any other playlist read. Local-row ownership is derived via the indexed `local_job_id` →
-`ingest_jobs.user_id`; that user is the sole owner, and the library-scope rule
-already restricts reads to it. `local_key` parsing is legacy backfill only,
-never a runtime access path.
+memberships exactly like any other playlist read. Local-row provenance is
+derived via the indexed `local_job_id` → `ingest_jobs` (whose `user_id` is
+the acting admin, never an end-user owner); visibility still comes only from
+the library-scope rule, never from job provenance. `local_key` parsing is
+legacy backfill only, never a runtime access path.
 Mirror-verified global rows (when they ship) use the same membership gate: shared
-metadata is readable only for tracks in the caller's library. Audio additionally
-requires its own-provider grant. **Artwork is membership-plus-entitlement-authorized metadata:**
-there are no art grants and art never contributes to `cache_bytes`; refills
-require current entitlement (rule 4 / ADR 0004) as well as membership. `release_art`
+metadata is readable only for tracks in the caller's library. Audio
+additionally requires active entitlement and a curated source for the track
+(ADR 0013); there is no grant. **Artwork is membership-plus-entitlement-authorized metadata:**
+art is excluded from the ADR 0013 audio cap; refills require current
+entitlement (rule 4 / ADR 0004) as well as membership. `release_art`
 holds a durable source descriptor and a nullable cache pointer; ingest `write`
 records the descriptor, then a separate idempotent **post-write `art` stage**
-acquires and caches bytes (ADR 0003). Local releases use tag-embedded art selected
-from an own current `track_sources` payload; verified global releases use only
-Cover Art Archive via the trusted release MBID, never tenant artwork. The schema
+acquires and caches bytes (ADR 0013, retaining ADR 0003's art model). Local
+releases use tag-embedded art selected from the track's curated
+`track_sources` payload as recorded at admin ingest; verified global releases
+use only Cover Art Archive via the trusted release MBID, never tenant artwork. The schema
 has one row per `(release_id, rendition)`; launch supports only `original`, which
 is therefore the primary. Other sizes/renditions are deferred, not extra rows or
 unbounded transforms. `content_hash=NULL` means uncached, not unrecoverable;
@@ -1112,24 +1161,26 @@ errors, not a cross-user fallback. Play/scrobble writes resolve the played track
 through the same memberships before accepting the event.
 
 Membership writes are ownership-checked, so membership cannot be self-asserted.
-A `library_tracks` row requires an own `track_sources` row, inserted in the
-same ingest transaction or already retained. For a local track the owner (via
-`releases.local_key` → `ingest_jobs.user_id`) must also be the caller; for a
-mirror-verified global track the own source proves the caller's import. Only
-ingest `write` creates sources, never a library edit. A `playlist_tracks` row requires all three: the caller owns the
-playlist (`playlists.owner_user_id` = caller, resolved via `public_id`), the track is in at least one of the caller's libraries (library
-membership, the same predicate reads use), AND the caller holds an own
-`track_sources` row for it (source predicate). Library edits move or copy only
-tracks between the caller's own libraries; they cannot mint sources, grants, or
-cross-user ownership. `playlist_tracks.track_id` is therefore a doubly-checked
-FK, not an unrestricted FK.
+A `library_tracks` row requires the track to exist in the shared catalogue
+(with its curated `track_sources` row, created only by admin ingest `write`,
+never by a library edit). There is no import-proof predicate: no caller
+"owns" a source, and holding a track id confers nothing until membership is
+written under ADR 0006's gate. A `playlist_tracks` row requires both: the
+caller owns the playlist (`playlists.owner_user_id` = caller, resolved via
+`public_id`) AND the track is in at least one of the caller's libraries
+(library membership, the same predicate reads use). The BYOP-era third
+predicate (caller-held own source) is retired with per-user sources. Library
+edits move or copy only tracks between the caller's own libraries; they
+cannot mint sources or cross-user ownership. `playlist_tracks.track_id` is
+therefore a doubly-checked FK, not an unrestricted FK.
 
 Playlist entries have their own ids so the same track may occur repeatedly.
 The deferrable `(playlist_id, position)` constraint allows transactional position
 shifts/reorders. Removal semantics: deleting a library, a playlist, or an
 account runs the explicit batched procedure in rule 3 (enumerate affected
 `(user_id, track_id)` pairs and release ids, fixed serializer order, per-batch
-membership delete plus both-counts-zero source cleanup and art invalidation) —
+membership delete and art invalidation; curated sources are not user data
+and are never cleaned up by it) —
 never a bare FK cascade that silently drops `library_tracks`/`playlist_tracks`
 rows without running that cleanup. Track-row deletion is allowed only after explicit local-catalog GC or consolidation has checked all library/playlist references and remapped references where applicable; it never cascades silently. Removing a track from the caller's last library, or
 deleting the last library holding it, does NOT delete that caller's playlist
@@ -1139,24 +1190,26 @@ by the absence of that caller's `library_tracks` membership. Reads return only
 the entry id and position with a `dormant: track not in any library` tombstone
 instead of track metadata (the tombstone exposes no track id), and
 `stream`/`scrobble` for a dormant entry return 404 (native) or Subsonic error
-70. The retained own `track_sources` row (rule 3) permits restoring that same
-local or verified track to an own library **only** through the entry-keyed
-restore operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
+70. The track's curated `track_sources` row (rule 3 as revised: retained with
+the catalogue, independent of this caller) permits restoring that same local
+or verified track to an own library **only** through the entry-keyed restore
+operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
 with body `{library_id}` (declared in ADR 0006): it resolves the playlist and
-entry ownership first, then the track through the entry and the caller's own
-`track_sources` row — never through a caller-supplied catalog id — inserts the
-library membership, and re-activates matching dormant entries in place without
+entry ownership first, then the track through the entry and its curated
+source — never through a caller-supplied catalog id — inserts the library
+membership, and re-activates matching dormant entries in place without
 reordering. A plain `POST /v1/library` with a non-member track id cannot perform
-this restore and stays 404/70. Deleted media/grants are rebuilt by a full own-provider fetch before
-streaming. If neither library nor playlist references remained and the source was
-deleted, neither the restore operation nor a library edit can restore playable content: require a new ingest.
-Ownership of a local id alone must not create a source-less membership; the
-restore and any track re-add also require the retained own source. Dormancy does not bypass caps.
+this restore and stays 404/70. Evicted media is not rebuilt by restore: the
+next play serves through the backend pool and ADR 0013 refill handles the
+cache. If the track itself was removed from the catalogue (source deleted
+with it), neither the restore operation nor a library edit can restore
+playable content: require a new admin ingest. Knowing a track id alone must
+not create a membership. Dormancy does not bypass caps.
 
-Implementation acceptance covers concurrent cross-user and same-user/different-job
-imports of one matched release position (one global row, one library count), with
-the newer accepted same-user job replacing the source and invalidating only its
-stale per-user media/grant mapping; serving selects only a current-source hash and
+Implementation acceptance covers concurrent different-job admin ingests of
+one matched release position (one global row, one library count), with the
+newer accepted job replacing the curated source and invalidating the stale
+global media mapping; serving selects only a current-source hash and
 uses the documented deterministic tie-break. Include opposite-order multi-track
 inputs to prove sorted upserts and bounded retries. Cover the same recording on
 two releases and two positions on one release (distinct tracks), multidisc positions,
@@ -1226,30 +1279,30 @@ retaining its `release_mbid_hint` without guessing. Also require:
 - Playlist/library consistency: for both a local and a mirror-verified track T,
   remove T from its last library while P references it. Assert stable P entry ids,
   positions and counts, unchanged non-NULL `playlist_tracks.track_id`, tombstones/no
-  metadata and stream/scrobble 404/70; GC retains the source by the
-  `(user_id, track_id)` playlist reference while audio mappings/unneeded grants do
-  not. Restore via the public
+  metadata and stream/scrobble 404/70; the curated source is retained with the
+  catalogue regardless of any user's references (2026-11-03 revision). Restore via the public
   entry-keyed operation `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore`
   with an own `{library_id}` and assert entries re-activate in place and
-  own-provider fetch makes streaming work; a plain `POST /v1/library` with the
+  playback then serves via the shared cache or backend pool; a plain `POST /v1/library` with the
   dormant track id stays 404/70 and does not restore. Negative cases: restoring
-  with another user's entry id, or a dormant entry whose source was deleted,
-  returns 404/70. Deleting the last playlist entry (or playlist) with no library membership
-  deletes the source; subsequent library-only re-add and the restore operation are
-  rejected for both track types. Run a plain `DELETE` of a playlist holding a
+  with another user's entry id, or a dormant entry whose track left the
+  catalogue, returns 404/70. Deleting the last playlist entry (or playlist)
+  with no library membership deletes only user rows — never the curated
+  source, the global mapping or cache objects. Run a plain `DELETE` of a playlist holding a
   dormant track with no library membership and a plain `DELETE` of a library
-  holding T with no playlist reference, and assert the orphaned source is removed
-  (including via the GC reconciliation step after a crash between batches) and the
-  re-add/restore is rejected; repeat with another reference present and assert the
-  source survives. A non-final membership removal retains the source. Race re-add against
-  final-reference removal: no committed membership may lack its source. A playlist
+  holding T with no playlist reference, and assert only the user rows are removed
+  (including after a crash between batches) and the
+  re-add/restore is rejected (catalogue removal is the only way a curated
+  source disappears). Any membership removal retains the curated source. Race
+  re-add against catalogue track removal: no committed membership may lack its
+  track. A playlist
   write for a track in no caller library is rejected. Schema FKs on
   `library_tracks`/`playlist_tracks` are `RESTRICT`/non-cascading so a bare
-  cascade cannot bypass the procedure. Deleting a library removes that user's
-  media for now-unreachable tracks and grants no other current mapping needs.
+  cascade cannot bypass the procedure. Deleting a library removes only that
+  user's membership rows; global media mappings and curated sources survive.
   Account deletion erases the user's outbox/events/ledger before tracks/users
-  (including the `play_events` and outbox track/user FKs), then processes grants,
-  media/sources, memberships, local catalog, jobs and remaining user-FK children
+  (including the `play_events` and outbox track/user FKs), then processes
+  memberships, local catalog, jobs and remaining user-FK children
   in valid FK order; no local tracks/releases/art or tenant tags survive. Include
   an account with played local tracks and pending outbox rows and assert no 23503
   on track/user deletion. Billing gate: delete a paying and a past_due account and
@@ -1272,8 +1325,8 @@ retaining its `release_mbid_hint` without guessing. Also require:
   owner-keyed GC and assert its outbox/event rows and track delete with no 23503
   while the user still exists; retire a duplicate local track and assert its
   outbox/events remap to the survivor. Race each writer (ingest write,
-  library/playlist edit and restore, stream media/grant publication including
-  play-event writes, art descriptor/pointer publication) against setting the
+  library/playlist edit and restore, play-event writes, art
+  descriptor/pointer publication) against setting the
   deleting marker; the marker waits for in-flight writers and no writer commits
   after it, and each fenced writer in this race returns 409 with
   `account_deleting` or `container_deleting` plus the blocking operation id
@@ -1281,8 +1334,8 @@ retaining its `release_mbid_hint` without guessing. Also require:
   response per rule 3). Assert schema marker
   columns and durable `delete_operations` cursor exist, cursor+batch commit
   atomically, crash resumes via the `delete` Workflow or hourly `delete-sweep`,
-  re-enumeration includes memberships, grants and media until empty before
-  provider/job removal, `DELETE /v1/account|/libraries/{id}|/playlists/{id}`
+  re-enumeration includes memberships and entries until empty before
+  container/job removal, `DELETE /v1/account|/libraries/{id}|/playlists/{id}`
   return 202 with an operation id readable via `GET /v1/operations/{id}`, and
   account completion removes all of the user's operation rows including
   in-flight scoped ones; a repeat DELETE returns the existing operation id with
@@ -1296,7 +1349,7 @@ retaining its `release_mbid_hint` without guessing. Also require:
   `play_event_outbox` and on partitioned `play_events`, plus `(track_id)`
   indexes on `library_tracks`, `playlist_tracks`, `track_sources` and
   `track_media`, `(source_job_id)` indexes on `track_sources`/`track_media`,
-  `(content_hash)` indexes on `track_media`/`user_cache_grants` and partial
+  `(content_hash)` indexes on `track_media` and partial
   `release_art`, a `(user_id)` index on `auth_challenges` (`audit_log`
   reuses the existing `idx_audit_user` — no duplicate), a partial
   `(action, at)` index on `audit_log` for the `account_deleted:%` retention
@@ -1350,8 +1403,8 @@ retaining its `release_mbid_hint` without guessing. Also require:
   accepted (no `cancellation_details[reason]`).
 - Cover art: B requests A's local art by `coverart:{release_id}` or raw hash and
   receives 404/70 **before any fetch**. A's member request refills embedded art from
-  an own current source; a verified-release member refills CAA art without a
-  provider id. Neither creates an audio grant nor changes the cache-bytes gauge.
+  the curated source recorded at ingest; a verified-release member refills CAA
+  art without any provider fetch. Neither path touches the audio cache gauge.
   Expire the art pointer after 30 idle days, then sweep: no FK failure, descriptor
   retained, authorized refetch works. A missing R2 object uses the same refill.
   Test post-write retry, crashes before/after pointer publication, two authorized
@@ -1429,13 +1482,16 @@ work. Production DB creation/migration remains gated by the ops contract.
 
 ## Concrete implementation alignment (not already deployed)
 
-- **Auth/vault (#15 merged):** retain every auth table/counter above and legacy
-  `provider_vaults`. Multi-provider support is additive: create `providers` and
-  `indexers` with v2 envelopes, read/decrypt v1 through its existing code, then
-  re-encrypt into row/field-bound v2 envelopes. Do not byte-copy v1 ciphertext
-  under v2 AAD, discard the legacy row, or switch readers before staged
-  backfill/dual-read parity and independent security acceptance. The old
-  single-vault path remains usable until that follow-up lands.
+- **Auth/vault (#15 merged):** retain every auth table/counter above.
+  Superseded 2026-11-03 for credentials: do **not** build the additive
+  per-user `providers`/`indexers` tables or migrate `provider_vaults`
+  ciphertext anywhere. The follow-up is a forward credential-purge migration
+  (drop `provider_vaults` and user-scoped provider rows; stored user
+  credentials are destroyed, not re-encrypted into the pool) plus the
+  `pool_providers` registry with row/field-bound envelopes for service
+  accounts (ADR 0014, ADR 0008 as revised), gated by independent security
+  acceptance. The legacy single-vault path in current code is removal-pending
+  legacy, not a path new work may extend.
 - **Ingest (#10 merged):** `workers/ingest/src/library.rs` currently upserts
   singular `library(idempotency_key, user_id, release_mbid, recording_mbids[])`;
   no table migration exists on inspected main. The implementation follow-up
@@ -1663,8 +1719,8 @@ work. Production DB creation/migration remains gated by the ops contract.
      cross-user playlist inserts, stable entry ids/positions/counts and
      metadata-free dormant tombstones when the last library membership is removed,
      entry-keyed restore to an own library, negative cross-user/missing-source/
-     ordinary-library-add cases, and source retention while either library or
-     playlist reference remains plus final-reference cleanup/races; the
+     ordinary-library-add cases, and curated-source retention independent of
+     library/playlist references (user-row deletion never removes it); the
      `playlist_tracks(track_id)` index exists and is used by the seeded
      GC/reference test and RESTRICT/delete cleanup;
      concurrent writer-versus-delete fence; DELETE returning 202 and resuming
@@ -1709,7 +1765,8 @@ work. Production DB creation/migration remains gated by the ops contract.
   Manifest positions are not a substitute for the mirror. These are implementation
   follow-ups, not changes to the merged mirror or pipeline in this docs-only PR.
 - **Stream/Subsonic/billing:** implement the target writers, envelope/pepper
-  constraints, grant checks, budgets and lifecycle with their contract tests.
+  constraints, entitlement checks (no cache grants — ADR 0013), pool budgets
+  (ADR 0014) and lifecycle with their contract tests.
   These changes are not implied by merging this document. Existing in-flight
   work may continue, but cannot claim alignment until its implementation matches.
 - **Migration/release:** explicit DB targets, staging upgrade from the existing
