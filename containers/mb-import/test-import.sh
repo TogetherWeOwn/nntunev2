@@ -373,7 +373,9 @@ else
 fi
 check "fk: artists loaded" "1" "$(db -c 'SELECT count(*) FROM mb_artist;')"
 check "fk: release groups loaded" "1" "$(db -c 'SELECT count(*) FROM mb_release_group;')"
-check "fk: releases loaded" "3" "$(db -c 'SELECT count(*) FROM mb_release;')"
+# Four release rows: 100001 + 100003 load; 100002 is DLQ'd
+# (fk_missing_artist) and 100004 is DLQ'd (fk_missing_release_group).
+check "fk: releases loaded" "2" "$(db -c 'SELECT count(*) FROM mb_release;')"
 check "fk: recordings loaded" "2" "$(db -c 'SELECT count(*) FROM mb_recording;')"
 check "fk: tracks loaded" "1" "$(db -c 'SELECT count(*) FROM mb_track;')"
 check "fk: urls loaded" "2" "$(db -c 'SELECT count(*) FROM mb_url;')"
