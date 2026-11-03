@@ -80,8 +80,9 @@ jobs:
       - name: Validate golden fixtures
         run: python3 scripts/check-subsonic-fixtures.py
 
-  # No checked-in NZB fixtures anywhere (TWO-1169): the journey ingests only
-  # the secret-held real NZB staged into RUNNER_TEMP. Owner rule (public
+  # No checked-in NZB fixtures anywhere (TWO-1169), and no journey NZB at
+  # all since the secret-held staging leg retired under the CC0-only
+  # fixture rule (docs/fixture-audio-licences.md). Owner rule (public
   # repo): no NZB bytes, message-IDs, subjects, file names or segment lists
   # in the repo. Fail closed on any tracked *.nzb. Keep this job id in
   # ci-ok's needs.
@@ -292,6 +293,8 @@ jobs:
         run: python3 .github/scripts/test_ci_rust_cache.py
       - name: Structural-test the required-check concurrency policy
         run: python3 .github/scripts/test_ci_required_check_concurrency.py
+      - name: Structural-test the CC0 fixture secret wiring
+        run: python3 .github/scripts/test_ci_fixture_secrets.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -689,7 +692,32 @@ jobs:
         with:
           workspaces: workers/ingest
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # CC0 fixture audio (docs/fixture-audio-licences.md): fetch track 1
+      # from R2 with the read-only fixture secrets so the ingest CC0 test
+      # below exercises real bytes instead of skipping. The fetcher exits
+      # 0 only when the cached file matches the manifest bytes + sha256,
+      # so this step is the visible fetch/sha256 proof and pre-warms the
+      # cache the test reuses. Fork PRs receive no secrets: the step
+      # notices, and the test skips via the fetcher's exit-77 path.
+      - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+        run: |
+          set -eu
+          if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
+            echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
+            exit 0
+          fi
+          fetched="$(python3 fixtures/cc0/fetch_fixture.py --position 1)"
+          echo "CC0 fixture fetched and sha256-verified against the manifest:"
+          sha256sum "$fetched"
       - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
       - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
@@ -1316,8 +1344,50 @@ jobs:
           const browser = await chromium.launch();
           await browser.close();
           JS
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        # CC0 fixture audio (docs/fixture-audio-licences.md): the player
+        # spec shells out to the stdlib-only fixture fetcher, and the
+        # Playwright image does not promise Python (same provisioning as
+        # e2e-lint).
+        with:
+          python-version: '3.13'
+      - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
+        # Exits 0 only when track 1 matches the manifest bytes + sha256,
+        # pre-warming the cache the player spec reuses; fork PRs receive
+        # no secrets, so the step notices and the spec skips cleanly.
+        # The toolcache Python in this container cannot import ssl
+        # (urllib: "unknown url type: https"), so the download prefers
+        # the image's SSL-capable system python; the suite then only
+        # needs the pre-warmed cache.
+        working-directory: ${{ github.workspace }}
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+        run: |
+          set -eu
+          if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
+            echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
+            exit 0
+          fi
+          fetcher=python3
+          if ! python3 -c 'import ssl' >/dev/null 2>&1; then
+            if [ -x /usr/bin/python3 ] && /usr/bin/python3 -c 'import ssl' >/dev/null 2>&1; then
+              fetcher=/usr/bin/python3
+            else
+              echo "::error::no SSL-capable python3 available for the fixture fetch"
+              exit 1
+            fi
+          fi
+          fetched="$("$fetcher" fixtures/cc0/fetch_fixture.py --position 1)"
+          echo "CC0 fixture fetched and sha256-verified against the manifest:"
+          sha256sum "$fetched"
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
