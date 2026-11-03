@@ -190,9 +190,11 @@ test('[RF-B3] client-side navigation away records the applied query without a bl
 	await expectRows(page, ['rec-zulu']);
 	expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
 
-	await page.getByRole('button', { name: 'Create', exact: true }).click();
-	await page.getByRole('menuitem', { name: 'Import NZB file', exact: true }).click();
-	await expect(page).toHaveURL(/\/library\/import/);
+	// User NZB import retired: navigate away via Account instead
+	// of the deleted import route; the unmount recorder fires the same way.
+	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();
+	await expect(page).toHaveURL(/\/account\/billing/);
 	expect(storedQueries(await readRecentRaw(page))[0]).toBe('zulu');
 
 	await page.getByRole('link', { name: 'Your Library', exact: true }).click();

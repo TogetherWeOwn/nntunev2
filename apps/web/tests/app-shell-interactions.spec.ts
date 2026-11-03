@@ -1,8 +1,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /**
- * App-shell interaction acceptance: keyboard traversal of the Create and
- * Account menus, and the per-toast Undo action on the Liked page.
+ * App-shell interaction acceptance: keyboard traversal of the Account
+ * menu, and the per-toast Undo action on the Liked page.
  *
  * This file lives next to the protected NAV contract
  * (app-shell-navigation.spec.ts, Builder-may-not-edit): new interaction
