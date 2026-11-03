@@ -121,7 +121,7 @@ field order; use an extract from the matching schema revision. Derivations:
   CHECK's canonical 12-character form. (Sources: `etl.py:70-84` (pinned
   GIDs), `:277-321` (allowlist resolution, kept-link set, empty-slice
   refusal), `:519-586` (url, artist/recording-url, music-video and ISRC
-  projections); `migrations/0028_mb_mirror_w6b.sql`.)
+  projections); `migrations/0029_mb_mirror_w6b.sql`.)
 - Orphan references fail the ETL before any curated file is written:
   artist type/area/country, artist-credit artists, group primary types,
   release groups/credits/years, track mediums/recordings, medium releases,
@@ -250,11 +250,11 @@ with a newer `DUMP_TS`, or a database restore. A position whose
 replacement row landed in the DLQ (poison or FK orphan) also loses its
 old row, leaving a visible gap rather than a stale recording. No
 data-destroying migrations in this path; 0014/0016 swap constraints in
-place (cursor PK, DLQ unique, `table_name` checks), and 0028 adds its six
+place (cursor PK, DLQ unique, `table_name` checks), and 0029 adds its six
 tables the same way (extending the cursor/DLQ `table_name` checks in
 place). (Sources: `import.sh:214-239`
 (prune, DLQ gap), `:618-636` (single transaction, forward-only
 guard, final-chunk prune); `test-import.sh:555-565` (older dump leaves rows alone);
 `migrations/0016_mb_track.sql:38-43` (check swaps);
 `migrations/0014_mb_import_resume_dlq.sql:28-29,46-49` (PK/unique swaps);
-`migrations/0028_mb_mirror_w6b.sql:103-114` (`table_name` check extension).)
+`migrations/0029_mb_mirror_w6b.sql:103-114` (`table_name` check extension).)

@@ -275,7 +275,7 @@ def test_commented_example_binding_ignored():
         '# binding = "ART_CACHE"\n'
         '# bucket_name = "nntunev2-archive-staging"\n'
     )
-    repo = _repo_with({"workers/mb/wrangler.toml.example": body})
+    repo = _repo_with({"workers/mb/wrangler.toml": body})
     assert archive_bindings(repo) == [], "commented bindings must not fail"
 
 

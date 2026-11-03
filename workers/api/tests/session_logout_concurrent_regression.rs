@@ -333,13 +333,7 @@ impl handlers::Store for FakeStore {
     }
 
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
-        self.audits.borrow_mut().push(vault::AuditEvent {
-            user_id: event.user_id.clone(),
-            action: event.action.clone(),
-            ok: event.ok,
-            source_ip: event.source_ip.clone(),
-            at: event.at,
-        });
+        self.audits.borrow_mut().push(event.clone());
         Ok(())
     }
 }

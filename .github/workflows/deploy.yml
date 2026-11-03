@@ -22,10 +22,10 @@ name: deploy
 #   (secrets cannot appear in a job-level `if`, so the gate maps the
 #   token to an output) — CI stays green without deploying. Production
 #   deploys are intentionally not wired here (a later gated lane adds
-#   the promotion step; the staging evidence from this workflow is
-#   web-only, see docs/ops.md).
-# Backend Worker staging lane (api only; ingest/mb/stream/repair each add
-#   their own job as follow-ups). The `staging-api` job below deploys the
+#   the promotion step; the staging evidence from this workflow covers
+#   web plus the api/mb/ingest lanes, see docs/ops.md).
+# Backend Worker staging lanes (api, mb, ingest; stream/repair/transcode
+#   each add their own job as follow-ups). The `staging-api` job below deploys the
 #   api Worker to its `staging` env on push to `main` and passes the public
 #   `BUILD_SHA` var (`--var BUILD_SHA:${{ github.sha }}`, never a secret),
 #   so worker log records carry the 40-hex deploy SHA in `fields.build_sha`
@@ -125,8 +125,9 @@ jobs:
           workingDirectory: apps/web
           command: deploy --env staging
 
-  # Api Worker staging lane (staging only; ingest/mb/stream/repair are
-  # follow-up jobs, each with its own evidence). Push to `main` only, gated
+  # Api Worker staging lane (staging only; stream/repair/transcode are
+  # follow-up jobs, each with its own evidence; mb/ingest lanes follow
+  # below). Push to `main` only, gated
   # on the same token gate as staging-web. Serves the staging host on
   # /v1/* and /healthz plus the staging-only /api/test-codes and
   # /api/test-accounts seams and the plan-cap-guarded POST /api/ingest
@@ -378,6 +379,486 @@ jobs:
             echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
             echo "Read-only session schema gate: ${SCHEMA_OUTCOME:-not-run}"
             echo "Deploy api to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$deployed" = true ]; then
+              echo "Source SHA: $source_sha"
+              echo "BUILD_SHA var: $source_sha"
+            fi
+            echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # MB mirror Worker staging lane (staging only). Push to `main` only, gated
+  # on the same token gate as staging-web. Deploys the mb Worker to its
+  # `staging` env (`nntune-mb-staging`): no routes and no workers_dev — the
+  # only caller is the ingest Worker's `MB_API` service binding, so there is
+  # no HTTP surface to serve. Passes the public BUILD_SHA var so worker log
+  # records carry the deploy SHA (never a secret); secrets live only in
+  # Cloudflare and are never written here. The MB mirror Hyperdrive config is
+  # a shared read mirror and may stay cached, so there is no cache-disabled
+  # gate here (unlike the app Hyperdrive lanes). Skips with a notice until
+  # the Operator wires HYPERDRIVE_ID_MB (a skip is not evidence). Production
+  # is never touched: the generated config has no production env table and
+  # the job deploys `--env staging` only.
+  staging-mb:
+    name: staging-mb
+    needs: [gate]
+    if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Own deploy group (never shared with the other lanes): GitHub allows one
+    # running plus one pending job per group, so sharing would let a push's
+    # own lanes cancel each other. Queued main pushes still deploy in order
+    # instead of racing wrangler.
+    concurrency:
+      group: ${{ github.workflow }}-staging-mb-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Push-to-main staging record (see the header): no rules, no secrets.
+    # Staging-scoped by name only — this lane never reads production
+    # secrets or protection rules, and never deploys --env production.
+    environment:
+      name: staging
+      url: https://staging.nntune.com
+    outputs:
+      deployed: ${{ steps.deployment.outputs.deployed }}
+      outcome: ${{ steps.deployment.outputs.outcome }}
+      source_sha: ${{ steps.deployment.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float (same pin as ci.yml).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check mb staging configuration
+        id: config
+        working-directory: workers/mb
+        env:
+          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${HYPERDRIVE_ID_MB:-}" ] || missing="$missing HYPERDRIVE_ID_MB"
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### staging-mb skipped: staging not configured"
+              echo "Missing repository variables (names only):$missing"
+              echo "Wiring is Operator-owned; a skipped job is not deploy evidence."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate staging wrangler.toml
+        if: steps.config.outputs.configured == 'true'
+        working-directory: workers/mb
+        env:
+          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+        run: |
+          set -euo pipefail
+          # The generated config is derived from the parity manifest
+          # (.github/scripts/binding_manifest.toml), which binding-parity
+          # already diffs against the committed wrangler.toml and docs/ops.md:
+          # values here cannot drift from the committed staging section
+          # without failing the pin below. Secrets are never written here;
+          # they live only in Cloudflare.
+          python3 - <<'PY'
+          import os, textwrap, tomllib
+          with open("../../.github/scripts/binding_manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          mb = next(w for w in manifest["worker"] if w["name"] == "mb")
+          def staged(binding):
+              return next(b for b in mb["binding"] if b["binding"] == binding)["staging"]
+          # Parity pin: the generated config binds HYPERDRIVE_ID_MB directly.
+          # Fail unless it equals the committed staging inventory id for MB_DB.
+          hyperdrive_id = os.environ["HYPERDRIVE_ID_MB"]
+          assert hyperdrive_id == staged("MB_DB"), \
+              "HYPERDRIVE_ID_MB must equal the mb MB_DB staging inventory id"
+          kv_id = staged("MB_CACHE")
+          art_bucket = staged("ART_CACHE")
+          toml = textwrap.dedent(f"""\
+          # GENERATED by deploy.yml staging-mb from public repo variables,
+          # pinned to .github/scripts/binding_manifest.toml. Do not edit or
+          # commit: secrets live in Cloudflare, ids in vars.
+          name = "nntune-mb-production"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-10-01"
+          workers_dev = false
+
+          [build]
+          command = "cargo install -q worker-build --locked && worker-build --release"
+
+          [env.staging]
+          name = "nntune-mb-staging"
+          workers_dev = false
+
+          [env.staging.vars]
+          ENVIRONMENT = "staging"
+
+          # Workers Logs persistence for the structured mb records (the
+          # build_sha evidence is read there). Without this block the
+          # deployed Worker has observability=null and persists nothing.
+          [env.staging.observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [[env.staging.tail_consumers]]
+          service = "nntune-alerts-staging"
+
+          [[env.staging.hyperdrive]]
+          binding = "MB_DB"
+          id = "{hyperdrive_id}"
+
+          [[env.staging.kv_namespaces]]
+          binding = "MB_CACHE"
+          id = "{kv_id}"
+
+          [[env.staging.r2_buckets]]
+          binding = "ART_CACHE"
+          bucket_name = "{art_bucket}"
+          """)
+          with open("wrangler.toml", "w") as f:
+              f.write(toml)
+          PY
+      - name: Deploy mb to staging
+        id: deploy
+        if: steps.config.outputs.configured == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          workingDirectory: workers/mb
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
+      # Always report the executed step outcomes, including safe config skips
+      # and failures. A green job alone is not evidence of a deployed Worker.
+      - name: Record mb deployment outcome
+        id: deployment
+        if: always()
+        env:
+          CONFIGURED: ${{ steps.config.outputs.configured }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deployed=false
+          outcome=failed
+          source_sha=""
+          if [ "$JOB_STATUS" = cancelled ]; then
+            outcome=cancelled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
+            outcome=unconfigured
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && \
+               [ "$DEPLOY_OUTCOME" = success ]; then
+            deployed=true
+            outcome=deployed
+            source_sha="$SOURCE_SHA"
+          fi
+          {
+            echo "deployed=$deployed"
+            echo "outcome=$outcome"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### staging-mb deployment outcome: $outcome"
+            echo "Worker: nntune-mb-staging (env staging)"
+            echo "deployed=$deployed"
+            echo "Deploy mb to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$deployed" = true ]; then
+              echo "Source SHA: $source_sha"
+              echo "BUILD_SHA var: $source_sha"
+            fi
+            echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Ingest pipeline Worker staging lane (staging only). Push to `main` only,
+  # gated on the same token gate as staging-web, and ordered after
+  # `staging-mb` (its `MB_API` service binding targets `nntune-mb-staging`,
+  # which that lane deploys first; Cloudflare fails a deploy whose
+  # service-binding target does not exist). Deploys the ingest Worker to its
+  # `staging` env: no routes and no workers_dev, with a LIVE
+  # `[[queues.consumers]]` stanza — the consumer goes live on deploy, so
+  # this lane carries its own disabled-by-default enable gate
+  # (INGEST_STAGING_ENABLED): the Operator sets it only after TWO-1660
+  # closes search intake, since a search job admitted before the search
+  # boundary is wired would burn its retry budget against the unwired
+  # boundary and quarantine. The shared HYPERDRIVE_ID_STAGING var alone
+  # never enables this lane (the staging-api lane already needs it wired).
+  # The deploy additionally requires staging-mb deployed on the same run
+  # (its `MB_API` service binding targets `nntune-mb-staging`); when mb
+  # skips unconfigured, ingest skips with a notice instead of failing on
+  # the missing target. Passes the public BUILD_SHA var so
+  # worker log records carry the deploy SHA (never a secret); secrets live
+  # only in Cloudflare and are never written here. Fails closed on the
+  # Hyperdrive cache-disabled gate for the shared app staging config
+  # (no --allow-skip); skips with a notice until the Operator wires the
+  # staging variables and enables the lane (a skip is not evidence).
+  # Production is never touched:
+  # the generated config has no production env table and the job deploys
+  # `--env staging` only.
+  staging-ingest:
+    name: staging-ingest
+    needs: [gate, staging-mb]
+    if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    # Own deploy group (never shared with the other lanes): GitHub allows one
+    # running plus one pending job per group, so sharing would let a push's
+    # own lanes cancel each other. Queued main pushes still deploy in order
+    # instead of racing wrangler.
+    concurrency:
+      group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Push-to-main staging record (see the header): no rules, no secrets.
+    # Staging-scoped by name only — this lane never reads production
+    # secrets or protection rules, and never deploys --env production.
+    environment:
+      name: staging
+      url: https://staging.nntune.com
+    outputs:
+      deployed: ${{ steps.deployment.outputs.deployed }}
+      outcome: ${{ steps.deployment.outputs.outcome }}
+      source_sha: ${{ steps.deployment.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float (same pin as ci.yml).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Check ingest staging configuration
+        id: config
+        working-directory: workers/ingest
+        env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          INGEST_STAGING_ENABLED: ${{ vars.INGEST_STAGING_ENABLED }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${HYPERDRIVE_ID_STAGING:-}" ] || missing="$missing HYPERDRIVE_ID_STAGING"
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### staging-ingest skipped: staging not configured"
+              echo "Missing repository variables (names only):$missing"
+              echo "Wiring is Operator-owned; a skipped job is not deploy evidence."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+          # Disabled-by-default enable gate: the shared HYPERDRIVE_ID_STAGING
+          # var alone never enables this lane (the staging-api lane already
+          # needs it wired). The Operator sets INGEST_STAGING_ENABLED only
+          # after search intake closes (runbook step 1); until then every
+          # downstream step skips and the live consumer never deploys.
+          if [ "${INGEST_STAGING_ENABLED:-}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### staging-ingest skipped: lane not enabled"
+              echo "INGEST_STAGING_ENABLED is not true (name only; disabled by default)."
+              echo "Enable only after search intake closes — runbook step 1."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Hyperdrive cache-disabled gate
+        id: hyperdrive
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        working-directory: workers/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ./check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"
+      - name: Generate staging wrangler.toml
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true'
+        working-directory: workers/ingest
+        env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+        run: |
+          set -euo pipefail
+          # The generated config is derived from the parity manifest
+          # (.github/scripts/binding_manifest.toml), which binding-parity
+          # already diffs against the committed wrangler.toml and docs/ops.md:
+          # values here cannot drift from the committed staging section
+          # without failing the pin below. Staging omits NNTP_POOL,
+          # REPAIR_CONTAINER and TRANSCODE_CONTAINER (targets do not exist;
+          # Cloudflare fails a deploy whose service-binding target is
+          # missing) — re-add per environment once each target Worker
+          # deploys; see the runbook in docs/ops.md. Secrets are never
+          # written here; they live only in Cloudflare.
+          python3 - <<'PY'
+          import os, textwrap, tomllib
+          with open("../../.github/scripts/binding_manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          ingest = next(w for w in manifest["worker"] if w["name"] == "ingest")
+          def staged(binding):
+              return next(b for b in ingest["binding"] if b["binding"] == binding)["staging"]
+          # Parity pin: the generated config binds HYPERDRIVE_ID_STAGING
+          # directly for LIBRARY_DB. Fail unless it equals the committed
+          # staging inventory id.
+          library_id = os.environ["HYPERDRIVE_ID_STAGING"]
+          assert library_id == staged("LIBRARY_DB"), \
+              "HYPERDRIVE_ID_STAGING must equal the ingest LIBRARY_DB staging inventory id"
+          queue = staged("INGEST_QUEUE")
+          dlq = staged("INGEST_DLQ")
+          state_id = staged("INGEST_STATE")
+          payloads_id = staged("INGEST_PAYLOADS")
+          scratch_bucket = staged("INGEST_SCRATCH")
+          audio_bucket = staged("AUDIO_PUBLISH")
+          toml = textwrap.dedent(f"""\
+          # GENERATED by deploy.yml staging-ingest from public repo variables,
+          # pinned to .github/scripts/binding_manifest.toml. Do not edit or
+          # commit: secrets live in Cloudflare, ids in vars.
+          name = "nntune-ingest"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-10-01"
+          workers_dev = false
+
+          [build]
+          command = "cargo install -q worker-build --locked && worker-build --release"
+
+          [env.staging]
+          name = "nntune-ingest-staging"
+          workers_dev = false
+
+          [env.staging.vars]
+          AUDIO_BUCKET_NAME = "{audio_bucket}"
+
+          # Workers Logs persistence for the structured ingest records (the
+          # build_sha evidence is read there). Without this block the
+          # deployed Worker has observability=null and persists nothing.
+          [env.staging.observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [[env.staging.tail_consumers]]
+          service = "nntune-alerts-staging"
+
+          [[env.staging.queues.producers]]
+          binding = "INGEST_QUEUE"
+          queue = "{queue}"
+
+          [[env.staging.queues.producers]]
+          binding = "INGEST_DLQ"
+          queue = "{dlq}"
+
+          # LIVE consumer: the consumer goes live the moment this environment
+          # deploys. This lane must stay operator-disabled until TWO-1660
+          # closes search intake. max_retries = CONSUMER_MAX_RETRIES (4) in
+          # src/retry.rs: it equals PAYLOAD_RETRY_ATTEMPTS in src/dispatch.rs
+          # and MAX_ATTEMPTS - 1 in src/jobs.rs.
+          [[env.staging.queues.consumers]]
+          queue = "{queue}"
+          max_batch_size = 10
+          max_retries = 4
+          dead_letter_queue = "{dlq}"
+
+          [[env.staging.hyperdrive]]
+          binding = "LIBRARY_DB"
+          id = "{library_id}"
+
+          [[env.staging.kv_namespaces]]
+          binding = "INGEST_STATE"
+          id = "{state_id}"
+
+          [[env.staging.kv_namespaces]]
+          binding = "INGEST_PAYLOADS"
+          id = "{payloads_id}"
+
+          # Staging omits NNTP_POOL, REPAIR_CONTAINER and TRANSCODE_CONTAINER:
+          # targets do not exist yet (see the header comment). Binding calls
+          # resolve per request and degrade to transient retries when absent.
+
+          [[env.staging.r2_buckets]]
+          binding = "INGEST_SCRATCH"
+          bucket_name = "{scratch_bucket}"
+
+          [[env.staging.r2_buckets]]
+          binding = "AUDIO_PUBLISH"
+          bucket_name = "{audio_bucket}"
+
+          [[env.staging.analytics_engine_datasets]]
+          binding = "INGEST_METER"
+          dataset = "nntune_ingest_meter"
+
+          # MB read API in staging (code: src/matching.rs). The staging-mb lane
+          # deploys `nntune-mb-staging` first; without it this deploy fails on
+          # the missing service target.
+          [[env.staging.services]]
+          binding = "MB_API"
+          service = "nntune-mb-staging"
+          """)
+          with open("wrangler.toml", "w") as f:
+              f.write(toml)
+          PY
+      - name: Deploy ingest to staging
+        id: deploy
+        if: steps.config.outputs.configured == 'true' && steps.config.outputs.enabled == 'true' && steps.hyperdrive.outcome == 'success' && needs.staging-mb.outputs.deployed == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          workingDirectory: workers/ingest
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
+      # Always report the executed step outcomes, including safe config skips
+      # and failures. A green job alone is not evidence of a deployed Worker.
+      - name: Record ingest deployment outcome
+        id: deployment
+        if: always()
+        env:
+          CONFIGURED: ${{ steps.config.outputs.configured }}
+          ENABLED: ${{ steps.config.outputs.enabled }}
+          MB_DEPLOYED: ${{ needs.staging-mb.outputs.deployed }}
+          HYPERDRIVE_OUTCOME: ${{ steps.hyperdrive.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deployed=false
+          outcome=failed
+          source_sha=""
+          if [ "$JOB_STATUS" = cancelled ]; then
+            outcome=cancelled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = false ]; then
+            outcome=unconfigured
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = false ]; then
+            outcome=disabled
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = true ] && \
+               [ "$MB_DEPLOYED" = false ]; then
+            outcome=mb-not-deployed
+          elif [ "$JOB_STATUS" = success ] && [ "$CONFIGURED" = true ] && [ "$ENABLED" = true ] && \
+               [ "$MB_DEPLOYED" = true ] && [ "$HYPERDRIVE_OUTCOME" = success ] && \
+               [ "$DEPLOY_OUTCOME" = success ]; then
+            deployed=true
+            outcome=deployed
+            source_sha="$SOURCE_SHA"
+          fi
+          {
+            echo "deployed=$deployed"
+            echo "outcome=$outcome"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### staging-ingest deployment outcome: $outcome"
+            echo "Worker: nntune-ingest-staging (env staging)"
+            echo "deployed=$deployed"
+            echo "Enable gate (INGEST_STAGING_ENABLED): ${ENABLED:-not-run}"
+            echo "staging-mb deployed this run: ${MB_DEPLOYED:-not-run}"
+            echo "Hyperdrive cache-disabled gate: ${HYPERDRIVE_OUTCOME:-not-run}"
+            echo "Deploy ingest to staging: ${DEPLOY_OUTCOME:-not-run}"
+            if [ "$outcome" = "disabled" ]; then
+              echo "Lane is operator-disabled by default; set INGEST_STAGING_ENABLED only after search intake closes (runbook step 1)."
+            fi
+            if [ "$outcome" = "mb-not-deployed" ]; then
+              echo "staging-mb did not deploy this run (wire HYPERDRIVE_ID_MB first); ingest skips rather than failing on the missing MB_API target."
+            fi
             if [ "$deployed" = true ]; then
               echo "Source SHA: $source_sha"
               echo "BUILD_SHA var: $source_sha"

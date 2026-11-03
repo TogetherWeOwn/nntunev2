@@ -32,8 +32,16 @@ EXPECTED = {
         "postgres_reap_delete_rechecks_locked_candidates_before_deleting",
         "postgres_reap_bounded_batch_drains_cap_plus_one",
         "postgres_reap_preserves_explicit_protected_user_and_dependents",
+        "postgres_reap_preserves_admin_stub_accounts",
         "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
         "postgres_reap_holds_selected_parent_lock_through_delete",
+        "postgres_admin_role_change_audits_each_replaced_value",
+        "postgres_admin_role_change_on_a_deleting_subject_writes_nothing",
+        "postgres_admin_role_change_rolls_back_when_the_audit_insert_fails",
+        "postgres_admin_role_change_waits_on_row_lock_and_audits_committed_value",
+        "postgres_admin_setting_writes_serialize_per_key",
+        "postgres_admin_write_refused_after_actor_demotion",
+        "postgres_admin_simultaneous_opposing_demotions_keep_one_admin",
     )
 }
 EXPECTED_CONFIG = {

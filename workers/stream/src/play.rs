@@ -1245,6 +1245,18 @@ impl PlayStream {
         self.served
     }
 
+    /// The half-open byte span `[start, end)` of the track handed to the
+    /// client so far — the delivered-byte interval the play route reports
+    /// for hour-meter accounting (`crate::delivered`). `pos` starts at the
+    /// resolved range start and advances only by chunks the iterator
+    /// yields, so `start = pos - served` holds at every pull; the
+    /// cache-fill drain inside [`PlayStream::finalize`] loads segments
+    /// directly and never moves this span. Read it before `finalize` /
+    /// `abort` consumes the stream.
+    pub fn delivered_span(&self) -> (u64, u64) {
+        (self.pos - self.served, self.pos)
+    }
+
     /// Project this play to its cache-observability event (Analytics Engine
     /// row + log line; see [`crate::observability`]). The caller — the
     /// Worker/DO entry point, which owns the request id and the clock —
