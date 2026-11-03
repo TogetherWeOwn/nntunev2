@@ -88,6 +88,20 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/dangling-url"
 fi
 grep -q 'artist-url link references missing url' "$temp_dir/dangling-url.err"
 
+# A phase-2 relationship edge whose link row is absent from the dump fails
+# closed: the relation projections inner-join link/link_type, so the edge
+# would otherwise be silently dropped while the nonempty-output guard still
+# passes on the surviving edges. Link 210 backs the l_artist_recording
+# composer edge in the fixture.
+cp -R "$fixtures/mbdump" "$temp_dir/dangling-link"
+grep -v '^210	' "$temp_dir/dangling-link/link" > "$temp_dir/dangling-link/link.tmp"
+mv "$temp_dir/dangling-link/link.tmp" "$temp_dir/dangling-link/link"
+if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/dangling-link" 2>"$temp_dir/dangling-link.err"; then
+  echo 'expected dangling-link failure' >&2
+  exit 1
+fi
+grep -q 'l_artist_recording references missing link' "$temp_dir/dangling-link.err"
+
 if DUMP_TS= "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
   echo 'expected missing timestamp failure' >&2
   exit 1

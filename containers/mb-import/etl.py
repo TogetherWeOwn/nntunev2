@@ -581,6 +581,33 @@ def main() -> int:
                 bad_rr = db.execute("SELECT l.e0,l.e1 FROM l_recording_recording l LEFT JOIN recording r0 ON r0.id=l.e0 LEFT JOIN recording r1 ON r1.id=l.e1 WHERE r0.id IS NULL OR r1.id IS NULL LIMIT 1").fetchone()
                 if bad_rr:
                     raise ValueError(f"recording-recording link references missing recording ({bad_rr[0]}, {bad_rr[1]})")
+                # Phase-2 song relations: every edge must resolve its link
+                # and link type, like the endpoints above. The projections
+                # below inner-join both, so an orphan edge would otherwise
+                # be silently dropped while the nonempty-output guard still
+                # passes on the surviving edges.
+                for rel_table in (
+                    "l_artist_recording",
+                    "l_artist_release",
+                    "l_artist_work",
+                    "l_recording_work",
+                    "l_recording_recording",
+                ):
+                    bad_rel_link = db.execute(
+                        f"SELECT l.e0,l.e1 FROM {rel_table} l "
+                        "LEFT JOIN link k ON k.id=l.link "
+                        "WHERE k.id IS NULL LIMIT 1"
+                    ).fetchone()
+                    if bad_rel_link:
+                        raise ValueError(f"{rel_table} references missing link ({bad_rel_link[0]}, {bad_rel_link[1]})")
+                    bad_rel_link_type = db.execute(
+                        f"SELECT l.e0,l.e1 FROM {rel_table} l "
+                        "JOIN link k ON k.id=l.link "
+                        "LEFT JOIN link_type lt ON lt.id=k.link_type "
+                        "WHERE lt.id IS NULL LIMIT 1"
+                    ).fetchone()
+                    if bad_rel_link_type:
+                        raise ValueError(f"{rel_table} references missing link_type ({bad_rel_link_type[0]}, {bad_rel_link_type[1]})")
                 # Aliases: every alias names a kept entity of its own kind.
                 for alias_table, parent in (
                     ("artist_alias", "artist"),
@@ -822,16 +849,29 @@ def main() -> int:
                 """
                 release_credit_count = insert_select(db, release_credit_query, output_dir / "mbdump-release_credit.tsv", updated_at)
                 # Aliases: one row per (entity, name, locale), NULL locales
-                # rewritten to '' and duplicate spellings collapsed with
-                # MAX(), so the natural-key primary key holds within a dump.
+                # rewritten to ''. Duplicate spellings collapse to one
+                # source row — the primary-for-locale row wins, then the
+                # greatest sort name — so sort_name and primary_flag always
+                # come from the same row instead of mixing MAX() columns
+                # from different rows.
                 def project_alias(table: str, parent: str, out: str) -> int:
                     query = f"""
-                        SELECT a.gid,al.name,COALESCE(al.locale,''),MAX(al.sort_name),
-                               MAX(al.primary_flag)
-                        FROM {table} al
-                        JOIN {parent} a ON a.id=al.entity
-                        GROUP BY a.gid,al.name,COALESCE(al.locale,'')
-                        ORDER BY a.gid,al.name,COALESCE(al.locale,'')
+                        SELECT gid,name,locale,sort_name,primary_flag FROM (
+                            SELECT a.gid AS gid,al.name AS name,
+                                   COALESCE(al.locale,'') AS locale,
+                                   al.sort_name AS sort_name,
+                                   al.primary_flag AS primary_flag,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY a.gid,al.name,
+                                                    COALESCE(al.locale,'')
+                                       ORDER BY al.primary_flag DESC,
+                                                al.sort_name DESC,
+                                                al.entity
+                                   ) AS rn
+                            FROM {table} al
+                            JOIN {parent} a ON a.id=al.entity
+                        ) WHERE rn=1
+                        ORDER BY gid,name,locale
                     """
                     return insert_select(
                         db, query, output_dir / out, updated_at,

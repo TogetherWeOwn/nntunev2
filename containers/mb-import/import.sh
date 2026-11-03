@@ -155,7 +155,11 @@ for table in $base_tables; do
 done
 phase2_present=""
 for table in $phase2_tables; do
-  if [[ -f "$dump_dir/mbdump-$table.tsv" ]]; then
+  # Detect any directory entry — including directories and dangling
+  # symlinks — so a malformed phase-2 snapshot cannot pass as a legacy
+  # base-only snapshot. The group preflight below still requires each
+  # entry to be a present, readable, nonempty regular file.
+  if [[ -e "$dump_dir/mbdump-$table.tsv" || -L "$dump_dir/mbdump-$table.tsv" ]]; then
     phase2_present="$phase2_present $table"
   fi
 done
