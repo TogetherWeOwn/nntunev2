@@ -175,6 +175,16 @@ SESSION_TTL_SECS = "86400"
 #                                 identical string. Unset or under 32 bytes:
 #                                 the play routes fail closed per-request,
 #                                 every other route keeps serving.
+#   METER_SINK_SECRET             HMAC key for the stream Worker's
+#                                 play-window flushes to
+#                                 POST /internal/v1/play-windows. Same
+#                                 raw-string rule as PLAY_GRANT_SECRET:
+#                                 plain random string of 32+ chars, same
+#                                 value on both Workers, never
+#                                 base64-decoded. Unset or under 32 chars:
+#                                 the endpoint fails closed and the stream
+#                                 side keeps windows pending (nothing
+#                                 meters, nothing is lost permanently).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
 #   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
 #                                 seam only). High-entropy; same value as the
