@@ -24,13 +24,11 @@
 			action: {
 				label: 'Undo',
 				run: () => {
-					// Keep searches saved after Clear (the toast survives
-					// navigation): stored entries missing from the cleared
-					// snapshot move to the front instead of being lost.
-					const added = loadRecentFinds(session, local).filter(
-						(query) => !previous.includes(query)
-					);
-					queries = [...added, ...previous].slice(0, MAX_RECENT_FINDS);
+					// Keep every post-clear search in its new recency position,
+					// including queries also present in the cleared snapshot.
+					const current = loadRecentFinds(session, local);
+					queries = [...current, ...previous.filter((query) => !current.includes(query))]
+						.slice(0, MAX_RECENT_FINDS);
 					saveRecentFinds(session, local, queries);
 				}
 			}

@@ -46,25 +46,39 @@
 
 	const liked = $derived(selectFavoriteItems(items, favoriteIds));
 
-	function persist(ids: string[]): void {
-		favoriteIds = ids;
-		saveFavorites(session, local, ids);
+	type FavoriteChange = (ids: readonly string[]) => readonly string[];
+	const pendingChanges = new Map<string, FavoriteChange>();
+
+	function currentFavorites(): string[] {
+		// Retry unsaved per-track changes against fresh storage, preserving
+		// both this visit's edits and additions from another tab.
+		let ids: readonly string[] = loadFavorites(session, local, favoriteIds);
+		for (const change of pendingChanges.values()) ids = change(ids);
+		return [...ids];
+	}
+
+	function persistChange(id: string, change: FavoriteChange): void {
+		pendingChanges.delete(id);
+		pendingChanges.set(id, change);
+		favoriteIds = currentFavorites();
+		if (saveFavorites(session, local, favoriteIds)) pendingChanges.clear();
 	}
 
 	function removeFavorite(id: string, title: string): void {
-		// Re-read storage so a favorite added in another tab is not dropped
-		// by this removal; fall back to component state when storage is
-		// stale (it lacks the id this list just rendered).
-		const stored = loadFavorites(session, local);
-		const previous = stored.includes(id) ? stored : [...favoriteIds];
+		// A missing stored id is an already-completed removal, not evidence
+		// that storage is stale. Reconcile the rendered list without saving.
+		const previous = currentFavorites();
 		const previousIndex = previous.indexOf(id);
-		if (previousIndex < 0) return;
+		if (previousIndex < 0) {
+			favoriteIds = previous;
+			return;
+		}
 		const anchor = {
 			previousIndex,
 			predecessor: previousIndex > 0 ? previous[previousIndex - 1] : null,
 			successor: previousIndex < previous.length - 1 ? previous[previousIndex + 1] : null
 		};
-		persist(previous.filter((entry) => entry !== id));
+		persistChange(id, (ids) => ids.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
@@ -73,9 +87,7 @@
 					// navigation or another tab's save is never overwritten,
 					// and anchor on the surviving successor so adjacent Undos
 					// restore the original order in either sequence.
-					const current = loadFavorites(session, local);
-					const next = restoreFavoriteId(current, id, anchor);
-					if (next !== current) persist([...next]);
+					persistChange(id, (ids) => restoreFavoriteId(ids, id, anchor));
 				}
 			}
 		});
