@@ -653,17 +653,31 @@ fn deterministic_play_keys_and_invalid_rows_are_unchanged() {
         Err(LedgerError::Invalid),
         "zero-byte rows must still fail closed"
     );
+    // Migration 0028 retired the nominal-rate equality: seconds are
+    // caller-derived (proportional derivation in ledger.rs), so a value
+    // disagreeing with ceil(bytes / 48_000) is accepted, and only the
+    // decoupled per-row cap still fails closed.
+    let decoupled = prepare_ledger_row(
+        "user-alice",
+        "track-1",
+        "some-key",
+        48_000,
+        2,
+        1_767_225_600,
+    )
+    .expect("seconds decoupled from the retired rate must prepare");
+    assert_eq!(decoupled.stream_seconds, 2);
     assert_eq!(
         prepare_ledger_row(
             "user-alice",
             "track-1",
             "some-key",
             48_000,
-            2,
+            86_401,
             1_767_225_600
         ),
         Err(LedgerError::Invalid),
-        "seconds disagreeing with bytes must still fail closed"
+        "seconds above the per-row cap must still fail closed"
     );
 }
 

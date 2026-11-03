@@ -8,8 +8,9 @@
 use nntune_api::ledger::{
     self, classify_fenced_replay, classify_replay, derive_play_idempotency_key,
     fold_monthly_totals, ledger_insert_statement, ledger_monthly_total_statement,
-    ledger_select_by_key_statement, new_idempotency_key, period_month_for_timestamp,
-    prepare_ledger_row, prepare_play_ledger_row, LedgerError, LedgerRow, ReplayOutcome,
+    ledger_play_window_upsert_statement, ledger_select_by_key_statement, new_idempotency_key,
+    period_month_for_timestamp, prepare_ledger_row, prepare_play_ledger_row, LedgerError,
+    LedgerRow, ReplayOutcome,
 };
 
 // --- Fixtures ---------------------------------------------------------------
@@ -344,7 +345,30 @@ fn statements_are_parameterized_replay_safe_and_month_scoped() {
         select.contains("FROM stream_play_ledger WHERE idempotency_key = $1"),
         "select by key: {select}"
     );
-    for sql in [insert, select, ledger_monthly_total_statement()] {
+    // The sink upsert converges monotonically instead of first-write-wins:
+    // same fence, snapshot columns bound positionally, and only a
+    // strictly larger union may advance the stored row — losing the
+    // WHERE would let an older snapshot rewind billed bytes.
+    let upsert = ledger_play_window_upsert_statement();
+    assert!(
+        upsert.contains("(idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms)"),
+        "column order with snapshots: {upsert}"
+    );
+    assert!(
+        upsert.contains("SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM"),
+        "positional bind through the fence select: {upsert}"
+    );
+    assert!(
+        upsert.contains(
+            "FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence"
+        ),
+        "fenced through the play owner's users row: {upsert}"
+    );
+    assert!(
+        upsert.contains("WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served"),
+        "monotonic advance only: {upsert}"
+    );
+    for sql in [insert, select, upsert, ledger_monthly_total_statement()] {
         assert!(!sql.contains('{'), "no interpolation: {sql}");
         assert!(!sql.contains("%s"), "no interpolation: {sql}");
     }
@@ -418,27 +442,49 @@ fn stream_play_feeds_the_ledger_without_silent_replays() {
 }
 
 #[test]
-fn migration_pins_rate_and_persisted_caps() {
-    // The migration is the persisted half of the prepare gate: if its rate
-    // literal drifts (e.g. 48000 -> 4800) every prepare-valid row fails at
-    // the DB, or corrupt rows are accepted. Dropping the CHECK has the same
-    // effect. This test reads the migration file so either mutant fails the
-    // suite.
+fn migration_pins_rate_retirement_and_persisted_caps() {
+    // The migrations are the persisted half of the prepare gate. 0020
+    // created the table WITH the nominal-rate CHECK; 0028 retires that
+    // coupling (it over-counts FLAC) and adds the derivation snapshot
+    // columns. If 0028's drop loses its 48000 definition match it drops
+    // nothing (or the wrong CHECK) and every proportionally derived row
+    // fails at the DB; if the snapshot columns vanish the sink upsert
+    // fails. This test reads both migration files so either mutant
+    // fails the suite.
     const MIGRATION: &str = include_str!("../../../migrations/0020_stream_play_ledger.sql");
+    const DERIVATION: &str =
+        include_str!("../../../migrations/0028_meter_derivation_and_leases.sql");
     let rate = ledger::STREAM_BYTES_PER_SEC.to_string();
     assert!(
         MIGRATION.contains(&format!("bytes_served / {rate}")),
-        "migration must divide by STREAM_BYTES_PER_SEC ({rate})"
+        "0020 must still spell the rate CHECK 0028 retires ({rate})"
     );
     assert!(
-        MIGRATION.contains(&format!("bytes_served % {rate}")),
-        "migration must modulo by STREAM_BYTES_PER_SEC ({rate})"
+        DERIVATION.contains(&format!("'%{rate}%'")),
+        "0028 must find the rate CHECK by its {rate} definition"
     );
-    // Literal pin: the rate re-bills history, so drift is deliberate only.
+    assert!(
+        DERIVATION.contains("DROP CONSTRAINT"),
+        "0028 must drop the rate CHECK"
+    );
+    assert!(
+        DERIVATION.contains("ADD COLUMN IF NOT EXISTS file_bytes"),
+        "0028 must add the file_bytes snapshot column"
+    );
+    assert!(
+        DERIVATION.contains("ADD COLUMN IF NOT EXISTS duration_ms"),
+        "0028 must add the duration_ms snapshot column"
+    );
+    assert!(
+        DERIVATION.contains("CREATE TABLE IF NOT EXISTS playback_leases ("),
+        "0028 must create the playback lease table"
+    );
+    // Literal pin: the fallback rate re-bills history, so drift is
+    // deliberate only.
     assert_eq!(ledger::STREAM_BYTES_PER_SEC, 48_000);
-    // Persisted caps mirror the prepare bounds: without them a row that
-    // satisfies the rate CHECK can still exceed the per-row / time-domain
-    // limits prepare enforces (LedgerRow fields alone do not enforce them).
+    // Persisted caps mirror the prepare bounds: without them a derived
+    // row can still exceed the per-row / time-domain limits prepare
+    // enforces (LedgerRow fields alone do not enforce them).
     assert!(
         MIGRATION.contains(&format!(
             "stream_seconds <= {}",

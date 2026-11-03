@@ -78,6 +78,7 @@ emit the code.
 | `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
 | `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
+| `subscription_required` | 402 | false | api | Playback grant refused because the account has no entitled subscription; the body carries a `reason` (`never_subscribed` or `lapsed`). Subscribing or reactivating changes the answer; retrying unchanged does not. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |

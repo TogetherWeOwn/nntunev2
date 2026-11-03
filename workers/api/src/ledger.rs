@@ -18,10 +18,18 @@
 //! Rules:
 //! - One [`LedgerRow`] per billed play window: (`user_id`, `track_id`,
 //!   `idempotency_key`, `bytes_served`, `stream_seconds`, `recorded_at`).
-//!   Seconds MUST equal `ceil(bytes / STREAM_BYTES_PER_SEC)` — the same rate
-//!   the stream worker attributes with — derived from the window's folded
-//!   byte total, never by summing per-event seconds (each event rounds up,
-//!   so per-event seconds are not additive); mismatched seconds are rejected.
+//!   Play-window seconds are derived by [`derive_stream_seconds`] from the
+//!   play's delivered-byte union as a proportion of the track
+//!   (`ceil(union_bytes * duration / file_size)`, clamped to
+//!   `duration + 2 s`), falling back to the nominal
+//!   [`STREAM_BYTES_PER_SEC`] rate only when duration or file size is
+//!   unknown. Until migration 0028 the nominal rate was the only
+//!   derivation and the schema enforced it; it over-counts FLAC roughly
+//!   2-3.7x, so [`prepare_ledger_row`] now bounds caller-derived seconds
+//!   instead of recomputing the rate, and [`prepare_play_window`] is the
+//!   sink path that derives them here. Seconds always derive from the
+//!   window's folded byte total, never by summing per-event seconds
+//!   (each event rounds up, so per-event seconds are not additive).
 //! - `period_month` (`YYYY-MM`, UTC) derives deterministically from
 //!   `recorded_at`; monthly usage is `SUM` over (`user_id`, `period_month`).
 //! - Replay safety: the insert is fenced `ON CONFLICT (idempotency_key)
@@ -42,19 +50,26 @@
 //!   [`ReplayOutcome::Conflict`], and no stored row with a closed fence reports
 //!   [`ReplayOutcome::AccountDeleting`] (typed 409 `account_deleting`, never
 //!   retried). Conflicts are flagged, never silently converged.
-//! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes (24 h
-//!   of audio at the nominal rate); zero-byte rows are rejected — an empty
-//!   row bills nothing and only widens the table.
+//! - Bounds: a single row carries at most [`MAX_BYTES_PER_ROW`] bytes and
+//!   [`MAX_STREAM_SECONDS_PER_ROW`] seconds — decoupled sanity caps since
+//!   migration 0028 (the byte cap keeps its historical value); zero-byte
+//!   rows are rejected — an empty row bills nothing and only widens the
+//!   table.
 
 use std::collections::BTreeMap;
 
-/// Nominal bytes per stream second. MUST match the stream worker's metering
-/// rate: both sides pin the same literal vectors in tests, so a drift fails
-/// the suite on either side instead of silently re-billing history.
+/// Nominal bytes per stream second: the fallback derivation rate when a
+/// play's duration or file size is unknown ([`derive_stream_seconds`]).
+/// Historically the only derivation (enforced by migration 0020's rate
+/// CHECK, dropped in 0028); the stream worker's legacy meter pins the same
+/// literal, so a drift fails the suite on either side instead of silently
+/// re-billing history.
 pub const STREAM_BYTES_PER_SEC: u64 = 48_000;
 /// Maximum stream seconds one row may attribute (24 h of audio).
 pub const MAX_STREAM_SECONDS_PER_ROW: u64 = 86_400;
-/// Maximum bytes one row may carry: exactly 24 h at the nominal rate.
+/// Maximum bytes one row may carry. A sanity cap since migration 0028;
+/// the value is historical (24 h at the old nominal rate) and no longer
+/// coupled to the derivation.
 pub const MAX_BYTES_PER_ROW: u64 = 4_147_200_000;
 /// Last Unix second representable by the persisted four-digit `YYYY-MM` month.
 pub const MAX_RECORDED_AT: u64 = 253_402_300_799;
@@ -78,7 +93,7 @@ pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 1159;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerError {
     /// Shape violation (empty/overlong handle, bad key charset, zero or
-    /// oversized bytes, seconds disagreeing with bytes, play key not binding
+    /// oversized bytes, oversized seconds, play key not binding
     /// its identity): HTTP 422.
     Invalid,
     /// Secure randomness unavailable while minting a fresh idempotency key:
@@ -247,10 +262,13 @@ fn check_key(value: &str) -> Result<String, LedgerError> {
     Ok(value.to_string())
 }
 
-/// Build the ledger intent for one billed service window. `stream_seconds`
-/// must already equal `ceil(bytes_served / STREAM_BYTES_PER_SEC)` — the
-/// Worker passes through what the stream worker metered, and any skew fails
-/// closed instead of billing a number neither side derived.
+/// Build the ledger intent for one billed service window. The caller
+/// derives `stream_seconds` (play windows via [`derive_stream_seconds`]);
+/// this gate bounds it to [`MAX_STREAM_SECONDS_PER_ROW`] rather than
+/// recomputing a derivation it lacks the duration/file inputs for.
+/// Until migration 0028 it also required the nominal-rate equality
+/// `seconds == ceil(bytes / STREAM_BYTES_PER_SEC)`; that coupling is
+/// retired with the rate CHECK it mirrored.
 ///
 /// Keys: fresh [`new_idempotency_key`] handles are accepted as-is; a key
 /// starting with `play:` MUST bind `(user_id, track_id)` per
@@ -276,7 +294,7 @@ pub fn prepare_ledger_row(
     if bytes_served == 0 || bytes_served > MAX_BYTES_PER_ROW {
         return Err(LedgerError::Invalid);
     }
-    if stream_seconds != bytes_served.div_ceil(STREAM_BYTES_PER_SEC) {
+    if stream_seconds > MAX_STREAM_SECONDS_PER_ROW {
         return Err(LedgerError::Invalid);
     }
     if recorded_at > MAX_RECORDED_AT {
@@ -322,6 +340,155 @@ pub fn prepare_play_ledger_row(
         stream_seconds,
         recorded_at,
     )
+}
+
+/// Outcome of [`derive_stream_seconds`]: the billed seconds and whether
+/// the nominal-rate fallback produced them (the caller flags the metric;
+/// a fallback row's snapshot columns stay NULL so it is recomputable as
+/// `ceil(bytes / STREAM_BYTES_PER_SEC)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondsDerivation {
+    pub seconds: u64,
+    pub rate_fallback: bool,
+}
+
+/// Derive billed seconds for one play from its delivered-byte union.
+///
+/// With both inputs known the seconds are the delivered proportion of
+/// the track, `ceil(union_bytes * duration / file_size)`, clamped to
+/// `[0, duration_s + 2]` — a full play is exact by construction, a
+/// seek-heavy play never exceeds the track's duration plus the 2 s
+/// tolerance, and re-delivered spans add nothing because the union, not
+/// the playhead, is measured. The multiply runs in `u128`, so no
+/// in-domain input overflows. Without a usable duration or file size
+/// the legacy nominal rate applies (`ceil(union / STREAM_BYTES_PER_SEC)`)
+/// and `rate_fallback` is set. Either path is additionally clamped to
+/// [`MAX_STREAM_SECONDS_PER_ROW`].
+pub fn derive_stream_seconds(
+    union_bytes: u64,
+    file_bytes: Option<u64>,
+    duration_ms: Option<u64>,
+) -> SecondsDerivation {
+    if let (Some(file_bytes), Some(duration_ms)) = (file_bytes, duration_ms) {
+        if file_bytes > 0 && duration_ms > 0 {
+            let numerator = u128::from(union_bytes) * u128::from(duration_ms);
+            let denominator = u128::from(file_bytes) * 1_000;
+            let duration_s = duration_ms.div_ceil(1_000);
+            // Clamp in u128 before the cast: an out-of-domain union must
+            // saturate at the clamp, never truncate into a small value.
+            let cap = u128::from(duration_s.saturating_add(2))
+                .min(u128::from(MAX_STREAM_SECONDS_PER_ROW));
+            let seconds = numerator.div_ceil(denominator).min(cap) as u64;
+            return SecondsDerivation {
+                seconds,
+                rate_fallback: false,
+            };
+        }
+    }
+    SecondsDerivation {
+        seconds: union_bytes
+            .div_ceil(STREAM_BYTES_PER_SEC)
+            .min(MAX_STREAM_SECONDS_PER_ROW),
+        rate_fallback: true,
+    }
+}
+
+/// Resolve a track's duration for [`derive_stream_seconds`] from the
+/// metadata hierarchy: the track's own `duration_ms`, then the
+/// MusicBrainz recording's, then a bitrate estimate
+/// (`file_bytes * 8 / bitrate_kbps` milliseconds — `track_media.bitrate`
+/// is kbit/s). Zero/unknown rungs are skipped; `None` leaves the caller
+/// on the nominal-rate fallback.
+pub fn resolve_duration_ms(
+    track_duration_ms: Option<u64>,
+    mb_duration_ms: Option<u64>,
+    bitrate_kbps: Option<u64>,
+    file_bytes: Option<u64>,
+) -> Option<u64> {
+    if let Some(ms) = track_duration_ms.filter(|ms| *ms > 0) {
+        return Some(ms);
+    }
+    if let Some(ms) = mb_duration_ms.filter(|ms| *ms > 0) {
+        return Some(ms);
+    }
+    let (kbps, bytes) = (bitrate_kbps?, file_bytes?);
+    if kbps == 0 || bytes == 0 {
+        return None;
+    }
+    let estimated = (u128::from(bytes) * 8 / u128::from(kbps)) as u64;
+    (estimated > 0).then_some(estimated)
+}
+
+/// Validated play-window intent for the meter sink: one play's
+/// delivered-byte union and the seconds derived from it, plus the
+/// `file_bytes` / `duration_ms` snapshots the derivation consumed
+/// (migration 0028 columns; `None` when the nominal-rate fallback
+/// derived the seconds). The Worker binds it to
+/// [`ledger_play_window_upsert_statement`]. Never serialized to clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayWindow {
+    pub idempotency_key: String,
+    pub user_id: String,
+    pub track_id: String,
+    pub period_month: String,
+    pub stream_seconds: u64,
+    pub bytes_served: u64,
+    pub file_bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// True when the nominal-rate fallback derived `stream_seconds`;
+    /// drives the fallback metric, never persisted.
+    pub rate_fallback: bool,
+    pub recorded_at: u64,
+}
+
+/// Build the play-window intent for one play's cumulative delivered
+/// union. Derives the idempotency key like [`prepare_play_ledger_row`]
+/// and the seconds via [`derive_stream_seconds`], so client-reported
+/// play time is never an input. `union_bytes` is the union total so far
+/// (monotonic per play): the upsert converges redeliveries of the same
+/// or an older snapshot to a no-op. Zero union, a zero file size, or a
+/// zero duration are inconsistent inputs and fail closed — resolve
+/// unknowns to `None` (via [`resolve_duration_ms`]) instead.
+pub fn prepare_play_window(
+    user_id: &str,
+    track_id: &str,
+    play_id: &str,
+    union_bytes: u64,
+    file_bytes: Option<u64>,
+    duration_ms: Option<u64>,
+    recorded_at: u64,
+) -> Result<PlayWindow, LedgerError> {
+    let idempotency_key = derive_play_idempotency_key(user_id, track_id, play_id)?;
+    if union_bytes == 0 || union_bytes > MAX_BYTES_PER_ROW {
+        return Err(LedgerError::Invalid);
+    }
+    if file_bytes == Some(0) || duration_ms == Some(0) {
+        return Err(LedgerError::Invalid);
+    }
+    if recorded_at > MAX_RECORDED_AT {
+        return Err(LedgerError::Invalid);
+    }
+    let derivation = derive_stream_seconds(union_bytes, file_bytes, duration_ms);
+    // Snapshots persist only for the proportional derivation: a fallback
+    // row must recompute from bytes alone, so it stores NULLs even when
+    // one of the two inputs happened to be known.
+    let (file_bytes, duration_ms) = if derivation.rate_fallback {
+        (None, None)
+    } else {
+        (file_bytes, duration_ms)
+    };
+    Ok(PlayWindow {
+        period_month: period_month_for_timestamp(recorded_at),
+        idempotency_key,
+        user_id: user_id.to_string(),
+        track_id: track_id.to_string(),
+        stream_seconds: derivation.seconds,
+        bytes_served: union_bytes,
+        file_bytes,
+        duration_ms,
+        rate_fallback: derivation.rate_fallback,
+        recorded_at,
+    })
 }
 
 /// What a zero-row fenced `ON CONFLICT DO NOTHING` insert means. The insert
@@ -459,6 +626,27 @@ pub fn ledger_insert_statement() -> &'static str {
     "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) SELECT $1, $2, $3, $4, $5, $6, $7 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO NOTHING"
 }
 
+/// Fenced monotonic upsert for one play's cumulative delivered union
+/// (the meter sink's write). Parameters: idempotency_key ($1), user_id
+/// ($2, also the fence key), track_id ($3), period_month ($4),
+/// stream_seconds ($5), bytes_served ($6), recorded_at ($7), file_bytes
+/// ($8, nullable), duration_ms ($9, nullable).
+///
+/// Unlike [`ledger_insert_statement`]'s first-write-wins, sink snapshots
+/// converge: the same play flushes repeatedly as its union grows, and
+/// only a strictly larger union advances the row (seconds were derived
+/// from that union by [`prepare_play_window`], so the pair always moves
+/// together; snapshot columns keep the latest non-NULL inputs).
+/// Redelivering the same or an older snapshot affects zero rows — as
+/// does a closed writer fence — so the Worker disambiguates a zero-row
+/// outcome with [`ledger_select_by_key_statement`] plus the fence probe,
+/// never by assuming a benign replay. `period_month` and `recorded_at`
+/// intentionally stay at the first flush: a play crossing a month
+/// boundary bills to its starting month.
+pub fn ledger_play_window_upsert_statement() -> &'static str {
+    "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = COALESCE(EXCLUDED.file_bytes, stream_play_ledger.file_bytes), duration_ms = COALESCE(EXCLUDED.duration_ms, stream_play_ledger.duration_ms) WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served"
+}
+
 /// Parameters: idempotency_key. Fetches the stored row after a zero-row
 /// insert so [`classify_replay`] can separate exact redeliveries
 /// ([`ReplayOutcome::Duplicate`]) from conflicting payloads
@@ -481,13 +669,15 @@ mod tests {
 
     #[test]
     fn constants_are_pinned() {
-        // Literal pins: the rate re-bills history and the row cap moves the
-        // corruption tripwire, so both change only deliberately and together
-        // with the stream worker's pins.
+        // Literal pins: the fallback rate re-bills history and the row caps
+        // move the corruption tripwire, so each changes only deliberately.
+        // The byte cap keeps its historical value but is NOT pinned to
+        // `86_400 * 48_000` anymore: migration 0028 decoupled the caps
+        // from the derivation, so asserting the product would re-couple
+        // them in the suite.
         assert_eq!(STREAM_BYTES_PER_SEC, 48_000);
         assert_eq!(MAX_STREAM_SECONDS_PER_ROW, 86_400);
         assert_eq!(MAX_BYTES_PER_ROW, 4_147_200_000);
-        assert_eq!(MAX_BYTES_PER_ROW, 86_400 * 48_000);
         assert_eq!(MAX_ID_LEN, 128);
         assert_eq!(MAX_USER_ID_LEN, 128);
         assert_eq!(MAX_TRACK_ID_LEN, 512);
@@ -570,9 +760,86 @@ mod tests {
     }
 
     #[test]
-    fn seconds_bytes_agreement_vectors() {
-        // The prepare gate recomputes the ceiling: these are the same
-        // literals the stream worker pins, so a rate drift fails here.
+    fn prepare_bounds_seconds_without_rate_coupling() {
+        // Since migration 0028 the prepare gate bounds caller-derived
+        // seconds instead of recomputing the nominal rate: a FLAC window
+        // whose proportional seconds sit far below ceil(bytes / 48_000)
+        // prepares fine, and only the per-row sanity cap refuses.
+        let row = prepare_ledger_row(
+            "user-alice",
+            "track-1",
+            &new_idempotency_key().expect("mint with working RNG"),
+            48_001,
+            0,
+            1_767_225_600,
+        )
+        .unwrap();
+        assert_eq!(row.stream_seconds, 0);
+        assert_eq!(row.period_month, "2026-01");
+        let row = prepare_ledger_row(
+            "user-alice",
+            "track-1",
+            &new_idempotency_key().expect("mint with working RNG"),
+            4_147_200_000,
+            MAX_STREAM_SECONDS_PER_ROW,
+            1_767_225_600,
+        )
+        .unwrap();
+        assert_eq!(row.stream_seconds, 86_400);
+        assert_eq!(
+            prepare_ledger_row(
+                "user-alice",
+                "track-1",
+                &new_idempotency_key().expect("mint with working RNG"),
+                48_001,
+                MAX_STREAM_SECONDS_PER_ROW + 1,
+                1_767_225_600,
+            ),
+            Err(LedgerError::Invalid),
+            "seconds above the per-row cap must fail closed"
+        );
+    }
+
+    #[test]
+    fn derivation_is_proportional_with_duration_clamp() {
+        // 30 MB FLAC, 240 s: a full play is exact by construction and a
+        // half play accrues half the duration — the nominal rate would
+        // have billed 625 s / 313 s for the same bytes.
+        let file = 30_000_000u64;
+        let duration_ms = 240_000u64;
+        let full = derive_stream_seconds(file, Some(file), Some(duration_ms));
+        assert_eq!(
+            full,
+            SecondsDerivation {
+                seconds: 240,
+                rate_fallback: false
+            }
+        );
+        let half = derive_stream_seconds(file / 2, Some(file), Some(duration_ms));
+        assert_eq!(half.seconds, 120);
+        // A sub-second remainder rounds up exactly once, from the folded
+        // union: 1 byte past the half still bills 121 s, never 240.
+        let just_past = derive_stream_seconds(file / 2 + 1, Some(file), Some(duration_ms));
+        assert_eq!(just_past.seconds, 121);
+        // An over-file union (inconsistent sink input) clamps to
+        // duration + 2 s instead of billing past the track.
+        let over = derive_stream_seconds(file * 3, Some(file), Some(duration_ms));
+        assert_eq!(over.seconds, 242);
+        // Odd durations ceil to whole seconds for the clamp bound.
+        let odd = derive_stream_seconds(file, Some(file), Some(200_500));
+        assert_eq!(odd.seconds, 201);
+        let odd_over = derive_stream_seconds(file * 2, Some(file), Some(200_500));
+        assert_eq!(odd_over.seconds, 203);
+        // Nothing delivered bills nothing.
+        assert_eq!(
+            derive_stream_seconds(0, Some(file), Some(duration_ms)).seconds,
+            0
+        );
+    }
+
+    #[test]
+    fn derivation_falls_back_to_the_nominal_rate() {
+        // Same literals the stream worker pins, so a rate drift fails here.
         for (bytes, seconds) in [
             (1u64, 1u64),
             (47_999, 1),
@@ -580,33 +847,115 @@ mod tests {
             (48_001, 2),
             (4_147_200_000, 86_400),
         ] {
-            let row = prepare_ledger_row(
-                "user-alice",
-                "track-1",
-                &new_idempotency_key().expect("mint with working RNG"),
-                bytes,
-                seconds,
-                1_767_225_600,
-            )
-            .unwrap();
-            assert_eq!(row.stream_seconds, seconds);
-            assert_eq!(row.period_month, "2026-01");
+            for (file, duration) in [
+                (None, None),
+                (Some(30_000_000), None),
+                (None, Some(240_000)),
+                (Some(0), Some(240_000)),
+                (Some(30_000_000), Some(0)),
+            ] {
+                let derived = derive_stream_seconds(bytes, file, duration);
+                assert_eq!(
+                    derived,
+                    SecondsDerivation {
+                        seconds,
+                        rate_fallback: true
+                    },
+                    "bytes={bytes} file={file:?} duration={duration:?}"
+                );
+            }
         }
-        // Skewed seconds fail closed, both directions.
-        for bad_seconds in [0, 1, 3] {
+    }
+
+    #[test]
+    fn duration_resolution_walks_the_hierarchy() {
+        // Track > MusicBrainz recording > bitrate estimate > unknown.
+        assert_eq!(
+            resolve_duration_ms(Some(240_000), Some(241_000), Some(1_000), Some(30_000_000)),
+            Some(240_000)
+        );
+        assert_eq!(
+            resolve_duration_ms(None, Some(241_000), Some(1_000), Some(30_000_000)),
+            Some(241_000)
+        );
+        // Zero rungs are skipped, never resolved as a 0 ms duration.
+        assert_eq!(
+            resolve_duration_ms(Some(0), Some(241_000), None, None),
+            Some(241_000)
+        );
+        // Bitrate estimate: 30 MB at 1_000 kbit/s is 240 s.
+        assert_eq!(
+            resolve_duration_ms(None, None, Some(1_000), Some(30_000_000)),
+            Some(240_000)
+        );
+        assert_eq!(
+            resolve_duration_ms(None, None, Some(0), Some(30_000_000)),
+            None
+        );
+        assert_eq!(resolve_duration_ms(None, None, Some(1_000), None), None);
+        assert_eq!(resolve_duration_ms(None, None, None, None), None);
+    }
+
+    #[test]
+    fn play_window_derives_seconds_and_snapshots() {
+        let window = prepare_play_window(
+            "user-1",
+            "track-9",
+            "play-7",
+            15_000_000,
+            Some(30_000_000),
+            Some(240_000),
+            1_767_225_600,
+        )
+        .unwrap();
+        assert_eq!(window.idempotency_key, "play:user-1:track-9:play-7");
+        assert_eq!(window.stream_seconds, 120);
+        assert_eq!(window.file_bytes, Some(30_000_000));
+        assert_eq!(window.duration_ms, Some(240_000));
+        assert!(!window.rate_fallback);
+        assert_eq!(window.period_month, "2026-01");
+        // Fallback derivation stores NULL snapshots even when one input
+        // was known, so the row recomputes from bytes alone.
+        let fallback = prepare_play_window(
+            "user-1",
+            "track-9",
+            "play-7",
+            48_001,
+            Some(30_000_000),
+            None,
+            1_767_225_600,
+        )
+        .unwrap();
+        assert_eq!(fallback.stream_seconds, 2);
+        assert_eq!(fallback.file_bytes, None);
+        assert_eq!(fallback.duration_ms, None);
+        assert!(fallback.rate_fallback);
+        // Inconsistent inputs fail closed: no bytes, zero file/duration,
+        // oversized union, unmeterable play id.
+        for (union, file, duration) in [
+            (0, Some(30_000_000), Some(240_000)),
+            (1, Some(0), Some(240_000)),
+            (1, Some(30_000_000), Some(0)),
+            (MAX_BYTES_PER_ROW + 1, None, None),
+        ] {
             assert_eq!(
-                prepare_ledger_row(
-                    "user-alice",
-                    "track-1",
-                    &new_idempotency_key().expect("mint with working RNG"),
-                    48_001,
-                    bad_seconds,
-                    1_767_225_600,
+                prepare_play_window(
+                    "user-1",
+                    "track-9",
+                    "play-7",
+                    union,
+                    file,
+                    duration,
+                    1_767_225_600
                 ),
                 Err(LedgerError::Invalid),
-                "seconds {bad_seconds} for 48_001 bytes"
+                "union={union} file={file:?} duration={duration:?}"
             );
         }
+        assert_eq!(
+            prepare_play_window("user-1", "track-9", "play:7", 1, None, None, 1_767_225_600),
+            Err(LedgerError::Invalid)
+        );
     }
 
     #[test]
@@ -653,6 +1002,11 @@ mod tests {
             ledger_insert_statement(),
             "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at) SELECT $1, $2, $3, $4, $5, $6, $7 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO NOTHING",
             "ledger insert"
+        );
+        assert_eq!(
+            ledger_play_window_upsert_statement(),
+            "INSERT INTO stream_play_ledger (idempotency_key, user_id, track_id, period_month, stream_seconds, bytes_served, recorded_at, file_bytes, duration_ms) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 FROM (SELECT id FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (idempotency_key) DO UPDATE SET stream_seconds = EXCLUDED.stream_seconds, bytes_served = EXCLUDED.bytes_served, file_bytes = COALESCE(EXCLUDED.file_bytes, stream_play_ledger.file_bytes), duration_ms = COALESCE(EXCLUDED.duration_ms, stream_play_ledger.duration_ms) WHERE EXCLUDED.bytes_served > stream_play_ledger.bytes_served",
+            "play window upsert"
         );
         assert_eq!(
             ledger_select_by_key_statement(),

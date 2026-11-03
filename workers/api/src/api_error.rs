@@ -48,6 +48,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "subscription_required",
+        status: 402,
+        retryable: false,
+    },
+    CodeSpec {
         code: "forbidden",
         status: 403,
         retryable: false,
@@ -150,6 +155,9 @@ impl ApiError {
     }
     pub fn plan_limit_exceeded(message: impl Into<String>) -> Self {
         Self::by_code("plan_limit_exceeded", message)
+    }
+    pub fn subscription_required(message: impl Into<String>) -> Self {
+        Self::by_code("subscription_required", message)
     }
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::by_code("forbidden", message)
@@ -327,6 +335,10 @@ mod tests {
         let plan = ApiError::plan_limit_exceeded("plan limit reached");
         assert_eq!((plan.status, plan.retryable), (402, false));
         assert_eq!(body(&plan)["code"], "plan_limit_exceeded");
+        let sub = ApiError::subscription_required("subscription required");
+        assert_eq!((sub.status, sub.retryable), (402, false));
+        assert_eq!(body(&sub)["code"], "subscription_required");
+        assert_eq!(sub.message, "subscription required");
         let rate = ApiError::rate_limited("too many requests");
         assert_eq!((rate.status, rate.retryable), (429, true));
         assert_eq!(body(&rate)["code"], "rate_limited");
