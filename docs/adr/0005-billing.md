@@ -145,18 +145,30 @@ their original deadlines; an unknown price grants no new or higher paid caps.
 A reconcile pass folding an older remote snapshot must not regress a fresher
 stored pass: coverage (`paid_through_at`, and the `plan_id`/`paid_invoice_id`
 tied to it) advances monotonically, and the same staleness predicate — the new
-evidence ends strictly before the stored paid end — guards stored `status` and
+evidence ends strictly before the stored paid end, or ties it while carrying
+no anchor against an anchored stored row — guards stored `status` and
 `grace_until` instead of writing stale verbatim fields over a fresher pass.
-The stale fold carries its evidence end into the write (not the stored end),
-so the predicate still fires when the stale-reading pass commits second.
-Empty-money observations are not stale (a first-failure `past_due` still sets
-the renewal grace); equal-money status order is unknowable across passes, so
-equal-end folds converge on the next hourly reconcile. When an equal paid end
-carries a new plan (a plan switch landing exactly on the old period end), the
-fold adopts the subscription item's current plan with unchanged coverage,
-anchored on the new evidence — and the write persists that relabel (an
-equal-end pass carrying a new-evidence anchor adopts `plan_id` /
-`paid_invoice_id`), so the switch cannot stick on the old plan forever.
+Staleness is anchor containment, not an end comparison: a snapshot that does
+not contain the invoice anchoring the stored coverage folded an older remote
+state, however its item-plan money compares (a snapshot with no stored anchor
+to check against falls back to the end comparison, and a snapshot with no
+item-plan money at all is not stale on that basis alone — a first failed
+renewal observes `past_due` with no new invoice, and that observation still
+sets the renewal grace). The stale fold carries its evidence end into the
+write (not the stored end), so the predicate still fires when the
+stale-reading pass commits second — falling back to the stored end, anchor
+cleared, when its snapshot holds no item-plan money at all. Equal-money
+status order across fresh passes is unknowable, so those still fold verbatim
+and converge on the next hourly reconcile. When an equal paid end carries a
+new plan (a plan switch landing exactly on the old period end), the fold
+relabels to the subscription item's current plan with unchanged coverage,
+anchored on the new evidence — but only onto equally-or-more-recently paid
+evidence (payment order as observed in the snapshot) — and the write persists
+that relabel only when the emitted anchor differs from the anchor the pass
+read, so a keep that read before the relabel committed cannot reverse the
+newer plan/anchor when it commits second (an equal-end pass carrying such
+new-evidence anchor adopts `plan_id` / `paid_invoice_id`), and the switch
+cannot stick on the old plan forever.
 
 An existing open Checkout Session — or a single-flight loser converging onto
 one — is reused only when its recorded price matches the newly requested

@@ -194,6 +194,13 @@ pub struct ReconcileOutcome {
     pub row: ReconciledRow,
     pub history: Vec<PaidInvoiceRow>,
     pub fail_closed: Option<FailClosedReason>,
+    /// The anchor the pass read (the stored anchor at fold time): the
+    /// write's equal-end adopt arm requires the emitted anchor to differ
+    /// from it, so a keep that read before a relabel committed cannot
+    /// reverse the newer plan/anchor when it commits second. Carried
+    /// through the outcome because the fold runs before the per-user lock
+    /// is taken; never persisted itself.
+    pub read_anchor: Option<String>,
 }
 
 impl ReconcileOutcome {
@@ -351,6 +358,7 @@ pub fn reconcile_subscription(
             },
             history: Vec::new(),
             fail_closed: None,
+            read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
         };
     }
     if is_held_status(status) {
@@ -375,6 +383,7 @@ pub fn reconcile_subscription(
             },
             history: Vec::new(),
             fail_closed: None,
+            read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
         };
     }
     if !is_advancing_status(status) {
@@ -520,9 +529,14 @@ pub fn reconcile_subscription(
     // `EXCLUDED.paid_through_at`, so a stale-reading pass that commits
     // second still compares strictly older and keeps the stored
     // status/grace instead of overwriting them with older verbatim
-    // fields. Coverage itself stays monotonic in the write (the guard
-    // keeps the greatest confirmed end), and the retained plan/anchor
-    // are kept with it there.
+    // fields. A stale pass whose snapshot holds no item-plan money at
+    // all emits no evidence end — and the guard only fires on non-NULL
+    // evidence — so it falls back to the stored end: with the anchor
+    // cleared that is exactly the anchor-less equal-end shape the guard
+    // already reads as stale against an anchored stored row (a shape
+    // only this branch emits). Coverage itself stays monotonic in the
+    // write (the guard keeps the greatest confirmed end), and the
+    // retained plan/anchor are kept with it there.
     let stale = match stored_anchor {
         Some(ref anchor) => !remote.invoices.iter().any(|inv| &inv.id == anchor),
         None => matches!((new_end, previous_end), (Some(end), Some(prev)) if end < prev),
@@ -539,12 +553,13 @@ pub fn reconcile_subscription(
                 status: kept.status.clone(),
                 current_period_end_unix: sub.current_period_end,
                 cancel_at_period_end: sub.cancel_at_period_end,
-                paid_through_unix: new_end,
+                paid_through_unix: new_end.or(previous_end),
                 paid_invoice_id: None,
                 grace_until_unix: kept.grace_until_unix,
             },
             history,
             fail_closed: None,
+            read_anchor: stored_anchor,
         };
     }
     // Monotonic coverage: duplicates and older invoices never regress a
@@ -589,7 +604,12 @@ pub fn reconcile_subscription(
     // anchor-less equal-end write against an anchored stored row as stale
     // evidence (only the stale branch emits that shape), so a fresh keep
     // must stay distinguishable from it — otherwise the guard would
-    // suppress the fresh status and grace this pass folded.
+    // suppress the fresh status and grace this pass folded. Re-pinning
+    // makes a keep indistinguishable from a relabel on the anchor alone,
+    // so the write's equal-end adopt additionally requires the emitted
+    // anchor to differ from the anchor this pass read (`read_anchor`,
+    // bound as `$13`): a keep committing after a relabel then keeps the
+    // newer plan/anchor while still applying its own status and grace.
     let (plan_id, paid_through_unix, paid_invoice_id) = if recovered || relabels {
         (item_plan, new_end, anchor_invoice)
     } else {
@@ -629,6 +649,7 @@ pub fn reconcile_subscription(
         },
         history,
         fail_closed: None,
+        read_anchor: stored_anchor,
     }
 }
 
@@ -679,6 +700,7 @@ fn fail_closed(
         },
         history: Vec::new(),
         fail_closed: Some(reason),
+        read_anchor: previous.and_then(|row| row.paid_invoice_id.clone()),
     }
 }
 
@@ -934,13 +956,19 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// coverage instead of regressing it. An equal-end pass carrying new
 /// evidence (a non-NULL anchor) still relabels `plan_id` /
 /// `paid_invoice_id`: that is the defined equal-end plan-switch outcome,
-/// and only such passes carry an anchor at equal coverage. The same
+/// and only such passes carry an anchor at equal coverage. A fresh keep
+/// re-pins the anchor it read, so the tie arm additionally requires the
+/// emitted anchor to differ from the anchor the pass read (`$13`): a
+/// keep that read before a relabel committed then keeps the newer
+/// plan/anchor while still applying its own status and grace. The same
 /// staleness guard covers `status` and `grace_until`: a pass whose money
 /// ends strictly before the stored coverage keeps the stored status/grace
 /// instead of writing stale verbatim fields over a fresher pass (the
 /// stale fold carries its evidence end precisely so this predicate fires
-/// even when the stale-reading pass commits second). Item bindings,
-/// period end and cancel still update verbatim.
+/// even when the stale-reading pass commits second — falling back to
+/// the stored end when its snapshot holds no item-plan money at all, so
+/// the anchor-less equal-end shape still presents non-NULL evidence).
+/// Item bindings, period end and cancel still update verbatim.
 /// Full staleness predicate (mirrored in both CASEs): EXCLUDED money is
 /// non-NULL, stored money is non-NULL, and EXCLUDED ends strictly before
 /// stored — or EXCLUDED ties stored while carrying no anchor against an
@@ -951,16 +979,17 @@ pub fn reconcile_lock_statement() -> &'static str {
 /// for stale evidence. Full advance-or-relabel predicate (mirrored in the
 /// plan and anchor CASEs): EXCLUDED money is non-NULL and stored money is
 /// NULL, or EXCLUDED ends strictly after stored, or EXCLUDED ties stored
-/// while carrying a new-evidence anchor.
+/// while carrying an anchor that differs from the read anchor (`$13`).
 ///
 /// Full parameter order:
 /// $1 user_id · $2 stripe_subscription_id · $3 stripe_customer_id ·
 /// $4 stripe_subscription_item_id · $5 stripe_price_id · $6 plan_id ·
 /// $7 status · $8 current_period_end epoch-or-NULL ·
 /// $9 cancel_at_period_end · $10 paid_through epoch-or-NULL ·
-/// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL.
+/// $11 paid_invoice_id-or-NULL · $12 grace_until epoch-or-NULL ·
+/// $13 read paid_invoice_id-or-NULL (the stored anchor at fold time).
 pub fn store_reconciled_subscription_statement() -> &'static str {
-    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
+    "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint)) ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND EXCLUDED.paid_invoice_id IS DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND EXCLUDED.paid_invoice_id IS DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END"
 }
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
@@ -1419,6 +1448,42 @@ mod tests {
         assert_eq!(
             outcome.row.paid_invoice_id, None,
             "only the stale branch emits the anchor-less shape"
+        );
+        assert_eq!(
+            outcome.read_anchor.as_deref(),
+            Some("in_pro"),
+            "the write needs the read anchor to tell keeps from relabels"
+        );
+    }
+
+    #[test]
+    fn stale_without_item_plan_money_carries_the_stored_end() {
+        // The snapshot lost the stored anchor AND holds no item-plan money
+        // (an empty listing): the stale outcome has no evidence end, but
+        // the write guard only fires on non-NULL evidence — so the fold
+        // falls back to the stored end. With the anchor cleared that is
+        // the anchor-less equal-end shape the guard reads as stale.
+        let e2 = NOW + 60 * 86_400;
+        let stored = anchored("pro-5x", e2, "in_pro");
+        let stale = RemoteSubscription {
+            subscription: subscription("past_due", PRICE_PLUS),
+            invoices: vec![],
+        };
+        let outcome = reconcile_subscription(&stored, &stale, NOW);
+        assert_eq!(outcome.fail_closed, None, "stale is clean, not fail-closed");
+        assert_eq!(
+            outcome.row.paid_through_unix,
+            Some(e2),
+            "no evidence end falls back to the stored end so the guard fires"
+        );
+        assert_eq!(
+            outcome.row.paid_invoice_id, None,
+            "only the stale branch emits the anchor-less shape"
+        );
+        assert_eq!(
+            outcome.read_anchor.as_deref(),
+            Some("in_pro"),
+            "the write needs the read anchor to tell keeps from relabels"
         );
     }
 
@@ -1997,12 +2062,15 @@ mod tests {
             );
         }
         // The equal-end relabel: a pass tying stored coverage while
-        // carrying a new-evidence anchor adopts the relabeled plan and
-        // anchor (the defined equal-end plan-switch outcome); anchor-less
-        // ties keep the stored ones.
+        // carrying a new-evidence anchor — one that differs from the
+        // anchor the pass read — adopts the relabeled plan and anchor
+        // (the defined equal-end plan-switch outcome); anchor-less ties,
+        // and keeps re-pinning the anchor they read, keep the stored
+        // ones. A keep committing after a relabel must not reverse the
+        // newer plan.
         for guarded in [
-            "plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END",
-            "paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END",
+            "plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND EXCLUDED.paid_invoice_id IS DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END",
+            "paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND EXCLUDED.paid_invoice_id IS DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END",
         ] {
             assert!(
                 store_reconciled_subscription_statement().contains(guarded),

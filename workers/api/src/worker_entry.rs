@@ -3771,6 +3771,7 @@ impl Store for PgStore {
                             (&row.paid_through_unix, Type::INT8),
                             (&row.paid_invoice_id, Type::TEXT),
                             (&row.grace_until_unix, Type::INT8),
+                            (&outcome.read_anchor, Type::TEXT),
                         ],
                     )
                     .await
