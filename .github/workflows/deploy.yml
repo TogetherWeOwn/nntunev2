@@ -902,7 +902,5 @@ jobs:
       SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
       SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
       SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
-      # Secret-held real NZB halves (xz+base64 split for the 48 KB cap):
-      # rebuilt into RUNNER_TEMP only by the e2e job's prepare step.
-      NNTUNE_TEST_NZB_XZ_B64_1: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_1 }}
-      NNTUNE_TEST_NZB_XZ_B64_2: ${{ secrets.NNTUNE_TEST_NZB_XZ_B64_2 }}
+      # No NZB fixture secrets are passed: the staging real-NZB leg is
+      # retired under the CC0-only fixture rule (see e2e-staging.yml).

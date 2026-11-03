@@ -984,6 +984,15 @@ test.describe('plan limit', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked with the other user-track legs: this leg needs a pre-seeded
+    // streamable track, and since the secret-held real-NZB staging leg
+    // retired (CC0-only fixture rule, docs/fixture-audio-licences.md)
+    // nothing stages one. Reseeds when admin ingest can seed a curated
+    // track on staging (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     if (realNzbActive()) {
       // The capped stream leg needs a pre-seeded streamable track, which the
       // RAR set cannot produce until RAR read lands.
