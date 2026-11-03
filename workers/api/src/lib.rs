@@ -17,6 +17,7 @@ pub mod api_error;
 pub mod auth;
 pub mod b64;
 pub mod billing;
+pub mod catalogue;
 pub mod handlers;
 pub mod ingest_grant;
 pub mod ledger;

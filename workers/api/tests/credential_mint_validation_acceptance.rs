@@ -586,11 +586,10 @@ mod surface_acceptance {
     fn invalid_and_absent_bearers_have_the_same_plain_not_found_surface() {
         // Catch mapped-path disclosure by malformed, unknown, revoked or expired keys,
         // including an attempted rescue by an otherwise valid session cookie.
+        // The catalogue slice-1 data routes (TWO-1583) are carved out below:
+        // they serve session callers, so their absent-bearer posture is 200/401,
+        // pinned by `landed_catalogue_routes_keep_gate_posture_with_session_dispatch`.
         let paths = [
-            ("GET", "/v1/library"),
-            ("GET", "/v1/artists"),
-            ("GET", "/v1/releases"),
-            ("GET", "/v1/tracks"),
             ("GET", "/v1/search"),
             ("GET", "/v1/playlists"),
             ("POST", "/v1/playlists"),
@@ -651,6 +650,101 @@ mod surface_acceptance {
                 }
             }
         }
+    }
+
+    #[test]
+    fn landed_catalogue_routes_keep_gate_posture_with_session_dispatch() {
+        // Catalogue slice 1 (TWO-1583) serves session-or-bearer callers, so
+        // the uniform-404 pin above no longer covers its routes. The gate
+        // posture is unchanged: malformed, unknown, revoked, or expired keys
+        // 404 with no session rescue and no successful-use accounting, on
+        // every landed route. Absent bearers dispatch instead: a session
+        // cookie serves (empty pages on this fixture store), anonymous
+        // callers take the generic 401.
+        let detail = "/v1/releases/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let paths = [
+            "/v1/library",
+            "/api/library",
+            "/v1/artists",
+            "/v1/releases",
+            "/v1/tracks",
+            detail,
+        ];
+        for path in paths {
+            for state in ["malformed", "unknown", "revoked", "expired"] {
+                let (h, cookie, bearer, id) = bearer_harness();
+                if state == "revoked" {
+                    h.store
+                        .native_credentials
+                        .borrow_mut()
+                        .get_mut(&id)
+                        .unwrap()
+                        .record
+                        .revoked_at = Some(NOW - 1);
+                } else if state == "expired" {
+                    h.store
+                        .native_credentials
+                        .borrow_mut()
+                        .get_mut(&id)
+                        .unwrap()
+                        .record
+                        .expires_at = NOW - 1;
+                }
+                let header = match state {
+                    "malformed" => "Bearer ",
+                    "unknown" => "Bearer ntk_syntheticUnknownKey0000000000000000000000000",
+                    _ => &bearer,
+                };
+                for cookie in [None, Some(cookie.as_str())] {
+                    let invalid = request(&h, "GET", path, Some(header), cookie);
+                    assert_eq!(
+                        invalid.status, 404,
+                        "GET {path}: {state} must not disclose route existence"
+                    );
+                    assert_eq!(
+                        invalid.body,
+                        r#"{"code":"not_found","message":"not found","retryable":false}"#,
+                        "GET {path}: {state} keeps the plain 404 body"
+                    );
+                    assert!(invalid.set_cookie.is_none(), "no session rescue/refresh");
+                    assert_eq!(
+                        h.store.native_use_calls.get(),
+                        0,
+                        "invalid keys cannot record successful use"
+                    );
+                    assert!(
+                        !invalid.body.contains("ntk_"),
+                        "no credential material in refusal"
+                    );
+                }
+            }
+        }
+        // Absent-bearer dispatch: session serves, anonymous 401s.
+        let (h, cookie, _bearer, _id) = bearer_harness();
+        for path in [
+            "/v1/library",
+            "/api/library",
+            "/v1/artists",
+            "/v1/releases",
+            "/v1/tracks",
+        ] {
+            let served = request(&h, "GET", path, None, Some(&cookie));
+            assert_eq!(served.status, 200, "GET {path}: session serves");
+            assert_eq!(served.body, "[]", "GET {path}: fixture store holds no rows");
+            let anon = request(&h, "GET", path, None, None);
+            assert_eq!(anon.status, 401, "GET {path}: anonymous 401s");
+        }
+        // The detail read 404s for a session caller too when the release is
+        // unknown — the same plain body the gate answers, so unknown
+        // releases and invalid bearers stay indistinguishable.
+        let unknown = request(&h, "GET", detail, None, Some(&cookie));
+        assert_eq!(unknown.status, 404);
+        assert_eq!(
+            unknown.body,
+            r#"{"code":"not_found","message":"not found","retryable":false}"#
+        );
+        let anon = request(&h, "GET", detail, None, None);
+        assert_eq!(anon.status, 401);
     }
 
     #[test]
@@ -768,8 +862,10 @@ mod surface_acceptance {
             "/v1/credentials/synthetic-id",
             // Scope-map-served native paths.
             "/v1/library",
+            "/api/library",
             "/v1/artists",
             "/v1/releases",
+            "/v1/releases/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "/v1/tracks",
             "/v1/search",
             "/v1/playlists",
@@ -800,6 +896,11 @@ mod surface_acceptance {
             "/v1/playlists//",
             "/v1/credentials/synthetic-id/extra",
             "/v1/credentials/",
+            // Release subpaths preflight only as single items (TWO-1583):
+            // nested shapes 404 in dispatch, including the reserved art path.
+            "/v1/releases/",
+            "/v1/releases/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/art",
+            "/v1/releases/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/tracks/extra",
         ] {
             let response = request(&h, "OPTIONS", path, None, None);
             assert_eq!(
