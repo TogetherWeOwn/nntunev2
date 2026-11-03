@@ -196,9 +196,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, BundleError> {
         path: MANIFEST_FILE.to_string(),
     })?;
     if meta.file_type().is_symlink() {
-        return Err(BundleError::Io(format!(
-            "refuses symlink: {MANIFEST_FILE}"
-        )));
+        return Err(BundleError::Io(format!("refuses symlink: {MANIFEST_FILE}")));
     }
     let raw = std::fs::read(&manifest_path).map_err(|_| BundleError::MissingFile {
         path: MANIFEST_FILE.to_string(),
@@ -291,16 +289,14 @@ mod tests {
         w.finish().unwrap();
         // Swap a verified file for a symlink to bytes outside the
         // bundle: verification must refuse, not follow.
-        let outside = std::env::temp_dir().join(format!("nntune-backup-test-{}-outside", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("nntune-backup-test-{}-outside", std::process::id()));
         std::fs::write(&outside, b"secretbox-bytes").unwrap();
         std::fs::remove_file(dir.join("blobs/x.bin")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("blobs/x.bin")).unwrap();
         #[cfg(unix)]
-        assert!(matches!(
-            verify_bundle(&dir),
-            Err(BundleError::Io(_))
-        ));
+        assert!(matches!(verify_bundle(&dir), Err(BundleError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&outside);
     }
