@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""Offline fixtures for ci/staging_admission.py (pure evaluator and fake Actions)."""
+
+import copy
+import importlib.util
+import io
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("staging_admission_under_test", HERE / "staging_admission.py")
+sa = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sa)
+
+SHA = "a" * 40
+OTHER_SHA = "b" * 40
+REPO = "org/repo"
+REPO_ID = 7
+WORKFLOW_ID = 5
+RUN_ID = 100
+ARTIFACT_ID = 900
+MANIFEST = b"[migrations]\n"
+NOW = datetime.now(timezone.utc)
+
+
+def iso(minutes):
+    return (NOW + timedelta(minutes=minutes)).isoformat()
+
+
+CONTRACT = {
+    "schema": 1, "evaluator": "junit-map-v1", "spec_revision": "spec-1",
+    "criteria": [
+        {"id": "signup", "applicable": True,
+         "evidence": [{"classname": "journey", "name": "signup", "outcome": "passed"}]},
+        {"id": "billing", "applicable": False, "rationale": "not offered in this release"},
+    ],
+}
+CONTRACT_BYTES = json.dumps(CONTRACT).encode()
+
+
+def make_policy(contract_bytes=CONTRACT_BYTES):
+    return {"schema": 1, "evaluator": "junit-map-v1", "approvals": [{
+        "sha256": sa.digest(contract_bytes), "spec_revision": "spec-1",
+        "product_approval": "synthetic-product", "qa_approval": "synthetic-qa"}]}
+
+
+def make_junit(skip=False, fail=False, omit=False, final_sha=SHA):
+    suite = ET.Element("testsuite")
+    if not omit:
+        case = ET.SubElement(suite, "testcase", classname="journey", name="signup")
+        if skip:
+            ET.SubElement(case, "skipped")
+        if fail:
+            ET.SubElement(case, "failure")
+    for phase, minutes, web in (("build-identity", -3, SHA), ("build-identity-final", -2, final_sha)):
+        case = ET.SubElement(suite, "testcase", classname="identity", name=phase)
+        props = ET.SubElement(case, "properties")
+        value = {"phase": phase, "web": web, "api": SHA, "expected": SHA, "observed_at": iso(minutes)}
+        ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
+    return ET.tostring(suite)
+
+
+def make_env(**over):
+    env = {"GITHUB_SHA": SHA, "GITHUB_REPOSITORY": REPO, "GITHUB_WORKFLOW_SHA": SHA,
+           "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ID": str(RUN_ID),
+           "GITHUB_RUN_ATTEMPT": "1", "API_DEPLOYED": "true", "API_DEPLOY_OUTCOME": "deployed",
+           "API_SOURCE_SHA": SHA, "JOURNEY_GATE": "success"}
+    env.update(over)
+    return env
+
+
+def make_zip(members):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in members:
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+class FakeActions(sa.Actions):
+    """Real listing/pagination checks over an in-memory route table; no network."""
+
+    def __init__(self, routes, hook=None):
+        super().__init__(REPO, "synthetic-token")
+        self.routes = routes
+        self.hook = hook
+        self.calls = []
+
+    def read(self, route, limit=sa.MAX_JSON):
+        self.calls.append(route)
+        if self.hook:
+            self.hook(route, self.routes)
+        require = sa.require
+        require(route in self.routes, "authenticated Actions evidence unavailable")
+        data = self.routes[route]
+        if not isinstance(data, bytes):
+            data = json.dumps(data).encode()
+        require(len(data) <= limit, "Actions response exceeds bounds")
+        return data
+
+
+def page(key, rows, total=None):
+    return {"total_count": len(rows) if total is None else total, key: rows}
+
+
+class World:
+    """Coherent synthetic run: one main-push attempt, three green jobs, one receipt."""
+
+    def __init__(self, env=None, xml=None, policy=None, contract_bytes=CONTRACT_BYTES, manifest=MANIFEST):
+        self.policy = policy or make_policy(contract_bytes)
+        self.contract_bytes = contract_bytes
+        self.manifest = manifest
+        self.receipt = sa.produce(make_env(**(env or {})), xml or make_junit(), self.policy,
+                                  contract_bytes, manifest)
+        self.workflow = {"id": WORKFLOW_ID, "path": sa.WORKFLOW, "state": "active"}
+        repo = {"full_name": REPO, "id": REPO_ID}
+        self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
+                    "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed",
+                    "conclusion": "success", "repository": repo, "head_repository": dict(repo),
+                    "created_at": iso(-20)}
+        self.runs = [self.run]
+        self.others = {}
+        self.jobs = [self.job("staging-web", -10), self.job("staging-api", -10),
+                     self.job(sa.JOURNEY, 5, started=-9, steps=[
+                         self.step("Run full journey", 1), self.step(
+                             "Enforce journey evidence gate (all-skipped must fail)", 2),
+                         self.step(sa.RECORD, 3), self.step(sa.UPLOAD, 4)])]
+        self.artifact = None
+        self.archive = None
+        self.set_archive()
+
+    @staticmethod
+    def step(name, number, conclusion="success"):
+        return {"name": name, "number": number, "status": "completed", "conclusion": conclusion}
+
+    @staticmethod
+    def job(name, done, started=-15, steps=None):
+        return {"name": name, "run_id": RUN_ID, "run_attempt": 1, "head_sha": SHA, "status": "completed",
+                "conclusion": "success", "started_at": iso(started), "completed_at": iso(done),
+                "steps": steps or []}
+
+    def set_archive(self, archive=None):
+        self.archive = archive if archive is not None else make_zip(
+            [("staging-admission.json", json.dumps(self.receipt))])
+        self.artifact = {
+            "id": ARTIFACT_ID, "name": sa.artifact_name(SHA, RUN_ID, 1), "expired": False,
+            "size_in_bytes": len(self.archive), "digest": "sha256:" + sa.digest(self.archive),
+            "expires_at": iso(60 * 24),
+            "workflow_run": {"id": RUN_ID, "repository_id": REPO_ID, "head_repository_id": REPO_ID,
+                             "head_branch": "main", "head_sha": SHA}}
+
+    def add_other(self, conclusion, status="completed", job="staging-api"):
+        other = {"id": 101, "run_attempt": 1, "event": "push", "head_sha": OTHER_SHA,
+                 "created_at": iso(-1)}
+        self.runs.append(other)
+        self.others[101] = [{"name": job, "status": status, "conclusion": conclusion,
+                             "completed_at": iso(-1)}]
+
+    def routes(self, artifacts=None, jobs=None):
+        base = "?per_page=100&page=1"
+        r = {
+            "workflows/deploy.yml": self.workflow,
+            f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&per_page=100&page=1":
+                page("workflow_runs", self.runs),
+            f"runs/{RUN_ID}": self.run,
+            f"runs/{RUN_ID}/attempts/1/jobs{base}": jobs or page("jobs", self.jobs),
+            f"runs/{RUN_ID}/artifacts{base}": artifacts or page("artifacts", [self.artifact]),
+            f"artifacts/{ARTIFACT_ID}/zip": self.archive,
+        }
+        for rid, jobs_ in self.others.items():
+            r[f"runs/{rid}/attempts/1/jobs{base}"] = page("jobs", jobs_)
+        return r
+
+    def verify(self, routes=None, hook=None, **over):
+        args = dict(repo=REPO, repository_id=str(REPO_ID), sha=SHA, policy=self.policy,
+                    contract_bytes=self.contract_bytes, manifest_hash=sa.digest(self.manifest),
+                    producer_source_ok=lambda source: None)
+        args.update(over)
+        return sa.verify(FakeActions(routes or self.routes(), hook), **args)
+
+
+class Base(unittest.TestCase):
+    def refused(self, reason, fn, *a, **kw):
+        with self.assertRaisesRegex(sa.Refused, reason):
+            fn(*a, **kw)
+
+    def assertWorldRefused(self, world, reason, **kw):
+        self.refused(reason, world.verify, **kw)
+
+
+class PolicyTests(Base):
+    def test_default_policy_has_no_approvals_and_refuses(self):
+        policy = json.loads((HERE / "staging-admission-policy.json").read_text())
+        self.assertEqual(policy["approvals"], [])
+        self.refused("unavailable or ambiguous", sa.approved_contract, policy, CONTRACT_BYTES)
+
+    def test_missing_or_ambiguous_approval(self):
+        policy = make_policy()
+        self.refused("unavailable", sa.approved_contract, dict(policy, approvals=[]), CONTRACT_BYTES)
+        self.refused("unavailable", sa.approved_contract,
+                     dict(policy, approvals=policy["approvals"] * 2), CONTRACT_BYTES)
+
+    def test_self_enrolled_contract_hash_not_approved(self):
+        edited = json.dumps(dict(CONTRACT, criteria=CONTRACT["criteria"][:1] * 1)).encode() + b" "
+        self.refused("unapproved product contract hash", sa.approved_contract, make_policy(), edited)
+
+    def test_approval_reference_and_spec_revision(self):
+        policy = make_policy()
+        del policy["approvals"][0]["qa_approval"]
+        self.refused("missing authenticated approval", sa.approved_contract, policy, CONTRACT_BYTES)
+        other = json.dumps(dict(CONTRACT, spec_revision="spec-2")).encode()
+        self.refused("contract policy mismatch", sa.approved_contract, make_policy(other), other)
+
+    def test_contract_shape(self):
+        for criteria, reason in (
+            ([], "empty or invalid"),
+            ([{"id": "x", "applicable": False, "rationale": " "}], "rationale"),
+            ([{"id": "x", "applicable": False, "rationale": "n/a"}], "no applicable"),
+            ([{"id": "x", "applicable": True, "evidence": []}], "no executable evidence"),
+            (CONTRACT["criteria"][:1] * 2, "invalid or duplicate"),
+        ):
+            data = json.dumps(dict(CONTRACT, criteria=criteria)).encode()
+            self.refused(reason, sa.approved_contract, make_policy(data), data)
+
+
+class ProduceTests(Base):
+    def test_positive_receipt_is_satisfied(self):
+        receipt = World().receipt
+        self.assertEqual((receipt["result"], receipt["reasons"]), ("satisfied", []))
+        self.assertEqual(receipt["coverage"], [{"id": "signup", "outcome": "passed"}])
+
+    def test_incomplete_criteria_are_never_satisfied(self):
+        for kind in ({"skip": True}, {"fail": True}, {"omit": True}):
+            receipt = World(xml=make_junit(**kind)).receipt
+            self.assertEqual(receipt["result"], "incomplete", kind)
+            self.assertTrue(receipt["reasons"], kind)
+
+    def test_unapproved_policy_never_satisfied(self):
+        w = World(policy={"schema": 1, "evaluator": "junit-map-v1", "approvals": []})
+        self.assertEqual(w.receipt["result"], "incomplete")
+
+    def test_undeployed_or_unconfigured_api(self):
+        for env in ({"API_DEPLOYED": "false"}, {"API_DEPLOYED": ""}, {"API_DEPLOY_OUTCOME": "skipped"},
+                    {"API_SOURCE_SHA": OTHER_SHA}, {"API_SOURCE_SHA": ""}):
+            self.assertEqual(World(env=env).receipt["result"], "incomplete", env)
+
+    def test_gate_failure_and_identity_disagreement(self):
+        self.assertEqual(World(env={"JOURNEY_GATE": "failure"}).receipt["result"], "incomplete")
+        self.assertEqual(World(xml=make_junit(final_sha=OTHER_SHA)).receipt["result"], "incomplete")
+
+    def test_receipt_drops_unapproved_annotation_fields_and_raw_diagnostics(self):
+        xml = make_junit().replace(b'&quot;phase&quot;', b'&quot;extra&quot;: &quot;private-value&quot;, &quot;phase&quot;')
+        receipt = World(xml=xml).receipt
+        self.assertEqual(receipt["result"], "satisfied")
+        self.assertNotIn("private-value", json.dumps(receipt))
+        self.refused("invalid API outcome", sa.produce,
+                     make_env(API_DEPLOY_OUTCOME="private-value"), make_junit(), make_policy(),
+                     CONTRACT_BYTES, MANIFEST)
+
+    def test_reporter_expected_failures_and_flaky_pass_are_not_product_pass(self):
+        # Locked reporter shape: expected failures have a fail property rather
+        # than a failure element; includeRetries adds flakyFailure/flakyError.
+        for marker in ('<properties><property name="fail" value="known gap"/></properties>',
+                       '<flakyFailure message="retry failure"/>', '<flakyError/>', '<rerunFailure/>'):
+            xml = make_junit().replace(b'name="signup" />',
+                                      b'name="signup">' + marker.encode() + b'</testcase>')
+            self.assertNotEqual(xml, make_junit(), "fixture must actually insert the marker")
+            with self.subTest(marker=marker):
+                self.assertEqual(World(xml=xml).receipt["result"], "incomplete", marker)
+
+    def test_unsafe_junit(self):
+        self.refused("unsafe", sa.junit_evidence, b"<!DOCTYPE x><a/>", CONTRACT)
+        self.refused("malformed", sa.junit_evidence, b"<a>", CONTRACT)
+        self.refused("empty", sa.junit_evidence, b"<testsuite/>", CONTRACT)
+
+
+class VerifyTests(Base):
+    def test_positive(self):
+        w = World()
+        self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_positive_ignores_skipped_gate_only_later_run(self):
+        w = World()
+        w.add_other("skipped")
+        self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_hash_source_and_manifest_mismatch(self):
+        w = World()
+        self.assertWorldRefused(w, "manifest mismatch", manifest_hash=sa.digest(b"other"))
+        self.assertWorldRefused(w, "no candidate", sha=OTHER_SHA)
+        for field, value in (("sha", OTHER_SHA), ("repository", "org/other"), ("ref", "refs/heads/x"),
+                             ("event", "workflow_dispatch"), ("workflow_sha", OTHER_SHA),
+                             ("run_id", "101"), ("run_attempt", "2"), ("contract_sha256", "0" * 64),
+                             ("policy_sha256", "0" * 64), ("junit_sha256", "xyz")):
+            w = World()
+            w.receipt[field] = value
+            w.set_archive()
+            self.assertWorldRefused(w, ".", )
+
+    def test_tampered_result_and_coverage(self):
+        for field, value in (("coverage", []), ("result", "incomplete"), ("reasons", ["x"]),
+                             ("legacy_gate", "failure"), ("api", {"job": "staging-api", "deployed": False,
+                                                                  "outcome": "", "source_sha": ""})):
+            w = World()
+            w.receipt[field] = value
+            w.set_archive()
+            self.assertWorldRefused(w, ".")
+
+    def test_identity_and_time_ordering(self):
+        w = World()
+        w.receipt["identities"]["build-identity-final"]["web"] = OTHER_SHA
+        w.set_archive()
+        self.assertWorldRefused(w, "live identities disagree")
+        w = World()
+        ids = w.receipt["identities"]
+        ids["build-identity"]["observed_at"], ids["build-identity-final"]["observed_at"] = (
+            ids["build-identity-final"]["observed_at"], ids["build-identity"]["observed_at"])
+        w.set_archive()
+        self.assertWorldRefused(w, "incoherent evidence ordering")
+
+    def test_journey_timing(self):
+        w = World()
+        w.jobs[2]["completed_at"] = iso(-4)
+        self.assertWorldRefused(w, "journey timing mismatch")
+        w = World()
+        w.jobs[0]["completed_at"] = iso(-2.5)
+        self.assertWorldRefused(w, "preceded candidate deployment")
+
+    def test_foreign_repository_and_manual_workflow(self):
+        w = World()
+        w.run["head_repository"] = {"full_name": "fork/repo", "id": 8}
+        self.assertWorldRefused(w, "foreign repository")
+        w = World()
+        w.run["repository"]["id"] = 8
+        self.assertWorldRefused(w, "foreign repository")
+        w = World()
+        w.run["event"] = "workflow_dispatch"
+        self.assertWorldRefused(w, "no candidate")
+        w = World()
+        w.workflow["path"] = ".github/workflows/other.yml"
+        self.assertWorldRefused(w, "wrong staging workflow")
+        w = World()
+        w.run["head_branch"] = "topic"
+        self.assertWorldRefused(w, "superseded or unsuccessful")
+        w = World()
+        w.run["conclusion"] = "failure"
+        self.assertWorldRefused(w, "superseded or unsuccessful")
+
+    def test_producer_source_drift_refused(self):
+        def drift(source):
+            raise sa.Refused("relevant producer or trusted policy drift")
+        self.assertWorldRefused(World(), "drift", producer_source_ok=drift)
+
+    def test_superseded_and_mixed_attempts(self):
+        w = World()
+        w.runs = [dict(w.run)]
+        w.run["run_attempt"] = 2
+        self.assertWorldRefused(w, "superseded or unsuccessful")
+        w = World()
+        w.runs = [dict(w.run, run_attempt=1)]
+
+        def rerun(route, routes):
+            # A rerun appears after the artifact download.
+            if route == f"artifacts/{ARTIFACT_ID}/zip":
+                routes[f"runs/{RUN_ID}"] = dict(w.run, run_attempt=2)
+        self.assertWorldRefused(w, "superseded or unsuccessful", hook=rerun)
+        w = World()
+        w.jobs[1]["run_attempt"] = 2
+        self.assertWorldRefused(w, "required job did not pass")
+
+    def test_later_conflicting_deploy_invalidates(self):
+        for status, conclusion in (("completed", "success"), ("in_progress", None)):
+            w = World()
+            w.add_other(conclusion, status=status, job="staging-web")
+            self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_older_queued_run_can_deploy_late(self):
+        w = World()
+        w.add_other("success")
+        w.runs[1]["created_at"] = iso(-30)
+        self.assertWorldRefused(w, "intervening staging deployment")
+        w.others[101][0]["completed_at"] = iso(-15)
+        self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_jobs_missing_duplicate_or_failed(self):
+        w = World()
+        w.jobs.pop(0)
+        self.assertWorldRefused(w, "missing or ambiguous required")
+        w = World()
+        w.jobs.append(dict(w.jobs[1]))
+        self.assertWorldRefused(w, "missing or ambiguous required")
+        w = World()
+        w.jobs[1]["conclusion"] = "skipped"
+        self.assertWorldRefused(w, "required job did not pass")
+        w = World()
+        w.jobs[0]["head_sha"] = OTHER_SHA
+        self.assertWorldRefused(w, "required job did not pass")
+
+    def test_step_ordering_and_outcomes(self):
+        w = World()
+        steps = w.jobs[2]["steps"]
+        steps[0]["number"], steps[1]["number"] = 2, 1
+        self.assertWorldRefused(w, "steps must succeed in order")
+        w = World()
+        w.jobs[2]["steps"][1]["conclusion"] = "skipped"
+        self.assertWorldRefused(w, "steps must succeed in order")
+        w = World()
+        w.jobs[2]["steps"].pop()
+        self.assertWorldRefused(w, "steps must succeed in order")
+        w = World()
+        w.jobs[2]["steps"].append(dict(w.jobs[2]["steps"][0], number=9))
+        self.assertWorldRefused(w, "steps must succeed in order")
+
+    def test_artifact_missing_duplicate_or_wrong_name(self):
+        w = World()
+        w.artifact["name"] = "other"
+        self.assertWorldRefused(w, "missing or ambiguous")
+        w = World()
+        self.assertWorldRefused(w, "missing or ambiguous",
+                                routes=w.routes(artifacts=page("artifacts", [w.artifact, dict(w.artifact, id=901)])))
+
+    def test_artifact_provenance_and_expiry(self):
+        for edit in (lambda a: a.update(expired=True),
+                     lambda a: a.update(expires_at=iso(-1)),
+                     lambda a: a.update(size_in_bytes=0),
+                     lambda a: a.update(digest="md5:abc"),
+                     lambda a: a["workflow_run"].update(head_sha=OTHER_SHA),
+                     lambda a: a["workflow_run"].update(head_repository_id=8),
+                     lambda a: a["workflow_run"].update(id=101),
+                     lambda a: a["workflow_run"].update(head_branch="topic")):
+            w = World()
+            edit(w.artifact)
+            self.assertWorldRefused(w, "invalid artifact provenance|expired")
+
+    def test_artifact_digest_mismatch(self):
+        w = World()
+        w.artifact["digest"] = "sha256:" + "0" * 64
+        self.assertWorldRefused(w, "content digest mismatch")
+
+    def test_incomplete_listings(self):
+        w = World()
+        self.assertWorldRefused(w, "incomplete or exhausted jobs",
+                                routes=w.routes(jobs=page("jobs", w.jobs, total=101)))
+        self.assertWorldRefused(w, "incomplete or exhausted jobs",
+                                routes=w.routes(jobs=page("jobs", w.jobs, total=len(w.jobs) + 1)))
+        self.assertWorldRefused(w, "incomplete or exhausted artifacts",
+                                routes=w.routes(artifacts=page("artifacts", [w.artifact], total=2)))
+        w.runs = w.runs * 1
+        routes = w.routes()
+        routes[f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&per_page=100&page=1"] = page(
+            "workflow_runs", w.runs, total=250)
+        self.assertWorldRefused(w, "incomplete or exhausted workflow_runs", routes=routes)
+
+    def test_unavailable_evidence(self):
+        w = World()
+        routes = w.routes()
+        del routes[f"runs/{RUN_ID}"]
+        self.assertWorldRefused(w, "unavailable", routes=routes)
+
+    def test_approval_absence_refused_even_when_everything_is_green(self):
+        w = World()
+        self.assertWorldRefused(w, "unavailable or ambiguous",
+                                policy={"schema": 1, "evaluator": "junit-map-v1", "approvals": []})
+
+
+class TransportTests(Base):
+    def test_archive_redirect_drops_repository_token(self):
+        request = urllib.request.Request("https://api.github.com/archive", headers={"Authorization": "Bearer dummy"})
+        redirected = sa.ArtifactRedirect().redirect_request(
+            request, None, 302, "", {}, "https://storage.example.invalid/signed")
+        self.assertIsNone(redirected.get_header("Authorization"))
+        self.refused("insecure", sa.ArtifactRedirect().redirect_request,
+                     request, None, 302, "", {}, "http://storage.example.invalid/signed")
+
+    def test_identity_never_redirects_access_pair(self):
+        self.refused("redirect refused", sa.NoRedirect().redirect_request,
+                     None, None, 302, "", {}, "https://login.example.invalid")
+
+    def test_admission_point_reads_both_current_identities(self):
+        env = {"STAGING_BASE_URL": "https://staging.example.invalid", "CF_ACCESS_CLIENT_ID": "dummy-id",
+               "CF_ACCESS_CLIENT_SECRET": "dummy-secret"}
+        class Response:
+            status = 200
+            def __init__(self, data):
+                self.data = data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, limit):
+                return json.dumps(self.data).encode()
+        with patch.object(sa.urllib.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": SHA})]
+            sa.current_identity(env, SHA)
+            self.assertEqual(opener.return_value.open.call_count, 2)
+            opener.return_value.open.side_effect = [Response({"sha": SHA}), Response({"build_sha": OTHER_SHA})]
+            self.refused("current staging identity drift", sa.current_identity, env, SHA)
+        for origin in ("http://staging.example.invalid", "https://user:pass@staging.example.invalid",
+                       "https://staging.example.invalid/?token=x", ""):
+            self.refused("invalid staging identity origin", sa.current_identity,
+                         dict(env, STAGING_BASE_URL=origin), SHA)
+        self.refused("missing staging identity Access pair", sa.current_identity,
+                     {"STAGING_BASE_URL": env["STAGING_BASE_URL"]}, SHA)
+
+
+class WiringTests(Base):
+    def test_production_requires_receipt_in_addition_to_green_jobs(self):
+        workflow = (HERE.parent / ".github/workflows/deploy-production.yml").read_text()
+        evidence = workflow.split("  staging-evidence:\n", 1)[1].split("\n  deploy-production:", 1)[0]
+        self.assertIn("persist-credentials: false", evidence)
+        self.assertIn("fetch-depth: 0", evidence)
+        self.assertIn("run: python3 -I ci/staging_admission.py verify", evidence)
+        self.assertNotIn("continue-on-error", evidence)
+        self.assertIn("needs: [preflight, staging-evidence]", workflow)
+        self.assertIn("PRODUCTION_DEPLOY_ENABLED", workflow)
+        self.assertIn("CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}", evidence)
+
+    def test_producer_uses_actual_api_outputs_and_attempt_bound_artifact(self):
+        workflows = HERE.parent / ".github/workflows"
+        deploy = (workflows / "deploy.yml").read_text()
+        e2e = (workflows / "e2e-staging.yml").read_text().split("  e2e:\n", 1)[1]
+        for key, output in (("api_deployed", "deployed"), ("api_source_sha", "source_sha"),
+                            ("api_deploy_outcome", "outcome")):
+            self.assertIn(f"{key}: ${{{{ needs.staging-api.outputs.{output} }}}}", deploy)
+        self.assertIn("run: python3 -I ci/staging_admission.py produce", e2e)
+        self.assertIn("name: staging-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}", e2e)
+        self.assertIn("path: staging-admission.json", e2e)
+        self.assertIn("if-no-files-found: error", e2e)
+        self.assertIn("JOURNEY_GATE: ${{ steps.journey-gate.outcome }}", e2e)
+        self.assertIn("PLAYWRIGHT_JUNIT_INCLUDE_RETRIES: 'true'", e2e)
+        self.assertIn("includeRetries: true", (HERE.parent / "e2e/playwright.config.ts").read_text())
+        ci = (workflows / "ci.yml").read_text()
+        self.assertIn("run: python3 ci/test_staging_admission.py", ci)
+
+
+class ArchiveTests(Base):
+    def test_valid(self):
+        self.assertEqual(sa.read_archive(make_zip([("staging-admission.json", "{}")])), {})
+
+    def test_unsafe_archives(self):
+        good = ("staging-admission.json", "{}")
+        for archive, reason in (
+            (b"", "oversized or absent"),
+            (b"not a zip", "unreadable"),
+            (make_zip([]), "invalid receipt archive member"),
+            (make_zip([good, ("extra.txt", "x")]), "invalid receipt archive member"),
+            (make_zip([("../staging-admission.json", "{}")]), "invalid receipt archive member"),
+            (make_zip([("nested/staging-admission.json", "{}")]), "invalid receipt archive member"),
+            (make_zip([("staging-admission.json/", "")]), "invalid receipt archive member"),
+            (make_zip([good]) + b"\0" * sa.MAX_ARCHIVE, "oversized or absent"),
+            (make_zip([("staging-admission.json", "x" * (sa.MAX_JSON + 1))]), "invalid receipt archive member"),
+            (make_zip([("staging-admission.json", '{"a":1,"a":2}')]), "duplicate JSON field"),
+            (make_zip([("staging-admission.json", "not json")]), "malformed JSON"),
+        ):
+            self.refused(reason, sa.read_archive, archive)
+
+    def test_unsafe_archive_through_verify(self):
+        w = World()
+        w.set_archive(make_zip([("staging-admission.json", "{}"), ("x", "y")]))
+        self.assertWorldRefused(w, "invalid receipt archive member")
+
+
+if __name__ == "__main__":
+    unittest.main()

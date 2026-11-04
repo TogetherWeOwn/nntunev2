@@ -1,0 +1,100 @@
+# Candidate staging admission receipts
+
+This is a necessary source-level production prerequisite, not operational
+acceptance or permission to deploy. The manual production lane remains disabled
+by default. No runner, migration, mirror, production binding, secret or promoter
+is enabled by this change.
+
+## Current state: no approved product scope
+
+`staging-admission-policy.json` deliberately has **no approvals**. A green legacy
+journey, its permitted parked skips and a successful but unconfigured API job
+cannot qualify a candidate. The producer can publish an `incomplete` diagnostic
+receipt. Real production admission refuses until an independently approved
+product contract and complete candidate execution evidence exist. Do not enroll
+one of the synthetic test contracts as a production approval.
+
+Product requirements/applicability belong to the product authority; QA separately
+reviews their executable evidence mapping. The repository's normal protected
+review process must authenticate those decisions before a policy entry is added.
+This interface does not select or reduce the applicable product requirements.
+
+## Reviewed input encoding
+
+The contract is the exact UTF-8 bytes of `ci/product-journey-contract.json` (not
+implicitly reserialized). It has `schema: 1`, `evaluator: "junit-map-v1"`, an
+immutable `spec_revision` and a nonempty `criteria` array. Each criterion has a
+stable unique `id` and boolean `applicable`. An exclusion requires an approved
+`rationale`; an applicable criterion requires nonempty `evidence`, each item
+containing exactly `classname`, `name` and `outcome: "passed"`. Selectors identify
+individual JUnit cases, must be unique and must occur exactly once as passed.
+Missing, retried/ambiguous, skipped, parked, unconfigured or failed evidence does
+not satisfy a criterion. The trusted reporter preserves retry failure markers;
+`fail` annotations and flaky/rerun failure or error elements cannot count as a
+passed product criterion even when Playwright calls the overall test green.
+No skip is automatically an applicability exclusion. Unsupported proof types
+require reviewed evaluator changes, not boolean inputs.
+
+The trusted policy has `schema: 1`, the evaluator and exactly one current approval
+when available. An entry pins `sha256` of the exact contract bytes, the same
+`spec_revision`, and immutable repository-safe `product_approval` and `qa_approval`
+references. Approval/revocation is a reviewed policy change, never an artifact's
+`approved` field or a dispatch input. The production CLI offers no policy path,
+API origin, local receipt, acceptance boolean or contract-hash override.
+
+The migration binding is SHA-256 of the existing candidate
+`migrations/manifest.toml` bytes. It is an envelope fingerprint of that existing
+manifest, not a new migration inventory or generation scheme. The existing
+per-SQL byte checksums, numbering/drift gate and read-only deployed schema gate
+remain authoritative and unchanged; this fingerprint does not certify a database
+or authorize executing any migration.
+
+## Producer and consumer
+
+`deploy.yml` passes the actual `staging-api` outputs into its same-revision reusable
+journey workflow. After the existing legacy integrity gate, the receipt records
+fixed outcome labels, exact source/root run/attempt, migration and product hashes,
+coverage and both live identity observations. The shared live helper adds only
+SHA/timestamp annotations after both web/API assertions pass. It never annotates
+same-build success for an unconfigured or skipped API. The producer reads JUnit
+but uploads only the bounded whitelisted receipt, not JUnit, URLs, accounts,
+credentials, logs or raw diagnostics. The existing failure sanitizer is unchanged.
+
+The production verifier is checked out from the main dispatch's reviewed source,
+not the selected candidate or an artifact. It requires authenticated GitHub
+workflow/repository/run/attempt/job/step and artifact association. It reads one
+fixed bounded ZIP member in memory, checks the archive's SHA-256 against Actions'
+immutable digest and recomputes receipt satisfaction against the trusted policy.
+It separately checks the candidate's manifest from Git objects. Full source
+objects must exist on main. Relevant producer/evaluator/policy source must match
+the trusted verifier and observed current main; unrelated main movement is not
+an expiry rule. Listings that cannot prove completeness refuse rather than
+silently selecting from a partial page. A superseding attempt invalidates the old
+receipt. A known conflicting intervening staging deploy invalidates old evidence.
+
+The admission point also rereads the existing public web/API identity endpoints
+with the existing staging Access pair, refusing redirects and identity drift.
+No Access credential follows a redirect; GitHub archive redirects drop the
+repository token before crossing origins. API/network/download failures refuse.
+
+Freshness means exact source/attempt/manifest/approval coherence and drift checks,
+not a new age TTL, soak, passive-production baseline or continuous staging
+reservation. Per-lane locks do not prove uninterrupted staging ownership. These
+observations do not replace independent runtime QA, incident/drill clearance,
+release acceptance, ledger/N-1 compatibility or separate operator execution.
+
+## Offline verification
+
+`python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
+API-shaped fixtures without a network, deploy or operational acceptance claim.
+It is included in the existing required `release-proof` CI job. The production
+workflow's old inline job checks are only preliminary guards, separately covered
+by `e2e/tests/deploy-production.spec.ts`; they cannot bypass the receipt verifier.
+
+AGENTS.md “Clean-room, YouTube and MetaBrainz guardrails”: this change handles
+admission metadata only; no UI, playback, catalogue ingestion or cover-art rights
+behavior changes. No per-lane lock is represented as a shared reservation.
+
+REA angle: reuse the shipped API outputs, JUnit integrity gate, live build checks,
+migration manifest and successful-release Actions provenance pattern, rather than
+introducing an evidence service or replacement acceptance programme.

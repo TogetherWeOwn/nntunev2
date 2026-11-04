@@ -280,6 +280,7 @@ const DISPATCH_RUN: RunRow = {
 };
 
 const HEALTHY_JOBS: JobRow[] = [
+  { name: 'staging-api', conclusion: 'success' },
   { name: 'staging-web', conclusion: 'success' },
   { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
   {
@@ -288,7 +289,7 @@ const HEALTHY_JOBS: JobRow[] = [
   },
 ];
 
-test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
+test.describe('staging job prerequisites (not receipt acceptance, stubbed API)', () => {
   let server: Server;
   let base: string;
 
@@ -312,17 +313,19 @@ test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
     evidenceStub.jobsByRun.set(100, HEALTHY_JOBS);
     const result = await runEvidence(base);
     expect(result.status).toBe(0);
-    expect(result.output).toContain('staging evidence ok');
+    expect(result.output).toContain('staging evidence job prerequisites ok');
+    expect(result.output).toContain('receipt verification still required');
     expect(result.output).toContain('deploy run 100');
   });
 
-  test('accepts the bare post-deploy-e2e name', async () => {
+  test('refuses the bare post-deploy-e2e name without a full journey', async () => {
     evidenceStub.runs = [PUSH_RUN];
     evidenceStub.jobsByRun.set(100, [
       { name: 'staging-web', conclusion: 'success' },
+      { name: 'staging-api', conclusion: 'success' },
       { name: 'post-deploy-e2e', conclusion: 'success' },
     ]);
-    expect((await runEvidence(base)).status).toBe(0);
+    expect((await runEvidence(base)).status).not.toBe(0);
   });
 
   test('requests only push-triggered deploy runs', async () => {
@@ -344,6 +347,40 @@ test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
     const result = await runEvidence(base);
     expect(result.status).toBe(0);
     expect(result.output).toContain('deploy run 100');
+  });
+
+  test('refuses candidate evidence with no staging-api deployment job', async () => {
+    evidenceStub.runs = [PUSH_RUN];
+    evidenceStub.jobsByRun.set(100, HEALTHY_JOBS.filter((job) => job.name !== 'staging-api'));
+    expect((await runEvidence(base)).status).not.toBe(0);
+  });
+
+  test('refuses candidate evidence with a skipped staging-api job', async () => {
+    evidenceStub.runs = [PUSH_RUN];
+    evidenceStub.jobsByRun.set(100, [
+      ...HEALTHY_JOBS,
+      { name: 'staging-api', conclusion: 'skipped' },
+    ]);
+    expect((await runEvidence(base)).status).not.toBe(0);
+  });
+
+  test('refuses candidate evidence with a failed staging-api job', async () => {
+    evidenceStub.runs = [PUSH_RUN];
+    evidenceStub.jobsByRun.set(100, [
+      ...HEALTHY_JOBS,
+      { name: 'staging-api', conclusion: 'failure' },
+    ]);
+    expect((await runEvidence(base)).status).not.toBe(0);
+  });
+
+  test('refuses candidate evidence containing only post-deploy smoke', async () => {
+    evidenceStub.runs = [PUSH_RUN];
+    evidenceStub.jobsByRun.set(100, [
+      { name: 'staging-web', conclusion: 'success' },
+      { name: 'staging-api', conclusion: 'success' },
+      { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
+    ]);
+    expect((await runEvidence(base)).status).not.toBe(0);
   });
 
   test('refuses when no e2e job matches', async () => {
