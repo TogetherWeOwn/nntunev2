@@ -26,6 +26,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # ring's Worker backend compiles C to wasm32; never select the runner's
+  # floating default clang. These target-only pins leave native builds alone.
+  CC_wasm32_unknown_unknown: clang-18
+  AR_wasm32_unknown_unknown: llvm-ar-18
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
 
@@ -316,6 +320,8 @@ jobs:
           persist-credentials: false
       - name: Run the bounded-pool offline suite
         run: python3 scripts/test_cargo_cache.py
+      - name: Run the bounded Worker packaging offline suite
+        run: python3 scripts/test_worker_package.py
       - name: Run the pool capacity acceptance suite
         run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy

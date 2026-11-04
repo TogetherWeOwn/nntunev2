@@ -356,6 +356,28 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
         cargo_flags = args[:args.index('--')] if '--' in args else args
         required = [flag for flag in ('--offline', '--locked') if flag not in cargo_flags]
         args = [args[0]] + required + args[1:]
+    return run_leased(pool, workspace, [cargo] + args, cargo, interval, _before_stop)
+
+
+def run_worker_build(pool, crate, output, interval=1):
+    # Packaging must retain the same lock after Cargo exits: metadata and
+    # wasm-bindgen read its target output. No skip-build shim or nested lease.
+    import worker_package
+    workspace = real_directory(Path.cwd())
+    try:
+        crate, output = worker_package.validate_paths(workspace, crate, output)
+        tools = worker_package.resolve_tools()
+    except (worker_package.Refusal, subprocess.SubprocessError) as error:
+        raise Refusal(str(error)) from error
+    cargo = resolve_cargo('cargo')
+    command = [sys.executable, str(Path(__file__).with_name('worker_package.py')),
+               str(crate), str(output), cargo, *map(str, tools)]
+    return run_leased(pool, workspace, command, cargo, interval)
+
+
+def run_leased(pool, workspace, command, cargo, interval=1, _before_stop=None):
+    """Supervise one process group, including its packaging descendants."""
+    pool = real_directory(pool)
     policy = load_policy(pool)
     warn_provisioning_mismatch(pool, policy)
     if available(pool) < policy['min_available_bytes']:
@@ -415,7 +437,7 @@ def run_cargo(pool, args, cargo='cargo', interval=1, _before_stop=None):
             env['PATH'] = os.pathsep.join(filter(None, (bindir, env.get('PATH'))))
         # Pass the lease FD to Cargo as well: wrapper SIGKILL must not free it.
         try:
-            child = subprocess.Popen([cargo] + args, env=env, start_new_session=True,
+            child = subprocess.Popen(command, env=env, start_new_session=True,
                                      pass_fds=(fd,))
         except OSError:
             # Exec/fork failed: Popen reaped any forked child, so no writer
@@ -1447,6 +1469,11 @@ def main():
     run = commands.add_parser('run')
     run.add_argument('--pool', type=Path, default=DEFAULT_POOL)
     run.add_argument('cargo_args', nargs=argparse.REMAINDER)
+    worker = commands.add_parser('worker-build', help='package a Worker under one bounded lease')
+    worker.add_argument('--pool', type=Path, default=DEFAULT_POOL)
+    worker.add_argument('--crate', type=Path, required=True)
+    worker.add_argument('--output', type=Path, required=True,
+                        help='new directory inside this workspace for the finished package')
     audit = commands.add_parser('audit')
     audit.add_argument('--worktrees', type=Path, required=True)
     audit.add_argument('--inventory', type=Path, required=True)
@@ -1468,6 +1495,8 @@ def main():
             if cargo_args[:1] == ['--']:
                 cargo_args = cargo_args[1:]
             return run_cargo(args.pool, cargo_args)
+        if args.command == 'worker-build':
+            return run_worker_build(args.pool, args.crate, args.output)
         if args.command == 'audit':
             result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
         elif args.command == 'retain':
