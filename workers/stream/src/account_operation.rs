@@ -63,13 +63,20 @@ pub trait AccountConnector {
     )>;
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "ids",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Operation {
     Body(String),
     Stat(Vec<String>),
 }
 
 impl Operation {
-    fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         match self {
             Self::Body(id) => valid_probe_id(id),
             Self::Stat(ids) => {

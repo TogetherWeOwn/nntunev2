@@ -1,6 +1,7 @@
 //! Internal pool-channel authentication shared by the API and stream Workers.
 //! POST only; exact path, timestamp and bytes are authenticated. These are not
-//! user tokens, leases, or replay-proof commands. Account hints are read-only.
+//! user tokens, leases, or replay-proof commands. Operation replay is bounded
+//! by fresh account admission; it never transfers or releases a remote lease.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -14,6 +15,10 @@ pub const MAX_CLOCK_SKEW_SECS: u64 = 30;
 pub const DIAL_MATERIAL_TTL_SECS: u64 = 5;
 pub const ACCOUNT_SECRET_VAR: &str = "POOL_ACCOUNT_SECRET";
 pub const CANDIDATE_PATH: &str = "/candidate";
+pub const OPERATION_PATH: &str = "/operation";
+// Up to 500 validated message IDs, including JSON escaping. Resolver and hint
+// requests retain their original 512-byte limit.
+pub const MAX_OPERATION_BYTES: usize = 1024 * 1024;
 const MIN_SECRET_BYTES: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -48,7 +53,14 @@ impl Channel {
     fn allows(self, path: &str) -> bool {
         match self {
             Self::Resolver => matches!(path, REGISTRY_PATH | RESOLVE_PATH),
-            Self::Account => path == CANDIDATE_PATH,
+            Self::Account => matches!(path, CANDIDATE_PATH | OPERATION_PATH),
+        }
+    }
+
+    fn max_request_bytes(self, path: &str) -> usize {
+        match (self, path) {
+            (Self::Account, OPERATION_PATH) => MAX_OPERATION_BYTES,
+            _ => MAX_REQUEST_BYTES,
         }
     }
 
@@ -75,7 +87,7 @@ impl Channel {
         body: &[u8],
     ) -> Option<String> {
         let secret = secret.filter(|s| s.len() >= MIN_SECRET_BYTES)?;
-        if !self.allows(path) || body.len() > MAX_REQUEST_BYTES {
+        if !self.allows(path) || body.len() > self.max_request_bytes(path) {
             return None;
         }
         Some(format!(
@@ -96,7 +108,7 @@ impl Channel {
         let secret = secret
             .filter(|s| s.len() >= MIN_SECRET_BYTES)
             .ok_or(AuthError::NotConfigured)?;
-        if !self.allows(path) || body.len() > MAX_REQUEST_BYTES {
+        if !self.allows(path) || body.len() > self.max_request_bytes(path) {
             return Err(AuthError::Unauthorized);
         }
         let (scheme, signed) = authorization

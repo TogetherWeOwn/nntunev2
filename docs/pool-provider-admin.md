@@ -178,11 +178,36 @@ absence revokes retained membership, whereas a failed/invalid read does not
 impersonate a kill switch. Failed closure/storage never silently frees a slot.
 Local proof refusal is not provider ill-health.
 
-**No operation RPC or product caller is enabled.** The Worker connector and
-resolver adapters compile, but real dialing and public NNTP misses remain
-unreachable. Native fake-backend tests prove ordering/fencing only, not actual
-Worker persistence, alarm delivery, TLS, entropy, clock or physical closure.
-Those qualification gates and curated-track staging playback remain required.
+`account_dispatch` authenticates an exact `/operation` envelope on the separate
+account channel. The envelope names the owning account, a trusted work class and
+one BODY ID or bounded STAT batch. Invalid signatures, method/path/browser context,
+identity, object shape, unknown/duplicate fields and message IDs refuse before any
+registry/storage/resolver/dial work. Each accepted call re-admits through the
+retained owner; a signature is not a lease or a replay-proof command. Replays
+cannot bypass caps or persistent quarantine. Only this operation path accepts up
+to 1 MiB of signed JSON; registry/resolver/candidate requests stay 512-byte bounded.
+Success returns a binary BODY or JSON STAT partition, with the actual serving
+account in `x-nntune-pool-provider`. Failures are generic and name no account.
+All responses are no-store; no remote release/credential endpoint is added.
+
+`account_selection` reads a fresh registry, filters enabled/read/class-eligible
+accounts, and requests at most eight concurrent bounded owner hints. Valid hints
+rank by tier, then in-flight count, then account ID. Exactly one operation RPC is
+attempted; refusal, auth failure, timeout and a lost reply never trigger a second
+account or credential attempt. Response identity, kind, BODY size and exact STAT
+partition (including duplicate multiplicities) are checked before attribution.
+The whole selection call has a <=20-second deadline. Worker client adapters use
+only the dedicated `NNTP_ACCOUNT` namespace and never a public URL fallback.
+
+**No operation RPC or product caller is enabled.** The composed Worker operation
+handler is behind a hard false compile-time qualification gate, not an environment
+toggle. It refuses `/operation` before reading its body or credentials. Selection,
+wire/client/connector and resolver adapters compile, but real dialing and public
+NNTP misses remain unreachable. Product ingest/playback callers and attribution
+writers are not wired yet. Native fake-backend tests prove ordering/fencing only,
+not actual Worker persistence, alarm delivery, TLS, entropy, clock or physical
+closure. Those qualification gates and curated-track staging playback remain
+required before enablement.
 
 ## Verification
 
