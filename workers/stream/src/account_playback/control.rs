@@ -108,6 +108,14 @@ impl<'a> RequestControl<'a> {
         self.state.last_ms.get() / 1000
     }
 
+    pub(super) fn observed_ms(&self) -> u64 {
+        self.state.last_ms.get()
+    }
+
+    pub(super) fn deadline_ms(&self) -> u64 {
+        self.state.deadline_ms
+    }
+
     /// Terminal across all clones. This revokes local response/source authority;
     /// it never releases an account slot or claims physical transport closure.
     pub fn stop(&self) {
@@ -125,7 +133,7 @@ impl<'a> RequestControl<'a> {
         }
     }
 
-    fn check_live(&self) -> Result<(), SourceError> {
+    pub(super) fn check_live(&self) -> Result<(), SourceError> {
         if self.state.stopped.get() {
             return Err(SourceError::Cancelled);
         }

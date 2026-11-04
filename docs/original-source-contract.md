@@ -214,6 +214,40 @@ A future supplier must still bind source index/reference to its validated
 catalogue and enforce its own at-most-20-second operation timer. Local revocation
 never proves physical account closure, releases capacity or records delivery.
 
+## Catalogue/account article supplier (off-route)
+
+`account_playback::supplier::ArticleSupplier::prepare` takes a clone of the
+already verified request authority and performs one trusted source lookup under
+that authority. Missing, failed or wrong-track lookups poison the shared control.
+It retains the validated source; each inherent `open(index, reference)` binds
+both the zero-based ordinal and the exact reference to that source. The final
+article may be requested first, but no ordinal can be attempted twice and total
+attempts cannot exceed the source's article count. Dropping an unpolled call
+performs no I/O; dropping a polled pending call revokes the shared authority.
+
+Every article open creates one injected operation timer for the earlier of
+20 seconds or the request/grant deadline. It spans registry, all candidate hints
+and the single fixed-Stream BODY dispatch without resetting at stage boundaries.
+Request cancellation and the operation timer are checked before and after each
+individual I/O poll, including synchronously-ready results, so expiry or clock
+rollback cannot advance selection to another stage. A hint failure can still be
+ignored by selection; no second account is tried after an operation dispatch,
+including a lost, invalid, empty, oversized or failed reply. Every terminal
+supplier error revokes the response control too.
+
+The account transport owns bounded reads and its server retains independent
+physical-close/capacity authority when client work is cancelled. A successful
+open yields a bounded encoded article, not verified media. Successful serving
+identities (including proof articles) are internal telemetry only: no public
+metadata, cache authority, entitlement or delivered-byte meter is created.
+
+These are inherent methods, not a copied async trait or another range reader.
+Thin forwarding to the separately reviewed async library remains to be added
+once that library lands. There is no Worker supplier/timer installation, HTTP
+response, writer, public caller or newly enabled route in this increment. Native
+generated fixtures do not qualify actual Worker abort, timers or physical close;
+dialing/ingress gates, full-slice security and curated staging remain mandatory.
+
 ## Internal catalogue transport (off-route)
 
 `SourceCatalogue` verifies the v2 play grant and signs a canonical-track lookup

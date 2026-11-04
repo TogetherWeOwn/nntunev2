@@ -5,6 +5,7 @@
 //! client-written metering. No cache write, prefetch or per-user pool is involved.
 
 pub mod control;
+pub mod supplier;
 
 use std::{future::Future, io::Cursor, ops::Range};
 
