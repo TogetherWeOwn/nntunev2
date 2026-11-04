@@ -7,7 +7,7 @@ import { SUPPORTED_NNTP_PORTS, TESTIDS } from '../../../../e2e/helpers/contract.
 import { ALLOWED_NNTP_PORTS } from './vault-validation.js';
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
-const sources = import.meta.glob('../routes/**/*.svelte', {
+const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.svelte', './player/*.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
@@ -33,6 +33,13 @@ const routeForTestId: Record<ActiveTestId, string> = {
 	libraryItem: '../routes/library/+page.svelte',
 	libraryList: '../routes/library/+page.svelte',
 	libraryStaleBadge: '../routes/library/+page.svelte',
+	trackContextMenu: './interactions/ContextMenu.svelte',
+	trackMore: '../routes/library/+page.svelte',
+	favoriteMore: '../routes/library/+page.svelte',
+	trackSelectionToolbar: '../routes/library/+page.svelte',
+	queueDropTarget: './player/PlayerQueue.svelte',
+	queueMore: './player/PlayerQueue.svelte',
+	queueSelectionToolbar: './player/PlayerQueue.svelte',
 	audioPlayer: '../routes/library/+page.svelte',
 	usageMeter: '../routes/library/+page.svelte',
 	// Today the demo player carries these; the player-bar build (design
