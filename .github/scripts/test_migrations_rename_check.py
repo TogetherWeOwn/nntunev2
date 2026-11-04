@@ -116,6 +116,16 @@ class GitFixture(unittest.TestCase):
         with self.assertRaisesRegex(history.HistoryError, "lacks renamed_from"):
             self.verify(entries)
 
+    def test_byte_identical_roundtrip_uses_current_identity_not_self_alias(self):
+        self.write("0001_first.sql")
+        self.commit()
+        self.rename("0001_first.sql", "0002_intermediate.sql")
+        self.rename("0002_intermediate.sql", "0001_first.sql")
+        entries = self.prepare()
+        entries[0]["renamed_from"] = [{"file": "0002_intermediate.sql",
+                                        "sha256": entries[0]["sha256"]}]
+        self.assertEqual(len(self.verify(entries)["0001_first.sql"]), 2)
+
     def test_changed_chain_passes_through_final_names(self):
         entries = self.chain()
         verified = self.verify(entries)

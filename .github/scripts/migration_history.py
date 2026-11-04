@@ -410,7 +410,8 @@ def verify(root, base, head, manifest_text, coverage=None):
                 raise HistoryError("rename edge resolves to multiple current entries")
             owners[event] = name
             identical = event[4] == event[5] == entry["sha256"]
-            if identical and (event[2].removeprefix("migrations/"), event[4]) not in aliases:
+            applied = aliases | {(name, entry["sha256"])}
+            if identical and (event[2].removeprefix("migrations/"), event[4]) not in applied:
                 raise HistoryError("byte-identical rename lacks renamed_from applied alias")
             if not identical and event not in claimed:
                 raise HistoryError("rename edge lacks source_rename_history coverage")
