@@ -59,9 +59,14 @@ class PublicPrSecurityTests(unittest.TestCase):
         # overrides or a second caller configuration from hiding in this job.
         self.assertEqual(re.findall(r"^    ([\w-]+):", caller, re.MULTILINE),
                          ["if", "permissions", "uses"])
-        self.assertEqual(re.findall(r"^      ([\w-]+): (\w+)$", caller, re.MULTILINE),
+        self.assertEqual(re.findall(r"^      ([\w-]+): (\w+)(?: +#.*)?$", caller, re.MULTILINE),
                          [("actions", "read"), ("contents", "read"),
                           ("security-events", "write")])
+
+    def test_nontrivial_permission_reasons_are_attached_to_each_key(self):
+        caller = self.jobs["public-pr-security"]
+        self.assertRegex(caller, r"(?m)^      actions: read # .*OSV.*artifacts.*$")
+        self.assertRegex(caller, r"(?m)^      security-events: write # .*OSV.*SARIF.*$")
 
     def test_existing_ci_events_and_concurrency_stay_reportable(self):
         events = re.search(r"^on:\n(.*?)^permissions:", self.text,
