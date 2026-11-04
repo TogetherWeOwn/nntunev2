@@ -5,6 +5,59 @@ NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
 wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
 excluded from native builds and tests.
 
+## Raw Durable Object URL boundary
+
+`wrangler.toml` selects the application-owned `entry.mjs`, which imports the
+unmodified generated SDK entry. Before either `NntpAccount` or `NntpPool` fetch
+can convert a Request into Rust, `ingress.mjs` bounds its complete serialized
+URL to 256 UTF-16 units and 256 UTF-8 bytes. Over-limit or inaccessible URLs
+receive a fixed 404 without invoking the original fetch or reading headers or
+body. The bounded byte scan handles surrogate pairs and replacement characters
+without allocating an encoded copy. Platform Request creation and its JS URL
+string are outside this bound; the default/public Worker fetch is unchanged.
+
+Both generated fetch descriptors are checked before either is decorated. A
+changed SDK export shape fails initialization rather than silently exposing an
+unguarded class. Constructors, SDK recovery proxies, alarms, other methods and
+all named/default exports are retained. The Rust URL/header/body/cancellation
+checks remain defense in depth, not proof of the earlier conversion boundary.
+
+Only worker-build **0.8.7**'s normal minified module output with panic recovery
+is supported here. The build command pins that tool, rejects custom-shim and
+coredump hooks, and executes the real generated package through
+`tests/check-package.mjs` before deployment packaging can proceed. Legacy,
+no-panic-recovery and custom modes are not qualified. Local builds must use the
+bounded pool path in AGENTS.md, not the Wrangler install command:
+
+```sh
+python3 scripts/cargo_cache.py worker-build --crate workers/stream --output workers/stream/build/new-package
+node --experimental-vm-modules workers/stream/tests/check-package.mjs workers/stream/build/new-package
+node --test workers/stream/tests/ingress.test.mjs
+python3 workers/stream/tests/test_entry_config.py
+```
+
+The generated-package checker executes actual minified glue and Wasm with
+network-denying local host stubs. It counts generated fetch and URL imports,
+compares SDK recovery against its unmodified baseline, and checks both alarms
+and a harmless public route. Its optional second path argument runs the same
+behavioral bank on a bundled entry. These are local fixtures, **not actual
+Cloudflare Worker qualification** or final Wrangler-bundle proof. The release
+artifact still needs authorized Worker instrumentation at URL import/handler
+entry, direct receiving-object rejection/admission, alarm delivery and audited
+removal of test-only instrumentation. Existing TLS/entropy/clock/physical-close,
+independent security and curated one-account staging gates remain mandatory;
+operations and public misses remain disabled.
+
+No dependencies are added or installed by these tests. Existing local packaging
+tools are version-checked by `scripts/worker_package.py`; the normal CI/deployment
+install now selects the same worker-build version instead of a floating release.
+Cargo has no stable native release-age filter or blanket dependency build-script
+or proc-macro disable. Version pins and locked/offline inputs do not remove that
+supply-chain gap, and this change does not authorize a host tool installation.
+
+This backend/playback boundary follows AGENTS.md **Clean-room, YouTube and
+MetaBrainz guardrails**; tests use generated requests, not provider data.
+
 ## Account owner boundary (scheduling only)
 
 `NntpAccount` (`src/account_runtime.rs`, `NNTP_ACCOUNT`) is a separate

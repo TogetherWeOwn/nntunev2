@@ -25,11 +25,13 @@
 #   Worker binds no database, by design).
 
 name = "nntune-stream"
-main = "build/worker/shim.mjs"
+main = "entry.mjs"
 compatibility_date = "2026-10-01"
 
 [build]
-command = "cargo install -q worker-build --locked && worker-build --release"
+# Only the normal minified module/panic-recovery packaging path is supported.
+# Do not select a custom shim or skip the generated-export execution gate.
+command = 'test -z "${CUSTOM_SHIM+x}${COREDUMP+x}" && cargo install -q worker-build --version 0.8.7 --locked && worker-build --release --locked && node --experimental-vm-modules tests/check-package.mjs'
 
 [[durable_objects.bindings]]
 name = "NNTP_POOL"

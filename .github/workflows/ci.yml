@@ -322,6 +322,13 @@ jobs:
         run: python3 scripts/test_cargo_cache.py
       - name: Run the bounded Worker packaging offline suite
         run: python3 scripts/test_worker_package.py
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test the stream raw Durable Object ingress boundary
+        run: |
+          node --test workers/stream/tests/ingress.test.mjs
+          python3 workers/stream/tests/test_entry_config.py
       - name: Run the pool capacity acceptance suite
         run: python3 scripts/test_pool_capacity_acceptance.py
       - name: Validate the shipped pool policy
