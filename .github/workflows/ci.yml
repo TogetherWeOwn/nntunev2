@@ -695,7 +695,9 @@ jobs:
 
   rust-ingest:
     name: rust (workers/ingest)
-    environment: ci-fixtures
+    environment:
+      name: ci-fixtures
+      deployment: false
     env:
       FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
@@ -1318,7 +1320,9 @@ jobs:
 
   web-e2e:
     name: web-e2e
-    environment: ci-fixtures
+    environment:
+      name: ci-fixtures
+      deployment: false
     env:
       FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest

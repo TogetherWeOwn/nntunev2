@@ -29,7 +29,9 @@ env:
 jobs:
   gate:
     name: gate
-    environment: staging
+    environment:
+      name: staging
+      deployment: false
     concurrency:
       group: ${{ github.workflow }}-gate-${{ github.ref }}
       cancel-in-progress: false
