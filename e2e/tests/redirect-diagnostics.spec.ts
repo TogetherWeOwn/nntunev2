@@ -1,7 +1,13 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { apiGet, apiPost } from '../helpers/accounts.js';
+import { inspect } from 'node:util';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { apiGet, apiOptions, apiPost } from '../helpers/accounts.js';
 
 // Acceptance: credentialed redirect diagnostics must never echo URLs.
 //
@@ -465,4 +471,161 @@ test.describe('redirect diagnostics redact URLs (fake request context)', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.opts.maxRedirects, 'apiPost must never follow redirects').toBe(0);
   });
+});
+
+// Transport errors include Playwright's request log, not just the network
+// failure. Inspect all Error fields a textual reporter could serialize, but
+// assert booleans so even a red regression prints no sentinel-bearing error.
+async function transportError(fn: () => Promise<unknown>): Promise<Error> {
+  try {
+    await fn();
+  } catch (error) {
+    expect(error instanceof Error, 'transport failure must remain an Error').toBe(true);
+    return error as Error;
+  }
+  throw new Error('expected a credentialed transport failure, but the request resolved');
+}
+
+function expectSafeTransport(error: Error, method: string): void {
+  const visible = [
+    String(error),
+    error.stack ?? '',
+    inspect(error, { showHidden: true, depth: 10 }),
+    JSON.stringify(error, Object.getOwnPropertyNames(error)),
+  ].join('\n');
+  const leaked = [...Object.values(SENT), '127.0.0.1', 'raw-transport-marker'].some((value) =>
+    visible.includes(value),
+  );
+  expect(leaked, 'reporter-visible transport error leaked request or original error data').toBe(false);
+  expect(Object.hasOwn(error, 'cause'), 'raw error must not be retained as a cause').toBe(false);
+  expect(error.message).toBe(
+    `[api] credentialed ${method} request transport failed (names only — no values logged).`,
+  );
+}
+
+const transports = [
+  { method: 'GET', send: (request: APIRequestContext, url: string, timeout?: number) =>
+    apiGet(request, url, credentialed, CONTEXT, { timeout }) },
+  { method: 'POST', send: (request: APIRequestContext, url: string, timeout?: number) =>
+    apiPost(request, url, credentialed, { token: SENT.session }, CONTEXT, { timeout }) },
+  { method: 'OPTIONS', send: (request: APIRequestContext, url: string, timeout?: number) =>
+    apiOptions(request, url, credentialed, CONTEXT, { timeout }) },
+];
+
+test.describe('credentialed transport diagnostics (offline)', () => {
+  test('uncaught GET/POST failures stay redacted in list and JUnit reporters', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'transport-reporters-'));
+    const path = (relative: string) => fileURLToPath(new URL(relative, import.meta.url));
+    try {
+      writeFileSync(join(dir, 'playwright.config.ts'), `export default {
+        testDir: '.', workers: 1, retries: 0, timeout: 5000,
+        outputDir: './results', use: { trace: 'off', screenshot: 'off', video: 'off' }
+      };`);
+      writeFileSync(join(dir, 'failure.spec.ts'), `
+        import { test } from ${JSON.stringify(path('../node_modules/@playwright/test/index.mjs'))};
+        import { apiGet, apiPost } from ${JSON.stringify(path('../helpers/accounts.ts'))};
+        import { createServer } from 'node:http';
+        const headers = ${JSON.stringify(credentialed)};
+        for (const method of ['GET', 'POST']) {
+          for (const failure of ['timeout', 'connection-reset']) {
+            test(method + ' ' + failure, async ({ request }) => {
+              const server = createServer((req) => {
+                req.resume();
+                if (failure === 'connection-reset') req.socket.destroy();
+              });
+              await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+              try {
+                const url = 'http://127.0.0.1:' + server.address().port + '/${SENT.reqPath}?token=${SENT.reqQuery}';
+                if (method === 'GET') await apiGet(request, url, headers, 'probe', { timeout: 500 });
+                else await apiPost(request, url, headers, {}, 'probe', { timeout: 500 });
+              } finally {
+                server.closeAllConnections();
+                await new Promise(resolve => server.close(resolve));
+              }
+            });
+          }
+        }
+      `);
+      const result = spawnSync(process.execPath, [
+        path('../node_modules/@playwright/test/cli.js'), 'test',
+        '--config', join(dir, 'playwright.config.ts'), '--reporter=list,junit',
+      ], { encoding: 'utf8', timeout: 20_000, env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+      expect(result.error === undefined, 'nested reporter run must finish within its bound').toBe(true);
+      expect(result.status, 'all four uncaught probe requests must fail').toBe(1);
+      const output = result.stdout + result.stderr;
+      expect(/tests="4"[^>]*failures="0"[^>]*errors="4"/.test(output),
+        'JUnit must contain four transport errors, not passing or missing tests').toBe(true);
+      expect(output.includes('credentialed GET request transport failed')).toBe(true);
+      expect(output.includes('credentialed POST request transport failed')).toBe(true);
+      expect([...Object.values(SENT), '127.0.0.1'].some(value => output.includes(value)),
+        'list/JUnit output must not expose synthetic request values').toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const { method, send } of transports) {
+    for (const failure of ['timeout', 'connection-reset'] as const) {
+      test(`${method} ${failure} drops raw message, stack and cause`, async ({ request }) => {
+        let hits = 0;
+        let receivedCredentials = false;
+        const server = createServer((req) => {
+          hits++;
+          receivedCredentials = req.method === method &&
+            req.headers.authorization === credentialed.Authorization &&
+            req.headers['cf-access-client-id'] === SENT.accessId &&
+            req.headers['cf-access-client-secret'] === SENT.accessSecret;
+          req.resume();
+          if (failure === 'connection-reset') req.socket.destroy();
+          // Timeout deliberately sends nothing; cleanup destroys every socket.
+        });
+        await new Promise<void>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen(0, '127.0.0.1', resolve);
+        });
+        try {
+          const { port } = server.address() as AddressInfo;
+          const url = `http://127.0.0.1:${port}/${SENT.reqPath}?token=${SENT.reqQuery}`;
+          const error = await transportError(() => send(request, url, 500));
+          expectSafeTransport(error, method);
+          expect(hits, 'fixture must observe the failed request').toBe(1);
+          expect(receivedCredentials, 'fixture must receive the original method and headers').toBe(true);
+        } finally {
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      });
+    }
+
+    test(`${method} synchronous setup failure cannot masquerade as a safe redirect`, async () => {
+      const raw = Object.assign(new Error(`unexpected redirect Access wall ${SENT.accessSecret}`), {
+        cause: new Error(SENT.session),
+      });
+      raw.stack = `raw-transport-marker ${SENT.accessId}`;
+      const fail = () => { throw raw; };
+      const request = { get: fail, post: fail, fetch: fail } as unknown as APIRequestContext;
+      expectSafeTransport(await transportError(() => send(request, 'malformed URL')), method);
+    });
+
+    test(`${method} preserves request options and normal responses`, async () => {
+      const calls: Array<{ url: string; opts: Record<string, unknown> }> = [];
+      const response = { status: () => 403, headers: () => ({}), text: async () => '{"error":"denied"}' };
+      const respond = async (url: string, opts: Record<string, unknown>) => {
+        calls.push({ url, opts });
+        return response;
+      };
+      const request = { get: respond, post: respond, fetch: respond } as unknown as APIRequestContext;
+      const url = 'https://fixture.invalid/probe';
+      expect(await send(request, url)).toBe(response);
+      expect(await send(request, url, 1234)).toBe(response);
+      expect(calls.map((call) => call.url)).toEqual([url, url]);
+      expect(calls.map((call) => call.opts)).toEqual([30_000, 1234].map((timeout) => ({
+        headers: credentialed,
+        timeout,
+        maxRedirects: 0,
+        ...(method === 'POST' ? { data: { token: SENT.session } } : {}),
+        ...(method === 'OPTIONS' ? { method: 'OPTIONS' } : {}),
+      })));
+    });
+  }
 });
