@@ -14,6 +14,10 @@ use super::{
 };
 use crate::rotation::KekSource;
 
+pub mod http;
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
+
 /// Construction is inert. connect must be cancellation-safe and must not keep a
 /// query/connection task alive after its future or returned repository is dropped.
 #[allow(async_fn_in_trait)]
@@ -88,7 +92,7 @@ pub async fn read_timed(
     let lookup = authenticate(play_grant_key, call, now)?;
     let remaining = Duration::from_millis(lookup.deadline_ms - now);
     #[cfg(target_arch = "wasm32")]
-    let deadline = worker::Delay::from(remaining);
+    let deadline = ::worker::Delay::from(remaining);
     #[cfg(not(target_arch = "wasm32"))]
     let deadline = futures_timer::Delay::new(remaining);
     read_authorized(

@@ -232,10 +232,32 @@ wins ties, authority is rechecked across suspension and no per-query timer
 reset or retry is introduced. The injected-deadline seam remains available for
 deterministic tests.
 
-No runtime caller, binding configuration or API HTTP handler is installed here;
-the existing account/provider qualification gates are not changed. Playback
-HTTP response/backpressure, ACK/drop accounting and delivered-byte metering
-remain in their separate adapter, not in this source-record transport.
+The portable off-route `service::http::handle` accepts only the fixed POST,
+JSON content type, a bounded authorization header, no content encoding and no
+browser context. It collects at most 512 request bytes, rejects zero-progress
+chunks and requires any declared length to equal the actual body. Its raw body
+adapter must check chunk length before copying into Rust and cancel reads on
+drop. Wakeable caller cancellation and a whole-request deadline enclose body
+collection and database work; the signed timer additionally bounds the
+remaining authenticated lookup. Controls win ties, including when they become
+ready during a work poll. A backward clock poisons the entire request.
+
+Success returns the exact existing encoded source and selected-job identity;
+every failure returns the same empty 503 with no job header. Both responses
+are explicitly no-store. The off-route `service::worker::handle` candidate
+preflights raw JavaScript URL/header lengths before Rust conversion and raw
+chunk lengths before copying. It binds an abort-event listener to a retained
+waker, removes that listener on drop, cancels the body reader on drop and
+supplies one five-second request timer in addition to the signed remaining
+time. It materializes only the exact source/job response, with explicit content
+length and no cache, CORS, compression or fallback middleware. Neither native
+fakes nor compilation establish actual Worker abort propagation or database
+physical closure.
+
+No runtime caller, binding configuration or API ingress is installed here; the
+existing account/provider qualification gates are not changed. Playback HTTP
+response/backpressure, ACK/drop accounting and delivered-byte metering remain
+in their separate adapter, not in this source-record transport.
 
 ## Acceptance boundary and verification
 

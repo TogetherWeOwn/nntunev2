@@ -33,6 +33,8 @@ use crate::{
 };
 use nntune_core::original_source::service::Payload;
 
+mod http_tests;
+
 const A: &str = "00000000-0000-0000-0000-000000000001";
 const RELEASE: &str = "00000000-0000-0000-0000-000000000003";
 const RECORDING: &str = "00000000-0000-0000-0000-000000000004";
