@@ -5,6 +5,9 @@ import copy
 import importlib.util
 import io
 import json
+import os
+import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
@@ -615,6 +618,147 @@ class VerifyTests(Base):
         w = World()
         self.assertWorldRefused(w, "unavailable or ambiguous",
                                 policy={"schema": 1, "evaluator": "junit-map-v1", "approvals": []})
+
+
+class SourceBindingTests(Base):
+    """Exercise main/verify with real Git objects; only Actions/live HTTP are fake."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.objects = {}
+        self.git("init", "--bare", "--quiet")
+        self.contract = json.dumps(dict(CONTRACT, criteria=[{
+            "id": "signup", "applicable": True, "evidence": [{
+                "classname": "signup.spec.ts", "name": "signup", "outcome": "passed"}]}])).encode()
+        self.policy = make_policy(self.contract)
+        for name, data in ((sa.POLICY, json.dumps(self.policy).encode()), (sa.CONTRACT, self.contract)):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        self.files = {name: ("100644", b"reviewed source") for name in sa.TRUSTED_FILES}
+        self.files.update({f"{name}/fixture": ("100644", b"reviewed tree") for name in sa.TRUSTED_TREES})
+        self.files.update({
+            "e2e/helpers/build-identity-live.ts": ("100644", b"listed identity helper"),
+            "e2e/tests/signup.spec.ts": ("100644", b"mapped journey implementation"),
+            "e2e/helpers/accounts.ts": ("100644", b"identity dependency"),
+            "e2e/helpers/access.ts": ("100644", b"transitive dependency"),
+            "e2e/package.json": ("100644", b"reporter runtime"),
+            "e2e/package-lock.json": ("100644", b"locked reporter runtime"),
+            "e2e/tsconfig.json": ("100644", b"compiler configuration"),
+            "e2e/fixtures/bot-contract/grants.json": ("100644", b"evidence fixture"),
+            "bin/smoke.mjs": ("100644", b"external executable"),
+            "fixtures/cc0/fetch_fixture.py": ("100644", b"external helper"),
+            "migrations/manifest.toml": ("100644", MANIFEST),
+            sa.POLICY: ("100644", json.dumps(self.policy).encode()),
+            sa.CONTRACT: ("100644", self.contract),
+        })
+
+    def git(self, *args, data=None):
+        env = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_COMMITTER_NAME="Fixture",
+                   GIT_AUTHOR_EMAIL="fixture@example.invalid", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        key = (args, data)
+        immutable = args[0] in ("hash-object", "mktree")
+        if immutable and key in self.objects:
+            return self.objects[key]
+        result = subprocess.check_output(["git", "-C", str(self.root), *args], input=data,
+                                         stderr=subprocess.PIPE, env=env, timeout=15)
+        if immutable:
+            self.objects[key] = result
+        return result
+
+    def commit(self, files, parent=None):
+        nested = {}
+        for path, value in files.items():
+            node = nested
+            parts = path.split("/")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+        def tree(node):
+            rows = []
+            for name, value in node.items():
+                if isinstance(value, dict):
+                    mode, kind, oid = "040000", "tree", tree(value)
+                else:
+                    mode, content = value
+                    kind, oid = "blob", self.git("hash-object", "-w", "--stdin", data=content).strip()
+                rows.append(f"{mode} {kind} ".encode() + oid + b"\t" + name.encode() + b"\0")
+            return self.git("mktree", "-z", data=b"".join(rows)).strip()
+        args = ["commit-tree", tree(nested).decode(), "-m", "synthetic source"]
+        if parent:
+            args.extend(["-p", parent])
+        return self.git(*args).decode().strip()
+
+    def run_main(self, candidate_files=None, trusted_files=None, current_files=None):
+        candidate = self.commit(candidate_files or self.files)
+        trusted = self.commit(trusted_files or self.files, candidate)
+        current = self.commit(current_files or trusted_files or self.files, trusted)
+        self.git("update-ref", "HEAD", trusted)
+        self.git("update-ref", "refs/remotes/origin/main", current)
+        with patch.dict(globals(), SHA=candidate):
+            world = World(policy=self.policy, contract_bytes=self.contract,
+                          xml=make_junit(final_sha=candidate).replace(
+                              b'classname="journey"', b'classname="signup.spec.ts"'))
+            actions = FakeActions(world.routes())
+        env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
+                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token")
+        with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
+                patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
+                patch.object(sa, "Actions", return_value=actions), \
+                patch.object(sa, "current_identity") as live, patch("sys.stdout", new=io.StringIO()):
+            sa.main()
+            live.assert_called_once_with(sa.os.environ, candidate)
+        self.assertIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
+
+    def test_main_accepts_matching_closure_despite_unrelated_main_movement(self):
+        current = dict(self.files, **{"docs/unrelated.md": ("100644", b"unrelated main change")})
+        self.run_main(current_files=current)
+
+    def test_main_refuses_older_executable_evidence_inputs(self):
+        for name in ("e2e/tests/signup.spec.ts", "e2e/helpers/accounts.ts", "e2e/helpers/access.ts",
+                     "e2e/package.json", "e2e/package-lock.json", "e2e/tsconfig.json",
+                     "e2e/fixtures/bot-contract/grants.json", "bin/smoke.mjs",
+                     "fixtures/cc0/fetch_fixture.py"):
+            with self.subTest(path=name):
+                corrected = dict(self.files, **{name: ("100644", b"corrected evidence input")})
+                self.refused("producer.*drift", self.run_main, trusted_files=corrected)
+
+    def test_main_refuses_current_main_only_dependency_drift(self):
+        corrected = dict(self.files, **{"e2e/helpers/accounts.ts": ("100644", b"current main correction")})
+        self.refused("producer.*drift", self.run_main, current_files=corrected)
+
+    def test_main_refuses_trusted_dispatch_only_dependency_drift(self):
+        corrected = dict(self.files, **{"e2e/package-lock.json": ("100644", b"dispatch correction")})
+        self.refused("producer.*drift", self.run_main, trusted_files=corrected, current_files=self.files)
+
+    def test_main_refuses_dependency_addition_deletion_and_mode_change(self):
+        added = dict(self.files, **{"e2e/helpers/new-dependency.ts": ("100644", b"new dependency")})
+        deleted = dict(self.files)
+        del deleted["e2e/helpers/accounts.ts"]
+        executable = dict(self.files, **{"e2e/helpers/accounts.ts": ("100755", b"identity dependency")})
+        symlink = dict(self.files, **{"e2e/helpers/accounts.ts": ("120000", b"access.ts")})
+        for changed in (added, deleted, executable, symlink):
+            with self.subTest(files=changed):
+                self.refused("producer.*drift", self.run_main, trusted_files=changed)
+
+    def test_main_refuses_external_tree_input_drift(self):
+        for tree in sa.TRUSTED_TREES:
+            with self.subTest(tree=tree):
+                changed = dict(self.files, **{f"{tree}/fixture": ("100644", b"corrected external input")})
+                self.refused("producer.*drift", self.run_main, trusted_files=changed)
+
+    def test_main_refuses_missing_and_non_tree_dependency_roots(self):
+        missing = {path: value for path, value in self.files.items() if not path.startswith("e2e/")}
+        symlink = dict(missing, e2e=("120000", b"elsewhere"))
+        for changed in (missing, symlink):
+            with self.subTest(root=changed.get("e2e")):
+                self.refused("missing or unsupported", self.run_main, trusted_files=changed)
+
+    def test_main_existing_identity_helper_drift_negative_control(self):
+        changed = dict(self.files, **{"e2e/helpers/build-identity-live.ts": ("100644", b"correction")})
+        self.refused("producer.*drift", self.run_main, trusted_files=changed)
 
 
 class TransportTests(Base):

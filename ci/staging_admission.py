@@ -30,13 +30,18 @@ WORKFLOW = ".github/workflows/deploy.yml"
 JOURNEY = "post-deploy-e2e / full journey (signup → library → meter → limits)"
 RECORD = "Record candidate admission receipt"
 UPLOAD = "Upload candidate admission receipt"
-# Relevant producer/evaluator changes invalidate old evidence, not unrelated main
-# movement. These files are compared to the trusted verifier and current main.
+# Bind conservative dependency roots, not a hand-picked set of test helpers.
+# The journey loads every e2e spec, imports helpers and reads/spawns root inputs.
+# Tree object IDs include all committed descendants, names, types and modes;
+# package/lock/config changes and new/deleted dependencies cannot be missed.
+# Changes outside these roots still do not expire evidence just by moving main.
+TRUSTED_TREES = (
+    "e2e", ".github", "fixtures/cc0", "config", "workers", "crates/nntune-config",
+)
 TRUSTED_FILES = (
-    WORKFLOW, ".github/workflows/e2e-staging.yml", "ci/staging_admission.py", POLICY, CONTRACT,
-    "e2e/helpers/build-identity-live.ts", "e2e/helpers/build-identity.ts",
-    "e2e/tests/build-identity.spec.ts", "e2e/tests/zz-build-identity-final.spec.ts",
-    "e2e/scripts/enforce-journey-evidence.mjs", "e2e/playwright.config.ts",
+    "ci/staging_admission.py", POLICY, CONTRACT, "bin/smoke.mjs", "Cargo.toml", "README.md",
+    "apps/web/wrangler.toml", "crates/nntune-core/src/transcode.rs",
+    "containers/mb-import/Dockerfile", "docs/api-errors.md", "docs/cost-basis.md",
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
@@ -553,10 +558,18 @@ def main():
     require(SHA.fullmatch(trusted) and git("rev-parse", "HEAD").decode().strip() == trusted,
             "verifier checkout is not workflow source")
     git("merge-base", "--is-ancestor", sha, "origin/main")
+    def source_binding(source):
+        records = git("ls-tree", "-z", source, "--", *TRUSTED_TREES, *TRUSTED_FILES)
+        entries = dict(row.split(b"\t", 1)[::-1] for row in records.split(b"\0") if row)
+        require(set(entries) == {path.encode() for path in (*TRUSTED_TREES, *TRUSTED_FILES)}
+                and all(entries[path.encode()].startswith(b"040000 tree ") for path in TRUSTED_TREES)
+                and all(entries[path.encode()].startswith(b"100644 blob ")
+                        or entries[path.encode()].startswith(b"100755 blob ") for path in TRUSTED_FILES),
+                "missing or unsupported producer dependency source")
+        return records
     def producer_source_ok(source):
-        for file in TRUSTED_FILES:
-            require(git_file(source, file) == git_file(trusted, file) == git_file("origin/main", file),
-                    "relevant producer or trusted policy drift; new evidence required")
+        require(source_binding(source) == source_binding(trusted) == source_binding("origin/main"),
+                "relevant producer or trusted policy drift; new evidence required")
     manifest = git_file(sha, "migrations/manifest.toml")
     require(manifest == git_file("origin/main", "migrations/manifest.toml"), "current migration manifest drift")
     verify(Actions(env["GITHUB_REPOSITORY"], env["GITHUB_TOKEN"]), repo=env["GITHUB_REPOSITORY"],

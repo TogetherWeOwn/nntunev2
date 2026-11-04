@@ -72,6 +72,28 @@ an expiry rule. Listings that cannot prove completeness refuse rather than
 silently selecting from a partial page. A superseding attempt invalidates the old
 receipt. A known conflicting intervening staging deploy invalidates old evidence.
 
+Source binding compares Git tree records (object IDs, names, types and modes),
+not selected helper bytes or the whole repository commit. The complete committed
+`e2e/` tree binds every mapped test, imported/transitive helper, fixture, script,
+Playwright/TypeScript configuration and reporter/runtime package and lock input.
+No TypeScript import parser or contract-selector-to-filename guess is involved:
+all specs load in the staging journey, so the conservative superset is deliberate.
+Generated/untracked reports, installed packages and caches are not Git inputs;
+`npm ci` and the workflow-pinned toolchain supply the locked runtime.
+
+The suite also reads or executes repository inputs outside `e2e/`. The binding
+includes `.github/`, `fixtures/cc0/`, `config/`, `workers/` and
+`crates/nntune-config/` trees, plus `bin/smoke.mjs`, `Cargo.toml`, `README.md`,
+`apps/web/wrangler.toml`, `crates/nntune-core/src/transcode.rs`,
+`containers/mb-import/Dockerfile`, `docs/api-errors.md` and `docs/cost-basis.md`.
+The evaluator, policy and contract remain explicitly bound. These conservative
+roots include source-scanned fixtures and worker-lockfile discovery, not just
+executable imports. Missing roots, non-tree roots and non-regular explicit files
+refuse. Adding dependencies outside these roots requires a reviewed binding
+update along with the test/runner change; do not narrow the roots to whatever
+happens to pass an older receipt. Changes elsewhere (for example an unrelated
+operations document) remain allowed and do not create a commit-age expiry rule.
+
 Candidate discovery queries the exact source SHA, not all lifetime history.
 Conflict discovery includes every run created within 66 days before the opening
 identity observation, plus independent all-time queries for queued, in-progress,
