@@ -3,8 +3,7 @@ import { describe, expect, it } from 'vitest';
 // Single source of truth lives in the e2e harness: if the app drifts
 // (renamed hook), this test names the missing contract key — the failure
 // IS the signal, not noise. Test-only import; never bundled into the app.
-import { SUPPORTED_NNTP_PORTS, TESTIDS } from '../../../../e2e/helpers/contract.js';
-import { ALLOWED_NNTP_PORTS } from './vault-validation.js';
+import { TESTIDS } from '../../../../e2e/helpers/contract.js';
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
 const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.svelte', './player/*.svelte'], {
@@ -13,23 +12,14 @@ const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.sve
 	eager: true
 }) as Record<string, string>;
 
-// Only the retired import hooks are excluded; every other shared hook
-// must still have a route pin while the end-to-end contract is migrated.
-type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus'>;
+// Legacy API fixtures retain the retired hooks; active web hooks still
+// require a markup pin while the end-to-end contract is migrated.
+type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus' | `byop${string}`>;
 const routeForTestId: Record<ActiveTestId, string> = {
 	appRoot: '../routes/+page.svelte',
 	signupEmail: '../routes/signup/+page.svelte',
 	signupSubmit: '../routes/signup/+page.svelte',
 	signupError: '../routes/signup/+page.svelte',
-	byopHost: '../routes/onboarding/byop/+page.svelte',
-	byopPort: '../routes/onboarding/byop/+page.svelte',
-	byopUser: '../routes/onboarding/byop/+page.svelte',
-	byopPass: '../routes/onboarding/byop/+page.svelte',
-	byopTls: '../routes/onboarding/byop/+page.svelte',
-	byopConnections: '../routes/onboarding/byop/+page.svelte',
-	byopTest: '../routes/onboarding/byop/+page.svelte',
-	byopSave: '../routes/onboarding/byop/+page.svelte',
-	byopStatus: '../routes/onboarding/byop/+page.svelte',
 	libraryItem: '../routes/library/+page.svelte',
 	libraryList: '../routes/library/+page.svelte',
 	libraryStaleBadge: '../routes/library/+page.svelte',
@@ -70,9 +60,19 @@ describe('retired user NZB import', () => {
 	});
 });
 
-describe('e2e NNTP port allowlist', () => {
-	it('matches the app/API allowlist (no drift between the copies)', () => {
-		expect([...SUPPORTED_NNTP_PORTS]).toEqual([...ALLOWED_NNTP_PORTS]);
+describe('retired provider credential routes', () => {
+	it('has no provider form, route, navigation link, or vault call in active web source', () => {
+		const webSources = import.meta.glob(['../routes/**/*.{svelte,ts}', './api/client.ts'], {
+			query: '?raw', import: 'default', eager: true
+		}) as Record<string, string>;
+		for (const [path, source] of Object.entries(webSources)) {
+			if (path.endsWith('.test.ts')) continue;
+			expect(path).not.toMatch(/\/onboarding\/(?:byop|provider)\//);
+			expect(path).not.toContain('/account/provider/');
+			expect(source).not.toMatch(/\/(?:onboarding\/(?:byop|provider)|account\/provider)\b/);
+			expect(source).not.toContain('/v1/vault');
+			expect(source).not.toMatch(/data-testid=["']byop-/);
+		}
 	});
 });
 

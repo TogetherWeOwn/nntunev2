@@ -38,18 +38,18 @@ describe('account security page', () => {
 		expect(body).toMatch(/<button[^>]*>[\s\S]*?Sign out[\s\S]*?<\/button>/i);
 	});
 
-	it('verifies an authenticated session with a read-only vault request', async () => {
+	it('verifies an authenticated session with a read-only credentials request', async () => {
 		const requests: Array<{ url: string; method: string }> = [];
 		const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
 			requests.push({ url: String(input), method: init?.method ?? 'GET' });
-			return new Response('{}', { status: 200 });
+			return new Response('{"credentials":[]}', { status: 200 });
 		}) as typeof fetch;
 
 		const data = await load({ fetch: fetchFn } as never);
 
 		expect(data?.sessionCheckFailed).toBe(false);
 		expect(requests).toHaveLength(1);
-		expect(requests[0]).toMatchObject({ url: expect.stringMatching(/\/v1\/vault$/), method: 'GET' });
+		expect(requests[0]).toMatchObject({ url: expect.stringMatching(/\/v1\/credentials$/), method: 'GET' });
 		expect(requests.some(({ url }) => /refresh|rotate/i.test(url))).toBe(false);
 	});
 
@@ -106,7 +106,7 @@ describe('account security page', () => {
 			expect(local.getItem(LIBRARY_SNAPSHOT_KEY)).toBeNull();
 			expect(broadcasts).toHaveLength(1);
 			expect(requests).toHaveLength(1);
-			expect(requests[0]).toMatch(/\/v1\/vault$/);
+			expect(requests[0]).toMatch(/\/v1\/credentials$/);
 			expect(requests.some((url) => /refresh|rotate/i.test(url))).toBe(false);
 		} finally {
 			vi.unstubAllGlobals();

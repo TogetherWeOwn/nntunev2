@@ -150,7 +150,7 @@
 			invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
-			window.location.href = '/library';
+			window.location.href = '/account/billing';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
@@ -175,14 +175,13 @@
 
 <svelte:head>
 	<title>NNTune — get started</title>
-	<meta name="description" content="Create your NNTune account and connect your Usenet provider." />
+	<meta name="description" content="Create your NNTune account and start listening." />
 </svelte:head>
 
 <main class="nt-wrap">
 	<h1>Get started</h1>
 	<p>
-		Create your account with a passkey — no password to phish or leak. Then connect your own
-		Usenet provider in the next step.
+		Create your account with a passkey — no password to phish or leak. Choose your plan next.
 	</p>
 	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'dismissed' || status === 'created'}
 		<form onsubmit={finishAccount}>
@@ -277,7 +276,7 @@
 	{:else if status === 'error'}
 		<p id="signup-email-error" data-testid="signup-error" role="alert">Something went wrong. Try again.</p>
 	{:else if status === 'created'}
-		<p role="status">Account created — taking you to provider setup…</p>
+		<p role="status">Account created — taking you to choose your plan…</p>
 	{/if}
 	<p>Already have an account? <a href="/login">Sign in</a>.</p>
 </main>

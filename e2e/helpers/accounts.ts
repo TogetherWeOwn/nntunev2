@@ -671,10 +671,10 @@ export async function awaitSignupOutcome(
  * the reachable first step of the real two-step flow: submit starts
  * registration (`registerStart`) and the page renders the emailed-code form
  * (`input[name="magic_code"]`, "Finish creating account"). Navigation to the
- * library happens only after the emailed code plus a passkey finish
+ * billing plan picker happens only after the emailed code plus a passkey finish
  * (`registerFinish`), which needs a staging-only code-retrieval seam and a
  * WebAuthn virtual authenticator (covered separately by
- * `submitPublicUiSignupToLibrary`) — so this helper must NOT assert library
+ * `submitPublicUiSignupToBilling`) — so this helper must NOT assert billing
  * arrival, or every configured run goes red. It never
  * touches the test-account seam, so it proves public UI form submission even
  * when the seam is configured. Callers authenticate the page first (a null
@@ -810,15 +810,15 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
 
 /**
  * Submit the public `/signup` form as a fresh synthetic identity and carry
- * the real two-step flow all the way to the library: submit starts
+ * the real two-step flow all the way to the billing plan picker: submit starts
  * registration (`registerStart`), the emailed-code step is filled with the
  * code from the staging-only retrieval seam (`retrieveStagedSignupCode`),
  * and the passkey finish (`registerFinish`) runs against a WebAuthn virtual
  * authenticator (`enableVirtualAuthenticator`), after which the page
- * navigates to `/library`.
+ * navigates to `/account/billing`.
  *
  * Unlike `submitPublicUiSignup` (which stops at the `magic_code` step so
- * every configured run stays green), this helper asserts library arrival and
+ * every configured run stays green), this helper asserts billing arrival and
  * therefore requires the seam: without it the code-retrieval POST fails with
  * the documented `[code-seam]` signature. It never touches the test-account
  * mint seam, so the account it creates comes only from the public form. Call
@@ -827,7 +827,7 @@ export async function enableVirtualAuthenticator(page: Page): Promise<void> {
  * identity; it and the code value are never interpolated into an assertion
  * message or diagnostic here.
  */
-export async function submitPublicUiSignupToLibrary(
+export async function submitPublicUiSignupToBilling(
   page: Page,
   request: APIRequestContext,
   baseURL: string,
@@ -854,7 +854,7 @@ export async function submitPublicUiSignupToLibrary(
   const code = await retrieveStagedSignupCode(request, baseURL, email);
   if (!code) {
     throw new Error(
-      '[code-seam] no staged signup code: this library-arrival step requires QA_AUTH_TOKEN ' +
+      '[code-seam] no staged signup code: this billing-arrival step requires QA_AUTH_TOKEN ' +
         'plus the staging code-retrieval seam for example.test mailboxes ' +
         '(names only — no values logged). See e2e/README.md.',
     );
@@ -864,18 +864,18 @@ export async function submitPublicUiSignupToLibrary(
   await enableVirtualAuthenticator(page);
   await codeField.fill(code);
   await page.getByRole('button', { name: 'Finish creating account' }).click();
-  // The page navigates to the library only after the emailed code plus
+  // The page navigates to billing only after the emailed code plus
   // the passkey finish succeed server-side. The regex waits for the
   // navigation; the plain-string read below names the arrival path verbatim
   // (kept as a pinnable contract string, never a value).
-  await expect(page, 'public UI signup did not reach the library').toHaveURL(/\/library/, {
+  await expect(page, 'public UI signup did not reach billing').toHaveURL(/\/account\/billing/, {
     timeout: 30_000,
   });
-  expect(page.url(), 'public UI signup did not land on the library').toContain('/library');
+  expect(page.url(), 'public UI signup did not land on billing').toContain('/account/billing');
   await waitForHydration(page, 'signup-arrival');
   await expect(
     page.getByRole('heading', { level: 1 }),
-    'library heading not visible after public UI signup',
-  ).toContainText('Library', { timeout: 15_000 });
+    'billing heading not visible after public UI signup',
+  ).toContainText('Billing', { timeout: 15_000 });
   return { email, viaApi: false };
 }

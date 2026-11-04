@@ -65,7 +65,7 @@ All routes below are POST. Binary values are unpadded base64url. Finish request
 structs reject unknown fields. Browser credential objects are flattened by the
 client; transports, attachment, extensions and userHandle are not finish fields.
 Sources: `workers/api/src/handlers.rs:1416-1444`,
-`apps/web/src/lib/api/client.ts:287-324`, `apps/web/src/lib/webauthn.ts:36-54`.
+`apps/web/src/lib/api/client.ts:158-195`, `apps/web/src/lib/webauthn.ts:36-54`.
 
 | Route | Request | Success |
 | --- | --- | --- |
@@ -81,7 +81,7 @@ Sources: `workers/api/src/handlers.rs:1467-1501`,
 `workers/api/src/handlers.rs:1928-1986`,
 `workers/api/src/handlers.rs:2083-2099`,
 `workers/api/src/handlers.rs:2233-2240`,
-`apps/web/src/lib/api/client.ts:471-546`.
+`apps/web/src/lib/api/client.ts:342-417`.
 
 Registration is initial enrollment only. An existing account with any passkey
 receives the same-shaped stand-in/unusable challenge; finish also rejects it.
@@ -159,7 +159,7 @@ explicitly does not record BE/BS. Sources: `migrations/0002_auth_vault.sql:17-35
 **No passkey list, remove, rename or authenticated add route exists** in the
 dispatcher. `/v1/credentials` is the separate native-REST bearer surface.
 Sources: `workers/api/src/handlers.rs:3341-3375`,
-`apps/web/src/lib/api/client.ts:449-467`.
+`apps/web/src/lib/api/client.ts:320-338`.
 
 The registry uses `{code,message,retryable}`, not `error_code/next_action`.
 Relevant registered codes are invalid_request (400), unauthorized and
@@ -174,7 +174,7 @@ Reachable auth handlers also return legacy generic 401
 Do not promise a uniform structured envelope for old routes. Freshness failure
 is structured reauth_required. The frontend validates start-success shapes
 before opening a ceremony. Sources: `workers/api/src/handlers.rs:906-969`,
-`apps/web/src/lib/api/client.ts:223-277`.
+`apps/web/src/lib/api/client.ts:94-148`.
 
 Session created_at is the fresh-auth timestamp: 600 seconds inclusive. Refresh
 preserves it; no method-specific proof receipt is in session claims. Existing

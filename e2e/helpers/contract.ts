@@ -111,8 +111,8 @@ export const API = {
   // served as `application/manifest+json`). A renamed path fails the
   // served-routes spec with this key named.
   manifest: '/manifest.webmanifest',
-  // Legacy provider-setup entry point (`apps/web/src/routes/onboarding/provider/+server.ts`,
-  // 307-redirects to `/onboarding/byop`). A renamed path fails the
+  // Retired provider-setup entry point (the route and the BYOP wizard are
+  // gone; both resolve to the app 404). A resurrected path fails the
   // served-routes spec with this key named.
   onboardingProvider: '/onboarding/provider',
   // Public plans page (`apps/web/src/routes/pricing/+page.svelte`).

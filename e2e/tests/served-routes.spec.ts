@@ -105,57 +105,45 @@ test.describe('served web routes (no-auth, staging)', () => {
     ).toBe('<svg');
   });
 
-  test('GET /onboarding/provider redirects to /onboarding/byop (307)', async ({ page }) => {
-    const baseURL = stagingBaseUrl('skip', 'served-provider-redirect');
+  test('GET /onboarding/provider and /onboarding/byop resolve to not-found (404)', async ({
+    page,
+  }) => {
+    const baseURL = stagingBaseUrl('skip', 'served-provider-retired');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
-    sessionlessHeaders('served-provider-redirect');
+    sessionlessHeaders('served-provider-retired');
     await applyAccountToPage(page, null, baseURL);
-    // The no-follow API wrapper throws on 3xx without naming the target
-    // (redirect diagnostics are value-free by design), so the 307 target is
-    // asserted through the browser: the staging-origin route hands the 307
-    // to the browser as-is and the follow-up re-enters the scope check.
-    const providerUrl = `${baseURL}${API.onboardingProvider}`;
-    const seen: Array<{ url: string; status: number }> = [];
-    page.on('response', (response) => {
-      if (response.url().startsWith(baseURL)) {
-        seen.push({ url: response.url(), status: response.status() });
-      }
-    });
-    const response = await page.goto(providerUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
-    });
-    expect(response, 'no HTTP response for provider redirect').not.toBeNull();
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(response?.headers() ?? {})) headers[k] = v;
-    assertNoAccessWall(
-      {
-        status: response?.status() ?? 0,
-        headers,
-        bodyText: await page.content().catch(() => ''),
-        url: providerUrl,
-      },
-      'served-provider-redirect',
-    );
-    expect(
-      seen.some((entry) => entry.url === providerUrl && entry.status === 307),
-      '[served-provider-redirect] expected an HTTP 307 from the provider route (names only — no location logged)',
-    ).toBe(true);
-    expect(
-      new URL(page.url()).href,
-      '[served-provider-redirect] provider route did not land on the BYOP wizard',
-    ).toBe(new URL('/onboarding/byop', baseURL).href);
-    expect(
-      response?.status(),
-      '[served-provider-redirect] provider redirect did not land on a live page',
-    ).toBe(200);
+    // User provider setup is retired: the legacy redirect entry point and
+    // the wizard both resolve to the app 404, never a credential form.
+    for (const path of [API.onboardingProvider, '/onboarding/byop']) {
+      const url = `${baseURL}${path}`;
+      const response = await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30_000,
+      });
+      expect(response, `no HTTP response for retired route ${path}`).not.toBeNull();
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(response?.headers() ?? {})) headers[k] = v;
+      assertNoAccessWall(
+        {
+          status: response?.status() ?? 0,
+          headers,
+          bodyText: await page.content().catch(() => ''),
+          url,
+        },
+        'served-provider-retired',
+      );
+      expect(
+        response?.status(),
+        `[served-provider-retired] expected HTTP 404 for retired route ${path}`,
+      ).toBe(404);
+    }
     await expect(
       page.getByRole('heading', { level: 1 }),
-      '[served-provider-redirect] BYOP wizard not visible after provider redirect',
-    ).toContainText(/connect your provider/i, { timeout: 15_000 });
+      '[served-provider-retired] 404 page not visible after retired provider route',
+    ).toContainText(/page not found/i, { timeout: 15_000 });
   });
 
   test('GET /pricing serves the plans page', async ({ page }) => {
