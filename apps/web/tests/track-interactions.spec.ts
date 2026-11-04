@@ -765,3 +765,72 @@ test('queue More is guarded with aria-disabled, not native disabled, during a de
 	await page.keyboard.press('Escape');
 	await expect(menu(page)).toHaveCount(0);
 });
+
+for (const gesture of ['Shift+Space', 'Shift+click'] as const) {
+	test(`${gesture} on a primary that leaves Selected only recovers focus when the anchor is hidden by find`, async ({ page }) => {
+		await seed(page);
+		await libraryRow(page, 'coral').getByRole('checkbox').check();
+		await libraryRow(page, 'dawn').getByRole('checkbox').check();
+		const show = page.getByLabel('Show', { exact: true });
+		await show.selectOption({ label: 'Selected only' });
+		await page.getByLabel('Find in loaded tracks', { exact: true }).fill('Coral');
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(1);
+		await expect(libraryRow(page, 'dawn')).toHaveCount(0);
+		const primary = libraryRow(page, 'coral').locator('.nt-library-row');
+		if (gesture === 'Shift+Space') {
+			await primary.focus();
+			await page.keyboard.press('Shift+Space');
+		} else {
+			await primary.click({ modifiers: ['Shift'] });
+		}
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(0);
+		await expect(page.locator('body')).not.toBeFocused();
+		await expect(show).toBeFocused();
+	});
+}
+
+test('queue Unstar under library Favorites only keeps focus on the queue More control', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	await libraryRow(page, 'coral').getByRole('button', { name: 'Star Coral Night', exact: true }).click();
+	const show = page.getByLabel('Show', { exact: true });
+	await show.selectOption({ label: 'Favorites only' });
+	await expect(libraryRow(page, 'coral')).toHaveCount(1);
+	const more = queueRow(page, 'coral').getByTestId(TESTIDS.queueMore);
+	await more.click();
+	await menu(page).getByRole('menuitem', { name: 'Unstar', exact: true }).click();
+	await expect(menu(page)).toHaveCount(0);
+	await expect(libraryRow(page, 'coral')).toHaveCount(0);
+	await expect(more).toBeFocused();
+	await expect(show).not.toBeFocused();
+});
+
+test('a second touch on a different row cancels a pending long-press and keeps the opened-menu click guard', async ({ browser }) => {
+	const context = await browser.newContext({ viewport: { width: 390, height: 900 }, isMobile: true, hasTouch: true });
+	const page = await context.newPage();
+	await seed(page);
+	const first = libraryRow(page, 'coral').locator('.nt-library-row');
+	const second = libraryRow(page, 'dawn').locator('.nt-library-row');
+	await first.scrollIntoViewIfNeeded();
+	const a = (await first.boundingBox())!;
+	const b = (await second.boundingBox())!;
+	await page.clock.install();
+	const session = await context.newCDPSession(page);
+	const one = { x: a.x + 8, y: a.y + 8, id: 1 };
+	const two = { x: b.x + 8, y: b.y + 8, id: 2 };
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [one] });
+	await page.clock.fastForward(200);
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [one, two] });
+	await page.clock.fastForward(600);
+	await expect(menu(page)).toHaveCount(0);
+	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	// An already opened menu still suppresses its compatibility click after a secondary touch.
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [one] });
+	await page.clock.fastForward(600);
+	await expect(menu(page)).toBeVisible();
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [one, two] });
+	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await context.close();
+});

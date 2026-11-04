@@ -1596,16 +1596,21 @@
 	 * ID. Selection changes announce the count once; no-ops stay silent.
 	 */
 	function activateSelectionRow(id: string, extend: boolean, box: HTMLInputElement): void {
+		selectInteractionRow(id, extend);
+		// A native toggle the selection did not follow (Shift on a selected
+		// anchor) would leave the box out of sync: re-assert the truth.
+		box.checked = selectedIds.includes(id);
+	}
+
+	function selectInteractionRow(id: string, extend: boolean): void {
 		const displayedIds = renderedItems.map((track) => track.id);
 		if (extend && rangeAnchorId !== null && displayedIds.includes(rangeAnchorId)) {
 			selectedIds = selectRange(selectedIds, displayedIds, rangeAnchorId, id);
 		} else {
+			// A missing displayed anchor toggles, and can remove the focused row.
 			toggleSelectedId(id);
 		}
 		rangeAnchorId = id;
-		// A native toggle the selection did not follow (Shift on a selected
-		// anchor) would leave the box out of sync: re-assert the truth.
-		box.checked = selectedIds.includes(id);
 	}
 
 	function toggleSelectedId(id: string): void {
@@ -1720,7 +1725,10 @@
 		const subject = ids.length === 1 && track ? displayTitle(track) : count;
 		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
 			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
-		if (view === 'favorites' && remove) focusLibraryView();
+		const focusedId = focusedLibraryRowId();
+		if (!queued && view === 'favorites' && remove && focusedId !== null && changed.includes(focusedId)) {
+			focusAfterSelectedRowRemoval(null, null);
+		}
 	}
 
 	function knownTracks(ids: readonly string[]): Track[] {
@@ -1837,9 +1845,7 @@
 		if (event.target instanceof Element && event.target.closest('input, .nt-library-copy, .nt-library-star, .nt-library-more')) return;
 		event.preventDefault();
 		event.stopPropagation();
-		if (event.shiftKey) selectedIds = selectRange(selectedIds, renderedItems.map((item) => item.id), rangeAnchorId, id);
-		else toggleSelectedId(id);
-		rangeAnchorId = id;
+		selectInteractionRow(id, event.shiftKey);
 	}
 
 	function libraryListKey(event: KeyboardEvent): void {
@@ -1853,9 +1859,7 @@
 			if (!id) return;
 			event.preventDefault();
 			event.stopPropagation();
-			if (event.shiftKey) selectedIds = selectRange(selectedIds, renderedItems.map((item) => item.id), rangeAnchorId, id);
-			else toggleSelectedId(id);
-			rangeAnchorId = id;
+			selectInteractionRow(id, event.shiftKey);
 		}
 	}
 

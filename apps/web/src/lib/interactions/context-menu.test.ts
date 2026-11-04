@@ -178,10 +178,10 @@ describe('contextMenu action', () => {
 		expect(open).toHaveBeenCalledTimes(1);
 	});
 
-	it.each(['blur', 'scroll', 'pointerup', 'pointercancel', 'hidden'])('cancels a pending press on external %s', (type) => {
+	it.each(['blur', 'scroll', 'pointerdown', 'pointerup', 'pointercancel', 'hidden'])('cancels a pending press on external %s', (type) => {
 		const action = contextMenu(node as never, open);
 		node.fire('pointerdown', touch());
-		expect(doc.count()).toBe(4);
+		expect(doc.count()).toBe(5);
 		expect(win.count()).toBe(1);
 		vi.advanceTimersByTime(250);
 		if (type === 'hidden') { doc.hidden = true; doc.fire('visibilitychange'); }
@@ -221,6 +221,7 @@ describe('contextMenu action', () => {
 		const action = contextMenu(node as never, open);
 		node.fire('pointerdown', touch());
 		vi.advanceTimersByTime(500);
+		doc.fire('pointerdown', touch({ isPrimary: false }));
 		node.fire('pointerdown', touch({ isPrimary: false }));
 		node.fire('pointerup');
 		vi.advanceTimersByTime(500);

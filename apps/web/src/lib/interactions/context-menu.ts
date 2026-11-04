@@ -94,6 +94,7 @@ export function contextMenu(node: HTMLElement, open: ((invoker: HTMLElement, poi
 			listen(window, 'blur', cancel),
 			listen(document, 'visibilitychange', hidden),
 			listen(document, 'scroll', cancel, true),
+			listen(document, 'pointerdown', cancel, true),
 			listen(document, 'pointerup', cancel),
 			listen(document, 'pointercancel', abort)
 		];

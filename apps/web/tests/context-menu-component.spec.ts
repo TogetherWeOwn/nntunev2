@@ -69,3 +69,23 @@ test('coarse mobile submenu replaces the sheet and Back restores its parent item
 	await expect(page.getByRole('button', { name: 'Open fixture menu' })).toBeFocused();
 	await context.close();
 });
+
+test('desktop flyout child removed by hovering a sibling leaves focus on the surviving parent', async ({ page }) => {
+	await page.setContent('<!doctype html><html lang="en"><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body></body></html>');
+	await page.addScriptTag({ content: script });
+	const invoker = page.getByRole('button', { name: 'Open fixture menu' });
+	await invoker.click();
+	await page.keyboard.press('End');
+	const parent = page.getByRole('menuitem', { name: 'Destinations', exact: true });
+	await expect(parent).toBeFocused();
+	await page.keyboard.press('ArrowRight');
+	await expect(page.getByRole('menu')).toHaveCount(2);
+	await expect(page.getByRole('menuitem', { name: 'First destination' })).toBeFocused();
+	await page.getByRole('menuitem', { name: 'Inline action', exact: true }).hover();
+	await expect(page.getByRole('menu')).toHaveCount(1);
+	await expect(page.locator('body')).not.toBeFocused();
+	await expect(parent).toBeFocused();
+	await page.keyboard.press('Escape');
+	await expect(page.getByRole('menu')).toHaveCount(0);
+	await expect(invoker).toBeFocused();
+});

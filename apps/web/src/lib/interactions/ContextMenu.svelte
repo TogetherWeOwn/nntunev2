@@ -52,8 +52,17 @@
 	function enter(event: PointerEvent, index: number) {
 		if (event.pointerType !== 'mouse') return;
 		clearTimeout(hover);
-		if (child?.invoker !== event.currentTarget) child = null;
+		if (child?.invoker !== event.currentTarget) dismissSubmenu();
 		if (!actions[index].disabled && actions[index].children) hover = setTimeout(() => openSubmenu(index), 300);
+	}
+
+	function dismissSubmenu() {
+		// Restore only focus owned by the removed flyout, not a newer choice
+		// elsewhere in the root. Focus its surviving invoker before teardown.
+		if (child && menu.contains(document.activeElement) && document.activeElement?.closest('[role="menu"]') !== menu) {
+			child.invoker.focus({ preventScroll: true });
+		}
+		child = null;
 	}
 
 	function finish() {
@@ -154,7 +163,7 @@
 		const scrollY = window.scrollY;
 		const scroll = (event: Event) => {
 			if (event.target instanceof Node && menu.contains(event.target)) {
-				if (event.target === menu) child = null;
+				if (event.target === menu) dismissSubmenu();
 				return;
 			}
 			// A click can scroll its invoker before this listener mounts, with
