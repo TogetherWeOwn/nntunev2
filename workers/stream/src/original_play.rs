@@ -17,6 +17,7 @@ use nntune_core::original_source::{
     OriginalSource, SourceError,
 };
 
+pub mod control;
 #[cfg(target_arch = "wasm32")]
 pub mod worker;
 

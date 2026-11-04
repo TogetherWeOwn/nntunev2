@@ -9,18 +9,109 @@ use std::{
     task::{Context, Poll},
 };
 
-use nntune_core::original_source::{SourceError, MAX_ARTICLE_BYTES};
+use nntune_core::original_source::{
+    reader::{AsyncReadControl, ReadControl},
+    SourceError, MAX_ARTICLE_BYTES,
+};
 use worker::{
     js_sys::{BigInt, Uint8Array},
+    wasm_bindgen::{closure::Closure, JsCast},
     wasm_bindgen_futures::JsFuture,
-    web_sys::WritableStreamDefaultWriter,
+    web_sys::{AbortSignal, WritableStreamDefaultWriter},
     worker_sys::FixedLengthStream,
-    Headers, Response, ResponseBody,
+    Date, Delay, Headers, Request, Response, ResponseBody,
 };
 
-use super::{OriginalPlay, OriginalWriter};
+use super::{
+    control::OriginalRequestControl, OriginalAuthorization, OriginalControl, OriginalPlay,
+    OriginalWriter,
+};
 
 type PendingPromise = Pin<Box<JsFuture>>;
+type GrantControl = OriginalRequestControl<Pin<Box<dyn Future<Output = ()>>>, fn() -> u64>;
+
+fn now_unix() -> u64 {
+    Date::now().as_millis() / 1000
+}
+
+/// Request-owned off-route control. Construct immediately after authorization,
+/// before awaiting source resolution; retain through response close. The caller
+/// still owns pump scheduling and the account supplier's operation timer.
+pub struct WorkerOriginalControl {
+    control: GrantControl,
+    signal: AbortSignal,
+    on_abort: Closure<dyn FnMut()>,
+}
+
+impl WorkerOriginalControl {
+    pub fn new(authority: &OriginalAuthorization, request: &Request) -> worker::Result<Self> {
+        let expiry_unix = authority.grant.exp_unix;
+        let timer: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
+            loop {
+                // Compute on poll, not construction: a delayed first poll must
+                // not extend the grant. Clamp to the SDK's signed timer range.
+                let remaining = expiry_unix
+                    .saturating_mul(1000)
+                    .saturating_sub(Date::now().as_millis());
+                if remaining == 0 {
+                    break;
+                }
+                Delay::from(std::time::Duration::from_millis(
+                    remaining.min(i32::MAX as u64),
+                ))
+                .await;
+            }
+        });
+        let control = OriginalRequestControl::new(expiry_unix, timer, now_unix as fn() -> u64);
+        let cancellation = control.cancellation();
+        let signal = request.inner().signal();
+        let on_abort = Closure::wrap(Box::new(move || cancellation.cancel()) as Box<dyn FnMut()>);
+        signal
+            .add_event_listener_with_callback("abort", on_abort.as_ref().unchecked_ref())
+            .map_err(worker::Error::from)?;
+        // An already-aborted signal emits no new event on registration.
+        if signal.aborted() {
+            control.cancellation().cancel();
+        }
+        Ok(Self {
+            control,
+            signal,
+            on_abort,
+        })
+    }
+}
+
+impl ReadControl for WorkerOriginalControl {
+    fn check(&mut self) -> Result<(), SourceError> {
+        if self.signal.aborted() {
+            self.control.cancellation().cancel();
+        }
+        self.control.check()
+    }
+}
+
+impl AsyncReadControl for WorkerOriginalControl {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(error);
+        }
+        self.control.poll_cancel(cx)
+    }
+}
+
+impl OriginalControl for WorkerOriginalControl {
+    fn now_unix(&self) -> u64 {
+        self.control.now_unix()
+    }
+}
+
+impl Drop for WorkerOriginalControl {
+    fn drop(&mut self) {
+        let _ = self
+            .signal
+            .remove_event_listener_with_callback("abort", self.on_abort.as_ref().unchecked_ref());
+    }
+}
 
 /// Build a response before pumping it, so the client may consume concurrently
 /// with writes. Pass the returned writer to `OriginalPlay::pump` with a wakeable

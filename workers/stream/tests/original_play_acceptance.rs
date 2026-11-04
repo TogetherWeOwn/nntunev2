@@ -22,7 +22,9 @@ use nntune_core::{
 use nntune_stream::{
     delivered::VecDeliveredSink,
     grant,
-    original_play::{authorize_original, OriginalControl, OriginalWriter},
+    original_play::{
+        authorize_original, control::OriginalRequestControl, OriginalControl, OriginalWriter,
+    },
     play_route::PlayRouteRequest,
 };
 
@@ -990,6 +992,84 @@ fn control_replaces_the_waker_in_each_pending_phase() {
             );
             drop(fut);
             assert_eq!(articles.opened, opened);
+            assert_eq!(st.borrow().aborts, 1);
+            assert_eq!(st.borrow().got.len(), acked);
+            if acked == 0 {
+                assert!(sink.0.is_empty());
+            } else {
+                assert_eq!(sink.0.len(), 1);
+                assert_eq!((sink.0[0].start, sink.0[0].end), (0, acked as u64));
+            }
+        }
+    }
+}
+
+#[test]
+fn request_control_relay_cancels_each_pending_phase_with_latest_task_and_exact_ack() {
+    for cancel in [true, false] {
+        for phase in 0..3 {
+            let (source, mut articles) = fixture();
+            let mut sink = VecDeliveredSink::default();
+            let ready = Rc::new(Cell::new(false));
+            let timer_waker = Rc::new(RefCell::new(None::<Waker>));
+            let timer = std::future::poll_fn({
+                let (ready, timer_waker) = (ready.clone(), timer_waker.clone());
+                move |cx| {
+                    // Like the pinned SDK, intentionally retain the FIRST waker.
+                    timer_waker
+                        .borrow_mut()
+                        .get_or_insert_with(|| cx.waker().clone());
+                    if ready.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            });
+            let mut control = OriginalRequestControl::new(NOW + 60, timer, || NOW);
+            let cancellation = control.cancellation();
+            let st = shared([]);
+            let (acked, opened) = match phase {
+                0 => {
+                    articles.pending = Some(2);
+                    (0, vec![2])
+                }
+                1 => {
+                    st.borrow_mut().script = [Step::Accept(1), Step::Block].into();
+                    (1, vec![2, 0])
+                }
+                _ => {
+                    st.borrow_mut().close_block = true;
+                    (9, vec![2, 0, 1])
+                }
+            };
+            let old = Arc::new(Wakes::default());
+            let latest = Arc::new(Wakes::default());
+            let old_waker = Waker::from(old.clone());
+            let latest_waker = Waker::from(latest.clone());
+            let mut cx = Context::from_waker(&latest_waker);
+            let mut fut = pump!(source, None, articles, control, sink, st);
+            assert!(fut
+                .as_mut()
+                .poll(&mut Context::from_waker(&old_waker))
+                .is_pending());
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let polls = (st.borrow().write_polls, st.borrow().closes);
+            if cancel {
+                cancellation.cancel();
+            } else {
+                ready.set(true);
+                timer_waker.borrow_mut().take().unwrap().wake();
+            }
+            assert_eq!(old.0.load(Ordering::SeqCst), 0);
+            assert_eq!(latest.0.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(SourceError::Cancelled))
+            );
+            drop(fut);
+            assert_eq!(articles.opened, opened);
+            assert_eq!((st.borrow().write_polls, st.borrow().closes), polls);
             assert_eq!(st.borrow().aborts, 1);
             assert_eq!(st.borrow().got.len(), acked);
             if acked == 0 {

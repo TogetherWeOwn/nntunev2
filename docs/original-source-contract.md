@@ -215,6 +215,19 @@ means sink acceptance, not proof of remote TCP receipt. The caller must return
 the response concurrently with pumping, provide a wakeable request/grant control
 and persist delivered reports; no runtime caller or account supplier is installed.
 
+`WorkerOriginalControl::new` binds the verified grant expiry and incoming
+request's abort signal before source resolution. The request owns the abort
+listener and an absolute-expiry timer; drop removes the listener and cancels a
+pending SDK delay. Timer delays are computed when polled and clamped to the
+SDK's signed timeout range, so delayed polling cannot extend the grant. A stable
+wake relay forwards both abort and timer events to the latest task waker, even
+when the SDK delay keeps its first registration. The portable
+`OriginalRequestControl` tests the relay and terminal expiry with injected
+clocks/timers; neither a cancellation handle nor the control releases account
+capacity. The supplier's operation timer is still separate. This wrapper is
+not called by any public fetch handler, and actual Worker signal/timer behavior
+remains unqualified.
+
 Generated async fixtures exercise lazy full/range output, hint fallback,
 endpoint/CRC/budget failures, wakeable pending cancellation, dropped pulls,
 grant expiry after awaits and partial-writer accounting. Writer fakes cover
