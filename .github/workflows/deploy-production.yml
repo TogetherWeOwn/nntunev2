@@ -121,6 +121,11 @@ jobs:
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Read staging identities with its existing credentials, without creating
+    # a deployment record or claiming that this admission job deployed staging.
+    environment:
+      name: staging
+      deployment: false
     steps:
       # Verifier and approval policy come from the dispatch's reviewed main
       # source, never from an artifact or an arbitrary selected candidate.
