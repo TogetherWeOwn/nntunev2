@@ -5,7 +5,9 @@ The app shell sets Figtree first with a system-ui fallback
 the font-src self policy holds; nothing loads from a font CDN.
 
 - Family: Figtree (sans-serif)
-- Licence: SIL Open Font License 1.1
+- Licence: SIL Open Font License 1.1; the full copyright and licence
+  notice ships beside these files in [OFL.txt](./OFL.txt), from the
+  [Google Fonts Figtree release](https://github.com/google/fonts/blob/main/ofl/figtree/OFL.txt).
 - Copyright: 2022 The Figtree Project Authors
 - Source: the Google Fonts release, via the Fontsource CDN
   (`figtree` package, latin subset, weights 400/700/800)

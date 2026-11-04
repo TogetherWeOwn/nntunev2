@@ -300,6 +300,31 @@ describe('design tokens: new layer presence', () => {
 		}
 		expect(dark.get('--nt-font')).toMatch(/^'Figtree',\s*system-ui/);
 	});
+
+	it('self-hosted typeface: copyright and complete OFL notice ship beside the fonts', () => {
+		const licence = readFileSync(new URL('../../../static/fonts/OFL.txt', import.meta.url), 'utf8');
+		expect(licence).toContain('Copyright 2022 The Figtree Project Authors');
+		expect(licence).toContain('SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007');
+		for (const section of [
+			'PREAMBLE',
+			'DEFINITIONS',
+			'PERMISSION & CONDITIONS',
+			'TERMINATION',
+			'DISCLAIMER'
+		]) {
+			expect(licence, section).toContain(section);
+		}
+		for (const condition of [
+			'1) Neither the Font Software nor any of its individual components,',
+			'2) Original or Modified Versions of the Font Software may be bundled,',
+			'3) No Modified Version of the Font Software may use the Reserved Font',
+			'4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font',
+			'5) The Font Software, modified or unmodified, in part or in whole,'
+		]) {
+			expect(licence, condition).toContain(condition);
+		}
+		expect(licence.trim()).toMatch(/OTHER DEALINGS IN THE FONT SOFTWARE\.$/);
+	});
 });
 
 describe('design tokens: contrast gates', () => {
