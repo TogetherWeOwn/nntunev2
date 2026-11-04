@@ -40,6 +40,7 @@ pub mod error;
 pub mod nntp;
 pub mod nzb;
 pub mod nzb_writer;
+pub mod original_source;
 pub mod par2;
 pub mod pinned_transport;
 pub mod rng;

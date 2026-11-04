@@ -1,23 +1,24 @@
 name: migrations-staging
 
-# A PR that adds or changes migrations/*.sql must declare its staging apply in
-# the PR body (docs/ops.md, "Staging migrations"):
-#   Staging migration: <files> — applied <YYYY-MM-DD> by <who>
-#   Staging migration: pending (blocked on <ticket>)
-# Recurrence guard for #815, whose migrations never reached staging and left
-# staging-api red. No secrets and no DB access, so it also runs on forks.
-# Proposed as a required check; keep the JOB name `migrations-staging`.
+# Whether staging actually has a migration is verified against the
+# database itself: the staging-api deploy gate compares the
+# `schema_migrations` rows with migrations/manifest.toml (docs/ops.md,
+# "Staging migrations"). This secretless per-PR check covers the one
+# thing the database cannot know: a PR that renames a migration file
+# must record the original name+sha as `renamed_from` in the manifest,
+# or the already-applied staging row becomes unrecognisable.
+# Required check; keep the JOB name `migrations-staging`.
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
-  # If made required it must report on merge_group; the queue run has no PR
-  # body, so it passes vacuously (the body was checked on the PR).
+  # Required checks must report on merge_group; the queue run has no PR
+  # file list, so it passes vacuously (renames were checked on the PR).
   merge_group:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: read # Read the PR file list to validate migration rename history.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -41,23 +42,33 @@ jobs:
       - name: Merge queue vacuous pass
         if: github.event_name == 'merge_group'
         run: |
-          echo "migrations-staging: merge_group vacuous pass (body checked on PR)"
+          echo "migrations-staging: merge_group vacuous pass (renames checked on PR)"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
-      - name: Check staging migration declaration
+          # Full history so intra-PR renames (renamed in an early PR
+          # commit, invisible in the base..head file list) are visible
+          # to `git log --find-renames` below.
+          fetch-depth: 0
+      - name: Check migration rename history
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body"
-          # Renames count under both names, so moving a migration still needs a line.
+          # filename<TAB>previous_filename, so each rename stays paired.
           gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
-            --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/pr-files"
-          python3 .github/scripts/migrations_staging_declaration.py \
-            --body-file "$RUNNER_TEMP/pr-body" --files-file "$RUNNER_TEMP/pr-files"
+            --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$RUNNER_TEMP/pr-files"
+          # The PR file list only diffs base..head; a file created and
+          # renamed within the PR shows as a plain add there. Union in
+          # every rename any PR commit performed.
+          git log --find-renames --format= --name-status "$BASE_SHA..$HEAD_SHA" \
+            | awk -F '\t' '$1 ~ /^R/ { print $3 "\t" $2 }' >> "$RUNNER_TEMP/pr-files"
+          sort -u "$RUNNER_TEMP/pr-files" -o "$RUNNER_TEMP/pr-files"
+          python3 .github/scripts/migrations_rename_check.py \
+            --files-file "$RUNNER_TEMP/pr-files"

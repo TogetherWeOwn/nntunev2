@@ -140,6 +140,62 @@ advance `plan_id`/`paid_through_at`, disable new purchases for it and alert for
 reconciliation. Existing previously confirmed coverage/allowances retain only
 their original deadlines; an unknown price grants no new or higher paid caps.
 
+### Reconcile folds and purchase-flight replacement
+
+A reconcile pass folding an older remote snapshot must not regress a fresher
+stored pass: coverage (`paid_through_at`, and the `plan_id`/`paid_invoice_id`
+tied to it) advances monotonically, and the same staleness predicate — the new
+evidence ends strictly before the stored paid end, or ties it while carrying
+no anchor against an anchored stored row — guards stored `status` and
+`grace_until` instead of writing stale verbatim fields over a fresher pass.
+Staleness is anchor containment, not an end comparison: a snapshot that does
+not contain the invoice anchoring the stored coverage folded an older remote
+state, however its item-plan money compares (a snapshot with no stored anchor
+to check against falls back to the end comparison, and a snapshot with no
+item-plan money at all is not stale on that basis alone — a first failed
+renewal observes `past_due` with no new invoice, and that observation still
+sets the renewal grace). The stale fold carries its evidence end into the
+write (not the stored end), so the predicate still fires when the
+stale-reading pass commits second — falling back to the stored end, anchor
+cleared, when its snapshot holds no item-plan money at all. Equal-money
+status order across fresh passes is unknowable, so those still fold verbatim
+and converge on the next hourly reconcile. When an equal paid end carries a
+new plan (a plan switch landing exactly on the old period end), the fold
+relabels to the subscription item's current plan with unchanged coverage,
+anchored on the new evidence — but only onto equally-or-more-recently paid
+evidence (payment order as observed in the snapshot) — and the write persists
+that relabel only when the stored row still matches what the pass read (plan
+and anchor), so a keep that read before the relabel committed cannot reverse
+the newer plan/anchor when it commits second, an older relabel committing
+after a newer one cannot revert it either, and a relabel onto the same shared
+invoice still persists when the row never moved — and the switch cannot stick
+on the old plan forever.
+
+An existing open Checkout Session — or a single-flight loser converging onto
+one — is reused only when its recorded price matches the newly requested
+price. A second attempt naming a different plan never inherits the first
+attempt's session: the open session is expired first, the flight is
+superseded, and a fresh operation mints under a fresh Stripe idempotency key.
+A session-less flight (never created, or its mark was lost) with a mismatched
+price is resolved under its ORIGINAL operation id and recorded price before
+anything supersedes it — the same-key replay recovers the session (never
+duplicates), which then retires per its retrieved state — because a missing
+mark does not mean Stripe has no session, and superseding blind would orphan
+a payable one. Repairing a confirmed-expired or Stripe-404-missing session
+replaces the same way (no expiry call: Stripe already converged the state),
+so a repair can never replay a dead session inside Stripe's retention window.
+Only `expired` deliberately replaces among the closed states: a `complete`
+session that is not paid (`unpaid` async processing, `no_payment_required`
+subscription already created) can still succeed, so the flight stays open for
+the real completion and the retry fails retryable without minting a second
+checkout beside it. An unconfirmed retrieve (any non-404 failure) fails
+retryable instead of minting beside unknown state.
+
+Paid-invoice history keeps one row per confirmed paid invoice under its own
+lines' plan — including invoices from an earlier plan after a plan change —
+idempotent on the invoice id; coverage still follows only the current item's
+plan.
+
 Once the previous subscription is confirmed Stripe-terminal, a new paid
 subscription may be created with a new operation id (a fresh Checkout
 Session).

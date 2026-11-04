@@ -121,6 +121,13 @@ class TestRequiredCheckConcurrency(unittest.TestCase):
                     [f"{name}: missing top-level concurrency"],
                 )
 
+    def test_public_security_suite_stays_required(self):
+        jobs = split_jobs(self.ci)
+        self.assertEqual(check_required_step(
+            "public-text", jobs["public-text"],
+            "python3 .github/scripts/test_ci_public_pr_security.py",
+        ), [])
+
     def test_self_step_is_required_in_public_text(self):
         """This suite's public-text step stays required.
 

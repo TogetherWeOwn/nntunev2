@@ -34,17 +34,24 @@ function isStoredId(value: unknown): value is string {
 }
 
 /**
- * Load the current context's favorites. Missing storage, a missing
- * context, or a corrupt/foreign value all yield an empty list.
+ * Load the current context's favorites. Missing or corrupt stored values
+ * yield an empty list. Unavailable storage/context also defaults to empty;
+ * a caller may supply in-memory state to use when storage cannot be read.
  */
 export function loadFavorites(
 	session: SnapshotStorage | null,
-	local: SnapshotStorage | null
+	local: SnapshotStorage | null,
+	fallback: readonly string[] = []
 ): string[] {
 	const key = favoritesKey(session);
-	if (!local || !key) return [];
+	if (!local || !key) return [...fallback];
+	let raw: string | null;
 	try {
-		const raw = local.getItem(key);
+		raw = local.getItem(key);
+	} catch {
+		return [...fallback];
+	}
+	try {
 		if (!raw) return [];
 		const parsed: unknown = JSON.parse(raw);
 		if (!Array.isArray(parsed)) return [];
@@ -54,19 +61,21 @@ export function loadFavorites(
 	}
 }
 
-/** Persist the current context's favorites; a no-op without storage/context. */
+/** Persist favorites, returning whether storage accepted the current set. */
 export function saveFavorites(
 	session: SnapshotStorage | null,
 	local: SnapshotStorage | null,
 	ids: readonly string[]
-): void {
+): boolean {
 	const key = favoritesKey(session);
-	if (!local || !key) return;
+	if (!local || !key) return false;
 	try {
 		local.setItem(key, JSON.stringify(ids.filter(isStoredId)));
+		return true;
 	} catch {
 		// Quota or privacy mode: memory remains authoritative this visit.
 		// A later toggle retries the full set; reload reads the last saved set.
+		return false;
 	}
 }
 

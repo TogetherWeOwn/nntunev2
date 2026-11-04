@@ -3664,6 +3664,9 @@ impl Store for PgStore {
                             paid_through_unix: row
                                 .try_get::<_, Option<i64>>("paid_through_unix")
                                 .map_err(|_| StoreError)?,
+                            paid_invoice_id: row
+                                .try_get::<_, Option<String>>("paid_invoice_id")
+                                .map_err(|_| StoreError)?,
                             grace_until_unix: row
                                 .try_get::<_, Option<i64>>("grace_until_unix")
                                 .map_err(|_| StoreError)?,
@@ -3768,6 +3771,8 @@ impl Store for PgStore {
                             (&row.paid_through_unix, Type::INT8),
                             (&row.paid_invoice_id, Type::TEXT),
                             (&row.grace_until_unix, Type::INT8),
+                            (&outcome.read_anchor, Type::TEXT),
+                            (&outcome.read_plan, Type::TEXT),
                         ],
                     )
                     .await
@@ -3938,17 +3943,20 @@ impl Store for PgStore {
         state: &str,
         price_id: &str,
         session_id: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // Best-effort mark: the session already exists under the
-                // operation's idempotency key, so a lost mark only costs a
-                // retrieve on the next attempt — never a duplicate.
+                // Conditional mark (the statement only touches unresolved
+                // rows): a mark that lands after a deliberate supersede
+                // reports `false` instead of resurrecting the retired row.
+                // The session already exists under the operation's
+                // idempotency key, so a lost mark only costs a retrieve on
+                // the next attempt — never a duplicate.
                 let payload =
                     crate::billing_reconcile::checkout_operation_payload(price_id, session_id);
                 let subscription: Option<String> = None;
-                client
+                let rows = client
                     .query_typed(
                         crate::billing_reconcile::update_checkout_operation_statement(),
                         &[
@@ -3962,7 +3970,7 @@ impl Store for PgStore {
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.update_checkout_operation")
                     })?;
-                Ok(())
+                Ok(!rows.is_empty())
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -4889,6 +4897,17 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
                 &session_id,
             ))
             .await
+        })
+    }
+    fn expire_checkout_session(
+        &self,
+        session_id: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::CheckoutSession>> + '_>,
+    > {
+        Box::pin(async move {
+            self.send(&crate::stripe::expire_checkout_session_request(&session_id))
+                .await
         })
     }
     fn retrieve_subscription(

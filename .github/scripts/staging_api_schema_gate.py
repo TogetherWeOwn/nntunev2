@@ -4,12 +4,20 @@
 Never apply migrations here. Connection details and provider errors are private;
 only a fixed verdict reaches CI output. The direct staging migrator target must
 match the selected Hyperdrive origin before any database connection is opened.
+
+The schema verdict compares the staging database's ``schema_migrations``
+tracking rows (written by ``apply_migration.py`` on every apply) against
+``migrations/manifest.toml``: every ``app`` entry must be recorded exactly
+once under its current name+sha256 or under a ``renamed_from`` original
+name+sha256, and no unlisted rows may exist.
 """
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 import urllib.parse
 import urllib.request
 
@@ -24,7 +32,7 @@ class GateError(Exception):
 #   binding  - Hyperdrive config fetch failed or does not match the migrator
 #   connect  - psql could not connect/authenticate (TLS, auth, network, timeout)
 #   query    - connected, but the read-only catalog query errored
-#   schema   - query ran; required sessions columns absent or shadowed
+#   schema   - query ran; schema_migrations absent/shadowed or != manifest
 CATEGORIES = ("config", "binding", "connect", "query", "schema")
 
 # Fixed, non-secret operator hints. Like the category word, these are constants
@@ -51,25 +59,145 @@ def _stage(category, fn, *args):
         raise CategorizedFailure(category) from exc
 
 
-# The Worker resolves unqualified `sessions` through its runtime role's
-# search path, while this gate connects as the migrator. Requiring that no
-# other non-system `sessions` relation exists means any search path that
-# resolves `sessions` at all resolves the checked public table.
-SCHEMA_SQL = """BEGIN READ ONLY;
+FILE_RE = re.compile(r"^\d{4}_[A-Za-z0-9_]+\.sql$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_ROWS_OUTPUT = 1_000_000
+
+
+def load_expected(manifest_path=None):
+    """Return the app-target manifest entries the staging DB must record.
+
+    Each entry is ``(file, sha256, renamed_from)`` where ``renamed_from``
+    is a tuple of original ``(file, sha256)`` pairs a pre-merge renumber
+    may have been applied under. Anything malformed raises GateError;
+    the manifest is repo configuration, so callers stage this as config.
+    """
+    if manifest_path is None:
+        manifest_path = pathlib.Path(__file__).resolve().parents[2] / "migrations" / "manifest.toml"
+    try:
+        data = tomllib.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise GateError("cannot read migrations manifest") from exc
+    entries = data.get("migration", [])
+    if not isinstance(entries, list) or not entries:
+        raise GateError("migrations manifest has no entries")
+    expected, seen = [], set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("target") != "app":
+            if not isinstance(entry, dict) or entry.get("target") not in ("app", "mirror"):
+                raise GateError("migrations manifest entry has no valid target")
+            continue
+        pairs = [(entry.get("file"), entry.get("sha256"))]
+        renamed = entry.get("renamed_from", [])
+        if not isinstance(renamed, list):
+            raise GateError("migrations manifest renamed_from must be a list")
+        pairs += [(item.get("file"), item.get("sha256")) if isinstance(item, dict)
+                   else (None, None) for item in renamed]
+        for filename, sha in pairs:
+            if not (isinstance(filename, str) and FILE_RE.match(filename)
+                    and isinstance(sha, str) and SHA_RE.match(sha)):
+                raise GateError("migrations manifest entry is malformed")
+            if filename in seen:
+                raise GateError("migrations manifest names a file more than once")
+            seen.add(filename)
+        # Renames are byte-identical (the migrations gate enforces this);
+        # an alias with different bytes would certify unapplied content.
+        if any(sha != pairs[0][1] for _filename, sha in pairs[1:]):
+            raise GateError("migrations manifest renamed_from sha256 must equal the entry sha256")
+        expected.append((pairs[0][0], pairs[0][1], tuple(pairs[1:])))
+    if not expected:
+        raise GateError("migrations manifest has no app entries")
+    return expected
+
+
+def compare(expected, rows):
+    """True iff applied rows satisfy every manifest entry exactly once.
+
+    A row satisfies an entry under the entry's current name+sha or any
+    ``renamed_from`` original name+sha. Unknown rows, sha mismatches,
+    missing entries and an entry satisfied by two rows (applied, then
+    applied again under the new name) all fail.
+    """
+    acceptable = {}
+    for index, (filename, sha, renamed) in enumerate(expected):
+        for pair in [(filename, sha), *renamed]:
+            if pair in acceptable:
+                return False
+            acceptable[pair] = index
+    satisfied = [0] * len(expected)
+    seen_files = set()
+    for row in rows:
+        if row[0] in seen_files or row not in acceptable:
+            return False
+        seen_files.add(row[0])
+        satisfied[acceptable[row]] += 1
+    return all(count == 1 for count in satisfied)
+
+
+def parse_rows(stdout):
+    """Parse the bounded JSON row transport; anything else fails schema.
+
+    JSON (not delimiter-joined text) so a stored value containing a tab
+    or newline can never frame-shift one row into another.
+    """
+    if len(stdout) > MAX_ROWS_OUTPUT:
+        raise CategorizedFailure("schema")
+    try:
+        payload = json.loads(stdout)
+    except ValueError as exc:
+        raise CategorizedFailure("schema") from exc
+    if not isinstance(payload, list):
+        raise CategorizedFailure("schema")
+    rows = []
+    for item in payload:
+        if (not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], str) or not FILE_RE.match(item[0])
+                or not isinstance(item[1], str) or not SHA_RE.match(item[1])):
+            raise CategorizedFailure("schema")
+        rows.append((item[0], item[1]))
+    return rows
+
+
+# The gate connects as the migrator and reads `public.schema_migrations`
+# qualified, but a same-named relation in another non-system schema would
+# shadow the unqualified name for other roles; requiring that none exists
+# keeps the checked table the only one any search path can resolve.
+# The rows are deploy proof, so the guard also requires that no role
+# other than the table owner (the migrator) holds a write privilege on
+# the table (relacl) or on any column (attacl — column-level INSERT
+# alone can forge a tracking row and never appears in relacl):
+# apply_migration.py's DDL pins that on every apply, and the gate
+# fails closed in between if a write grant appears.
+GUARD_SQL = """BEGIN READ ONLY;
 SELECT current_database() = 'nntunev2_staging'
    AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-               WHERE n.nspname='public' AND c.relname='sessions' AND c.relkind='r')
+               WHERE n.nspname='public' AND c.relname='schema_migrations' AND c.relkind='r')
    AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-               WHERE c.relname='sessions'
+               WHERE c.relname='schema_migrations'
                  AND n.nspname NOT IN ('public','pg_catalog','information_schema')
                  AND n.nspname NOT LIKE 'pg\\_temp\\_%'
                  AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%')
-   AND (SELECT count(*) = 3 FROM pg_attribute a
-        WHERE a.attrelid=to_regclass('public.sessions') AND a.attnum > 0
-          AND NOT a.attisdropped AND NOT a.attnotnull AND a.atttypmod = -1
-          AND ((a.attname='refresh_retry_hash' AND a.atttypid='text'::regtype)
-            OR (a.attname='refresh_issued_at' AND a.atttypid='int8'::regtype)
-            OR (a.attname='refresh_claimed_at' AND a.atttypid='int8'::regtype)));
+   AND NOT EXISTS (SELECT 1 FROM pg_class c CROSS JOIN aclexplode(c.relacl) a
+               WHERE c.oid=to_regclass('public.schema_migrations')
+                 AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER')
+                 AND a.grantee <> c.relowner)
+   AND NOT EXISTS (SELECT 1 FROM pg_class c
+               JOIN pg_attribute t ON t.attrelid=c.oid AND t.attnum > 0 AND NOT t.attisdropped
+               CROSS JOIN aclexplode(t.attacl) a
+               WHERE c.oid=to_regclass('public.schema_migrations')
+                 AND a.privilege_type IN ('INSERT','UPDATE','REFERENCES')
+                 AND a.grantee <> c.relowner)
+   AND (SELECT count(*) = 2 FROM pg_attribute a
+        WHERE a.attrelid=to_regclass('public.schema_migrations') AND a.attnum > 0
+          AND NOT a.attisdropped AND a.atttypmod = -1
+          AND a.atttypid='text'::regtype
+          AND a.attname IN ('file','sha256'));
+COMMIT;
+"""
+
+ROWS_SQL = """BEGIN READ ONLY;
+SELECT COALESCE(json_agg(json_build_array(file, sha256) ORDER BY file), '[]'::json)
+FROM public.schema_migrations;
 COMMIT;
 """
 
@@ -152,15 +280,12 @@ def validate_inputs(env):
     connection_env(env, None)
 
 
-def check(env, fetch=fetch_config, run=subprocess.run):
-    _stage("config", validate_inputs, env)
-    payload = _stage("binding", fetch, env)
-    child = _stage("binding", connection_env, env, payload)
+def _run_sql(run, child, sql):
     try:
         result = run(
             ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only",
              "--no-align", "--set", "ON_ERROR_STOP=1"],
-            input=SCHEMA_SQL, text=True, capture_output=True, timeout=15, env=child,
+            input=sql, text=True, capture_output=True, timeout=15, env=child,
         )
     except Exception as exc:
         raise CategorizedFailure("connect") from exc
@@ -170,7 +295,21 @@ def check(env, fetch=fetch_config, run=subprocess.run):
         raise CategorizedFailure("connect")
     if result.returncode != 0:
         raise CategorizedFailure("query")
-    if result.stdout.strip() != "t":
+    return result.stdout
+
+
+def check(env, fetch=fetch_config, run=subprocess.run, expected=None):
+    _stage("config", validate_inputs, env)
+    if expected is None:
+        expected = _stage("config", load_expected)
+    payload = _stage("binding", fetch, env)
+    child = _stage("binding", connection_env, env, payload)
+    # Guard first, so a missing or shadowed tracking table is a schema
+    # verdict rather than a query error from selecting from it.
+    if _run_sql(run, child, GUARD_SQL).strip() != "t":
+        raise CategorizedFailure("schema")
+    rows = parse_rows(_run_sql(run, child, ROWS_SQL))
+    if not compare(expected, rows):
         raise CategorizedFailure("schema")
 
 
