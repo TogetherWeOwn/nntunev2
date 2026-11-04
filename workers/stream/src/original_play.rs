@@ -41,6 +41,7 @@ fn refusal(status: u16, api_error: ApiError) -> PlayRouteRefusal {
         status,
         api_error,
         retry_after: None,
+        content_range: None,
     }
 }
 
@@ -54,8 +55,11 @@ pub fn authorize_original(
     }
     let grant = grant::verify(request.token.as_deref().unwrap_or(""), secret, now_unix)
         .map_err(|_| refusal(401, ApiError::unauthorized()))?;
-    if grant.play_id.is_none() || grant.track_id != request.track_id {
+    if grant.play_id.is_none() {
         return Err(refusal(401, ApiError::unauthorized()));
+    }
+    if grant.track_id != request.track_id {
+        return Err(refusal(403, ApiError::forbidden()));
     }
     Ok(OriginalAuthorization { grant })
 }
@@ -159,7 +163,9 @@ impl OriginalAuthorization {
             ),
             RangeOutcome::Partial(selected) => (206, selected),
             RangeOutcome::Unsatisfiable => {
-                return Err(refusal(416, ApiError::range_not_satisfiable()));
+                let mut error = refusal(416, ApiError::range_not_satisfiable());
+                error.content_range = Some(format!("bytes */{size}"));
+                return Err(error);
             }
         };
         let mut headers = vec![

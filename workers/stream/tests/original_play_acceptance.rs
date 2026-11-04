@@ -266,14 +266,6 @@ fn invalid_grants_precede_source_resolution_and_emit_nothing() {
             NOW + grant::MAX_GRANT_TTL + grant::CLOCK_SKEW_SECS + 1,
             SECRET,
         )),
-        Some(grant::issue_v2(
-            "user_generated",
-            "other",
-            "play_generated",
-            1,
-            NOW + 60,
-            SECRET,
-        )),
     ];
     let mut forged = request(None).token.unwrap();
     forged.push('x');
@@ -285,6 +277,64 @@ fn invalid_grants_precede_source_resolution_and_emit_nothing() {
         let result = authorize_original(&req, SECRET, NOW);
         assert_eq!(result.err().unwrap().status, 401);
     }
+}
+
+#[test]
+fn wrong_track_grants_distinguish_verified_v2_from_unauthorized_tokens() {
+    let (source, articles) = fixture();
+    let mut control = Control::new();
+    let mut sink = VecDeliveredSink::default();
+    for (token, status, code) in [
+        (
+            grant::issue_v2(
+                "user_generated",
+                "other",
+                "play_generated",
+                1,
+                NOW + 60,
+                SECRET,
+            ),
+            403,
+            "forbidden",
+        ),
+        (
+            grant::issue("user_generated", "other", NOW + 60, SECRET),
+            401,
+            "unauthorized",
+        ),
+        (
+            grant::issue_v2("user_generated", "other", "play_generated", 1, NOW, SECRET),
+            401,
+            "unauthorized",
+        ),
+        (
+            grant::issue_v2(
+                "user_generated",
+                "other",
+                "play_generated",
+                1,
+                NOW + 60,
+                b"wrong-signing-material",
+            ),
+            401,
+            "unauthorized",
+        ),
+    ] {
+        let mut req = request(None);
+        req.token = Some(token);
+        // A refusal must never produce the capability needed for source access.
+        let err = match authorize_original(&req, SECRET, NOW) {
+            Ok(authority) => {
+                let _ = authority.prepare(&source, None, &mut control, &mut sink);
+                panic!("wrong-track grant authorized");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.status, status);
+        assert_eq!(err.api_error.code, code);
+        assert_eq!(err.content_range, None);
+    }
+    assert!(articles.opened.is_empty() && sink.0.is_empty());
 }
 
 #[tokio::test]
@@ -414,14 +464,14 @@ fn unsatisfiable_range_and_wrong_source_binding_do_no_article_io() {
     let mut sink = VecDeliveredSink::default();
     for range in ["bytes=9-", "bytes=-0"] {
         let authority = authorize_original(&request(Some(range)), SECRET, NOW).unwrap();
-        assert_eq!(
-            authority
-                .prepare(&source, Some(range), &mut control, &mut sink)
-                .err()
-                .unwrap()
-                .status,
-            416
-        );
+        let err = authority
+            .prepare(&source, Some(range), &mut control, &mut sink)
+            .err()
+            .unwrap();
+        assert_eq!(err.status, 416);
+        assert_eq!(err.api_error.code, "range_not_satisfiable");
+        assert_eq!(err.content_range.as_deref(), Some("bytes */9"));
+        assert_eq!(err.retry_after, None);
     }
     let mut req = request(None);
     req.track_id = "other".into();
@@ -624,11 +674,15 @@ fn owned_plan_shares_metadata_refusals_and_opens_nothing_before_pumping() {
         assert!(articles.opened.is_empty());
         assert!(sink.0.is_empty());
     }
-    for mode in 0..3 {
+    for mode in 0..4 {
         let (source, articles) = fixture();
         let mut control = Control::new();
         let mut req = request(None);
-        let range = (mode == 0).then_some("bytes=9-");
+        let range = match mode {
+            0 => Some("bytes=9-"),
+            3 => Some("bytes=-0"),
+            _ => None,
+        };
         if mode == 1 {
             req.track_id = "00000000-0000-0000-0000-000000000002".into();
             req.token = Some(grant::issue_v2(
@@ -648,7 +702,8 @@ fn owned_plan_shares_metadata_refusals_and_opens_nothing_before_pumping() {
             .prepare_owned(source, range, &mut control)
             .err()
             .expect("refusal");
-        assert_eq!(err.status, [416, 502, 401][mode]);
+        assert_eq!(err.status, [416, 502, 401, 416][mode]);
+        assert_eq!(err.content_range.as_deref(), range.map(|_| "bytes */9"));
         assert!(articles.opened.is_empty());
     }
 }
