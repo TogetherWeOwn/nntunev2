@@ -161,6 +161,42 @@ later integrations without making a hint a new publication authority. An
 error after streaming output requires the response authority to abort, never
 claim a complete file or retry bytes into the same response.
 
+## Async reader and off-route response adapter
+
+`original_source::reader::AsyncRangeReader` shares the synchronous reader's
+bounded decode, final-first proof, aggregate budget and contiguous prefix
+transitions. `AsyncArticleSource` supplies one bounded encoded article by trusted
+source index; it owns wire collection limits, its operation timer and account
+physical-close/capacity obligations. `AsyncReadControl` combines boundary checks
+with a wakeable cancellation/deadline signal, so a pending fetch can be dropped.
+A failed or dropped pending pull stops the reader permanently: no retry after
+an uncertain operation. Dropping an unpolled pull performs no I/O.
+
+`workers/stream/src/original_play.rs` is an **off-route** response driver, not a
+public miss-path installation. `authorize_original` verifies the v2 capability
+before a caller resolves the source. After resolution, `prepare` rechecks the
+request authority and track binding and reuses the existing HTTP range parser.
+Its request control must wake at grant expiry as well as cancellation/deadlines;
+the future production account supplier still owns its at-most-20-second timer.
+The API remains the sole source envelope/key/database owner. No new service
+wire shape, source resolver, account registry or provider config is introduced.
+
+A returned chunk is not delivery evidence. The response adapter acknowledges
+only the ordered prefix accepted by its writer using `written(n)`, then either
+acknowledges the rest before pulling again or drops the response. `finish`,
+`abort`, errors and drop settle at most one interval of acknowledged bytes;
+zero bytes emit none. Verification/prefix bytes and unacknowledged pulls never
+count. There is no cache-fill drain, speculative prefetch or account release in
+this driver. An article/source failure does not establish unknown-track 404.
+
+Generated async fixtures exercise lazy full/range output, hint fallback,
+endpoint/CRC/budget failures, wakeable pending cancellation, dropped pulls,
+grant expiry after awaits and partial-writer accounting. Existing cache-hit
+and public-route fixtures remain regressions, not evidence of a newly wired
+original-source route. Actual source/catalogue/account composition, Worker
+writer/abort behavior, R2 misses and cold-cache end-to-end operation remain
+unimplemented/unqualified here. Compile-time dialing/ingress gates are unchanged.
+
 ## Acceptance boundary and verification
 
 Generated/redacted fixtures cover persisted per-track/file readback, interleaved

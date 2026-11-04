@@ -4,7 +4,16 @@ use nntune_core::{
     original_source::{reader::*, *},
     yenc,
 };
-use std::{collections::HashMap, io::Cursor};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io::Cursor,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll, Wake, Waker},
+};
 
 const TRACK: &str = "00000000-0000-0000-0000-000000000001";
 const OTHER: &str = "00000000-0000-0000-0000-000000000002";
@@ -542,4 +551,417 @@ fn collection_cap_is_enforced_during_reads() {
         vec![b'x'; MAX_ARTICLE_BYTES + 1],
     );
     assert_eq!(read(&s, 0..1, &mut t), Err(SourceError::Bounds));
+}
+
+// ---- Async reader fixtures: synthetic bodies and in-memory signals only. ----
+
+#[derive(Default)]
+struct CancelSignal {
+    cancelled: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+impl CancelSignal {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(w) = self.waker.lock().unwrap().take() {
+            w.wake();
+        }
+    }
+}
+struct AsyncControl {
+    signal: Arc<CancelSignal>,
+    calls: usize,
+    /// 1-based `check` call that fails with `Cancelled`.
+    fail_check_at: Option<usize>,
+}
+impl AsyncControl {
+    fn new() -> Self {
+        Self {
+            signal: Arc::default(),
+            calls: 0,
+            fail_check_at: None,
+        }
+    }
+    fn failing_at(call: usize) -> Self {
+        Self {
+            fail_check_at: Some(call),
+            ..Self::new()
+        }
+    }
+}
+impl ReadControl for AsyncControl {
+    fn check(&mut self) -> Result<(), SourceError> {
+        self.calls += 1;
+        if self.fail_check_at == Some(self.calls) {
+            return Err(SourceError::Cancelled);
+        }
+        Ok(())
+    }
+}
+impl AsyncReadControl for AsyncControl {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
+        if self.signal.cancelled.load(Ordering::SeqCst) {
+            return Poll::Ready(SourceError::Cancelled);
+        }
+        *self.signal.waker.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct AsyncTransport {
+    inner: Transport,
+    pending_at: Option<usize>,
+    /// Trusted ordinals, recorded when the open future is first polled.
+    opened: Vec<usize>,
+}
+impl AsyncArticleSource for AsyncTransport {
+    async fn open(&mut self, index: usize, reference: &str) -> Result<Vec<u8>, SourceError> {
+        assert_eq!(reference, format!("generated-{index}@fixture.invalid"));
+        self.opened.push(index);
+        if self.pending_at == Some(index) {
+            std::future::pending::<()>().await;
+        }
+        self.inner
+            .bodies
+            .get(reference)
+            .cloned()
+            .ok_or(SourceError::Transport)
+    }
+}
+fn async_transport(sizes: &[usize]) -> AsyncTransport {
+    AsyncTransport {
+        inner: transport(sizes),
+        pending_at: None,
+        opened: Vec::new(),
+    }
+}
+fn set_body(t: &mut AsyncTransport, index: usize, body: Vec<u8>) {
+    t.inner
+        .bodies
+        .insert(format!("generated-{index}@fixture.invalid"), body);
+}
+
+struct WakeCount(AtomicUsize);
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+async fn chunks(
+    s: &OriginalSource,
+    r: std::ops::Range<u64>,
+    t: &mut AsyncTransport,
+) -> Result<Vec<Vec<u8>>, SourceError> {
+    let mut reader = AsyncRangeReader::new(s, r)?;
+    let mut control = AsyncControl::new();
+    let mut out = Vec::new();
+    while let Some(bytes) = reader.next(t, &mut control).await? {
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
+#[tokio::test]
+async fn async_complete_and_range_output_matches_with_any_hint_and_sizes() {
+    let hints = [
+        None,
+        Some(RangeHint {
+            part_size: 3,
+            final_begin: 6,
+            final_end: 8,
+        }),
+        Some(RangeHint {
+            part_size: u64::MAX,
+            final_begin: 0,
+            final_end: 1,
+        }),
+    ];
+    for hint in hints {
+        let s = source(&[3, 3, 2], hint);
+        for r in [0..8u64, 2..7, 3..6, 7..8] {
+            let mut t = async_transport(&[3, 3, 2]);
+            let got = chunks(&s, r.clone(), &mut t).await.unwrap();
+            assert_eq!(got.concat(), r.map(|n| n as u8).collect::<Vec<u8>>());
+            assert!(got.iter().all(|c| !c.is_empty()));
+            assert_eq!(t.opened[0], 2, "final article is opened first");
+            let mut seen = t.opened.clone();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), t.opened.len(), "no article opened twice");
+            assert!(t.opened.len() <= 3);
+        }
+        let mut t = async_transport(&[3, 3, 2]);
+        let got = chunks(&s, 2..7, &mut t).await.unwrap();
+        assert_eq!(got, vec![vec![2], vec![3, 4, 5], vec![6]]);
+    }
+    // Stale uniform hint over actual nonuniform parts: prefix fallback only.
+    let s = source(
+        &[3, 2, 4, 2],
+        Some(RangeHint {
+            part_size: 3,
+            final_begin: 9,
+            final_end: 11,
+        }),
+    );
+    let mut t = async_transport(&[3, 2, 4, 2]);
+    let got = chunks(&s, 4..10, &mut t).await.unwrap();
+    assert_eq!(got.concat(), (4..10).collect::<Vec<u8>>());
+    assert_eq!(t.opened, vec![3, 0, 1, 2]);
+}
+
+#[tokio::test]
+async fn async_opens_final_first_and_outputs_before_full_traversal() {
+    let s = source(&[3, 3, 3, 3], None);
+    let mut t = async_transport(&[3, 3, 3, 3]);
+    let mut reader = AsyncRangeReader::new(&s, 0..2).unwrap();
+    let mut control = AsyncControl::new();
+    assert_eq!(t.opened.len(), 0, "construction performs no I/O");
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![0, 1]))
+    );
+    assert_eq!(t.opened, vec![3, 0]);
+    assert_eq!(reader.next(&mut t, &mut control).await, Ok(None));
+    assert_eq!(t.opened, vec![3, 0], "no open past the requested range");
+
+    let mut t = async_transport(&[3, 3, 3, 3]);
+    let mut reader = AsyncRangeReader::new(&s, 4..8).unwrap();
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![4, 5]))
+    );
+    assert_eq!(t.opened, vec![3, 0, 1]);
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![6, 7]))
+    );
+    assert_eq!(t.opened, vec![3, 0, 1, 2]);
+    assert_eq!(reader.next(&mut t, &mut control).await, Ok(None));
+    assert!(t.opened.len() <= s.article_count());
+}
+
+#[tokio::test]
+async fn async_single_part_and_geometry_contradictions_fail_closed() {
+    let s = source(
+        &[3],
+        Some(RangeHint {
+            part_size: 3,
+            final_begin: 0,
+            final_end: 3,
+        }),
+    );
+    let mut t = async_transport(&[3]);
+    assert_eq!(chunks(&s, 0..3, &mut t).await, Ok(vec![vec![0, 1, 2]]));
+    assert_eq!(t.opened, vec![0]);
+    set_body(&mut t, 0, article(&[0, 1, 2], 0, 2, 0, 3));
+    assert_eq!(chunks(&s, 0..3, &mut t).await, Err(SourceError::Integrity));
+
+    let s = source(&[3, 3, 2], None);
+    for bad in [
+        article(&[6, 7], 2, 3, 5, 8),
+        article(&[6, 7], 2, 3, 6, 9),
+        b"=ybegin part=3 size=8 name=generated\r\n=ypart begin=7 end=8\r\n01".to_vec(),
+    ] {
+        let mut t = async_transport(&[3, 3, 2]);
+        set_body(&mut t, 2, bad);
+        assert_eq!(chunks(&s, 0..8, &mut t).await, Err(SourceError::Integrity));
+        assert_eq!(t.opened, vec![2], "invalid final stops before the prefix");
+    }
+    // Contradictory intermediate geometry.
+    let mut t = async_transport(&[3, 3, 2]);
+    set_body(&mut t, 1, article(&[3, 4, 5], 1, 3, 2, 8));
+    assert_eq!(chunks(&s, 3..6, &mut t).await, Err(SourceError::Integrity));
+    // Bad CRC.
+    let mut t = async_transport(&[3, 3, 2]);
+    let body = t
+        .inner
+        .bodies
+        .get_mut("generated-2@fixture.invalid")
+        .unwrap();
+    let i = body.windows(7).position(|w| w == b"pcrc32=").unwrap();
+    body[i + 7] = b'z';
+    assert_eq!(chunks(&s, 0..8, &mut t).await, Err(SourceError::Integrity));
+    // Encoded cap, checked on the supplied buffer.
+    let s = source(&[1], None);
+    let mut t = async_transport(&[1]);
+    set_body(&mut t, 0, vec![b'x'; MAX_ARTICLE_BYTES + 1]);
+    assert_eq!(chunks(&s, 0..1, &mut t).await, Err(SourceError::Bounds));
+}
+
+#[tokio::test]
+async fn async_aggregate_budget_refuses_the_next_open() {
+    let s = source(&[1, 1], None);
+    let mut t = async_transport(&[1, 1]);
+    for i in 0..2 {
+        set_body(&mut t, i, article(&[0, 1], i, 2, 0, 2));
+    }
+    assert_eq!(chunks(&s, 0..2, &mut t).await, Err(SourceError::Integrity));
+    assert_eq!(t.opened, vec![1]);
+}
+
+#[tokio::test]
+async fn async_invalid_range_does_no_io() {
+    let s = source(&[3], None);
+    for r in [
+        0..0,
+        3..4,
+        std::ops::Range { start: 2, end: 1 },
+        0..u64::MAX,
+    ] {
+        assert_eq!(AsyncRangeReader::new(&s, r).err(), Some(SourceError::Range));
+    }
+    // A control that cancels at the first check also reaches no transport.
+    let mut t = async_transport(&[3]);
+    let mut reader = AsyncRangeReader::new(&s, 0..3).unwrap();
+    let mut control = AsyncControl::failing_at(1);
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Err(SourceError::Cancelled)
+    );
+    assert!(t.opened.is_empty());
+}
+
+#[test]
+fn async_pending_fetch_is_cancelled_by_wakeable_control() {
+    let s = source(&[3, 3, 2], None);
+    let mut t = async_transport(&[3, 3, 2]);
+    t.pending_at = Some(2);
+    let mut reader = AsyncRangeReader::new(&s, 0..8).unwrap();
+    let mut control = AsyncControl::new();
+    let signal = control.signal.clone();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    {
+        let mut fut = Box::pin(reader.next(&mut t, &mut control));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        signal.cancel();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "cancel wakes the task");
+        assert_eq!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(SourceError::Cancelled))
+        );
+    }
+    assert_eq!(t.opened, vec![2]);
+    // The reader stays stopped and never retries the uncertain open.
+    t.pending_at = None;
+    let mut fut = Box::pin(reader.next(&mut t, &mut control));
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    assert_eq!(t.opened, vec![2]);
+}
+
+#[test]
+fn async_simultaneous_ready_cancellation_wins_over_the_article() {
+    let s = source(&[3], None);
+    let mut t = async_transport(&[3]);
+    let mut reader = AsyncRangeReader::new(&s, 0..3).unwrap();
+    let mut control = AsyncControl::new();
+    control.signal.cancel(); // `check` stays Ok; only `poll_cancel` is ready.
+    let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(reader.next(&mut t, &mut control));
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    assert!(t.opened.is_empty(), "the ready article was never taken");
+}
+
+#[tokio::test]
+async fn async_control_failure_after_open_releases_no_output() {
+    // Check order for [3,3,2], 0..8: 1 start; 2 before final open; 3 after it;
+    // 4 before open 0; 5 after it; 6 before releasing output.
+    let s = source(&[3, 3, 2], None);
+    for (call, opened) in [(5usize, vec![2, 0]), (6, vec![2, 0]), (3, vec![2])] {
+        let mut t = async_transport(&[3, 3, 2]);
+        let mut reader = AsyncRangeReader::new(&s, 0..8).unwrap();
+        let mut control = AsyncControl::failing_at(call);
+        assert_eq!(
+            reader.next(&mut t, &mut control).await,
+            Err(SourceError::Cancelled)
+        );
+        assert_eq!(t.opened, opened);
+        assert_eq!(
+            reader.next(&mut t, &mut AsyncControl::new()).await,
+            Err(SourceError::Cancelled)
+        );
+        assert_eq!(t.opened, opened, "stopped reader opens nothing more");
+    }
+}
+
+#[tokio::test]
+async fn async_transport_failure_after_partial_output_stops_for_good() {
+    let s = source(&[3, 3, 3], None);
+    let mut t = async_transport(&[3, 3, 3]);
+    t.inner.bodies.remove("generated-1@fixture.invalid");
+    let mut reader = AsyncRangeReader::new(&s, 0..9).unwrap();
+    let mut control = AsyncControl::new();
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![0, 1, 2]))
+    );
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Err(SourceError::Transport)
+    );
+    assert_eq!(t.opened, vec![2, 0, 1]);
+    for _ in 0..2 {
+        assert_eq!(
+            reader.next(&mut t, &mut control).await,
+            Err(SourceError::Cancelled)
+        );
+    }
+    assert_eq!(t.opened, vec![2, 0, 1], "no further opens after failure");
+}
+
+#[test]
+fn async_dropping_pending_next_stops_the_reader_without_retry() {
+    let s = source(&[3, 3, 2], None);
+    let mut t = async_transport(&[3, 3, 2]);
+    t.pending_at = Some(2);
+    let mut reader = AsyncRangeReader::new(&s, 0..8).unwrap();
+    let mut control = AsyncControl::new();
+    let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
+    let mut cx = Context::from_waker(&waker);
+    {
+        let mut fut = Box::pin(reader.next(&mut t, &mut control));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+    } // dropped while the open is pending
+    assert_eq!(t.opened, vec![2]);
+    t.pending_at = None;
+    let mut fut = Box::pin(reader.next(&mut t, &mut control));
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    assert_eq!(t.opened, vec![2], "the uncertain open is not retried");
+}
+
+#[tokio::test]
+async fn async_dropping_the_reader_makes_no_extra_opens() {
+    let s = source(&[3, 3, 3], None);
+    let mut t = async_transport(&[3, 3, 3]);
+    drop(AsyncRangeReader::new(&s, 0..9).unwrap());
+    assert!(t.opened.is_empty());
+    let mut reader = AsyncRangeReader::new(&s, 0..9).unwrap();
+    let mut control = AsyncControl::new();
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![0, 1, 2]))
+    );
+    drop(reader);
+    assert_eq!(t.opened, vec![2, 0]);
+    // An unpolled `next` future is lazy too.
+    let mut reader = AsyncRangeReader::new(&s, 0..9).unwrap();
+    drop(reader.next(&mut t, &mut control));
+    drop(reader);
+    assert_eq!(t.opened, vec![2, 0]);
 }
