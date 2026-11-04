@@ -84,5 +84,6 @@ pub mod yenc;
 pub mod account_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
+pub mod source_catalogue;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stampede;

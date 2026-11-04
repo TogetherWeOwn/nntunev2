@@ -729,11 +729,20 @@ fn playback_adapter_is_not_wired_into_any_runtime_or_route_source() {
     for entry in fs::read_dir(&src).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name == "account_playback.rs" || name == "lib.rs" {
+        // The portable source catalogue implements this seam but installs no
+        // transport. Keep both adapters forbidden in every runtime/route file.
+        if matches!(
+            name.as_str(),
+            "account_playback.rs" | "source_catalogue.rs" | "lib.rs"
+        ) {
             continue;
         }
         if path.extension().is_some_and(|e| e == "rs") {
             let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("source_catalogue"),
+                "{name} must not install the source catalogue"
+            );
             assert!(
                 !text.contains("account_playback"),
                 "{name} must not reference the unwired playback adapter"

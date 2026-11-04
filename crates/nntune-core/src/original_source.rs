@@ -13,6 +13,7 @@ use serde::{
 use crate::nzb::{self, File};
 
 pub mod reader;
+pub mod service;
 
 pub const PAYLOAD_FORMAT: i16 = 1;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;

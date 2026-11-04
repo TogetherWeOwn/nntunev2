@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod postgres;
+pub mod service;
 
 pub const ENVELOPE_VERSION: i16 = 2;
 

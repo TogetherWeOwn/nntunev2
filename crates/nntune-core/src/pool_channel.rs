@@ -33,6 +33,9 @@ pub enum AuthError {
 pub enum Channel {
     Resolver,
     Account,
+    /// Stream/API source reads use the existing play-grant key, never a pool
+    /// account/resolver key. Domain separation prevents cross-channel replay.
+    OriginalSource,
 }
 
 impl Channel {
@@ -40,6 +43,7 @@ impl Channel {
         match self {
             Self::Resolver => "PoolResolver",
             Self::Account => "PoolAccount",
+            Self::OriginalSource => "OriginalSource",
         }
     }
 
@@ -47,6 +51,7 @@ impl Channel {
         match self {
             Self::Resolver => b"nntune-pool-resolver-v1\nPOST\n",
             Self::Account => b"nntune-pool-account-v1\nPOST\n",
+            Self::OriginalSource => b"nntune-original-source-v1\nPOST\n",
         }
     }
 
@@ -54,6 +59,7 @@ impl Channel {
         match self {
             Self::Resolver => matches!(path, REGISTRY_PATH | RESOLVE_PATH),
             Self::Account => matches!(path, CANDIDATE_PATH | OPERATION_PATH),
+            Self::OriginalSource => path == crate::original_source::service::PATH,
         }
     }
 
