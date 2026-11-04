@@ -17,9 +17,10 @@ import pathlib
 import re
 import subprocess
 import sys
-import tomllib
 import urllib.parse
 import urllib.request
+
+from migration_history import HistoryError, parse_manifest, read_input
 
 
 class GateError(Exception):
@@ -75,36 +76,17 @@ def load_expected(manifest_path=None):
     if manifest_path is None:
         manifest_path = pathlib.Path(__file__).resolve().parents[2] / "migrations" / "manifest.toml"
     try:
-        data = tomllib.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        entries = parse_manifest(read_input(manifest_path))
+    except (OSError, UnicodeError, HistoryError) as exc:
         raise GateError("cannot read migrations manifest") from exc
-    entries = data.get("migration", [])
-    if not isinstance(entries, list) or not entries:
-        raise GateError("migrations manifest has no entries")
-    expected, seen = [], set()
+    expected = []
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("target") != "app":
-            if not isinstance(entry, dict) or entry.get("target") not in ("app", "mirror"):
-                raise GateError("migrations manifest entry has no valid target")
+        if entry["target"] != "app":
             continue
-        pairs = [(entry.get("file"), entry.get("sha256"))]
-        renamed = entry.get("renamed_from", [])
-        if not isinstance(renamed, list):
-            raise GateError("migrations manifest renamed_from must be a list")
-        pairs += [(item.get("file"), item.get("sha256")) if isinstance(item, dict)
-                   else (None, None) for item in renamed]
-        for filename, sha in pairs:
-            if not (isinstance(filename, str) and FILE_RE.match(filename)
-                    and isinstance(sha, str) and SHA_RE.match(sha)):
-                raise GateError("migrations manifest entry is malformed")
-            if filename in seen:
-                raise GateError("migrations manifest names a file more than once")
-            seen.add(filename)
-        # Renames are byte-identical (the migrations gate enforces this);
-        # an alias with different bytes would certify unapplied content.
-        if any(sha != pairs[0][1] for _filename, sha in pairs[1:]):
-            raise GateError("migrations manifest renamed_from sha256 must equal the entry sha256")
-        expected.append((pairs[0][0], pairs[0][1], tuple(pairs[1:])))
+        # Source history is parsed strictly for both targets, but is NEVER
+        # part of this positive accepted set. Different-byte rows stay unknown.
+        aliases = tuple((a["file"], a["sha256"]) for a in entry.get("renamed_from", []))
+        expected.append((entry["file"], entry["sha256"], aliases))
     if not expected:
         raise GateError("migrations manifest has no app entries")
     return expected
