@@ -9,6 +9,7 @@ import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.j
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { endTrackDrag } from '#lib/interactions/track-drag.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -50,7 +51,7 @@ function pageScript(search: string) {
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearMiniPlayerHint, setMiniPlayerHint,
-		resolveStreamUrl, resolveShareTarget,
+		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},

@@ -15,6 +15,7 @@ import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/ord
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
+import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import {
 	appendResultLabel,
 	appendSelection,
@@ -110,6 +111,7 @@ function pageScript() {
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,
+		endTrackDrag,
 		appendResultLabel,
 		appendSelection,
 		clearSelection,

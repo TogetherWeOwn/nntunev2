@@ -27,6 +27,13 @@ export const TESTIDS = {
   libraryItem: 'library-item',
   libraryList: 'library-list',
   libraryStaleBadge: 'library-stale-badge',
+  trackContextMenu: 'track-context-menu',
+  trackMore: 'track-more',
+  favoriteMore: 'favorite-more',
+  trackSelectionToolbar: 'track-selection-toolbar',
+  queueDropTarget: 'queue-drop-target',
+  queueMore: 'queue-more',
+  queueSelectionToolbar: 'queue-selection-toolbar',
   // Player contract across the app-shell redesign (design spec v1): the
   // audio element keeps this hook (its native `controls` go away), the
   // usage meter keeps its hook (rail footer XOR library page, never

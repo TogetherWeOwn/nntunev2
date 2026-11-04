@@ -1,0 +1,570 @@
+import AxeBuilder from '@axe-core/playwright';
+import { expect, test, type Page } from '@playwright/test';
+import { TESTIDS } from '../../../e2e/helpers/contract';
+
+const ITEMS = [
+	{ id: 'coral', title: 'Coral Night', artist: 'Harbor Lights' },
+	{ id: 'dawn', title: 'Dawn Chorus' },
+	{ id: 'ember', title: 'Ember Sky' },
+	{ id: 'tide', title: 'Tide Pools' }
+];
+
+const pageErrors: string[] = [];
+test.beforeEach(() => { pageErrors.length = 0; });
+test.afterEach(() => { expect(pageErrors).toEqual([]); });
+
+async function seed(page: Page, items: Array<{ id: string; title: string; artist?: string; streamUrl?: string }> = ITEMS) {
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
+	await page.goto('/library');
+	await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(items.length);
+}
+
+const libraryRow = (page: Page, id: string) => page.locator(`[data-testid="library-item"][data-id="${id}"]`);
+const queueRow = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
+const menu = (page: Page) => page.getByTestId(TESTIDS.trackContextMenu);
+
+async function queueAll(page: Page) {
+	for (const item of ITEMS) await libraryRow(page, item.id).locator('.nt-library-row').click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(ITEMS.length);
+}
+
+async function queueIds(page: Page) {
+	return page.getByTestId('queue-item').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')));
+}
+
+test('More, right-click and keyboard menus share actions, navigation and return focus', async ({ page }) => {
+	await seed(page);
+	const more = libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+	await more.click();
+	await expect(menu(page).getByRole('menuitem', { name: 'Play now', exact: true })).toBeFocused();
+	await page.keyboard.press('End');
+	await expect(menu(page).getByRole('menuitem', { name: 'Copy link' })).toBeFocused();
+	await page.keyboard.press('ArrowUp');
+	await expect(menu(page).getByRole('menuitem', { name: 'Add to playlist, not available yet' })).toBeFocused();
+	await page.keyboard.press('ArrowUp');
+	await expect(menu(page).getByRole('menuitemcheckbox', { name: 'Star', exact: true })).toBeFocused();
+	await page.keyboard.press('Home');
+	await page.keyboard.press('a');
+	await expect(menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true })).toBeFocused();
+	await page.keyboard.press('Escape');
+	await expect(menu(page)).toHaveCount(0);
+	await expect(more).toBeFocused();
+	await more.press('Shift+F10');
+	await expect(menu(page)).toBeVisible();
+	await page.keyboard.press('Escape');
+	await libraryRow(page, 'coral').click({ button: 'right' });
+	await expect(menu(page)).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(more).toBeFocused();
+	await libraryRow(page, 'coral').click({ button: 'right' });
+	await menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(1);
+	await expect(page.getByTestId('queue-item')).toHaveAttribute('data-track-id', 'coral');
+	await expect(page.locator('audio[src]:not([src=""])')).toHaveCount(0);
+});
+
+test('Copy link is inline, restores focus and preserves whole-menu dismissal', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (url: string) => {
+			(window as unknown as { copiedLink: string }).copiedLink = url;
+		} } });
+	});
+	await seed(page);
+	const more = libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+	await more.click();
+	await expect(page.getByRole('menuitem', { name: 'Share', exact: true })).toHaveCount(0);
+	await page.keyboard.press('End');
+	await expect(page.getByRole('menuitem', { name: 'Copy link', exact: true })).toBeFocused();
+	await page.keyboard.press('Enter');
+	await expect(menu(page)).toHaveCount(0);
+	await expect(more).toBeFocused();
+	await expect.poll(() => page.evaluate(() => (window as unknown as { copiedLink: string }).copiedLink))
+		.toContain('/library?track=coral');
+	await more.click();
+	await page.keyboard.press('Tab');
+	await expect(menu(page)).toHaveCount(0);
+	await expect(page.locator('body')).not.toBeFocused();
+	await more.click();
+	await page.getByRole('heading', { name: 'Library', exact: true }).click();
+	await expect(menu(page)).toHaveCount(0);
+	await expect(more).toBeFocused();
+});
+
+test('reserved playlist slots are discoverable but never activate or persist', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const requests: string[] = [];
+	page.on('request', (request) => requests.push(request.url()));
+	const snapshot = () => page.evaluate(() => ({
+		queue: [...document.querySelectorAll('[data-testid="queue-item"]')].map((row) => row.getAttribute('data-track-id')),
+		current: document.querySelector('[data-testid="now-playing"]')?.textContent,
+		local: { ...localStorage }, session: { ...sessionStorage }
+	}));
+	for (const more of [libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore), queueRow(page, 'coral').getByTestId(TESTIDS.queueMore)]) {
+		const before = await snapshot();
+		await more.click();
+		const slot = menu(page).getByRole('menuitem', { name: 'Add to playlist, not available yet', exact: true });
+		await expect(slot).toHaveAttribute('aria-disabled', 'true');
+		await expect(slot).toContainText('Not available yet');
+		await page.keyboard.press('Home');
+		for (let step = 0; step < 14 && !await slot.evaluate((node) => node === document.activeElement); step++) {
+			await page.keyboard.press('ArrowDown');
+		}
+		await expect(slot).toBeFocused();
+		for (const key of ['Enter', 'Space']) {
+			await page.keyboard.press(key);
+			await expect(slot).toBeFocused();
+			await expect(menu(page)).toBeVisible();
+			expect(await snapshot()).toEqual(before);
+		}
+		// aria-disabled items remain discoverable, unlike native disabled buttons.
+		await slot.click({ force: true });
+		await expect(menu(page)).toBeVisible();
+		expect(await snapshot()).toEqual(before);
+		await page.keyboard.press('Home');
+		await page.keyboard.press('a');
+		await expect(slot).not.toBeFocused();
+		await page.keyboard.press('Escape');
+	}
+	expect(requests).toEqual([]);
+});
+
+test('modifier selection and list-scoped select all do not queue or change favorites', async ({ page }) => {
+	await seed(page);
+	await libraryRow(page, 'coral').locator('.nt-library-row').click({ modifiers: ['Control'] });
+	await expect(page.getByTestId('selection-count')).toHaveText('1 selected');
+	await libraryRow(page, 'ember').locator('.nt-library-row').click({ modifiers: ['Shift'] });
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	await libraryRow(page, 'tide').locator('.nt-library-row').focus();
+	await page.keyboard.press('Control+a');
+	await expect(page.getByTestId('selection-count')).toHaveText('4 selected');
+	await page.keyboard.press('Space');
+	await expect(page.getByTestId('selection-count')).toHaveText('3 selected');
+	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+	await menu(page).getByRole('menuitem', { name: 'Play next', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember']);
+	await page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Done', exact: true }).click();
+	await expect(page.getByTestId('selection-count')).toHaveText('0 selected');
+});
+
+test('queue batch selection has keyboard insertion parity and preserves the current track', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const current = await page.getByTestId('now-playing').textContent();
+	await queueRow(page, 'dawn').getByRole('checkbox').check();
+	await queueRow(page, 'tide').getByRole('checkbox').click({ modifiers: ['Shift'] });
+	const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+	await expect(toolbar.getByRole('status')).toHaveText('3 selected in queue');
+	await toolbar.getByLabel('Move selected before').selectOption('coral');
+	await toolbar.getByRole('button', { name: 'Move selected', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['dawn', 'ember', 'tide', 'coral']);
+	await expect(page.getByTestId('now-playing')).toHaveText(current!);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
+	await expect(menu(page)).toHaveAttribute('aria-label', '3 selected tracks');
+	await menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
+	await toolbar.getByRole('button', { name: 'Remove selected from queue' }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+});
+
+for (const action of ['Move selected', 'Play next']) {
+	test(`queue toolbar ${action} retains queue order after reverse selection`, async ({ page }) => {
+		await seed(page);
+		await queueAll(page);
+		await queueRow(page, 'ember').getByRole('checkbox').check();
+		await queueRow(page, 'dawn').getByRole('checkbox').check();
+		const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+		await toolbar.getByLabel('Move selected before').selectOption('tide');
+		await toolbar.getByRole('button', { name: action, exact: true }).click();
+		await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
+		await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	});
+}
+
+test('batch Play now keeps the old current track when it follows the first selection', async ({ page }) => {
+	await page.addInitScript(() => {
+		(window as unknown as { playCalls: number }).playCalls = 0;
+		HTMLMediaElement.prototype.play = function () {
+			(window as unknown as { playCalls: number }).playCalls++;
+			return Promise.resolve();
+		};
+	});
+	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	await seed(page, ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` })));
+	await queueAll(page);
+	await queueRow(page, 'ember').getByRole('button', { name: /^Select Ember Sky/ }).click();
+	await libraryRow(page, 'ember').getByRole('checkbox').check();
+	await libraryRow(page, 'dawn').getByRole('checkbox').check();
+	await libraryRow(page, 'dawn').getByTestId(TESTIDS.trackMore).click();
+	await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
+	await expect(queueRow(page, 'dawn')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('queue-announcement')).toHaveText('Playing Dawn Chorus. Added 0, 2 already queued.');
+	await expect.poll(() => page.evaluate(() => (window as unknown as { playCalls: number }).playCalls)).toBe(1);
+});
+
+test('narrow row retains its primary action alongside More', async ({ page }) => {
+	await page.setViewportSize({ width: 320, height: 844 });
+	await seed(page);
+	await libraryRow(page, 'coral').click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	await expect(menu(page)).toHaveCount(0);
+});
+
+for (const path of ['/library/liked', '/library/recent', '/search?q=Coral', '/demo/player']) {
+	test(`${path} does not opt into track menus or drag controls`, async ({ page }) => {
+		await seed(page);
+		await libraryRow(page, 'coral').getByRole('button', { name: /^Star Coral Night/ }).click();
+		await page.goto(path);
+		const main = page.getByRole('main');
+		await expect(main).toBeVisible();
+		await expect(main.locator('[draggable="true"], .queue-grip')).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.trackMore)).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.favoriteMore)).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.queueMore)).toHaveCount(0);
+		await main.click({ button: 'right', position: { x: 10, y: 10 } });
+		await expect(menu(page)).toHaveCount(0);
+		await page.keyboard.press('Shift+F10');
+		await expect(menu(page)).toHaveCount(0);
+	});
+}
+
+test('native drag inserts into an empty queue, rejects external data and supports queue reordering', async ({ page }) => {
+	await page.setViewportSize({ width: 1280, height: 1800 });
+	await seed(page);
+	await libraryRow(page, 'coral').dragTo(page.getByTestId(TESTIDS.queueDropTarget), { sourcePosition: { x: 4, y: 4 } });
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	await libraryRow(page, 'dawn').locator('.nt-library-row').click();
+	await libraryRow(page, 'ember').locator('.nt-library-row').click();
+	await queueRow(page, 'ember').getByRole('button', { name: /^Reorder / }).dragTo(queueRow(page, 'coral'), { targetPosition: { x: 4, y: 1 } });
+	await expect.poll(() => queueIds(page)).toEqual(['ember', 'coral', 'dawn']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	await page.getByTestId(TESTIDS.queueDropTarget).evaluate((target) => {
+		const dataTransfer = new DataTransfer();
+		dataTransfer.setData('application/x-nntune-track-ids', 'forged');
+		target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+	});
+	await expect.poll(() => queueIds(page)).toEqual(['ember', 'coral', 'dawn']);
+});
+
+test('library batch Play now uses displayed order and hydrates only its first track', async ({ page }) => {
+	await page.addInitScript(() => {
+		(window as unknown as { playCalls: number }).playCalls = 0;
+		HTMLMediaElement.prototype.play = function () {
+			(window as unknown as { playCalls: number }).playCalls++;
+			return Promise.resolve();
+		};
+	});
+	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	await seed(page, ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` })));
+	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await libraryRow(page, 'ember').getByRole('checkbox').check();
+	await libraryRow(page, 'dawn').getByRole('checkbox').check();
+	await libraryRow(page, 'ember').getByTestId(TESTIDS.trackMore).click();
+	await expect(menu(page)).toHaveAttribute('aria-label', '2 selected tracks');
+	await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember']);
+	await expect(queueRow(page, 'dawn')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('queue-announcement')).toHaveText('Playing Dawn Chorus. Added 2.');
+	await expect.poll(() => page.evaluate(() => (window as unknown as { playCalls: number }).playCalls)).toBe(1);
+	await queueRow(page, 'ember').getByRole('button', { name: /^Select Ember Sky/ }).click();
+	await expect(page.locator('audio')).toHaveCount(0);
+});
+
+test('mixed stars have one aggregate outcome and shelf menus retain local management behavior', async ({ page }) => {
+	await seed(page);
+	await libraryRow(page, 'coral').getByRole('button', { name: 'Star Coral Night', exact: true }).click();
+	await libraryRow(page, 'coral').getByRole('checkbox').check();
+	await libraryRow(page, 'dawn').getByRole('checkbox').check();
+	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+	await menu(page).getByRole('menuitemcheckbox', { name: 'Star all', exact: true }).click();
+	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
+	await expect(page.getByTestId('favorites-announcement')).toHaveText('Starred 1 track; 1 was already starred.');
+	const shelf = (id: string) => page.locator(`[data-testid="favorite-item"][data-id="${id}"]`);
+	const more = shelf('coral').getByTestId(TESTIDS.favoriteMore);
+	await more.press('Shift+F10');
+	await expect(menu(page)).toHaveAttribute('aria-label', 'Actions for Coral Night');
+	await expect(menu(page).getByRole('menuitem', { name: 'Move up', exact: true })).toHaveCount(0);
+	await menu(page).getByRole('menuitem', { name: 'Move down', exact: true }).click();
+	await expect(page.getByTestId('favorite-item').first()).toHaveAttribute('data-id', 'dawn');
+	await expect(more).toBeFocused();
+	await more.click();
+	await menu(page).getByRole('menuitemcheckbox', { name: 'Unstar', exact: true }).click();
+	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
+	await expect(shelf('dawn').locator('[data-shelf-unstar]')).toBeFocused();
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+});
+
+test('queue grip opens at Move and menu removal focuses the next surviving More control', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const grip = queueRow(page, 'dawn').getByRole('button', { name: 'Reorder Dawn Chorus', exact: true });
+	await grip.focus();
+	await page.keyboard.press('Enter');
+	await expect(menu(page).getByRole('menuitem', { name: 'Move to top', exact: true })).toBeFocused();
+	await expect(menu(page).getByRole('menuitem', { name: 'Select track', exact: true })).toHaveCount(0);
+	await expect(menu(page).getByRole('menuitem').last()).toHaveText('Remove from queue');
+	await menu(page).getByRole('menuitem', { name: 'Remove from queue', exact: true }).click();
+	await expect(queueRow(page, 'ember').getByTestId(TESTIDS.queueMore)).toBeFocused();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'tide']);
+});
+
+for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as const) {
+	test(`queue Play now is an explicit, single playback attempt: ${outcome}`, async ({ page }) => {
+		await page.addInitScript((outcome) => {
+			const scope = window as unknown as { playCalls: number; finishPlay?: () => void };
+			scope.playCalls = 0;
+			HTMLMediaElement.prototype.play = function () {
+				scope.playCalls += 1;
+				if (outcome === 'blocked') return Promise.reject(new DOMException('Blocked', 'NotAllowedError'));
+				if (outcome === 'superseded') return new Promise<void>((resolve) => { scope.finishPlay = resolve; });
+				return Promise.resolve();
+			};
+		}, outcome);
+		await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+		await seed(page, ITEMS.map((item) => ({ ...item,
+			...(item.id === 'dawn' && outcome !== 'no-stream' ? { streamUrl: '/interaction-audio/dawn' } : {})
+		})));
+		// Menu insertion is metadata-only, even when the library has a stream.
+		await libraryRow(page, 'dawn').getByTestId(TESTIDS.trackMore).click();
+		await menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
+		await libraryRow(page, 'coral').locator('.nt-library-row').click();
+		await expect(page.locator('audio')).toHaveCount(0);
+		await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
+		await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
+		await expect(queueRow(page, 'dawn')).toHaveAttribute('aria-current', 'true');
+		await expect.poll(() => page.evaluate(() => (window as unknown as { playCalls: number }).playCalls))
+			.toBe(outcome === 'no-stream' ? 0 : 1);
+		if (outcome === 'superseded') {
+			await queueRow(page, 'coral').getByRole('button', { name: /^Select Coral Night/ }).click();
+			const announcement = await page.getByTestId('queue-announcement').textContent();
+			await page.evaluate(() => (window as unknown as { finishPlay: () => void }).finishPlay());
+			await expect(page.getByTestId('queue-announcement')).toHaveText(announcement!);
+			await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+		} else {
+			await expect(page.getByTestId('queue-announcement')).toHaveText(outcome === 'accepted'
+				? 'Playing Dawn Chorus.' : outcome === 'blocked'
+					? 'Selected Dawn Chorus, paused: playback was blocked.' : 'Selected Dawn Chorus; no stream to play.');
+		}
+		await expect.poll(() => queueIds(page)).toEqual(['dawn', 'coral']);
+	});
+}
+
+test('grouped drops resolve an after-row boundary beyond moving tracks', async ({ page }) => {
+	await page.setViewportSize({ width: 1280, height: 1800 });
+	await seed(page);
+	await queueAll(page);
+	await queueRow(page, 'coral').getByRole('checkbox').check();
+	await queueRow(page, 'ember').getByRole('checkbox').check();
+	const destination = queueRow(page, 'dawn');
+	const box = (await destination.boundingBox())!;
+	await queueRow(page, 'coral').getByRole('button', { name: /^Reorder / }).dragTo(destination, {
+		targetPosition: { x: 4, y: box.height - 2 }
+	});
+	await expect.poll(() => queueIds(page)).toEqual(['dawn', 'coral', 'ember', 'tide']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+});
+
+test('Done returns keyboard focus from disappearing library and queue toolbars', async ({ page }) => {
+	await seed(page);
+	await libraryRow(page, 'coral').getByRole('checkbox').check();
+	const done = page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Done', exact: true });
+	await done.focus();
+	await page.keyboard.press('Enter');
+	await expect(libraryRow(page, 'coral').getByRole('checkbox')).toBeFocused();
+	await libraryRow(page, 'coral').getByRole('checkbox').check();
+	await page.getByLabel('Show', { exact: true }).selectOption('selected');
+	await done.focus();
+	await page.keyboard.press('Enter');
+	await expect(page.getByLabel('Show', { exact: true })).toBeFocused();
+	await page.getByLabel('Show', { exact: true }).selectOption('all');
+	await queueAll(page);
+	await queueRow(page, 'dawn').getByRole('checkbox').check();
+	await page.getByTestId(TESTIDS.queueSelectionToolbar).getByRole('button', { name: 'Done', exact: true }).focus();
+	await page.keyboard.press('Enter');
+	await expect(queueRow(page, 'dawn').getByRole('checkbox')).toBeFocused();
+});
+
+for (const width of [1280, 390]) {
+	test(`open menu and batch selection have no blocking axe violations at ${width}px`, async ({ page }) => {
+		await page.setViewportSize({ width, height: 1000 });
+		await seed(page);
+		await queueAll(page);
+		await queueRow(page, 'dawn').getByRole('checkbox').check();
+		await queueRow(page, 'ember').getByRole('checkbox').check();
+		await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+		await expect(menu(page)).toBeVisible();
+		const results = await new AxeBuilder({ page }).analyze();
+		expect(results.violations.filter((violation) =>
+			violation.impact === 'serious' || violation.impact === 'critical')).toEqual([]);
+		await page.keyboard.press('Escape');
+		await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
+		await expect(menu(page)).toHaveAttribute('aria-label', '2 selected tracks');
+		const queueResults = await new AxeBuilder({ page }).analyze();
+		expect(queueResults.violations.filter((violation) =>
+			violation.impact === 'serious' || violation.impact === 'critical')).toEqual([]);
+	});
+}
+
+for (const interruption of ['blur', 'scroll', 'hidden'] as const) {
+	test(`pending touch long-press is canceled on ${interruption}`, async ({ browser }) => {
+		const context = await browser.newContext({ viewport: { width: 390, height: 700 }, isMobile: true, hasTouch: true });
+		const page = await context.newPage();
+		await seed(page);
+		const target = libraryRow(page, 'coral').locator('.nt-library-row');
+		await target.scrollIntoViewIfNeeded();
+		const source = (await target.boundingBox())!;
+		await page.clock.install();
+		const session = await context.newCDPSession(page);
+		await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
+		await page.evaluate((interruption) => {
+			if (interruption === 'blur') window.dispatchEvent(new Event('blur'));
+			else if (interruption === 'scroll') document.dispatchEvent(new Event('scroll'));
+			else {
+				Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+				document.dispatchEvent(new Event('visibilitychange'));
+				Reflect.deleteProperty(document, 'hidden');
+			}
+		}, interruption);
+		await page.clock.fastForward(600);
+		await expect(menu(page)).toHaveCount(0);
+		await session.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
+		await context.close();
+	});
+}
+
+test('hiding the page invalidates a native drag before a later drop', async ({ page }) => {
+	await seed(page);
+	await page.evaluate(() => {
+		const source = document.querySelector('[data-testid="library-item"]')!;
+		const destination = document.querySelector('[data-testid="queue-drop-target"]')!;
+		const dataTransfer = new DataTransfer();
+		source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+		if (document.documentElement.dataset.trackDragging !== 'library') throw new Error('Drag did not start');
+		Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+		document.dispatchEvent(new Event('visibilitychange'));
+		Reflect.deleteProperty(document, 'hidden');
+		destination.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+	});
+	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+});
+
+test('a refresh invalidates an open menu and its captured actions', async ({ page }) => {
+	await seed(page);
+	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+	await expect(menu(page)).toBeVisible();
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(menu(page)).toHaveCount(0);
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+});
+
+test('touch grip reorders, Escape cancels, and non-grip touches leave the queue unchanged', async ({ browser }) => {
+	const context = await browser.newContext({ viewport: { width: 390, height: 1000 }, isMobile: true, hasTouch: true });
+	const page = await context.newPage();
+	await seed(page);
+	await queueAll(page);
+	const source = queueRow(page, 'ember').getByRole('button', { name: /^Reorder / });
+	await queueRow(page, 'dawn').scrollIntoViewIfNeeded();
+	await source.scrollIntoViewIfNeeded();
+	const start = (await source.boundingBox())!;
+	const destination = (await queueRow(page, 'dawn').boundingBox())!;
+	const session = await context.newCDPSession(page);
+	const touch = async (type: 'touchStart' | 'touchMove' | 'touchEnd', x = 0, y = 0) => {
+		await session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] });
+	};
+	await touch('touchStart', start.x + 8, start.y + 8);
+	await touch('touchMove', start.x + 18, start.y + 8);
+	await expect(page.locator('html')).toHaveAttribute('data-track-dragging', 'queue');
+	await touch('touchMove', destination.x + 4, destination.y + 3);
+	await touch('touchEnd');
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'dawn', 'tide']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	const second = (await source.boundingBox())!;
+	await touch('touchStart', second.x + 8, second.y + 8);
+	await touch('touchMove', second.x + 18, second.y + 8);
+	await expect(page.locator('html')).toHaveAttribute('data-track-dragging', 'queue');
+	await page.keyboard.press('Escape');
+	await touch('touchEnd');
+	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'dawn', 'tide']);
+	const body = (await queueRow(page, 'dawn').boundingBox())!;
+	await touch('touchStart', body.x + 3, body.y + 20);
+	await touch('touchMove', body.x + 3, body.y + 70);
+	await touch('touchEnd');
+	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'dawn', 'tide']);
+	await context.close();
+});
+
+test('a stationary touch drag scrolls its queue pane and stops scrolling on drop', async ({ browser }) => {
+	const context = await browser.newContext({ viewport: { width: 390, height: 900 }, isMobile: true, hasTouch: true });
+	const page = await context.newPage();
+	const items = [...ITEMS, ...Array.from({ length: 40 }, (_, i) => ({ id: `extra-${i}`, title: `Extra ${i}` }))];
+	await seed(page, items);
+	await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
+	const list = page.getByTestId(TESTIDS.queueDropTarget);
+	await list.evaluate((node) => { node.style.maxHeight = '320px'; node.style.overflowY = 'auto'; });
+	await list.scrollIntoViewIfNeeded();
+	const source = (await queueRow(page, 'coral').getByRole('button', { name: /^Reorder / }).boundingBox())!;
+	const box = (await list.boundingBox())!;
+	const session = await context.newCDPSession(page);
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
+	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
+	await expect(page.locator('html')).toHaveAttribute('data-track-dragging', 'queue');
+	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: box.x + 40, y: box.y + box.height - 8 }] });
+	await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeGreaterThan(200);
+	await page.keyboard.press('Escape');
+	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
+	await expect.poll(() => queueIds(page)).toEqual(items.map((item) => item.id));
+	expect(await list.evaluate(async (node) => {
+		const before = node.scrollTop;
+		await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+		return before === node.scrollTop;
+	})).toBe(true);
+	await list.evaluate((node) => { node.scrollTop = 0; });
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
+	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: source.x + 18, y: source.y + 8 }] });
+	await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: box.x + 40, y: box.y + box.height - 8 }] });
+	await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeGreaterThan(200);
+	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+	await expect(page.locator('html')).not.toHaveAttribute('data-track-dragging');
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	await expect.poll(async () => (await queueIds(page)).indexOf('coral')).toBeGreaterThan(0);
+	const stopped = await list.evaluate(async (node) => {
+		const before = node.scrollTop;
+		await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+		return before === node.scrollTop;
+	});
+	expect(stopped).toBe(true);
+	await context.close();
+});
+
+test('menus stay in a narrow viewport and coarse-pointer long press opens a sheet', async ({ browser }) => {
+	const context = await browser.newContext({ viewport: { width: 390, height: 700 }, isMobile: true, hasTouch: true });
+	const page = await context.newPage();
+	await seed(page);
+	const target = libraryRow(page, 'coral').locator('.nt-library-row');
+	await target.scrollIntoViewIfNeeded();
+	const source = (await target.boundingBox())!;
+	const session = await context.newCDPSession(page);
+	await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: source.x + 8, y: source.y + 8 }] });
+	await expect(menu(page)).toBeVisible();
+	await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+	const box = await menu(page).boundingBox();
+	expect(box!.x).toBeGreaterThanOrEqual(0);
+	expect(box!.x + box!.width).toBeLessThanOrEqual(391);
+	expect(box!.y + box!.height).toBeLessThanOrEqual(701);
+	await expect(page.getByRole('menuitem', { name: 'Copy link', exact: true })).toBeVisible();
+	await expect(page.getByRole('menuitem', { name: 'Add to playlist, not available yet' })).toHaveAttribute('aria-disabled', 'true');
+	await page.keyboard.press('Escape');
+	await expect(menu(page)).toHaveCount(0);
+	await expect(libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore)).toBeFocused();
+	await context.close();
+});
