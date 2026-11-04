@@ -12,6 +12,8 @@ use crate::{
     rotation::KekSource,
 };
 
+pub mod postgres;
+
 pub const ENVELOPE_VERSION: i16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,13 +126,23 @@ pub fn read_original_source(
     let envelope = repository
         .envelope(&selected)?
         .ok_or(SourceServiceError::Missing)?;
+    open_selected(&selected, &envelope, kek, version, track_id)
+}
+
+fn open_selected(
+    selected: &SourceMetadata,
+    envelope: &FieldEnvelope,
+    kek: &[u8; 32],
+    version: u32,
+    track_id: &str,
+) -> Result<OriginalSource, SourceServiceError> {
     if envelope.ciphertext.len() != selected.ciphertext_len as usize
         || envelope.dek_wrapped.len() != 48
     {
         return Err(SourceServiceError::Invalid);
     }
     let plaintext = Zeroizing::new(
-        field_envelope::open(kek, version, &context(track_id), &envelope)
+        field_envelope::open(kek, version, &context(track_id), envelope)
             .map_err(|_| SourceServiceError::Crypto)?,
     );
     OriginalSource::parse(
@@ -140,6 +152,50 @@ pub fn read_original_source(
         &selected.source_job_id,
     )
     .map_err(|_| SourceServiceError::Invalid)
+}
+
+/// Async counterpart of the bounded repository seam. Constructing an adapter
+/// must not perform I/O; authorization precedes the first repository call.
+#[allow(async_fn_in_trait)]
+pub trait AsyncSourceRepository {
+    async fn metadata(
+        &mut self,
+        track_id: &str,
+    ) -> Result<[Option<SourceMetadata>; 2], SourceServiceError>;
+    async fn envelope(
+        &mut self,
+        selected: &SourceMetadata,
+    ) -> Result<Option<FieldEnvelope>, SourceServiceError>;
+}
+
+/// Internal service composition only, not a route or a stream-side key store.
+/// Callers own the whole-call deadline and supply a live authorization check.
+/// Recheck after each suspension, before byte-bearing I/O and before returning
+/// plaintext. Cancellation drops the walk, with no fallback key or retry.
+pub async fn read_original_source_async(
+    authorization: &impl SourceReadAuthorization,
+    repository: &mut impl AsyncSourceRepository,
+    keks: &impl KekSource,
+    track_id: &str,
+) -> Result<OriginalSource, SourceServiceError> {
+    authorization.authorize(track_id)?;
+    if !canonical_track_id(track_id) {
+        return Err(SourceServiceError::Invalid);
+    }
+    let [first, second] = repository.metadata(track_id).await?;
+    authorization.authorize(track_id)?;
+    if second.is_some() {
+        return Err(SourceServiceError::Invalid);
+    }
+    let selected = first.ok_or(SourceServiceError::Missing)?;
+    let version = selected.validate(track_id)?;
+    let kek = keks.kek(version).ok_or(SourceServiceError::UnknownKey)?;
+    let envelope = repository
+        .envelope(&selected)
+        .await?
+        .ok_or(SourceServiceError::Missing)?;
+    authorization.authorize(track_id)?;
+    open_selected(&selected, &envelope, kek, version, track_id)
 }
 
 /// One complete source value for the existing album publish transaction.

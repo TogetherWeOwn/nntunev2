@@ -18,6 +18,14 @@ const RECORDING: &str = "00000000-0000-0000-0000-000000000004";
 const RECORDING_B: &str = "00000000-0000-0000-0000-000000000005";
 const JOB: &str = "job_generated";
 
+include!("original_source/async_tests.rs");
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+mod postgres_execution {
+    use super::*;
+    include!("original_source/postgres_tests.rs");
+}
+
 struct Keys;
 impl KekSource for Keys {
     fn kek(&self, version: u32) -> Option<&[u8; 32]> {
