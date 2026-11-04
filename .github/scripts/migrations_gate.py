@@ -10,6 +10,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from migration_history import HistoryError, edge_key, validate_history
+
 
 MANIFEST = Path("migrations/manifest.toml")
 MIGRATIONS = Path("migrations")
@@ -101,6 +103,8 @@ def load_manifest(root):
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise GateError(f"cannot read {MANIFEST}: {exc}") from exc
+    if "source_rename_history" in data:
+        raise GateError("source_rename_history belongs on its final migration entry")
     entries = data.get("migration", [])
     if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
         raise GateError(f"{MANIFEST} must contain [[migration]] tables")
@@ -132,6 +136,10 @@ def load_manifest(root):
                 raise GateError(
                     f"{MANIFEST} entry {index} renamed_from file must be a migration filename"
                 )
+    try:
+        validate_history(entries)
+    except HistoryError as exc:
+        raise GateError(f"{MANIFEST}: {exc}") from exc
     return entries
 
 
@@ -289,6 +297,10 @@ def check_drift(root, base_ref):
                 raise GateError(
                     f"base migrations/manifest.toml entry {index} renamed_from must be a list of file/sha256 tables"
                 )
+        try:
+            validate_history(base_entries)
+        except HistoryError as exc:
+            raise GateError(f"base {MANIFEST}: {exc}") from exc
         base_manifest = {entry["file"]: entry for entry in base_entries}
 
     violations = 0
@@ -376,6 +388,14 @@ def check_drift(root, base_ref):
                         f"renamed_from entries are append-only; an entry present on base {base_ref} was removed or changed",
                     )
                     violations += 1
+    for filename, previous in base_manifest.items():
+        current_entry = current_entries.get(filename, {})
+        before = {edge_key(e) for e in previous.get("source_rename_history", [])}
+        after = {edge_key(e) for e in current_entry.get("source_rename_history", [])}
+        if not before <= after:
+            report("source-history-removed", filename,
+                   f"source_rename_history is append-only against base {base_ref}")
+            violations += 1
     return violations
 
 

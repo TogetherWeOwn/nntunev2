@@ -4,9 +4,9 @@ name: migrations-staging
 # database itself: the staging-api deploy gate compares the
 # `schema_migrations` rows with migrations/manifest.toml (docs/ops.md,
 # "Staging migrations"). This secretless per-PR check covers the one
-# thing the database cannot know: a PR that renames a migration file
-# must record the original name+sha as `renamed_from` in the manifest,
-# or the already-applied staging row becomes unrecognisable.
+# thing the database cannot know: pinned source lineage. Source history
+# never supplies applied proof; byte-identical applied aliases remain
+# separate, and differing historical rows must still fail staging.
 # Required check; keep the JOB name `migrations-staging`.
 
 on:
@@ -47,9 +47,8 @@ jobs:
         if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
-          # Full history so intra-PR renames (renamed in an early PR
-          # commit, invisible in the base..head file list) are visible
-          # to `git log --find-renames` below.
+          # Verify actual PR ancestry, not the synthetic integration commit.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - name: Check migration rename history
         if: github.event_name == 'pull_request'
@@ -61,14 +60,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          # filename<TAB>previous_filename, so each rename stays paired.
-          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
-            --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$RUNNER_TEMP/pr-files"
-          # The PR file list only diffs base..head; a file created and
-          # renamed within the PR shows as a plain add there. Union in
-          # every rename any PR commit performed.
-          git log --find-renames --format= --name-status "$BASE_SHA..$HEAD_SHA" \
-            | awk -F '\t' '$1 ~ /^R/ { print $3 "\t" $2 }' >> "$RUNNER_TEMP/pr-files"
-          sort -u "$RUNNER_TEMP/pr-files" -o "$RUNNER_TEMP/pr-files"
+          # Keep both coverage sources. Complete API pages cover net PR
+          # changes; the checker independently collects every per-parent
+          # Git rename, including files created then renamed within the PR.
+          # Metadata pins the API response and detects the 3000-file cap.
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr-metadata.json"
+          gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
+            > "$RUNNER_TEMP/pr-files.json"
           python3 .github/scripts/migrations_rename_check.py \
-            --files-file "$RUNNER_TEMP/pr-files"
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --files-file "$RUNNER_TEMP/pr-files.json" \
+            --metadata-file "$RUNNER_TEMP/pr-metadata.json"

@@ -14,6 +14,11 @@ database and proves:
 - applying out of manifest order refuses until priors are recorded;
 - the advisory lock is held while the migration body runs;
 - a mid-migration failure leaves neither schema change nor tracking row;
+- recorded rows under an identity name or a source-rename-history name
+  that are not a permitted (file, sha256) pair, and duplicate accepted
+  rows (current name plus alias), refuse before "already recorded", for
+  normal and record-only applies, with migration effects and rows left
+  unchanged, and history never satisfies a prior;
 - re-running the DDL revokes a stray non-owner write grant, table-level
   or column-level (``pg_attribute.attacl``).
 
@@ -21,6 +26,7 @@ No provider calls or deployed databases: require the workflow's exact
 throwaway endpoint, create a fresh fixture database, and refuse to
 reuse an existing one.
 """
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import pathlib
@@ -109,6 +115,167 @@ class Fixture:
 def recorded_files(env):
     return scalar(env, "SELECT string_agg(file, ',' ORDER BY file) "
                        "FROM public.schema_migrations;")
+
+
+HISTORY_MIGRATIONS = {
+    "0010_hist.sql": "CREATE TABLE hist_current (id int);\n",
+    "0011_first.sql": "CREATE TABLE hist_first (id int);\n",
+    "0012_second.sql": "CREATE TABLE hist_second (id int);\n",
+}
+BAD_SHA = "f" * 64
+
+
+def history_manifest(root):
+    """Separate manifest: 0010 has an alias and a multi-hop history
+    chain attached to it; 0011 (0012's prior) has an edge of its own."""
+    edges = {
+        "0010_hist.sql": [("0010_hist_hop.sql", "0010_hist_prior.sql"),
+                          ("0010_hist_prior.sql", "0010_hist.sql")],
+        "0011_first.sql": [("0011_first_old.sql", "0011_first.sql")],
+    }
+    manifest = ""
+    for name in sorted(HISTORY_MIGRATIONS):
+        (root / name).write_text(HISTORY_MIGRATIONS[name], encoding="utf-8")
+        sha = hashlib.sha256(HISTORY_MIGRATIONS[name].encode()).hexdigest()
+        manifest += (f'[[migration]]\nfile = "{name}"\ntarget = "app"\n'
+                     f'sha256 = "{sha}"\n')
+        if name == "0010_hist.sql":
+            manifest += (f'renamed_from = [{{ file = "0010_hist_old.sql", '
+                         f'sha256 = "{sha}" }}]\n')
+        for old, new in edges.get(name, []):
+            manifest += ("[[migration.source_rename_history]]\n"
+                         f'parent = "{"a" * 40}"\ncommit = "{"b" * 40}"\n'
+                         f'old_path = "migrations/{old}"\n'
+                         f'new_path = "migrations/{new}"\n'
+                         f'old_sha256 = "{"c" * 64}"\nnew_sha256 = "{"d" * 64}"\n')
+    path = root / "history-manifest.toml"
+    path.write_text(manifest, encoding="utf-8")
+    return path
+
+
+def history_sha(name):
+    return hashlib.sha256(HISTORY_MIGRATIONS[name].encode()).hexdigest()
+
+
+def all_rows(env):
+    return scalar(env, "SELECT coalesce(string_agg(file || ':' || sha256, ',' "
+                       "ORDER BY file), '') FROM public.schema_migrations;")
+
+
+def run_history_cases(fixture, manifest, test_env):
+    def apply(name, record_only=False):
+        saved = fixture.manifest
+        fixture.manifest = manifest
+        try:
+            return fixture.apply(name, record_only=record_only)
+        finally:
+            fixture.manifest = saved
+
+    def seed(*rows):
+        run_psql(test_env, "".join(
+            "INSERT INTO public.schema_migrations (file, sha256, applied_by) "
+            f"VALUES ('{file}', '{sha}', 'seed');\n" for file, sha in rows))
+
+    def clear():
+        run_psql(test_env, "DELETE FROM public.schema_migrations "
+                           "WHERE file >= '0010';")
+
+    def refused(name, table, rows, record_only=False):
+        seed(*rows)
+        before = all_rows(test_env)
+        assert apply(name, record_only=record_only) == 1, (name, rows)
+        assert all_rows(test_env) == before, "refusal changed recorded rows"
+        assert scalar(test_env, f"SELECT to_regclass('public.{table}') IS NULL;") == "t"
+        clear()
+
+    base = all_rows(test_env)
+    good = history_sha("0010_hist.sql")
+
+    # Different-byte historical row under a source-history name.
+    refused("0010_hist.sql", "hist_current", [("0010_hist_prior.sql", BAD_SHA)])
+    print("apply-migration-postgres: passed history-different-bytes-refused")
+
+    # A good current row must not hide a conflicting historical row:
+    # the deny check runs before "already recorded" (which is exit 0).
+    refused("0010_hist.sql", "hist_current",
+            [("0010_hist.sql", good), ("0010_hist_prior.sql", BAD_SHA)])
+    print("apply-migration-postgres: passed good-current-bad-history-refused")
+
+    # record-only takes the same guard.
+    refused("0010_hist.sql", "hist_current",
+            [("0010_hist_prior.sql", BAD_SHA)], record_only=True)
+    refused("0010_hist.sql", "hist_current",
+            [("0010_hist.sql", good), ("0010_hist_prior.sql", BAD_SHA)],
+            record_only=True)
+    print("apply-migration-postgres: passed history-record-only-refused")
+
+    # Current name plus alias both recorded: more than one accepted row.
+    refused("0010_hist.sql", "hist_current",
+            [("0010_hist.sql", good), ("0010_hist_old.sql", good)])
+    print("apply-migration-postgres: passed current-and-alias-duplicate-refused")
+
+    # Multi-hop: an intermediate path that is no alias is still denied.
+    refused("0010_hist.sql", "hist_current", [("0010_hist_hop.sql", BAD_SHA)])
+
+    # Right bytes under a history name are still not an identity.
+    refused("0010_hist.sql", "hist_current", [("0010_hist_prior.sql", good)])
+
+    # A good prior cannot hide conflicting prior history, and history
+    # rows never satisfy the prior.
+    first = history_sha("0011_first.sql")
+    refused("0012_second.sql", "hist_second",
+            [("0011_first.sql", first), ("0011_first_old.sql", BAD_SHA)])
+    refused("0012_second.sql", "hist_second", [("0011_first_old.sql", first)])
+    print("apply-migration-postgres: passed prior-not-supplied-by-history")
+    refused("0012_second.sql", "hist_second",
+            [("0010_hist.sql", good), ("0010_hist_old.sql", good),
+             ("0011_first.sql", first)])
+    print("apply-migration-postgres: passed duplicate-prior-refused")
+
+    assert all_rows(test_env) == base
+    # Positive controls: with clean rows the same applies succeed, and
+    # an alias row alone is accepted.
+    assert apply("0010_hist.sql") == 0
+    assert apply("0011_first.sql") == 0
+    assert apply("0012_second.sql") == 0
+    assert scalar(test_env, "SELECT to_regclass('public.hist_second') IS NOT NULL;") == "t"
+    clear()
+    run_psql(test_env, "DROP TABLE hist_current, hist_first, hist_second;")
+    seed(("0010_hist_old.sql", good))
+    assert apply("0010_hist.sql") == 0, "alias-recorded identity is an already-recorded no-op"
+    assert all_rows(test_env).endswith(f"0010_hist_old.sql:{good}")
+    clear()
+    print("apply-migration-postgres: passed history-positive-controls")
+
+
+def run_concurrent_apply(root, env):
+    from threading import Barrier
+
+    name = "0020_concurrent.sql"
+    body = "SELECT pg_sleep(0.25);\nCREATE TABLE concurrent_probe (id int);\n"
+    (root / name).write_text(body, encoding="utf-8")
+    sha = hashlib.sha256(body.encode()).hexdigest()
+    manifest = root / "concurrent.toml"
+    manifest.write_text(f'[[migration]]\nfile = "{name}"\ntarget = "app"\nsha256 = "{sha}"\n')
+    sql, *_ = apply_migration.compose(root / name, manifest, "concurrency-fixture",
+                                      expect_database=TEST_DB)
+    start = Barrier(2, timeout=10)
+
+    def apply(_index):
+        start.wait()
+        try:
+            apply_migration.psql(env, sql, single_transaction=True)
+            return "applied"
+        except apply_migration._AlreadyRecorded as recorded:
+            assert recorded.same
+            return "same"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(apply, range(2))) == ["applied", "same"]
+    assert scalar(env, "SELECT count(*) FROM public.schema_migrations "
+                       f"WHERE file = '{name}' AND sha256 = '{sha}';") == "1"
+    assert scalar(env, "SELECT to_regclass('public.concurrent_probe') IS NOT NULL;") == "t"
+    print("apply-migration-postgres: passed concurrent-apply-exactly-once")
 
 
 def main():
@@ -252,6 +419,9 @@ def main():
                 run_psql(test_env, "DROP OWNED BY apply_column_sneak;\n"
                                    "DROP ROLE apply_column_sneak;")
             print("apply-migration-postgres: passed column-write-privileges-pinned")
+
+            run_history_cases(fixture, history_manifest(fixture.root), test_env)
+            run_concurrent_apply(fixture.root, test_env)
     finally:
         run_psql(env, f"DROP DATABASE {TEST_DB};")
 
