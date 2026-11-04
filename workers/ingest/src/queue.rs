@@ -164,11 +164,10 @@ pub fn validate_indexer_ref(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Provider identity shape: `8-4-4-4-12` hex, the text form of the
-/// `providers.id` UUID the grant publication binds to. Case-insensitive
-/// like [`validate_mbid`] (the `::uuid` cast normalizes anyway) with no
-/// version/variant pin: the pool's future attribution format is not
-/// ours to constrain beyond the UUID shape.
+/// Legacy queue provider-hint shape: `8-4-4-4-12` hex, case-insensitive
+/// like [`validate_mbid`], with no version/variant pin. Kept for old message
+/// compatibility only; the consumer clears this hint rather than using it as
+/// pool attribution. Actual serving identities use the canonical shared codec.
 pub fn validate_provider_id(raw: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let parts: Vec<&str> = raw.split('-').collect();

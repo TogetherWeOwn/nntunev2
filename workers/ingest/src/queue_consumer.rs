@@ -164,10 +164,9 @@ fn validate_queue_msg(msg: &QueueMsg) -> Result<(), &'static str> {
     if msg.state != JobState::Queued || msg.attempt != 1 || msg.repair_rounds != 0 {
         return Err("invalid initial queue state");
     }
-    // Attribution is optional but shape-pinned: a malformed id must fail
-    // closed here, never ride into the grant publication later. Checked
-    // before the per-source identity comparisons so both sources report
-    // the same cause.
+    // Legacy provider hints remain shape-pinned for message compatibility,
+    // but are cleared by the consumer, never promoted to pool attribution.
+    // Check before source comparisons so both sources report the same cause.
     if let Some(provider_id) = msg.provider_id.as_deref() {
         if !validate_provider_id(provider_id) {
             return Err("invalid provider id");

@@ -215,12 +215,12 @@ keeps the existing single whole-call deadline and streaming byte ceiling.
 
 Checkpoint `pool_observations` unions confirmed successful account IDs across
 batches and BODY fetches, with a 1,000-ID ceiling and explicit truncation flag.
-It is **observation evidence, not per-artifact provenance or singular grant
-attribution**: retries may span accounts, and scratch adoption or non-atomic
-scratch/checkpoint recovery can omit observations. New checkpoints ignore the
-legacy queue `provider_id`, and the live consumer clears old hints. The first
-account, sole observed account or requested account must never be copied into a
-whole-job grant.
+It is **observation evidence, not per-artifact provenance or serving authority**:
+retries may span accounts, and scratch adoption or non-atomic scratch/checkpoint
+recovery can omit observations. New checkpoints ignore the legacy queue
+`provider_id`, and the live consumer clears old hints. The first account, sole
+observed account or requested account must never be claimed as the only
+contributor to the whole job.
 
 `pool_provenance` separately binds complete BODY contributions to decoded bytes
 by SHA-256 and size. Each successful, decoded segment stores the actual serving
@@ -257,10 +257,21 @@ artifact hash. This derivation relies on the trusted front/Container contract's
 source-hash verification and trusted checkpoint writers; it is not a signed
 transcode receipt, and arbitrary scratch writers must not be trusted.
 
-This is provenance evidence, **not a grant or entitlement proof**. Even a single
-contributor does not authorize service. Multi-account grant publication, repair
-contribution propagation and the independent publication security gate remain
-unfinished; no grant writer is enabled by this increment.
+This is service provenance, **not a grant or entitlement proof**. Even a single
+contributor does not authorize service. ADR 0013 removes the own-provider cache
+grant layer: ingest grant writers are deleted, not repurposed for pool accounts.
+The unused per-user transcode mapping/grant SQL helpers have been retired; the
+existing content-global blob write is unchanged and grants no serving authority.
+The legacy schema is preserved until the coordinated forward-migration/removal
+slice; no stored grants are rewritten or deleted here. Signed playback grants
+and their entitlement, concurrency and metering checks are **not** retired.
+
+Shared catalogue mapping, popularity admission and serialized publication belong
+to the ADR 0013 implementation, with independent security review before launch;
+per-hash serialization, reference rechecks and no-oracle requirements remain.
+Do not wire the old per-user publication path as a prerequisite to this pool.
+Repair contribution propagation remains conservative/unfinished; incomplete
+records stay unattributed, without affecting playback authority.
 
 **No operation RPC or product dial is enabled.** The composed operation and ingest
 forwarding handlers share the hard false compile-time qualification gate, not an
