@@ -1,8 +1,8 @@
 //! Service-level pool provider registry (ADR 0014 foundation).
 //!
 //! Pool providers are operator-owned NNTP accounts shared by the whole
-//! service, not per-user vault rows. This module holds the pure pieces:
-//! the settings shape + validation, and the password secret envelope.
+//! service, not per-user vault rows. This module holds the settings and
+//! write contracts, redacted views/audits, and the password secret envelope.
 //!
 //! Secret envelope: the same v2 field envelope as
 //! [`crate::providers`] (shared implementation, no second crypto path),
@@ -65,7 +65,7 @@ fn has_control(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
-fn lower_uuid_ok(raw: &str) -> bool {
+pub fn lower_uuid_ok(raw: &str) -> bool {
     validate_provider_mint_id(raw) && !raw.bytes().any(|b| b.is_ascii_uppercase())
 }
 
@@ -237,4 +237,114 @@ pub fn rewrap_pool_secret(
         CREDS_PAYLOAD_FORMAT_JSON_V1,
         envelope,
     )
+}
+
+/// Stored registry metadata. The password envelope is deliberately separate;
+/// admin reads cannot accidentally return it. No credential-bearing Debug.
+#[derive(Clone)]
+pub struct PoolProviderRow {
+    pub settings: PoolProviderSettings,
+    pub secret_ref: String,
+    pub revision: u64,
+}
+
+impl PoolProviderRow {
+    /// Explicit response allowlist: neither username nor secret identity leaks
+    /// through an admin read, an audit record, or a successful write response.
+    pub fn view(&self) -> serde_json::Value {
+        let s = &self.settings;
+        serde_json::json!({
+            "id": s.id, "label": s.label, "host": s.host,
+            "port": s.port, "tls": s.tls, "can_read": s.can_read,
+            "can_post": s.can_post, "max_connections": s.max_connections,
+            "stream_reserve": s.stream_reserve, "ingest_limit": s.ingest_limit,
+            "backbone": s.backbone, "tier": s.tier, "enabled": s.enabled,
+            "revision": self.revision,
+        })
+    }
+}
+
+/// Fresh envelope for a create or an explicit credential rotation. A rotation
+/// always mints a new identity; settings-only writes retain the old identity
+/// and therefore cannot clear an authentication quarantine.
+pub struct PoolSecretWrite {
+    pub secret_ref: String,
+    pub kek_version: u32,
+    pub envelope: ProviderCredsEnvelope,
+}
+
+/// Compare-and-swap registry write. Revision zero means create, never upsert.
+/// The store revalidates all inputs before touching persistent state.
+pub struct PoolProviderWrite {
+    pub settings: PoolProviderSettings,
+    pub expected_revision: u64,
+    pub secret: Option<PoolSecretWrite>,
+}
+
+impl PoolProviderWrite {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.settings.validate()?;
+        if self.expected_revision >= i64::MAX as u64 {
+            return Err("invalid revision");
+        }
+        match &self.secret {
+            None if self.expected_revision == 0 => Err("create requires credentials"),
+            Some(secret) => {
+                if !lower_uuid_ok(&secret.secret_ref)
+                    || secret.kek_version == 0
+                    || secret.kek_version > i32::MAX as u32
+                    || secret.envelope.dek_wrapped.len() != 48
+                    || secret.envelope.ciphertext.len() < 16
+                {
+                    return Err("invalid secret envelope");
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+pub enum PoolProviderWriteOutcome {
+    Applied(PoolProviderRow),
+    ActorNotAdmin,
+    Conflict,
+}
+
+/// Fixed audit vocabulary plus redacted before/after views. Every affected
+/// category is recorded in the same transaction as the registry mutation.
+pub fn audit_changes(
+    previous: Option<&PoolProviderRow>,
+    next: &PoolProviderRow,
+    rotated: bool,
+) -> Vec<(&'static str, String)> {
+    let mut actions = vec![if previous.is_none() {
+        "pool_provider.created"
+    } else {
+        "pool_provider.updated"
+    }];
+    if let Some(old) = previous {
+        if old.settings.enabled && !next.settings.enabled {
+            actions.push("pool_provider.disabled");
+        }
+        if old.settings.max_connections != next.settings.max_connections
+            || old.settings.stream_reserve != next.settings.stream_reserve
+            || old.settings.ingest_limit != next.settings.ingest_limit
+        {
+            actions.push("pool_provider.caps_changed");
+        }
+        if rotated {
+            actions.push("pool_provider.credentials_rotated");
+        }
+    }
+    let details = serde_json::json!({
+        "provider_id": next.settings.id,
+        "old": previous.map(PoolProviderRow::view),
+        "new": next.view(),
+    })
+    .to_string();
+    actions
+        .into_iter()
+        .map(|action| (action, details.clone()))
+        .collect()
 }

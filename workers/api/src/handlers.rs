@@ -687,12 +687,32 @@ pub enum PairAdmission {
     DeniedSecond,
 }
 
+mod admin_pool;
+
 /// Persistence over migration-0002 tables. Implementations must use
 /// parameterized statements only, and conditional single-row updates for
 /// the rotation/sign-count advances. `Store` implementors also implement
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Service account metadata only. Unprovisioned stores fail closed.
+    fn pool_providers(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Atomic registry/envelope/audit write with a transaction-side role
+    /// recheck and revision CAS. Never persists plaintext credentials.
+    fn admin_write_pool_provider(
+        &self,
+        _actor_user_id: &str,
+        _write: &crate::pool_providers::PoolProviderWrite,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::pool_providers::PoolProviderWriteOutcome, StoreError>>
+    {
+        async { Err(StoreError) }
+    }
     fn user_by_email(
         &self,
         email: &str,
@@ -7282,6 +7302,11 @@ where
         ("DELETE", path) if path.starts_with("/v1/credentials/") => {
             credentials_revoke(ctx, req).await
         }
+        ("GET", "/v1/admin/pool-providers") => admin_pool::list(ctx, req).await,
+        ("POST", "/v1/admin/pool-providers") => admin_pool::write(ctx, req).await,
+        ("PUT", path) if path.starts_with("/v1/admin/pool-providers/") => {
+            admin_pool::write(ctx, req).await
+        }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
         // The entry preserves the list query string for exactly this
@@ -7572,9 +7597,129 @@ mod tests {
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
+        /// Mirror of `pool_providers` (registry rows, settings + current
+        /// `secret_ref` + revision).
+        pool_provider_rows: RefCell<Vec<crate::pool_providers::PoolProviderRow>>,
+        /// Mirror of `pool_provider_secrets`, keyed by `secret_ref`:
+        /// stored KEK version plus the envelope fields (the envelope type
+        /// is neither `Clone` nor `Debug`, so fields are copied).
+        pool_provider_secrets: RefCell<HashMap<String, (u32, StoredPoolEnvelope)>>,
+    }
+
+    struct StoredPoolEnvelope {
+        dek_wrapped_nonce: [u8; 12],
+        dek_wrapped: Vec<u8>,
+        payload_nonce: [u8; 12],
+        ciphertext: Vec<u8>,
+    }
+
+    impl StoredPoolEnvelope {
+        fn to_envelope(&self) -> crate::providers::ProviderCredsEnvelope {
+            crate::providers::ProviderCredsEnvelope {
+                dek_wrapped_nonce: self.dek_wrapped_nonce,
+                dek_wrapped: self.dek_wrapped.clone(),
+                payload_nonce: self.payload_nonce,
+                ciphertext: self.ciphertext.clone(),
+            }
+        }
     }
 
     impl Store for FakeStore {
+        async fn pool_providers(
+            &self,
+        ) -> Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError> {
+            let mut rows = self.pool_provider_rows.borrow().clone();
+            rows.sort_by(|a, b| {
+                (a.settings.tier, &a.settings.id).cmp(&(b.settings.tier, &b.settings.id))
+            });
+            Ok(rows)
+        }
+        async fn admin_write_pool_provider(
+            &self,
+            actor_user_id: &str,
+            write: &crate::pool_providers::PoolProviderWrite,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<crate::pool_providers::PoolProviderWriteOutcome, StoreError> {
+            use crate::pool_providers::{PoolProviderRow, PoolProviderWriteOutcome};
+            write.validate().map_err(|_| StoreError)?;
+            // Production: `role FROM users WHERE id = $1 AND deleting_at IS
+            // NULL` under the lock, so a deleting actor is not an admin.
+            match self.user_role(actor_user_id).await? {
+                role if crate::admin::is_admin_role(role.as_deref())
+                    && !self.deleting_users.borrow().contains(actor_user_id) => {}
+                _ => return Ok(PoolProviderWriteOutcome::ActorNotAdmin),
+            }
+            let previous = self
+                .pool_provider_rows
+                .borrow()
+                .iter()
+                .find(|row| row.settings.id == write.settings.id)
+                .cloned();
+            if previous.as_ref().map_or(0, |row| row.revision) != write.expected_revision {
+                return Ok(PoolProviderWriteOutcome::Conflict);
+            }
+            let secret_ref = match (&write.secret, &previous) {
+                (Some(secret), _) => secret.secret_ref.clone(),
+                (None, Some(old)) => old.secret_ref.clone(),
+                _ => return Err(StoreError),
+            };
+            if let Some(secret) = &write.secret {
+                // A rotation must be a new identity; never overwrite a row.
+                if self
+                    .pool_provider_secrets
+                    .borrow()
+                    .contains_key(&secret.secret_ref)
+                {
+                    return Err(StoreError);
+                }
+                self.pool_provider_secrets.borrow_mut().insert(
+                    secret.secret_ref.clone(),
+                    (
+                        secret.kek_version,
+                        StoredPoolEnvelope {
+                            dek_wrapped_nonce: secret.envelope.dek_wrapped_nonce,
+                            dek_wrapped: secret.envelope.dek_wrapped.clone(),
+                            payload_nonce: secret.envelope.payload_nonce,
+                            ciphertext: secret.envelope.ciphertext.clone(),
+                        },
+                    ),
+                );
+            }
+            let next = PoolProviderRow {
+                settings: write.settings.clone(),
+                secret_ref,
+                revision: write.expected_revision + 1,
+            };
+            {
+                let mut rows = self.pool_provider_rows.borrow_mut();
+                rows.retain(|row| row.settings.id != next.settings.id);
+                rows.push(next.clone());
+            }
+            for (action, details) in crate::pool_providers::audit_changes(
+                previous.as_ref(),
+                &next,
+                write.secret.is_some(),
+            ) {
+                self.audits.borrow_mut().push(vault::audit_event_extended(
+                    actor_user_id,
+                    action,
+                    true,
+                    source_ip,
+                    now,
+                    None,
+                    serde_json::from_str(&details).map_err(|_| StoreError)?,
+                ));
+            }
+            if let Some(old) = &previous {
+                if old.secret_ref != next.secret_ref {
+                    self.pool_provider_secrets
+                        .borrow_mut()
+                        .remove(&old.secret_ref);
+                }
+            }
+            Ok(PoolProviderWriteOutcome::Applied(next))
+        }
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -17683,6 +17828,8 @@ mod tests {
         let resp = h.call_full("OPTIONS", "/v1/me", None, None, Some(ORIGIN));
         assert_eq!(resp.status, 204);
     }
+
+    include!("handlers/admin_pool_tests.rs");
 
     #[test]
     fn admin_write_store_recheck_refuses_a_demoted_actor() {

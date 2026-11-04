@@ -49,6 +49,10 @@ const HYPERDRIVE_BINDING: &str = "HYPERDRIVE";
 /// Fixed public DNS-over-HTTPS endpoint (never user-controlled).
 const DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 
+mod pool_registry;
+#[cfg(all(test, feature = "postgres-tests"))]
+mod pool_registry_tests;
+
 // --- Config ---------------------------------------------------------------------------
 
 fn env_string(env: &Env, name: &str) -> Option<String> {
@@ -1937,6 +1941,36 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn pool_providers(
+        &self,
+    ) -> Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                pool_registry::list_on(&client).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_write_pool_provider(
+        &self,
+        actor_user_id: &str,
+        write: &crate::pool_providers::PoolProviderWrite,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<crate::pool_providers::PoolProviderWriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                pool_registry::write_on(&mut client, actor_user_id, write, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
         Self::bounded(
             async {
