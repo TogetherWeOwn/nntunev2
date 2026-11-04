@@ -219,8 +219,13 @@ Generated async fixtures exercise lazy full/range output, hint fallback,
 endpoint/CRC/budget failures, wakeable pending cancellation, dropped pulls,
 grant expiry after awaits and partial-writer accounting. Writer fakes cover
 backpressure, partial/invalid acknowledgements, disconnect races, dropped pumps,
-article/write/close failures and exactly-once settlement. Existing cache-hit
-and public-route fixtures remain regressions, not evidence of a newly wired
+article/write/close failures and exactly-once settlement. Control fakes store and
+replace the task waker: cancellation and grant expiry explicitly wake pending
+articles, writes and closes, win ready write/close races, and preserve only the
+acknowledged range prefix. Pending close also covers writer wake-to-success and
+drop-to-abort. These are synthetic events, not real Worker timer or AbortSignal
+qualification. Existing cache-hit and public-route fixtures remain regressions,
+not evidence of a newly wired
 original-source route. Actual source/catalogue/account composition, Worker
 writer/abort behavior, R2 misses and cold-cache end-to-end operation remain
 unimplemented/unqualified here. Compile-time dialing/ingress gates are unchanged.

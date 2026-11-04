@@ -46,21 +46,27 @@ fn request(range: Option<&str>) -> PlayRouteRequest {
     }
 }
 
+#[derive(Default)]
+struct ControlState {
+    cancelled: bool,
+    waker: Option<Waker>,
+}
+
 struct Control {
     now: Rc<Cell<u64>>,
-    cancelled: bool,
+    state: Rc<RefCell<ControlState>>,
 }
 impl Control {
     fn new() -> Self {
         Self {
             now: Rc::new(Cell::new(NOW)),
-            cancelled: false,
+            state: Rc::default(),
         }
     }
 }
 impl ReadControl for Control {
     fn check(&mut self) -> Result<(), SourceError> {
-        if self.cancelled {
+        if self.state.borrow().cancelled {
             Err(SourceError::Cancelled)
         } else {
             Ok(())
@@ -68,10 +74,12 @@ impl ReadControl for Control {
     }
 }
 impl AsyncReadControl for Control {
-    fn poll_cancel(&mut self, _: &mut Context<'_>) -> Poll<SourceError> {
-        if self.cancelled {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
+        let mut state = self.state.borrow_mut();
+        if state.cancelled {
             Poll::Ready(SourceError::Cancelled)
         } else {
+            state.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -482,12 +490,14 @@ struct WState {
     block: bool,            // poll_write stays Pending, storing the waker
     cancel: Option<SourceError>,
     close: Option<SourceError>,
+    close_block: bool,
     got: Vec<u8>,
     write_polls: usize,
     closes: usize,
     aborts: usize,
     at_close: usize,
     waker: Option<Waker>,
+    close_waker: Option<Waker>,
 }
 type Shared = Rc<RefCell<WState>>;
 struct Writer(Shared);
@@ -529,10 +539,14 @@ impl OriginalWriter for Writer {
         st.got.extend_from_slice(&bytes[..n.min(bytes.len())]);
         Poll::Ready(Ok(n))
     }
-    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
         let mut st = self.0.borrow_mut();
         st.closes += 1;
         st.at_close = st.got.len();
+        if st.close_block {
+            st.close_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         Poll::Ready(st.close.take().map_or(Ok(()), Err))
     }
     fn abort(&mut self) {
@@ -545,6 +559,26 @@ fn shared(steps: impl IntoIterator<Item = Step>) -> Shared {
         script: steps.into_iter().collect(),
         ..WState::default()
     }))
+}
+
+#[derive(Clone, Copy)]
+enum ControlEvent {
+    Cancel,
+    Expire,
+}
+impl ControlEvent {
+    fn fire(self, now: &Cell<u64>, state: &RefCell<ControlState>) {
+        let waker = {
+            let mut state = state.borrow_mut();
+            match self {
+                Self::Cancel => state.cancelled = true,
+                Self::Expire => now.set(NOW + 60),
+            }
+            state.waker.take().expect("control registered a waker")
+        };
+        // Only the control's registered waker schedules these cancellation polls.
+        waker.wake();
+    }
 }
 
 #[derive(Default)]
@@ -764,6 +798,208 @@ fn failed_article_aborts_writer_and_preserves_only_the_acknowledged_prefix() {
     assert_eq!(articles.opened, vec![2, 0, 1]);
     assert_eq!(sink.0.len(), 1);
     assert_eq!((sink.0[0].start, sink.0[0].end), (0, 3));
+}
+
+#[test]
+fn control_events_wake_pending_articles_without_retry_or_extra_delivery() {
+    for event in [ControlEvent::Cancel, ControlEvent::Expire] {
+        for pending in [2, 1] {
+            let (source, mut articles) = fixture();
+            articles.pending = Some(pending);
+            let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+            let (now, signal) = (control.now.clone(), control.state.clone());
+            let st = shared([]);
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = pump!(source, Some("bytes=1-7"), articles, control, sink, st);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+            let polls = st.borrow().write_polls;
+            event.fire(&now, &signal);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(SourceError::Cancelled))
+            );
+            drop(fut);
+            let st = st.borrow();
+            assert_eq!((st.write_polls, st.closes, st.aborts), (polls, 0, 1));
+            if pending == 2 {
+                assert_eq!(articles.opened, vec![2]);
+                assert!(st.got.is_empty() && sink.0.is_empty());
+            } else {
+                assert_eq!(articles.opened, vec![2, 0, 1]);
+                assert_eq!(st.got, vec![1, 2]);
+                assert_eq!(sink.0.len(), 1);
+                assert_eq!((sink.0[0].start, sink.0[0].end), (1, 3));
+            }
+        }
+    }
+}
+
+#[test]
+fn control_events_win_ready_writer_races_without_another_write_poll() {
+    for event in [ControlEvent::Cancel, ControlEvent::Expire] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let (now, signal) = (control.now.clone(), control.state.clone());
+        let st = shared([Step::Accept(1), Step::Block]);
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pump!(source, Some("bytes=1-7"), articles, control, sink, st);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        let polls = st.borrow().write_polls;
+        st.borrow_mut().block = false;
+        event.fire(&now, &signal);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(SourceError::Cancelled))
+        );
+        drop(fut);
+        let st = st.borrow();
+        assert_eq!((st.write_polls, st.closes, st.aborts), (polls, 0, 1));
+        assert_eq!(st.got, vec![1]);
+        assert_eq!(articles.opened, vec![2, 0]);
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!((sink.0[0].start, sink.0[0].end), (1, 2));
+    }
+}
+
+#[test]
+fn control_events_wake_pending_close_and_win_ready_close_races() {
+    for event in [ControlEvent::Cancel, ControlEvent::Expire] {
+        for close_ready in [false, true] {
+            let (source, mut articles) = fixture();
+            let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+            let (now, signal) = (control.now.clone(), control.state.clone());
+            let st = shared([]);
+            st.borrow_mut().close_block = true;
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = pump!(source, Some("bytes=1-7"), articles, control, sink, st);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(st.borrow().closes, 1);
+            let polls = st.borrow().write_polls;
+            st.borrow_mut().close_block = !close_ready;
+            event.fire(&now, &signal);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(SourceError::Cancelled))
+            );
+            drop(fut);
+            let st = st.borrow();
+            assert_eq!((st.write_polls, st.closes, st.aborts), (polls, 1, 1));
+            assert_eq!(st.got, (1..8).collect::<Vec<u8>>());
+            assert_eq!(articles.opened, vec![2, 0, 1]);
+            assert_eq!(sink.0.len(), 1);
+            assert_eq!((sink.0[0].start, sink.0[0].end), (1, 8));
+        }
+    }
+}
+
+#[test]
+fn pending_close_resumes_on_writer_wake_or_aborts_on_drop() {
+    for complete in [false, true] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let st = shared([]);
+        st.borrow_mut().close_block = true;
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pump!(source, None, articles, control, sink, st);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(st.borrow().closes, 1);
+        let polls = st.borrow().write_polls;
+        if complete {
+            let waker = {
+                let mut state = st.borrow_mut();
+                state.close_block = false;
+                state
+                    .close_waker
+                    .take()
+                    .expect("pending close registered its own waker")
+            };
+            waker.wake();
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        }
+        drop(fut);
+        let st = st.borrow();
+        assert_eq!(st.write_polls, polls);
+        assert_eq!(
+            (st.closes, st.aborts),
+            if complete { (2, 0) } else { (1, 1) }
+        );
+        assert_eq!(st.got, (0..9).collect::<Vec<u8>>());
+        assert_eq!(articles.opened, vec![2, 0, 1]);
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!((sink.0[0].start, sink.0[0].end), (0, 9));
+    }
+}
+
+#[test]
+fn control_replaces_the_waker_in_each_pending_phase() {
+    enum Phase {
+        Article,
+        Write,
+        Close,
+    }
+    for event in [ControlEvent::Cancel, ControlEvent::Expire] {
+        for phase in [Phase::Article, Phase::Write, Phase::Close] {
+            let (source, mut articles) = fixture();
+            let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+            let (now, signal) = (control.now.clone(), control.state.clone());
+            let st = shared([]);
+            let (acked, opened) = match phase {
+                Phase::Article => {
+                    articles.pending = Some(2);
+                    (0, vec![2])
+                }
+                Phase::Write => {
+                    st.borrow_mut().script = [Step::Accept(1), Step::Block].into();
+                    (1, vec![2, 0])
+                }
+                Phase::Close => {
+                    st.borrow_mut().close_block = true;
+                    (9, vec![2, 0, 1])
+                }
+            };
+            let old_wakes = Arc::new(Wakes::default());
+            let old_waker = Waker::from(old_wakes.clone());
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = pump!(source, None, articles, control, sink, st);
+            assert!(fut
+                .as_mut()
+                .poll(&mut Context::from_waker(&old_waker))
+                .is_pending());
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            event.fire(&now, &signal);
+            assert_eq!(old_wakes.0.load(Ordering::SeqCst), 0);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(SourceError::Cancelled))
+            );
+            drop(fut);
+            assert_eq!(articles.opened, opened);
+            assert_eq!(st.borrow().aborts, 1);
+            assert_eq!(st.borrow().got.len(), acked);
+            if acked == 0 {
+                assert!(sink.0.is_empty());
+            } else {
+                assert_eq!(sink.0.len(), 1);
+                assert_eq!((sink.0[0].start, sink.0[0].end), (0, acked as u64));
+            }
+        }
+    }
 }
 
 #[test]
