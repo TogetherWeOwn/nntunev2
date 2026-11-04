@@ -259,10 +259,12 @@ fn worker_activation_remains_hard_disabled_before_ingress_io() {
         .unwrap();
     assert!(
         ingress.find("!OPERATIONS_QUALIFIED").unwrap()
-            < ingress.find("read_request(req, cap)").unwrap()
+            < ingress.find("request_io::read(req, cap)").unwrap()
     );
     assert!(ingress.find("!OPERATIONS_QUALIFIED").unwrap() < ingress.find(".secret(").unwrap());
-    assert!(ingress.contains("req.headers().has(\"origin\")"));
-    assert!(ingress.contains("req.headers().has(\"cookie\")"));
-    assert!(ingress.contains("req.url()?.query().is_some()"));
+    assert!(ingress.contains("request_io::internal_post(req)"));
+    assert!(ingress.contains("request_io::path(req)"));
+    let boundary = include_str!("../src/account_request/worker.rs");
+    assert!(boundary.contains("[\"origin\", \"cookie\", \"sec-fetch-site\", \"sec-fetch-mode\"]"));
+    assert!(boundary.contains("url.query().is_some() || url.fragment().is_some()"));
 }

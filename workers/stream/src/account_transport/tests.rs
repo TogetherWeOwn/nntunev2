@@ -800,6 +800,6 @@ fn adapter_source_keeps_raw_helpers_and_fixed_bindings() {
 fn runtime_operation_gate_stays_hard_false() {
     assert!(RUNTIME.contains("const OPERATIONS_QUALIFIED: bool = false;"));
     assert!(!RUNTIME.contains("OPERATIONS_QUALIFIED: bool = true"));
-    assert!(RUNTIME.contains("req.path() == OPERATION_PATH && OPERATIONS_QUALIFIED"));
+    assert!(RUNTIME.contains("path == OPERATION_PATH && OPERATIONS_QUALIFIED"));
     assert_eq!(RUNTIME.matches("const OPERATIONS_QUALIFIED").count(), 1);
 }

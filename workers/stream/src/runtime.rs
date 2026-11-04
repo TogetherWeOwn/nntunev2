@@ -361,8 +361,12 @@ impl DurableObject for NntpPool {
 
     /// Serves `POST /probe`, `POST /body` and `POST /delivered`; any other method or path is a 404.
     async fn fetch(&self, mut req: Request) -> Result<Response> {
+        let path = match crate::account_request::worker::path(&req) {
+            Ok(path) => path,
+            Err(_) => return Response::error("not found", 404),
+        };
         if matches!(
-            req.path().as_str(),
+            path.as_str(),
             nntune_core::pool_operation::INGEST_BODY_PATH
                 | nntune_core::pool_operation::INGEST_STAT_PATH
         ) {
@@ -374,7 +378,7 @@ impl DurableObject for NntpPool {
             .await;
         }
         let has_owner_name = self.state.id().name().is_some();
-        match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {
+        match routes::decide_pool_action(req.method().as_ref(), &path, has_owner_name) {
             PoolAction::Respond(ProbeDecision::NotFound) => Response::error(
                 ProbeDecision::NotFound.body(),
                 ProbeDecision::NotFound.status(),

@@ -8,12 +8,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use nntune_core::pool_channel::{
     self, CANDIDATE_PATH, MAX_OPERATION_BYTES, MAX_REQUEST_BYTES, OPERATION_PATH,
 };
 use worker::{
-    durable_object, Delay, DurableObject, Env, Headers, Method, Request, Response, Result, State,
+    durable_object, Delay, DurableObject, Env, Headers, Request, Response, Result, State,
 };
 
 use zeroize::Zeroizing;
@@ -26,6 +25,7 @@ use crate::account_operation::{
     AccountConnector, CleanupScheduler, DialSource, OperationError, OperationUnavailable,
 };
 use crate::account_pool::with_session_deadline;
+use crate::account_request::{self, worker as request_io};
 use crate::account_route::{
     self, CandidateCall, CandidateReply, ChannelKeys, RegistryError, RegistrySource, REGISTRY_BODY,
 };
@@ -55,27 +55,32 @@ impl DurableObject for NntpAccount {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let operation = req.path() == OPERATION_PATH && OPERATIONS_QUALIFIED;
-        if req.method() != Method::Post
-            || (req.path() != CANDIDATE_PATH && !operation)
-            || req.url()?.query().is_some()
-            || req.headers().has("origin")?
-            || req.headers().has("cookie")?
-        {
+        let path = match request_io::path(&req) {
+            Ok(path) => path,
+            Err(_) => return respond(CandidateReply::NotFound),
+        };
+        let operation = path == OPERATION_PATH && OPERATIONS_QUALIFIED;
+        if (path != CANDIDATE_PATH && !operation) || request_io::internal_post(&req).is_err() {
             return respond(CandidateReply::NotFound);
         }
+        let cancellation = match request_io::RequestAbort::new(&req) {
+            Ok(cancellation) => cancellation,
+            Err(_) => return respond(CandidateReply::Unavailable),
+        };
         if operation {
             return operation_response(
-                with_session_deadline(
+                account_request::run(
                     self.operation(&mut req),
+                    cancellation,
                     Delay::from(Duration::from_secs(20)),
                 )
                 .await
                 .unwrap_or(OperationReply::Failed(OperationError::Deadline)),
             );
         }
-        match with_session_deadline(
+        match account_request::run(
             self.candidate(&mut req),
+            cancellation,
             Delay::from(Duration::from_secs(10)),
         )
         .await
@@ -138,8 +143,11 @@ impl NntpAccount {
         let resolver_key = self.env.secret(pool_channel::SECRET_VAR).ok();
         let account_key = account_key.map(|s| s.to_string());
         let resolver_key = resolver_key.map(|s| s.to_string());
-        let authorization = req.headers().get("authorization").ok().flatten();
-        let body = match read_request(req, MAX_OPERATION_BYTES).await {
+        let authorization = match request_io::authorization(req) {
+            Ok(Some(authorization)) => authorization,
+            _ => return OperationReply::NotFound,
+        };
+        let body = match request_io::read(req, MAX_OPERATION_BYTES).await {
             Ok(body) => body,
             Err(_) => return OperationReply::BadRequest,
         };
@@ -151,7 +159,7 @@ impl NntpAccount {
             CandidateCall {
                 method: "POST",
                 path: OPERATION_PATH,
-                authorization: authorization.as_deref(),
+                authorization: Some(&authorization),
                 body: &body,
                 browser_context: false,
             },
@@ -173,8 +181,11 @@ impl NntpAccount {
         let resolver_key = self.env.secret(pool_channel::SECRET_VAR).ok();
         let account_key = account_key.map(|s| s.to_string());
         let resolver_key = resolver_key.map(|s| s.to_string());
-        let authorization = req.headers().get("authorization").ok().flatten();
-        let body = match read_request(req, MAX_REQUEST_BYTES).await {
+        let authorization = match request_io::authorization(req) {
+            Ok(Some(authorization)) => authorization,
+            _ => return CandidateReply::NotFound,
+        };
+        let body = match request_io::read(req, MAX_REQUEST_BYTES).await {
             Ok(body) => body,
             Err(_) => return CandidateReply::BadRequest,
         };
@@ -184,7 +195,7 @@ impl NntpAccount {
             CandidateCall {
                 method: "POST",
                 path: CANDIDATE_PATH,
-                authorization: authorization.as_deref(),
+                authorization: Some(&authorization),
                 body: &body,
                 browser_context: false,
             },
@@ -206,23 +217,24 @@ pub(crate) async fn ingest_fetch(
     pool_user: Option<&str>,
     req: &mut Request,
 ) -> Result<Response> {
-    if !OPERATIONS_QUALIFIED
-        || req.method() != Method::Post
-        || pool_user.is_none()
-        || req.url()?.query().is_some()
-        || req.headers().has("origin")?
-        || req.headers().has("cookie")?
-    {
+    if !OPERATIONS_QUALIFIED || pool_user.is_none() || request_io::internal_post(req).is_err() {
         return operation_response(OperationReply::NotFound);
     }
+    let path = match request_io::path(req) {
+        Ok(path) => path,
+        Err(_) => return operation_response(OperationReply::NotFound),
+    };
+    let cancellation = match request_io::RequestAbort::new(req) {
+        Ok(cancellation) => cancellation,
+        Err(_) => return operation_response(OperationReply::Failed(OperationError::Unavailable)),
+    };
     let work = async {
-        let path = req.path();
         let cap = match path.as_str() {
             nntune_core::pool_operation::INGEST_BODY_PATH => crate::body::MAX_BODY_REQUEST_BYTES,
             nntune_core::pool_operation::INGEST_STAT_PATH => crate::probe::MAX_PROBE_BODY_BYTES,
             _ => return OperationReply::NotFound,
         };
-        let body = match read_request(req, cap).await {
+        let body = match request_io::read(req, cap).await {
             Ok(body) => body,
             Err(_) => return OperationReply::BadRequest,
         };
@@ -250,7 +262,7 @@ pub(crate) async fn ingest_fetch(
         .await
     };
     operation_response(
-        with_session_deadline(work, Delay::from(Duration::from_secs(20)))
+        account_request::run(work, cancellation, Delay::from(Duration::from_secs(20)))
             .await
             .unwrap_or(OperationReply::Failed(OperationError::Deadline)),
     )
@@ -420,22 +432,6 @@ impl AccountConnector for WorkerAccountConnector {
     )> {
         WorkerPinnedTlsTransport::open(PeerTlsTarget::new(peer, tls_name)?, Duration::from_secs(3))
     }
-}
-
-async fn read_request(
-    req: &mut Request,
-    max_bytes: usize,
-) -> std::result::Result<Vec<u8>, RegistryError> {
-    let mut stream = req.stream().map_err(|_| RegistryError)?;
-    let mut raw = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| RegistryError)?;
-        if raw.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(RegistryError);
-        }
-        raw.extend_from_slice(&chunk);
-    }
-    Ok(raw)
 }
 
 fn operation_response(reply: OperationReply) -> Result<Response> {

@@ -51,6 +51,8 @@ pub mod account_operation;
 pub mod account_owner;
 pub mod account_playback;
 pub mod account_pool;
+#[cfg(any(target_arch = "wasm32", test))]
+mod account_request;
 pub mod account_route;
 pub mod account_selection;
 pub mod account_storage;
