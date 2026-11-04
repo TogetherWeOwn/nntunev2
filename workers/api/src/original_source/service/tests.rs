@@ -6,6 +6,7 @@ use std::{
     cell::{Cell, RefCell},
     future::Future,
     rc::Rc,
+    time::Duration,
 };
 
 use nntune_core::{
@@ -22,7 +23,7 @@ use nntune_ingest::{
 };
 use serde_json::{json, Value};
 
-use super::{read, Call, RepositoryFactory};
+use super::{read, read_timed, Call, RepositoryFactory};
 use crate::{
     field_envelope::FieldEnvelope,
     original_source::{
@@ -238,6 +239,24 @@ impl Req {
     fn valid() -> Self {
         Self::signed(serde_json::to_vec(&lookup()).unwrap())
     }
+    async fn send_timed(&self, f: &Factory) -> Result<Payload, SourceServiceError> {
+        let clock = f.clock.clone();
+        read_timed(
+            f,
+            &Keys,
+            self.key,
+            Call {
+                method: self.method,
+                path: self.path,
+                authorization: self.auth.as_deref(),
+                body: &self.body,
+                browser_context: self.browser,
+            },
+            move || clock.get(),
+        )
+        .await
+    }
+
     async fn send(
         &self,
         f: &Factory,
@@ -261,6 +280,75 @@ fn never() -> impl Future<Output = ()> {
 
 fn denied<T>(r: Result<T, SourceServiceError>) -> bool {
     matches!(r, Err(SourceServiceError::Denied))
+}
+
+#[tokio::test]
+async fn timed_lookup_uses_the_same_authenticated_read() {
+    let f = Factory::new();
+    let payload = Req::valid().send_timed(&f).await.ok().unwrap();
+    assert_eq!(payload.bytes, source().encode().unwrap());
+    assert_eq!(f.connects.get(), 1);
+    assert!(f.dropped_repo.get());
+}
+
+#[tokio::test]
+async fn timed_lookup_denies_before_connect_or_timer_io() {
+    let f = Factory::new();
+    let mut request = Req::valid();
+    request.auth = None;
+    assert!(denied(request.send_timed(&f).await));
+    let request = Req::signed(lookup_with(|v| v["deadline_ms"] = json!(NOW)));
+    assert!(denied(request.send_timed(&f).await));
+    assert_eq!(f.connects.get(), 0);
+}
+
+#[tokio::test]
+async fn signed_remaining_timer_drops_stalled_connect_and_query() {
+    for connect in [true, false] {
+        let mut f = Factory::new();
+        f.pend_connect = connect;
+        f.pend_metadata = !connect;
+        let request = Req::signed(lookup_with(|v| {
+            v["issued_at_ms"] = json!(NOW - 4990);
+            v["deadline_ms"] = json!(NOW + 10);
+        }));
+        // Frozen wall-clock authority remains valid: only the real timer can
+        // terminate this. A reset to MAX_LOOKUP_MS would miss the outer bound.
+        let result = tokio::time::timeout(Duration::from_millis(500), request.send_timed(&f))
+            .await
+            .expect("signed remaining budget, not a fresh five seconds");
+        assert!(denied(result));
+        assert_eq!(f.connects.get(), 1);
+        assert!(if connect {
+            f.dropped_connect.get()
+        } else {
+            f.dropped_repo.get()
+        });
+    }
+}
+
+#[tokio::test]
+async fn caller_cancels_the_timed_connect_without_a_driver_task() {
+    let mut f = Factory::new();
+    f.pend_connect = true;
+    let request = Req::valid();
+    {
+        let pending = request.send_timed(&f);
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert!(!f.dropped_connect.get());
+    }
+    assert!(f.dropped_connect.get());
+}
+
+#[tokio::test]
+async fn timed_lookup_rejects_rollback_after_connect() {
+    let mut f = Factory::new();
+    f.hook = Some(("connect", NOW - 1));
+    assert!(denied(Req::valid().send_timed(&f).await));
+    assert_eq!(f.connects.get(), 1);
+    assert!(f.calls.borrow().is_empty());
+    assert!(f.dropped_repo.get());
 }
 
 #[tokio::test]

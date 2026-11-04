@@ -1,7 +1,7 @@
 //! Off-route authenticated source-service composition. No Worker fetch route,
 //! database connection, key provisioning or public caller is installed here.
 
-use std::{cell::Cell, future::Future, task::Poll};
+use std::{cell::Cell, future::Future, task::Poll, time::Duration};
 
 use futures_util::future::poll_fn;
 use nntune_core::{
@@ -66,6 +66,49 @@ pub async fn read(
     deadline: impl Future<Output = ()>,
 ) -> Result<Payload, SourceServiceError> {
     let now = now_ms();
+    let authority = Authority {
+        lookup: authenticate(play_grant_key, call, now)?,
+        now_ms,
+        last_ms: Cell::new(now),
+    };
+    read_authorized(factory, keks, authority, deadline).await
+}
+
+/// Runtime entry for the off-route repository factory. One timer covers the
+/// signed time remaining, not a fresh five-second budget at every await. It is
+/// polled before connect and dropped with the request; no timer task is spawned.
+pub async fn read_timed(
+    factory: &impl RepositoryFactory,
+    keks: &impl KekSource,
+    play_grant_key: Option<&[u8]>,
+    call: Call<'_>,
+    now_ms: impl Fn() -> u64,
+) -> Result<Payload, SourceServiceError> {
+    let now = now_ms();
+    let lookup = authenticate(play_grant_key, call, now)?;
+    let remaining = Duration::from_millis(lookup.deadline_ms - now);
+    #[cfg(target_arch = "wasm32")]
+    let deadline = worker::Delay::from(remaining);
+    #[cfg(not(target_arch = "wasm32"))]
+    let deadline = futures_timer::Delay::new(remaining);
+    read_authorized(
+        factory,
+        keks,
+        Authority {
+            lookup,
+            now_ms,
+            last_ms: Cell::new(now),
+        },
+        deadline,
+    )
+    .await
+}
+
+fn authenticate(
+    play_grant_key: Option<&[u8]>,
+    call: Call<'_>,
+    now: u64,
+) -> Result<Lookup, SourceServiceError> {
     if call.method != "POST"
         || call.path != PATH
         || call.browser_context
@@ -84,11 +127,18 @@ pub async fn read(
     }
     let lookup: Lookup =
         serde_json::from_slice(call.body).map_err(|_| SourceServiceError::Denied)?;
-    let authority = Authority {
-        lookup,
-        now_ms,
-        last_ms: Cell::new(now),
-    };
+    if !lookup.valid_at(now) {
+        return Err(SourceServiceError::Denied);
+    }
+    Ok(lookup)
+}
+
+async fn read_authorized(
+    factory: &impl RepositoryFactory,
+    keks: &impl KekSource,
+    authority: Authority<impl Fn() -> u64>,
+    deadline: impl Future<Output = ()>,
+) -> Result<Payload, SourceServiceError> {
     let track_id = &authority.lookup.track_id;
     authority.authorize(track_id)?;
     let work = async {

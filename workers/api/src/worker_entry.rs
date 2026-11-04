@@ -377,7 +377,7 @@ fn apply_rate_limit_overlay(config: Config, get: impl Fn(&str) -> Option<String>
 /// Hyperdrive config has query caching disabled; anything else (missing,
 /// empty, any other value) refuses to start. Unit-tested below; the same
 /// truthy spelling as the other feature flags.
-fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+pub(crate) fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
     matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 

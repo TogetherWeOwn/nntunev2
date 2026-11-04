@@ -1,7 +1,10 @@
 use super::super::postgres::PostgresSourceRepository;
 use tokio_postgres::{Client, NoTls};
 
-async fn connection() -> Client {
+async fn connection_parts() -> (
+    Client,
+    impl std::future::Future<Output = Result<(), tokio_postgres::Error>>,
+) {
     let url = std::env::var("NNTUNE_TEST_DATABASE_URL").expect("disposable PostgreSQL URL");
     let config: tokio_postgres::Config = url.parse().unwrap();
     assert_eq!(config.get_dbname(), Some("nntune_ci"));
@@ -15,8 +18,17 @@ async fn connection() -> Client {
         _ => false,
     }));
     assert!(config.get_hostaddrs().iter().all(|ip| ip.is_loopback()));
-    let (client, driver) = config.connect(NoTls).await.unwrap();
+    config.connect(NoTls).await.unwrap()
+}
+
+async fn connection() -> Client {
+    let (client, driver) = connection_parts().await;
     tokio::spawn(async move { driver.await.expect("disposable source connection") });
+    setup(&client).await;
+    client
+}
+
+async fn setup(client: &Client) {
     // Exact production column types, but deliberately no constraints, to
     // exercise corrupt metadata. TEMP rows disappear with this connection.
     // This is query/codec conformance, not a migration or Hyperdrive proof.
@@ -32,7 +44,40 @@ async fn connection() -> Client {
         )
         .await
         .unwrap();
-    client
+}
+
+#[tokio::test]
+async fn postgres_source_owned_driver_round_trips_without_spawn() {
+    use super::super::postgres::{owned::DrivenRepository, ClientRepository};
+    use futures_util::future::{select, Either};
+    let (client, driver) = connection_parts().await;
+    let source = prepare(A, 1, JOB);
+    let setup = async {
+        setup(&client).await;
+        insert(&client, &seal_original_source(&Keys, 7, &source).unwrap()).await;
+    };
+    let driver = match select(Box::pin(setup), Box::pin(driver)).await {
+        Either::Left(((), driver)) => driver,
+        Either::Right(_) => panic!("driver ended during setup"),
+    };
+    let closes = std::cell::Cell::new(0);
+    let mut repository = DrivenRepository::new(
+        ClientRepository::new(client),
+        async move { driver.await.map_err(|_| SourceServiceError::Store) },
+        || closes.set(closes.get() + 1),
+    );
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_original_source_async(&Allow, &mut repository, &Keys, A),
+    ).await.expect("inline driver makes progress").unwrap();
+    assert_eq!(read.encode().unwrap(), source.encode().unwrap());
+    assert_eq!(closes.get(), 0);
+    assert!(matches!(
+        read_original_source_async(&Allow, &mut repository, &Keys, B).await,
+        Err(SourceServiceError::Missing)
+    ));
+    drop(repository);
+    assert_eq!(closes.get(), 1);
 }
 
 async fn insert(client: &Client, source: &SealedSource) {

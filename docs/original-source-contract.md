@@ -214,8 +214,25 @@ fetch and returned reader retain an abort controller until drop, including
 error, timeout and caller cancellation. Native fakes exercise that ownership
 contract, not actual Worker abort propagation or physical connection closure.
 
-No runtime caller, binding configuration, API HTTP handler or owned PostgreSQL
-connection factory is installed here. Those remain separate integration work;
+The off-route `WorkerRepositoryFactory` accesses only the existing Hyperdrive
+binding, after authentication. It requires the existing query-cache-disabled
+attestation and PostgreSQL STARTTLS with no plaintext fallback. A retained raw
+socket owns forced-close initiation through opening and handshake, updating
+that authority to the replacement TLS socket before PostgreSQL authentication.
+The returned `DrivenRepository` polls its driver alongside bounded queries;
+no detached connection task is spawned. Driver completion, query failure or
+query cancellation poisons the repository and initiates closure once. Dropping
+the repository closes before destroying its client/driver. This is not proof of
+actual Worker physical closure. Native PostgreSQL tests prove inline driver
+progress, not the Hyperdrive/Worker transport boundary.
+
+`service::read_timed` authenticates first, then uses one platform timer for the
+signed time remaining through connection, both queries and encoding. Expiry
+wins ties, authority is rechecked across suspension and no per-query timer
+reset or retry is introduced. The injected-deadline seam remains available for
+deterministic tests.
+
+No runtime caller, binding configuration or API HTTP handler is installed here;
 the existing account/provider qualification gates are not changed. Playback
 HTTP response/backpressure, ACK/drop accounting and delivered-byte metering
 remain in their separate adapter, not in this source-record transport.

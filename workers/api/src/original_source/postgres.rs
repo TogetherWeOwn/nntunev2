@@ -1,7 +1,41 @@
 //! Bounded PostgreSQL execution shared by native tests and Hyperdrive callers.
 //! No connection, key lookup, route or source publication is installed here.
 
-use tokio_postgres::{types::Type, GenericClient};
+use tokio_postgres::{types::Type, Client, GenericClient};
+
+pub mod owned;
+
+/// Owning query adapter; use DrivenRepository to own and poll its driver too.
+/// No connection is opened by construction and no query implementation is forked.
+pub struct ClientRepository {
+    client: Client,
+}
+
+impl ClientRepository {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl AsyncSourceRepository for ClientRepository {
+    async fn metadata(
+        &mut self,
+        track_id: &str,
+    ) -> Result<[Option<SourceMetadata>; 2], SourceServiceError> {
+        PostgresSourceRepository::new(&self.client)
+            .metadata(track_id)
+            .await
+    }
+
+    async fn envelope(
+        &mut self,
+        selected: &SourceMetadata,
+    ) -> Result<Option<FieldEnvelope>, SourceServiceError> {
+        PostgresSourceRepository::new(&self.client)
+            .envelope(selected)
+            .await
+    }
+}
 
 use super::{
     source_envelope_sql, source_metadata_sql, AsyncSourceRepository, FieldEnvelope, SourceMetadata,
