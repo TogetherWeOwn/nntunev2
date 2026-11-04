@@ -25,6 +25,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
@@ -38,17 +39,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy
+          rustup default stable
       # rust-cache policy for every Rust lane: PR and merge-queue runs
       # restore main's cache but only main saves, so per-PR copies do not
       # evict main's entries from the 10 GB repo cache. Standalone crates
       # (workers/*) build into their own target dir and must name it in
       # `workspaces:`, or only the registry is cached.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The workspace includes nntune-core and the stream crate; run all native
@@ -116,13 +116,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Scalar core (no transport features) and the Workers transport build.
@@ -154,9 +152,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - name: Install pinned cargo-deny 0.20.2
         run: |
           set -euo pipefail
@@ -200,12 +199,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit-test the budget check
@@ -233,12 +231,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit-test the size reporter
@@ -295,6 +292,8 @@ jobs:
         run: python3 .github/scripts/test_ci_required_check_concurrency.py
       - name: Structural-test the CC0 fixture secret wiring
         run: python3 .github/scripts/test_ci_fixture_secrets.py
+      - name: Test workflow setup and shell data boundaries
+        run: python3 .github/scripts/test_workflow_policy_hardening.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -438,11 +437,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p nntune-test-nntp --all-targets
@@ -471,13 +470,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/api
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -594,8 +591,11 @@ jobs:
         run: python3 .github/scripts/test_apply_migration_postgres.py
         env:
           APPLY_MIGRATION_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/api
           key: api-postgres-acceptance
@@ -633,13 +633,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/mb
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -697,19 +695,22 @@ jobs:
 
   rust-ingest:
     name: rust (workers/ingest)
+    environment:
+      name: ci-fixtures
+      deployment: false
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/ingest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -722,9 +723,9 @@ jobs:
       # notices, and the test skips via the fetcher's exit-77 path.
       - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
         run: |
           set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
@@ -736,9 +737,9 @@ jobs:
           sha256sum "$fetched"
       - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
@@ -753,13 +754,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/repair
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -813,13 +812,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/transcode
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1317,12 +1314,17 @@ jobs:
       # because this job defaults to working-directory apps/web. Keep this
       # job id in ci-ok's needs (already there via web-build).
       - name: Enforce client-JS bundle budget
-        run: python3 ${{ github.workspace }}/.github/scripts/check_web_bundle_budget.py
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"
       - name: Bundle-budget self-tests (pass + breach fixtures)
-        run: python3 ${{ github.workspace }}/.github/scripts/test_check_web_bundle_budget.py
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
 
   web-e2e:
     name: web-e2e
+    environment:
+      name: ci-fixtures
+      deployment: false
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
     # 18.8-20.6 minutes; container setup (image pull + pnpm install)
@@ -1386,9 +1388,9 @@ jobs:
         # needs the pre-warmed cache.
         working-directory: ${{ github.workspace }}
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
         run: |
           set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
@@ -1410,9 +1412,9 @@ jobs:
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
