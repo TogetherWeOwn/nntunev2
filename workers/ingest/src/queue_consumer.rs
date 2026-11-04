@@ -1784,12 +1784,7 @@ async fn run_transcode_step_with<R: TranscodeRuntime>(
     // that ever disagrees fails closed as a pipeline bug, never as
     // another job's bytes).
     let input_key = input.key.rsplit('/').next().unwrap_or("");
-    let staging_id = match crate::transcode::derive_transcode_staging(
-        &input.sha256,
-        input_key,
-        &msg.job_id,
-        &input.scratch_prefix,
-    ) {
+    let staging_id = match input.staging_id(&msg.job_id) {
         Ok(staging_id) => staging_id,
         Err(reason) => return Err(JobError::permanent(ERR_TRANSCODE_FAILED, reason)),
     };
@@ -1839,12 +1834,19 @@ async fn run_transcode_step_with<R: TranscodeRuntime>(
             ))
         }
     };
-    if crate::transcode::verify_transcode_artifact(&bytes, &artifact_sha256, byte_size).is_err() {
-        return Err(JobError::permanent(
+    let output = crate::transcode::TranscodeOutput::verified(
+        &req,
+        &input,
+        &bytes,
+        &artifact_sha256,
+        byte_size,
+    )
+    .map_err(|_| {
+        JobError::permanent(
             ERR_TRANSCODE_FAILED,
             "transcode artifact failed verification",
-        ));
-    }
+        )
+    })?;
     let r2_key = match nntune_core::transcode::artifact_r2_key(&artifact_sha256) {
         Ok(key) => key,
         Err(_) => {
@@ -1902,6 +1904,10 @@ async fn run_transcode_step_with<R: TranscodeRuntime>(
             "meter transcode unavailable",
         ));
     }
+    // Commit the per-artifact derivation with the cursor, only after all
+    // publication effects succeed. A lost checkpoint safely replays the same
+    // generation; legacy cursors never synthesize missing output evidence.
+    cp.transcode_outputs.insert(cp.transcode_next, output);
     cp.transcode_next += 1;
     if cp.transcode_next >= cp.transcode_inputs.len() {
         advance_checkpoint(cp, false);
@@ -2658,6 +2664,160 @@ mod tests {
         crate::transcode::TranscodeCall::Completed {
             artifact_sha256: nntune_core::par2::scratch::sha256_hex(bytes),
             byte_size: bytes.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn transcode_outputs_keep_each_artifacts_source_across_checkpoint_replay() {
+        use crate::pool_provenance::PoolProvenance;
+
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 2);
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let first = &mut cp.transcode_inputs[0];
+        first.sha256 = crate::dispatch::content_sha256_hex(b"first lossless source");
+        first.size = b"first lossless source".len() as u64;
+        first.pool_provenance = Some(serde_json::from_value::<PoolProvenance>(
+            serde_json::json!({"sha256": first.sha256, "size": first.size, "provider_ids": [a, b]}),
+        ).unwrap());
+        let source = b"second lossless source";
+        let second = &mut cp.transcode_inputs[1];
+        second.sha256 = crate::dispatch::content_sha256_hex(source);
+        second.size = source.len() as u64;
+        second.pool_provenance = PoolProvenance::from_body(b, source);
+
+        let lost_checkpoint = cp.clone();
+        let artifact = b"first encoded output".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .unwrap_err();
+        assert!(err.made_progress);
+        assert_eq!(cp.transcode_outputs.len(), 1);
+        let first_output = cp.transcode_outputs[&0].clone();
+        assert_eq!(
+            first_output.contributing_provider_ids(&msg.job_id, &cp.transcode_inputs[0]),
+            Some(&[a.to_string(), b.to_string()].into())
+        );
+
+        // A failed checkpoint put loses both output and cursor. Replaying the
+        // same generation converges on exactly the same record, not a union.
+        let mut replay = lost_checkpoint;
+        let err = run_transcode_step_with(&runtime, &msg, &mut replay)
+            .await
+            .unwrap_err();
+        assert!(err.made_progress);
+        assert_eq!(cp, replay);
+        let mut cp: JobCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&cp).unwrap()).unwrap();
+        // Different lossless inputs may encode to identical output. Keep both
+        // derivations separate instead of merging contributors by output hash.
+        let artifact = b"first encoded output".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .unwrap_err();
+        assert!(err.made_progress);
+        assert_eq!(cp.state, JobState::Writing);
+        assert_eq!(cp.transcode_outputs.len(), 2);
+        assert_eq!(cp.transcode_outputs[&0], first_output);
+        let second_output = &cp.transcode_outputs[&1];
+        assert_eq!(
+            second_output.contributing_provider_ids(&msg.job_id, &cp.transcode_inputs[1]),
+            Some(&[b.to_string()].into())
+        );
+        assert_eq!(
+            second_output.contributing_provider_ids(&msg.job_id, &cp.transcode_inputs[0]),
+            None
+        );
+        assert_eq!(
+            first_output.artifact_sha256(),
+            second_output.artifact_sha256()
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_legacy_cursors_and_queue_hints_never_backfill_output_evidence() {
+        let msg = search_message();
+        let mut cp = transcoding_checkpoint(&msg, 1);
+        cp.provider_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        cp.pool_observations
+            .record("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            .unwrap();
+        let artifact = b"encoded output".to_vec();
+        let runtime = FakeTranscode::succeeding(completed_call_for(&artifact), artifact);
+        let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+            .await
+            .unwrap_err();
+        assert!(err.made_progress);
+        let output = &cp.transcode_outputs[&0];
+        assert!(output.matches_input(&msg.job_id, &cp.transcode_inputs[0]));
+        assert_eq!(
+            output.contributing_provider_ids(&msg.job_id, &cp.transcode_inputs[0]),
+            None
+        );
+
+        let mut json = serde_json::to_value(cp).unwrap();
+        json.as_object_mut().unwrap().remove("transcode_outputs");
+        let mut legacy: JobCheckpoint = serde_json::from_value(json).unwrap();
+        assert!(legacy.transcode_outputs.is_empty());
+        legacy.state = JobState::Transcoding;
+        let unused = FakeTranscode::succeeding(crate::transcode::TranscodeCall::Retry, vec![]);
+        let err = run_transcode_step_with(&unused, &msg, &mut legacy)
+            .await
+            .unwrap_err();
+        assert!(err.made_progress);
+        assert!(unused.calls().is_empty());
+        assert!(legacy.transcode_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcode_failed_effects_do_not_commit_an_output_or_cursor() {
+        use crate::transcode::{PublishError, TranscodeCall};
+
+        let msg = search_message();
+        let artifact = b"encoded output".to_vec();
+        for failure in 0..6 {
+            let mut cp = transcoding_checkpoint(&msg, 1);
+            let mut runtime =
+                FakeTranscode::succeeding(completed_call_for(&artifact), artifact.clone());
+            match failure {
+                0 => runtime.front = TranscodeCall::Retry,
+                1 => runtime.artifact = Err(crate::transcode::ArtifactFetchError::Missing),
+                2 => runtime.bucket = Err(()),
+                3 => runtime.put_ok = false,
+                4 => runtime.publish = Err(PublishError::Transient),
+                _ => runtime.meter_ok = false,
+            }
+            let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+                .await
+                .unwrap_err();
+            assert!(!err.made_progress, "failure {failure}");
+            assert_eq!(cp.transcode_next, 0);
+            assert!(cp.transcode_outputs.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn transcode_wrong_full_source_layout_fails_before_any_front_effect() {
+        let msg = search_message();
+        for failure in 0..4 {
+            let mut cp = transcoding_checkpoint(&msg, 1);
+            let input = &mut cp.transcode_inputs[0];
+            match failure {
+                0 => input.key = input.key.replace(&msg.job_id, "job_other"),
+                1 => input.key = input.key.replace("/r1/", "/r2/"),
+                2 => input.file_index += 1,
+                _ => input.size = 0,
+            }
+            let runtime = FakeTranscode::succeeding(crate::transcode::TranscodeCall::Retry, vec![]);
+            let err = run_transcode_step_with(&runtime, &msg, &mut cp)
+                .await
+                .unwrap_err();
+            assert!(!err.transient);
+            assert!(runtime.calls().is_empty());
+            assert!(cp.transcode_outputs.is_empty());
         }
     }
 

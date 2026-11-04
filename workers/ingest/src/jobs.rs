@@ -99,6 +99,11 @@ pub struct JobCheckpoint {
     /// checkpoints readable (they record on their next verify).
     #[serde(default)]
     pub transcode_inputs: Vec<crate::transcode::TranscodeInput>,
+    /// Published artifacts keyed by their transcode-input cursor. Each record
+    /// retains its exact source/generation, never a whole-job or first-account
+    /// attribution. Legacy checkpoints have no output evidence.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transcode_outputs: std::collections::BTreeMap<usize, crate::transcode::TranscodeOutput>,
     /// Index of the next input `Transcoding` must encode. Advances
     /// past each published artifact; `#[serde(default)]` restarts
     /// pre-existing checkpoints at the first input.
@@ -349,6 +354,7 @@ mod tests {
             pool_observations: Default::default(),
             transcode_inputs: Vec::new(),
             transcode_next: 0,
+            transcode_outputs: Default::default(),
         }
     }
 

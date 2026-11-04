@@ -542,6 +542,114 @@ pub struct TranscodeInput {
     pub pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
 }
 
+impl TranscodeInput {
+    /// Validate the full checkpoint layout, not just the basename sent to the
+    /// front. A swapped job, round or file index must fail before dispatch.
+    pub fn staging_id(&self, job_id: &str) -> Result<String, &'static str> {
+        let input_key = self.key.rsplit('/').next().unwrap_or("");
+        if self.size == 0
+            || self.file_index >= crate::verify::MAX_VERIFY_FILES
+            || self.key != format!("{}in/{input_key}", self.scratch_prefix)
+            || !input_key.starts_with(&format!("{:04}-", self.file_index))
+        {
+            return Err("transcode input outside recorded source layout");
+        }
+        derive_transcode_staging(&self.sha256, input_key, job_id, &self.scratch_prefix)
+    }
+
+    fn with_valid_provenance(&self) -> Self {
+        let mut input = self.clone();
+        input.pool_provenance = input
+            .pool_provenance
+            .filter(|proof| proof.matches_identity(&input.sha256, input.size));
+        input
+    }
+}
+
+/// One verified, published artifact and its exact encode source. The source
+/// proof stays source-bound: encoded output is not an NNTP BODY. Trusted
+/// checkpoint writers carry this derivation, not an authenticated receipt or a
+/// grant. Deserialized records must be checked against the current job/input.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodeOutput {
+    source: TranscodeInput,
+    staging_id: String,
+    artifact_sha256: String,
+    byte_size: u64,
+}
+
+impl TranscodeOutput {
+    /// Called with the request actually dispatched and the bytes actually
+    /// fetched. The front contract checks the source hash before encoding;
+    /// ingest checks output size/hash here before publication. Neither check
+    /// establishes entitlement or makes arbitrary scratch writers trustworthy.
+    pub fn verified(
+        req: &TranscodeRequest,
+        input: &TranscodeInput,
+        bytes: &[u8],
+        artifact_sha256: &str,
+        byte_size: u64,
+    ) -> Result<Self, &'static str> {
+        let staging_id = input.staging_id(&req.job_id)?;
+        if req.staging_id != staging_id
+            || req.input_key != input.key.rsplit('/').next().unwrap_or("")
+            || req.scratch_prefix != input.scratch_prefix
+            || req.source_sha256
+                != canonical_sha256_hex(&input.sha256)
+                    .map_err(|_| "source hash outside content identity")?
+        {
+            return Err("transcode output outside dispatched generation");
+        }
+        if !(1..=MAX_ARTIFACT_BYTES).contains(&byte_size) {
+            return Err("transcode artifact outside profile ceiling");
+        }
+        verify_transcode_artifact(bytes, artifact_sha256, byte_size)?;
+        Ok(Self {
+            source: input.with_valid_provenance(),
+            staging_id,
+            artifact_sha256: canonical_sha256_hex(artifact_sha256)
+                .map_err(|_| "artifact hash outside content identity")?,
+            byte_size,
+        })
+    }
+
+    pub fn matches_input(&self, job_id: &str, input: &TranscodeInput) -> bool {
+        input
+            .staging_id(job_id)
+            .is_ok_and(|id| id == self.staging_id)
+            && self.source == input.with_valid_provenance()
+            && (1..=MAX_ARTIFACT_BYTES).contains(&self.byte_size)
+            && canonical_sha256_hex(&self.artifact_sha256)
+                .is_ok_and(|sha| sha == self.artifact_sha256)
+    }
+
+    /// Complete contributors to this source only. Never select one account
+    /// from a multi-account set or fill missing evidence from job observations.
+    pub fn contributing_provider_ids(
+        &self,
+        job_id: &str,
+        input: &TranscodeInput,
+    ) -> Option<&std::collections::BTreeSet<String>> {
+        if !self.matches_input(job_id, input) {
+            return None;
+        }
+        self.source
+            .pool_provenance
+            .as_ref()
+            .filter(|proof| proof.matches_identity(&self.source.sha256, self.source.size))
+            .map(|proof| proof.provider_ids())
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    pub fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
+}
+
 /// Audio containers the profile accepts, matched case-insensitively
 /// against the extension after the final dot. Everything here is an
 /// ffmpeg-decodable audio shape (`-map 0:a:0` selects the first audio
@@ -639,6 +747,7 @@ pub fn record_transcode_inputs(
 ) -> Result<(), &'static str> {
     cp.transcode_inputs = select_transcode_inputs(files, staged, job_id, round)?;
     cp.transcode_next = 0;
+    cp.transcode_outputs.clear();
     Ok(())
 }
 
@@ -1324,6 +1433,7 @@ mod tests {
             pool_observations: Default::default(),
             transcode_inputs: Vec::new(),
             transcode_next: 7,
+            transcode_outputs: Default::default(),
         };
         record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
         assert_eq!(cp.transcode_inputs.len(), 1);
@@ -1334,6 +1444,27 @@ mod tests {
             cp.transcode_inputs[0].scratch_prefix,
             "ingest-scratch/job_01J9ZQ8K2M/r2/"
         );
+        let input = &cp.transcode_inputs[0];
+        let req = decide_transcode(
+            JOB,
+            USER,
+            KEY,
+            input.key.rsplit('/').next().unwrap(),
+            &input.sha256,
+            &input.scratch_prefix,
+            &input.staging_id(JOB).unwrap(),
+        )
+        .unwrap();
+        let output =
+            TranscodeOutput::verified(&req, input, b"opus", &sha256_hex(b"opus"), 4).unwrap();
+        cp.transcode_outputs.insert(0, output);
+        cp.transcode_next = 1;
+        record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
+        assert!(
+            cp.transcode_outputs.is_empty(),
+            "a new verify selection resets output evidence"
+        );
+        assert_eq!(cp.transcode_next, 0);
     }
 
     #[test]
@@ -1443,7 +1574,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            function.contains("crate::transcode::derive_transcode_staging( &input.sha256, input_key, &msg.job_id, &input.scratch_prefix, )"),
+            function.contains("input.staging_id(&msg.job_id)"),
             "queue caller must derive from the recorded job and scratch prefix, not a reconstructed default round"
         );
     }

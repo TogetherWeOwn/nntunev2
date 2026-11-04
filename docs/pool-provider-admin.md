@@ -240,11 +240,27 @@ single-object audio proofs follow their exact source identity into transcode
 inputs. These records rely on trusted pipeline scratch/checkpoint writers: the
 hash detects stale content, not forged attribution.
 
-This is input provenance evidence, **not a grant or entitlement proof**. Even a
-single contributor does not authorize service. Artifact-output mapping, multi-
-account grant publication, repair contribution propagation and the independent
-publication security gate remain unfinished; no grant writer is enabled by this
-increment.
+Checkpoint `transcode_outputs` records each published artifact by its input
+cursor, together with its exact source input, profile-bound encode staging ID,
+verified artifact hash and size. The full source key must match the job, round
+and file index before dispatch. Output records are committed with the cursor
+only after the audio put, blob-row publication and meter succeed; a lost
+checkpoint replays the same generation. New verify selections clear old output
+records, and legacy past-end cursors do not backfill missing evidence.
+
+Each output retains the source-bound proof (not a fictitious BODY proof for
+encoded bytes). Reading contributors validates the current job/input, generation,
+artifact identity shape and complete source proof. Multiple contributors remain
+an explicit set; unknown/stale/overflowed input evidence remains absent. Records
+from another input are never combined, even if two inputs encode to the same
+artifact hash. This derivation relies on the trusted front/Container contract's
+source-hash verification and trusted checkpoint writers; it is not a signed
+transcode receipt, and arbitrary scratch writers must not be trusted.
+
+This is provenance evidence, **not a grant or entitlement proof**. Even a single
+contributor does not authorize service. Multi-account grant publication, repair
+contribution propagation and the independent publication security gate remain
+unfinished; no grant writer is enabled by this increment.
 
 **No operation RPC or product dial is enabled.** The composed operation and ingest
 forwarding handlers share the hard false compile-time qualification gate, not an

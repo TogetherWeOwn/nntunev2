@@ -46,6 +46,7 @@ fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
         pool_observations: Default::default(),
         transcode_inputs: Vec::new(),
         transcode_next: 0,
+        transcode_outputs: Default::default(),
     }
 }
 

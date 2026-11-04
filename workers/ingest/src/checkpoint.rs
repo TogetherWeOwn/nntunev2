@@ -61,6 +61,7 @@ pub fn initial(msg: &QueueMsg) -> JobCheckpoint {
         // cursor starts at the first input.
         transcode_inputs: Vec::new(),
         transcode_next: 0,
+        transcode_outputs: Default::default(),
     }
 }
 
