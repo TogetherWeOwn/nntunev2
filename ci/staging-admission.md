@@ -72,6 +72,18 @@ an expiry rule. Listings that cannot prove completeness refuse rather than
 silently selecting from a partial page. A superseding attempt invalidates the old
 receipt. A known conflicting intervening staging deploy invalidates old evidence.
 
+Current main is resolved independently of checkout's `origin/main`: the pinned
+checkout action can reset that tracking ref to the captured dispatch commit when
+main advances before checkout. The verifier queries the remote's exact
+`refs/heads/main`, fetches the resolved immutable commit without writing tracking
+refs or `FETCH_HEAD`, verifies its commit identity, and repeats the remote query
+to refuse movement during resolution. Missing, ambiguous, unavailable or
+incoherent resolution refuses; the dispatch commit must remain an ancestor.
+All current-main ancestry, producer/policy and manifest comparisons then use
+that one pinned SHA, never a mutable tracking ref. The trusted dispatch checkout
+and policy remain unchanged. This is a point-in-time source snapshot, not a
+reservation of main or staging and not operational acceptance.
+
 Source binding compares Git tree records (object IDs, names, types and modes),
 not selected helper bytes or the whole repository commit. The complete committed
 `e2e/` tree binds every mapped test, imported/transitive helper, fixture, script,

@@ -696,7 +696,11 @@ class SourceBindingTests(Base):
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
         self.git("update-ref", "HEAD", trusted)
-        self.git("update-ref", "refs/remotes/origin/main", current)
+        # Model checkout's full-history fallback: origin/main names the captured
+        # dispatch commit, even though the remote branch has already advanced.
+        self.git("update-ref", "refs/remotes/origin/main", trusted)
+        self.git("update-ref", "refs/heads/main", current)
+        self.git("config", "remote.origin.url", str(self.root))
         with patch.dict(globals(), SHA=candidate):
             world = World(policy=self.policy, contract_bytes=self.contract,
                           xml=make_junit(final_sha=candidate).replace(
@@ -708,8 +712,15 @@ class SourceBindingTests(Base):
                 patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
                 patch.object(sa, "Actions", return_value=actions), \
                 patch.object(sa, "current_identity") as live, patch("sys.stdout", new=io.StringIO()):
-            sa.main()
+            with patch.object(sa, "git", wraps=sa.git) as source_git:
+                sa.main()
             live.assert_called_once_with(sa.os.environ, candidate)
+            source_git.assert_any_call("merge-base", "--is-ancestor", candidate, current)
+            source_git.assert_any_call("ls-tree", "-z", current, "--", *sa.TRUSTED_TREES, *sa.TRUSTED_FILES)
+            source_git.assert_any_call("show", f"{current}:migrations/manifest.toml")
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), trusted)
+        self.assertEqual(self.git("rev-parse", "origin/main").decode().strip(), trusted)
+        self.assertFalse((self.root / "FETCH_HEAD").exists())
         self.assertIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
 
     def test_main_accepts_matching_closure_despite_unrelated_main_movement(self):
@@ -728,6 +739,24 @@ class SourceBindingTests(Base):
     def test_main_refuses_current_main_only_dependency_drift(self):
         corrected = dict(self.files, **{"e2e/helpers/accounts.ts": ("100644", b"current main correction")})
         self.refused("producer.*drift", self.run_main, current_files=corrected)
+
+    def test_main_refuses_current_main_only_policy_revocation(self):
+        revoked = dict(self.files, **{sa.POLICY: ("100644", json.dumps(
+            dict(self.policy, approvals=[])).encode())})
+        self.refused("producer.*drift", self.run_main, current_files=revoked)
+
+    def test_main_refuses_current_main_only_manifest_drift(self):
+        changed = dict(self.files, **{"migrations/manifest.toml": ("100644", b"new manifest")})
+        self.refused("current migration manifest drift", self.run_main, current_files=changed)
+
+    def test_main_refuses_unavailable_remote_main(self):
+        real_git = sa.git
+        def unavailable(*args):
+            if args[0] == "ls-remote":
+                raise sa.Refused("current main unavailable")
+            return real_git(*args)
+        with patch.object(sa, "git", side_effect=unavailable):
+            self.refused("current main unavailable", self.run_main)
 
     def test_main_refuses_trusted_dispatch_only_dependency_drift(self):
         corrected = dict(self.files, **{"e2e/package-lock.json": ("100644", b"dispatch correction")})
@@ -759,6 +788,82 @@ class SourceBindingTests(Base):
     def test_main_existing_identity_helper_drift_negative_control(self):
         changed = dict(self.files, **{"e2e/helpers/build-identity-live.ts": ("100644", b"correction")})
         self.refused("producer.*drift", self.run_main, trusted_files=changed)
+
+
+class CurrentMainTests(Base):
+    def resolve(self, responses=None, commit=SHA, fail=None):
+        responses = iter(responses if responses is not None else [
+            f"{SHA}\trefs/heads/main\n".encode()] * 2)
+        def command(*args):
+            if fail == args[0]:
+                raise sa.Refused("current main object unavailable")
+            if args[0] == "ls-remote":
+                return next(responses)
+            if args[0] == "rev-parse":
+                return (commit + "\n").encode()
+            return b""
+        with patch.object(sa, "git", side_effect=command) as git:
+            result = sa.current_main(OTHER_SHA)
+            git.assert_any_call("fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", SHA)
+            git.assert_any_call("merge-base", "--is-ancestor", OTHER_SHA, SHA)
+            return result
+
+    def test_pins_remote_commit(self):
+        self.assertEqual(self.resolve(), SHA)
+
+    def test_refuses_missing_malformed_ambiguous_or_foreign_ref(self):
+        for result in (b"", b"not-a-sha\trefs/heads/main\n", f"{SHA}\trefs/heads/other\n".encode(),
+                       f"{SHA}\trefs/heads/main\n{OTHER_SHA}\trefs/heads/main\n".encode()):
+            with self.subTest(response=result):
+                self.refused("incoherent current main", self.resolve, [result])
+
+    def test_refuses_main_movement_during_fetch(self):
+        self.refused("main moved", self.resolve, [f"{sha}\trefs/heads/main\n".encode()
+                                                  for sha in (SHA, OTHER_SHA)])
+
+    def test_refuses_noncommit_or_mismatched_object(self):
+        self.refused("not the resolved commit", self.resolve, commit=OTHER_SHA)
+        self.refused("object unavailable", self.resolve, fail="rev-parse")
+
+    def test_refuses_network_or_fetch_failure(self):
+        for command in ("ls-remote", "fetch"):
+            with self.subTest(command=command):
+                self.refused("object unavailable", self.resolve, fail=command)
+
+    def test_refuses_dispatch_not_ancestor_of_current_main(self):
+        self.refused("object unavailable", self.resolve, fail="merge-base")
+
+    def test_fetches_missing_remote_commit_without_changing_local_refs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            remote, local = root / "remote.git", root / "local.git"
+            def git_at(path, *args, data=None):
+                env = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_COMMITTER_NAME="Fixture",
+                           GIT_AUTHOR_EMAIL="fixture@example.invalid", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+                return subprocess.check_output(["git", "-C", str(path), *args], input=data,
+                                               stderr=subprocess.PIPE, env=env, timeout=15)
+            for path in (remote, local):
+                path.mkdir()
+                git_at(path, "init", "--bare", "--quiet")
+            tree = git_at(remote, "mktree", data=b"").decode().strip()
+            trusted = git_at(remote, "commit-tree", tree, "-m", "dispatch").decode().strip()
+            git_at(remote, "update-ref", "refs/heads/main", trusted)
+            git_at(local, "config", "remote.origin.url", str(remote))
+            git_at(local, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            git_at(local, "fetch", "--quiet", "origin")
+            git_at(local, "update-ref", "HEAD", trusted)
+            before = git_at(local, "show-ref")
+            fetch_head = (local / "FETCH_HEAD").read_bytes()
+            current = git_at(remote, "commit-tree", tree, "-p", trusted, "-m", "main advanced").decode().strip()
+            git_at(remote, "update-ref", "refs/heads/main", current)
+            with self.assertRaises(subprocess.CalledProcessError):
+                git_at(local, "cat-file", "-e", current)
+            with patch.object(sa, "ROOT", local):
+                self.assertEqual(sa.current_main(trusted), current)
+            self.assertEqual(git_at(local, "cat-file", "-t", current), b"commit\n")
+            self.assertEqual(git_at(local, "show-ref"), before)
+            self.assertEqual((local / "FETCH_HEAD").read_bytes(), fetch_head)
+            self.assertEqual(git_at(local, "rev-parse", "HEAD").decode().strip(), trusted)
 
 
 class TransportTests(Base):

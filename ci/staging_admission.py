@@ -233,6 +233,23 @@ def git_file(sha, name):
     return git("show", f"{sha}:{name}")
 
 
+def current_main(trusted):
+    # Checkout may reset origin/main to the dispatch SHA after fetching history.
+    # Resolve the remote independently, then pin objects without changing any ref.
+    def resolve():
+        result = git("ls-remote", "--exit-code", "origin", "refs/heads/main")
+        match = re.fullmatch(rb"([0-9a-f]{40})\trefs/heads/main\n", result)
+        require(match is not None, "missing or incoherent current main resolution")
+        return match[1].decode("ascii")
+    tip = resolve()
+    git("fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", tip)
+    require(git("rev-parse", "--verify", f"{tip}^{{commit}}").decode().strip() == tip,
+            "current main is not the resolved commit")
+    require(resolve() == tip, "current main moved during source resolution; retry required")
+    git("merge-base", "--is-ancestor", trusted, tip)
+    return tip
+
+
 def produce(env, xml, policy, contract_bytes, manifest_bytes):
     sha = env["GITHUB_SHA"]
     require(SHA.fullmatch(sha) and SHA.fullmatch(env["GITHUB_WORKFLOW_SHA"])
@@ -557,7 +574,8 @@ def main():
     trusted = env.get("GITHUB_SHA", "")
     require(SHA.fullmatch(trusted) and git("rev-parse", "HEAD").decode().strip() == trusted,
             "verifier checkout is not workflow source")
-    git("merge-base", "--is-ancestor", sha, "origin/main")
+    main_tip = current_main(trusted)
+    git("merge-base", "--is-ancestor", sha, main_tip)
     def source_binding(source):
         records = git("ls-tree", "-z", source, "--", *TRUSTED_TREES, *TRUSTED_FILES)
         entries = dict(row.split(b"\t", 1)[::-1] for row in records.split(b"\0") if row)
@@ -568,10 +586,10 @@ def main():
                 "missing or unsupported producer dependency source")
         return records
     def producer_source_ok(source):
-        require(source_binding(source) == source_binding(trusted) == source_binding("origin/main"),
+        require(source_binding(source) == source_binding(trusted) == source_binding(main_tip),
                 "relevant producer or trusted policy drift; new evidence required")
     manifest = git_file(sha, "migrations/manifest.toml")
-    require(manifest == git_file("origin/main", "migrations/manifest.toml"), "current migration manifest drift")
+    require(manifest == git_file(main_tip, "migrations/manifest.toml"), "current migration manifest drift")
     verify(Actions(env["GITHUB_REPOSITORY"], env["GITHUB_TOKEN"]), repo=env["GITHUB_REPOSITORY"],
            repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
            contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok)
