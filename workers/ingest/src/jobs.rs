@@ -444,6 +444,7 @@ mod tests {
     fn checkpoint_transcode_cursor_roundtrips_with_legacy_default() {
         let mut cp = checkpoint_at(JobState::Transcoding);
         cp.transcode_inputs = vec![crate::transcode::TranscodeInput {
+            pool_provenance: None,
             file_index: 0,
             key: "ingest-scratch/job_0123456789abcdef/r1/in/0000-aabb".to_string(),
             sha256: "a".repeat(64),

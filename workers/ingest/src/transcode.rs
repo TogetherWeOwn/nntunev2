@@ -536,6 +536,10 @@ pub struct TranscodeInput {
     pub sha256: String,
     pub size: u64,
     pub scratch_prefix: String,
+    /// Complete input contributions only. No grant is inferred here, including
+    /// when there is exactly one account; publication has its own gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
 }
 
 /// Audio containers the profile accepts, matched case-insensitively
@@ -612,6 +616,11 @@ pub fn select_transcode_inputs(
             sha256,
             size: rec.size,
             scratch_prefix: VerifyProgress::scratch_prefix(job_id, round),
+            pool_provenance: rec
+                .pool_provenance
+                .as_ref()
+                .filter(|proof| proof.matches_identity(&rec.sha256, rec.size))
+                .cloned(),
         });
     }
     Ok(inputs)
@@ -1151,6 +1160,7 @@ mod tests {
 
     fn staged_audio(key: String, sha256: &str, size: u64) -> StagedFile {
         StagedFile {
+            pool_provenance: None,
             key,
             size,
             sha256: sha256.to_string(),
@@ -1231,6 +1241,7 @@ mod tests {
         // is incorrect output).
         let mut spooled = staged_audio(key.clone(), SHA, 512);
         spooled.spool = vec![crate::verify::StagedSpoolSegment {
+            pool_provenance: None,
             key: "seg".to_string(),
             size: 1,
             crc32: 0,

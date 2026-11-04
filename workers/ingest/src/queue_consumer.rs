@@ -922,22 +922,25 @@ impl BodySource for PoolBodySource<'_> {
     ) -> Result<crate::verify::ArticleFetch, VerifyError> {
         let req = build_body_request(self.msg, segment_id)
             .map_err(|_| VerifyError::Permanent("invalid segment id".into()))?;
-        let fetched = call_pool_body(self.env, &req).await.map(|served| {
-            if let Some(provider_id) = &served.provider_id {
-                // The decoder has already validated this exact successful
-                // account-owned response; never copy the queued hint.
-                let _ = self.observations.record(provider_id);
-            }
-            served.outcome
-        });
+        let fetched = call_pool_body(self.env, &req).await;
         match fetched {
-            Ok(BodyFetch::Bytes(bytes)) => Ok(crate::verify::ArticleFetch::Present(bytes)),
-            Ok(BodyFetch::Missing) => Ok(crate::verify::ArticleFetch::Missing),
-            // `413` is per-article data: the segment is judged absent
-            // and flagged size-refused (never a permanent job failure
-            // by itself), so the round can skip the repair dispatch a
-            // refetch-identical refusal could never satisfy.
-            Ok(BodyFetch::TooLarge) => Ok(crate::verify::ArticleFetch::TooLarge),
+            Ok(served) => match served.outcome {
+                BodyFetch::Bytes(bytes) => {
+                    let Some(provider_id) = served.provider_id else {
+                        return Err(VerifyError::Transient(
+                            "pool body attribution unavailable".into(),
+                        ));
+                    };
+                    self.observations.record(&provider_id).map_err(|_| {
+                        VerifyError::Transient("pool body attribution unavailable".into())
+                    })?;
+                    Ok(crate::verify::ArticleFetch::Served { provider_id, bytes })
+                }
+                BodyFetch::Missing => Ok(crate::verify::ArticleFetch::Missing),
+                // `413` is absent, size-refused article data, never a permanent
+                // job failure by itself or a repairable transport fault.
+                BodyFetch::TooLarge => Ok(crate::verify::ArticleFetch::TooLarge),
+            },
             Err(PoolBodyError::Retry { .. }) => {
                 Err(VerifyError::Transient("pool body fetch unavailable".into()))
             }
@@ -995,6 +998,20 @@ fn staged_from_metadata(
         spool: Vec::new(),
         crc32: meta.get("crc32").and_then(|v| v.parse().ok()).unwrap_or(0),
         missing: meta.get("missing").is_some_and(|v| v == "1"),
+        pool_provenance: meta
+            .get("pool_provenance")
+            .filter(|raw| raw.len() <= 1800)
+            .and_then(|raw| {
+                serde_json::from_str::<crate::pool_provenance::PoolProvenance>(raw).ok()
+            })
+            .filter(|proof| {
+                proof.matches_identity(
+                    meta.get("sha256").map(String::as_str).unwrap_or(""),
+                    meta.get("size")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(size),
+                )
+            }),
     })
 }
 
@@ -1004,6 +1021,15 @@ fn staged_from_metadata(
 /// together with the parse side (see the round-trip tests).
 fn staged_to_metadata(meta: &StagedFile) -> std::collections::HashMap<String, String> {
     let mut md = std::collections::HashMap::new();
+    if let Some(proof) = meta
+        .pool_provenance
+        .as_ref()
+        .filter(|proof| proof.matches_identity(&meta.sha256, meta.size))
+    {
+        if let Ok(raw) = serde_json::to_string(proof) {
+            md.insert("pool_provenance".into(), raw);
+        }
+    }
     md.insert("sha256".to_string(), meta.sha256.clone());
     md.insert("size".to_string(), meta.size.to_string());
     md.insert("crc32".to_string(), meta.crc32.to_string());
@@ -2610,6 +2636,7 @@ mod tests {
     fn transcode_input(msg: &QueueMsg, index: usize) -> crate::transcode::TranscodeInput {
         let component = format!("{index:04}-{}", "a".repeat(64));
         crate::transcode::TranscodeInput {
+            pool_provenance: None,
             file_index: index,
             key: format!("ingest-scratch/{}/r1/in/{component}", msg.job_id),
             sha256: "b".repeat(64),
@@ -3315,6 +3342,82 @@ mod tests {
         assert_eq!(staged.size_refused_blocks, 0);
     }
 
+    fn proven_scratch_meta() -> StagedFile {
+        let bytes = b"decoded audio";
+        StagedFile {
+            key: "k".into(),
+            size: bytes.len() as u64,
+            sha256: crate::dispatch::content_sha256_hex(bytes),
+            missing_blocks: 0,
+            size_refused_blocks: 0,
+            par2_set_id: None,
+            spool: Vec::new(),
+            crc32: crc32fast::hash(bytes),
+            missing: false,
+            pool_provenance: crate::pool_provenance::PoolProvenance::from_body(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                bytes,
+            ),
+        }
+    }
+
+    #[test]
+    fn staged_metadata_roundtrips_content_bound_contributors_within_r2_budget() {
+        let mut meta = proven_scratch_meta();
+        let mut value = serde_json::to_value(meta.pool_provenance.as_ref().unwrap()).unwrap();
+        value["provider_ids"] = serde_json::json!((0..crate::pool_provenance::MAX_CONTRIBUTORS)
+            .map(|n| format!("{n:08x}-0000-4000-8000-000000000000"))
+            .collect::<Vec<_>>());
+        meta.pool_provenance = Some(serde_json::from_value(value).unwrap());
+        meta.par2_set_id = Some("f".repeat(64));
+        let written = staged_to_metadata(&meta);
+        assert!(written.contains_key("pool_provenance"));
+        assert!(
+            written
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                <= 2048
+        );
+        let restored = staged_from_metadata("k", meta.size, &written).unwrap();
+        assert_eq!(restored, meta);
+    }
+
+    #[test]
+    fn malformed_or_stale_metadata_never_adopts_provenance() {
+        let meta = proven_scratch_meta();
+        let written = staged_to_metadata(&meta);
+        for (key, value) in [
+            ("pool_provenance", "garbage".to_owned()),
+            ("pool_provenance", " ".repeat(1801)),
+            ("sha256", "f".repeat(64)),
+            ("size", "999".to_owned()),
+        ] {
+            let mut damaged = written.clone();
+            damaged.insert(key.to_owned(), value);
+            let restored = staged_from_metadata("k", meta.size, &damaged).unwrap();
+            assert_eq!(restored.pool_provenance, None, "{key}");
+        }
+        let mut legacy = written;
+        legacy.remove("pool_provenance");
+        assert_eq!(
+            staged_from_metadata("k", meta.size, &legacy)
+                .unwrap()
+                .pool_provenance,
+            None
+        );
+    }
+
+    #[test]
+    fn metadata_writer_omits_stale_proof_instead_of_rebinding_it() {
+        let mut meta = proven_scratch_meta();
+        meta.sha256 = "f".repeat(64);
+        assert!(!staged_to_metadata(&meta).contains_key("pool_provenance"));
+        let mut meta = proven_scratch_meta();
+        meta.size += 1;
+        assert!(!staged_to_metadata(&meta).contains_key("pool_provenance"));
+    }
+
     #[test]
     fn staged_metadata_write_read_round_trips_the_refusal_count() {
         // The `put` side must write the count `staged_from_metadata`
@@ -3322,6 +3425,7 @@ mod tests {
         // test green (they clone the full `StagedFile`), so this map
         // assertion plus the round trip is the pin.
         let meta = StagedFile {
+            pool_provenance: None,
             key: "k".into(),
             size: 512,
             sha256: "abc123".into(),

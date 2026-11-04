@@ -184,6 +184,10 @@ pub struct StagedFile {
     pub crc32: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub missing: bool,
+    /// Complete content-bound BODY contributions, absent on legacy, damaged or
+    /// unproven scratch. Stored with the bytes, never inferred from job hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -213,6 +217,8 @@ pub struct StagedSpoolSegment {
     pub missing: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub size_refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
 }
 
 /// Resume cursor for one spooled file's streaming block judgement:
@@ -414,7 +420,12 @@ pub enum VerifyOutcome {
 /// repair-dispatched (see `finalize`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleFetch {
+    /// Unattributed fixtures/legacy sources never establish pool provenance.
     Present(Vec<u8>),
+    Served {
+        provider_id: String,
+        bytes: Vec<u8>,
+    },
     Missing,
     TooLarge,
 }
@@ -491,7 +502,11 @@ enum LoadedFile {
     /// present spool objects that disappeared between cursor
     /// validation and this read-back (their ranges read as zeros): the
     /// judgement must not let a decode-time proof vouch for them.
-    Assembled { bytes: Vec<u8>, vanished: u32 },
+    Assembled {
+        bytes: Vec<u8>,
+        vanished: u32,
+        pool_provenance: Option<crate::pool_provenance::PoolProvenance>,
+    },
     /// Too large to hold in memory: judged by streaming the spool.
     Spooled { logical_len: u64 },
 }
@@ -697,6 +712,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                             // rebuilt cursor never adopts one: any
                             // object found here held real bytes.
                             size_refused: false,
+                            pool_provenance: meta.pool_provenance,
                         }),
                         None => break,
                     }
@@ -825,7 +841,11 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
         // the delivery deadline: stop the step with the spool durable
         // and judge again next delivery.
         let staged = match load {
-            LoadedFile::Assembled { bytes, vanished } => {
+            LoadedFile::Assembled {
+                bytes,
+                vanished,
+                pool_provenance,
+            } => {
                 let (missing_blocks, par2_set_id) = if file.is_par2 {
                     // A vanished range zero-fills into the staged par2
                     // bytes; `load_sets` then simply cannot use those
@@ -838,6 +858,11 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                 let staged = StagedFile {
                     size: bytes.len() as u64,
                     sha256: content_sha256_hex(&bytes),
+                    pool_provenance: if missing_blocks == 0 && vanished == 0 {
+                        pool_provenance
+                    } else {
+                        None
+                    },
                     key: key.clone(),
                     missing_blocks,
                     // The spool cursor is dropped once assembled, so the
@@ -898,6 +923,7 @@ pub async fn run_verifying_step<B: BodySource, S: ScratchStore>(
                         let key = VerifyProgress::spool_meta_key(job_id, round, idx);
                         let staged = StagedFile {
                             size: logical_len,
+                            pool_provenance: None,
                             sha256,
                             key: key.clone(),
                             missing_blocks,
@@ -982,6 +1008,7 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
         crc32: 0,
         missing: true,
         size_refused: false,
+        pool_provenance: None,
     };
     // A size refusal is judged absent exactly like a `430`, but flagged
     // so triage can tell "provider lost it" from "over cap" — and so a
@@ -1001,8 +1028,14 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
             ..missing_rec.clone()
         }
     };
-    let article = match source.fetch_body(segment_id).await? {
-        ArticleFetch::Present(article) => article,
+    let (article, provider_id) = match source.fetch_body(segment_id).await? {
+        ArticleFetch::Present(article) => (article, None),
+        ArticleFetch::Served { provider_id, bytes } => {
+            if !nntune_core::pool_operation::valid_provider_id(&provider_id) {
+                return Err(VerifyError::Permanent("invalid serving account".into()));
+            }
+            (bytes, Some(provider_id))
+        }
         ArticleFetch::Missing => return Ok(missing_rec),
         // The source refused the article for size (pool `413` / client
         // read limit): same absent judgement as below the in-Worker cap,
@@ -1016,7 +1049,11 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
     let Some(bytes) = decode_segment(segment_id, &article) else {
         return Ok(missing_rec);
     };
+    let pool_provenance = provider_id
+        .as_deref()
+        .and_then(|id| crate::pool_provenance::PoolProvenance::from_body(id, &bytes));
     let rec = StagedSpoolSegment {
+        pool_provenance: pool_provenance.clone(),
         key: key.clone(),
         size: bytes.len() as u64,
         crc32: crc32fast::hash(&bytes),
@@ -1024,6 +1061,7 @@ async fn spool_one<B: BodySource, S: ScratchStore>(
         size_refused: false,
     };
     let meta = StagedFile {
+        pool_provenance,
         size: rec.size,
         sha256: content_sha256_hex(&bytes),
         key: key.clone(),
@@ -1132,20 +1170,30 @@ async fn load_segments<S: ScratchStore>(
         if total > caps.max_file_bytes || usize::try_from(total).is_err() {
             return Ok(Some(LoadedFile::Spooled { logical_len: total }));
         }
+        let mut proof = crate::pool_provenance::AssemblyProvenance::default();
         let mut out = Vec::with_capacity(total as usize);
         let mut vanished = 0u32;
         for seg in segs {
             match scratch.get(&seg.key).await? {
-                Some(bytes) => out.extend_from_slice(&bytes),
+                Some(bytes) => {
+                    proof.push(seg.pool_provenance.as_ref(), &bytes);
+                    out.extend_from_slice(&bytes);
+                }
                 None => {
                     vanished += 1;
                     out.resize(out.len() + seg.size as usize, 0);
                 }
             }
         }
+        let pool_provenance = if vanished == 0 {
+            proof.finish(&out)
+        } else {
+            None
+        };
         return Ok(Some(LoadedFile::Assembled {
             bytes: out,
             vanished,
+            pool_provenance,
         }));
     }
     let Some(part_size) = uniform_part_size(segs, total_segments) else {
@@ -1177,6 +1225,7 @@ async fn load_segments<S: ScratchStore>(
         return Ok(Some(LoadedFile::Assembled {
             bytes: out,
             vanished,
+            pool_provenance: None,
         }));
     };
     let Some(geometry) = implied_len(segs, total_segments) else {
@@ -1218,6 +1267,7 @@ async fn load_segments<S: ScratchStore>(
     Ok(Some(LoadedFile::Assembled {
         bytes: out,
         vanished,
+        pool_provenance: None,
     }))
 }
 
@@ -2227,6 +2277,7 @@ async fn write_manifest<S: ScratchStore>(
         .map_err(|_| VerifyError::Transient("manifest encode failed".into()))?;
     let key = VerifyProgress::manifest_key(job_id, round);
     let meta = StagedFile {
+        pool_provenance: None,
         size: json.len() as u64,
         sha256: content_sha256_hex(json.as_bytes()),
         key: key.clone(),
@@ -2246,6 +2297,7 @@ mod tests {
 
     fn srec(size: u64) -> StagedSpoolSegment {
         StagedSpoolSegment {
+            pool_provenance: None,
             key: "k".into(),
             size,
             crc32: 0,
@@ -2326,6 +2378,7 @@ mod tests {
 
     fn staged(sha: &str, missing_blocks: u32, par2_set_id: Option<String>) -> StagedFile {
         StagedFile {
+            pool_provenance: None,
             key: "k".into(),
             size: 1,
             sha256: sha.into(),
@@ -2629,6 +2682,7 @@ mod tests {
 
     fn krec(key: &str, size: u64) -> StagedSpoolSegment {
         StagedSpoolSegment {
+            pool_provenance: None,
             key: key.into(),
             size,
             crc32: 0,
@@ -2671,7 +2725,9 @@ mod tests {
             .expect("load")
             .expect("some");
         match loaded {
-            LoadedFile::Assembled { bytes, vanished } => {
+            LoadedFile::Assembled {
+                bytes, vanished, ..
+            } => {
                 assert_eq!(bytes.len(), 12);
                 assert_eq!(&bytes[..4], &[7u8; 4]);
                 assert_eq!(&bytes[4..], &[0u8; 8]);
@@ -2778,6 +2834,7 @@ mod tests {
         progress.spool.insert(
             1,
             vec![StagedSpoolSegment {
+                pool_provenance: None,
                 key: "k/0".into(),
                 size: 12,
                 crc32: 9,

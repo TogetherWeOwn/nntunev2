@@ -49,6 +49,7 @@ pub mod pool_attribution;
 pub mod pool_body;
 pub mod pool_deadline;
 pub mod pool_probe;
+pub mod pool_provenance;
 pub mod probe;
 pub mod queue;
 pub mod queue_consumer;

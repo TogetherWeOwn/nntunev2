@@ -134,6 +134,7 @@ struct MemoryScratch {
 impl MemoryScratch {
     fn put_obj(&self, key: &str, bytes: Vec<u8>) {
         let meta = StagedFile {
+            pool_provenance: None,
             key: key.to_string(),
             size: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
@@ -190,6 +191,7 @@ fn parsed(name: &str, is_par2: bool, segments: usize) -> ParsedFile {
 fn stage_par2(scratch: &MemoryScratch, progress: &mut VerifyProgress, set_bytes: &[u8]) {
     let key = VerifyProgress::file_key(JOB, 0, 0, PAR2_NAME);
     let staged = StagedFile {
+        pool_provenance: None,
         key: key.clone(),
         size: set_bytes.len() as u64,
         sha256: sha256_hex(set_bytes),
@@ -221,6 +223,7 @@ fn prespool(
         let key = VerifyProgress::spool_key(JOB, 0, 1, n);
         scratch.put_obj(&key, body.clone());
         recs.push(StagedSpoolSegment {
+            pool_provenance: None,
             key,
             size: *size,
             crc32: crc32fast::hash(body),

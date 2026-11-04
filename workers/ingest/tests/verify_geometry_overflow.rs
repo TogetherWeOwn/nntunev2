@@ -51,6 +51,7 @@ const ALIGNED_MAX: u64 = u64::MAX - 3;
 
 fn srec(size: u64) -> StagedSpoolSegment {
     StagedSpoolSegment {
+        pool_provenance: None,
         key: "k".into(),
         size,
         crc32: 0,
@@ -98,6 +99,7 @@ struct MemoryScratch {
 impl MemoryScratch {
     fn insert_synthetic(&self, key: &str, bytes: Vec<u8>) {
         let meta = StagedFile {
+            pool_provenance: None,
             key: key.to_string(),
             size: bytes.len() as u64,
             sha256: format!("synthetic-{key}"),

@@ -220,8 +220,31 @@ attribution**: retries may span accounts, and scratch adoption or non-atomic
 scratch/checkpoint recovery can omit observations. New checkpoints ignore the
 legacy queue `provider_id`, and the live consumer clears old hints. The first
 account, sole observed account or requested account must never be copied into a
-whole-job grant. Per-artifact contribution persistence and grant publication
-remain unfinished; no grant writer is enabled by this increment.
+whole-job grant.
+
+`pool_provenance` separately binds complete BODY contributions to decoded bytes
+by SHA-256 and size. Each successful, decoded segment stores the actual serving
+account with its bytes in the same scratch object write. A lost progress write
+can recover that record from object metadata; no successful STAT observation or
+queue hint creates one. Assembly checks each present segment's proof against the
+bytes actually read, then records the full contributor set against the assembled
+file's hash and size. An unknown/legacy segment, changed byte, missing range or
+contributor overflow yields **no complete proof**, never a truncated claim.
+
+The contributor ceiling is 32, keeping the complete serialized record and the
+existing judgement metadata within R2's 2 KiB custom-metadata budget. JSON
+checkpoints default absent records to unknown. Invalid/mismatched metadata is
+never promoted to provenance. Spooled staged outputs conservatively have no
+complete proof; repaired outputs do not inherit their input proofs. Valid
+single-object audio proofs follow their exact source identity into transcode
+inputs. These records rely on trusted pipeline scratch/checkpoint writers: the
+hash detects stale content, not forged attribution.
+
+This is input provenance evidence, **not a grant or entitlement proof**. Even a
+single contributor does not authorize service. Artifact-output mapping, multi-
+account grant publication, repair contribution propagation and the independent
+publication security gate remain unfinished; no grant writer is enabled by this
+increment.
 
 **No operation RPC or product dial is enabled.** The composed operation and ingest
 forwarding handlers share the hard false compile-time qualification gate, not an
