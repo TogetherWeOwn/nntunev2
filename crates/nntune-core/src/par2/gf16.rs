@@ -150,11 +150,20 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a + b
 }
 
+/// Number of full-order bases in GF(2^16): φ(65535) = 32 768. No larger
+/// [`input_bases`] count can succeed, so larger counts are rejected before
+/// any allocation.
+pub const MAX_INPUT_BASES: usize = 32_768;
+
 /// Vandermonde bases for `count` input slices: the first `count` full-order
 /// powers of the primitive element, i.e. `antilog[logbase]` skipping every
 /// `logbase` with `gcd(65535, logbase) != 1`. Fails closed past the group
-/// order (the scheme has no more full-order bases beyond it).
+/// order (the scheme has no more full-order bases beyond it), and rejects
+/// counts past [`MAX_INPUT_BASES`] before allocating.
 pub fn input_bases(count: usize) -> Option<Vec<u16>> {
+    if count > MAX_INPUT_BASES {
+        return None;
+    }
     let alog = alog_table();
     let mut bases = Vec::with_capacity(count);
     let mut logbase: u32 = 0;
@@ -203,9 +212,9 @@ pub fn nibble_tables(factor: u16) -> NibbleMul {
 }
 
 /// Scalar multiply-accumulate: `dst[i] ^= mul(src[i], factor)` via `t`.
-/// Lengths must match; empty slices are a no-op.
+/// Panics on length mismatch; empty slices are a no-op.
 pub fn madd_scalar(dst: &mut [u16], src: &[u16], t: &NibbleMul) {
-    debug_assert_eq!(dst.len(), src.len());
+    assert_eq!(dst.len(), src.len());
     for (d, &w) in dst.iter_mut().zip(src.iter()) {
         let n0 = (w & 0xF) as usize;
         let n1 = ((w >> 4) & 0xF) as usize;
@@ -242,8 +251,12 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
     // Regroups alternating nibble lanes into [first-8 | second-8].
     static REGROUP: [u8; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
     // Keeps the low / high 8 lanes of a lookup result.
-    static KEEP_LO: [u8; 16] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
-    static KEEP_HI: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    static KEEP_LO: [u8; 16] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    static KEEP_HI: [u8; 16] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
     // Folds [A0..A7, B0..B7] to (A^B) in the low 8 lanes.
     static FOLD_HI_DOWN: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7];
     // Spreads 8 lane values to even (or, masked, odd) byte lanes.
@@ -255,29 +268,29 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
         0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF,
     ];
 
-    let regroup = v128_load(REGROUP.as_ptr());
-    let keep_lo = v128_load(KEEP_LO.as_ptr());
-    let keep_hi = v128_load(KEEP_HI.as_ptr());
-    let fold_hi_down = v128_load(FOLD_HI_DOWN.as_ptr());
-    let spread = v128_load(SPREAD.as_ptr());
-    let keep_even = v128_load(KEEP_EVEN.as_ptr());
-    let keep_odd = v128_load(KEEP_ODD.as_ptr());
+    let regroup = v128_load(REGROUP.as_ptr() as *const v128);
+    let keep_lo = v128_load(KEEP_LO.as_ptr() as *const v128);
+    let keep_hi = v128_load(KEEP_HI.as_ptr() as *const v128);
+    let fold_hi_down = v128_load(FOLD_HI_DOWN.as_ptr() as *const v128);
+    let spread = v128_load(SPREAD.as_ptr() as *const v128);
+    let keep_even = v128_load(KEEP_EVEN.as_ptr() as *const v128);
+    let keep_odd = v128_load(KEEP_ODD.as_ptr() as *const v128);
     let nibble_mask = i8x16_splat(0x0F);
 
-    let t0lo = v128_load(t.lo[0].as_ptr());
-    let t1lo = v128_load(t.lo[1].as_ptr());
-    let t2lo = v128_load(t.lo[2].as_ptr());
-    let t3lo = v128_load(t.lo[3].as_ptr());
-    let t0hi = v128_load(t.hi[0].as_ptr());
-    let t1hi = v128_load(t.hi[1].as_ptr());
-    let t2hi = v128_load(t.hi[2].as_ptr());
-    let t3hi = v128_load(t.hi[3].as_ptr());
+    let t0lo = v128_load(t.lo[0].as_ptr() as *const v128);
+    let t1lo = v128_load(t.lo[1].as_ptr() as *const v128);
+    let t2lo = v128_load(t.lo[2].as_ptr() as *const v128);
+    let t3lo = v128_load(t.lo[3].as_ptr() as *const v128);
+    let t0hi = v128_load(t.hi[0].as_ptr() as *const v128);
+    let t1hi = v128_load(t.hi[1].as_ptr() as *const v128);
+    let t2hi = v128_load(t.hi[2].as_ptr() as *const v128);
+    let t3hi = v128_load(t.hi[3].as_ptr() as *const v128);
 
     let chunks = words / 8;
     for c in 0..chunks {
         // SAFETY: `c` addresses a whole 8-word chunk inside the caller's
         // range; loads/stores are unaligned-safe.
-        let s = v128_load((src as *const u8).add(c * 16));
+        let s = v128_load((src as *const u8).add(c * 16) as *const v128);
         let lo_idx = v128_and(s, nibble_mask);
         let shifted = u16x8_shr(s, 4);
         let hi_idx = v128_and(shifted, nibble_mask);
@@ -320,8 +333,8 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
             v128_and(i8x16_swizzle(hi_folded, spread), keep_odd),
         );
 
-        let d = v128_load((dst as *const u8).add(c * 16));
-        v128_store((dst as *mut u8).add(c * 16), v128_xor(d, emit));
+        let d = v128_load((dst as *const u8).add(c * 16) as *const v128);
+        v128_store((dst as *mut u8).add(c * 16) as *mut v128, v128_xor(d, emit));
     }
 }
 
@@ -329,7 +342,10 @@ pub unsafe fn madd_simd128(dst: *mut u16, src: *const u16, words: usize, t: &Nib
 /// Dispatches to the simd128 kernel where available, otherwise the scalar
 /// nibble loop. A zero factor is a no-op (matches the reference early-out).
 pub fn madd(dst: &mut [u16], src: &[u16], factor: u16) {
-    debug_assert_eq!(dst.len(), src.len());
+    // Unconditional: this safe fn guards unsafe backend reads sized by
+    // `dst.len()`, so a shorter `src` must panic here, never read OOB in a
+    // release simd128 build.
+    assert_eq!(dst.len(), src.len());
     if factor == 0 || dst.is_empty() {
         return;
     }
