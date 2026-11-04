@@ -163,9 +163,19 @@ claim a complete file or retry bytes into the same response.
 
 ## Async reader and off-route response adapter
 
-`original_source::reader::AsyncRangeReader` shares the synchronous reader's
-bounded decode, final-first proof, aggregate budget and contiguous prefix
-transitions. `AsyncArticleSource` supplies one bounded encoded article by trusted
+`original_source::reader::RangeReader::new/next_reference/push` is the shared
+incremental reader for synchronous and asynchronous consumers. `read_range`
+uses that same state machine; `AsyncRangeReader` only adapts asynchronous article
+fetches, cancellation and bounded output scheduling. There is one bounded decode,
+final-first proof, aggregate budget and contiguous prefix implementation.
+
+A successful `push` can emit both the current and retained final article slices.
+The async wrapper queues at most two article-sized slices and releases one per
+pull, with no new dispatch while buffered output remains. Cancellation is checked
+again before buffered output, including the retained final slice. A failed push
+poisons the incremental reader; fetch failure or a dropped pending await also
+permanently stops the async wrapper. Neither permits retry after uncertainty.
+`AsyncArticleSource` supplies one bounded encoded article by trusted
 source index; it owns wire collection limits, its operation timer and account
 physical-close/capacity obligations. `AsyncReadControl` combines boundary checks
 with a wakeable cancellation/deadline signal, so a pending fetch can be dropped.
