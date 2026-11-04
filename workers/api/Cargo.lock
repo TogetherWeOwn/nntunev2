@@ -975,6 +975,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "md5",
  "nntune-core",
  "nntune-logging",
  "nntune-ssrf-guard",

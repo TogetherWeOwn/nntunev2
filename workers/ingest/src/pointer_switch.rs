@@ -176,22 +176,13 @@ impl TargetCatalogue {
 /// hold before the real catalogue may switch: the admin flag (an operator
 /// sets [`REAL_CATALOGUE_SWITCH_ENV`] after the drill) AND the drill
 /// evidence itself. Default denies everything real.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PointerSwitchGate {
     /// Operator-set allow flag (from [`REAL_CATALOGUE_SWITCH_ENV`]).
     pub allow_real_catalogue_switch: bool,
     /// Whether the O7 staging-leg card ([`O7_GATE_CARD`]: keyring/KEK
     /// backup + proven restore drill) completed with evidence on its card.
     pub o7_drill_complete: bool,
-}
-
-impl Default for PointerSwitchGate {
-    fn default() -> Self {
-        Self {
-            allow_real_catalogue_switch: false,
-            o7_drill_complete: false,
-        }
-    }
 }
 
 impl PointerSwitchGate {
