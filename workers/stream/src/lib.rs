@@ -55,6 +55,8 @@ pub mod account_route;
 pub mod account_selection;
 pub mod account_storage;
 pub mod account_supervisor;
+#[cfg(any(target_arch = "wasm32", test))]
+mod account_transport;
 pub mod api_error;
 pub mod body;
 pub mod cache;

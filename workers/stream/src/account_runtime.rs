@@ -12,10 +12,8 @@ use futures_util::StreamExt;
 use nntune_core::pool_channel::{
     self, CANDIDATE_PATH, MAX_OPERATION_BYTES, MAX_REQUEST_BYTES, OPERATION_PATH,
 };
-use worker::wasm_bindgen::JsValue;
 use worker::{
-    durable_object, Delay, DurableObject, Env, Headers, Method, Request, RequestInit,
-    RequestRedirect, Response, Result, State,
+    durable_object, Delay, DurableObject, Env, Headers, Method, Request, Response, Result, State,
 };
 
 use zeroize::Zeroizing;
@@ -26,15 +24,14 @@ use nntune_core::transports::worker_pinned_tls::{WorkerPinnedTlsTransport, Worke
 use crate::account_dispatch::{self, OperationReply};
 use crate::account_operation::{
     AccountConnector, CleanupScheduler, DialSource, OperationError, OperationUnavailable,
-    MAX_DIAL_BYTES,
 };
 use crate::account_pool::with_session_deadline;
 use crate::account_route::{
-    self, CandidateCall, CandidateReply, ChannelKeys, RegistryError, RegistrySource,
-    MAX_REGISTRY_BYTES, REGISTRY_BODY,
+    self, CandidateCall, CandidateReply, ChannelKeys, RegistryError, RegistrySource, REGISTRY_BODY,
 };
 use crate::account_selection::AccountSource;
 use crate::account_storage::{worker_account_owner, WorkerAccountOwner};
+use crate::account_transport::{self, worker::Binding, Kind};
 
 // Not an env toggle. Change only after actual authorized Worker transport,
 // clock/entropy, alarm/physical-close and curated-track staging qualification.
@@ -264,12 +261,7 @@ struct WorkerRegistry<'a>(&'a Env);
 impl RegistrySource for WorkerRegistry<'_> {
     async fn fetch(&self, authorization: &str) -> std::result::Result<Vec<u8>, RegistryError> {
         with_session_deadline(
-            self.read(
-                authorization,
-                pool_channel::REGISTRY_PATH,
-                REGISTRY_BODY,
-                MAX_REGISTRY_BYTES,
-            ),
+            self.read(authorization, Kind::Registry, REGISTRY_BODY),
             Delay::from(Duration::from_secs(3)),
         )
         .await
@@ -285,12 +277,7 @@ impl DialSource for WorkerRegistry<'_> {
         body: &[u8],
     ) -> std::result::Result<Zeroizing<Vec<u8>>, OperationUnavailable> {
         with_session_deadline(
-            self.read(
-                authorization,
-                pool_channel::RESOLVE_PATH,
-                body,
-                MAX_DIAL_BYTES,
-            ),
+            self.read(authorization, Kind::Resolve, body),
             Delay::from(Duration::from_secs(3)),
         )
         .await
@@ -303,48 +290,20 @@ impl WorkerRegistry<'_> {
     async fn read(
         &self,
         authorization: &str,
-        path: &str,
+        kind: Kind,
         body: &[u8],
-        max_bytes: usize,
     ) -> std::result::Result<Zeroizing<Vec<u8>>, RegistryError> {
-        let api = self.0.service("API").map_err(|_| RegistryError)?;
-        let headers = Headers::new();
-        headers
-            .set("authorization", authorization)
-            .map_err(|_| RegistryError)?;
-        headers
-            .set("content-type", "application/json")
-            .map_err(|_| RegistryError)?;
-        headers
-            .set("cache-control", "no-store")
-            .map_err(|_| RegistryError)?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_redirect(RequestRedirect::Error)
-            .with_body(Some(JsValue::from_str(
-                std::str::from_utf8(body).map_err(|_| RegistryError)?,
-            )));
-        // This URL is routed only by the service binding, never public fetch.
-        let url = format!("https://nntune-api{path}");
-        let request = Request::new_with_init(&url, &init).map_err(|_| RegistryError)?;
-        let mut response = api
-            .fetch_request(request)
-            .await
-            .map_err(|_| RegistryError)?;
-        if response.status_code() != 200 {
+        let response = account_transport::exchange(
+            &Binding::Api { env: self.0, kind },
+            kind,
+            authorization,
+            body,
+        )
+        .await?;
+        if response.head.status != 200 {
             return Err(RegistryError);
         }
-        let mut stream = response.stream().map_err(|_| RegistryError)?;
-        let mut raw = Zeroizing::new(Vec::new());
-        while let Some(chunk) = stream.next().await {
-            let chunk = Zeroizing::new(chunk.map_err(|_| RegistryError)?);
-            if raw.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(RegistryError);
-            }
-            raw.extend_from_slice(&chunk);
-        }
-        Ok(raw)
+        Ok(response.bytes)
     }
 }
 
@@ -359,30 +318,30 @@ impl AccountSource for WorkerAccounts<'_> {
         authorization: &str,
         body: &[u8],
     ) -> std::result::Result<Vec<u8>, RegistryError> {
-        let reply = with_session_deadline(
-            self.call(account_id, CANDIDATE_PATH, authorization, body),
+        let mut reply = with_session_deadline(
+            self.call(account_id, Kind::Candidate, authorization, body),
             Delay::from(Duration::from_secs(4)),
         )
         .await
         .map_err(|_| RegistryError)??;
-        if reply.0 != 200 || reply.1 != "application/json" {
+        if reply.head.status != 200 {
             return Err(RegistryError);
         }
-        Ok(reply.3)
+        Ok(std::mem::take(&mut *reply.bytes))
     }
 
     async fn execute(&self, account_id: &str, authorization: &str, body: &[u8]) -> OperationReply {
         match with_session_deadline(
-            self.call(account_id, OPERATION_PATH, authorization, body),
+            self.call(account_id, Kind::Operation, authorization, body),
             Delay::from(Duration::from_secs(20)),
         )
         .await
         {
-            Ok(Ok((status, content_type, provider_id, body))) => account_dispatch::decode_response(
-                status,
-                &content_type,
-                provider_id.as_deref(),
-                body,
+            Ok(Ok(mut response)) => account_dispatch::decode_response(
+                response.head.status,
+                &response.head.content_type,
+                response.head.provider_id.as_deref(),
+                std::mem::take(&mut *response.bytes),
             ),
             Ok(Err(_)) => OperationReply::Failed(OperationError::Unavailable),
             Err(_) => OperationReply::Failed(OperationError::Deadline),
@@ -394,79 +353,21 @@ impl WorkerAccounts<'_> {
     async fn call(
         &self,
         account_id: &str,
-        path: &str,
+        kind: Kind,
         authorization: &str,
         body: &[u8],
-    ) -> std::result::Result<(u16, String, Option<String>, Vec<u8>), RegistryError> {
-        if !crate::account_pool::uuid_shaped(account_id)
-            || !matches!(path, CANDIDATE_PATH | OPERATION_PATH)
-            || body.len()
-                > if path == CANDIDATE_PATH {
-                    MAX_REQUEST_BYTES
-                } else {
-                    MAX_OPERATION_BYTES
-                }
-        {
-            return Err(RegistryError);
-        }
-        let stub = self
-            .0
-            .durable_object("NNTP_ACCOUNT")
-            .and_then(|ns| ns.id_from_name(account_id)?.get_stub())
-            .map_err(|_| RegistryError)?;
-        let headers = Headers::new();
-        headers
-            .set("authorization", authorization)
-            .map_err(|_| RegistryError)?;
-        headers
-            .set("content-type", "application/json")
-            .map_err(|_| RegistryError)?;
-        headers
-            .set("cache-control", "no-store")
-            .map_err(|_| RegistryError)?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_redirect(RequestRedirect::Error)
-            .with_body(Some(JsValue::from_str(
-                std::str::from_utf8(body).map_err(|_| RegistryError)?,
-            )));
-        // Naming and fetch go ONLY through the dedicated DO namespace.
-        let request = Request::new_with_init(&format!("https://nntune-account{path}"), &init)
-            .map_err(|_| RegistryError)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(|_| RegistryError)?;
-        let status = response.status_code();
-        if status != 200 {
-            return Ok((status, String::new(), None, Vec::new()));
-        }
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .map_err(|_| RegistryError)?
-            .ok_or(RegistryError)?;
-        let provider_id = response
-            .headers()
-            .get(account_dispatch::PROVIDER_HEADER)
-            .map_err(|_| RegistryError)?;
-        let max_bytes = match (path, content_type.as_str()) {
-            (CANDIDATE_PATH, "application/json") => MAX_REQUEST_BYTES,
-            (OPERATION_PATH, "application/json") => MAX_OPERATION_BYTES,
-            (OPERATION_PATH, "application/octet-stream") => crate::body::MAX_BODY_ARTICLE_BYTES,
-            _ => return Err(RegistryError),
-        };
-        let mut stream = response.stream().map_err(|_| RegistryError)?;
-        let mut raw = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| RegistryError)?;
-            if raw.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(RegistryError);
-            }
-            raw.extend_from_slice(&chunk);
-        }
-        Ok((status, content_type, provider_id, raw))
+    ) -> std::result::Result<account_transport::Response, RegistryError> {
+        account_transport::exchange(
+            &Binding::Account {
+                env: self.0,
+                account_id,
+                kind,
+            },
+            kind,
+            authorization,
+            body,
+        )
+        .await
     }
 }
 
