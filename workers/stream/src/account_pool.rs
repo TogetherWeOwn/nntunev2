@@ -2,10 +2,10 @@
 //! these per account, never per user. Registry snapshots are authoritative;
 //! selection hints are not leases and admission is always checked again here.
 //!
-//! Session expiry cancels the operation (and closes its socket) before its
-//! guard frees a slot. A TTL must never just forget a lease while its physical
-//! connection is still live. Quarantine is persisted by the runtime against
-//! `secret_ref`, so eviction cannot turn a bad login into a retry loop.
+//! The runtime must force-close and confirm the physical socket before a
+//! session's guard frees a slot. A TTL or dropped future is not closure
+//! evidence. Quarantine must be persisted by the runtime against `secret_ref`,
+//! so eviction cannot turn a bad login into a retry loop.
 
 use std::cell::RefCell;
 use std::future::{poll_fn, Future};
@@ -177,8 +177,11 @@ pub fn ranked_candidates(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionExpired;
 
-/// The deadline owns cancellation, not just a bookkeeping TTL. Dropping the
-/// losing operation here drops its client and lease before returning expiry.
+/// Race an operation against its deadline, dropping the losing future. This
+/// does NOT prove physical socket closure. A Worker supervisor must retain
+/// close authority AND the account lease outside this future, force-close on
+/// every exit and await confirmed closure before releasing capacity. Never
+/// place a Worker account lease inside `operation` and rely on its Drop alone.
 /// Runtime supplies Worker Delay; native tests use a short Tokio timer.
 pub async fn with_session_deadline<F, D>(
     operation: F,

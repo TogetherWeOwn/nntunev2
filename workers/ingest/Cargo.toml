@@ -5,6 +5,10 @@ edition = "2021"
 description = "NNTune v2 ingest pipeline worker (Cloudflare Worker, Rust workers-rs): BYO indexer search, NZB upload, verify, MB match"
 license = "MIT"
 
+# Preserve standalone discovery even inside a nested Git worktree.
+[workspace]
+resolver = "2"
+
 [lib]
 # cdylib for the worker; rlib so tests/ integration targets can link the crate.
 crate-type = ["cdylib", "rlib"]
