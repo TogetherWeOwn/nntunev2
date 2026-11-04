@@ -54,6 +54,7 @@ class PublicPrSecurityTests(unittest.TestCase):
         self.assertEqual(job_level_field(caller, "if"), GUARD)
         self.assertEqual(job_level_field(caller, "uses"),
                          "TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@" + PIN)
+        self.assertRegex(caller, rf"(?m)^    uses: .+@{PIN} # v0\.5\.0$")
         # An exact key set prevents inherited secrets, inputs, skip/soft-fail
         # overrides or a second caller configuration from hiding in this job.
         self.assertEqual(re.findall(r"^    ([\w-]+):", caller, re.MULTILINE),
