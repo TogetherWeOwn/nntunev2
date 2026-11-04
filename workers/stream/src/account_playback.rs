@@ -4,6 +4,8 @@
 //! caller still owns segment verification, decryption, range slicing and actual
 //! client-written metering. No cache write, prefetch or per-user pool is involved.
 
+pub mod control;
+
 use std::{future::Future, io::Cursor, ops::Range};
 
 use nntune_core::original_source::{

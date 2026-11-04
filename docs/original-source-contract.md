@@ -186,6 +186,34 @@ route, output backpressure adapter, writer execution or metering call site.
 It does not decrypt posted files or claim cryptographic original-media
 authentication. Runtime qualification gates remain disabled and mandatory.
 
+## Shared request authority preparation (off-route)
+
+`account_playback::control::RequestControl` is a local authority primitive for
+future catalogue/account-supplier and response composition. It verifies a
+canonical track-bound v2 play grant before constructing its timer. One timer
+covers the earlier of the request deadline and grant expiry, with exact
+remaining milliseconds. The injected timer and abort futures must wake the
+current task; native tests do not qualify platform timer or request-abort APIs.
+
+Clones share terminal state and a monotonic clock watermark. Clock rollback,
+expiry, explicit stop, a failed enclosed call or dropping a polled pending call
+permanently revoke every clone. Abort/deadline signals and explicit stop wake
+live handles; dropping a sibling cannot strand the remaining signal waiter.
+The last handle owns signal cleanup. `run` checks cancellation before and after
+polling work, so control wins a simultaneous success. An unpolled call does no
+I/O and does not revoke authority. `check` is a synchronous boundary check;
+`poll_cancel` supplies the wakeable seam. `now_unix` returns the last checked
+clock observation and must only be used after checking authority.
+
+This preparation implements the existing `ReadControl` only. Its inherent
+`poll_cancel` and `now_unix` methods are intended for thin forwarding after the
+separately reviewed async source/control library lands; no draft traits or
+competing reader/response implementation are copied here. No account supplier,
+source lookup, HTTP driver or runtime caller is installed by this primitive.
+A future supplier must still bind source index/reference to its validated
+catalogue and enforce its own at-most-20-second operation timer. Local revocation
+never proves physical account closure, releases capacity or records delivery.
+
 ## Internal catalogue transport (off-route)
 
 `SourceCatalogue` verifies the v2 play grant and signs a canonical-track lookup
