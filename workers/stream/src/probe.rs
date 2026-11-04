@@ -304,13 +304,13 @@ where
             }
             // Closed while idle: drop it and redial once below.
             Err(nntune_core::Error::Io(_)) => {}
-            Err(_) => return Err(provider_failed(pool, &tick, lease)),
+            Err(error) => return Err(provider_failed_with_error(pool, &tick, lease, &error)),
         }
     }
 
     let mut client = match dial().await {
         Ok(client) => client,
-        Err(_) => return Err(provider_failed(pool, &tick, lease)),
+        Err(error) => return Err(provider_failed_with_error(pool, &tick, lease, &error)),
     };
     pool.borrow_mut().record_connect();
     let pool_ref = pool;
@@ -330,7 +330,7 @@ where
             pool.release(lease, Some(client));
             Ok(outcome(req, found))
         }
-        Err(_) => Err(provider_failed(pool, &tick, lease)),
+        Err(error) => Err(provider_failed_with_error(pool, &tick, lease, &error)),
     }
 }
 
@@ -352,7 +352,20 @@ pub(crate) fn provider_failed<T: Transport>(
 ) -> ProbeError {
     let mut pool = pool.borrow_mut();
     tick(&mut pool);
-    pool.record_provider_error_for(lease.id);
+    pool.record_lease_provider_error(&lease);
+    pool.release(lease, None);
+    ProbeError::Provider
+}
+
+pub(crate) fn provider_failed_with_error<T: Transport>(
+    pool: &RefCell<Pool<NntpClient<T>>>,
+    tick: &impl Fn(&mut Pool<NntpClient<T>>),
+    lease: crate::pool::Lease,
+    error: &nntune_core::Error,
+) -> ProbeError {
+    let mut pool = pool.borrow_mut();
+    tick(&mut pool);
+    pool.record_dial_failure_for(&lease, error);
     pool.release(lease, None);
     ProbeError::Provider
 }

@@ -4,7 +4,11 @@
 //! `providers` row: the vault row stays the single-credential source of
 //! truth (`provider_vaults`, legacy envelope v1), while the `providers`
 //! row is the identity-bearing projection the stream pool and the ingest
-//! grant publication join against (`user_cache_grants.provider_id`).
+//! grant publication joined against `user_cache_grants.provider_id`.
+//! Since migration 0035 that column is pool attribution; the legacy
+//! per-user reference lives in
+//! `user_cache_grants.legacy_provider_id`, which the prune/purge guards
+//! below consult).
 //!
 //! Envelope (ADR 0002 rule 1): brand-new v2 field envelope — fresh
 //! per-row 32-byte DEK, fresh 12-byte nonces, canonical
@@ -161,6 +165,32 @@ fn frame(out: &mut Vec<u8>, s: &str) {
 /// the DEK wrap. Built from the row being written/read, never from a
 /// stored unauthenticated claim. Payload AAD intentionally excludes
 /// `kek_version`: an authorized rewrap changes only the wrap columns.
+fn aad_v2_for(
+    table: &str,
+    purpose: &str,
+    owner_scope: &str,
+    row_key: &str,
+    envelope_version: u16,
+    payload_format: u16,
+    kek_version: Option<u32>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + owner_scope.len() + row_key.len());
+    frame(&mut out, AAD_DOMAIN);
+    frame(&mut out, purpose);
+    frame(&mut out, table);
+    frame(&mut out, AAD_FIELD);
+    frame(&mut out, owner_scope);
+    frame(&mut out, row_key);
+    out.extend_from_slice(&envelope_version.to_be_bytes());
+    out.extend_from_slice(&payload_format.to_be_bytes());
+    if let Some(v) = kek_version {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// Legacy `providers` AAD (table pinned to `providers`).
+#[cfg(test)]
 fn aad_v2(
     purpose: &str,
     user_id: &str,
@@ -169,19 +199,15 @@ fn aad_v2(
     payload_format: u16,
     kek_version: Option<u32>,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + user_id.len() + provider_id.len());
-    frame(&mut out, AAD_DOMAIN);
-    frame(&mut out, purpose);
-    frame(&mut out, AAD_TABLE);
-    frame(&mut out, AAD_FIELD);
-    frame(&mut out, user_id);
-    frame(&mut out, provider_id);
-    out.extend_from_slice(&envelope_version.to_be_bytes());
-    out.extend_from_slice(&payload_format.to_be_bytes());
-    if let Some(v) = kek_version {
-        out.extend_from_slice(&v.to_be_bytes());
-    }
-    out
+    aad_v2_for(
+        AAD_TABLE,
+        purpose,
+        user_id,
+        provider_id,
+        envelope_version,
+        payload_format,
+        kek_version,
+    )
 }
 
 /// Encrypt provider credentials into a v2 envelope bound to
@@ -196,13 +222,26 @@ pub fn encrypt_provider_creds(
     provider_id: &str,
     plaintext: &[u8],
 ) -> Result<ProviderCredsEnvelope, VaultError> {
+    encrypt_v2_in_table(AAD_TABLE, kek, kek_version, user_id, provider_id, plaintext)
+}
+
+/// Table-scoped v2 encrypt shared by the legacy `providers` wrapper and
+/// the service pool registry. Same machinery, only the AAD table differs.
+pub(crate) fn encrypt_v2_in_table(
+    table: &str,
+    kek: &[u8; 32],
+    kek_version: u32,
+    owner_scope: &str,
+    row_key: &str,
+    plaintext: &[u8],
+) -> Result<ProviderCredsEnvelope, VaultError> {
     let mut dek_bytes = crate::random::secure_random_bytes::<32>()?;
     let dek = Dek(dek_bytes);
     // `Dek(dek_bytes)` copies the array: clear the source buffer so the
     // DEK lives only in the zeroizing holder (mirrors `vault.rs`).
     dek_bytes.zeroize();
 
-    // Wrap the DEK with the KEK (AAD binds user + row + KEK version).
+    // Wrap the DEK with the KEK (AAD binds owner + row + KEK version).
     let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
     let wrap_nonce = crate::random::secure_random_bytes::<NONCE_LEN>()?;
     let dek_wrapped = kek_cipher
@@ -210,10 +249,11 @@ pub fn encrypt_provider_creds(
             &Nonce::from(wrap_nonce),
             Payload {
                 msg: &dek.0,
-                aad: &aad_v2(
+                aad: &aad_v2_for(
+                    table,
                     "dek",
-                    user_id,
-                    provider_id,
+                    owner_scope,
+                    row_key,
                     CREDS_ENVELOPE_VERSION as u16,
                     CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
                     Some(kek_version),
@@ -222,7 +262,7 @@ pub fn encrypt_provider_creds(
         )
         .map_err(|_| VaultError::Crypto)?;
 
-    // Encrypt the payload with the DEK (AAD binds user + row; no KEK
+    // Encrypt the payload with the DEK (AAD binds owner + row; no KEK
     // version, so an authorized rewrap never touches the payload).
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
     let payload_nonce = crate::random::secure_random_bytes::<NONCE_LEN>()?;
@@ -231,10 +271,11 @@ pub fn encrypt_provider_creds(
             &Nonce::from(payload_nonce),
             Payload {
                 msg: plaintext,
-                aad: &aad_v2(
+                aad: &aad_v2_for(
+                    table,
                     "payload",
-                    user_id,
-                    provider_id,
+                    owner_scope,
+                    row_key,
                     CREDS_ENVELOPE_VERSION as u16,
                     CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
                     None,
@@ -268,10 +309,31 @@ pub fn decrypt_provider_creds(
     kek_version: u32,
     envelope: &ProviderCredsEnvelope,
 ) -> Result<Vec<u8>, VaultError> {
-    let envelope_version =
-        u16::try_from(envelope_version).map_err(|_| VaultError::CorruptStoredData)?;
-    let payload_format =
-        u16::try_from(payload_format).map_err(|_| VaultError::CorruptStoredData)?;
+    decrypt_v2_in_table(
+        AAD_TABLE,
+        kek,
+        user_id,
+        provider_id,
+        envelope_version,
+        payload_format,
+        kek_version,
+        envelope,
+    )
+}
+
+/// Unwrap the DEK under `kek` (AAD binds table, owner, row, stored
+/// versions and the wrap's KEK version).
+#[allow(clippy::too_many_arguments)]
+fn unwrap_dek_in_table(
+    table: &str,
+    kek: &[u8; 32],
+    owner_scope: &str,
+    row_key: &str,
+    envelope_version: u16,
+    payload_format: u16,
+    kek_version: u32,
+    envelope: &ProviderCredsEnvelope,
+) -> Result<Dek, VaultError> {
     if envelope.dek_wrapped.len() != WRAPPED_DEK_LEN {
         return Err(VaultError::CorruptStoredData);
     }
@@ -281,10 +343,11 @@ pub fn decrypt_provider_creds(
             &Nonce::from(envelope.dek_wrapped_nonce),
             Payload {
                 msg: &envelope.dek_wrapped,
-                aad: &aad_v2(
+                aad: &aad_v2_for(
+                    table,
                     "dek",
-                    user_id,
-                    provider_id,
+                    owner_scope,
+                    row_key,
                     envelope_version,
                     payload_format,
                     Some(kek_version),
@@ -298,20 +361,48 @@ pub fn decrypt_provider_creds(
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&dek_bytes);
-    // Clear the AES-GCM output buffer: the DEK now lives only in `dek`.
+    // Clear the AES-GCM output buffer: the DEK now lives only in the holder.
     dek_bytes.zeroize();
-    let dek = Dek(arr);
+    Ok(Dek(arr))
+}
 
+/// Table-scoped, version-pinned v2 decrypt (see [`decrypt_provider_creds`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decrypt_v2_in_table(
+    table: &str,
+    kek: &[u8; 32],
+    owner_scope: &str,
+    row_key: &str,
+    envelope_version: i16,
+    payload_format: i16,
+    kek_version: u32,
+    envelope: &ProviderCredsEnvelope,
+) -> Result<Vec<u8>, VaultError> {
+    let envelope_version =
+        u16::try_from(envelope_version).map_err(|_| VaultError::CorruptStoredData)?;
+    let payload_format =
+        u16::try_from(payload_format).map_err(|_| VaultError::CorruptStoredData)?;
+    let dek = unwrap_dek_in_table(
+        table,
+        kek,
+        owner_scope,
+        row_key,
+        envelope_version,
+        payload_format,
+        kek_version,
+        envelope,
+    )?;
     let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
     dek_cipher
         .decrypt(
             &Nonce::from(envelope.payload_nonce),
             Payload {
                 msg: &envelope.ciphertext,
-                aad: &aad_v2(
+                aad: &aad_v2_for(
+                    table,
                     "payload",
-                    user_id,
-                    provider_id,
+                    owner_scope,
+                    row_key,
                     envelope_version,
                     payload_format,
                     None,
@@ -319,6 +410,62 @@ pub fn decrypt_provider_creds(
             },
         )
         .map_err(|_| VaultError::Crypto)
+}
+
+/// Table-scoped KEK rotation: unwrap the DEK under the old KEK/version,
+/// wrap it under the new KEK/version with a fresh wrap nonce. The
+/// payload ciphertext and payload nonce are copied unchanged (the
+/// payload AAD carries no KEK version), so only the wrap columns change.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rewrap_v2_in_table(
+    table: &str,
+    old_kek: &[u8; 32],
+    old_version: u32,
+    new_kek: &[u8; 32],
+    new_version: u32,
+    owner_scope: &str,
+    row_key: &str,
+    envelope_version: i16,
+    payload_format: i16,
+    envelope: &ProviderCredsEnvelope,
+) -> Result<ProviderCredsEnvelope, VaultError> {
+    let ev = u16::try_from(envelope_version).map_err(|_| VaultError::CorruptStoredData)?;
+    let pf = u16::try_from(payload_format).map_err(|_| VaultError::CorruptStoredData)?;
+    let dek = unwrap_dek_in_table(
+        table,
+        old_kek,
+        owner_scope,
+        row_key,
+        ev,
+        pf,
+        old_version,
+        envelope,
+    )?;
+    let new_cipher = Aes256Gcm::new_from_slice(new_kek).map_err(|_| VaultError::Crypto)?;
+    let new_nonce = crate::random::secure_random_bytes::<NONCE_LEN>()?;
+    let dek_wrapped = new_cipher
+        .encrypt(
+            &Nonce::from(new_nonce),
+            Payload {
+                msg: &dek.0,
+                aad: &aad_v2_for(
+                    table,
+                    "dek",
+                    owner_scope,
+                    row_key,
+                    ev,
+                    pf,
+                    Some(new_version),
+                ),
+            },
+        )
+        .map_err(|_| VaultError::Crypto)?;
+    Ok(ProviderCredsEnvelope {
+        dek_wrapped_nonce: new_nonce,
+        dek_wrapped,
+        payload_nonce: envelope.payload_nonce,
+        ciphertext: envelope.ciphertext.clone(),
+    })
 }
 
 /// `$n` parameter order for [`insert_provider_sql`]. The envelope
@@ -357,7 +504,7 @@ pub fn insert_provider_sql() -> &'static str {
 /// its own. Grant-referenced rows survive (the `RESTRICT` attribution
 /// guarantee); zero pruned rows is success, never a guard failure.
 pub fn prune_superseded_providers_sql() -> &'static str {
-    "DELETE FROM providers WHERE user_id = $1 AND id <> $2::text::uuid AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+    "DELETE FROM providers WHERE user_id = $1 AND id <> $2::text::uuid AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.legacy_provider_id = providers.id)"
 }
 
 /// Vault-delete purge: remove every `providers` row of `$1` that no
@@ -366,7 +513,7 @@ pub fn prune_superseded_providers_sql() -> &'static str {
 /// grant still references survive; their tombstone/purge lifecycle
 /// lands with the pool-reader slice.
 pub fn purge_unreferenced_providers_sql() -> &'static str {
-    "DELETE FROM providers WHERE user_id = $1 AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+    "DELETE FROM providers WHERE user_id = $1 AND NOT EXISTS (SELECT 1 FROM user_cache_grants g WHERE g.user_id = $1 AND g.legacy_provider_id = providers.id)"
 }
 
 /// One mintable row: the envelope output plus the identity the vault
@@ -748,7 +895,7 @@ mod tests {
         assert!(
             prune.contains(
                 "AND NOT EXISTS (SELECT 1 FROM user_cache_grants g \
-                 WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+                 WHERE g.user_id = $1 AND g.legacy_provider_id = providers.id)"
             ),
             "{prune}"
         );
@@ -763,7 +910,7 @@ mod tests {
         assert!(
             purge.contains(
                 "AND NOT EXISTS (SELECT 1 FROM user_cache_grants g \
-                 WHERE g.user_id = $1 AND g.provider_id = providers.id)"
+                 WHERE g.user_id = $1 AND g.legacy_provider_id = providers.id)"
             ),
             "{purge}"
         );

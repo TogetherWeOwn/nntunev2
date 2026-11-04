@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::pool::{CircuitState, Lane, Pool, PoolError};
 use crate::probe::{
-    provider_failed, valid_probe_id, ProbeError, LANE_FULL_RETRY_MS, MAX_USER_ID_LEN,
+    provider_failed, provider_failed_with_error, valid_probe_id, ProbeError, LANE_FULL_RETRY_MS,
+    MAX_USER_ID_LEN,
 };
 
 /// Largest accepted body-request envelope: one id of up to 250 bytes,
@@ -135,8 +136,8 @@ enum FetchFail {
     TooLargeUnusable,
     /// The connection died (`Io`): redial once when it was warm.
     Closed,
-    /// Auth, protocol or any other provider failure.
-    Provider,
+    /// Auth, protocol or any other provider failure. Never rendered on the wire.
+    Provider(nntune_core::Error),
 }
 
 /// Fetch one article body on `client`: `222` is bytes, `430` is missing.
@@ -169,7 +170,7 @@ async fn fetch_body<T: Transport>(
             Err(FetchFail::TooLargeUnusable)
         }
         Err(nntune_core::Error::Io(_)) => Err(FetchFail::Closed),
-        Err(_) => Err(FetchFail::Provider),
+        Err(error) => Err(FetchFail::Provider(error)),
     }
 }
 
@@ -178,9 +179,28 @@ async fn fetch_body<T: Transport>(
 /// most once (none when a warm connection answers).
 pub async fn run_body<T, D, F, S>(
     pool: &RefCell<Pool<NntpClient<T>>>,
+    dial: D,
+    tick: S,
+    req: &BodyRequest,
+) -> Result<BodyOutcome, ProbeError>
+where
+    T: Transport,
+    D: FnMut() -> F,
+    F: Future<Output = nntune_core::Result<NntpClient<T>>>,
+    S: Fn(&mut Pool<NntpClient<T>>),
+{
+    run_body_on_lane(pool, dial, tick, req, Lane::Ingest).await
+}
+
+/// Account-scoped article fetch shared by stream misses and ingest. The caller
+/// chooses a trusted work class; it must never come from an unsigned user field.
+/// The account owner bounds this whole future with the session deadline.
+pub async fn run_body_on_lane<T, D, F, S>(
+    pool: &RefCell<Pool<NntpClient<T>>>,
     mut dial: D,
     tick: S,
     req: &BodyRequest,
+    lane: Lane,
 ) -> Result<BodyOutcome, ProbeError>
 where
     T: Transport,
@@ -191,7 +211,7 @@ where
     let (lease, warm, success_epoch, is_probe) = {
         let mut pool = pool.borrow_mut();
         tick(&mut pool);
-        let lease = pool.try_acquire(Lane::Ingest).map_err(|e| match e {
+        let lease = pool.try_acquire(lane).map_err(|e| match e {
             PoolError::Quarantined { retry_after_ms } => ProbeError::Busy { retry_after_ms },
             PoolError::Exhausted => ProbeError::Busy {
                 retry_after_ms: LANE_FULL_RETRY_MS,
@@ -244,13 +264,15 @@ where
             }
             // Closed while idle: drop it and redial once below.
             Err(FetchFail::Closed) => {}
-            Err(FetchFail::Provider) => return Err(provider_failed(pool, &tick, lease)),
+            Err(FetchFail::Provider(error)) => {
+                return Err(provider_failed_with_error(pool, &tick, lease, &error));
+            }
         }
     }
 
     let mut client = match dial().await {
         Ok(client) => client,
-        Err(_) => return Err(provider_failed(pool, &tick, lease)),
+        Err(error) => return Err(provider_failed_with_error(pool, &tick, lease, &error)),
     };
     pool.borrow_mut().record_connect();
     let lease_id = lease.id;
@@ -280,7 +302,10 @@ where
             pool.release(lease, None);
             Err(ProbeError::TooLarge)
         }
-        Err(FetchFail::Closed | FetchFail::Provider) => Err(provider_failed(pool, &tick, lease)),
+        Err(FetchFail::Closed) => Err(provider_failed(pool, &tick, lease)),
+        Err(FetchFail::Provider(error)) => {
+            Err(provider_failed_with_error(pool, &tick, lease, &error))
+        }
     }
 }
 

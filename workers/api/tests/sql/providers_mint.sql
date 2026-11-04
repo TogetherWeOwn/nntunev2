@@ -218,7 +218,7 @@ BEGIN
     INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at)
     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             1992294, 'nntunev2-audio-staging', 'audio/aa/aa/aaaa', 1700000000);
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     VALUES ('user-pm-1',
             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 1700000000);
@@ -304,7 +304,7 @@ BEGIN
            1,
            1700000001, 1700000001
     FROM (SELECT id FROM users WHERE id = 'user-pm-4' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     VALUES ('user-pm-4',
             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             '44444444-4444-4444-8444-444444444444', 1700000000);
@@ -314,7 +314,7 @@ BEGIN
     DELETE FROM providers
     WHERE user_id = 'user-pm-4' AND id <> '55555555-5555-4555-8555-555555555555'
       AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
-                      WHERE g.user_id = 'user-pm-4' AND g.provider_id = providers.id);
+                      WHERE g.user_id = 'user-pm-4' AND g.legacy_provider_id = providers.id);
     SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-4';
     IF row_count_var <> 2 THEN
         RAISE EXCEPTION 'prune removed a referenced or kept row';
@@ -323,11 +323,11 @@ BEGIN
     -- The grant drains: the same prune now removes the superseded row
     -- and keeps only the fresh mint.
     DELETE FROM user_cache_grants
-    WHERE user_id = 'user-pm-4' AND provider_id = '44444444-4444-4444-8444-444444444444';
+    WHERE user_id = 'user-pm-4' AND legacy_provider_id = '44444444-4444-4444-8444-444444444444';
     DELETE FROM providers
     WHERE user_id = 'user-pm-4' AND id <> '55555555-5555-4555-8555-555555555555'
       AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
-                      WHERE g.user_id = 'user-pm-4' AND g.provider_id = providers.id);
+                      WHERE g.user_id = 'user-pm-4' AND g.legacy_provider_id = providers.id);
     SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-4';
     IF row_count_var <> 1 THEN
         RAISE EXCEPTION 'prune kept an unreferenced superseded row';
@@ -363,14 +363,14 @@ BEGIN
            1,
            1700000001, 1700000001
     FROM (SELECT id FROM users WHERE id = 'user-pm-5' AND deleting_at IS NULL FOR SHARE) AS writer_fence;
-    INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
+    INSERT INTO user_cache_grants (user_id, content_hash, legacy_provider_id, verified_at)
     VALUES ('user-pm-5',
             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             '66666666-6666-4666-8666-666666666666', 1700000000);
     DELETE FROM providers
     WHERE user_id = 'user-pm-5'
       AND NOT EXISTS (SELECT 1 FROM user_cache_grants g
-                      WHERE g.user_id = 'user-pm-5' AND g.provider_id = providers.id);
+                      WHERE g.user_id = 'user-pm-5' AND g.legacy_provider_id = providers.id);
     SELECT count(*) INTO row_count_var FROM providers WHERE user_id = 'user-pm-5';
     IF row_count_var <> 1 THEN
         RAISE EXCEPTION 'purge took the wrong rows';
