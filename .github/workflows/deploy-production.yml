@@ -55,7 +55,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: read # Verify successful staging run and job evidence on the target SHA.
 
 concurrency:
   group: deploy-production
@@ -229,7 +229,7 @@ jobs:
         run: pnpm build
       - name: Build production target without deploying
         working-directory: apps/web
-        run: npx --yes wrangler@${{ env.WRANGLER_VERSION }} deploy --dry-run --env production --outdir dist-production
+        run: npx --yes "wrangler@${WRANGLER_VERSION:?}" deploy --dry-run --env production --outdir dist-production
       - name: Require production Worker secret shape before upload
         # Offline shape check, not a secret read: the web Worker ships no
         # bindings and needs no secrets, so any production vars table in
@@ -264,7 +264,7 @@ jobs:
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
         run: |
           set -euo pipefail
-          npx --yes wrangler@${{ env.WRANGLER_VERSION }} deployments list --env production --name "$WORKER_NAME" --json \
+          npx --yes "wrangler@${WRANGLER_VERSION:?}" deployments list --env production --name "$WORKER_NAME" --json \
             | node -e '
               let raw = "";
               process.stdin.on("data", (c) => { raw += c; });
@@ -311,7 +311,7 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          npx --yes wrangler@${{ env.WRANGLER_VERSION }} versions upload --env production \
+          npx --yes "wrangler@${WRANGLER_VERSION:?}" versions upload --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
@@ -400,7 +400,7 @@ jobs:
     permissions:
       actions: read # Read only this repository's promotion evidence.
       contents: write # Create the tag and its GitHub Release.
-    uses: ./.github/workflows/release.yml
+    uses: $/.github/workflows/release.yml
     with:
       sha: ${{ needs.preflight.outputs.sha }}
       promotion_run_id: ${{ github.run_id }}

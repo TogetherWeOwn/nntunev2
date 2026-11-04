@@ -29,6 +29,10 @@ env:
 jobs:
   gate:
     name: gate
+    concurrency:
+      group: ${{ github.workflow }}-gate-${{ github.ref }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
