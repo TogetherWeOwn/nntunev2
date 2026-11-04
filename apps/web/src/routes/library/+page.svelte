@@ -1551,6 +1551,12 @@
 		return holder?.getAttribute('data-id') ?? null;
 	}
 
+	function focusLibraryRecovery(): void {
+		const target = [viewSelect, refreshButton].find((element) =>
+			element?.isConnected && !element.matches(':disabled'));
+		target?.focus({ preventScroll: true });
+	}
+
 	/**
 	 * After a selected row unmounts, land focus on the checkbox of the next
 	 * surviving displayed row, else the previous one, else the Show
@@ -1579,7 +1585,7 @@
 					return;
 				}
 			}
-			(viewSelect?.isConnected ? viewSelect : refreshButton)?.focus({ preventScroll: true });
+			focusLibraryRecovery();
 		});
 	}
 
@@ -1631,8 +1637,8 @@
 	}
 
 	function clearSelectedIds(): void {
-		// Done unmounts with the toolbar; Selected only also removes all rows.
-		// Recover only if that explicit action strands focus after rendering.
+		// Selected only removes all rows. Recover only focus stranded by the
+		// explicit clear; the mounted Clear selection button keeps its focus.
 		const focusLeavesWithRows = view === 'selected' && focusedLibraryRowId() !== null;
 		const focusLeavesWithToolbar = typeof document !== 'undefined' &&
 			!!document.activeElement?.closest?.('[data-testid="track-selection-toolbar"]');
@@ -1783,7 +1789,7 @@
 		const starred = ids.every((id) => favoriteIds.has(id));
 		const actions = playbackMenuActions(ids);
 		actions.push(
-			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, checked: starred, run: () => favoriteInteractionIds(ids) },
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids) },
 			unavailablePlaylistAction
 		);
 		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } });
@@ -1813,13 +1819,16 @@
 			} });
 		}
 		actions.push(
-			{ label: 'Unstar', checked: true, run: () => {
+			{ label: 'Unstar', run: () => {
 				if (availableInteractionIds([id]).length && favoriteIds.has(id)) unstarFromShelf(id);
 			} },
 			unavailablePlaylistAction,
 			{ label: 'Copy link', run: () => { if (availableInteractionIds([id]).length) void copyTrackLink(id); } }
 		);
-		trackMenu = { ...menuAt(target, `Actions for ${displayTitle(track)}`, actions), fallbackFocus: () => (shelfHeading ?? refreshButton)?.focus({ preventScroll: true }), ...point };
+		trackMenu = { ...menuAt(target, `Actions for ${displayTitle(track)}`, actions), fallbackFocus: () => {
+			if (shelfHeading?.isConnected) shelfHeading.focus({ preventScroll: true });
+			else focusLibraryRecovery();
+		}, ...point };
 	}
 
 	function libraryRowClick(event: MouseEvent, id: string): void {
@@ -2114,7 +2123,8 @@
 							</button>
 							<button type="button" class="nt-favorite-more" data-testid="favorite-more"
 								aria-label={`More actions for ${displayTitle(track)}`} aria-haspopup="menu"
-								onclick={(event) => openFavoriteMenu(track.id, event.currentTarget)}>More</button>
+								onclick={(event) => openFavoriteMenu(track.id, event.currentTarget)}
+								><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 						</li>
 					{/each}
 				</ul>
@@ -2344,10 +2354,6 @@
 				</p>
 			{/if}
 			<div class="nt-selection-bar" data-testid="track-selection-toolbar">
-				{#if selectedIds.length > 0}
-					<button class="nt-button" type="button" onclick={() => queueNextIds(selectedIds)}>Play next</button>
-					<button class="nt-button" type="button" onclick={clearSelectedIds}>Done</button>
-				{/if}
 				<p data-testid="selection-count" role={loading ? undefined : 'status'}>{selectionCountLabel(selectedIds.length)}</p>
 				{#if visibleItems.length > 0}
 					<button class="nt-button" type="button" onclick={selectDisplayedIds}>
@@ -2357,6 +2363,8 @@
 				<button class="nt-button" type="button" onclick={() => clearSelectedIds()}>
 					Clear selection
 				</button>
+				<button class="nt-button" type="button" disabled={selectedIds.length === 0}
+					onclick={() => queueNextIds(selectedIds)}>Play next</button>
 				<button
 					class="nt-button"
 					type="button"
@@ -2430,6 +2438,7 @@
 				onmove={moveQueuedTrack}
 				oninsert={insertQueuedIds}
 				interactionsUnavailable={loading || libraryUnavailable}
+				onmenufocusfallback={focusLibraryRecovery}
 				onreorder={reorderQueuedIds}
 				onplaynextids={queueNextIds}
 				onremoveids={removeQueuedIds}
@@ -2689,7 +2698,7 @@
 	main :global(.queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	main :global(.queue-row button:not(.queue-star)) {
+	main :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}

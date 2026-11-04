@@ -21,6 +21,8 @@
 		/** Stable-id drag intents: host resolves against its current, authorized catalogue. */
 		oninsert?: (ids: readonly string[], beforeId: string | null) => void;
 		interactionsUnavailable?: boolean;
+		/** Host recovery target when invalidation unmounts the whole queue. */
+		onmenufocusfallback?: () => void;
 		onreorder?: (ids: readonly string[], beforeId: string | null) => void;
 		onplaynextids?: (ids: readonly string[]) => void;
 		onremoveids?: (ids: readonly string[]) => void;
@@ -94,6 +96,7 @@
 		onmove,
 		oninsert,
 		interactionsUnavailable = false,
+		onmenufocusfallback,
 		onreorder,
 		onplaynextids,
 		onremoveids,
@@ -557,7 +560,8 @@
 	function focusMenuSurvivor(beforeIds: string[], removedId: string | undefined): void {
 		const survivor = survivorId(beforeIds, removedId, new Set(visibleEntries.map(({ track }) => track.id)));
 		if (survivor && focusRowControl(survivor, '[data-testid="queue-more"]')) return;
-		menuHeading?.focus({ preventScroll: true });
+		if (menuHeading?.isConnected) menuHeading.focus({ preventScroll: true });
+		else onmenufocusfallback?.();
 	}
 
 	function recoverMenuRemoval(beforeIds: string[], removedId: string | undefined): void {
@@ -586,7 +590,7 @@
 			if (!atBottom) actions.push({ label: 'Move to bottom', run: () => onreorder?.(ids, null) });
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = ids.every((x) => favoriteIds.has(x));
-				actions.push({ label: starred ? 'Unstar all' : 'Star all', checked: starred, run: () => toggleFavorites(ids) });
+				actions.push({ label: starred ? 'Unstar all' : 'Star all', run: () => toggleFavorites(ids) });
 			}
 			actions.push(unavailablePlaylistAction);
 			if (onremoveids) actions.push({ label: 'Remove from queue', destructive: true, run: () => {
@@ -609,7 +613,7 @@
 			}
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = favoriteIds.has(id);
-				actions.push({ label: starred ? 'Unstar' : 'Star', checked: starred, run: () => toggleFavorites([id]) });
+				actions.push({ label: starred ? 'Unstar' : 'Star', run: () => toggleFavorites([id]) });
 			}
 			actions.push(unavailablePlaylistAction);
 			if (oncopylink) actions.push({ label: 'Copy link', run: () => { if (at() >= 0) oncopylink?.(id); } });
@@ -1003,7 +1007,7 @@
 
 <style>
 	ol { min-height: 48px; }
-	.queue-grip { cursor: grab; min-height: 40px; touch-action: none; color: var(--nt-fg-muted); }
+	.queue-grip { cursor: grab; min-height: 40px; touch-action: none; }
 	.queue-more, .queue-batch-select { min-width: 40px; min-height: 40px; }
 	.queue-batch-select { display: inline-flex; align-items: center; justify-content: center; }
 	.queue-batch-select input { width: 1.5rem; height: 1.5rem; }

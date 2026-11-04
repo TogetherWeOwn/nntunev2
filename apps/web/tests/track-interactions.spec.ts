@@ -43,7 +43,10 @@ test('More, right-click and keyboard menus share actions, navigation and return 
 	await page.keyboard.press('ArrowUp');
 	await expect(menu(page).getByRole('menuitem', { name: 'Add to playlist, not available yet' })).toBeFocused();
 	await page.keyboard.press('ArrowUp');
-	await expect(menu(page).getByRole('menuitemcheckbox', { name: 'Star', exact: true })).toBeFocused();
+	const star = menu(page).getByRole('menuitem', { name: 'Star', exact: true });
+	await expect(star).toBeFocused();
+	await expect(star).not.toHaveAttribute('aria-checked');
+	await expect(star).toHaveText('Star');
 	await page.keyboard.press('Home');
 	await page.keyboard.press('a');
 	await expect(menu(page).getByRole('menuitem', { name: 'Add to queue', exact: true })).toBeFocused();
@@ -145,7 +148,7 @@ test('modifier selection and list-scoped select all do not queue or change favor
 	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
 	await menu(page).getByRole('menuitem', { name: 'Play next', exact: true }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember']);
-	await page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Done', exact: true }).click();
+	await page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Clear selection', exact: true }).click();
 	await expect(page.getByTestId('selection-count')).toHaveText('0 selected');
 });
 
@@ -280,11 +283,13 @@ test('mixed stars have one aggregate outcome and shelf menus retain local manage
 	await libraryRow(page, 'coral').getByRole('checkbox').check();
 	await libraryRow(page, 'dawn').getByRole('checkbox').check();
 	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
-	await menu(page).getByRole('menuitemcheckbox', { name: 'Star all', exact: true }).click();
+	await menu(page).getByRole('menuitem', { name: 'Star all', exact: true }).click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(2);
 	await expect(page.getByTestId('favorites-announcement')).toHaveText('Starred 1 track; 1 was already starred.');
 	const shelf = (id: string) => page.locator(`[data-testid="favorite-item"][data-id="${id}"]`);
 	const more = shelf('coral').getByTestId(TESTIDS.favoriteMore);
+	await expect(more).toHaveText('');
+	await expect(more.locator('svg[aria-hidden="true"] circle')).toHaveCount(3);
 	await more.press('Shift+F10');
 	await expect(menu(page)).toHaveAttribute('aria-label', 'Actions for Coral Night');
 	await expect(menu(page).getByRole('menuitem', { name: 'Move up', exact: true })).toHaveCount(0);
@@ -292,10 +297,28 @@ test('mixed stars have one aggregate outcome and shelf menus retain local manage
 	await expect(page.getByTestId('favorite-item').first()).toHaveAttribute('data-id', 'dawn');
 	await expect(more).toBeFocused();
 	await more.click();
-	await menu(page).getByRole('menuitemcheckbox', { name: 'Unstar', exact: true }).click();
+	const unstar = menu(page).getByRole('menuitem', { name: 'Unstar', exact: true });
+	await expect(unstar).not.toHaveAttribute('aria-checked');
+	await expect(unstar).toHaveText('Unstar');
+	await unstar.click();
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 	await expect(shelf('dawn').locator('[data-shelf-unstar]')).toBeFocused();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+});
+
+test('queue Star and Unstar actions are verbs without checkbox state or checkmarks', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const more = queueRow(page, 'coral').getByTestId(TESTIDS.queueMore);
+	for (const name of ['Star', 'Unstar']) {
+		await more.click();
+		const action = menu(page).getByRole('menuitem', { name, exact: true });
+		await expect(action).not.toHaveAttribute('aria-checked');
+		await expect(action).toHaveText(name);
+		await action.click();
+		await expect(menu(page)).toHaveCount(0);
+		await expect(more).toBeFocused();
+	}
 });
 
 test('queue grip opens at Move and menu removal focuses the next surviving More control', async ({ page }) => {
@@ -368,18 +391,18 @@ test('grouped drops resolve an after-row boundary beyond moving tracks', async (
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
 });
 
-test('Done returns keyboard focus from disappearing library and queue toolbars', async ({ page }) => {
+test('Clear selection keeps library focus and queue Done recovers disappearing toolbar focus', async ({ page }) => {
 	await seed(page);
 	await libraryRow(page, 'coral').getByRole('checkbox').check();
-	const done = page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Done', exact: true });
-	await done.focus();
+	const clear = page.getByTestId(TESTIDS.trackSelectionToolbar).getByRole('button', { name: 'Clear selection', exact: true });
+	await clear.focus();
 	await page.keyboard.press('Enter');
-	await expect(libraryRow(page, 'coral').getByRole('checkbox')).toBeFocused();
+	await expect(clear).toBeFocused();
 	await libraryRow(page, 'coral').getByRole('checkbox').check();
 	await page.getByLabel('Show', { exact: true }).selectOption('selected');
-	await done.focus();
+	await clear.focus();
 	await page.keyboard.press('Enter');
-	await expect(page.getByLabel('Show', { exact: true })).toBeFocused();
+	await expect(clear).toBeFocused();
 	await page.getByLabel('Show', { exact: true }).selectOption('all');
 	await queueAll(page);
 	await queueRow(page, 'dawn').getByRole('checkbox').check();
@@ -388,9 +411,10 @@ test('Done returns keyboard focus from disappearing library and queue toolbars',
 	await expect(queueRow(page, 'dawn').getByRole('checkbox')).toBeFocused();
 });
 
-for (const width of [1280, 390]) {
-	test(`open menu and batch selection have no blocking axe violations at ${width}px`, async ({ page }) => {
+for (const width of [1280, 390]) for (const colorScheme of ['light', 'dark'] as const) {
+	test(`open menu and batch selection have no blocking axe violations at ${width}px in ${colorScheme}`, async ({ page }) => {
 		await page.setViewportSize({ width, height: 1000 });
+		await page.emulateMedia({ colorScheme });
 		await seed(page);
 		await queueAll(page);
 		await queueRow(page, 'dawn').getByRole('checkbox').check();
@@ -458,9 +482,71 @@ test('a refresh invalidates an open menu and its captured actions', async ({ pag
 	await seed(page);
 	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
 	await expect(menu(page)).toBeVisible();
-	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+	await refresh.click();
 	await expect(menu(page)).toHaveCount(0);
+	await expect(refresh).toBeFocused();
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
+});
+
+for (const surface of ['library', 'favorites', 'queue'] as const) {
+	test(`auth invalidation of the ${surface} menu recovers focus without stealing a newer choice`, async ({ page }) => {
+		await seed(page);
+		await queueAll(page);
+		await libraryRow(page, 'coral').getByRole('button', { name: 'Star Coral Night', exact: true }).click();
+		const more = surface === 'queue' ? queueRow(page, 'coral').getByTestId(TESTIDS.queueMore)
+			: surface === 'favorites' ? page.getByTestId(TESTIDS.favoriteMore)
+			: libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore);
+		await more.click();
+		await expect(menu(page)).toBeVisible();
+		await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+			key: 'nntune.library.auth-transition.v1', newValue: 'changed', storageArea: localStorage
+		})));
+		await expect(menu(page)).toHaveCount(0);
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(0);
+		await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeFocused();
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
+		await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(ITEMS.length);
+		await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+		await page.evaluate(() => {
+			window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' }));
+			document.getElementById('library-density')?.focus();
+		});
+		await expect(page.getByLabel('Density', { exact: true })).toBeFocused();
+	});
+}
+
+test('library toolbar reserves Play next before Append selected and includes hidden tracks in activation order', async ({ page }) => {
+	await seed(page);
+	const toolbar = page.getByTestId(TESTIDS.trackSelectionToolbar);
+	const next = toolbar.getByRole('button', { name: 'Play next', exact: true });
+	await expect(next).toBeDisabled();
+	await expect(toolbar.getByRole('button', { name: 'Done', exact: true })).toHaveCount(0);
+	await expect.poll(async () => (await toolbar.getByRole('button').allTextContents()).map((text) => text.trim()).slice(0, 4))
+		.toEqual(['Select all', 'Clear selection', 'Play next', 'Append selected']);
+	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await libraryRow(page, 'ember').getByRole('checkbox').check();
+	await libraryRow(page, 'dawn').getByRole('checkbox').check();
+	await page.getByLabel('Find in loaded tracks', { exact: true }).fill('Dawn');
+	await expect(page.getByTestId('selection-hidden-count')).toContainText('1 selected track is hidden');
+	await next.click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'ember', 'dawn']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+});
+
+test('library touch More and grip targets meet the coarse-pointer minimum', async ({ browser }) => {
+	const context = await browser.newContext({ viewport: { width: 390, height: 1000 }, isMobile: true, hasTouch: true });
+	const page = await context.newPage();
+	await seed(page);
+	await queueAll(page);
+	for (const control of [libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore),
+		queueRow(page, 'coral').getByTestId(TESTIDS.queueMore),
+		queueRow(page, 'coral').getByRole('button', { name: 'Reorder Coral Night', exact: true })]) {
+		const box = (await control.boundingBox())!;
+		expect(box.width).toBeGreaterThanOrEqual(48);
+		expect(box.height).toBeGreaterThanOrEqual(48);
+	}
+	await context.close();
 });
 
 test('touch grip reorders, Escape cancels, and non-grip touches leave the queue unchanged', async ({ browser }) => {

@@ -11,6 +11,7 @@
 		submenu?: boolean;
 	} = $props();
 	let menu: HTMLDivElement;
+	let opening: MenuRequest;
 	let active = $state(0);
 	let left = $state(0);
 	let top = $state(0);
@@ -71,7 +72,7 @@
 		if (closed) return;
 		closed = true;
 		clearTimeout(hover);
-		const invoker = request.invoker;
+		const invoker = opening.invoker;
 		onclose();
 		if (restore && invoker.isConnected) invoker.focus({ preventScroll: true });
 	}
@@ -84,9 +85,9 @@
 		const height = viewport?.height ?? window.innerHeight;
 		const offsetX = viewport?.offsetLeft ?? 0;
 		const offsetY = viewport?.offsetTop ?? 0;
-		const anchor = request.invoker.getBoundingClientRect();
-		const point = menuPosition(submenu ? anchor.right - offsetX : request.x - offsetX,
-			submenu ? anchor.top - offsetY : request.y - offsetY, rect.width, rect.height, width, height);
+		const anchor = opening.invoker.getBoundingClientRect();
+		const point = menuPosition(submenu ? anchor.right - offsetX : opening.x - offsetX,
+			submenu ? anchor.top - offsetY : opening.y - offsetY, rect.width, rect.height, width, height);
 		if (submenu) {
 			point.left = Math.max(0, Math.min(anchor.right - offsetX + rect.width > width
 				? anchor.left - offsetX - rect.width : anchor.right - offsetX, width - rect.width));
@@ -133,6 +134,9 @@
 	}
 
 	onMount(() => {
+		// The parent can clear its request before teardown or the recovery tick.
+		opening = request;
+		const { invoker, fallbackFocus } = opening;
 		menu.showPopover();
 		place();
 		ready = true;
@@ -174,11 +178,10 @@
 			// Snapshot invalidation can unmount the menu without an activation.
 			// Recover only focus that belonged to it, never a newer user choice.
 			if (!submenu && !closed && (menu.contains(document.activeElement) || document.activeElement === document.body)) {
-				const invoker = request.invoker;
 				void tick().then(() => {
 					if (document.activeElement !== document.body && document.activeElement?.isConnected) return;
 					if (invoker.isConnected) invoker.focus({ preventScroll: true });
-					else request.fallbackFocus?.();
+					else fallbackFocus?.();
 				});
 			}
 			clearTimeout(hover);
