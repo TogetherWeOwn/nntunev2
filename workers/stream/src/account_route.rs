@@ -64,6 +64,56 @@ pub fn parse_registry(raw: &[u8]) -> Result<Vec<AccountConfig>, RegistryError> {
     Ok(registry.accounts)
 }
 
+pub(crate) async fn current_account(
+    source: &impl RegistrySource,
+    key: Option<&[u8]>,
+    account_id: &str,
+    now_ms: u64,
+) -> Result<AccountConfig, RegistryError> {
+    account_snapshot(source, key, account_id, now_ms)
+        .await?
+        .ok_or(RegistryError)
+}
+
+/// Alarm refresh: authenticated absence revokes membership; a failed or invalid
+/// registry read does not impersonate a kill switch. Cleanup runs independently.
+pub async fn refresh<S: AccountStorage, C: CloseControl>(
+    owner: &AccountOwner<S, C>,
+    source: &impl RegistrySource,
+    key: Option<&[u8]>,
+    now_ms: impl Fn() -> u64,
+) -> Result<(), RegistryError> {
+    match account_snapshot(source, key, owner.account_id(), now_ms()).await? {
+        Some(current) => {
+            owner
+                .lock(current, now_ms())
+                .await
+                .map_err(|_| RegistryError)?;
+        }
+        None => owner.registry_missing().await,
+    }
+    Ok(())
+}
+
+pub(crate) async fn account_snapshot(
+    source: &impl RegistrySource,
+    key: Option<&[u8]>,
+    account_id: &str,
+    now_ms: u64,
+) -> Result<Option<AccountConfig>, RegistryError> {
+    let authorization = pool_channel::authorization_header(
+        key,
+        pool_channel::REGISTRY_PATH,
+        now_ms / 1000,
+        REGISTRY_BODY,
+    )
+    .ok_or(RegistryError)?;
+    let raw = source.fetch(&authorization).await?;
+    Ok(parse_registry(&raw)?
+        .into_iter()
+        .find(|a| a.id == account_id))
+}
+
 fn is_object(raw: &[u8]) -> bool {
     raw.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
 }
@@ -125,24 +175,9 @@ pub async fn candidate<S: AccountStorage, C: CloseControl>(
         Ok(request) if request.account_id == owner.account_id() => request,
         _ => return CandidateReply::BadRequest,
     };
-    let Some(authorization) = pool_channel::authorization_header(
-        keys.resolver,
-        pool_channel::REGISTRY_PATH,
-        now_ms() / 1000,
-        REGISTRY_BODY,
-    ) else {
-        return CandidateReply::Unavailable;
-    };
-    let raw = match source.fetch(&authorization).await {
-        Ok(raw) => raw,
+    let current = match current_account(source, keys.resolver, owner.account_id(), now_ms()).await {
+        Ok(current) => current,
         Err(_) => return CandidateReply::Unavailable,
-    };
-    let current = match parse_registry(&raw) {
-        Ok(accounts) => accounts.into_iter().find(|a| a.id == owner.account_id()),
-        Err(_) => return CandidateReply::Unavailable,
-    };
-    let Some(current) = current else {
-        return CandidateReply::Unavailable;
     };
     // Read completion time, not dispatch time: registry latency must not consume
     // a retained owner's cooldown before it is advanced/reconciled.

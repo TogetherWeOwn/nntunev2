@@ -12,8 +12,10 @@
 //! restart is evidence that an old socket closed. There is deliberately no
 //! automatic recovery/reset API or warm socket reuse in this first boundary.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::rc::Rc;
 
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -129,9 +131,26 @@ pub enum SupervisorError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionResult {
+    /// A local authorization/cancellation refusal says nothing about health.
+    Aborted,
     Success,
     ProviderFailure,
     AuthFailure,
+}
+
+/// One owner-retained, reservation-bound completion latch. The operation can
+/// publish a terminal result without acquiring the mutation mutex; dropping it
+/// while waiting to finish cannot erase a known authentication failure. No new
+/// entries or arbitrary session IDs can be manufactured through this handle.
+#[derive(Clone, Default)]
+pub struct SessionCompletion(Rc<Cell<Option<SessionResult>>>);
+
+impl SessionCompletion {
+    pub fn complete(&self, result: SessionResult) {
+        if self.0.get().is_none() {
+            self.0.set(Some(result));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -148,6 +167,8 @@ struct Held<C> {
     // Terminal even if close is cancelled, fails, or the clock moves backwards.
     closing: bool,
     control: Option<C>,
+    completion: SessionCompletion,
+    completion_applied: bool,
 }
 
 pub struct AccountSupervisor<S, C> {
@@ -159,6 +180,8 @@ pub struct AccountSupervisor<S, C> {
     // accidentally restore admission on the retained in-memory instance.
     poisoned: bool,
     recovery_fenced: bool,
+    pending_result_write: bool,
+    registry_missing: bool,
 }
 
 impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
@@ -193,6 +216,8 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
             held: BTreeMap::new(),
             poisoned: false,
             recovery_fenced,
+            pending_result_write: false,
+            registry_missing: false,
         };
         owner.reconcile(current).await?;
         Ok(owner)
@@ -226,13 +251,75 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
 
     pub fn candidate(&self, class: WorkClass) -> Candidate {
         let mut candidate = self.pool.candidate(class);
-        if self.poisoned || self.recovery_fenced {
+        if self.poisoned
+            || self.recovery_fenced
+            || self.registry_missing
+            || self.pending_auth_failure()
+        {
             candidate.eligible = false;
         }
         // Count recovered reservations and leases whose retirement write is
         // uncertain; neither may disappear from the scheduling projection.
         candidate.in_flight = self.outstanding();
         candidate
+    }
+
+    pub fn completion(&self, id: SessionId) -> Result<SessionCompletion, SupervisorError> {
+        if !id.belongs_to(&self.journal.config) {
+            return Err(SupervisorError::UnknownSession);
+        }
+        self.held
+            .get(&id.sequence)
+            .map(|h| h.completion.clone())
+            .ok_or(SupervisorError::UnknownSession)
+    }
+
+    pub fn has_completions(&self) -> bool {
+        self.pending_result_write
+            || self
+                .held
+                .values()
+                .any(|h| !h.completion_applied && h.completion.0.get().is_some())
+    }
+
+    fn pending_auth_failure(&self) -> bool {
+        self.held.iter().any(|(id, h)| {
+            h.completion.0.get() == Some(SessionResult::AuthFailure)
+                && self
+                    .journal
+                    .reservations
+                    .get(id)
+                    .is_some_and(|r| r.secret_ref == self.journal.config.secret_ref)
+        })
+    }
+
+    fn stage_completions(&mut self) {
+        let pending: Vec<_> = self
+            .held
+            .iter()
+            .filter_map(|(id, h)| {
+                if h.completion_applied {
+                    None
+                } else {
+                    h.completion.0.get().map(|result| (*id, result))
+                }
+            })
+            .collect();
+        for (sequence, result) in pending {
+            let id = SessionId::new(sequence, &self.journal.config);
+            if let Ok(dirty) = self.apply_result(id, result) {
+                self.pending_result_write |= dirty;
+            }
+            let held = self.held.get_mut(&sequence).unwrap();
+            held.completion_applied = true;
+            held.closing = true;
+        }
+    }
+
+    /// Authenticated registry absence is revocation, not a transient read error.
+    /// It is terminal on this instance; only a fresh DO can recover membership.
+    pub fn registry_missing(&mut self) {
+        self.registry_missing = true;
     }
 
     pub async fn reserve(
@@ -242,6 +329,9 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
     ) -> Result<SessionId, SupervisorError> {
         if self.poisoned || self.recovery_fenced {
             return Err(SupervisorError::Fenced);
+        }
+        if self.registry_missing || self.pending_auth_failure() {
+            return Err(SupervisorError::Refused);
         }
         let next_id = self
             .journal
@@ -276,6 +366,8 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
                 attempted: false,
                 closing: false,
                 control: None,
+                completion: SessionCompletion::default(),
+                completion_applied: false,
             },
         );
         self.persist().await?;
@@ -287,6 +379,8 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
     pub fn auth_permitted(&self, id: SessionId, proof_expires_at_ms: u64, now_ms: u64) -> bool {
         if self.poisoned
             || self.recovery_fenced
+            || self.registry_missing
+            || self.pending_auth_failure()
             || !id.belongs_to(&self.journal.config)
             || now_ms >= proof_expires_at_ms
         {
@@ -295,7 +389,11 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         let Some(reservation) = self.journal.reservations.get(&id.sequence) else {
             return false;
         };
-        if self.held.get(&id.sequence).is_none_or(|held| held.closing) {
+        if self
+            .held
+            .get(&id.sequence)
+            .is_none_or(|held| held.closing || held.completion.0.get().is_some())
+        {
             return false;
         }
         let config = &self.journal.config;
@@ -359,6 +457,17 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         id: SessionId,
         result: SessionResult,
     ) -> Result<(), SupervisorError> {
+        if self.apply_result(id, result)? {
+            self.persist().await?;
+        }
+        Ok(())
+    }
+
+    fn apply_result(
+        &mut self,
+        id: SessionId,
+        result: SessionResult,
+    ) -> Result<bool, SupervisorError> {
         if self.poisoned || self.recovery_fenced {
             return Err(SupervisorError::Fenced);
         }
@@ -378,13 +487,14 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
             .get(&id.sequence)
             .ok_or(SupervisorError::UnknownSession)?;
         match result {
+            SessionResult::Aborted => {}
             SessionResult::AuthFailure => {
                 // Settings-only revisions must not forget a failed identity.
                 // Conversely, an old failure must never quarantine new secrets.
                 if reservation.secret_ref == self.journal.config.secret_ref {
                     self.journal.quarantined_secret = Some(reservation.secret_ref.clone());
                     self.pool.pool().borrow_mut().quarantine_auth();
-                    self.persist().await?;
+                    return Ok(true);
                 }
             }
             SessionResult::ProviderFailure => self
@@ -401,13 +511,50 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
                 }
             }
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Finish under the owner's one mutation lock: apply quarantine before any
+    /// await, then physically drain BEFORE waiting on storage. Keep capacity
+    /// until both the result and retirement are durable. Cancellation anywhere
+    /// leaves a terminal session for retained cleanup, never a retryable login.
+    pub async fn finish(
+        &mut self,
+        id: SessionId,
+        result: SessionResult,
+    ) -> Result<(), SupervisorError> {
+        self.completion(id)?.complete(result);
+        self.stage_completions();
+        if !id.belongs_to(&self.journal.config) {
+            return Err(SupervisorError::UnknownSession);
+        }
+        let held = self
+            .held
+            .get_mut(&id.sequence)
+            .ok_or(SupervisorError::UnknownSession)?;
+        held.closing = true;
+        let closed = match &held.control {
+            Some(control) => control.close().await.is_ok() && control.confirmed_closed(),
+            None => false,
+        };
+        if self.poisoned || self.recovery_fenced {
+            return Err(SupervisorError::Fenced);
+        }
+        if self.pending_result_write {
+            self.persist().await?;
+            self.pending_result_write = false;
+        }
+        if !closed {
+            return Err(SupervisorError::CloseUnconfirmed);
+        }
+        self.retire(id).await
     }
 
     /// Close is allowed even on a poisoned instance: drain physical sockets but
     /// never release any uncertain reservation. A close/storage error or cancelled
     /// close leaves the lease held. The runtime must bound the control's close.
     pub async fn close(&mut self, id: SessionId) -> Result<(), SupervisorError> {
+        self.stage_completions();
         if !id.belongs_to(&self.journal.config) {
             return Err(SupervisorError::UnknownSession);
         }
@@ -437,6 +584,7 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
     /// this sweep leaves every selected session terminal and its capacity held.
     /// Resolver proof expiry gates AUTHINFO, not an already authenticated session.
     pub async fn cleanup(&mut self, now_ms: u64) -> Result<CleanupReport, SupervisorError> {
+        self.stage_completions();
         let invalid: Vec<u32> = self
             .held
             .keys()
@@ -475,7 +623,14 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         if self.poisoned {
             return Err(SupervisorError::Fenced);
         }
-        if self.recovery_fenced || retired.is_empty() {
+        if self.recovery_fenced {
+            return Ok(self.cleanup_report(0));
+        }
+        if retired.is_empty() {
+            if self.pending_result_write {
+                self.persist().await?;
+                self.pending_result_write = false;
+            }
             return Ok(self.cleanup_report(0));
         }
         for sequence in &retired {
@@ -485,6 +640,7 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
                 .ok_or(SupervisorError::UnknownSession)?;
         }
         self.persist().await?;
+        self.pending_result_write = false;
         for sequence in &retired {
             let held = self
                 .held
@@ -493,6 +649,17 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
             self.pool.pool().borrow_mut().release(held.lease, None);
         }
         Ok(self.cleanup_report(retired.len() as u32))
+    }
+
+    /// Only live controls or safely cancellable unstarted reservations need a
+    /// recurring wake. Recovered/uncertain occupancy stays fenced indefinitely,
+    /// but must not create an endless alarm loop after physical sockets drain.
+    pub fn needs_cleanup(&self) -> bool {
+        (!self.poisoned && self.has_completions())
+            || self.held.values().any(|held| match &held.control {
+                Some(control) => !control.confirmed_closed(),
+                None => !held.attempted && !self.poisoned,
+            })
     }
 
     fn cleanup_report(&self, retired: u32) -> CleanupReport {
@@ -517,6 +684,7 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
             .remove(&id.sequence)
             .ok_or(SupervisorError::UnknownSession)?;
         self.persist().await?;
+        self.pending_result_write = false;
         let held = self
             .held
             .remove(&id.sequence)

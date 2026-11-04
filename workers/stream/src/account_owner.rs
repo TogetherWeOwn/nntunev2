@@ -80,6 +80,9 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
         {
             supervisor.advance(now_ms.saturating_sub(*last_now_ms));
             *last_now_ms = (*last_now_ms).max(now_ms);
+            if supervisor.has_completions() {
+                supervisor.cleanup(*last_now_ms).await?;
+            }
             supervisor.reconcile(current).await?;
         } else {
             return Err(SupervisorError::Fenced);
@@ -116,6 +119,19 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
         }
     }
 
+    pub async fn registry_missing(&self) {
+        if let OwnerState::Ready { supervisor, .. } = &mut *self.state.lock().await {
+            supervisor.registry_missing();
+        }
+    }
+
+    pub async fn needs_cleanup(&self) -> bool {
+        match &*self.state.lock().await {
+            OwnerState::Ready { supervisor, .. } => supervisor.needs_cleanup(),
+            _ => false,
+        }
+    }
+
     /// Tick at I/O completion, not at the last admission: slow operations must
     /// not consume part of the breaker's cooldown before they even fail.
     pub async fn record_result(
@@ -133,6 +149,49 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
                 supervisor.advance(now_ms.saturating_sub(*last_now_ms));
                 *last_now_ms = (*last_now_ms).max(now_ms);
                 supervisor.record_result(id, result).await
+            }
+            _ => Err(SupervisorError::Fenced),
+        }
+    }
+
+    pub async fn finish(
+        &self,
+        id: SessionId,
+        result: SessionResult,
+        now_ms: u64,
+    ) -> Result<(), SupervisorError> {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            OwnerState::Ready {
+                supervisor,
+                last_now_ms,
+            } => {
+                supervisor.advance(now_ms.saturating_sub(*last_now_ms));
+                *last_now_ms = (*last_now_ms).max(now_ms);
+                supervisor.finish(id, result).await
+            }
+            _ => Err(SupervisorError::Fenced),
+        }
+    }
+
+    /// Return the setup future after retaining its independent close control.
+    /// No owner lock is held while setup or subsequent socket I/O is polled.
+    pub async fn start<F: std::future::Future, E>(
+        &self,
+        id: SessionId,
+        proof_expires_at_ms: u64,
+        now_ms: u64,
+        factory: impl FnOnce() -> Result<(C, F), E>,
+    ) -> Result<F, SupervisorError> {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            OwnerState::Ready {
+                supervisor,
+                last_now_ms,
+            } => {
+                supervisor.advance(now_ms.saturating_sub(*last_now_ms));
+                *last_now_ms = (*last_now_ms).max(now_ms);
+                supervisor.start(id, proof_expires_at_ms, *last_now_ms, factory)
             }
             _ => Err(SupervisorError::Fenced),
         }
@@ -169,6 +228,22 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
 
 pub struct AccountGuard<'a, S, C> {
     state: MutexGuard<'a, OwnerState<S, C>>,
+}
+
+impl<S: AccountStorage, C: CloseControl> AccountGuard<'_, S, C> {
+    /// Use the owner's retained high-water time, never a fresh backwards sample.
+    pub async fn reserve_current(
+        &mut self,
+        class: crate::account_pool::WorkClass,
+    ) -> Result<SessionId, SupervisorError> {
+        match &mut *self.state {
+            OwnerState::Ready {
+                supervisor,
+                last_now_ms,
+            } => supervisor.reserve(class, *last_now_ms).await,
+            _ => Err(SupervisorError::Fenced),
+        }
+    }
 }
 
 impl<S, C> Deref for AccountGuard<'_, S, C> {

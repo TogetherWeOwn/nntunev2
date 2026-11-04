@@ -908,6 +908,7 @@ dependencies = [
  "futures-util",
  "nntune-core",
  "nntune-logging",
+ "nntune-ssrf-guard",
  "nntune-test-nntp",
  "quote",
  "serde",
@@ -916,6 +917,7 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "worker",
+ "zeroize",
 ]
 
 [[package]]

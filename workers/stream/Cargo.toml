@@ -19,6 +19,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Serializes account-owner mutations across durable storage awaits on both targets.
 futures-util = "0.3"
+# Ephemeral resolver bytes and credentials are never cached or persisted.
+zeroize = { version = "1", features = ["derive"] }
+nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
 
 # Worker + NntpPool Durable Object entry (src/runtime.rs), wasm32 only: native
 # builds and `cargo test` stay free of the Workers runtime.

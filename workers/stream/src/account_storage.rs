@@ -69,22 +69,31 @@ mod worker_backend {
 
     impl JournalBackend for WorkerJournalBackend {
         async fn get(&mut self) -> Result<Option<String>, StorageError> {
-            self.storage
-                .get(ACCOUNT_JOURNAL_KEY)
-                .await
-                .map_err(|_| StorageError)
+            bounded(self.storage.get(ACCOUNT_JOURNAL_KEY)).await
         }
 
         async fn put(&mut self, value: String) -> Result<(), StorageError> {
-            self.storage
-                .put(ACCOUNT_JOURNAL_KEY, value)
-                .await
-                .map_err(|_| StorageError)
+            bounded(self.storage.put(ACCOUNT_JOURNAL_KEY, value)).await
         }
 
         async fn sync(&mut self) -> Result<(), StorageError> {
-            self.storage.sync().await.map_err(|_| StorageError)
+            bounded(self.storage.sync()).await
         }
+    }
+
+    // A stuck storage promise must not hold the owner's mutex forever and
+    // suppress deadline/revocation cleanup. An uncertain write returns failure;
+    // the supervisor's existing poison/recovery fences remain authoritative.
+    async fn bounded<T>(
+        operation: impl std::future::Future<Output = worker::Result<T>>,
+    ) -> Result<T, StorageError> {
+        crate::account_pool::with_session_deadline(
+            operation,
+            worker::Delay::from(std::time::Duration::from_secs(2)),
+        )
+        .await
+        .map_err(|_| StorageError)?
+        .map_err(|_| StorageError)
     }
 
     pub type WorkerAccountOwner =

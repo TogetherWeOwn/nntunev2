@@ -114,7 +114,7 @@ TLS/port policy but still dials a hostname; it does **not** satisfy this peer
 pinning contract. Until the account runtime and suitable transport land,
 NNTP cache misses remain unavailable; this channel alone is not deploy-ready.
 
-## Account owner and storage boundary (unrouted)
+## Account owner and storage boundary (operations gated)
 
 `account_owner` serializes lazy initialization, reconciliation, reservation and
 close/result mutations through one async mutex per account. Construct it once
@@ -144,13 +144,45 @@ physical close remains possible after poisoning, but uncertain capacity is not
 released. Synchronous AUTHINFO checks refuse while the owner lock is held,
 rather than block or borrow shared mutable state across an await.
 
-The Worker storage factory compiles against the installed storage API. It is
-**not** yet called by a Durable Object class or a product route: no account
-namespace, migration, alarm, admission RPC, deadline sweep or resolver-to-dial
-wiring is installed. Native fake-backend tests prove ordering/fencing only;
-they do not prove actual Worker persistence, TLS, entropy, clock or physical
-closure. Those runtime qualification gates and curated-track staging playback
-remain required before real dialing or public NNTP misses are enabled.
+The dedicated `NntpAccount` Durable Object retains the owner in its separate
+account namespace. Its authenticated candidate endpoint offers scheduling hints
+only, never reservations or credentials. The user meter object remains separate.
+The account alarm reconciles registry revocations and drains retained controls,
+including after registry failure. Failed/slow refresh cannot suppress cleanup.
+Storage promises have bounded waits; an uncertain write still fences admission.
+Wakes continue only for live controls or current cancellable reservations, not
+forever for recovery-fenced bookkeeping after all physical sockets have drained.
+
+`account_operation` composes one BODY or bounded STAT batch: fresh registry,
+durable cleanup wake, durable class reservation, signed exact-identity resolution,
+validated ephemeral material, then one literal-peer TLS setup. The proof and
+owner's high-water clock are checked at each AUTHINFO command. No credential
+retry, hostname re-resolution, warm client, plaintext or user-provider fallback
+is allowed. Original resolver buffers and successfully parsed credentials are
+zeroized on drop. BODY is bounded to 16 MiB; STAT is bounded to 500 message IDs.
+The result names the actual admitted account for eventual ingest attribution.
+
+Known results are synchronously published to reservation-owned completion
+latches before awaiting the owner lock. In particular, dropping a failed AUTHINFO
+operation while another request owns that lock cannot erase quarantine evidence
+or permit another authentication attempt. Admission and cleanup drain those
+latches, and explicit close cannot discard them.
+
+Finishing uses one owner mutation lock: apply auth quarantine before any await,
+physically close before result-storage waits, persist quarantine and retirement,
+and only then release capacity and return output. The whole-session timer also
+covers finalization. Expiry returns no output, marks the retained session terminal
+and leaves confirmation/retirement to the already-scheduled independent cleanup;
+it never waits indefinitely for post-deadline storage. Authenticated registry
+absence revokes retained membership, whereas a failed/invalid read does not
+impersonate a kill switch. Failed closure/storage never silently frees a slot.
+Local proof refusal is not provider ill-health.
+
+**No operation RPC or product caller is enabled.** The Worker connector and
+resolver adapters compile, but real dialing and public NNTP misses remain
+unreachable. Native fake-backend tests prove ordering/fencing only, not actual
+Worker persistence, alarm delivery, TLS, entropy, clock or physical closure.
+Those qualification gates and curated-track staging playback remain required.
 
 ## Verification
 

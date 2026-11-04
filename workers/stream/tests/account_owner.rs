@@ -953,3 +953,175 @@ fn auth_time_observations_do_not_double_count_breaker_cooldown() {
             .eligible
     );
 }
+
+#[test]
+fn cancelled_finish_quarantines_before_awaiting_close_and_cleanup_persists_it() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    ctl.block(true);
+    let mut finish = Box::pin(o.finish(id, SessionResult::AuthFailure, 10));
+    assert!(is_pending(&mut finish));
+    assert_eq!(ctl.calls(), 1);
+    assert!(!o.auth_permitted(id, u64::MAX, 10));
+    drop(finish);
+    assert!(now(o.needs_cleanup()));
+    let mut admission = Box::pin(o.lock(cfg(3), 10));
+    assert!(
+        is_pending(&mut admission),
+        "admission drains the terminal completion first"
+    );
+    drop(admission);
+    assert!(!o.auth_permitted(id, u64::MAX, 0));
+    ctl.block(false);
+    assert_eq!(counts(now(o.cleanup(10))), (1, 0));
+    assert!(
+        !now(o.lock(cfg(3), 10))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+    assert_eq!(store.json()["quarantined_secret"], SECRET_A);
+    assert!(!now(o.needs_cleanup()));
+}
+
+#[test]
+fn finish_storage_failure_closes_first_and_stops_wakes_without_unfencing_capacity() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    store.fail_save(true);
+    assert_eq!(
+        now(o.finish(id, SessionResult::AuthFailure, 10)),
+        Err(SupervisorError::Storage)
+    );
+    assert!(ctl.confirmed());
+    assert!(
+        !now(o.needs_cleanup()),
+        "closed controls do not spin alarms"
+    );
+    assert_eq!(store.reservations(), 1);
+    store.fail_save(false);
+    assert_eq!(now(o.lock(cfg(3), 11)).err(), Some(SupervisorError::Fenced));
+}
+
+#[test]
+fn cleanup_wakes_only_for_live_or_cancellable_current_instance_reservations() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    assert!(!now(o.needs_cleanup()));
+    let mut guard = now(o.lock(cfg(3), 0)).unwrap();
+    let id = now(guard.reserve_current(WorkClass::Stream)).unwrap();
+    drop(guard);
+    assert!(
+        now(o.needs_cleanup()),
+        "unstarted reservation still needs expiry"
+    );
+    now(o.cancel_unstarted(id)).unwrap();
+    assert!(!now(o.needs_cleanup()));
+    let (_, ctl) = reserve_started(&o, cfg(3), 0);
+    assert!(now(o.needs_cleanup()));
+    let reopened = owner(&store);
+    assert!(!now(reopened.needs_cleanup()));
+    let guard = now(reopened.lock(cfg(3), 20_000)).unwrap();
+    assert_eq!(guard.candidate(WorkClass::Stream).in_flight, 1);
+    drop(guard);
+    assert!(
+        !now(reopened.needs_cleanup()),
+        "recovery fences need no recurring close"
+    );
+    now(o.cleanup(20_000)).unwrap();
+    assert!(ctl.confirmed());
+    assert!(!now(o.needs_cleanup()));
+}
+
+#[test]
+fn factory_error_has_uncertain_occupancy_but_no_control_to_poll_forever() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let id = {
+        let mut guard = now(o.lock(cfg(3), 0)).unwrap();
+        now(guard.reserve_current(WorkClass::Stream)).unwrap()
+    };
+    assert!(now(o.start(id, 5000, 0, || Err::<(FakeControl, Ready<()>), _>(()))).is_err());
+    assert!(!now(o.needs_cleanup()));
+    assert_eq!(
+        now(o.finish(id, SessionResult::ProviderFailure, 0)),
+        Err(SupervisorError::CloseUnconfirmed)
+    );
+    assert_eq!(store.reservations(), 1);
+}
+
+#[test]
+fn reserve_current_and_start_use_the_retained_high_water_clock() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    drop(now(o.lock(cfg(3), 10_000)).unwrap());
+    let id = {
+        let mut guard = now(o.lock(cfg(3), 0)).unwrap();
+        now(guard.reserve_current(WorkClass::Stream)).unwrap()
+    };
+    let journal = store.json();
+    let reservation = journal["reservations"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(reservation["expires_at_ms"], 30_000);
+    let called = std::cell::Cell::new(false);
+    let result = now(o.start(id, 10_000, 0, || {
+        called.set(true);
+        Ok::<_, ()>((FakeControl::new(), ready(())))
+    }));
+    assert!(matches!(result, Err(SupervisorError::Refused)));
+    assert!(!called.get());
+    now(o.cancel_unstarted(id)).unwrap();
+}
+
+#[test]
+fn explicit_close_cannot_discard_a_retained_auth_failure() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, _) = reserve_started(&o, cfg(3), 0);
+    let guard = now(o.lock(cfg(3), 0)).unwrap();
+    let completion = guard.completion(id).unwrap();
+    drop(guard);
+    completion.complete(SessionResult::AuthFailure);
+    now(o.close(id)).unwrap();
+    assert_eq!(store.json()["quarantined_secret"], SECRET_A);
+    assert_eq!(store.reservations(), 0);
+    assert!(
+        !now(o.lock(cfg(3), 0))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+}
+
+#[test]
+fn local_aborts_do_not_trip_or_clear_provider_breaker() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    for _ in 0..3 {
+        let (id, _) = reserve_started(&o, cfg(3), 0);
+        now(o.finish(id, SessionResult::Aborted, 0)).unwrap();
+    }
+    assert!(
+        now(o.lock(cfg(3), 0))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+    let (id, _) = reserve_started(&o, cfg(3), 0);
+    for _ in 0..3 {
+        now(o.record_result(id, SessionResult::ProviderFailure, 0)).unwrap();
+    }
+    now(o.finish(id, SessionResult::Aborted, 0)).unwrap();
+    assert!(
+        !now(o.lock(cfg(3), 0))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+}
