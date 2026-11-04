@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::account_pool::{
@@ -133,10 +134,19 @@ pub enum SessionResult {
     AuthFailure,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub retired: u32,
+    /// All outstanding reservations, including active and recovery-fenced ones.
+    pub retained: u32,
+}
+
 struct Held<C> {
     lease: Lease,
     error_epoch: u64,
     attempted: bool,
+    // Terminal even if close is cancelled, fails, or the clock moves backwards.
+    closing: bool,
     control: Option<C>,
 }
 
@@ -219,8 +229,9 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         if self.poisoned || self.recovery_fenced {
             candidate.eligible = false;
         }
-        // Recovered reservations are not reconstructed as droppable leases.
-        candidate.in_flight = self.journal.reservations.len() as u32;
+        // Count recovered reservations and leases whose retirement write is
+        // uncertain; neither may disappear from the scheduling projection.
+        candidate.in_flight = self.outstanding();
         candidate
     }
 
@@ -263,6 +274,7 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
                 lease,
                 error_epoch: self.pool.pool().borrow().provider_error_epoch(),
                 attempted: false,
+                closing: false,
                 control: None,
             },
         );
@@ -283,6 +295,9 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         let Some(reservation) = self.journal.reservations.get(&id.sequence) else {
             return false;
         };
+        if self.held.get(&id.sequence).is_none_or(|held| held.closing) {
+            return false;
+        }
         let config = &self.journal.config;
         config.enabled
             && config.can_read
@@ -398,8 +413,9 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
         }
         let held = self
             .held
-            .get(&id.sequence)
+            .get_mut(&id.sequence)
             .ok_or(SupervisorError::UnknownSession)?;
+        held.closing = true;
         let control = held.control.as_ref().ok_or(SupervisorError::NotStarted)?;
         control
             .close()
@@ -412,6 +428,87 @@ impl<S: AccountStorage, C: CloseControl> AccountSupervisor<S, C> {
             return Err(SupervisorError::Fenced);
         }
         self.retire(id).await
+    }
+
+    /// Drain expired/revoked sessions without fetching the registry. A runtime
+    /// must invoke this on its deadline/revocation path even if requests or
+    /// registry reads fail. Each control must bound its own close; all controls
+    /// are polled together so one slow close cannot hide the others. Cancelling
+    /// this sweep leaves every selected session terminal and its capacity held.
+    /// Resolver proof expiry gates AUTHINFO, not an already authenticated session.
+    pub async fn cleanup(&mut self, now_ms: u64) -> Result<CleanupReport, SupervisorError> {
+        let invalid: Vec<u32> = self
+            .held
+            .keys()
+            .copied()
+            .filter(|sequence| {
+                !self.auth_permitted(
+                    SessionId::new(*sequence, &self.journal.config),
+                    u64::MAX,
+                    now_ms,
+                )
+            })
+            .collect();
+        // Fence ALL selected sessions before polling any close future.
+        for sequence in invalid {
+            self.held.get_mut(&sequence).unwrap().closing = true;
+        }
+        let retired: Vec<u32> = join_all(self.held.iter().filter(|(_, held)| held.closing).map(
+            |(sequence, held)| async move {
+                if !held.attempted {
+                    return Some(*sequence);
+                }
+                let control = held.control.as_ref()?;
+                if control.close().await.is_ok() && control.confirmed_closed() {
+                    Some(*sequence)
+                } else {
+                    None
+                }
+            },
+        ))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        // A previous uncertain write may have removed journal entries already.
+        // Drain controls anyway, but never infer safe capacity from that journal.
+        if self.poisoned {
+            return Err(SupervisorError::Fenced);
+        }
+        if self.recovery_fenced || retired.is_empty() {
+            return Ok(self.cleanup_report(0));
+        }
+        for sequence in &retired {
+            self.journal
+                .reservations
+                .remove(sequence)
+                .ok_or(SupervisorError::UnknownSession)?;
+        }
+        self.persist().await?;
+        for sequence in &retired {
+            let held = self
+                .held
+                .remove(sequence)
+                .ok_or(SupervisorError::UnknownSession)?;
+            self.pool.pool().borrow_mut().release(held.lease, None);
+        }
+        Ok(self.cleanup_report(retired.len() as u32))
+    }
+
+    fn cleanup_report(&self, retired: u32) -> CleanupReport {
+        CleanupReport {
+            retired,
+            retained: self.outstanding(),
+        }
+    }
+
+    fn outstanding(&self) -> u32 {
+        let held_only = self
+            .held
+            .keys()
+            .filter(|sequence| !self.journal.reservations.contains_key(sequence))
+            .count();
+        (self.journal.reservations.len() + held_only) as u32
     }
 
     async fn retire(&mut self, id: SessionId) -> Result<(), SupervisorError> {

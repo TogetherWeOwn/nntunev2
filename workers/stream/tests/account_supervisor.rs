@@ -1728,3 +1728,470 @@ async fn valid_edits_for_this_account_are_honoured_and_fence() {
     let mut sup = open(&store, cfg(3)).await;
     assert!(is_quarantined(sup.reserve(WorkClass::Stream, 0).await));
 }
+
+// ------------------------------------------------------------- cleanup
+//
+// `cleanup` closes every expired, revoked, quarantined or previously-closing
+// session in parallel. `retained` is the TOTAL outstanding reservations after
+// the call (journal/held union), including still-active ones. Fake controls
+// prove bookkeeping only, never real Worker socket closure.
+
+async fn clean(sup: &mut Sup, now: u64) -> (u32, u32) {
+    let r = sup.cleanup(now).await.expect("cleanup reports");
+    (r.retired, r.retained)
+}
+
+async fn clean_err(sup: &mut Sup, now: u64) -> SupervisorError {
+    match sup.cleanup(now).await {
+        Err(e) => e,
+        Ok(_) => panic!("cleanup must fail"),
+    }
+}
+
+#[tokio::test]
+async fn cleanup_without_work_writes_nothing() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    let saves = store.save_attempts();
+    assert_eq!(clean(&mut sup, 0).await, (0, 0));
+    assert_eq!(store.save_attempts(), saves, "empty no-op writes nothing");
+
+    let (id, ctl) = started(&mut sup, 1_000).await;
+    let saves = store.save_attempts();
+    assert_eq!(clean(&mut sup, 1_001).await, (0, 1));
+    assert_eq!(
+        store.save_attempts(),
+        saves,
+        "active-only no-op writes nothing"
+    );
+    assert_eq!(ctl.calls(), 0);
+    assert!(sup.auth_permitted(id, u64::MAX, 1_001));
+}
+
+#[tokio::test]
+async fn cleanup_retires_at_the_exact_ttl_and_separates_active_sessions() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    let (old, old_ctl) = started(&mut sup, 0).await;
+    let (fresh, fresh_ctl) = started(&mut sup, 5_000).await;
+    let unstarted = reserve(&mut sup, 0).await;
+    let saves = store.save_attempts();
+
+    // One millisecond before the TTL nothing is eligible.
+    assert_eq!(clean(&mut sup, SESSION_TTL_MS - 1).await, (0, 3));
+    assert_eq!(store.save_attempts(), saves);
+    assert_eq!(old_ctl.calls(), 0);
+
+    // Exactly at the TTL the started and the unstarted expired ones go; the
+    // active one is untouched and still counted as retained.
+    assert_eq!(clean(&mut sup, SESSION_TTL_MS).await, (2, 1));
+    assert_eq!(old_ctl.calls(), 1);
+    assert!(old_ctl.confirmed());
+    assert_eq!(fresh_ctl.calls(), 0);
+    assert_eq!(store.reservations(), 1);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 1);
+    assert!(!sup.auth_permitted(old, u64::MAX, SESSION_TTL_MS));
+    assert!(sup.auth_permitted(fresh, u64::MAX, SESSION_TTL_MS));
+    assert_eq!(
+        sup.cancel_unstarted(unstarted).await,
+        Err(SupervisorError::UnknownSession)
+    );
+    // The unstarted one never needed a factory; capacity is really free again.
+    assert!(sup.reserve(WorkClass::Stream, SESSION_TTL_MS).await.is_ok());
+
+    assert_eq!(clean(&mut sup, 5_000 + SESSION_TTL_MS).await, (1, 1));
+    assert_eq!(fresh_ctl.calls(), 1);
+}
+
+#[tokio::test]
+async fn cleanup_retires_sessions_revoked_by_configuration() {
+    let mut settings = rev(cfg(4), 2);
+    settings.tier = 3;
+    let mut disabled = rev(cfg(4), 2);
+    disabled.enabled = false;
+    let mut no_read = rev(cfg(4), 2);
+    no_read.can_read = false;
+    no_read.ingest_limit = 0;
+    // (name, successor snapshot, can admit a fresh session afterwards)
+    let variants = [
+        ("settings revision", settings, true),
+        ("secret rotation", rotated(cfg(4), 2, SECRET_B), true),
+        ("disabled", disabled, false),
+        ("cannot read", no_read, false),
+    ];
+    for (name, next, admits) in variants {
+        let store = FakeStorage::new();
+        let mut sup = open(&store, cfg(4)).await;
+        let (a, a_ctl) = started(&mut sup, 0).await;
+        let ingest = sup.reserve(WorkClass::Ingest, 0).await.unwrap();
+        let ingest_ctl = begin(&mut sup, ingest, 0);
+        let unstarted = reserve(&mut sup, 0).await;
+        sup.reconcile(next).await.unwrap();
+        let mut fresh = None;
+        if admits {
+            fresh = Some(started(&mut sup, 1_000).await);
+        }
+        for id in [a, ingest, unstarted] {
+            assert!(!sup.auth_permitted(id, u64::MAX, 1_000), "{name}");
+        }
+
+        let kept = u32::from(admits);
+        assert_eq!(clean(&mut sup, 1_000).await, (3, kept), "{name}");
+        assert_eq!((a_ctl.calls(), ingest_ctl.calls()), (1, 1), "{name}");
+        assert!(a_ctl.confirmed() && ingest_ctl.confirmed(), "{name}");
+        assert_eq!(store.reservations(), kept as usize, "{name}");
+        assert_eq!(sup.candidate(WorkClass::Stream).in_flight, kept, "{name}");
+        if let Some((id, ctl)) = fresh {
+            assert!(sup.auth_permitted(id, u64::MAX, 1_000), "{name}");
+            assert_eq!(ctl.calls(), 0, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_retires_every_session_of_a_quarantined_secret() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    let (a, a_ctl) = started(&mut sup, 0).await;
+    let (b, b_ctl) = started(&mut sup, 0).await;
+    let _unstarted = reserve(&mut sup, 0).await;
+    sup.record_result(a, SessionResult::AuthFailure)
+        .await
+        .unwrap();
+    assert!(!sup.auth_permitted(b, u64::MAX, 0));
+
+    // Nowhere near the TTL: quarantine alone selects all of them.
+    assert_eq!(clean(&mut sup, 1).await, (3, 0));
+    assert!(a_ctl.confirmed() && b_ctl.confirmed());
+    assert_eq!(store.reservations(), 0);
+    assert_eq!(quarantined_secret(&store), json!(SECRET_A), "never cleared");
+    assert!(is_quarantined(sup.reserve(WorkClass::Stream, 1).await));
+}
+
+#[tokio::test]
+async fn cleanup_drains_controls_independently_of_a_pending_or_failing_sibling() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    // The pending one has the lowest id so a sequential drain would stall on it.
+    let (_, pending_ctl) = started(&mut sup, 0).await;
+    let (_, failing_ctl) = started(&mut sup, 0).await;
+    let (_, good_ctl) = started(&mut sup, 0).await;
+    pending_ctl.set_mode(CloseMode::Pending);
+    failing_ctl.set_mode(CloseMode::Err);
+
+    assert!(poll_then_drop(sup.cleanup(SESSION_TTL_MS)), "pending close");
+    assert_eq!(pending_ctl.calls(), 1);
+    assert_eq!(failing_ctl.calls(), 1);
+    assert_eq!(
+        good_ctl.calls(),
+        1,
+        "polled despite the earlier pending one"
+    );
+    assert!(good_ctl.confirmed());
+    // A cancelled cleanup retired nothing and released nothing.
+    assert_eq!(store.reservations(), 3);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 3);
+    assert_eq!(sup.reserve(WorkClass::Stream, 0).await, exhausted());
+
+    // Retry once the stuck ones can finish; the already-closed one is fine too.
+    pending_ctl.set_mode(CloseMode::Ok);
+    failing_ctl.set_mode(CloseMode::Ok);
+    assert_eq!(
+        clean(&mut sup, 0).await,
+        (3, 0),
+        "retry never goes back in time"
+    );
+    assert_eq!(store.reservations(), 0);
+}
+
+#[tokio::test]
+async fn cleanup_close_errors_and_unconfirmed_closes_report_retained_without_release() {
+    for mode in [
+        CloseMode::Err,
+        CloseMode::ErrConfirmed,
+        CloseMode::OkUnconfirmed,
+    ] {
+        let store = FakeStorage::new();
+        let mut sup = open(&store, cfg(3)).await;
+        let (bad, bad_ctl) = started(&mut sup, 0).await;
+        let (_good, good_ctl) = started(&mut sup, 0).await;
+        let _unstarted = reserve(&mut sup, 0).await;
+        bad_ctl.set_mode(mode);
+
+        assert_eq!(clean(&mut sup, SESSION_TTL_MS).await, (2, 1), "{mode:?}");
+        assert!(good_ctl.confirmed());
+        assert_eq!(bad_ctl.calls(), 1);
+        assert_eq!(store.reservations(), 1, "{mode:?}");
+        assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 1);
+        // Not poisoned, but the failed one holds its slot and can never AUTH again.
+        assert!(sup.candidate(WorkClass::Stream).eligible);
+        assert!(!sup.auth_permitted(bad, u64::MAX, 0));
+        assert!(!sup.auth_permitted(bad, u64::MAX, SESSION_TTL_MS));
+
+        bad_ctl.set_mode(CloseMode::Ok);
+        assert_eq!(clean(&mut sup, SESSION_TTL_MS).await, (1, 0), "{mode:?}");
+        assert_eq!(bad_ctl.calls(), 2);
+        assert_eq!(store.reservations(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_or_failed_cleanup_never_lets_a_selected_session_authenticate_again() {
+    for mode in [CloseMode::Pending, CloseMode::Err, CloseMode::OkUnconfirmed] {
+        let store = FakeStorage::new();
+        let mut sup = open(&store, cfg(2)).await;
+        let (old, old_ctl) = started(&mut sup, 1_000).await;
+        let (live, _live_ctl) = started(&mut sup, 5_000).await;
+        old_ctl.set_mode(mode);
+        let at = 1_000 + SESSION_TTL_MS;
+        if mode == CloseMode::Pending {
+            assert!(poll_then_drop(sup.cleanup(at)));
+        } else {
+            assert_eq!(clean(&mut sup, at).await, (0, 2), "{mode:?}");
+        }
+        // Terminal from before the first await: a clock that moves backwards
+        // (or any other time) cannot resurrect it. Unselected stays valid.
+        for t in [0, 1_000, at - 1, at, at + 1] {
+            assert!(!sup.auth_permitted(old, u64::MAX, t), "{mode:?} at {t}");
+        }
+        assert!(sup.auth_permitted(live, u64::MAX, at), "{mode:?}");
+        let refused = sup.start(old, u64::MAX, 0, || {
+            Ok::<_, ()>((FakeControl::new(CloseMode::Ok), ready(())))
+        });
+        assert!(refused.is_err());
+
+        // A later cleanup, even with an earlier timestamp, still finishes the job.
+        old_ctl.set_mode(CloseMode::Ok);
+        assert_eq!(clean(&mut sup, 0).await, (1, 1), "{mode:?}");
+        assert!(sup.auth_permitted(live, u64::MAX, 0));
+    }
+}
+
+#[tokio::test]
+async fn explicit_close_cancellation_or_failure_blocks_authentication_and_cleanup_finishes_it() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(2)).await;
+    let (cancelled, cancelled_ctl) = started(&mut sup, 0).await;
+    let (failed, failed_ctl) = started(&mut sup, 0).await;
+    cancelled_ctl.set_mode(CloseMode::Pending);
+    failed_ctl.set_mode(CloseMode::Err);
+    assert!(sup.auth_permitted(cancelled, u64::MAX, 0));
+
+    assert!(poll_then_drop(sup.close(cancelled)));
+    assert_eq!(
+        sup.close(failed).await,
+        Err(SupervisorError::CloseUnconfirmed)
+    );
+    for id in [cancelled, failed] {
+        assert!(
+            !sup.auth_permitted(id, u64::MAX, 0),
+            "terminal despite no expiry"
+        );
+    }
+    assert_eq!(store.reservations(), 2);
+
+    // Previously-closing sessions are selected although nothing else revokes them.
+    cancelled_ctl.set_mode(CloseMode::Ok);
+    failed_ctl.set_mode(CloseMode::Ok);
+    assert_eq!(clean(&mut sup, 0).await, (2, 0));
+    assert_eq!(store.reservations(), 0);
+}
+
+#[tokio::test]
+async fn cleanup_attempted_factory_failure_without_control_stays_retained() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    let broken = reserve(&mut sup, 0).await;
+    let r = sup.start(broken, u64::MAX, 0, || {
+        Err::<(FakeControl, Ready<()>), ()>(())
+    });
+    assert_eq!(r.err(), Some(SupervisorError::Dial));
+    let (_, ctl) = started(&mut sup, 0).await;
+    let _unstarted = reserve(&mut sup, 0).await;
+
+    // Only the one with a confirmed control and the never-dialed one retire.
+    assert_eq!(clean(&mut sup, SESSION_TTL_MS).await, (2, 1));
+    assert!(ctl.confirmed());
+    assert_eq!(store.reservations(), 1);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 1);
+    assert!(!sup.auth_permitted(broken, u64::MAX, 0));
+    assert_eq!(
+        sup.cancel_unstarted(broken).await,
+        Err(SupervisorError::AlreadyStarted)
+    );
+    // Stable on repeat, and a restart still fences on it.
+    assert_eq!(clean(&mut sup, 10 * SESSION_TTL_MS).await, (0, 1));
+    drop(sup);
+    let mut again = open(&store, cfg(3)).await;
+    assert_eq!(
+        again.reserve(WorkClass::Stream, 0).await,
+        Err(SupervisorError::Fenced)
+    );
+}
+
+#[tokio::test]
+async fn cleanup_never_retires_or_resets_recovered_reservations() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(3)).await;
+    let _ = started(&mut sup, 0).await;
+    let _ = reserve(&mut sup, 0).await;
+    drop(sup); // eviction: socket fate unknown
+
+    let mut again = open(&store, cfg(3)).await;
+    let saves = store.save_attempts();
+    assert_eq!(clean(&mut again, 100 * SESSION_TTL_MS).await, (0, 2));
+    assert_eq!(
+        store.save_attempts(),
+        saves,
+        "nothing written for recovered ones"
+    );
+    assert_eq!(store.reservations(), 2);
+    assert_eq!(
+        again.reserve(WorkClass::Stream, 100 * SESSION_TTL_MS).await,
+        Err(SupervisorError::Fenced)
+    );
+    assert!(!again.candidate(WorkClass::Stream).eligible);
+    assert_eq!(again.candidate(WorkClass::Stream).in_flight, 2);
+
+    // Neither rotation nor a later snapshot changes that.
+    again.reconcile(rotated(cfg(3), 2, SECRET_B)).await.unwrap();
+    assert_eq!(clean(&mut again, 1 << 40).await, (0, 2));
+    assert_eq!(store.reservations(), 2);
+    drop(again);
+    let mut third = open(&store, rotated(cfg(3), 2, SECRET_B)).await;
+    assert_eq!(
+        third.reserve(WorkClass::Stream, 0).await,
+        Err(SupervisorError::Fenced)
+    );
+}
+
+#[tokio::test]
+async fn cleanup_storage_failure_or_cancellation_fences_but_controls_close_and_nothing_is_released()
+{
+    for fault in [
+        Fault::FailBefore,
+        Fault::FailAfter,
+        Fault::PendBefore,
+        Fault::PendAfter,
+    ] {
+        let store = FakeStorage::new();
+        let mut sup = open(&store, cfg(2)).await;
+        let (a, a_ctl) = started(&mut sup, 0).await;
+        let (b, b_ctl) = started(&mut sup, 0).await;
+        store.set_save_fault(fault);
+        match fault {
+            Fault::FailBefore | Fault::FailAfter => {
+                assert_eq!(
+                    clean_err(&mut sup, SESSION_TTL_MS).await,
+                    SupervisorError::Storage,
+                    "{fault:?}"
+                );
+            }
+            _ => assert!(poll_then_drop(sup.cleanup(SESSION_TTL_MS)), "{fault:?}"),
+        }
+        store.set_save_fault(Fault::None);
+
+        assert!(a_ctl.confirmed() && b_ctl.confirmed(), "{fault:?}");
+        // Poisoned, and even a backwards clock cannot reopen AUTH.
+        for id in [a, b] {
+            assert!(!sup.auth_permitted(id, u64::MAX, 0), "{fault:?}");
+        }
+        assert!(!sup.candidate(WorkClass::Stream).eligible);
+        assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 2, "{fault:?}");
+        assert_eq!(
+            sup.reserve(WorkClass::Stream, 0).await,
+            Err(SupervisorError::Fenced)
+        );
+
+        // Cleanup stays a drain path while poisoned: closes again, releases nothing.
+        assert!(sup.cleanup(SESSION_TTL_MS).await.is_err(), "{fault:?}");
+        assert_eq!((a_ctl.calls(), b_ctl.calls()), (2, 2), "{fault:?}");
+        assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 2, "{fault:?}");
+
+        if matches!(fault, Fault::FailBefore | Fault::PendBefore) {
+            drop(sup);
+            let mut again = open(&store, cfg(2)).await;
+            assert_eq!(store.reservations(), 2, "{fault:?}");
+            assert_eq!(
+                again.reserve(WorkClass::Stream, 0).await,
+                Err(SupervisorError::Fenced)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_on_an_already_poisoned_instance_still_closes_without_release() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(1)).await;
+    let (id, ctl) = started(&mut sup, 0).await;
+    store.set_save_fault(Fault::FailBefore);
+    assert_eq!(
+        sup.reconcile(rev(cfg(1), 2)).await,
+        Err(SupervisorError::Storage)
+    );
+    store.set_save_fault(Fault::None);
+    let saves = store.save_attempts();
+
+    assert!(sup.cleanup(0).await.is_err());
+    assert_eq!(ctl.calls(), 1);
+    assert!(ctl.confirmed());
+    assert_eq!(
+        store.save_attempts(),
+        saves,
+        "poisoned instances never write"
+    );
+    assert_eq!(store.reservations(), 1);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 1);
+    assert!(!sup.auth_permitted(id, u64::MAX, 0));
+    assert_eq!(
+        sup.reserve(WorkClass::Stream, 0).await,
+        Err(SupervisorError::Fenced)
+    );
+}
+
+#[tokio::test]
+async fn cleanup_releases_capacity_only_after_the_storage_ack() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(1)).await;
+    let (_, ctl) = started(&mut sup, 0).await;
+    store.set_save_fault(Fault::PendAfter);
+    assert!(poll_then_drop(sup.cleanup(SESSION_TTL_MS)));
+    // Durable write happened, but the ack never came: the cap slot stays taken.
+    assert!(ctl.confirmed());
+    assert_eq!(store.reservations(), 0);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 1);
+    store.set_save_fault(Fault::None);
+    assert_eq!(
+        sup.reserve(WorkClass::Stream, SESSION_TTL_MS).await,
+        Err(SupervisorError::Fenced)
+    );
+
+    // Control: with a clean ack the same shape frees the slot.
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(1)).await;
+    let _ = started(&mut sup, 0).await;
+    assert_eq!(clean(&mut sup, SESSION_TTL_MS).await, (1, 0));
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 0);
+    assert!(sup.reserve(WorkClass::Stream, SESSION_TTL_MS).await.is_ok());
+}
+
+#[tokio::test]
+async fn cleanup_polls_the_entire_hard_cap_before_waiting_and_retires_in_one_write() {
+    let store = FakeStorage::new();
+    let mut sup = open(&store, cfg(HARD_MAX_CONNS)).await;
+    let mut controls = Vec::new();
+    for _ in 0..HARD_MAX_CONNS {
+        controls.push(started(&mut sup, 0).await.1);
+    }
+    controls[0].set_mode(CloseMode::Pending);
+    let saves = store.save_attempts();
+    assert!(poll_then_drop(sup.cleanup(SESSION_TTL_MS)));
+    assert!(controls.iter().all(|control| control.calls() == 1));
+    assert_eq!(store.save_attempts(), saves);
+    assert_eq!(store.reservations(), HARD_MAX_CONNS as usize);
+    controls[0].set_mode(CloseMode::Ok);
+    assert_eq!(clean(&mut sup, 0).await, (HARD_MAX_CONNS, 0));
+    assert_eq!(store.save_attempts(), saves + 1);
+    assert_eq!(sup.candidate(WorkClass::Stream).in_flight, 0);
+}

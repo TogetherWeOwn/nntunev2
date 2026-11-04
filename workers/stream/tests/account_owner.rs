@@ -133,6 +133,8 @@ impl AccountStorage for FakeStorage {
 struct CloseState {
     calls: u32,
     confirmed: bool,
+    /// While set, `close` suspends (after counting the call) and confirms nothing.
+    blocked: bool,
 }
 
 #[derive(Clone)]
@@ -143,7 +145,11 @@ impl FakeControl {
         Self(Rc::new(RefCell::new(CloseState {
             calls: 0,
             confirmed: false,
+            blocked: false,
         })))
+    }
+    fn block(&self, v: bool) {
+        self.0.borrow_mut().blocked = v;
     }
     fn calls(&self) -> u32 {
         self.0.borrow().calls
@@ -155,9 +161,16 @@ impl FakeControl {
 
 impl CloseControl for FakeControl {
     async fn close(&self) -> Result<(), CloseError> {
-        let mut s = self.0.borrow_mut();
-        s.calls += 1;
-        s.confirmed = true;
+        self.0.borrow_mut().calls += 1;
+        poll_fn(|_| {
+            if self.0.borrow().blocked {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        self.0.borrow_mut().confirmed = true;
         Ok(())
     }
     fn confirmed_closed(&self) -> bool {
@@ -566,9 +579,6 @@ fn auth_permitted_refuses_while_locked_and_works_outside_the_guard() {
     // Expired proof (now >= proof expiry) and exact boundary are refused.
     assert!(!o.auth_permitted(id, 100, 100));
     assert!(!o.auth_permitted(id, 99, 100));
-    // Reservation TTL elapsed.
-    assert!(!o.auth_permitted(id, u64::MAX, 100 + 20_000));
-
     let g = now(o.lock(cfg(3), 100)).expect("lock");
     assert!(
         !o.auth_permitted(id, 1_000, 100),
@@ -576,6 +586,9 @@ fn auth_permitted_refuses_while_locked_and_works_outside_the_guard() {
     );
     drop(g);
     assert!(o.auth_permitted(id, 1_000, 100));
+    // Reservation TTL elapsed; a subsequent backward reading cannot restore it.
+    assert!(!o.auth_permitted(id, u64::MAX, 100 + 20_000));
+    assert!(!o.auth_permitted(id, 1_000, 100));
 }
 
 #[test]
@@ -585,6 +598,31 @@ fn auth_permitted_is_false_before_initialization() {
     let o = owner(&store);
     assert!(!o.auth_permitted(scratch_id, 1_000, 0));
     assert_eq!((store.loads(), store.saves()), (0, 0));
+}
+
+#[test]
+fn auth_permitted_clamps_a_backward_clock_to_the_owner_high_water_mark() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, _ctl) = reserve_started(&o, cfg(3), 0);
+    assert!(
+        o.auth_permitted(id, 5_000, 4_999),
+        "control: valid before the mark moves"
+    );
+    // A later admission advances the high-water mark; no cleanup ever runs.
+    drop(now(o.lock(cfg(3), 6_000)).expect("lock"));
+    assert!(
+        !o.auth_permitted(id, 5_000, 100),
+        "proof expired at the 6_000 high-water mark, not at the raw 100"
+    );
+    assert!(!o.auth_permitted(id, 6_000, 0));
+    assert!(
+        o.auth_permitted(id, 6_001, 100),
+        "mark itself is still inside the proof"
+    );
+    // The same clamp applies to the session TTL.
+    drop(now(o.lock(cfg(3), 20_000)).expect("lock"));
+    assert!(!o.auth_permitted(id, u64::MAX, 0));
 }
 
 // ------------------------------------------------ cleanup close
@@ -693,4 +731,225 @@ fn owner_operations_on_an_uninitialized_owner_are_fenced() {
     );
     assert_eq!(now(o.cancel_unstarted(id)), Err(SupervisorError::Fenced));
     assert_eq!((store.loads(), store.saves()), (0, 0));
+}
+
+// ------------------------------------------------ cleanup (owner)
+
+fn counts<E: std::fmt::Debug>(
+    r: Result<nntune_stream::account_supervisor::CleanupReport, E>,
+) -> (u32, u32) {
+    let r = r.expect("cleanup reports");
+    (r.retired, r.retained)
+}
+
+#[test]
+fn cleanup_on_an_unopened_owner_reports_nothing_without_touching_storage() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    assert_eq!(counts(now(o.cleanup(0))), (0, 0));
+    assert_eq!(counts(now(o.cleanup(u64::MAX))), (0, 0));
+    assert_eq!((store.loads(), store.saves()), (0, 0));
+    // Still unopened, not fenced: a normal lock initializes it afterwards.
+    assert!(now(o.lock(cfg(3), 0)).is_ok());
+    assert_eq!(store.loads(), 1);
+}
+
+#[test]
+fn cleanup_on_a_fenced_owner_returns_fenced() {
+    // Cancelled initialization leaves the terminal fence.
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    store.block_load(true);
+    let mut a = Box::pin(o.lock(cfg(3), 0));
+    assert!(is_pending(&mut a));
+    drop(a);
+    store.block_load(false);
+    assert_eq!(now(o.cleanup(0)).err(), Some(SupervisorError::Fenced));
+    assert_eq!(store.loads(), 1, "no second open over an uncertain state");
+    assert_eq!(store.saves(), 0);
+
+    // So does a failed initialization.
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    store.fail_load(true);
+    assert_eq!(
+        now(o.lock(cfg(3), 0)).err().expect("storage"),
+        SupervisorError::Storage
+    );
+    store.fail_load(false);
+    assert_eq!(now(o.cleanup(0)).err(), Some(SupervisorError::Fenced));
+    assert_eq!(store.loads(), 1);
+}
+
+#[test]
+fn cleanup_needs_no_registry_snapshot_and_leaves_active_sessions_alone() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (old, old_ctl) = reserve_started(&o, cfg(3), 0);
+    let (live, live_ctl) = reserve_started(&o, cfg(3), 15_000);
+    let (loads, saves) = (store.loads(), store.saves());
+
+    assert_eq!(counts(now(o.cleanup(19_999))), (0, 2));
+    assert_eq!(
+        (store.loads(), store.saves()),
+        (loads, saves),
+        "no-op writes nothing"
+    );
+    assert_eq!(counts(now(o.cleanup(20_000))), (1, 1));
+    assert_eq!(old_ctl.calls(), 1);
+    assert!(old_ctl.confirmed());
+    assert_eq!(live_ctl.calls(), 0);
+    assert_eq!(store.reservations(), 1);
+    assert_eq!(store.loads(), loads, "never reloads");
+    assert!(!o.auth_permitted(old, u64::MAX, 20_000));
+    assert!(o.auth_permitted(live, u64::MAX, 20_000));
+}
+
+#[test]
+fn cleanup_after_a_failed_reconciliation_still_closes_but_releases_nothing() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    let mut next = cfg(3);
+    next.revision = 2;
+    store.fail_save(true);
+    assert_eq!(
+        now(o.lock(next, 1)).err().expect("storage"),
+        SupervisorError::Storage
+    );
+    store.fail_save(false);
+    let saves = store.saves();
+
+    let r = now(o.cleanup(20_000));
+    assert!(
+        matches!(r, Err(SupervisorError::Fenced | SupervisorError::Storage)),
+        "poisoned owner cannot report a clean release"
+    );
+    assert_eq!(ctl.calls(), 1);
+    assert!(ctl.confirmed());
+    assert_eq!(store.saves(), saves);
+    assert_eq!(store.reservations(), 1, "reservation remains durable");
+    assert!(!o.auth_permitted(id, u64::MAX, 0));
+}
+
+#[test]
+fn cleanup_storage_failure_poisons_the_owner_after_closing_physically() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    store.fail_save(true);
+    assert_eq!(now(o.cleanup(20_000)).err(), Some(SupervisorError::Storage));
+    store.fail_save(false);
+    assert!(ctl.confirmed());
+    assert!(!o.auth_permitted(id, u64::MAX, 0));
+    assert_eq!(
+        now(o.lock(cfg(3), 20_001)).err().expect("fenced"),
+        SupervisorError::Fenced
+    );
+}
+
+#[test]
+fn cleanup_timestamps_are_monotonic_so_a_backward_clock_cannot_resurrect_a_session() {
+    // A later lock establishes the high-water mark; an earlier cleanup uses it.
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    drop(now(o.lock(cfg(3), 30_000)).expect("lock"));
+    assert_eq!(counts(now(o.cleanup(1))), (1, 0));
+    assert!(ctl.confirmed());
+    assert!(!o.auth_permitted(id, u64::MAX, 1));
+
+    // A cancelled cleanup at a later time, then a backward one.
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    ctl.block(true);
+    let mut c = Box::pin(o.cleanup(25_000));
+    assert!(is_pending(&mut c));
+    assert_eq!(ctl.calls(), 1);
+    drop(c);
+    for t in [0, 1, 24_999, 25_000] {
+        assert!(!o.auth_permitted(id, u64::MAX, t), "terminal at {t}");
+    }
+    ctl.block(false);
+    assert_eq!(counts(now(o.cleanup(0))), (1, 0), "treated as >= 25_000");
+    assert_eq!(store.reservations(), 0);
+}
+
+#[test]
+fn cleanup_queues_behind_a_held_guard() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (_, ctl) = reserve_started(&o, cfg(3), 0);
+    let g = now(o.lock(cfg(3), 1)).expect("lock");
+    let mut c = Box::pin(o.cleanup(20_000));
+    assert!(is_pending(&mut c));
+    assert_eq!(ctl.calls(), 0, "serialized behind the guard");
+    drop(g);
+    assert_eq!(counts(done(poll(&mut c))), (1, 0));
+    assert_eq!(ctl.calls(), 1);
+}
+
+#[test]
+fn explicit_close_cancellation_blocks_authentication_through_the_owner() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, ctl) = reserve_started(&o, cfg(3), 0);
+    assert!(o.auth_permitted(id, u64::MAX, 0));
+    ctl.block(true);
+    let mut c = Box::pin(o.close(id));
+    assert!(is_pending(&mut c));
+    drop(c);
+    assert!(
+        !o.auth_permitted(id, u64::MAX, 0),
+        "terminal before the await"
+    );
+    assert_eq!(store.reservations(), 1);
+    ctl.block(false);
+    assert_eq!(
+        counts(now(o.cleanup(0))),
+        (1, 0),
+        "closing sessions are finished"
+    );
+}
+
+#[test]
+fn consecutive_auth_checks_retain_observed_time_without_another_mutation() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, _) = reserve_started(&o, cfg(3), 100);
+    assert!(!o.auth_permitted(id, 5_000, 5_000));
+    assert!(!o.auth_permitted(id, 5_000, 4_999));
+    assert!(o.auth_permitted(id, 5_001, 0));
+    assert!(!o.auth_permitted(id, u64::MAX, 20_100));
+    assert!(!o.auth_permitted(id, u64::MAX, 20_099));
+}
+
+#[test]
+fn auth_time_observations_do_not_double_count_breaker_cooldown() {
+    let store = FakeStorage::new();
+    let o = owner(&store);
+    let (id, _) = reserve_started(&o, cfg(3), 0);
+    for _ in 0..3 {
+        now(o.record_result(id, SessionResult::ProviderFailure, 0)).unwrap();
+    }
+    assert!(
+        !now(o.lock(cfg(3), 0))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+    assert!(o.auth_permitted(id, u64::MAX, 19_000));
+    assert!(
+        !now(o.lock(cfg(3), 29_999))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
+    assert!(
+        now(o.lock(cfg(3), 30_000))
+            .unwrap()
+            .candidate(WorkClass::Stream)
+            .eligible
+    );
 }

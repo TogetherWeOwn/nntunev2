@@ -12,7 +12,8 @@ use futures_util::lock::{Mutex, MutexGuard};
 
 use crate::account_pool::{uuid_shaped, AccountConfig, ConfigError};
 use crate::account_supervisor::{
-    AccountStorage, AccountSupervisor, CloseControl, SessionId, SessionResult, SupervisorError,
+    AccountStorage, AccountSupervisor, CleanupReport, CloseControl, SessionId, SessionResult,
+    SupervisorError,
 };
 
 pub struct AccountOwner<S, C> {
@@ -96,6 +97,25 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
         }
     }
 
+    /// Independent retained-control cleanup for the runtime's deadline path.
+    /// No registry lookup or successful reconciliation is needed. An unopened
+    /// owner has no live sockets and is not initialized just to run cleanup.
+    pub async fn cleanup(&self, now_ms: u64) -> Result<CleanupReport, SupervisorError> {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            OwnerState::Ready {
+                supervisor,
+                last_now_ms,
+            } => {
+                supervisor.advance(now_ms.saturating_sub(*last_now_ms));
+                *last_now_ms = (*last_now_ms).max(now_ms);
+                supervisor.cleanup(*last_now_ms).await
+            }
+            OwnerState::Unopened(_) => Ok(CleanupReport::default()),
+            OwnerState::Fenced => Err(SupervisorError::Fenced),
+        }
+    }
+
     /// Tick at I/O completion, not at the last admission: slow operations must
     /// not consume part of the breaker's cooldown before they even fail.
     pub async fn record_result(
@@ -127,14 +147,20 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
     }
 
     /// Synchronous AUTHINFO hook: refuse rather than wait or panic when a
-    /// mutation is in progress. No guard or mutable reference escapes this read.
+    /// mutation is in progress. Clock observations are retained even on refusal;
+    /// no guard or mutable reference escapes this check.
     pub fn auth_permitted(&self, id: SessionId, proof_expires_at_ms: u64, now_ms: u64) -> bool {
-        let Some(state) = self.state.try_lock() else {
+        let Some(mut state) = self.state.try_lock() else {
             return false;
         };
-        match &*state {
-            OwnerState::Ready { supervisor, .. } => {
-                supervisor.auth_permitted(id, proof_expires_at_ms, now_ms)
+        match &mut *state {
+            OwnerState::Ready {
+                supervisor,
+                last_now_ms,
+            } => {
+                supervisor.advance(now_ms.saturating_sub(*last_now_ms));
+                *last_now_ms = (*last_now_ms).max(now_ms);
+                supervisor.auth_permitted(id, proof_expires_at_ms, *last_now_ms)
             }
             _ => false,
         }
