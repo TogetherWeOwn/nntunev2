@@ -148,6 +148,92 @@ fn applied(outcome: PoolProviderWriteOutcome) -> PoolProviderRow {
 }
 
 #[tokio::test]
+async fn production_registry_malformed_material_is_unavailable() {
+    let f = Fixture::new().await;
+    let mut db = f.connection().await;
+    applied(
+        write_on(&mut db, "admin", &write(0, true), "", NOW)
+            .await
+            .unwrap(),
+    );
+    // These malformed states pass the schema but cannot yield dial material.
+    // The production adapter must return the same unavailable result as a
+    // missing account, not a StoreError that the handler would expose as 500.
+    for mutation in [
+        "UPDATE pool_provider_secrets SET encrypted_creds=decode('00','hex')",
+        "UPDATE pool_provider_secrets SET creds_kek_version=0",
+        "UPDATE pool_provider_secrets SET creds_kek_version=-1",
+        "UPDATE pool_provider_secrets SET creds_payload_format=2",
+        "UPDATE pool_providers SET host='invalid/endpoint'",
+    ] {
+        let tx = db.transaction().await.unwrap();
+        tx.batch_execute(mutation).await.unwrap();
+        assert!(account_on(&tx, ID).await.unwrap().is_none(), "{mutation}");
+        tx.rollback().await.unwrap();
+    }
+    assert!(account_on(&db, ID).await.unwrap().is_some());
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_registry_resolution_joins_the_current_envelope() {
+    let f = Fixture::new().await;
+    let mut db = f.connection().await;
+    assert!(account_on(&db, ID).await.unwrap().is_none());
+    assert!(account_on(&db, "not-an-id").await.is_err());
+    let first = applied(
+        write_on(&mut db, "admin", &write(0, true), "", NOW)
+            .await
+            .unwrap(),
+    );
+    let request = crate::pool_resolver::ResolveRequest {
+        provider_id: ID.into(),
+        revision: first.revision,
+        secret_ref: first.secret_ref.clone(),
+        class: crate::pool_resolver::WorkClass::Stream,
+    };
+    let original = account_on(&db, ID).await.unwrap().unwrap();
+    assert!(request.matches(&original.row));
+    let opened = crate::pool_providers::decrypt_pool_secret(
+        &[7; 32],
+        original.kek_version,
+        &original.row.secret_ref,
+        &original.envelope,
+    )
+    .unwrap();
+    assert_eq!(opened.password, "synthetic-pool-password");
+    let mut rotation = write(1, true);
+    rotation.settings.host = "rotated.example.test".into();
+    applied(
+        write_on(&mut db, "admin", &rotation, "", NOW + 1)
+            .await
+            .unwrap(),
+    );
+    let next = account_on(&db, ID).await.unwrap().unwrap();
+    assert!(!request.matches(&next.row));
+    assert_eq!(next.row.settings.host, "rotated.example.test");
+    assert_eq!(next.row.revision, 2);
+    assert_ne!(next.row.secret_ref, original.row.secret_ref);
+    assert!(crate::pool_providers::decrypt_pool_secret(
+        &[7; 32],
+        next.kek_version,
+        &next.row.secret_ref,
+        &next.envelope,
+    )
+    .is_ok());
+    // A previously returned snapshot remains internally coherent, but cannot
+    // authenticate as the new identity. The handler rejects its old revision.
+    assert!(crate::pool_providers::decrypt_pool_secret(
+        &[7; 32],
+        next.kek_version,
+        &next.row.secret_ref,
+        &original.envelope,
+    )
+    .is_err());
+    f.cleanup().await;
+}
+
+#[tokio::test]
 async fn production_registry_write_rotation_and_redaction() {
     let f = Fixture::new().await;
     let mut db = f.connection().await;

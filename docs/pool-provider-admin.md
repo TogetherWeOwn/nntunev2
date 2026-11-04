@@ -59,6 +59,61 @@ views, never usernames, passwords, envelope bytes or secret references.
 Use the approved operator credential-entry procedure. Do not put actual
 credentials into shell command lines, logs, source files or task comments.
 
+## Internal account resolution
+
+This channel is not an admin or user API. The stream Worker calls the API
+service binding using a dedicated `POOL_RESOLVER_SECRET` (raw string bytes,
+at least 32 bytes, API and stream only). Provisioning the key follows the
+credential approval procedure; implementation does not provision it. Never
+reuse a session, play-grant or metering key. The API alone retains the KEK.
+No cookie or Origin is accepted and no OPTIONS/CORS surface is advertised.
+Absent/short configuration fails closed with 500; bad authentication is the
+ordinary 404, before any registry, DNS or secret read.
+
+The Authorization value is `PoolResolver <unix-seconds>.<lowercase-hex-mac>`.
+The MAC is HMAC-SHA256 over the exact concatenation:
+`nntune-pool-resolver-v1\nPOST\n<path>\n<unix-seconds>\n<body>` (the `\n`
+separators mean newline bytes). The timestamp must be within 30 seconds of
+the API clock. This binds the method, endpoint, timestamp and exact JSON
+bytes; a request signed for registry listing cannot resolve credentials.
+Requests are at most 512 bytes. Service-binding transport is required; the
+signature is not a bearer token for browser use. Freshness limits replay,
+but does not make a signature single-use. Resolving is read-only and does
+not grant an account lease or permission to retry rejected credentials.
+
+- `POST /internal/v1/pool-providers`, body `{}`, returns `{"accounts": [...]}`
+  with scheduling snapshots only: `id`, `revision`, `secret_ref`, `can_read`,
+  `max_connections`, `stream_reserve`, `ingest_limit`, `tier`, `enabled`.
+  Disabled rows remain visible for runtime reconciliation. No endpoint,
+  username, password or envelope is listed. More than 1,000 rows refuses.
+- `POST /internal/v1/pool-providers/resolve` takes `provider_id`, `revision`,
+  `secret_ref` and `class` (`stream` or `ingest`). It joins the current
+  registry row and envelope in one uncached database statement, requires an
+  exact snapshot match, an enabled read account, and nonzero ingest budget
+  for ingest. Unknown fields and invalid identifiers reject with 422.
+  Missing, stale, disabled, rotated, unreadable and class-disabled accounts,
+  unavailable KEK versions, corrupt ciphertext and forbidden DNS targets
+  all return the same generic 503. No alternate KEK or credential retry occurs.
+
+Successful resolve returns `provider_id`, `revision`, `secret_ref`, `host`,
+`port`, `tls`, exact public `peer`, `expires_at`, `username` and `password`.
+The password is decrypted using only its stored KEK version. All DNS answers
+are freshly resolved with the existing bounded, cancellation-safe resolver
+and checked by the shared SSRF policy before selecting a peer; IP literals
+are checked directly. Material expires five seconds after API request time.
+Responses are `Cache-Control: no-store`. Never log or persist these response
+bodies, dump them to a console, store them in DO/R2, or send them in queues.
+
+**Runtime safety gate:** this API does not itself dial or enforce a lease.
+The account DO must reserve capacity, reconcile its current revision and
+quarantine, and consume the result immediately through a transport that dials
+only `peer:port` while authenticating TLS against `host`, without re-resolving
+the hostname. An expired result or a transport unable to preserve that
+pinning must refuse. The existing `WorkerTransport::connect_pinned` checks
+TLS/port policy but still dials a hostname; it does **not** satisfy this peer
+pinning contract. Until the account runtime and suitable transport land,
+NNTP cache misses remain unavailable; this channel alone is not deploy-ready.
+
 ## Verification
 
 Handler tests use the standard API harness. Production transaction tests run
@@ -76,6 +131,6 @@ This backend/playback work follows AGENTS.md **Clean-room, YouTube and
 MetaBrainz guardrails**: no external UI assets or copy, video extraction,
 background video playback, or new catalogue/licensing behavior is introduced.
 
-REA angle: the API reuses the existing admin serialization/role fence and v2
-vault field envelope. No new protocol, crypto scheme or failover policy is
-introduced.
+REA angle: the API reuses the existing admin serialization/role fence, v2
+vault field envelope, HMAC request-authentication pattern and bounded DNS/SSRF
+guard. No new encryption scheme or failover policy is introduced.

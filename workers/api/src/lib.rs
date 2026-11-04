@@ -32,6 +32,7 @@ pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
 pub mod pool_providers;
+pub mod pool_resolver;
 pub mod providers;
 pub mod random;
 pub mod rate_limit;

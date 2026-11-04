@@ -288,6 +288,9 @@ pub struct Config {
     /// closed per-request with a generic 500 while every other
     /// route keeps serving.
     pub meter_sink_secret: Option<Vec<u8>>,
+    /// Dedicated API/stream service-channel key, raw string bytes. Not a
+    /// session, grant or meter key. Absent/short fails resolution closed.
+    pub pool_resolver_secret: Option<Vec<u8>>,
     /// Rate-limit tunables for the auth-start burst and vault
     /// test-connection budgets. `Config::new` uses the documented
     /// defaults; the Worker entry overlays [vars] via
@@ -359,6 +362,7 @@ impl Config {
             stripe_webhook_secret: None,
             play_grant_secret: None,
             meter_sink_secret: None,
+            pool_resolver_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
             qa_code_seam: false,
             qa_auth_token: None,
@@ -451,6 +455,12 @@ impl Config {
     /// closed), so this setter accepts whatever the entry staged.
     pub fn with_meter_sink_secret(mut self, secret: Vec<u8>) -> Self {
         self.meter_sink_secret = Some(secret);
+        self
+    }
+
+    /// Provision the dedicated pool-resolver service-channel key.
+    pub fn with_pool_resolver_secret(mut self, secret: Vec<u8>) -> Self {
+        self.pool_resolver_secret = Some(secret);
         self
     }
 
@@ -688,6 +698,7 @@ pub enum PairAdmission {
 }
 
 mod admin_pool;
+mod pool_resolver;
 
 /// Persistence over migration-0002 tables. Implementations must use
 /// parameterized statements only, and conditional single-row updates for
@@ -699,6 +710,14 @@ pub trait Store {
     fn pool_providers(
         &self,
     ) -> impl Future<Output = Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Current registry row and its envelope in one database snapshot.
+    /// Only the authenticated internal resolver may decrypt this result.
+    fn pool_account(
+        &self,
+        _provider_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::pool_resolver::StoredAccount>, StoreError>> {
         async { Err(StoreError) }
     }
     /// Atomic registry/envelope/audit write with a transaction-side role
@@ -7287,6 +7306,9 @@ where
         // above never sees its Authorization header; it is absent
         // from `is_known_path` on purpose (no browser preflight).
         ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
+        ("POST", crate::pool_resolver::REGISTRY_PATH | crate::pool_resolver::RESOLVE_PATH) => {
+            pool_resolver::handle(ctx, req).await
+        }
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -7600,6 +7622,7 @@ mod tests {
         /// Mirror of `pool_providers` (registry rows, settings + current
         /// `secret_ref` + revision).
         pool_provider_rows: RefCell<Vec<crate::pool_providers::PoolProviderRow>>,
+        pool_reads: std::cell::Cell<usize>,
         /// Mirror of `pool_provider_secrets`, keyed by `secret_ref`:
         /// stored KEK version plus the envelope fields (the envelope type
         /// is neither `Clone` nor `Debug`, so fields are copied).
@@ -7625,9 +7648,35 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn pool_account(
+            &self,
+            provider_id: &str,
+        ) -> Result<Option<crate::pool_resolver::StoredAccount>, StoreError> {
+            self.pool_reads.set(self.pool_reads.get() + 1);
+            let Some(row) = self
+                .pool_provider_rows
+                .borrow()
+                .iter()
+                .find(|row| row.settings.id == provider_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let secrets = self.pool_provider_secrets.borrow();
+            let Some((kek_version, envelope)) = secrets.get(&row.secret_ref) else {
+                return Ok(None);
+            };
+            Ok(Some(crate::pool_resolver::StoredAccount {
+                row,
+                kek_version: *kek_version,
+                envelope: envelope.to_envelope(),
+            }))
+        }
+
         async fn pool_providers(
             &self,
         ) -> Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError> {
+            self.pool_reads.set(self.pool_reads.get() + 1);
             let mut rows = self.pool_provider_rows.borrow().clone();
             rows.sort_by(|a, b| {
                 (a.settings.tier, &a.settings.id).cmp(&(b.settings.tier, &b.settings.id))
@@ -17830,6 +17879,7 @@ mod tests {
     }
 
     include!("handlers/admin_pool_tests.rs");
+    include!("handlers/pool_resolver_tests.rs");
 
     #[test]
     fn admin_write_store_recheck_refuses_a_demoted_actor() {

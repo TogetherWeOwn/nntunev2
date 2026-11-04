@@ -308,6 +308,10 @@ fn config_from_env(env: &Env) -> Option<Config> {
         Some(secret) => config.with_meter_sink_secret(secret),
         None => config,
     };
+    let config = match env_string(env, crate::pool_resolver::SECRET_VAR) {
+        Some(secret) => config.with_pool_resolver_secret(secret.into_bytes()),
+        None => config,
+    };
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
@@ -1941,6 +1945,20 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    async fn pool_account(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<crate::pool_resolver::StoredAccount>, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                pool_registry::account_on(&client, provider_id).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn pool_providers(
         &self,
     ) -> Result<Vec<crate::pool_providers::PoolProviderRow>, StoreError> {

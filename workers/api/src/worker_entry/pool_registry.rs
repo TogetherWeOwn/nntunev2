@@ -42,6 +42,71 @@ pub(super) async fn list_on(
     rows.iter().map(from_row).collect()
 }
 
+pub(super) async fn account_on(
+    client: &impl GenericClient,
+    provider_id: &str,
+) -> Result<Option<crate::pool_resolver::StoredAccount>, StoreError> {
+    if !pool_providers::lower_uuid_ok(provider_id) {
+        return Err(StoreError);
+    }
+    let rows = client
+        .query_typed(
+            &format!(
+                "SELECT {ROW_COLUMNS}, s.encrypted_creds, s.creds_envelope_version, \
+            s.creds_kek_version, s.creds_dek_wrapped_nonce, s.creds_dek_wrapped, \
+            s.creds_payload_nonce, s.creds_payload_format \
+            FROM pool_providers p JOIN pool_provider_secrets s ON s.secret_ref=p.secret_ref \
+            WHERE p.id=$1::uuid"
+            ),
+            &[(&provider_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first()
+        .map(|row| {
+            let version: i16 = row
+                .try_get("creds_envelope_version")
+                .map_err(|_| StoreError)?;
+            let format: i16 = row
+                .try_get("creds_payload_format")
+                .map_err(|_| StoreError)?;
+            let kek_version: i32 = row.try_get("creds_kek_version").map_err(|_| StoreError)?;
+            let wrapped_nonce: Vec<u8> = row
+                .try_get("creds_dek_wrapped_nonce")
+                .map_err(|_| StoreError)?;
+            let payload_nonce: Vec<u8> =
+                row.try_get("creds_payload_nonce").map_err(|_| StoreError)?;
+            let dek_wrapped: Vec<u8> = row.try_get("creds_dek_wrapped").map_err(|_| StoreError)?;
+            let ciphertext: Vec<u8> = row.try_get("encrypted_creds").map_err(|_| StoreError)?;
+            if version != crate::providers::CREDS_ENVELOPE_VERSION
+                || format != crate::providers::CREDS_PAYLOAD_FORMAT_JSON_V1
+                || kek_version <= 0
+                || dek_wrapped.len() != 48
+                || ciphertext.len() < 16
+            {
+                return Err(StoreError);
+            }
+            Ok(crate::pool_resolver::StoredAccount {
+                row: from_row(row)?,
+                kek_version: kek_version as u32,
+                envelope: crate::providers::ProviderCredsEnvelope {
+                    dek_wrapped_nonce: wrapped_nonce.try_into().map_err(|_| StoreError)?,
+                    dek_wrapped,
+                    payload_nonce: payload_nonce.try_into().map_err(|_| StoreError)?,
+                    ciphertext,
+                },
+            })
+        })
+        .transpose()
+        // Query failures above are store outages (500). Malformed stored
+        // material is an unavailable account, just like a failed decrypt
+        // (503); never distinguish corrupt envelope metadata on the wire.
+        .or(Ok(None))
+}
+
 pub(super) async fn write_on(
     client: &mut tokio_postgres::Client,
     actor_user_id: &str,
