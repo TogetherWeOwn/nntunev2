@@ -543,3 +543,98 @@ fn collection_cap_is_enforced_during_reads() {
     );
     assert_eq!(read(&s, 0..1, &mut t), Err(SourceError::Bounds));
 }
+
+#[test]
+fn incremental_walk_matches_synchronous_ranges_and_stops_at_completion() {
+    use nntune_core::original_source::reader::RangeReader;
+    for sizes in [&[4][..], &[3, 3, 2][..], &[3, 2, 4, 2][..]] {
+        let s = source(sizes, None);
+        let size = s.file_size();
+        for start in 0..size {
+            for end in start + 1..=size {
+                let mut expected_transport = transport(sizes);
+                let expected = read(&s, start..end, &mut expected_transport).unwrap();
+                let mut t = transport(sizes);
+                let mut walk = RangeReader::new(&s, start..end).unwrap();
+                let mut control = Control { remaining: 100000 };
+                let mut actual = Vec::new();
+                while let Some(reference) = walk.next_reference().unwrap() {
+                    let body = t.open(reference).unwrap();
+                    walk.push(body, &mut control, |b| {
+                        actual.extend_from_slice(b);
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(t.opened, expected_transport.opened);
+                assert_eq!(
+                    walk.push(Cursor::new(Vec::new()), &mut control, |_| panic!(
+                        "complete"
+                    )),
+                    Err(SourceError::Integrity)
+                );
+                assert!(walk.next_reference().unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn incremental_walk_is_poisoned_by_integrity_or_sink_failure() {
+    use nntune_core::original_source::reader::RangeReader;
+    let s = source(&[3, 3, 2], None);
+    for corrupt in [true, false] {
+        let mut t = transport(&[3, 3, 2]);
+        let mut control = Control { remaining: 100000 };
+        let mut walk = RangeReader::new(&s, 0..8).unwrap();
+        let final_body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+        walk.push(final_body, &mut control, |_| {
+            panic!("no prefix before final proof")
+        })
+        .unwrap();
+        let body = if corrupt {
+            Cursor::new(b"malformed".to_vec())
+        } else {
+            t.open(walk.next_reference().unwrap().unwrap()).unwrap()
+        };
+        assert!(walk
+            .push(body, &mut control, |_| Err(SourceError::Transport))
+            .is_err());
+        assert_eq!(walk.next_reference(), Err(SourceError::Integrity));
+        assert_eq!(
+            walk.push(Cursor::new(Vec::new()), &mut control, |_| panic!(
+                "poisoned"
+            )),
+            Err(SourceError::Integrity)
+        );
+    }
+}
+
+#[test]
+fn incremental_retained_final_sink_failure_cannot_be_resumed() {
+    use nntune_core::original_source::reader::RangeReader;
+    let s = source(&[3, 2], None);
+    let mut t = transport(&[3, 2]);
+    let mut walk = RangeReader::new(&s, 0..5).unwrap();
+    let mut control = Control { remaining: 100000 };
+    let body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+    walk.push(body, &mut control, |_| panic!("no early output"))
+        .unwrap();
+    let body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+    let mut calls = 0;
+    assert_eq!(
+        walk.push(body, &mut control, |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(SourceError::Transport)
+            }
+        }),
+        Err(SourceError::Transport)
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(t.opened.len(), 2);
+    assert_eq!(walk.next_reference(), Err(SourceError::Integrity));
+}

@@ -139,6 +139,8 @@ struct State {
     candidate_calls: RefCell<Vec<(String, String, Vec<u8>)>>,
     execute_calls: RefCell<Vec<(String, String, Vec<u8>)>>,
     reply: RefCell<Option<OperationReply>>,
+    bodies: RefCell<HashMap<String, OperationReply>>,
+    after_execute: RefCell<Option<Box<dyn Fn()>>>,
     execute_hangs: Cell<bool>,
     execute_dropped: Rc<Cell<bool>>,
 }
@@ -182,6 +184,15 @@ impl AccountSource for Fake {
         if self.0.execute_hangs.get() {
             let _flag = DropFlag(self.0.execute_dropped.clone());
             std::future::pending::<()>().await;
+        }
+        if let Some(after) = self.0.after_execute.borrow().as_ref() {
+            after();
+        }
+        let request: OperationRequest = serde_json::from_slice(body).unwrap();
+        if let nntune_stream::account_operation::Operation::Body(reference) = request.operation {
+            if let Some(reply) = self.0.bodies.borrow_mut().remove(&reference) {
+                return reply;
+            }
         }
         self.0
             .reply
@@ -730,3 +741,6 @@ fn playback_adapter_is_not_wired_into_any_runtime_or_route_source() {
         }
     }
 }
+
+#[path = "account_playback/original_range.rs"]
+mod original_range;

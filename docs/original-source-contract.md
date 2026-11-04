@@ -161,6 +161,31 @@ later integrations without making a hint a new publication authority. An
 error after streaming output requires the response authority to abort, never
 claim a complete file or retry bytes into the same response.
 
+## Async playback composition
+
+`reader::RangeReader` exposes that same bounded walk incrementally: await
+only `next_reference()`, then `push` its framed body. The synchronous
+`read_range` also uses this state machine. It retains the final decoded part
+for proof, never fetches it twice, checks the remaining aggregate decoded
+budget before another open, and poisons a walk after any failed push. A
+completed walk requests no further articles. Transport cancellation and a
+whole-request deadline remain the caller's responsibility.
+
+The internal `account_playback::read_original_range` composition verifies a
+v2 play grant before the trusted source lookup, rechecks its track binding
+and expiry before provider work and output, and dispatches only fixed Stream
+BODY requests. A caller-owned deadline of at most 20 seconds covers the
+lookup and the entire range walk; each article has at most one dispatch,
+without failure/uncertainty retries. The sink streams verified slices and
+must abort a partial response on error. Its internal receipt counts slices
+accepted by the sink, **not bytes delivered to a client**, and records actual
+serving-account identities only as telemetry. It confers no cache authority.
+
+This composition installs no production catalogue/service binding, public
+route, output backpressure adapter, writer execution or metering call site.
+It does not decrypt posted files or claim cryptographic original-media
+authentication. Runtime qualification gates remain disabled and mandatory.
+
 ## Acceptance boundary and verification
 
 Generated/redacted fixtures cover persisted per-track/file readback, interleaved

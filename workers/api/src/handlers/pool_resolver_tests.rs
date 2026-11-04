@@ -276,31 +276,29 @@ fn pool_resolver_refuses_every_other_auth_without_store_or_dns() {
         body.as_bytes(),
     );
 
-    let mut cases: Vec<(&str, Request)> = Vec::new();
-    cases.push(("absent", pr_request(PR_RESOLVE, None, &body)));
-    cases.push(("forged", pr_request(PR_RESOLVE, Some(forged), &body)));
-    cases.push(("stale", pr_request(PR_RESOLVE, stale, &body)));
-    cases.push((
-        "wrong path",
-        pr_request(PR_RESOLVE, registry_header, &body),
-    ));
-    cases.push(("meter", pr_request(PR_RESOLVE, Some(meter.clone()), &body)));
-    cases.push((
-        "meter renamed",
-        pr_request(
-            PR_RESOLVE,
-            Some(meter.replacen("MeterSink ", "PoolResolver ", 1)),
-            &body,
+    let mut cases: Vec<(&str, Request)> = vec![
+        ("absent", pr_request(PR_RESOLVE, None, &body)),
+        ("forged", pr_request(PR_RESOLVE, Some(forged), &body)),
+        ("stale", pr_request(PR_RESOLVE, stale, &body)),
+        ("wrong path", pr_request(PR_RESOLVE, registry_header, &body)),
+        ("meter", pr_request(PR_RESOLVE, Some(meter.clone()), &body)),
+        (
+            "meter renamed",
+            pr_request(
+                PR_RESOLVE,
+                Some(meter.replacen("MeterSink ", "PoolResolver ", 1)),
+                &body,
+            ),
         ),
-    ));
-    cases.push((
-        "bearer",
-        pr_request(PR_RESOLVE, Some("Bearer ntk_synthetic".into()), &body),
-    ));
-    cases.push((
-        "tampered body",
-        pr_request(PR_RESOLVE, Some(header.clone()), &body.replace("stream", "ingest")),
-    ));
+        (
+            "bearer",
+            pr_request(PR_RESOLVE, Some("Bearer ntk_synthetic".into()), &body),
+        ),
+        (
+            "tampered body",
+            pr_request(PR_RESOLVE, Some(header.clone()), &body.replace("stream", "ingest")),
+        ),
+    ];
     let mut session = good.clone();
     session.cookie = Some(cookie.clone());
     cases.push(("session cookie", session));
@@ -589,22 +587,25 @@ fn pool_resolver_dns_must_be_entirely_public() {
         "93.184.216.36".parse().unwrap(),
         "93.184.216.37".parse().unwrap(),
     ];
-    let with = |extra: &str| {
+    let with = |extra: IpAddr| {
         let mut v = public.clone();
-        v.push(extra.parse().unwrap());
+        v.push(extra);
         v
     };
     let cases: Vec<(&str, Vec<IpAddr>)> = vec![
         ("empty", Vec::new()),
         (
             "mixed public+private",
-            vec!["93.184.216.34".parse().unwrap(), "10.0.0.7".parse().unwrap()],
+            vec![[93, 184, 216, 34].into(), [10, 0, 0, 7].into()],
         ),
-        ("late private", with("192.168.1.9")),
-        ("late loopback", with("127.0.0.1")),
-        ("late v6 loopback", with("::1")),
-        ("late link-local", with("169.254.169.254")),
-        ("late metadata-mapped v6", with("::ffff:10.0.0.1")),
+        ("late private", with([192, 168, 1, 9].into())),
+        ("late loopback", with([127, 0, 0, 1].into())),
+        ("late v6 loopback", with(std::net::Ipv6Addr::LOCALHOST.into())),
+        ("late link-local", with([169, 254, 169, 254].into())),
+        (
+            "late metadata-mapped v6",
+            with(std::net::Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped().into()),
+        ),
     ];
     for (name, addrs) in cases {
         h.dns
