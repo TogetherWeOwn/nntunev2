@@ -48,7 +48,7 @@ class TestMigrationWorkflow(unittest.TestCase):
             root = Path(temp)
             scripts = root / ".github/scripts"
             scripts.mkdir(parents=True)
-            for name in ("migrations_base.py", "migrations_gate.py"):
+            for name in ("migrations_base.py", "migrations_gate.py", "migration_history.py"):
                 shutil.copyfile(ROOT / ".github/scripts" / name, scripts / name)
 
             def run(*args, **kwargs):
