@@ -3,94 +3,16 @@
 //! KEK never leaves the API. Resolved credentials are ephemeral dial material:
 //! never log, persist, queue, cache, or return them on a user-facing route.
 
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::pool_providers::{lower_uuid_ok, PoolProviderRow};
 use crate::providers::ProviderCredsEnvelope;
 
-pub const SECRET_VAR: &str = "POOL_RESOLVER_SECRET";
-pub const REGISTRY_PATH: &str = "/internal/v1/pool-providers";
-pub const RESOLVE_PATH: &str = "/internal/v1/pool-providers/resolve";
-pub const MAX_REQUEST_BYTES: usize = 512;
-pub const MAX_CLOCK_SKEW_SECS: u64 = 30;
-pub const DIAL_MATERIAL_TTL_SECS: u64 = 5;
-const MIN_SECRET_BYTES: usize = 32;
-const AUTH_SCHEME: &str = "PoolResolver";
-const DOMAIN: &[u8] = b"nntune-pool-resolver-v1\nPOST\n";
-
-type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AuthError {
-    NotConfigured,
-    Unauthorized,
-}
-
-fn signature(secret: &[u8], path: &str, timestamp: u64, body: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
-    mac.update(DOMAIN);
-    mac.update(path.as_bytes());
-    mac.update(b"\n");
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b"\n");
-    mac.update(body);
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// Sign the exact POST path and bytes. Keys for grants, metering and sessions
-/// cannot authorize this channel, even when accidentally set to the same value.
-pub fn authorization_header(
-    secret: Option<&[u8]>,
-    path: &str,
-    timestamp: u64,
-    body: &[u8],
-) -> Option<String> {
-    let secret = secret.filter(|s| s.len() >= MIN_SECRET_BYTES)?;
-    if !matches!(path, REGISTRY_PATH | RESOLVE_PATH) || body.len() > MAX_REQUEST_BYTES {
-        return None;
-    }
-    Some(format!(
-        "{AUTH_SCHEME} {timestamp}.{}",
-        signature(secret, path, timestamp, body)
-    ))
-}
-
-pub fn verify(
-    secret: Option<&[u8]>,
-    path: &str,
-    authorization: Option<&str>,
-    body: &[u8],
-    now: u64,
-) -> Result<(), AuthError> {
-    let secret = secret
-        .filter(|s| s.len() >= MIN_SECRET_BYTES)
-        .ok_or(AuthError::NotConfigured)?;
-    if !matches!(path, REGISTRY_PATH | RESOLVE_PATH) || body.len() > MAX_REQUEST_BYTES {
-        return Err(AuthError::Unauthorized);
-    }
-    let (timestamp, supplied) = authorization
-        .and_then(|h| h.strip_prefix("PoolResolver "))
-        .and_then(|h| h.split_once('.'))
-        .ok_or(AuthError::Unauthorized)?;
-    let timestamp: u64 = timestamp.parse().map_err(|_| AuthError::Unauthorized)?;
-    if now.abs_diff(timestamp) > MAX_CLOCK_SKEW_SECS {
-        return Err(AuthError::Unauthorized);
-    }
-    let expected = signature(secret, path, timestamp, body);
-    if expected.as_bytes().ct_eq(supplied.as_bytes()).into() {
-        Ok(())
-    } else {
-        Err(AuthError::Unauthorized)
-    }
-}
+pub use nntune_core::pool_channel::{
+    authorization_header, verify, AuthError, DIAL_MATERIAL_TTL_SECS, MAX_CLOCK_SKEW_SECS,
+    MAX_REQUEST_BYTES, REGISTRY_PATH, RESOLVE_PATH, SECRET_VAR,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -3,7 +3,8 @@
 //! JSON is stored as a string, not a JS object: u64 revisions/deadlines retain
 //! exact integers and reservation map keys/required null fields round-trip
 //! identically on native and wasm. No resolver material enters this adapter.
-//! The Worker factory is not called by any product route yet.
+//! The dedicated account DO constructs the Worker factory once; product byte
+//! routes cannot reach it or admit a dial yet.
 
 use crate::account_supervisor::{AccountJournal, AccountStorage, StorageError};
 
@@ -92,7 +93,7 @@ mod worker_backend {
     /// Construct exactly once in a dedicated account DO's `new`, retaining the
     /// returned owner for that instance's entire lifetime. Never use this in a
     /// request handler, the user meter DO, or a second owner of the same storage.
-    /// No namespace binding, migration, route or real dial is enabled here.
+    /// The account namespace offers scheduling hints only; no real dial.
     pub fn worker_account_owner(
         state: &worker::State,
     ) -> Result<WorkerAccountOwner, SupervisorError> {

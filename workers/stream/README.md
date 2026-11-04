@@ -5,6 +5,43 @@ NNTP pool Durable Object. The Workers entry (`src/runtime.rs`) compiles on
 wasm32 only; its `worker`, `wasm-bindgen`, and transport dependencies are
 excluded from native builds and tests.
 
+## Account owner boundary (scheduling only)
+
+`NntpAccount` (`src/account_runtime.rs`, `NNTP_ACCOUNT`) is a separate
+Durable Object, named by the lowercase account UUID rather than a user ID.
+The additive SQLite class migration preserves the existing `NntpPool` user
+meter namespace. Each account instance constructs one retained serialized
+owner over its own journal; requests never construct replacement owners.
+
+Its only route is internal `POST /candidate`, with an object body containing
+`account_id` and `class` (`stream` or `ingest`). It authenticates the exact
+path/body/timestamp with the separate `POOL_ACCOUNT_SECRET` channel and
+rejects browser context, other methods/paths and a mismatched object name.
+The shared authentication contract is `nntune_core::pool_channel`; neither a
+play grant nor a resolver signature authorizes this route. Missing keys fail
+closed. No keys are provisioned by this change.
+
+Each accepted hint request makes a fresh, signed registry-only read through
+the `API` service binding using `POOL_RESOLVER_SECRET`; it never resolves
+credentials. Redirects and non-200 replies fail closed. Registry response I/O
+is limited to three seconds and 512 KiB, with at most 1,000 unique validated
+account rows; the entire hint handler, including inbound body and durable
+storage, is bounded to ten seconds. The current row is reconciled under the
+owner lock, preserving revision, recovery, storage-failure and quarantine
+fences. Responses are `no-store` and expose only account ID, tier, in-flight
+count and eligibility, never credential identity or endpoint material.
+
+**A candidate is not a lease.** This route cannot reserve capacity, dial,
+authenticate to a provider, or fetch bytes. There is no public route or ingest
+caller to the new namespace yet. Public NNTP misses and real account dialing
+remain disabled pending live Worker transport/physical-close qualification.
+Operation-time registry refresh, authoritative admission and deadline/revocation
+cleanup are still required before enabling them. Native fake tests and Worker
+packaging do not satisfy those live qualification gates.
+
+This backend/playback preparation follows AGENTS.md **Clean-room, YouTube and
+MetaBrainz guardrails**; it adds no UI assets, video behavior or catalogue data.
+
 ## Play path
 
 ```text

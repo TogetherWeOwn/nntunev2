@@ -47,6 +47,7 @@
 
 pub mod account_owner;
 pub mod account_pool;
+pub mod account_route;
 pub mod account_storage;
 pub mod account_supervisor;
 pub mod api_error;
@@ -74,6 +75,8 @@ pub mod yenc;
 // Native only: the Mutex/Condvar waiter path traps on wasm32-unknown-unknown
 // (and a single-threaded isolate cannot park a waiter anyway). The Worker
 // entry point gets an async shared-future equivalent; see the module docs.
+#[cfg(target_arch = "wasm32")]
+pub mod account_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]

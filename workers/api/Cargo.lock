@@ -951,10 +951,12 @@ dependencies = [
  "crc32fast",
  "crypto_secretbox",
  "getrandom 0.2.17",
+ "hmac",
  "libc",
  "md5",
  "quick-xml",
  "sha2",
+ "subtle",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! Serialized, account-bound owner for the durable supervisor. Not routed yet.
+//! Serialized, account-bound owner for the durable supervisor.
 //!
 //! A Durable Object keeps exactly one owner for its lifetime. The async mutex
 //! covers initialization and every mutation, including storage acknowledgements;
@@ -40,6 +40,10 @@ impl<S: AccountStorage, C: CloseControl> AccountOwner<S, C> {
             account_id,
             state: Mutex::new(OwnerState::Unopened(storage)),
         })
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
     /// `current` must come from a fresh authenticated registry read, not a
