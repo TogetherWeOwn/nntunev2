@@ -6,12 +6,19 @@
 //! only bytes accepted by its writer, then finishes or drops this response.
 //! Drop settles a partial interval once, with no cache fill or further I/O.
 
-use std::task::{Context, Poll};
+use std::{
+    future::{poll_fn, Future},
+    pin::pin,
+    task::{Context, Poll},
+};
 
 use nntune_core::original_source::{
     reader::{AsyncArticleSource, AsyncRangeReader, AsyncReadControl, ReadControl},
     OriginalSource, SourceError,
 };
+
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
 
 use crate::{
     api_error::ApiError,
@@ -57,6 +64,40 @@ pub fn authorize_original(
 /// eventual account supplier still enforces its own <=20 s operation timer.
 pub trait OriginalControl: AsyncReadControl {
     fn now_unix(&self) -> u64;
+}
+
+/// Ordered response output, not an account receipt or a readable-stream pull.
+/// `poll_write` acknowledges a positive prefix only after the sink accepts it;
+/// pending or failed writes acknowledge nothing and must never be retried with
+/// another chunk. Each pending method registers the waker. `poll_cancel` must
+/// observe a disconnected reader even while no write is in flight. A pending
+/// close must also wake on disconnect. `abort` is synchronous, idempotent and
+/// never drains, retries or releases account capacity.
+///
+/// A successful write is sink acceptance, not proof of remote TCP receipt.
+/// Concrete runtime behavior still needs actual Worker/abort qualification.
+pub trait OriginalWriter {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError>;
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, SourceError>>;
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SourceError>>;
+    fn abort(&mut self);
+}
+
+struct ResponseWriter<W: OriginalWriter> {
+    inner: W,
+    closed: bool,
+}
+
+impl<W: OriginalWriter> Drop for ResponseWriter<W> {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.inner.abort();
+        }
+    }
 }
 
 impl OriginalAuthorization {
@@ -163,7 +204,82 @@ pub struct OriginalPlay<'a> {
     stopped: bool,
 }
 
-impl OriginalPlay<'_> {
+impl<'a> OriginalPlay<'a> {
+    /// Own the writer until a successful close. Only one bounded slice and one
+    /// write may be in flight; no next article is fetched under backpressure.
+    /// Cancellation wins ready races, and dropping even an unpolled pump aborts
+    /// its writer. Failed/uncertain writes are never retried or acknowledged.
+    pub fn pump<'p, T, C, W>(
+        mut self,
+        transport: &'p mut T,
+        control: &'p mut C,
+        writer: W,
+    ) -> impl Future<Output = Result<(), SourceError>> + 'p + use<'a, 'p, T, C, W>
+    where
+        Self: 'p,
+        T: AsyncArticleSource + 'p,
+        C: OriginalControl + 'p,
+        W: OriginalWriter + 'p,
+    {
+        let mut writer = ResponseWriter {
+            inner: writer,
+            closed: false,
+        };
+        async move {
+            loop {
+                let bytes = {
+                    let mut next = pin!(self.next(transport, control));
+                    poll_fn(|cx| {
+                        if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
+                            return Poll::Ready(Err(error));
+                        }
+                        next.as_mut().poll(cx)
+                    })
+                    .await?
+                };
+                let Some(bytes) = bytes else {
+                    break;
+                };
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let accepted = poll_fn(|cx| {
+                        if let Err(error) = self.authority.check(control) {
+                            return Poll::Ready(Err(error));
+                        }
+                        if let Poll::Ready(error) = control.poll_cancel(cx) {
+                            return Poll::Ready(Err(error));
+                        }
+                        if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
+                            return Poll::Ready(Err(error));
+                        }
+                        writer.inner.poll_write(cx, &bytes[offset..])
+                    })
+                    .await?;
+                    if accepted == 0 || accepted > bytes.len() - offset {
+                        return Err(SourceError::Bounds);
+                    }
+                    self.written(accepted)?;
+                    offset += accepted;
+                }
+            }
+            poll_fn(|cx| {
+                if let Err(error) = self.authority.check(control) {
+                    return Poll::Ready(Err(error));
+                }
+                if let Poll::Ready(error) = control.poll_cancel(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                // `closed` may resolve successfully during this phase; only
+                // poll_close decides whether our own close completed.
+                writer.inner.poll_close(cx)
+            })
+            .await?;
+            writer.closed = true;
+            drop(writer);
+            self.finish()
+        }
+    }
+
     /// Fetch at most the next output article slice. Before another pull, the
     /// writer must acknowledge the entire previous slice, or drop/abort the
     /// response after a partial write. Never count the fetched bytes here.

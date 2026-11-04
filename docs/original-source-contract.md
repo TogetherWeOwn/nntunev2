@@ -199,9 +199,27 @@ zero bytes emit none. Verification/prefix bytes and unacknowledged pulls never
 count. There is no cache-fill drain, speculative prefetch or account release in
 this driver. An article/source failure does not establish unknown-track 404.
 
+`OriginalPlay::pump` owns an ordered, wakeable `OriginalWriter` until close.
+It awaits each accepted prefix before pulling another article, observes reader
+disconnect during both pending article and writer operations, and races request
+cancellation/expiry against each write and close. Dropping even an unpolled pump
+aborts its writer without source I/O; an error or uncertain write is never retried.
+A failed close still reports only the bytes already acknowledged.
+
+The off-route wasm `original_play::worker::response_channel` pairs the prepared
+response with the pinned SDK's fixed-length Web Stream and a concrete writer.
+It copies at most one bounded slice into a JS chunk, waits for that write promise,
+and only then acknowledges it. Its `closed` promise wakes a pending article on
+reader disconnect; drop requests an idempotent writer abort. Promise resolution
+means sink acceptance, not proof of remote TCP receipt. The caller must return
+the response concurrently with pumping, provide a wakeable request/grant control
+and persist delivered reports; no runtime caller or account supplier is installed.
+
 Generated async fixtures exercise lazy full/range output, hint fallback,
 endpoint/CRC/budget failures, wakeable pending cancellation, dropped pulls,
-grant expiry after awaits and partial-writer accounting. Existing cache-hit
+grant expiry after awaits and partial-writer accounting. Writer fakes cover
+backpressure, partial/invalid acknowledgements, disconnect races, dropped pumps,
+article/write/close failures and exactly-once settlement. Existing cache-hit
 and public-route fixtures remain regressions, not evidence of a newly wired
 original-source route. Actual source/catalogue/account composition, Worker
 writer/abort behavior, R2 misses and cold-cache end-to-end operation remain

@@ -1,9 +1,14 @@
 //! Synthetic byte patterns only. Off-route tests, not Worker/provider proof.
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     future::Future,
     rc::Rc,
-    task::{Context, Poll, Waker},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
 use nntune_core::{
@@ -17,7 +22,7 @@ use nntune_core::{
 use nntune_stream::{
     delivered::VecDeliveredSink,
     grant,
-    original_play::{authorize_original, OriginalControl},
+    original_play::{authorize_original, OriginalControl, OriginalWriter},
     play_route::PlayRouteRequest,
 };
 
@@ -83,11 +88,13 @@ struct Articles {
     fail: Option<usize>,
     pending: Option<usize>,
     expire: Option<Rc<Cell<u64>>>,
+    log: Rc<RefCell<Vec<usize>>>, // readable while a pump borrows the source
 }
 impl AsyncArticleSource for Articles {
     async fn open(&mut self, index: usize, reference: &str) -> Result<Vec<u8>, SourceError> {
         assert_eq!(reference, format!("generated-{index}@fixture.invalid"));
         self.opened.push(index);
+        self.log.borrow_mut().push(index);
         if self.pending == Some(index) {
             std::future::pending::<()>().await;
         }
@@ -134,6 +141,7 @@ fn fixture() -> (OriginalSource, Articles) {
             fail: None,
             pending: None,
             expire: None,
+            log: Rc::default(),
         },
     )
 }
@@ -456,4 +464,323 @@ async fn dropping_a_pending_pull_after_output_settles_partial_delivery_without_r
     assert_eq!(articles.opened, vec![2, 0, 1]);
     assert_eq!(sink.0.len(), 1);
     assert_eq!((sink.0[0].start, sink.0[0].end), (0, 3));
+}
+
+// ---- Fake writer pump regressions: manual polling, no timers or runtime. ----
+
+enum Step {
+    Accept(usize),
+    Zero,
+    Over,
+    Fail,
+    Block, // from here on poll_write stays Pending
+}
+
+#[derive(Default)]
+struct WState {
+    script: VecDeque<Step>, // empty script accepts everything
+    block: bool,            // poll_write stays Pending, storing the waker
+    cancel: Option<SourceError>,
+    close: Option<SourceError>,
+    got: Vec<u8>,
+    write_polls: usize,
+    closes: usize,
+    aborts: usize,
+    at_close: usize,
+    waker: Option<Waker>,
+}
+type Shared = Rc<RefCell<WState>>;
+struct Writer(Shared);
+
+impl OriginalWriter for Writer {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
+        let mut st = self.0.borrow_mut();
+        match st.cancel.take() {
+            Some(e) => Poll::Ready(e),
+            None => {
+                st.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, SourceError>> {
+        let mut st = self.0.borrow_mut();
+        st.write_polls += 1;
+        if let Some(Step::Block) = st.script.front() {
+            st.script.pop_front();
+            st.block = true;
+        }
+        if st.block {
+            st.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let n = match st.script.pop_front() {
+            None => bytes.len(),
+            Some(Step::Accept(n)) => n.min(bytes.len()),
+            Some(Step::Zero) => 0,
+            Some(Step::Over) => return Poll::Ready(Ok(bytes.len() + 1)),
+            Some(Step::Fail) => return Poll::Ready(Err(SourceError::Transport)),
+            Some(Step::Block) => unreachable!(),
+        };
+        st.got.extend_from_slice(&bytes[..n.min(bytes.len())]);
+        Poll::Ready(Ok(n))
+    }
+    fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
+        let mut st = self.0.borrow_mut();
+        st.closes += 1;
+        st.at_close = st.got.len();
+        Poll::Ready(st.close.take().map_or(Ok(()), Err))
+    }
+    fn abort(&mut self) {
+        self.0.borrow_mut().aborts += 1;
+    }
+}
+
+fn shared(steps: impl IntoIterator<Item = Step>) -> Shared {
+    Rc::new(RefCell::new(WState {
+        script: steps.into_iter().collect(),
+        ..WState::default()
+    }))
+}
+
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+macro_rules! pump {
+    ($source:expr, $range:expr, $articles:expr, $control:expr, $sink:expr, $state:expr) => {{
+        let play = authorize_original(&request($range), SECRET, NOW)
+            .unwrap()
+            .prepare(&$source, $range, &mut $control, &mut $sink)
+            .unwrap();
+        Box::pin(play.pump(&mut $articles, &mut $control, Writer($state.clone())))
+    }};
+}
+
+#[test]
+fn partial_writes_complete_full_and_range_output_then_close_once() {
+    for (range, expected) in [(None, 0..9u8), (Some("bytes=2-6"), 2..7)] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let st = shared([Step::Accept(1), Step::Accept(2), Step::Accept(1)]);
+        let mut fut = pump!(source, range, articles, control, sink, st);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(fut);
+        let st = st.borrow();
+        assert_eq!(st.got, expected.clone().collect::<Vec<_>>());
+        assert_eq!((st.closes, st.aborts, st.at_close), (1, 0, st.got.len()));
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!(
+            (sink.0[0].start, sink.0[0].end),
+            (expected.start as u64, expected.end as u64)
+        );
+    }
+}
+
+#[test]
+fn writer_failure_zero_or_overlong_ack_stops_pump_with_partial_interval() {
+    for bad in [Step::Fail, Step::Zero, Step::Over] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let st = shared([Step::Accept(1), bad]);
+        let mut fut = pump!(source, None, articles, control, sink, st);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        drop(fut);
+        assert_eq!(
+            articles.opened,
+            vec![2, 0],
+            "no later article after failure"
+        );
+        let st = st.borrow();
+        assert_eq!((st.got.len(), st.closes, st.aborts), (1, 0, 1));
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!((sink.0[0].start, sink.0[0].end), (0, 1));
+    }
+}
+
+#[test]
+fn pending_write_backpressure_blocks_next_article_until_accepted() {
+    let (source, mut articles) = fixture();
+    let log = articles.log.clone();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    st.borrow_mut().block = true;
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..3 {
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(
+        *log.borrow(),
+        vec![2, 0],
+        "final/first proof precedes output; backpressure opens no later article"
+    );
+    assert!(st.borrow().got.is_empty());
+    st.borrow_mut().block = false;
+    assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    drop(fut);
+    assert_eq!(articles.opened, vec![2, 0, 1]);
+    assert_eq!((st.borrow().closes, st.borrow().aborts), (1, 0));
+}
+
+#[test]
+fn dropping_pending_pump_aborts_once_and_meters_only_prior_ack() {
+    for acked in [1usize, 3] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let st = shared([Step::Accept(acked), Step::Block]);
+        let mut fut = pump!(source, None, articles, control, sink, st);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        drop(fut);
+        let st = st.borrow();
+        assert_eq!((st.aborts, st.closes, st.got.len()), (1, 0, acked));
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!((sink.0[0].start, sink.0[0].end), (0, acked as u64));
+    }
+}
+
+#[test]
+fn wakeable_writer_cancellation_interrupts_pending_article() {
+    let (source, mut articles) = fixture();
+    articles.pending = Some(2);
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    {
+        let mut s = st.borrow_mut();
+        s.cancel = Some(SourceError::Cancelled);
+        s.waker
+            .take()
+            .expect("poll_cancel registered a waker")
+            .wake();
+    }
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    assert_eq!(articles.opened, vec![2]);
+    let st = st.borrow();
+    assert_eq!((st.write_polls, st.closes, st.aborts), (0, 0, 1));
+    assert!(sink.0.is_empty());
+}
+
+#[test]
+fn expiry_while_writer_pending_interrupts_before_next_write_poll() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let now = control.now.clone();
+    let st = shared([Step::Accept(3), Step::Block]);
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(fut.as_mut().poll(&mut cx).is_pending()); // ack 3, then blocked
+    assert_eq!(st.borrow().got.len(), 3);
+    let polls = st.borrow().write_polls;
+    now.set(NOW + 60);
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    let st = st.borrow();
+    assert_eq!(
+        st.write_polls, polls,
+        "expired before polling the writer again"
+    );
+    assert_eq!((st.closes, st.aborts), (0, 1));
+    assert_eq!((sink.0[0].start, sink.0[0].end), (0, 3));
+}
+
+#[test]
+fn dropping_unpolled_pump_aborts_without_source_or_write_io() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    let fut = pump!(source, None, articles, control, sink, st);
+    drop(fut);
+    assert!(articles.opened.is_empty());
+    assert!(sink.0.is_empty());
+    let st = st.borrow();
+    assert_eq!((st.aborts, st.closes, st.write_polls), (1, 0, 0));
+}
+
+#[test]
+fn disconnect_wins_a_ready_writer_race_without_acknowledging_its_chunk() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([Step::Accept(1), Step::Block]);
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    let polls = st.borrow().write_polls;
+    {
+        let mut state = st.borrow_mut();
+        state.block = false;
+        state.cancel = Some(SourceError::Cancelled);
+        state.waker.take().unwrap().wake();
+    }
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(fut);
+    let st = st.borrow();
+    assert_eq!((st.got.len(), st.write_polls, st.aborts), (1, polls, 1));
+    assert_eq!(articles.opened, vec![2, 0]);
+    assert_eq!((sink.0[0].start, sink.0[0].end), (0, 1));
+}
+
+#[test]
+fn failed_article_aborts_writer_and_preserves_only_the_acknowledged_prefix() {
+    let (source, mut articles) = fixture();
+    articles.fail = Some(1);
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Transport))
+    );
+    drop(fut);
+    let st = st.borrow();
+    assert_eq!((st.got.len(), st.aborts, st.closes), (3, 1, 0));
+    assert_eq!(articles.opened, vec![2, 0, 1]);
+    assert_eq!(sink.0.len(), 1);
+    assert_eq!((sink.0[0].start, sink.0[0].end), (0, 3));
+}
+
+#[test]
+fn close_failure_keeps_full_ack_interval_and_aborts() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    st.borrow_mut().close = Some(SourceError::Transport);
+    let mut fut = pump!(source, None, articles, control, sink, st);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SourceError::Transport))
+    );
+    drop(fut);
+    let st = st.borrow();
+    assert_eq!((st.got.len(), st.closes, st.aborts), (9, 1, 1));
+    assert_eq!(sink.0.len(), 1);
+    assert_eq!((sink.0[0].start, sink.0[0].end), (0, 9));
 }
