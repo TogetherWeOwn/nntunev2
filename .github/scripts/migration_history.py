@@ -375,13 +375,15 @@ class GitHistory:
 def verify(root, base, head, manifest_text, coverage=None):
     """Return Git-derived edges by final entry; validate all claimed provenance.
 
-    Base metadata was verified when introduced and is immutable. Original PR
-    commits need not remain ancestors after a squash merge. Only additions are
-    proved again; no historical applied aliases may be reclassified or removed.
+    Common-baseline metadata was verified when introduced and is immutable.
+    Target-only additions are not PR deletions. Original PR commits need not
+    remain ancestors after a squash merge. Only additions are proved again;
+    no historical applied aliases may be reclassified or removed.
     """
     entries = parse_manifest(manifest_text)
     history = GitHistory(root, base, head)
-    base_text = history.git("show", f"{base}:migrations/manifest.toml", limit=MAX_INPUT).decode("utf-8")
+    base_text = history.git("show", f"{history.merge_base}:migrations/manifest.toml",
+                            limit=MAX_INPUT).decode("utf-8")
     previous = {e["file"]: e for e in parse_manifest(base_text)}
     states = history.collect()
     owners, result = {}, {}

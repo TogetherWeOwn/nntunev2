@@ -27,7 +27,9 @@ throwaway endpoint, create a fresh fixture database, and refuse to
 reuse an existing one.
 """
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import hashlib
+import io
 import os
 import pathlib
 import subprocess
@@ -180,10 +182,17 @@ def run_history_cases(fixture, manifest, test_env):
         run_psql(test_env, "DELETE FROM public.schema_migrations "
                            "WHERE file >= '0010';")
 
-    def refused(name, table, rows, record_only=False):
+    CONFLICT = "recorded history conflicts with the manifest"
+
+    def refused(name, table, rows, record_only=False, diagnostic=CONFLICT):
         seed(*rows)
         before = all_rows(test_env)
-        assert apply(name, record_only=record_only) == 1, (name, rows)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = apply(name, record_only=record_only)
+        assert code == 1, (name, rows)
+        # The refusal must come from the intended guard, not any failure.
+        assert diagnostic in stderr.getvalue(), (name, rows, stderr.getvalue())
         assert all_rows(test_env) == before, "refusal changed recorded rows"
         assert scalar(test_env, f"SELECT to_regclass('public.{table}') IS NULL;") == "t"
         clear()
@@ -223,9 +232,14 @@ def run_history_cases(fixture, manifest, test_env):
     # A good prior cannot hide conflicting prior history, and history
     # rows never satisfy the prior.
     first = history_sha("0011_first.sql")
+    # 0010 is seeded as a good unrelated prior in both negative cases so
+    # a missing prior cannot mask the history guard, which runs first.
+    prior_0010 = ("0010_hist.sql", good)
     refused("0012_second.sql", "hist_second",
-            [("0011_first.sql", first), ("0011_first_old.sql", BAD_SHA)])
-    refused("0012_second.sql", "hist_second", [("0011_first_old.sql", first)])
+            [prior_0010, ("0011_first.sql", first),
+             ("0011_first_old.sql", BAD_SHA)])
+    refused("0012_second.sql", "hist_second",
+            [prior_0010, ("0011_first_old.sql", first)])
     print("apply-migration-postgres: passed prior-not-supplied-by-history")
     refused("0012_second.sql", "hist_second",
             [("0010_hist.sql", good), ("0010_hist_old.sql", good),

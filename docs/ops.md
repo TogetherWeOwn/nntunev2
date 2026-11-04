@@ -391,8 +391,10 @@ These six fields describe source evidence only. They never satisfy an
 applied migration or an ordered prior, enter backfill rows, or allow a
 history-only name to be applied. Keep byte-identical `renamed_from`
 identities separate; do not reclassify existing applied aliases. Both
-alias and source metadata are append-only against the base. Neither
-field permits editing/removing a base migration, changing its target,
+alias and source metadata are append-only against the pinned common
+merge base of the target and PR head. Target-only additions after divergence
+are not PR deletions; no merge from the target is required to hide them.
+Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 
 The secretless PR gate retains **both** coverage sources: complete,

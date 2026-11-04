@@ -228,6 +228,97 @@ class GitFixture(unittest.TestCase):
         self.git("merge", "--no-edit", "main")
         self.verify(self.prepare())
 
+    def diverge_target(self, entries):
+        self.git("checkout", "-qb", "feature")
+        (self.root / "feature.txt").write_text("unrelated PR change")
+        self.commit("feature")
+        self.git("checkout", "main")
+        (self.root / "target.txt").write_text("unrelated target change")
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        target = self.commit("target-only manifest changes")
+        self.git("checkout", "feature")
+        return target
+
+    def test_stale_head_ignores_target_only_migration(self):
+        self.write("0001_shared.sql")
+        entries = self.entries()
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        self.base = self.commit("common baseline")
+        self.write("0002_target.sql", BODY + b"-- target only\n")
+        target_entries = self.entries()
+        # Keep the target-only SQL off the feature branch as well as its manifest.
+        (self.root / "migrations/manifest.toml").write_text(manifest(target_entries))
+        target = self.commit("target migration")
+        self.git("checkout", "-qb", "feature", self.base)
+        (self.root / "feature.txt").write_text("unrelated PR change")
+        self.commit("feature")
+        self.assertNotEqual(target, self.base)
+        self.base = target
+        self.assertEqual(self.verify(entries, ({}, set())), {"0001_shared.sql": []})
+
+    def test_stale_head_ignores_target_only_alias_and_source_additions(self):
+        entries = self.chain()
+        path = self.root / "migrations/manifest.toml"
+        # The common baseline predates the already-verified metadata additions.
+        baseline = copy.deepcopy(entries)
+        for entry in baseline:
+            entry["source_rename_history"] = []
+        path.write_text(manifest(baseline))
+        self.base = self.commit("common baseline")
+        target_entries = copy.deepcopy(entries)
+        target_entries[0]["renamed_from"] = [{"file": "0020_target_alias.sql",
+                                               "sha256": entries[0]["sha256"]}]
+        self.base = self.diverge_target(target_entries)
+        self.assertEqual(self.verify(baseline), {e["file"]: [] for e in baseline})
+
+    def test_diverged_head_cannot_delete_common_alias_or_source_history(self):
+        entries = self.chain()
+        entries[0]["renamed_from"] = [{"file": "0020_applied_alias.sql",
+                                       "sha256": entries[0]["sha256"]}]
+        path = self.root / "migrations/manifest.toml"
+        path.write_text(manifest(entries))
+        self.base = self.commit("record verified common history")
+        self.base = self.diverge_target(entries)
+        for field in ("renamed_from", "source_rename_history"):
+            broken = copy.deepcopy(entries)
+            broken[0][field] = []
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    history.HistoryError, "append-only against base"):
+                self.verify(broken)
+
+    def test_diverged_head_cannot_remove_common_manifest_entry(self):
+        self.write("0001_shared.sql")
+        entries = self.entries()
+        (self.root / "migrations/manifest.toml").write_text(manifest(entries))
+        self.base = self.commit("common baseline")
+        self.base = self.diverge_target(entries)
+        with self.assertRaisesRegex(history.HistoryError, "base migration entry removed"):
+            self.verify([])
+
+    def test_diverged_head_cannot_edit_or_delete_common_sql(self):
+        self.write("0001_shared.sql")
+        entries = self.entries()
+        path = self.root / "migrations/manifest.toml"
+        path.write_text(manifest(entries))
+        common = self.commit("common baseline")
+        self.base = self.diverge_target(entries)
+        sql = self.root / "migrations/0001_shared.sql"
+        sql.write_bytes(BODY + b"SELECT 9;\n")
+        entries = self.entries()
+        path.write_text(manifest(entries))
+        self.commit("PR changes common SQL and hash")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertGreater(migrations_gate.check_drift(self.root, common), 0)
+        self.assertIn("applied-edited", output.getvalue())
+        sql.unlink()
+        path.write_text("")
+        self.commit("PR deletes common SQL")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertGreater(migrations_gate.check_drift(self.root, common), 0)
+        self.assertIn("applied-removed", output.getvalue())
+        with self.assertRaisesRegex(history.HistoryError, "no provable rename lineage"):
+            self.verify([])
+
     def test_unreachable_commit_and_truncated_git_history_refuse(self):
         entries = self.chain()
         self.git("checkout", "-qb", "unreachable", self.base)
@@ -269,9 +360,37 @@ class GitFixture(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertGreater(migrations_gate.check_drift(self.root, base), 0)
 
+    def test_collector_file_and_event_bounds_refuse_directly(self):
+        self.chain()
+        parent = self.git("rev-parse", "HEAD")
+        for name in ("first.txt", "second.txt"):
+            (self.root / name).write_text("non-migration change")
+        head = self.commit("non-migration changes")
+        h = history.GitHistory(self.root, self.base, head)
+        with mock.patch.object(history, "MAX_FILES", 1):
+            with self.assertRaisesRegex(history.HistoryError, "Git migration file bound exceeded"):
+                h.tree(head)
+            self.assertNotIn(head, h.trees)
+            # Count transport records even when none is a migration record.
+            with self.assertRaisesRegex(history.HistoryError, "Git change record bound exceeded"):
+                h.diff(parent, head)
+            self.assertNotIn((parent, head, True), h.diffs)
+        with mock.patch.object(history, "MAX_EVENTS", 1):
+            with self.assertRaisesRegex(history.HistoryError, "Git rename event bound exceeded"):
+                h.collect()
+            self.assertEqual(len(h.events), 2)
+
+    def test_manifest_file_and_event_bounds_refuse(self):
+        entries = self.chain()
+        for key, diagnostic in (("MAX_FILES", "migration entry bound exceeded"),
+                                ("MAX_EVENTS", "source rename event bound exceeded")):
+            with self.subTest(key=key), mock.patch.object(history, key, 1):
+                with self.assertRaisesRegex(history.HistoryError, diagnostic):
+                    history.parse_manifest(manifest(entries))
+
     def test_all_collection_bounds_refuse(self):
         entries = self.chain()
-        for key, limit in (("MAX_COMMITS", 1), ("MAX_EVENTS", 1), ("MAX_FILES", 1),
+        for key, limit in (("MAX_COMMITS", 1),
                            ("MAX_STATES", 1), ("MAX_EVENT_REFERENCES", 1),
                            ("MAX_TOTAL_OUTPUT", 1), ("MAX_BLOB", 1), ("MAX_OUTPUT", 1),
                            ("GIT_TIMEOUT", 0)):
@@ -322,12 +441,14 @@ class GitFixture(unittest.TestCase):
             self.assertGreater(migrations_gate.check_manifest(self.root), 0)
 
     def test_missing_and_malformed_git_transport_refuse(self):
-        entries = self.chain()
+        self.chain()
         h = history.GitHistory(self.root, self.base, self.git("rev-parse", "HEAD"))
-        for raw in (b"R100\\0migrations/0001_old.sql\\0", b"M\\0migrations/0001_old.sql",
-                    b"X\\0migrations/0001_old.sql\\0"):
-            with mock.patch.object(h, "git", return_value=raw):
-                with self.assertRaises(history.HistoryError):
+        for raw, diagnostic in (
+                (b"R100\0migrations/0001_old.sql\0", "truncated Git change"),
+                (b"M\0migrations/0001_old.sql", "truncated Git diff"),
+                (b"X\0migrations/0001_old.sql\0", "unsupported Git change type")):
+            with self.subTest(diagnostic=diagnostic), mock.patch.object(h, "git", return_value=raw):
+                with self.assertRaisesRegex(history.HistoryError, diagnostic):
                     h.diff("a" * 40, "b" * 40)
         with self.assertRaises(history.HistoryError):
             history.GitHistory(self.root, "0" * 40, self.git("rev-parse", "HEAD"))
