@@ -729,8 +729,8 @@ fn playback_adapter_is_not_wired_into_any_runtime_or_route_source() {
     for entry in fs::read_dir(&src).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        // The portable source catalogue implements this seam but installs no
-        // transport. Keep both adapters forbidden in every runtime/route file.
+        // The source catalogue and its qualification transport have no product
+        // caller. Keep both adapters forbidden in every runtime/route file.
         if matches!(
             name.as_str(),
             "account_playback.rs" | "source_catalogue.rs" | "lib.rs"

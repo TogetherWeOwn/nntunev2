@@ -1,6 +1,11 @@
 //! Grant-bound internal original-source catalogue, off-route until runtime
 //! qualification. No source encryption keys, public fetch or response driver.
 
+#[cfg(any(test, target_arch = "wasm32"))]
+mod transport;
+#[cfg(target_arch = "wasm32")]
+pub use transport::worker::WorkerSourceTransport;
+
 use std::cell::Cell;
 
 use nntune_core::{

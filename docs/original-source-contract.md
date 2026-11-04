@@ -186,6 +186,40 @@ route, output backpressure adapter, writer execution or metering call site.
 It does not decrypt posted files or claim cryptographic original-media
 authentication. Runtime qualification gates remain disabled and mandatory.
 
+## Internal catalogue transport (off-route)
+
+`SourceCatalogue` verifies the v2 play grant and signs a canonical-track lookup
+with the existing play-grant key in a distinct HMAC domain. The attestation's
+absolute deadline is at most five seconds and never outlives the grant. The
+API service composition authenticates before lazy repository connection and
+rechecks authority across every suspension. This is not a public raw-source
+endpoint or a new entitlement token.
+
+The qualification-only `WorkerSourceTransport` makes one POST to
+`/internal/v1/original-source` through the `API` service binding; it has no
+public-fetch, redirect-following, retry or cache path. Its successful internal
+reply contract is status 200, `Content-Type: application/octet-stream`,
+`Cache-Control: no-store`, and `X-NNTune-Source-Job` containing the persisted
+job identity (1–64 validated ASCII bytes). The body is the existing source
+encoding, not a second payload format. Content encoding must be absent or
+identity. Optional content length must be positive, at most 8 MiB and equal
+the final read length. Unknown/missing job identity, bad headers, empty or
+oversized bodies and failed reads are opaque catalogue failures.
+
+The whole-call timer covers fetch and body consumption without resetting per
+chunk. Monotonic authority checks run before/after I/O and before returning;
+zero-progress chunks fail closed. The raw Worker reader checks each typed
+array's length before copying into the bounded Rust destination. The pending
+fetch and returned reader retain an abort controller until drop, including
+error, timeout and caller cancellation. Native fakes exercise that ownership
+contract, not actual Worker abort propagation or physical connection closure.
+
+No runtime caller, binding configuration, API HTTP handler or owned PostgreSQL
+connection factory is installed here. Those remain separate integration work;
+the existing account/provider qualification gates are not changed. Playback
+HTTP response/backpressure, ACK/drop accounting and delivered-byte metering
+remain in their separate adapter, not in this source-record transport.
+
 ## Acceptance boundary and verification
 
 Generated/redacted fixtures cover persisted per-track/file readback, interleaved
