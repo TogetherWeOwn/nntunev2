@@ -30,7 +30,6 @@ const ROUTES = [
 	'/library',
 	'/library/liked',
 	'/library/recent',
-	'/library/import',
 	'/onboarding/byop'
 ] as const;
 

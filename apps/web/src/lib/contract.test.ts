@@ -13,7 +13,10 @@ const sources = import.meta.glob(['../routes/**/*.svelte', './interactions/*.sve
 	eager: true
 }) as Record<string, string>;
 
-const routeForTestId: Record<keyof typeof TESTIDS, string> = {
+// Only the retired import hooks are excluded; every other shared hook
+// must still have a route pin while the end-to-end contract is migrated.
+type ActiveTestId = Exclude<keyof typeof TESTIDS, 'importFile' | 'importStatus'>;
+const routeForTestId: Record<ActiveTestId, string> = {
 	appRoot: '../routes/+page.svelte',
 	signupEmail: '../routes/signup/+page.svelte',
 	signupSubmit: '../routes/signup/+page.svelte',
@@ -27,8 +30,6 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	byopTest: '../routes/onboarding/byop/+page.svelte',
 	byopSave: '../routes/onboarding/byop/+page.svelte',
 	byopStatus: '../routes/onboarding/byop/+page.svelte',
-	importFile: '../routes/library/import/+page.svelte',
-	importStatus: '../routes/library/import/+page.svelte',
 	libraryItem: '../routes/library/+page.svelte',
 	libraryList: '../routes/library/+page.svelte',
 	libraryStaleBadge: '../routes/library/+page.svelte',
@@ -58,6 +59,17 @@ const routeForTestId: Record<keyof typeof TESTIDS, string> = {
 	miniPlayer: '../routes/+layout.svelte'
 };
 
+describe('retired user NZB import', () => {
+	it('has no route, navigation link, or import control in any route source', () => {
+		expect(sources['../routes/library/import/+page.svelte']).toBeUndefined();
+		for (const source of Object.values(sources)) {
+			expect(source).not.toContain('/library/import');
+			expect(source).not.toMatch(/data-testid=["']import-(?:file|status)["']/);
+			expect(source).not.toMatch(/accept=["'][^"']*\.nzb/i);
+		}
+	});
+});
+
 describe('e2e NNTP port allowlist', () => {
 	it('matches the app/API allowlist (no drift between the copies)', () => {
 		expect([...SUPPORTED_NNTP_PORTS]).toEqual([...ALLOWED_NNTP_PORTS]);
@@ -65,9 +77,9 @@ describe('e2e NNTP port allowlist', () => {
 });
 
 describe('e2e contract hooks', () => {
-	for (const [key, testid] of Object.entries(TESTIDS) as [keyof typeof TESTIDS, string][]) {
+	for (const [key, route] of Object.entries(routeForTestId) as [ActiveTestId, string][]) {
+		const testid = TESTIDS[key];
 		it(`declares data-testid="${testid}" in its route markup (${key})`, () => {
-			const route = routeForTestId[key];
 			const source = sources[route];
 			expect(source, `contract key "${key}": expected route source "${route}"`).toBeDefined();
 			expect(
