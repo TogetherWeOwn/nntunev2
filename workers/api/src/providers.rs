@@ -12,7 +12,7 @@
 //! field, owner scope, row key, versions). The v1 helpers in
 //! [`crate::vault`] cannot produce this (their AAD joins are explicitly
 //! not the v2 encoding, and byte-copying v1 ciphertext under v2 AAD is
-//! forbidden), so this module implements the v2 AAD while reusing the
+//! forbidden), so this module pins its context in the shared API v2
 //! existing envelope machinery: [`crate::random::secure_random_bytes`]
 //! for every random fill, `aes-gcm` for the AEAD, the [`crate::vault`]
 //! error taxonomy, and `Config::kek_by_version` for KEK selection. No
@@ -51,12 +51,7 @@
 //! grants drain — is decided with the pool-reader slice, which is what
 //! first consumes these rows. No landed code reads them today.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
-};
-use zeroize::{Zeroize, ZeroizeOnDrop};
-
+use crate::field_envelope::{self, Context};
 use crate::vault::VaultError;
 
 /// Value bound into `providers.creds_envelope_version`: the ADR 0002
@@ -84,8 +79,6 @@ pub const NONCE_LEN: usize = 12;
 /// (octet_length(creds_dek_wrapped) = 48)`).
 pub const WRAPPED_DEK_LEN: usize = 48;
 
-/// AAD domain pinning the v2 envelope family (ADR 0002 rule 1).
-const AAD_DOMAIN: &str = "nntune-envelope-v2";
 /// AAD table/field pins for this envelope.
 const AAD_TABLE: &str = "providers";
 const AAD_FIELD: &str = "encrypted_creds";
@@ -131,36 +124,34 @@ pub fn validate_provider_mint_id(raw: &str) -> bool {
         .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Per-row data-encrypting key, cleared on drop (mirrors the v1
-/// holder in [`crate::vault`]: the same zeroizing discipline, not a
-/// second crypto design).
-#[derive(Zeroize, ZeroizeOnDrop)]
-struct Dek([u8; 32]);
+/// v2 credential envelope: raw bytes for the `BYTEA` columns. Re-export
+/// of `FieldEnvelope` under its prior name. No `Debug` derive: this
+/// struct carries key material adjacent to ciphertext, and a derived
+/// dump would print both (threat-model §3: no log line may contain
+/// credential material).
+pub use crate::field_envelope::FieldEnvelope as ProviderCredsEnvelope;
 
-/// v2 credential envelope: raw bytes for the `BYTEA` columns. No `Debug`
-/// derive: this struct carries key material adjacent to ciphertext, and
-/// a derived dump would print both (threat-model §3: no log line may
-/// contain credential material).
-pub struct ProviderCredsEnvelope {
-    pub dek_wrapped_nonce: [u8; NONCE_LEN],
-    pub dek_wrapped: Vec<u8>,
-    pub payload_nonce: [u8; NONCE_LEN],
-    pub ciphertext: Vec<u8>,
-}
-
-/// Frame one variable-length AAD segment: `u32` big-endian length +
-/// bytes. Fixed field order + fixed int widths make the encoding
-/// unambiguous (ADR 0002 rule 1: no delimiter joins).
-fn frame(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    out.extend_from_slice(s.as_bytes());
+/// Pinned envelope context for a `providers` row.
+fn creds_context<'a>(
+    user_id: &'a str,
+    provider_id: &'a str,
+    envelope_version: u16,
+    payload_format: u16,
+) -> Context<'a> {
+    Context {
+        table: AAD_TABLE,
+        field: AAD_FIELD,
+        scope: user_id,
+        row: provider_id,
+        version: envelope_version,
+        format: payload_format,
+    }
 }
 
 /// Canonical v2 AAD: `(domain, purpose, table, field, owner_scope,
 /// row_key, envelope_version, payload_format)` plus `kek_version` for
-/// the DEK wrap. Built from the row being written/read, never from a
-/// stored unauthenticated claim. Payload AAD intentionally excludes
-/// `kek_version`: an authorized rewrap changes only the wrap columns.
+/// the DEK wrap. Thin wrapper over [`Context::aad`], retained for tests.
+#[cfg(test)]
 fn aad_v2(
     purpose: &str,
     user_id: &str,
@@ -169,19 +160,7 @@ fn aad_v2(
     payload_format: u16,
     kek_version: Option<u32>,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + user_id.len() + provider_id.len());
-    frame(&mut out, AAD_DOMAIN);
-    frame(&mut out, purpose);
-    frame(&mut out, AAD_TABLE);
-    frame(&mut out, AAD_FIELD);
-    frame(&mut out, user_id);
-    frame(&mut out, provider_id);
-    out.extend_from_slice(&envelope_version.to_be_bytes());
-    out.extend_from_slice(&payload_format.to_be_bytes());
-    if let Some(v) = kek_version {
-        out.extend_from_slice(&v.to_be_bytes());
-    }
-    out
+    creds_context(user_id, provider_id, envelope_version, payload_format).aad(purpose, kek_version)
 }
 
 /// Encrypt provider credentials into a v2 envelope bound to
@@ -196,59 +175,13 @@ pub fn encrypt_provider_creds(
     provider_id: &str,
     plaintext: &[u8],
 ) -> Result<ProviderCredsEnvelope, VaultError> {
-    let mut dek_bytes = crate::random::secure_random_bytes::<32>()?;
-    let dek = Dek(dek_bytes);
-    // `Dek(dek_bytes)` copies the array: clear the source buffer so the
-    // DEK lives only in the zeroizing holder (mirrors `vault.rs`).
-    dek_bytes.zeroize();
-
-    // Wrap the DEK with the KEK (AAD binds user + row + KEK version).
-    let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let wrap_nonce = crate::random::secure_random_bytes::<NONCE_LEN>()?;
-    let dek_wrapped = kek_cipher
-        .encrypt(
-            &Nonce::from(wrap_nonce),
-            Payload {
-                msg: &dek.0,
-                aad: &aad_v2(
-                    "dek",
-                    user_id,
-                    provider_id,
-                    CREDS_ENVELOPE_VERSION as u16,
-                    CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
-                    Some(kek_version),
-                ),
-            },
-        )
-        .map_err(|_| VaultError::Crypto)?;
-
-    // Encrypt the payload with the DEK (AAD binds user + row; no KEK
-    // version, so an authorized rewrap never touches the payload).
-    let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    let payload_nonce = crate::random::secure_random_bytes::<NONCE_LEN>()?;
-    let ciphertext = dek_cipher
-        .encrypt(
-            &Nonce::from(payload_nonce),
-            Payload {
-                msg: plaintext,
-                aad: &aad_v2(
-                    "payload",
-                    user_id,
-                    provider_id,
-                    CREDS_ENVELOPE_VERSION as u16,
-                    CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
-                    None,
-                ),
-            },
-        )
-        .map_err(|_| VaultError::Crypto)?;
-
-    Ok(ProviderCredsEnvelope {
-        dek_wrapped_nonce: wrap_nonce,
-        dek_wrapped,
-        payload_nonce,
-        ciphertext,
-    })
+    let context = creds_context(
+        user_id,
+        provider_id,
+        CREDS_ENVELOPE_VERSION as u16,
+        CREDS_PAYLOAD_FORMAT_JSON_V1 as u16,
+    );
+    field_envelope::seal(kek, kek_version, &context, plaintext)
 }
 
 /// Decrypt a minted `providers` row. The expected AAD is built from
@@ -275,50 +208,8 @@ pub fn decrypt_provider_creds(
     if envelope.dek_wrapped.len() != WRAPPED_DEK_LEN {
         return Err(VaultError::CorruptStoredData);
     }
-    let kek_cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| VaultError::Crypto)?;
-    let mut dek_bytes = kek_cipher
-        .decrypt(
-            &Nonce::from(envelope.dek_wrapped_nonce),
-            Payload {
-                msg: &envelope.dek_wrapped,
-                aad: &aad_v2(
-                    "dek",
-                    user_id,
-                    provider_id,
-                    envelope_version,
-                    payload_format,
-                    Some(kek_version),
-                ),
-            },
-        )
-        .map_err(|_| VaultError::Crypto)?;
-    if dek_bytes.len() != 32 {
-        dek_bytes.zeroize();
-        return Err(VaultError::Crypto);
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&dek_bytes);
-    // Clear the AES-GCM output buffer: the DEK now lives only in `dek`.
-    dek_bytes.zeroize();
-    let dek = Dek(arr);
-
-    let dek_cipher = Aes256Gcm::new_from_slice(&dek.0).map_err(|_| VaultError::Crypto)?;
-    dek_cipher
-        .decrypt(
-            &Nonce::from(envelope.payload_nonce),
-            Payload {
-                msg: &envelope.ciphertext,
-                aad: &aad_v2(
-                    "payload",
-                    user_id,
-                    provider_id,
-                    envelope_version,
-                    payload_format,
-                    None,
-                ),
-            },
-        )
-        .map_err(|_| VaultError::Crypto)
+    let context = creds_context(user_id, provider_id, envelope_version, payload_format);
+    field_envelope::open(kek, kek_version, &context, envelope)
 }
 
 /// `$n` parameter order for [`insert_provider_sql`]. The envelope
