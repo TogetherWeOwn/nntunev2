@@ -49,7 +49,7 @@ pub struct AccountConfig {
     pub enabled: bool,
 }
 
-fn uuid_shaped(raw: &str) -> bool {
+pub(crate) fn uuid_shaped(raw: &str) -> bool {
     raw.len() == 36
         && raw.bytes().enumerate().all(|(i, b)| match i {
             8 | 13 | 18 | 23 => b == b'-',
