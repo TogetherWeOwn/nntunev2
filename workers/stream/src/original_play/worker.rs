@@ -32,15 +32,21 @@ use crate::delivered::{DeliveredInterval, DeliveredSink};
 /// Start only an already-prepared off-route response. The task owns its source,
 /// supplier, request control and writer; the response is returned without waiting
 /// for backpressure. No source lookup, account construction or public route is
-/// selected here. Construct the control before resolving the private source.
+/// selected here. Construct the control before resolving the private source;
+/// a production supplier must share that same request authority with the response,
+/// not construct an independent clock, timer or cancellation authority here.
 /// Runtime lifetime limits and abort/report durability need Worker qualification.
-pub fn schedule_response<T: AsyncArticleSource + 'static>(
+pub fn schedule_response<T, C>(
     play: OwnedOriginalPlay,
     mut transport: T,
-    mut control: WorkerOriginalControl,
+    mut control: C,
     env: Env,
     ctx: worker::Context,
-) -> worker::Result<Response> {
+) -> worker::Result<Response>
+where
+    T: AsyncArticleSource + 'static,
+    C: OriginalControl + 'static,
+{
     let (response, writer) = channel(play.status(), play.headers(), play.body_len())?;
     let ctx = Rc::new(ctx);
     let mut sink = WorkerDeliveredSink {

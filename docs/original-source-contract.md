@@ -228,8 +228,13 @@ the response without awaiting the backpressured pump. Its `DeliveredSink`
 forwards the one settled interval through a separate `wait_until` call to the
 existing runtime reporter and bounded retries; it adds no meter, retry policy,
 wire format or account-release action. Source lookup and account construction
-remain with their existing owners. Nothing calls this scheduler from the public
-fetch path. Runtime task limits, nested report scheduling and disconnect/report
+remain with their existing owners. The scheduler accepts the existing
+`OriginalControl` trait rather than requiring a separate concrete control. A
+production supplier and response must share the same checked request authority
+through thin forwarding; do not create a second clock watermark or cancellation
+authority during composition. That forwarding is not installed here. Nothing
+calls this scheduler from the public fetch path. Runtime task limits, nested
+report scheduling and disconnect/report
 durability still require actual Worker qualification; static compilation and
 owned-task fixtures do not establish them.
 

@@ -328,71 +328,69 @@ impl<'a> OriginalPlay<'a> {
         )
     }
 
-    fn pump_guard<'p, T, C, W>(
+    async fn pump_guard<'p, T, C, W>(
         mut self,
         transport: &'p mut T,
         control: &'p mut C,
         mut writer: ResponseWriter<W>,
-    ) -> impl Future<Output = Result<(), SourceError>> + 'p + use<'a, 'p, T, C, W>
+    ) -> Result<(), SourceError>
     where
         Self: 'p,
         T: AsyncArticleSource + 'p,
         C: OriginalControl + 'p,
         W: OriginalWriter + 'p,
     {
-        async move {
-            loop {
-                let bytes = {
-                    let mut next = pin!(self.next(transport, control));
-                    poll_fn(|cx| {
-                        if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
-                            return Poll::Ready(Err(error));
-                        }
-                        next.as_mut().poll(cx)
-                    })
-                    .await?
-                };
-                let Some(bytes) = bytes else {
-                    break;
-                };
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    let accepted = poll_fn(|cx| {
-                        if let Err(error) = self.authority.check(control) {
-                            return Poll::Ready(Err(error));
-                        }
-                        if let Poll::Ready(error) = control.poll_cancel(cx) {
-                            return Poll::Ready(Err(error));
-                        }
-                        if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
-                            return Poll::Ready(Err(error));
-                        }
-                        writer.inner.poll_write(cx, &bytes[offset..])
-                    })
-                    .await?;
-                    if accepted == 0 || accepted > bytes.len() - offset {
-                        return Err(SourceError::Bounds);
+        loop {
+            let bytes = {
+                let mut next = pin!(self.next(transport, control));
+                poll_fn(|cx| {
+                    if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
+                        return Poll::Ready(Err(error));
                     }
-                    self.written(accepted)?;
-                    offset += accepted;
+                    next.as_mut().poll(cx)
+                })
+                .await?
+            };
+            let Some(bytes) = bytes else {
+                break;
+            };
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let accepted = poll_fn(|cx| {
+                    if let Err(error) = self.authority.check(control) {
+                        return Poll::Ready(Err(error));
+                    }
+                    if let Poll::Ready(error) = control.poll_cancel(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                    if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                    writer.inner.poll_write(cx, &bytes[offset..])
+                })
+                .await?;
+                if accepted == 0 || accepted > bytes.len() - offset {
+                    return Err(SourceError::Bounds);
                 }
+                self.written(accepted)?;
+                offset += accepted;
             }
-            poll_fn(|cx| {
-                if let Err(error) = self.authority.check(control) {
-                    return Poll::Ready(Err(error));
-                }
-                if let Poll::Ready(error) = control.poll_cancel(cx) {
-                    return Poll::Ready(Err(error));
-                }
-                // `closed` may resolve successfully during this phase; only
-                // poll_close decides whether our own close completed.
-                writer.inner.poll_close(cx)
-            })
-            .await?;
-            writer.closed = true;
-            drop(writer);
-            self.finish()
         }
+        poll_fn(|cx| {
+            if let Err(error) = self.authority.check(control) {
+                return Poll::Ready(Err(error));
+            }
+            if let Poll::Ready(error) = control.poll_cancel(cx) {
+                return Poll::Ready(Err(error));
+            }
+            // `closed` may resolve successfully during this phase; only
+            // poll_close decides whether our own close completed.
+            writer.inner.poll_close(cx)
+        })
+        .await?;
+        writer.closed = true;
+        drop(writer);
+        self.finish()
     }
 
     /// Fetch at most the next output article slice. Before another pull, the
