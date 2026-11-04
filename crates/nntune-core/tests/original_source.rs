@@ -136,6 +136,34 @@ fn strings_and_collections_are_capped_before_growth() {
 }
 
 #[test]
+fn producer_declared_article_sizes_fit_the_reader_cap() {
+    for index in 0..3 {
+        let mut f = file(3);
+        f.segments[index].encoded_bytes = MAX_ARTICLE_BYTES as i64;
+        assert!(OriginalSource::from_file(TRACK, JOB, &f, 3, None).is_ok());
+        for bytes in [0, -1, MAX_ARTICLE_BYTES as i64 + 1, 17 * 1024 * 1024] {
+            f.segments[index].encoded_bytes = bytes;
+            assert!(OriginalSource::from_file(TRACK, JOB, &f, 3, None).is_err());
+        }
+    }
+}
+
+#[test]
+fn parser_declared_article_sizes_fit_the_reader_cap() {
+    let s = source(&[1, 1, 1], None);
+    for index in 0..3 {
+        let at_cap = change(&s, |v| {
+            v["articles"][index]["encoded_bytes"] = MAX_ARTICLE_BYTES.into()
+        });
+        assert!(parse(&at_cap).is_ok());
+        for bytes in [0, MAX_ARTICLE_BYTES + 1, 17 * 1024 * 1024] {
+            let over_cap = change(&s, |v| v["articles"][index]["encoded_bytes"] = bytes.into());
+            assert!(parse(&over_cap).is_err());
+        }
+    }
+}
+
+#[test]
 fn producer_rechecks_parser_invariants_before_clone() {
     let mut f = file(1);
     f.ordinal = 1024;

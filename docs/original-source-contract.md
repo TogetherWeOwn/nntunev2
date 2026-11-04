@@ -97,7 +97,7 @@ key store, credential creation or new cipher is introduced.
 | Files represented | One; original ordinal below 1024 |
 | Articles | 1–4096, no reserve from stored count/sequence hints |
 | Reference | 1–998 decoded bytes, no brackets/whitespace/control bytes |
-| Encoded declaration | Each at most core `MAX_SEGMENT_BYTES`; checked sum at most 64 GiB |
+| Encoded declaration | Each 1–16,777,216 bytes inclusive (`MAX_ARTICLE_BYTES`); checked sum at most 64 GiB |
 | Decoded file | 1–64 GiB; never a file-sized allocation |
 | Actual encoded/decoded article | At most 16 MiB each |
 | Traversal | At most N opens and at most the bounded file's total decoded bytes |
@@ -108,13 +108,20 @@ column's length in SQL and pins the selected job, KEK and ciphertext length.
 Nonce conversion and decryption happen only afterwards. An adapter must not
 replace these steps with an unrestricted row/base64/JSON fetch followed by a
 late size check. A concurrent change loses the selected snapshot or fails
-closed at authentication/binding checks.
+closed at authentication/binding checks. Metadata uses Rust `i32` for the
+PostgreSQL `INTEGER` KEK version and `octet_length(BYTEA)` projections, including
+the KEK/length snapshot parameters of the byte-bearing query. Sealing checks
+the keyring's `u32` version fits the persisted `INTEGER` domain before use;
+reading checks the stored nonnegative version before exact keyring selection.
 
 JSON lexical preflight bounds each string token (including escaped forms),
 its decoded byte count, numeric token length and nesting **before** structured
 parsing allocates fields. A private wire type and bounded sequence visitor
 prevent bypass through public deserialization or unchecked capacity hints.
 Public source values can be created only by the validated producer/parser.
+Both enforce the declared article cap before a source can be sealed or passed
+to transport, including the final article required by every range read. The
+general NZB `MAX_SEGMENT_BYTES` intake limit is unchanged.
 
 The reader collects one encoded article in capped chunks and decodes into a
 bounded destination, reusing core yEnc. It retains the final decoded article

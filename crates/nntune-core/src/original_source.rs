@@ -222,7 +222,7 @@ impl OriginalSource {
             if a.number != i + 1
                 || a.reference.len() > MAX_REFERENCE_BYTES
                 || a.encoded_bytes == 0
-                || a.encoded_bytes > nzb::MAX_SEGMENT_BYTES as u64
+                || a.encoded_bytes > MAX_ARTICLE_BYTES as u64
             {
                 return Err(SourceError::Shape);
             }

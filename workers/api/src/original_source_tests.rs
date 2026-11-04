@@ -258,6 +258,55 @@ fn persisted() -> (TempDb, Store) {
 }
 
 #[test]
+fn metadata_matches_postgres_int4_projection_and_snapshot_parameters() {
+    use tokio_postgres::types::{FromSql, ToSql, Type};
+
+    fn int4<T>(value: T, wire_value: i32)
+    where
+        T: for<'a> FromSql<'a> + ToSql + PartialEq + std::fmt::Debug,
+    {
+        assert!(<T as FromSql>::accepts(&Type::INT4));
+        assert!(<T as ToSql>::accepts(&Type::INT4));
+        assert!(!<T as FromSql>::accepts(&Type::INT8));
+        assert!(!<T as ToSql>::accepts(&Type::INT8));
+        let decoded = T::from_sql(&Type::INT4, &wire_value.to_be_bytes()).unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    let source = prepare(A, 1, JOB);
+    let metadata = seal_original_source(&Keys, 7, &source).unwrap().metadata;
+    // INTEGER KEK version and octet_length(BYTEA) are PostgreSQL int4;
+    // the same selected values bind $3/$4 of source_envelope_sql.
+    int4(metadata.kek_version, 7);
+    int4(
+        metadata.ciphertext_len,
+        (source.encode().unwrap().len() + 16).try_into().unwrap(),
+    );
+    int4(metadata.wrap_nonce_len, 12);
+    int4(metadata.wrapped_dek_len, 48);
+    int4(metadata.payload_nonce_len, 12);
+}
+
+#[test]
+fn seal_rejects_kek_versions_outside_the_persisted_integer_domain() {
+    struct AnyVersion;
+    impl KekSource for AnyVersion {
+        fn kek(&self, _: u32) -> Option<&[u8; 32]> {
+            Some(&[19; 32])
+        }
+    }
+    let source = prepare(A, 1, JOB);
+    for version in [i32::MAX as u32 + 1, u32::MAX] {
+        assert!(matches!(
+            seal_original_source(&AnyVersion, version, &source),
+            Err(SourceServiceError::Invalid)
+        ));
+    }
+    let sealed = seal_original_source(&AnyVersion, i32::MAX as u32, &source).unwrap();
+    assert_eq!(sealed.metadata.validate(A), Ok(i32::MAX as u32));
+}
+
+#[test]
 fn persisted_winner_producer_seal_reopen_reader_is_per_backed_file() {
     let (temp, mut store) = persisted();
     // Resolve the actual persisted winner, never mint a pre-insert UUID.

@@ -37,17 +37,19 @@ fn context(track_id: &str) -> Context<'_> {
 
 /// Safe bounded projection, with no ciphertext. Store adapters must never
 /// fetch BYTEA (or base64/JSON encode it) until this shape passes validation.
+/// INTEGER and octet_length(BYTEA) are PostgreSQL int4 (Rust i32), including
+/// the selected KEK/length parameters bound by source_envelope_sql.
 #[derive(Clone)]
 pub struct SourceMetadata {
     pub track_id: String,
     pub source_job_id: String,
     pub envelope_version: i16,
     pub payload_format: i16,
-    pub kek_version: i64,
-    pub ciphertext_len: i64,
-    pub wrap_nonce_len: i64,
-    pub wrapped_dek_len: i64,
-    pub payload_nonce_len: i64,
+    pub kek_version: i32,
+    pub ciphertext_len: i32,
+    pub wrap_nonce_len: i32,
+    pub wrapped_dek_len: i32,
+    pub payload_nonce_len: i32,
 }
 
 impl SourceMetadata {
@@ -57,7 +59,7 @@ impl SourceMetadata {
             || !valid_source_job(&self.source_job_id)
             || self.envelope_version != ENVELOPE_VERSION
             || self.payload_format != PAYLOAD_FORMAT
-            || !(17..=MAX_CIPHERTEXT_BYTES as i64).contains(&self.ciphertext_len)
+            || !(17..=MAX_CIPHERTEXT_BYTES as i32).contains(&self.ciphertext_len)
             || self.wrap_nonce_len != 12
             || self.wrapped_dek_len != 48
             || self.payload_nonce_len != 12
@@ -122,7 +124,7 @@ pub fn read_original_source(
     let envelope = repository
         .envelope(&selected)?
         .ok_or(SourceServiceError::Missing)?;
-    if envelope.ciphertext.len() as i64 != selected.ciphertext_len
+    if envelope.ciphertext.len() != selected.ciphertext_len as usize
         || envelope.dek_wrapped.len() != 48
     {
         return Err(SourceServiceError::Invalid);
@@ -153,6 +155,7 @@ pub fn seal_original_source(
     kek_version: u32,
     source: &OriginalSource,
 ) -> Result<SealedSource, SourceServiceError> {
+    let stored_kek_version = i32::try_from(kek_version).map_err(|_| SourceServiceError::Invalid)?;
     let kek = keks
         .kek(kek_version)
         .ok_or(SourceServiceError::UnknownKey)?;
@@ -164,8 +167,9 @@ pub fn seal_original_source(
         source_job_id: source.source_job_id().into(),
         envelope_version: ENVELOPE_VERSION,
         payload_format: PAYLOAD_FORMAT,
-        kek_version: i64::from(kek_version),
-        ciphertext_len: envelope.ciphertext.len() as i64,
+        kek_version: stored_kek_version,
+        ciphertext_len: i32::try_from(envelope.ciphertext.len())
+            .map_err(|_| SourceServiceError::Invalid)?,
         wrap_nonce_len: 12,
         wrapped_dek_len: 48,
         payload_nonce_len: 12,
