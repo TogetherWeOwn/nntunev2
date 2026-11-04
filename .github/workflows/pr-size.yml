@@ -48,7 +48,7 @@ jobs:
       contents: read
       issues: write # Create and apply the advisory size labels.
       pull-requests: write # Label the selected pull request with its advisory size.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2 # v0.1.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # No repo-specific generated paths: the script's built-in exclusions
@@ -65,4 +65,4 @@ jobs:
       contents: read
       issues: read # Resolve advisory size labels for the weekly tally.
       pull-requests: read # List pull requests for the read-only weekly tally.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2 # v0.1.0

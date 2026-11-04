@@ -320,7 +320,7 @@ jobs:
       # stays above; only versions promote/rollback runs here.
       - name: Gradual promotion 5-50-100 with automatic rollback
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06 # v0.3.0
         with:
           worker-name: ${{ env.PRODUCTION_WORKER_NAME }}
           version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

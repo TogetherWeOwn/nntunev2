@@ -69,6 +69,7 @@ env:
 jobs:
   gate:
     name: gate
+    environment: staging
     concurrency:
       group: ${{ github.workflow }}-gate-${{ github.ref }}
       cancel-in-progress: false

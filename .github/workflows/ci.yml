@@ -695,6 +695,9 @@ jobs:
 
   rust-ingest:
     name: rust (workers/ingest)
+    environment: ci-fixtures
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -718,9 +721,9 @@ jobs:
       # notices, and the test skips via the fetcher's exit-77 path.
       - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
         run: |
           set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
@@ -732,9 +735,9 @@ jobs:
           sha256sum "$fetched"
       - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
@@ -1315,6 +1318,9 @@ jobs:
 
   web-e2e:
     name: web-e2e
+    environment: ci-fixtures
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
     # 18.8-20.6 minutes; container setup (image pull + pnpm install)
@@ -1378,9 +1384,9 @@ jobs:
         # needs the pre-warmed cache.
         working-directory: ${{ github.workspace }}
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
         run: |
           set -eu
           if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
@@ -1402,9 +1408,9 @@ jobs:
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
         env:
-          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID }}
-          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY }}
-          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID }}
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
