@@ -49,6 +49,7 @@ pub mod account_dispatch;
 pub mod account_ingress;
 pub mod account_operation;
 pub mod account_owner;
+pub mod account_playback;
 pub mod account_pool;
 pub mod account_route;
 pub mod account_selection;

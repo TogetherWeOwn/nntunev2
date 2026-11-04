@@ -273,6 +273,30 @@ Do not wire the old per-user publication path as a prerequisite to this pool.
 Repair contribution propagation remains conservative/unfinished; incomplete
 records stay unattributed, without affecting playback authority.
 
+### Playback article source (portable, not installed)
+
+`account_playback::fetch` composes the account selector for a **fixed stream
+class**, without using the legacy per-user pool or XOR demo. It verifies a v2
+play grant and its track binding before any catalogue or registry read. A trusted
+`PlaybackCatalogue` selects the message ID by curated track and article index;
+requests cannot nominate an article ID, account, endpoint or class. A second
+grant check after the catalogue await prevents an expired grant starting the
+pool read. One whole-call deadline covers catalogue, registry, hints and BODY.
+The selector makes at most one operation attempt, including on a lost reply.
+
+The result is a bounded, **still-encoded article**, with verified play identity
+and actual serving account for internal telemetry. It is not playable audio,
+a cache admission/grant or delivered bytes. Missing catalogue rows/articles,
+quarantine/auth failures, exhausted capacity and transport failures all map to
+generic retryable service unavailability, never a user provider re-auth prompt
+or an account/article-existence response. Segment integrity, decryption, range
+validation and client-written metering remain the downstream caller's job.
+
+No production catalogue adapter or public Worker caller is installed. The old
+`TrackManifest`/XOR demo is not a trusted catalogue adapter. The public R2 route,
+its source order and delivered-byte metering are unchanged; NNTP misses remain
+unavailable. Native fakes test source composition only, not end-to-end playback.
+
 **No operation RPC or product dial is enabled.** The composed operation and ingest
 forwarding handlers share the hard false compile-time qualification gate, not an
 environment toggle. They refuse before request body or internal key reads. The
