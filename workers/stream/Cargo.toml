@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Serializes account-owner mutations across durable storage awaits on both targets.
+futures-util = "0.3"
 
 # Worker + NntpPool Durable Object entry (src/runtime.rs), wasm32 only: native
 # builds and `cargo test` stay free of the Workers runtime.
@@ -25,7 +27,6 @@ nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-fe
 worker = "0.8"
 # `#[durable_object]` expands to `#[wasm_bindgen]` items resolved by name.
 wasm-bindgen = "0.2.129"
-futures-util = "0.3"
 
 [dev-dependencies]
 # id_cap_agreement_acceptance.rs reads the api ledger as source text via

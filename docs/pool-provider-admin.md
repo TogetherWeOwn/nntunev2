@@ -114,6 +114,44 @@ TLS/port policy but still dials a hostname; it does **not** satisfy this peer
 pinning contract. Until the account runtime and suitable transport land,
 NNTP cache misses remain unavailable; this channel alone is not deploy-ready.
 
+## Account owner and storage boundary (unrouted)
+
+`account_owner` serializes lazy initialization, reconciliation, reservation and
+close/result mutations through one async mutex per account. Construct it once
+from the named account Durable Object, never once per request or in the user
+meter object. The authenticated registry snapshot must match that object name;
+selection hints and request bodies are not registry authority. The owner does
+not authenticate snapshots itself. Reconcile a fresh authenticated snapshot
+before every admission and release the guard before awaiting socket I/O.
+Result recording takes the I/O-completion timestamp and advances the breaker
+clock under the same lock; a slow failure must still receive its full cooldown.
+Backward wall-clock samples never double-count elapsed time.
+
+`account_storage` stores a single bounded JSON string at
+`account-supervisor-v1`. JSON preserves full-width integer revisions and
+reservation keys through Worker serialization. A save awaits atomic `put`
+**and** `storage.sync()` before acknowledging the journal. A load synchronizes
+pending writes first; there is no application read cache. Storage/parse errors
+are redacted and never interpreted as a missing journal. Only scheduling
+identities, quarantine and outstanding reservations are stored, never endpoint
+credentials or resolver response bodies.
+
+Cancellation or uncertainty during initialization leaves that instance fenced;
+there is no second lazy initializer over an uncertain write. The supervisor
+likewise fences canceled/failed mutation writes. Cleanup uses a separate owner
+method that does not need a successful registry read or reconciliation write:
+physical close remains possible after poisoning, but uncertain capacity is not
+released. Synchronous AUTHINFO checks refuse while the owner lock is held,
+rather than block or borrow shared mutable state across an await.
+
+The Worker storage factory compiles against the installed storage API. It is
+**not** yet called by a Durable Object class or a product route: no account
+namespace, migration, alarm, admission RPC, deadline sweep or resolver-to-dial
+wiring is installed. Native fake-backend tests prove ordering/fencing only;
+they do not prove actual Worker persistence, TLS, entropy, clock or physical
+closure. Those runtime qualification gates and curated-track staging playback
+remain required before real dialing or public NNTP misses are enabled.
+
 ## Verification
 
 Handler tests use the standard API harness. Production transaction tests run

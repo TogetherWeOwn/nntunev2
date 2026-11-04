@@ -45,7 +45,9 @@
 //! exports the `NntpPool` Durable Object with its probe route. Native builds
 //! and `cargo test` never link the Workers runtime.
 
+pub mod account_owner;
 pub mod account_pool;
+pub mod account_storage;
 pub mod account_supervisor;
 pub mod api_error;
 pub mod body;
