@@ -78,10 +78,13 @@ export function contextMenu(node: HTMLElement, open: ((invoker: HTMLElement, poi
 	}
 	function down(event: PointerEvent) {
 		cancel();
+		// A second contact cancels a pending press but must not release the
+		// compatibility-click guard of a menu that already opened.
+		if (!event.isPrimary) return;
 		pressed = false;
 		// Primary row controls opt in; form controls and secondary actions keep
 		// their own press, selection and scroll behavior.
-		if (!callback || event.pointerType === 'mouse' || !event.isPrimary || event.button !== 0 ||
+		if (!callback || event.pointerType === 'mouse' || event.button !== 0 ||
 			(event.target instanceof Element && event.target.closest('button, input, a, select, textarea') &&
 			 !event.target.closest('[data-context-menu-longpress]'))) return;
 		origin = { x: event.clientX, y: event.clientY };

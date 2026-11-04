@@ -1691,7 +1691,7 @@
 		const index = base.tracks.findIndex((track) => track.id === first.id);
 		const target = base.tracks[index];
 		if (!target) return;
-		const source = playableTrackFor(first).streamUrl;
+		const source = resolveStreamUrl(target) || playableTrackFor(first).streamUrl;
 		const tracks = [...base.tracks];
 		tracks[index] = { ...target, streamUrl: source };
 		replaceQueue(selectQueueIndex({ ...base, tracks }, index));
@@ -1735,7 +1735,8 @@
 		const surviving = availableInteractionIds(ids);
 		if (!surviving.length) return;
 		const next = insertTracksNext(queue, knownTracks(surviving));
-		if (next !== queue) replaceQueue(next);
+		if (next === queue) return;
+		replaceQueue(next);
 		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
 	}
 

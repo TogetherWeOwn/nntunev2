@@ -217,6 +217,20 @@ describe('contextMenu action', () => {
 		action.destroy();
 	});
 
+	it('a secondary touch after opening preserves one compatibility-click suppression', () => {
+		const action = contextMenu(node as never, open);
+		node.fire('pointerdown', touch());
+		vi.advanceTimersByTime(500);
+		node.fire('pointerdown', touch({ isPrimary: false }));
+		node.fire('pointerup');
+		vi.advanceTimersByTime(500);
+		expect(open).toHaveBeenCalledOnce();
+		expect(node.fire('mousedown').preventDefault).toHaveBeenCalled();
+		expect(node.fire('click', { detail: 1 }).preventDefault).toHaveBeenCalled();
+		expect(node.fire('click', { detail: 1 }).preventDefault).not.toHaveBeenCalled();
+		action.destroy();
+	});
+
 	it('does not long-press for mouse, non-primary button or native controls', () => {
 		contextMenu(node as never, open);
 		node.fire('pointerdown', touch({ pointerType: 'mouse' }));

@@ -654,3 +654,114 @@ test('menus stay in a narrow viewport and coarse-pointer long press opens a shee
 	await expect(libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore)).toBeFocused();
 	await context.close();
 });
+
+test('library Play now retains queued audio and plays once when refresh omits streamUrl', async ({ page }) => {
+	await page.addInitScript(() => {
+		(window as unknown as { playCalls: number }).playCalls = 0;
+		HTMLMediaElement.prototype.play = function () {
+			(window as unknown as { playCalls: number }).playCalls++;
+			return Promise.resolve();
+		};
+	});
+	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	const withStream = ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` }));
+	let current: typeof ITEMS = withStream;
+	page.on('pageerror', (error) => pageErrors.push(error.message));
+	await page.route('**/api/library', (route) => route.fulfill({ json: current }));
+	await page.goto('/library');
+	await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(ITEMS.length);
+	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	await expect(page.locator('audio')).toHaveAttribute('src', /\/interaction-audio\/coral$/);
+	const playsBefore = await page.evaluate(() => (window as unknown as { playCalls: number }).playCalls);
+	current = ITEMS;
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByTestId(TESTIDS.libraryItem)).toHaveCount(ITEMS.length);
+	await expect(queueRow(page, 'coral')).toBeVisible();
+	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+	await menu(page).getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await expect(page.getByTestId('queue-announcement')).toContainText('Playing Coral Night');
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	await expect(page.locator('audio')).toHaveAttribute('src', /\/interaction-audio\/coral$/);
+	await expect.poll(() => page.evaluate(() => (window as unknown as { playCalls: number }).playCalls)).toBe(playsBefore + 1);
+	await expect(menu(page)).toHaveCount(0);
+	expect(await page.evaluate(() => (window as unknown as { playCalls: number }).playCalls)).toBe(playsBefore + 1);
+});
+
+test('library Play next on only the current track is a silent no-op', async ({ page }) => {
+	await seed(page);
+	await libraryRow(page, 'coral').locator('.nt-library-row').click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	const announcement = page.getByTestId('queue-announcement');
+	const before = await announcement.textContent();
+	const nowPlaying = await page.getByTestId('now-playing').textContent();
+	await libraryRow(page, 'coral').getByTestId(TESTIDS.trackMore).click();
+	await menu(page).getByRole('menuitem', { name: 'Play next', exact: true }).click();
+	await expect(menu(page)).toHaveCount(0);
+	await expect.poll(() => queueIds(page)).toEqual(['coral']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying!);
+	await expect(announcement).toHaveText(before ?? '');
+	await expect(announcement).not.toContainText('Tracks placed next in the queue');
+});
+
+test('queue Move selected before resets to End of queue when the chosen target joins the batch', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const current = await page.getByTestId('now-playing').textContent();
+	await queueRow(page, 'dawn').getByRole('checkbox').check();
+	const toolbar = page.getByTestId(TESTIDS.queueSelectionToolbar);
+	const select = toolbar.getByLabel('Move selected before');
+	await select.selectOption('ember');
+	await expect(select).toHaveValue('ember');
+	await queueRow(page, 'ember').getByRole('checkbox').check();
+	await expect(toolbar.getByRole('status')).toHaveText('2 selected in queue');
+	await expect(select).toHaveValue('');
+	await toolbar.getByRole('button', { name: 'Move selected', exact: true }).click();
+	await expect.poll(() => queueIds(page)).toEqual(['coral', 'tide', 'dawn', 'ember']);
+	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
+	await expect(page.getByTestId('now-playing')).toHaveText(current!);
+});
+
+test('queue More is guarded with aria-disabled, not native disabled, during a deferred refresh', async ({ page }, testInfo) => {
+	await seed(page);
+	await queueAll(page);
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	await page.unroute('**/api/library');
+	await page.route('**/api/library', async (route) => {
+		await gate;
+		await route.fulfill({ json: ITEMS });
+	});
+	const more = queueRow(page, 'coral').getByTestId(TESTIDS.queueMore);
+	await more.focus();
+	await expect(more).not.toHaveAttribute('aria-disabled', 'true');
+	const before = await queueIds(page);
+	const nowPlaying = await page.getByTestId('now-playing').textContent();
+	try {
+		await page.getByRole('button', { name: 'Refresh', exact: true }).evaluate((node: HTMLButtonElement) => node.click());
+		await expect(more).toHaveAttribute('aria-disabled', 'true');
+		expect(await more.evaluate((node: HTMLButtonElement) => node.disabled)).toBe(false);
+		await expect(more).toBeFocused();
+		await more.hover();
+		await expect(more).toHaveCSS('cursor', 'default');
+		await expect(more).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+		const screenshot = testInfo.outputPath('queue-more-unavailable.png');
+		await page.screenshot({ path: screenshot, fullPage: true });
+		await testInfo.attach('queue-more-unavailable', { path: screenshot, contentType: 'image/png' });
+		await more.click({ force: true });
+		await page.keyboard.press('Enter');
+		await page.keyboard.press('Shift+F10');
+		await expect(menu(page)).toHaveCount(0);
+		await expect(more).toBeFocused();
+		expect(await queueIds(page)).toEqual(before);
+		await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying!);
+	} finally {
+		release();
+	}
+	await expect(more).not.toHaveAttribute('aria-disabled', 'true');
+	await more.click();
+	await expect(menu(page)).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(menu(page)).toHaveCount(0);
+});

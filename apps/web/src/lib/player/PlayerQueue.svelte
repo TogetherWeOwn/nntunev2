@@ -461,6 +461,11 @@
 	const orderedBatch = $derived(queue.tracks.filter((track) => batchIds.includes(track.id)).map((track) => track.id));
 	let batchAnchor = $state<string | null>(null);
 	let moveBefore = $state('');
+	$effect(() => {
+		if (moveBefore && (batchIds.includes(moveBefore) || !queue.tracks.some((track) => track.id === moveBefore))) {
+			moveBefore = '';
+		}
+	});
 	let selectionGeneration: number | undefined;
 
 	$effect(() => {
@@ -844,7 +849,7 @@
 			{displayTitle(track)}{#if track.artist}{' — '}{track.artist}{/if}
 			{#if oninsert || onreorder}
 				<button type="button" class="queue-more" data-testid="queue-more" aria-haspopup="menu"
-					aria-label="More actions for {displayTitle(track)}"
+					aria-label="More actions for {displayTitle(track)}" aria-disabled={interactionsUnavailable}
 					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
 				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
 			{/if}
@@ -1009,6 +1014,7 @@
 	ol { min-height: 48px; }
 	.queue-grip { cursor: grab; min-height: 40px; touch-action: none; }
 	.queue-more, .queue-batch-select { min-width: 40px; min-height: 40px; }
+	.queue-more[aria-disabled='true'] { color: var(--nt-fg-muted); cursor: default; background: transparent; }
 	.queue-batch-select { display: inline-flex; align-items: center; justify-content: center; }
 	.queue-batch-select input { width: 1.5rem; height: 1.5rem; }
 	.queue-row[data-selected] { background: var(--nt-bg-raised); outline: 1px solid var(--nt-accent); }
