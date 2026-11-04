@@ -123,7 +123,7 @@ class World:
         self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
                     "head_sha": SHA, "head_branch": "main", "event": "push", "status": "completed",
                     "conclusion": "success", "repository": repo, "head_repository": dict(repo),
-                    "created_at": iso(-20)}
+                    "created_at": iso(-20), "updated_at": iso(5)}
         self.runs = [self.run]
         self.others = {}
         self.jobs = [self.job("staging-web", -10), self.job("staging-api", -10),
@@ -157,10 +157,13 @@ class World:
 
     def add_other(self, conclusion, status="completed", job="staging-api"):
         other = {"id": 101, "run_attempt": 1, "event": "push", "head_sha": OTHER_SHA,
-                 "created_at": iso(-1)}
+                 "created_at": iso(-1), "updated_at": iso(-1), "status": status,
+                 "conclusion": "success" if status == "completed" else None}
         self.runs.append(other)
         self.others[101] = [{"name": job, "status": status, "conclusion": conclusion,
-                             "completed_at": iso(-1)}]
+                             "completed_at": iso(-1), "run_attempt": 1},
+                            {"name": "staging-web" if job == "staging-api" else "staging-api",
+                             "status": "completed", "conclusion": "skipped", "run_attempt": 1}]
 
     def routes(self, artifacts=None, jobs=None):
         base = "?per_page=100&page=1"
@@ -173,8 +176,24 @@ class World:
             f"runs/{RUN_ID}/artifacts{base}": artifacts or page("artifacts", [self.artifact]),
             f"artifacts/{ARTIFACT_ID}/zip": self.archive,
         }
+        # Discovery fixtures expose only the bounded queries. The unfiltered
+        # lifetime endpoint remains above to demonstrate that it is not needed.
+        candidate = [run for run in self.runs if run.get("head_sha") == SHA]
+        queries = {f"head_sha={SHA}": candidate, f"head_sha={OTHER_SHA}": []}
+        for status in ("queued", "in_progress", "waiting", "pending", "requested"):
+            queries[f"status={status}"] = [run for run in self.runs if run.get("status") == status]
+        cutoff = (datetime.fromisoformat(self.receipt["identities"]["build-identity"]["observed_at"])
+                  - timedelta(days=66)).date().isoformat()
+        queries[f"created=%3E%3D{cutoff}"] = [
+            run for run in self.runs if datetime.fromisoformat(run["created_at"]).date().isoformat() >= cutoff]
+        for query, rows in queries.items():
+            for start in range(0, max(1, len(rows)), 100):
+                route = (f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&{query}"
+                         f"&per_page=100&page={start // 100 + 1}")
+                r[route] = page("workflow_runs", rows[start:start + 100], total=len(rows))
         for rid, jobs_ in self.others.items():
             r[f"runs/{rid}/attempts/1/jobs{base}"] = page("jobs", jobs_)
+            r[f"runs/{rid}/jobs?filter=all&per_page=100&page=1"] = page("jobs", jobs_)
         return r
 
     def verify(self, routes=None, hook=None, **over):
@@ -183,6 +202,11 @@ class World:
                     producer_source_ok=lambda source: None)
         args.update(over)
         return sa.verify(FakeActions(routes or self.routes(), hook), **args)
+
+    def verify_with_actions(self, actions):
+        return sa.verify(actions, repo=REPO, repository_id=str(REPO_ID), sha=SHA,
+                         policy=self.policy, contract_bytes=self.contract_bytes,
+                         manifest_hash=sa.digest(self.manifest), producer_source_ok=lambda source: None)
 
 
 class Base(unittest.TestCase):
@@ -388,6 +412,130 @@ class VerifyTests(Base):
         w.others[101][0]["completed_at"] = iso(-15)
         self.assertEqual(w.verify()["result"], "satisfied")
 
+    def test_large_lifetime_history_and_complete_relevant_pagination(self):
+        w = World()
+        for rid in range(200, 986):
+            # More than a hundred relevant rows, plus old lifetime history.
+            recent = rid < 401
+            w.runs.append(dict(w.run, id=rid, head_sha=OTHER_SHA,
+                               created_at=iso(-60 if recent else -100 * 24 * 60),
+                               updated_at=iso(-30)))
+        actions = FakeActions(w.routes())
+        self.assertEqual(w.verify_with_actions(actions)["result"], "satisfied")
+        self.assertTrue(any("page=3" in route for route in actions.calls))
+        self.assertNotIn(f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&per_page=100&page=1",
+                         actions.calls)
+
+    def test_incomplete_relevant_discovery_refuses(self):
+        w = World()
+        routes = w.routes()
+        route = next(r for r in routes if "&created=" in r)
+        routes[route]["total_count"] = 201
+        self.assertWorldRefused(w, "incomplete or exhausted workflow_runs", routes=routes)
+
+    def test_older_unresolved_run_is_discovered_independently(self):
+        w = World()
+        w.add_other(None, status="waiting")
+        w.runs[1]["created_at"] = iso(-100 * 24 * 60)
+        self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_predeployment_failure_does_not_invalidate(self):
+        for lane, deploy in (("staging-web", "Deploy to staging"),
+                             ("staging-api", "Deploy api to staging")):
+            with self.subTest(lane=lane):
+                w = World()
+                w.add_other("failure", job=lane)
+                w.others[101][0]["steps"] = [w.step("Prerequisite", 1, "failure"),
+                                            w.step(deploy, 2, "skipped")]
+                self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_executed_or_uncertain_deployment_invalidates(self):
+        for steps in ([], [World.step("Deploy api to staging", 2, "failure")],
+                      [World.step("Deploy api to staging", 2)],
+                      [World.step("Deploy api to staging", 2, "cancelled")],
+                      [World.step("Deploy api to staging", 2, "skipped")],
+                      [World.step("Prerequisite", 3, "failure"),
+                       World.step("Deploy api to staging", 2, "skipped")]):
+            w = World()
+            w.add_other("failure")
+            w.others[101][0]["steps"] = steps
+            self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_every_unresolved_job_and_missing_conclusion_refuses(self):
+        for status in ("queued", "waiting", "pending", "requested", "in_progress", "unknown", None):
+            for conclusion in (None, "skipped"):
+                with self.subTest(status=status, conclusion=conclusion):
+                    w = World()
+                    w.add_other(conclusion)
+                    w.others[101][0]["status"] = status
+                    self.assertWorldRefused(w, "intervening staging deployment")
+        w = World()
+        w.add_other(None)
+        w.others[101][0]["completed_at"] = iso(-30)
+        self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_prior_rerun_mutation_is_not_hidden_by_latest_predeploy_failure(self):
+        w = World()
+        w.add_other("failure")
+        w.others[101][0]["steps"] = [w.step("Prerequisite", 1, "failure"),
+                                    w.step("Deploy api to staging", 2, "skipped")]
+        w.others[101].append(dict(w.others[101][0], conclusion="success", steps=[]))
+        self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_pending_rerun_cannot_reuse_historical_lanes(self):
+        for status in ("queued", "waiting", "in_progress"):
+            with self.subTest(status=status):
+                w = World()
+                w.add_other("success", status=status)
+                w.runs[1]["run_attempt"] = 2
+                w.others[101][0].update(status="completed", completed_at=iso(-30))
+                w.others[101].append({"name": "gate", "status": status,
+                                      "run_attempt": 2, "conclusion": None})
+                self.assertWorldRefused(w, "missing current-attempt conflicting staging jobs")
+
+    def test_current_attempt_terminal_lanes_can_finish_before_other_jobs(self):
+        w = World()
+        w.add_other("success", status="in_progress")
+        w.others[101][0].update(status="completed", completed_at=iso(-30))
+        self.assertEqual(w.verify()["result"], "satisfied")
+
+    def test_predeploy_exemption_requires_reviewed_producer(self):
+        w = World()
+        w.add_other("failure")
+        w.others[101][0]["steps"] = [w.step("Prerequisite", 1, "failure"),
+                                    w.step("Deploy api to staging", 2, "skipped")]
+        def source_ok(source):
+            if source != SHA:
+                raise sa.Refused("conflicting producer drift")
+        self.assertWorldRefused(w, "conflicting producer drift", producer_source_ok=source_ok)
+
+    def test_old_created_rerun_with_recent_mutation_is_discovered(self):
+        w = World()
+        w.add_other("success")
+        w.runs[1].update(created_at=iso(-60 * 24 * 60), run_attempt=2)
+        w.others[101][0]["run_attempt"] = 2
+        self.assertWorldRefused(w, "intervening staging deployment")
+
+    def test_run_listing_bounds_drift_duplicates_and_response_size(self):
+        route = "workflows/5/runs?branch=main&event=push"
+        rows = [dict(World().run, id=rid) for rid in range(1, 102)]
+        first = route + "&per_page=100&page=1"
+        second = route + "&per_page=100&page=2"
+        for routes in ({first: page("workflow_runs", rows[:100], total=1000)},
+                       {first: page("workflow_runs", rows[:100], total=101)},
+                       {first: page("workflow_runs", rows[:100], total=101),
+                        second: page("workflow_runs", rows[100:], total=102)},
+                       {first: page("workflow_runs", rows[:100], total=101),
+                        second: page("workflow_runs", rows[:1], total=101)}):
+            self.refused("incomplete or exhausted|unavailable", FakeActions(routes).runs, route)
+        self.refused("response exceeds bounds", FakeActions({first: b" " * (sa.MAX_RUN_PAGE + 1)}).runs, route)
+
+    def test_missing_conflicting_lanes_refuses(self):
+        w = World()
+        w.add_other("success")
+        w.others[101] = [{"name": "gate", "status": "completed", "conclusion": "success"}]
+        self.assertWorldRefused(w, "missing conflicting staging jobs")
+
     def test_jobs_missing_duplicate_or_failed(self):
         w = World()
         w.jobs.pop(0)
@@ -453,7 +601,7 @@ class VerifyTests(Base):
                                 routes=w.routes(artifacts=page("artifacts", [w.artifact], total=2)))
         w.runs = w.runs * 1
         routes = w.routes()
-        routes[f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&per_page=100&page=1"] = page(
+        routes[f"workflows/{WORKFLOW_ID}/runs?branch=main&event=push&head_sha={SHA}&per_page=100&page=1"] = page(
             "workflow_runs", w.runs, total=250)
         self.assertWorldRefused(w, "incomplete or exhausted workflow_runs", routes=routes)
 

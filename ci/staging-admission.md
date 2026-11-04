@@ -72,6 +72,36 @@ an expiry rule. Listings that cannot prove completeness refuse rather than
 silently selecting from a partial page. A superseding attempt invalidates the old
 receipt. A known conflicting intervening staging deploy invalidates old evidence.
 
+Candidate discovery queries the exact source SHA, not all lifetime history.
+Conflict discovery includes every run created within 66 days before the opening
+identity observation, plus independent all-time queries for queued, in-progress,
+waiting, pending and requested runs. The window is a conservative execution
+horizon, not a receipt TTL: GitHub permits reruns only within [30 days of the
+initial run](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+and limits each run, including waiting and approval, to [35 days](https://docs.github.com/en/actions/reference/limits).
+The extra day and UTC date rounding include the boundary. Thus an old run that
+was rerun or waited before deploying late is included; a small creation-only
+lookback would not be sufficient. Revisit this horizon if those platform limits
+change. Each query must return a complete, stable-count, duplicate-free listing
+below GitHub's 1,000-result search ceiling (up to ten pages, 4 MiB per page).
+Missing pages, inconsistent counts, ceiling exhaustion, malformed evidence and
+the existing 120-second aggregate network deadline refuse admission.
+
+Completed runs last updated before the opening observation cannot contain a
+later completed job in that snapshot. For other conflicting runs, inspect jobs
+from **all attempts**, not only the latest rerun. An unresolved rerun must also
+expose both deployment lanes in its current attempt; historical terminal lanes
+cannot substitute for current-attempt evidence. Missing deployment lanes,
+nonterminal jobs (even with a stray skipped conclusion), absent conclusions,
+actual deployment execution after opening and uncertain mutation all refuse.
+A completed skipped job is non-mutating. A later failed job is also non-mutating
+only when the reviewed producer source matches, an earlier prerequisite failed,
+and the uniquely identified deployment step explicitly completed as skipped.
+A failed or cancelled deployment step is not proof that no mutation occurred.
+Whole-job completion time alone must not reject a proven pre-deployment failure.
+The existing single-page job/artifact bounds remain; incomplete attempt/job
+history refuses rather than hiding a prior mutation behind a later failed rerun.
+
 The admission point also rereads the existing public web/API identity endpoints
 with the existing staging Access pair, refusing redirects and identity drift.
 No Access credential follows a redirect; GitHub archive redirects drop the

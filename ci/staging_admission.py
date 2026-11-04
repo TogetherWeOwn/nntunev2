@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY = "ci/staging-admission-policy.json"
@@ -44,6 +44,11 @@ LABEL = re.compile(r"[A-Za-z0-9_.:/@ -]{1,200}")
 MAX_JSON = 256 * 1024
 MAX_ARCHIVE = 512 * 1024
 MAX_XML = 2 * 1024 * 1024
+MAX_RUN_PAGE = 4 * 1024 * 1024
+PENDING_RUN_STATES = ("queued", "in_progress", "waiting", "pending", "requested")
+TERMINAL_CONCLUSIONS = ("success", "failure", "cancelled", "skipped", "timed_out",
+                        "action_required", "neutral", "stale", "startup_failure")
+DEPLOY_STEPS = {"staging-web": "Deploy to staging", "staging-api": "Deploy api to staging"}
 
 
 class Refused(Exception):
@@ -75,8 +80,8 @@ def timestamp(value):
         raise Refused("invalid evidence time") from None
 
 
-def parse_json(data):
-    require(len(data) <= MAX_JSON, "oversized JSON")
+def parse_json(data, limit=MAX_JSON):
+    require(len(data) <= limit, "oversized JSON")
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -358,6 +363,66 @@ class Actions:
                 f"incomplete or exhausted {key} listing")
         return rows
 
+    def runs(self, route):
+        # GitHub search-filtered run listings expose at most 1,000 results.
+        # Refuse at that ceiling, on page drift, duplicates or a short page.
+        rows, seen, total = [], set(), None
+        for number in range(1, 11):
+            data = parse_json(self.read(f"{route}&per_page=100&page={number}", MAX_RUN_PAGE), MAX_RUN_PAGE)
+            count, batch = data.get("total_count"), data.get("workflow_runs")
+            require(type(count) is int and 0 <= count < 1000 and isinstance(batch, list)
+                    and (total is None or total == count)
+                    and len(batch) == min(100, count - len(rows)),
+                    "incomplete or exhausted workflow_runs listing")
+            total = count
+            for run in batch:
+                rid = decimal(run.get("id"))
+                require(rid not in seen, "incomplete or exhausted workflow_runs listing")
+                seen.add(rid)
+            rows.extend(batch)
+            if len(rows) == total:
+                return rows
+        raise Refused("incomplete or exhausted workflow_runs listing")
+
+    def conflicts(self, workflow_id, opening):
+        # A creation-only recent window would miss old reruns/queued deploys.
+        # GitHub permits reruns within 30 days of the INITIAL run, then bounds
+        # execution (including waiting/approval) to 35 days. Include 66 days
+        # before the receipt opening, rounded down, plus ALL unresolved runs
+        # independently of creation time. See staging-admission.md for sources.
+        cutoff = (opening - timedelta(days=66)).astimezone(timezone.utc).date().isoformat()
+        base = f"workflows/{workflow_id}/runs?branch=main&event=push"
+        queries = [f"{base}&created=%3E%3D{cutoff}"]
+        queries.extend(f"{base}&status={status}" for status in PENDING_RUN_STATES)
+        found = {}
+        for query in queries:
+            for run in self.runs(query):
+                rid = decimal(run.get("id"))
+                require(rid not in found or found[rid] == run,
+                        "staging run changed during conflict discovery")
+                found[rid] = run
+        return list(found.values())
+
+
+def unchanged_by_job(job, opening, source, producer_source_ok):
+    reason = "known intervening staging deployment; fresh journey required"
+    require(job.get("status") == "completed" and job.get("conclusion") in TERMINAL_CONCLUSIONS, reason)
+    if job["conclusion"] == "skipped":
+        return
+    if timestamp(job.get("completed_at")) <= opening:
+        return
+    # A failed install/build/schema prerequisite is not a mutation, but only
+    # the reviewed producer plus an explicit skipped deploy step proves that.
+    steps = job.get("steps", [])
+    deploy = [step for step in steps if step.get("name") == DEPLOY_STEPS[job["name"]]]
+    require(job["conclusion"] == "failure" and len(deploy) == 1
+            and deploy[0].get("status") == "completed" and deploy[0].get("conclusion") == "skipped"
+            and type(deploy[0].get("number")) is int, reason)
+    require(any(step.get("status") == "completed" and step.get("conclusion") == "failure"
+                and type(step.get("number")) is int and 0 < step["number"] < deploy[0]["number"]
+                for step in steps), reason)
+    producer_source_ok(source)
+
 
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
            producer_source_ok):
@@ -367,7 +432,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     require(workflow.get("path") == WORKFLOW and workflow.get("state") == "active",
             "wrong staging workflow")
     workflow_id = decimal(workflow.get("id"))
-    runs = actions.listing(f"workflows/{workflow_id}/runs?branch=main&event=push", "workflow_runs")
+    runs = actions.runs(f"workflows/{workflow_id}/runs?branch=main&event=push&head_sha={sha}")
     same = [r for r in runs if r.get("head_sha") == sha and r.get("event") == "push"]
     require(same, "no candidate main-push staging run")
     selected = max(same, key=lambda r: int(decimal(r.get("id"))))
@@ -432,23 +497,34 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     for name in ("staging-web", "staging-api"):
         require(timestamp(selected_jobs[name].get("completed_at")) <= opening,
                 "journey preceded candidate deployment")
-    # Per-lane locks are not a reservation. A known later conflicting deploy
-    # invalidates the old receipt; skipped gate-only runs do not.
-    for other in runs:
+    # Per-lane locks are not a reservation. Discover recent/rerunnable runs
+    # and every unresolved run, not the workflow's entire lifetime history.
+    for other in actions.conflicts(workflow_id, opening):
         if other.get("event") != "push" or other.get("head_sha") == sha:
             continue
-        other_id = decimal(other.get("id"))
-        other_jobs = actions.listing(f"runs/{other_id}/attempts/{decimal(other.get('run_attempt'))}/jobs", "jobs")
-        for job in other_jobs:
-            if job.get("name") not in ("staging-web", "staging-api") or job.get("conclusion") == "skipped":
+        require(other.get("status") in (*PENDING_RUN_STATES, "completed"),
+                "unclassified conflicting staging run")
+        if other["status"] == "completed":
+            require(other.get("conclusion") in TERMINAL_CONCLUSIONS,
+                    "unclassified conflicting staging run conclusion")
+            # Completed run metadata is updated after its jobs. A completed
+            # pre-opening run cannot conceal a later job in that snapshot.
+            if timestamp(other.get("updated_at")) <= opening:
                 continue
-            # A queued older run can deploy late too; creation order and lane
-            # locks cannot establish absence of an intervening mutation.
-            if job.get("status") == "in_progress":
-                raise Refused("known intervening staging deployment; fresh journey required")
-            if job.get("status") == "completed":
-                require(timestamp(job.get("completed_at")) <= opening,
-                        "known intervening staging deployment; fresh journey required")
+        other_id = decimal(other.get("id"))
+        # Include ALL attempts: a failed latest rerun must not hide a mutation
+        # from an earlier attempt after the candidate journey started.
+        other_jobs = actions.listing(f"runs/{other_id}/jobs?filter=all", "jobs")
+        require(all(any(job.get("name") == lane for job in other_jobs) for lane in DEPLOY_STEPS),
+                "missing conflicting staging jobs; fresh journey required")
+        if other["status"] != "completed":
+            other_attempt = int(decimal(other.get("run_attempt")))
+            require(all(any(job.get("name") == lane and job.get("run_attempt") == other_attempt
+                            for job in other_jobs) for lane in DEPLOY_STEPS),
+                    "missing current-attempt conflicting staging jobs; fresh journey required")
+        for job in other_jobs:
+            if job.get("name") in DEPLOY_STEPS:
+                unchanged_by_job(job, opening, other.get("head_sha"), producer_source_ok)
     # Re-resolve after download and drift discovery: a rerun cannot mix attempts.
     run_identity(actions.api(f"runs/{run_id}"))
     return receipt
