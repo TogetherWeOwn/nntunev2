@@ -602,6 +602,174 @@ macro_rules! pump {
 }
 
 #[test]
+fn owned_plan_shares_metadata_refusals_and_opens_nothing_before_pumping() {
+    for range in [None, Some("bytes=2-6"), Some("bytes=-2"), Some("bytes=4-")] {
+        let (source, articles) = fixture();
+        let mut control = Control::new();
+        let mut sink = VecDeliveredSink::default();
+        let borrowed = authorize_original(&request(range), SECRET, NOW)
+            .unwrap()
+            .prepare(&source, range, &mut control, &mut sink)
+            .unwrap();
+        let owned = authorize_original(&request(range), SECRET, NOW)
+            .unwrap()
+            .prepare_owned(source.clone(), range, &mut control)
+            .unwrap();
+        assert_eq!(
+            (owned.status(), owned.body_len()),
+            (borrowed.status, borrowed.body_len)
+        );
+        assert_eq!(owned.headers(), borrowed.headers);
+        drop((borrowed, owned));
+        assert!(articles.opened.is_empty());
+        assert!(sink.0.is_empty());
+    }
+    for mode in 0..3 {
+        let (source, articles) = fixture();
+        let mut control = Control::new();
+        let mut req = request(None);
+        let range = (mode == 0).then_some("bytes=9-");
+        if mode == 1 {
+            req.track_id = "00000000-0000-0000-0000-000000000002".into();
+            req.token = Some(grant::issue_v2(
+                "user_generated",
+                &req.track_id,
+                "play_generated",
+                1,
+                NOW + 60,
+                SECRET,
+            ));
+        }
+        let authority = authorize_original(&req, SECRET, NOW).unwrap();
+        if mode == 2 {
+            control.now.set(NOW + 60);
+        }
+        let err = authority
+            .prepare_owned(source, range, &mut control)
+            .err()
+            .expect("refusal");
+        assert_eq!(err.status, [416, 502, 401][mode]);
+        assert!(articles.opened.is_empty());
+    }
+}
+
+#[test]
+fn owned_unpolled_pump_aborts_writer_without_io_or_delivery() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let st = shared([]);
+    let owned = authorize_original(&request(None), SECRET, NOW)
+        .unwrap()
+        .prepare_owned(source, None, &mut control)
+        .unwrap();
+    let future = owned.pump(&mut articles, &mut control, &mut sink, Writer(st.clone()));
+    drop(future);
+    assert!(articles.opened.is_empty());
+    assert!(sink.0.is_empty());
+    let st = st.borrow();
+    assert_eq!((st.aborts, st.closes, st.write_polls), (1, 0, 0));
+}
+
+struct ReportSink(Rc<RefCell<Vec<nntune_stream::delivered::DeliveredInterval>>>);
+impl nntune_stream::delivered::DeliveredSink for ReportSink {
+    fn delivered(&mut self, interval: nntune_stream::delivered::DeliveredInterval) {
+        self.0.borrow_mut().push(interval);
+    }
+}
+
+#[test]
+fn owned_static_task_settles_success_error_and_drop_prefixes_once() {
+    // A real request-lifetime task can own all inputs, with the reporting sink
+    // constructed inside it. No source borrow or live handler stack is needed.
+    for mode in 0..6 {
+        let (source, mut articles) = fixture();
+        let log = articles.log.clone();
+        let mut control = Control::new();
+        let owned = authorize_original(&request(Some("bytes=1-7")), SECRET, NOW)
+            .unwrap()
+            .prepare_owned(source, Some("bytes=1-7"), &mut control)
+            .unwrap();
+        let st = shared([]);
+        match mode {
+            1 => articles.pending = Some(2),
+            2 => st.borrow_mut().script = [Step::Accept(1), Step::Block].into(),
+            3 => st.borrow_mut().close_block = true,
+            4 => articles.fail = Some(1),
+            5 => st.borrow_mut().script = [Step::Accept(1), Step::Fail].into(),
+            _ => {}
+        }
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let (writer, out) = (Writer(st.clone()), reports.clone());
+        let task = async move {
+            let mut sink = ReportSink(out);
+            owned
+                .pump(&mut articles, &mut control, &mut sink, writer)
+                .await
+        };
+        fn require_static(_: &(impl Future<Output = Result<(), SourceError>> + 'static)) {}
+        require_static(&task);
+        let mut future = Box::pin(task);
+        let result = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        match mode {
+            0 => assert_eq!(result, Poll::Ready(Ok(()))),
+            4 | 5 => assert_eq!(result, Poll::Ready(Err(SourceError::Transport))),
+            _ => assert!(result.is_pending()),
+        }
+        drop(future);
+        let st = st.borrow();
+        let expected = [7, 0, 1, 7, 2, 1][mode];
+        assert_eq!(st.got, (1..1 + expected as u8).collect::<Vec<_>>());
+        assert_eq!(
+            (st.closes, st.aborts),
+            ([1, 0, 0, 1, 0, 0][mode], usize::from(mode != 0))
+        );
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), usize::from(expected != 0));
+        if expected != 0 {
+            assert_eq!(
+                (reports[0].start, reports[0].end, reports[0].file_bytes),
+                (1, 1 + expected, Some(9))
+            );
+            assert_eq!(
+                (
+                    &*reports[0].user_id,
+                    &*reports[0].play_id,
+                    &*reports[0].track_id
+                ),
+                ("user_generated", "play_generated", TRACK)
+            );
+        }
+        assert_eq!(log.borrow().len(), [3, 1, 2, 3, 3, 2][mode]);
+    }
+}
+
+#[test]
+fn owned_task_rechecks_expiry_after_scheduling_before_source_or_output() {
+    let (source, mut articles) = fixture();
+    let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+    let owned = authorize_original(&request(None), SECRET, NOW)
+        .unwrap()
+        .prepare_owned(source, None, &mut control)
+        .unwrap();
+    control.now.set(NOW + 60);
+    let st = shared([]);
+    let mut future =
+        Box::pin(owned.pump(&mut articles, &mut control, &mut sink, Writer(st.clone())));
+    assert_eq!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(SourceError::Cancelled))
+    );
+    drop(future);
+    assert!(articles.opened.is_empty());
+    assert!(sink.0.is_empty());
+    assert_eq!((st.borrow().aborts, st.borrow().write_polls), (1, 0));
+}
+
+#[test]
 fn partial_writes_complete_full_and_range_output_then_close_once() {
     for (range, expected) in [(None, 0..9u8), (Some("bytes=2-6"), 2..7)] {
         let (source, mut articles) = fixture();

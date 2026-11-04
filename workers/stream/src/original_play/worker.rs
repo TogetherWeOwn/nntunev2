@@ -6,11 +6,12 @@
 use std::{
     future::Future,
     pin::Pin,
+    rc::Rc,
     task::{Context, Poll},
 };
 
 use nntune_core::original_source::{
-    reader::{AsyncReadControl, ReadControl},
+    reader::{AsyncArticleSource, AsyncReadControl, ReadControl},
     SourceError, MAX_ARTICLE_BYTES,
 };
 use worker::{
@@ -19,13 +20,54 @@ use worker::{
     wasm_bindgen_futures::JsFuture,
     web_sys::{AbortSignal, WritableStreamDefaultWriter},
     worker_sys::FixedLengthStream,
-    Date, Delay, Headers, Request, Response, ResponseBody,
+    Date, Delay, Env, Headers, Request, Response, ResponseBody,
 };
 
 use super::{
     control::OriginalRequestControl, OriginalAuthorization, OriginalControl, OriginalPlay,
-    OriginalWriter,
+    OriginalWriter, OwnedOriginalPlay,
 };
+use crate::delivered::{DeliveredInterval, DeliveredSink};
+
+/// Start only an already-prepared off-route response. The task owns its source,
+/// supplier, request control and writer; the response is returned without waiting
+/// for backpressure. No source lookup, account construction or public route is
+/// selected here. Construct the control before resolving the private source.
+/// Runtime lifetime limits and abort/report durability need Worker qualification.
+pub fn schedule_response<T: AsyncArticleSource + 'static>(
+    play: OwnedOriginalPlay,
+    mut transport: T,
+    mut control: WorkerOriginalControl,
+    env: Env,
+    ctx: worker::Context,
+) -> worker::Result<Response> {
+    let (response, writer) = channel(play.status(), play.headers(), play.body_len())?;
+    let ctx = Rc::new(ctx);
+    let mut sink = WorkerDeliveredSink {
+        env,
+        ctx: ctx.clone(),
+    };
+    ctx.wait_until(async move {
+        // The writer aborts on error/drop; the response settles its ACK prefix
+        // through the sink. Never turn an interrupted body into a successful EOF.
+        let _ = play
+            .pump(&mut transport, &mut control, &mut sink, writer)
+            .await;
+    });
+    Ok(response)
+}
+
+struct WorkerDeliveredSink {
+    env: Env,
+    ctx: Rc<worker::Context>,
+}
+
+impl DeliveredSink for WorkerDeliveredSink {
+    fn delivered(&mut self, interval: DeliveredInterval) {
+        self.ctx
+            .wait_until(crate::runtime::report_delivered(self.env.clone(), interval));
+    }
+}
 
 type PendingPromise = Pin<Box<JsFuture>>;
 type GrantControl = OriginalRequestControl<Pin<Box<dyn Future<Output = ()>>>, fn() -> u64>;
@@ -121,14 +163,22 @@ impl Drop for WorkerOriginalControl {
 pub fn response_channel(
     play: &OriginalPlay<'_>,
 ) -> worker::Result<(Response, WorkerOriginalWriter)> {
+    channel(play.status, &play.headers, play.body_len)
+}
+
+fn channel(
+    status: u16,
+    values: &[(String, String)],
+    body_len: u64,
+) -> worker::Result<(Response, WorkerOriginalWriter)> {
     let headers = Headers::new();
-    for (name, value) in &play.headers {
+    for (name, value) in values {
         headers.set(name, value)?;
     }
-    let stream = if play.body_len < u32::MAX as u64 {
-        FixedLengthStream::new(play.body_len as u32)
+    let stream = if body_len < u32::MAX as u64 {
+        FixedLengthStream::new(body_len as u32)
     } else {
-        FixedLengthStream::new_big_int(BigInt::from(play.body_len))
+        FixedLengthStream::new_big_int(BigInt::from(body_len))
     }
     .map_err(worker::Error::from)?;
     let raw = stream
@@ -143,7 +193,7 @@ pub fn response_channel(
         stopped: false,
     };
     let response = Response::from_body(ResponseBody::Stream(stream.readable()))?
-        .with_status(play.status)
+        .with_status(status)
         .with_headers(headers);
     Ok((response, writer))
 }

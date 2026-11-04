@@ -213,7 +213,25 @@ and only then acknowledges it. Its `closed` promise wakes a pending article on
 reader disconnect; drop requests an idempotent writer abort. Promise resolution
 means sink acceptance, not proof of remote TCP receipt. The caller must return
 the response concurrently with pumping, provide a wakeable request/grant control
-and persist delivered reports; no runtime caller or account supplier is installed.
+and persist delivered reports; no public runtime caller or account supplier is installed.
+
+`prepare_owned` uses the same checked response plan as `prepare`, but takes
+ownership of the validated source. Its `OwnedOriginalPlay::pump` constructs the
+single shared reader inside the enclosing task rather than borrowing the fetch
+handler's stack or resolving/cloning the source a second time. It uses the same
+writer guard and acknowledged-prefix settlement, including unpolled-task drop.
+Expiry is rechecked on first output work after scheduling.
+
+The off-route wasm `schedule_response` creates the fixed-length channel, moves
+the source/supplier/control/writer into a `Context::wait_until` task, and returns
+the response without awaiting the backpressured pump. Its `DeliveredSink`
+forwards the one settled interval through a separate `wait_until` call to the
+existing runtime reporter and bounded retries; it adds no meter, retry policy,
+wire format or account-release action. Source lookup and account construction
+remain with their existing owners. Nothing calls this scheduler from the public
+fetch path. Runtime task limits, nested report scheduling and disconnect/report
+durability still require actual Worker qualification; static compilation and
+owned-task fixtures do not establish them.
 
 `WorkerOriginalControl::new` binds the verified grant expiry and incoming
 request's abort signal before source resolution. The request owns the abort

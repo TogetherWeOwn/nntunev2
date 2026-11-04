@@ -121,6 +121,28 @@ impl OriginalAuthorization {
         control: &mut C,
         sink: &'a mut dyn DeliveredSink,
     ) -> Result<OriginalPlay<'a>, PlayRouteRefusal> {
+        self.plan(source, range_header, control)?.bind(source, sink)
+    }
+
+    /// Prepare a response whose source can move into a request-lifetime task.
+    /// No article is opened until its pump is polled. Metadata and range checks
+    /// are shared with the borrowed response, not repeated after scheduling.
+    pub fn prepare_owned<C: OriginalControl>(
+        self,
+        source: OriginalSource,
+        range_header: Option<&str>,
+        control: &mut C,
+    ) -> Result<OwnedOriginalPlay, PlayRouteRefusal> {
+        let plan = self.plan(&source, range_header, control)?;
+        Ok(OwnedOriginalPlay { source, plan })
+    }
+
+    fn plan<C: OriginalControl>(
+        self,
+        source: &OriginalSource,
+        range_header: Option<&str>,
+        control: &mut C,
+    ) -> Result<OriginalPlan, PlayRouteRefusal> {
         self.check(control)
             .map_err(|_| refusal(401, ApiError::unauthorized()))?;
         if source.track_id() != self.grant.track_id {
@@ -151,21 +173,95 @@ impl OriginalAuthorization {
                 range::content_range_value(selected, size),
             ));
         }
-        let reader = AsyncRangeReader::new(source, selected.start..selected.end + 1)
-            .map_err(|_| refusal(502, ApiError::upstream_unavailable()))?;
-        Ok(OriginalPlay {
+        Ok(OriginalPlan {
             status,
             headers,
-            body_len: selected.len(),
-            reader,
+            selected,
             authority: self,
-            sink,
-            start: selected.start,
             file_bytes: size,
+        })
+    }
+}
+
+struct OriginalPlan {
+    status: u16,
+    headers: Vec<(String, String)>,
+    selected: ByteRange,
+    authority: OriginalAuthorization,
+    file_bytes: u64,
+}
+
+impl OriginalPlan {
+    fn bind<'a>(
+        self,
+        source: &'a OriginalSource,
+        sink: &'a mut dyn DeliveredSink,
+    ) -> Result<OriginalPlay<'a>, PlayRouteRefusal> {
+        let reader = AsyncRangeReader::new(source, self.selected.start..self.selected.end + 1)
+            .map_err(|_| refusal(502, ApiError::upstream_unavailable()))?;
+        Ok(OriginalPlay {
+            status: self.status,
+            headers: self.headers,
+            body_len: self.selected.len(),
+            reader,
+            authority: self.authority,
+            sink,
+            start: self.selected.start,
+            file_bytes: self.file_bytes,
             written: 0,
             offered: 0,
             stopped: false,
         })
+    }
+}
+
+/// Owned source and checked response plan; no self-referential reader or
+/// second source lookup. Move this into a task after returning its channel.
+/// Dropping an unstarted plan performs no I/O and reports no delivery.
+pub struct OwnedOriginalPlay {
+    source: OriginalSource,
+    plan: OriginalPlan,
+}
+
+impl OwnedOriginalPlay {
+    pub fn status(&self) -> u16 {
+        self.plan.status
+    }
+
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.plan.headers
+    }
+
+    pub fn body_len(&self) -> u64 {
+        self.plan.selected.len()
+    }
+
+    /// Own the response and writer even before the first poll; borrow only the
+    /// enclosing task's transport/control/sink. Drop/error settles the same
+    /// acknowledged-prefix interval as the borrowed pump, with no drain.
+    pub fn pump<'p, T, C, W>(
+        self,
+        transport: &'p mut T,
+        control: &'p mut C,
+        sink: &'p mut dyn DeliveredSink,
+        writer: W,
+    ) -> impl Future<Output = Result<(), SourceError>> + 'p
+    where
+        T: AsyncArticleSource + 'p,
+        C: OriginalControl + 'p,
+        W: OriginalWriter + 'p,
+    {
+        let writer = ResponseWriter {
+            inner: writer,
+            closed: false,
+        };
+        async move {
+            let play = self
+                .plan
+                .bind(&self.source, sink)
+                .map_err(|_| SourceError::Bounds)?;
+            play.pump_guard(transport, control, writer).await
+        }
     }
 }
 
@@ -211,7 +307,7 @@ impl<'a> OriginalPlay<'a> {
     /// Cancellation wins ready races, and dropping even an unpolled pump aborts
     /// its writer. Failed/uncertain writes are never retried or acknowledged.
     pub fn pump<'p, T, C, W>(
-        mut self,
+        self,
         transport: &'p mut T,
         control: &'p mut C,
         writer: W,
@@ -222,10 +318,28 @@ impl<'a> OriginalPlay<'a> {
         C: OriginalControl + 'p,
         W: OriginalWriter + 'p,
     {
-        let mut writer = ResponseWriter {
-            inner: writer,
-            closed: false,
-        };
+        self.pump_guard(
+            transport,
+            control,
+            ResponseWriter {
+                inner: writer,
+                closed: false,
+            },
+        )
+    }
+
+    fn pump_guard<'p, T, C, W>(
+        mut self,
+        transport: &'p mut T,
+        control: &'p mut C,
+        mut writer: ResponseWriter<W>,
+    ) -> impl Future<Output = Result<(), SourceError>> + 'p + use<'a, 'p, T, C, W>
+    where
+        Self: 'p,
+        T: AsyncArticleSource + 'p,
+        C: OriginalControl + 'p,
+        W: OriginalWriter + 'p,
+    {
         async move {
             loop {
                 let bytes = {
