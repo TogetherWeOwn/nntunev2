@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use serde::{
-    de::{self, SeqAccess, Visitor},
+    de::{self, value::MapAccessDeserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 
@@ -36,20 +36,54 @@ pub enum SourceError {
 
 /// Optional geometry only. It gains no authority until actual first/final
 /// articles corroborate it; every subsequently fetched part is checked too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RangeHint {
     pub part_size: u64,
     pub final_begin: u64,
     pub final_end: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl<'de> Deserialize<'de> for RangeHint {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            part_size: u64,
+            final_begin: u64,
+            final_end: u64,
+        }
+        let fields: Fields = deserialize_object(d)?;
+        Ok(Self {
+            part_size: fields.part_size,
+            final_begin: fields.final_begin,
+            final_end: fields.final_end,
+        })
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub struct Article {
     number: usize,
     reference: String,
     encoded_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for Article {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            number: usize,
+            reference: String,
+            encoded_bytes: u64,
+        }
+        let fields: Fields = deserialize_object(d)?;
+        Ok(Self {
+            number: fields.number,
+            reference: fields.reference,
+            encoded_bytes: fields.encoded_bytes,
+        })
+    }
 }
 
 impl Article {
@@ -76,17 +110,61 @@ pub struct OriginalSource {
     range_hint: Option<RangeHint>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SourceRecord {
     track_id: String,
     source_job_id: String,
     file_ordinal: usize,
     file_size: u64,
     article_count: usize,
-    #[serde(deserialize_with = "bounded_articles")]
     articles: Vec<Article>,
     range_hint: Option<RangeHint>,
+}
+
+impl<'de> Deserialize<'de> for SourceRecord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            track_id: String,
+            source_job_id: String,
+            file_ordinal: usize,
+            file_size: u64,
+            article_count: usize,
+            #[serde(deserialize_with = "bounded_articles")]
+            articles: Vec<Article>,
+            range_hint: Option<RangeHint>,
+        }
+        let fields: Fields = deserialize_object(d)?;
+        Ok(Self {
+            track_id: fields.track_id,
+            source_job_id: fields.source_job_id,
+            file_ordinal: fields.file_ordinal,
+            file_size: fields.file_size,
+            article_count: fields.article_count,
+            articles: fields.articles,
+            range_hint: fields.range_hint,
+        })
+    }
+}
+
+// Derived structs also accept positional sequences. Require a map first, then
+// retain derived field/type/duplicate checks without buffering a generic value.
+fn deserialize_object<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Object<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for Object<T> {
+        type Value = T;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("source object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            T::deserialize(MapAccessDeserializer::new(map))
+        }
+    }
+    d.deserialize_map(Object(std::marker::PhantomData))
 }
 
 fn bounded_articles<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Article>, D::Error> {

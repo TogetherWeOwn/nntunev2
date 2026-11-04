@@ -102,6 +102,107 @@ fn strict_shape_rejects_order_count_size_and_identity_disagreements() {
 }
 
 #[test]
+fn object_contract_accepts_valid_objects_and_optional_hints() {
+    let hint = RangeHint {
+        part_size: 3,
+        final_begin: 6,
+        final_end: 7,
+    };
+    for range_hint in [None, Some(hint)] {
+        let s = source(&[3, 3, 1], range_hint);
+        let read = parse(&s.encode().unwrap()).unwrap();
+        assert_eq!(read.range_hint(), range_hint);
+        assert_eq!(read.article_count(), 3);
+        assert_eq!(
+            read.article(2).unwrap().reference(),
+            "generated-2@fixture.invalid"
+        );
+    }
+    let without_hint = change(&source(&[1], None), |v| {
+        v.as_object_mut().unwrap().remove("range_hint");
+    });
+    assert!(parse(&without_hint).unwrap().range_hint().is_none());
+}
+
+#[test]
+fn object_contract_rejects_positional_root_arrays() {
+    let s = source(&[1], None);
+    let bytes = change(&s, |v| {
+        *v = serde_json::json!([
+            v["track_id"],
+            v["source_job_id"],
+            v["file_ordinal"],
+            v["file_size"],
+            v["article_count"],
+            v["articles"],
+            v["range_hint"]
+        ]);
+    });
+    assert!(matches!(parse(&bytes), Err(SourceError::Shape)));
+}
+
+#[test]
+fn object_contract_rejects_positional_article_arrays() {
+    let s = source(&[3, 3, 1], None);
+    for index in 0..3 {
+        let bytes = change(&s, |v| {
+            let a = &v["articles"][index];
+            v["articles"][index] =
+                serde_json::json!([a["number"], a["reference"], a["encoded_bytes"]]);
+        });
+        assert!(matches!(parse(&bytes), Err(SourceError::Shape)));
+    }
+}
+
+#[test]
+fn object_contract_rejects_positional_range_hint_arrays() {
+    let s = source(&[3, 3, 1], None);
+    let bytes = change(&s, |v| v["range_hint"] = serde_json::json!([3, 6, 7]));
+    assert!(matches!(parse(&bytes), Err(SourceError::Shape)));
+}
+
+#[test]
+fn object_contract_retains_nested_field_validation() {
+    let s = source(
+        &[3, 3, 1],
+        Some(RangeHint {
+            part_size: 3,
+            final_begin: 6,
+            final_end: 7,
+        }),
+    );
+    let raw = String::from_utf8(s.encode().unwrap()).unwrap();
+    for (field, value) in [
+        ("number", 1),
+        ("part_size", 3),
+        ("final_begin", 6),
+        ("final_end", 7),
+    ] {
+        let key = format!("\"{field}\":{value}");
+        let duplicate = raw.replacen(&key, &format!("{key},{key}"), 1);
+        assert_ne!(duplicate, raw);
+        assert!(matches!(
+            parse(duplicate.as_bytes()),
+            Err(SourceError::Shape)
+        ));
+    }
+    for bytes in [
+        change(&s, |v| v["range_hint"]["unexpected"] = 1.into()),
+        change(&s, |v| {
+            v["range_hint"].as_object_mut().unwrap().remove("final_end");
+        }),
+        change(&s, |v| {
+            v["articles"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("encoded_bytes");
+        }),
+    ] {
+        assert!(matches!(parse(&bytes), Err(SourceError::Shape)));
+    }
+}
+
+#[test]
 fn strings_and_collections_are_capped_before_growth() {
     let s = source(&[1], None);
     let max = "a".repeat(MAX_REFERENCE_BYTES);
