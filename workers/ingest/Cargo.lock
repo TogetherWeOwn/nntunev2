@@ -677,6 +677,8 @@ dependencies = [
  "nntune-ssrf-guard",
  "quick-xml",
  "rustls",
+ "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tokio",

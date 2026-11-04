@@ -563,6 +563,8 @@ async fn load_upload_parse(
 /// jobs, whose NZB bytes do not exist until the search step is wired)
 /// is a transient boundary failure today.
 async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(), JobError> {
+    // Old queue/checkpoint hints cannot become pool-account grant attribution.
+    cp.provider_id = None;
     if cp.state == JobState::Queued {
         advance_checkpoint(cp, false);
     }
@@ -594,7 +596,9 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
             }
             let batches = crate::parse::probe_batches_with_ranges(&parsed);
             let probing_started_ms = Date::now().as_millis();
-            run_probing_batches(
+            let observations =
+                std::cell::RefCell::new(crate::pool_attribution::PoolObservations::default());
+            let result = run_probing_batches(
                 msg,
                 cp,
                 &batches,
@@ -603,9 +607,22 @@ async fn run_step(env: &Env, msg: &QueueMsg, cp: &mut JobCheckpoint) -> Result<(
                     Date::now().as_millis().saturating_sub(probing_started_ms)
                         >= PROBE_DELIVERY_BUDGET_MS
                 },
-                |request| async move { call_pool_probe(env, &request).await },
+                |request| {
+                    let observations = &observations;
+                    async move {
+                        let served = call_pool_probe(env, &request).await?;
+                        observations
+                            .borrow_mut()
+                            .record(&served.provider_id)
+                            .map_err(|_| PoolProbeError::Rejected)?;
+                        Ok(served.outcome)
+                    }
+                },
             )
-            .await?;
+            .await;
+            // Keep successful earlier batches even when a later batch fails.
+            cp.pool_observations.merge(&observations.into_inner());
+            result?;
             // Probing completed and advanced the checkpoint to
             // Verifying: continuing to the next state is progress, not
             // a failure, so it must not spend the attempt budget.
@@ -788,7 +805,11 @@ async fn run_verifying(
         }
     };
     let scratch = R2Scratch { bucket };
-    let mut source = PoolBodySource { env, msg };
+    let mut source = PoolBodySource {
+        env,
+        msg,
+        observations: Default::default(),
+    };
     let started_ms = worker::Date::now().as_millis();
     let deadline = move || {
         worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
@@ -806,6 +827,9 @@ async fn run_verifying(
         &deadline,
     )
     .await;
+    // Observations are evidence only: scratch/checkpoint persistence is not
+    // atomic, and adopted bytes cannot prove a single provider for this job.
+    cp.pool_observations.merge(&source.observations);
     let spooled_after: usize = progress.spool.values().map(Vec::len).sum();
     let judged_after: u64 = progress.judging.values().map(|c| c.pos).sum();
     // Durable segment-level spool growth is progress exactly like a
@@ -888,6 +912,7 @@ async fn run_verifying(
 struct PoolBodySource<'a> {
     env: &'a Env,
     msg: &'a QueueMsg,
+    observations: crate::pool_attribution::PoolObservations,
 }
 
 impl BodySource for PoolBodySource<'_> {
@@ -897,7 +922,15 @@ impl BodySource for PoolBodySource<'_> {
     ) -> Result<crate::verify::ArticleFetch, VerifyError> {
         let req = build_body_request(self.msg, segment_id)
             .map_err(|_| VerifyError::Permanent("invalid segment id".into()))?;
-        match call_pool_body(self.env, &req).await {
+        let fetched = call_pool_body(self.env, &req).await.map(|served| {
+            if let Some(provider_id) = &served.provider_id {
+                // The decoder has already validated this exact successful
+                // account-owned response; never copy the queued hint.
+                let _ = self.observations.record(provider_id);
+            }
+            served.outcome
+        });
+        match fetched {
             Ok(BodyFetch::Bytes(bytes)) => Ok(crate::verify::ArticleFetch::Present(bytes)),
             Ok(BodyFetch::Missing) => Ok(crate::verify::ArticleFetch::Missing),
             // `413` is per-article data: the segment is judged absent

@@ -38,6 +38,7 @@ pub mod nzb;
 pub mod par2;
 pub mod pinned_transport;
 pub mod pool_channel;
+pub mod pool_operation;
 pub mod rng;
 pub mod segment_identity;
 pub mod transcode;

@@ -2,19 +2,18 @@
 //! Hints rank one operation attempt; only that account's owner can admit it.
 //! There is no retry/failover after an operation RPC (including a lost reply).
 
-use std::collections::BTreeMap;
 use std::future::Future;
 
 use futures_util::{stream, StreamExt};
 use nntune_core::pool_channel::{self, Channel};
 
 use crate::account_dispatch::{OperationReply, OperationRequest};
-use crate::account_operation::{Operation, OperationError, Output, Served};
+use crate::account_operation::{Operation, OperationError, Served};
 use crate::account_pool::{ranked_candidates, with_session_deadline, Candidate, WorkClass};
 use crate::account_route::{
     parse_registry, CandidateRequest, ChannelKeys, RegistryError, RegistrySource, REGISTRY_BODY,
 };
-use crate::body::MAX_BODY_ARTICLE_BYTES;
+use nntune_core::pool_operation::valid_output;
 
 pub const HINT_CONCURRENCY: usize = 8;
 
@@ -137,32 +136,4 @@ pub async fn run(
     with_session_deadline(work, deadline)
         .await
         .map_err(|_| OperationError::Deadline)?
-}
-
-fn valid_output(operation: &Operation, output: &Output) -> bool {
-    match (operation, output) {
-        (Operation::Body(_), Output::Body(bytes)) => bytes.len() <= MAX_BODY_ARTICLE_BYTES,
-        (Operation::Stat(ids), Output::Stat { present, missing }) => {
-            if present.len().saturating_add(missing.len()) != ids.len() {
-                return false;
-            }
-            // Each duplicate is probed independently and may observe expiry
-            // between commands. Partition occurrences, not unique ID values.
-            let mut expected = BTreeMap::new();
-            for id in ids {
-                *expected.entry(id.as_str()).or_insert(0_usize) += 1;
-            }
-            for id in present.iter().chain(missing) {
-                let Some(count) = expected.get_mut(id.as_str()) else {
-                    return false;
-                };
-                if *count == 0 {
-                    return false;
-                }
-                *count -= 1;
-            }
-            expected.values().all(|count| *count == 0)
-        }
-        _ => false,
-    }
 }

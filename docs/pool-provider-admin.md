@@ -199,15 +199,38 @@ partition (including duplicate multiplicities) are checked before attribution.
 The whole selection call has a <=20-second deadline. Worker client adapters use
 only the dedicated `NNTP_ACCOUNT` namespace and never a public URL fallback.
 
-**No operation RPC or product caller is enabled.** The composed Worker operation
-handler is behind a hard false compile-time qualification gate, not an environment
-toggle. It refuses `/operation` before reading its body or credentials. Selection,
-wire/client/connector and resolver adapters compile, but real dialing and public
-NNTP misses remain unreachable. Product ingest/playback callers and attribution
-writers are not wired yet. Native fake-backend tests prove ordering/fencing only,
-not actual Worker persistence, alarm delivery, TLS, entropy, clock or physical
-closure. Those qualification gates and curated-track staging playback remain
-required before enablement.
+The shared `nntune_core::pool_operation` codec is the single binary BODY/JSON STAT
+contract used by stream and ingest. The binding-only per-user object forwards
+`/pool-body` and `/pool-stat` envelopes through selection with a **fixed ingest
+class**. It validates the routing owner, object shape, duplicate/unknown fields,
+message IDs and size before registry/account work; user/job IDs, byte-range hints
+and batch indices never enter account operations. This object owns no account
+lease or credential material. No user-vault fallback is added.
+
+Ingest calls those new paths, refuses legacy unattributed `200` responses, checks
+content type/size and the exact STAT multiset, and retains the actual successful
+serving identity. An operation-level missing article is `410`; a route `404` is
+unavailable, never missing data. Requests disable redirects, and response I/O
+keeps the existing single whole-call deadline and streaming byte ceiling.
+
+Checkpoint `pool_observations` unions confirmed successful account IDs across
+batches and BODY fetches, with a 1,000-ID ceiling and explicit truncation flag.
+It is **observation evidence, not per-artifact provenance or singular grant
+attribution**: retries may span accounts, and scratch adoption or non-atomic
+scratch/checkpoint recovery can omit observations. New checkpoints ignore the
+legacy queue `provider_id`, and the live consumer clears old hints. The first
+account, sole observed account or requested account must never be copied into a
+whole-job grant. Per-artifact contribution persistence and grant publication
+remain unfinished; no grant writer is enabled by this increment.
+
+**No operation RPC or product dial is enabled.** The composed operation and ingest
+forwarding handlers share the hard false compile-time qualification gate, not an
+environment toggle. They refuse before request body or internal key reads. The
+ingest consumer is connected to the gated paths; playback misses remain unwired
+and unavailable. Native fake-backend tests prove ordering/fencing only, not actual
+Worker persistence, alarm delivery, TLS, entropy, clock or physical closure.
+Those qualification gates and curated-track staging playback remain required
+before enablement.
 
 ## Verification
 

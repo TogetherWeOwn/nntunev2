@@ -201,6 +201,64 @@ impl NntpAccount {
     }
 }
 
+/// The old per-user DO is only an ingress router for these new paths. It
+/// cannot provide an account ID/class, resolve a user vault or own a socket.
+/// Keep the qualification check before request body and internal key reads.
+pub(crate) async fn ingest_fetch(
+    env: &Env,
+    pool_user: Option<&str>,
+    req: &mut Request,
+) -> Result<Response> {
+    if !OPERATIONS_QUALIFIED
+        || req.method() != Method::Post
+        || pool_user.is_none()
+        || req.url()?.query().is_some()
+        || req.headers().has("origin")?
+        || req.headers().has("cookie")?
+    {
+        return operation_response(OperationReply::NotFound);
+    }
+    let work = async {
+        let path = req.path();
+        let cap = match path.as_str() {
+            nntune_core::pool_operation::INGEST_BODY_PATH => crate::body::MAX_BODY_REQUEST_BYTES,
+            nntune_core::pool_operation::INGEST_STAT_PATH => crate::probe::MAX_PROBE_BODY_BYTES,
+            _ => return OperationReply::NotFound,
+        };
+        let body = match read_request(req, cap).await {
+            Ok(body) => body,
+            Err(_) => return OperationReply::BadRequest,
+        };
+        let account_key = env
+            .secret(pool_channel::ACCOUNT_SECRET_VAR)
+            .ok()
+            .map(|s| s.to_string());
+        let resolver_key = env
+            .secret(pool_channel::SECRET_VAR)
+            .ok()
+            .map(|s| s.to_string());
+        crate::account_ingress::run(
+            &WorkerRegistry(env),
+            &WorkerAccounts(env),
+            ChannelKeys {
+                account: account_key.as_deref().map(str::as_bytes),
+                resolver: resolver_key.as_deref().map(str::as_bytes),
+            },
+            &path,
+            &body,
+            pool_user.unwrap_or(""),
+            || worker::Date::now().as_millis(),
+            Delay::from(Duration::from_secs(20)),
+        )
+        .await
+    };
+    operation_response(
+        with_session_deadline(work, Delay::from(Duration::from_secs(20)))
+            .await
+            .unwrap_or(OperationReply::Failed(OperationError::Deadline)),
+    )
+}
+
 struct WorkerRegistry<'a>(&'a Env);
 
 impl RegistrySource for WorkerRegistry<'_> {

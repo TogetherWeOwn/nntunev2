@@ -77,16 +77,11 @@ pub struct QueueMsg {
     /// the later retries.
     #[serde(default)]
     pub payload_ref: Option<String>,
-    /// Pool-fetch attribution: the `providers.id` (UUID text) whose
-    /// connection served this job's bytes, carried for the §4.2 grant
-    /// publication (`user_cache_grants` needs the fetching provider).
-    /// Ingest never mints it — the only future source is the stream
-    /// pool's provider wiring, which does not exist yet (the pool
-    /// answers `provider_unavailable` until then), so admission always
-    /// sends `None`. `#[serde(default)]` so older messages still decode.
-    /// The checkpoint is the live copy after admission: Queue bodies are
-    /// immutable on redelivery, so a redelivered `None` must never
-    /// clobber a checkpoint that already carries an id.
+    /// Legacy provider hint retained only for old Queue message compatibility.
+    /// Admission sends `None`, and a new checkpoint never trusts this field
+    /// as service-account attribution. Actual operation replies name accounts
+    /// in `pool_providers`; their observations live on the checkpoint and may
+    /// span accounts. A queued/first-observed ID never labels a whole job.
     #[serde(default)]
     pub provider_id: Option<String>,
 }

@@ -1,12 +1,10 @@
-//! Pool probe call: one [`ProbeRequest`] to the user's `NntpPool` Durable
-//! Object (stream Worker), answered with a [`ProbeOutcome`].
-//!
-//! The object is reached through the cross-script Durable Object binding
-//! [`POOL_BINDING`] and addressed by `id_from_name(user_id)`, so there is no
-//! public route and no shared secret: only Workers holding the binding can
-//! call it, and the pool refuses envelopes naming another user. The answer
-//! is checked against the request ([`check_outcome`]) before the tally may
-//! fold it.
+//! Account STAT through binding-only per-user ingress, addressed by
+//! `id_from_name(user_id)` for routing validation. Only bound Workers can call
+//! it; there is no public route or shared key on the ingest side. The stream
+//! Worker fixes the class to ingest and selects and admits one account, not a user's
+//! provider. Success must name the actual account and partition the exact ID
+//! multiset before tally or observation updates. Ingress stays hard-disabled
+//! pending qualification; the old pure classifier is compatibility/error mapping.
 
 use futures_util::StreamExt;
 use worker::{wasm_bindgen::JsValue, Env, Headers, Method, Request, RequestInit};
@@ -18,7 +16,7 @@ pub const POOL_BINDING: &str = "NNTP_POOL";
 
 /// Probe route on the Durable Object. The host is a placeholder: a stub
 /// fetch is delivered to the object and never leaves the runtime.
-pub const POOL_PROBE_URL: &str = "https://nntp-pool/probe";
+pub const POOL_PROBE_URL: &str = "https://nntp-pool/pool-stat";
 
 /// Redelivery delay when the pool gives no `Retry-After`.
 pub const DEFAULT_RETRY_SECS: u32 = 5;
@@ -31,6 +29,57 @@ pub const MAX_RETRY_SECS: u32 = 300;
 /// retain. An oversize body is `Rejected` because more bytes existed, never
 /// parsed from a truncated prefix.
 pub const MAX_PROBE_REPLY_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolProbeOutcome {
+    pub provider_id: String,
+    pub outcome: ProbeOutcome,
+}
+
+/// Correlate the account-owned STAT reply with this exact request before any
+/// tally or attribution update. Batch index is local metadata, not NNTP data.
+pub fn classify_account_probe_reply(
+    req: &ProbeRequest,
+    status: u16,
+    content_type: &str,
+    provider_id: Option<&str>,
+    retry_after: Option<&str>,
+    body: Vec<u8>,
+) -> Result<PoolProbeOutcome, PoolProbeError> {
+    use nntune_core::pool_operation::{
+        decode_response, valid_output, Operation, OperationReply, Output,
+    };
+    if status != 200 {
+        return match classify_reply(req, status, retry_after, "") {
+            Err(error) => Err(error),
+            Ok(_) => Err(PoolProbeError::Rejected),
+        };
+    }
+    let operation = Operation::Stat(req.segment_ids.clone());
+    if !operation.valid() {
+        return Err(PoolProbeError::Rejected);
+    }
+    let OperationReply::Served(served) = decode_response(status, content_type, provider_id, body)
+    else {
+        return Err(PoolProbeError::Rejected);
+    };
+    if !valid_output(&operation, &served.output) {
+        return Err(PoolProbeError::Rejected);
+    }
+    let Output::Stat { present, missing } = served.output else {
+        return Err(PoolProbeError::Rejected);
+    };
+    let outcome = ProbeOutcome {
+        batch_index: req.batch_index,
+        present,
+        missing,
+    };
+    check_outcome(req, &outcome)?;
+    Ok(PoolProbeOutcome {
+        provider_id: served.provider_id,
+        outcome,
+    })
+}
 
 /// Why a probe call produced no usable outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +194,7 @@ const _: () = assert!(POOL_PROBE_DEADLINE_MS >= 500 * 25 + 5_000);
 pub async fn call_pool_probe(
     env: &Env,
     req: &ProbeRequest,
-) -> Result<ProbeOutcome, PoolProbeError> {
+) -> Result<PoolProbeOutcome, PoolProbeError> {
     call_pool_probe_with_deadline(env, req, POOL_PROBE_DEADLINE_MS).await
 }
 
@@ -155,7 +204,7 @@ pub async fn call_pool_probe_with_deadline(
     env: &Env,
     req: &ProbeRequest,
     deadline_ms: u64,
-) -> Result<ProbeOutcome, PoolProbeError> {
+) -> Result<PoolProbeOutcome, PoolProbeError> {
     let unavailable = PoolProbeError::Retry {
         after_secs: DEFAULT_RETRY_SECS,
     };
@@ -174,6 +223,7 @@ pub async fn call_pool_probe_with_deadline(
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Error)
         .with_body(Some(JsValue::from_str(&body)));
     let request = Request::new_with_init(POOL_PROBE_URL, &init).map_err(|_| unavailable)?;
     // One cancellable deadline spans headers plus the body drain, armed
@@ -194,6 +244,17 @@ pub async fn call_pool_probe_with_deadline(
     };
     let status = response.status_code();
     let retry_after = response.headers().get("retry-after").ok().flatten();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let provider_id = response
+        .headers()
+        .get(nntune_core::pool_operation::PROVIDER_HEADER)
+        .ok()
+        .flatten();
     // Ceiling for the 200 reply read, bound before any classification so the
     // source pin (cap precedes classify) keeps holding. A non-200 verdict
     // never reads the body: the classifier ignores the body for non-200, so
@@ -202,7 +263,14 @@ pub async fn call_pool_probe_with_deadline(
     // Retry-After).
     let reply_cap = MAX_PROBE_REPLY_BYTES;
     if status != 200 {
-        return classify_reply(req, status, retry_after.as_deref(), "");
+        return classify_account_probe_reply(
+            req,
+            status,
+            &content_type,
+            provider_id.as_deref(),
+            retry_after.as_deref(),
+            Vec::new(),
+        );
     }
     // Bounded 200 read under the same deadline: stream the body and fail
     // closed on the chunk that would cross the cap, so no more than the cap
@@ -243,8 +311,14 @@ pub async fn call_pool_probe_with_deadline(
         Some(Err(_)) | None => return Err(expired),
     };
     drop(deadline);
-    let text = String::from_utf8(bytes).map_err(|_| PoolProbeError::Rejected)?;
-    classify_reply(req, status, retry_after.as_deref(), &text)
+    classify_account_probe_reply(
+        req,
+        status,
+        &content_type,
+        provider_id.as_deref(),
+        retry_after.as_deref(),
+        bytes,
+    )
 }
 
 #[cfg(test)]

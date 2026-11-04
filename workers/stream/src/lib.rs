@@ -46,6 +46,7 @@
 //! and `cargo test` never link the Workers runtime.
 
 pub mod account_dispatch;
+pub mod account_ingress;
 pub mod account_operation;
 pub mod account_owner;
 pub mod account_pool;

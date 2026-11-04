@@ -489,6 +489,7 @@ mod tests {
             failure_code: None,
             failure_reason: None,
             provider_id: msg.provider_id.clone(),
+            pool_observations: Default::default(),
             transcode_inputs: Vec::new(),
             transcode_next: 0,
         }

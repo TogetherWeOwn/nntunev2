@@ -955,6 +955,8 @@ dependencies = [
  "libc",
  "md5",
  "quick-xml",
+ "serde",
+ "serde_json",
  "sha2",
  "subtle",
 ]

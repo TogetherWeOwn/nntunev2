@@ -19,7 +19,7 @@ use crate::account_pool::{with_session_deadline, AccountConfig, WorkClass};
 use crate::account_route::{current_account, RegistryError, RegistrySource};
 use crate::account_supervisor::{AccountStorage, CloseControl, SessionResult};
 use crate::body::MAX_BODY_ARTICLE_BYTES;
-use crate::probe::{stat_batch, valid_probe_id, MAX_PROBE_SEGMENTS};
+use crate::probe::stat_batch;
 
 pub const MAX_DIAL_BYTES: usize = 16 * 1024;
 
@@ -63,55 +63,7 @@ pub trait AccountConnector {
     )>;
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "ids",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum Operation {
-    Body(String),
-    Stat(Vec<String>),
-}
-
-impl Operation {
-    pub fn valid(&self) -> bool {
-        match self {
-            Self::Body(id) => valid_probe_id(id),
-            Self::Stat(ids) => {
-                !ids.is_empty()
-                    && ids.len() <= MAX_PROBE_SEGMENTS
-                    && ids.iter().all(|id| valid_probe_id(id))
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Output {
-    Body(Vec<u8>),
-    Stat {
-        present: Vec<String>,
-        missing: Vec<String>,
-    },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct Served {
-    /// Actual admitted account, not a caller-provided attribution hint.
-    pub provider_id: String,
-    pub output: Output,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OperationError {
-    Invalid,
-    Unavailable,
-    Deadline,
-    Missing,
-    TooLarge,
-}
+pub use nntune_core::pool_operation::{Operation, OperationError, Output, Served};
 
 #[derive(Serialize)]
 struct ResolveRequest<'a> {
