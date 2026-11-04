@@ -368,7 +368,7 @@ fn call_pool_probe_bounds_the_read_before_classification() {
         .find("MAX_PROBE_REPLY_BYTES")
         .expect("cap use must exist");
     let classify = body
-        .find("classify_reply")
+        .find("classify_account_probe_reply")
         .expect("call_pool_probe must still classify the reply");
     assert!(
         cap < classify,
@@ -398,7 +398,7 @@ fn call_pool_probe_bounds_the_read_before_classification() {
     // Pin the non-200 early return: a non-200 verdict never reads the body.
     // Deleting the `status != 200` early return would send every status through
     // the streaming read, so the branch, its position before the stream, and
-    // the `from_utf8` decode after the stream must all be pinned.
+    // the shared account codec after the stream must all be pinned.
     let status_branch = body
         .find("status != 200")
         .or_else(|| body.find("status!=200"))
@@ -407,8 +407,8 @@ fn call_pool_probe_bounds_the_read_before_classification() {
         .find(".stream()")
         .expect("the bounded 200 read must stream the body");
     let decode = body
-        .find("from_utf8")
-        .expect("the streamed bytes must decode with from_utf8 after the stream");
+        .rfind("classify_account_probe_reply")
+        .expect("the streamed bytes must decode with the shared account codec");
     assert!(
         status_branch < stream,
         "the status != 200 return must precede the streaming read, so non-200 \
@@ -416,13 +416,13 @@ fn call_pool_probe_bounds_the_read_before_classification() {
     );
     assert!(
         stream < decode,
-        "from_utf8 must follow the stream, so only the bounded 200 bytes decode"
+        "the account codec must follow the stream, so only bounded 200 bytes decode"
     );
     assert!(
         body[status_branch..stream].contains("return")
-            && body[status_branch..stream].contains("classify_reply")
-            && body[status_branch..stream].contains("\"\""),
-        "the non-200 branch must return classify_reply with an empty body, \
+            && body[status_branch..stream].contains("classify_account_probe_reply")
+            && body[status_branch..stream].contains("Vec::new()"),
+        "the non-200 branch must return the account classifier with an empty body, \
          never the streamed bytes"
     );
     // Pin the over-cap Rejected passthrough: the raced 200 body read fails
