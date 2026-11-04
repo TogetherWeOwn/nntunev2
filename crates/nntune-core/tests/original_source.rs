@@ -876,10 +876,14 @@ fn async_simultaneous_ready_cancellation_wins_over_the_article() {
 
 #[tokio::test]
 async fn async_control_failure_after_open_releases_no_output() {
-    // Check order for [3,3,2], 0..8: 1 start; 2 before final open; 3 after it;
-    // 4 before open 0; 5 after it; 6 before releasing output.
+    // Exercise every check before the first output, including checks inside
+    // the shared decoder, without coupling the fixture to their exact count.
     let s = source(&[3, 3, 2], None);
-    for (call, opened) in [(5usize, vec![2, 0]), (6, vec![2, 0]), (3, vec![2])] {
+    let mut t = async_transport(&[3, 3, 2]);
+    let mut control = AsyncControl::new();
+    let mut reader = AsyncRangeReader::new(&s, 0..8).unwrap();
+    assert!(reader.next(&mut t, &mut control).await.unwrap().is_some());
+    for call in 1..=control.calls {
         let mut t = async_transport(&[3, 3, 2]);
         let mut reader = AsyncRangeReader::new(&s, 0..8).unwrap();
         let mut control = AsyncControl::failing_at(call);
@@ -887,7 +891,8 @@ async fn async_control_failure_after_open_releases_no_output() {
             reader.next(&mut t, &mut control).await,
             Err(SourceError::Cancelled)
         );
-        assert_eq!(t.opened, opened);
+        let opened = t.opened.clone();
+        assert!(opened.is_empty() || opened == [2] || opened == [2, 0]);
         assert_eq!(
             reader.next(&mut t, &mut AsyncControl::new()).await,
             Err(SourceError::Cancelled)
@@ -964,4 +969,154 @@ async fn async_dropping_the_reader_makes_no_extra_opens() {
     drop(reader.next(&mut t, &mut control));
     drop(reader);
     assert_eq!(t.opened, vec![2, 0]);
+}
+
+#[tokio::test]
+async fn async_current_and_retained_final_are_separate_pulls_without_more_io() {
+    for sizes in [&[4][..], &[3, 2][..], &[3, 2, 4, 2][..]] {
+        let s = source(sizes, None);
+        for start in 0..s.file_size() {
+            for end in start + 1..=s.file_size() {
+                let mut t = async_transport(sizes);
+                let got = chunks(&s, start..end, &mut t).await.unwrap();
+                let mut sync_transport = transport(sizes);
+                let expected = read(&s, start..end, &mut sync_transport).unwrap();
+                assert_eq!(got.concat(), expected);
+                assert!(got.iter().all(|b| b.len() <= *sizes.iter().max().unwrap()));
+                assert_eq!(t.opened.len(), sync_transport.opened.len());
+            }
+        }
+    }
+    let s = source(&[3, 2], None);
+    let mut t = async_transport(&[3, 2]);
+    let mut reader = AsyncRangeReader::new(&s, 0..5).unwrap();
+    let mut control = AsyncControl::new();
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![0, 1, 2]))
+    );
+    assert_eq!(t.opened, [1, 0]);
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![3, 4]))
+    );
+    assert_eq!(reader.next(&mut t, &mut control).await, Ok(None));
+    assert_eq!(t.opened, [1, 0], "retained final is not dispatched again");
+}
+
+#[tokio::test]
+async fn async_buffered_final_obeys_cancel_and_never_resumes() {
+    let s = source(&[3, 2], None);
+    let mut t = async_transport(&[3, 2]);
+    let mut reader = AsyncRangeReader::new(&s, 0..5).unwrap();
+    let mut control = AsyncControl::new();
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Ok(Some(vec![0, 1, 2]))
+    );
+    control.signal.cancel(); // Wakeable signal only; boundary checks stay Ok.
+    assert_eq!(
+        reader.next(&mut t, &mut control).await,
+        Err(SourceError::Cancelled)
+    );
+    assert_eq!(
+        reader.next(&mut t, &mut AsyncControl::new()).await,
+        Err(SourceError::Cancelled)
+    );
+    assert_eq!(t.opened, [1, 0]);
+}
+
+#[test]
+fn incremental_walk_matches_synchronous_ranges_and_stops_at_completion() {
+    use nntune_core::original_source::reader::RangeReader;
+    for sizes in [&[4][..], &[3, 3, 2][..], &[3, 2, 4, 2][..]] {
+        let s = source(sizes, None);
+        let size = s.file_size();
+        for start in 0..size {
+            for end in start + 1..=size {
+                let mut expected_transport = transport(sizes);
+                let expected = read(&s, start..end, &mut expected_transport).unwrap();
+                let mut t = transport(sizes);
+                let mut walk = RangeReader::new(&s, start..end).unwrap();
+                let mut control = Control { remaining: 100000 };
+                let mut actual = Vec::new();
+                while let Some(reference) = walk.next_reference().unwrap() {
+                    let body = t.open(reference).unwrap();
+                    walk.push(body, &mut control, |b| {
+                        actual.extend_from_slice(b);
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                assert_eq!(actual, expected);
+                assert_eq!(t.opened, expected_transport.opened);
+                assert_eq!(
+                    walk.push(Cursor::new(Vec::new()), &mut control, |_| panic!(
+                        "complete"
+                    )),
+                    Err(SourceError::Integrity)
+                );
+                assert!(walk.next_reference().unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn incremental_walk_is_poisoned_by_integrity_or_sink_failure() {
+    use nntune_core::original_source::reader::RangeReader;
+    let s = source(&[3, 3, 2], None);
+    for corrupt in [true, false] {
+        let mut t = transport(&[3, 3, 2]);
+        let mut control = Control { remaining: 100000 };
+        let mut walk = RangeReader::new(&s, 0..8).unwrap();
+        let final_body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+        walk.push(final_body, &mut control, |_| {
+            panic!("no prefix before final proof")
+        })
+        .unwrap();
+        let body = if corrupt {
+            Cursor::new(b"malformed".to_vec())
+        } else {
+            t.open(walk.next_reference().unwrap().unwrap()).unwrap()
+        };
+        assert!(walk
+            .push(body, &mut control, |_| Err(SourceError::Transport))
+            .is_err());
+        assert_eq!(walk.next_reference(), Err(SourceError::Integrity));
+        assert_eq!(
+            walk.push(Cursor::new(Vec::new()), &mut control, |_| panic!(
+                "poisoned"
+            )),
+            Err(SourceError::Integrity)
+        );
+    }
+}
+
+#[test]
+fn incremental_retained_final_sink_failure_cannot_be_resumed() {
+    use nntune_core::original_source::reader::RangeReader;
+    let s = source(&[3, 2], None);
+    let mut t = transport(&[3, 2]);
+    let mut walk = RangeReader::new(&s, 0..5).unwrap();
+    let mut control = Control { remaining: 100000 };
+    let body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+    walk.push(body, &mut control, |_| panic!("no early output"))
+        .unwrap();
+    let body = t.open(walk.next_reference().unwrap().unwrap()).unwrap();
+    let mut calls = 0;
+    assert_eq!(
+        walk.push(body, &mut control, |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(SourceError::Transport)
+            }
+        }),
+        Err(SourceError::Transport)
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(t.opened.len(), 2);
+    assert_eq!(walk.next_reference(), Err(SourceError::Integrity));
 }
