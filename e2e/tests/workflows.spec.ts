@@ -1418,7 +1418,7 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       // includes BOTH clippy invocations, not just the first/native one.
       const compilingCommands = [
         testCommand,
-        `cargo clippy --locked ${manifest} --all-targets -- -D warnings`,
+        `cargo clippy --locked ${manifest}${crate === 'api' ? ' --features postgres-tests' : ''} --all-targets -- -D warnings`,
         `cargo check --locked ${manifest} --target wasm32-unknown-unknown`,
         ...(crate === 'repair'
           ? [`cargo clippy --locked ${manifest} --target wasm32-unknown-unknown -- -D warnings`]

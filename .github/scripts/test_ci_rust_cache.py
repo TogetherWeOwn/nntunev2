@@ -24,26 +24,38 @@ COVERAGE_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "coverage.yml")
 
 SELF_COMMAND = "python3 .github/scripts/test_ci_rust_cache.py"
 SAVE_IF_MAIN = "${{ github.ref == 'refs/heads/main' }}"
-# Job id -> the standalone crate dir its rust-cache step must name.
+# Job id -> the standalone crate dirs its rust-cache step must name.
 STANDALONE_WORKSPACES = {
-    "api": "workers/api",
-    "api-migrations": "workers/api",
-    "rust-mb": "workers/mb",
-    "rust-ingest": "workers/ingest",
-    "rust-repair": "workers/repair",
-    "rust-transcode": "workers/transcode",
+    "api": ["workers/api"],
+    "api-migrations": ["workers/api"],
+    "rust-mb": ["workers/mb"],
+    "rust-ingest": ["workers/ingest"],
+    "rust-repair": ["workers/repair"],
+    "rust-transcode": ["workers/transcode"],
 }
 # Floor on cached Rust lanes so deleting cache steps cannot pass vacuously.
 MIN_CACHE_STEPS = 11
 
 
 def with_input(step_chunk, name):
-    """A `with:` input's scalar value (ten-space indent), comment-stripped."""
+    """A ten-space `with:` input; hashes inside literal blocks stay literal."""
     pattern = re.compile(rf"^          {re.escape(name)}:\s*(.*?)\s*$")
-    for line in step_chunk.splitlines():
+    lines = step_chunk.splitlines()
+    for index, line in enumerate(lines):
         match = pattern.match(line)
         if match:
-            return re.sub(r"\s+#.*$", "", match.group(1))
+            value = re.sub(r"\s+#.*$", "", match.group(1))
+            if value != "|":
+                return value
+            values = []
+            for continuation in lines[index + 1:]:
+                if not continuation.strip():
+                    values.append("")
+                    continue
+                if not continuation.startswith("            "):
+                    break
+                values.append(continuation[12:])
+            return "\n".join(values)
     return None
 
 
@@ -68,13 +80,13 @@ def cache_errors(text):
                 errors.append(f"{job_id}: rust-cache must save only on main")
     if total < MIN_CACHE_STEPS:
         errors.append(f"expected >= {MIN_CACHE_STEPS} rust-cache steps, found {total}")
-    for job_id, workspace in STANDALONE_WORKSPACES.items():
+    for job_id, workspaces in STANDALONE_WORKSPACES.items():
         steps = cache_steps(jobs.get(job_id, ""))
         if not steps:
             errors.append(f"{job_id}: missing rust-cache step")
         for step in steps:
-            if with_input(step, "workspaces") != workspace:
-                errors.append(f"{job_id}: rust-cache must name workspaces: {workspace}")
+            if (with_input(step, "workspaces") or "").splitlines() != workspaces:
+                errors.append(f"{job_id}: rust-cache must name workspaces: {', '.join(workspaces)}")
     return errors
 
 
@@ -123,14 +135,51 @@ class TestRustCachePolicy(unittest.TestCase):
         self.assertTrue(cache_errors(mutated))
 
     def test_each_standalone_workspace_is_required(self):
-        """Removing any standalone lane's workspaces input is caught."""
-        for job_id, workspace in STANDALONE_WORKSPACES.items():
-            with self.subTest(job=job_id):
-                chunk = split_jobs(self.ci)[job_id]
-                bad = chunk.replace(f"          workspaces: {workspace}\n", "", 1)
+        """Removing any crate from a scalar or block workspaces input is caught."""
+        for job_id, workspaces in STANDALONE_WORKSPACES.items():
+            for workspace in workspaces:
+                with self.subTest(job=job_id, workspace=workspace):
+                    chunk = split_jobs(self.ci)[job_id]
+                    bad = re.sub(
+                        rf"^          (?:workspaces: |  ){re.escape(workspace)}\n",
+                        "", chunk, count=1, flags=re.MULTILINE,
+                    )
+                    self.assertNotEqual(bad, chunk)
+                    self.assertIn(
+                        f"{job_id}: rust-cache must name workspaces: {', '.join(workspaces)}",
+                        cache_errors(self.ci.replace(chunk, bad, 1)),
+                    )
+
+    def test_literal_workspaces_stop_at_next_input(self):
+        """Block values retain both crates, not sibling inputs or header comments."""
+        step = (
+            "        with:\n"
+            "          workspaces: | # two standalone crates\n"
+            "            workers/api\n"
+            "            workers/mb\n"
+            "          key: api-postgres-acceptance\n"
+            "          save-if: " + SAVE_IF_MAIN + "\n"
+        )
+        self.assertEqual(with_input(step, "workspaces"), "workers/api\nworkers/mb")
+        self.assertEqual(with_input(step, "save-if"), SAVE_IF_MAIN)
+        self.assertIsNone(with_input(step, "missing"))
+
+    def test_literal_workspaces_hashes_are_not_comments(self):
+        """Hashes in block data change the action input and must not be stripped."""
+        for line in [
+            "            workers/api # validation store\n",
+            "            # native acceptance target\n            workers/api\n",
+        ]:
+            with self.subTest(line=line):
+                chunk = split_jobs(self.ci)["api-migrations"]
+                bad = chunk.replace(
+                    "          workspaces: workers/api\n",
+                    "          workspaces: |\n" + line,
+                    1,
+                )
                 self.assertNotEqual(bad, chunk)
                 self.assertIn(
-                    f"{job_id}: rust-cache must name workspaces: {workspace}",
+                    "api-migrations: rust-cache must name workspaces: workers/api",
                     cache_errors(self.ci.replace(chunk, bad, 1)),
                 )
 

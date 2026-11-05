@@ -61,6 +61,9 @@ wrangler.toml.bak
 *.sql.gz
 /dump/
 
+# Runtime-generated local settings are not feature source.
+/.claude/settings.local.json
+
 # OS / editors
 .DS_Store
 Thumbs.db

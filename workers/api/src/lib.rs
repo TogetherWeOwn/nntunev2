@@ -40,6 +40,7 @@ pub mod session;
 pub mod session_retry_store;
 pub mod stripe;
 pub mod vault;
+pub mod videolinks;
 pub mod webauthn;
 pub mod worker_entry;
 
@@ -141,6 +142,33 @@ pub async fn main(
         return subsonic_response(&mut req).await;
     }
     worker_entry::dispatch(req, env).await
+}
+
+// worker 0.8.7's scheduled macro discards the handler's return value. Export
+// the compatible Promise boundary explicitly so a sanitized dispatch failure
+// completes with Err instead of throwing out of a Rust future's poll.
+#[cfg(target_arch = "wasm32")]
+mod scheduled_export {
+    use worker::wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(
+        wasm_bindgen = ::worker::wasm_bindgen,
+        wasm_bindgen_futures = ::worker::wasm_bindgen_futures,
+        js_sys = ::worker::js_sys
+    )]
+    pub async fn scheduled(
+        event: worker::worker_sys::ScheduledEvent,
+        env: worker::Env,
+        _ctx: worker::worker_sys::ScheduleContext,
+    ) -> Result<JsValue, JsValue> {
+        std::panic::AssertUnwindSafe(async move {
+            crate::worker_entry::dispatch_scheduled(event.into(), env)
+                .await
+                .map(|()| JsValue::UNDEFINED)
+                .map_err(|label| JsValue::from_str(label))
+        })
+        .await
+    }
 }
 
 /// True when this request targets the Subsonic `/rest/*` surface.

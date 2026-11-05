@@ -295,7 +295,10 @@ jobs:
           pattern = "${API_RP_ID_STAGING}/api/ingest"
           zone_name = "nntune.com"
 
+          # No recurring curation triggers: qualification activation/expiry is
+          # separately gated. This public label alone does not install a cron.
           [env.staging.vars]
+          ENVIRONMENT = "staging"
           RP_ID = "${API_RP_ID_STAGING}"
           RP_ORIGIN = "${API_RP_ORIGIN_STAGING}"
           SESSION_TTL_SECS = "86400"

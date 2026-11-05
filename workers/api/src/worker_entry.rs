@@ -365,7 +365,7 @@ fn apply_rate_limit_overlay(config: Config, get: impl Fn(&str) -> Option<String>
 /// Hyperdrive config has query caching disabled; anything else (missing,
 /// empty, any other value) refuses to start. Unit-tested below; the same
 /// truthy spelling as the other feature flags.
-fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
+pub(crate) fn hyperdrive_caching_disabled_attested(raw: Option<String>) -> bool {
     matches!(raw.as_deref(), Some("1") | Some("true") | Some("TRUE"))
 }
 
@@ -5038,6 +5038,178 @@ fn emit_record(
     #[cfg(target_arch = "wasm32")]
     worker::console_log!("{line}");
     Some(line)
+}
+
+/// Scheduled retention uses only app HYPERDRIVE and public job configuration.
+/// Do not call config_from_env here: missing session/KEK/mail/validation secrets
+/// must not disable cleanup. Trigger installation remains separately gated.
+pub async fn dispatch_scheduled(
+    event: worker::ScheduledEvent,
+    env: Env,
+) -> Result<(), &'static str> {
+    use crate::videolinks::jobs::cleanup_tick;
+    use crate::videolinks::scheduled::{run_retention, ScheduleError};
+
+    let trace_id = crate::logging::resolve_trace_id(None);
+    let build_sha = crate::logging::parse_build_sha(
+        env.var("BUILD_SHA").ok().map(|v| v.to_string()).as_deref(),
+    );
+    let result = run_retention(
+        &event.cron(),
+        event.schedule(),
+        now_millis(),
+        |name| env.var(name).ok().map(|v| v.to_string()),
+        |invocation| {
+            let env = env.clone();
+            let trace_id = trace_id.clone();
+            async move {
+                let store = PgStore {
+                    env: Some(env),
+                    trace_id,
+                    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+                    test_client: std::cell::RefCell::new(None),
+                };
+                // Reuse the 15-second dial/handshake/setup path. The outer budget
+                // encloses this AND the tick's 20-second claim/work/receipt attempt.
+                let mut client = store.connect().await.map_err(|_| ScheduleError::Connect)?;
+                cleanup_tick(
+                    &mut client,
+                    invocation.environment,
+                    invocation.scheduled_at,
+                    &invocation.build_sha,
+                    || i64::try_from(now_millis() / 1000).unwrap_or(0),
+                )
+                .await
+                .map_err(ScheduleError::Job)
+            }
+        },
+    )
+    .await;
+    let (level, outcome) = scheduled_retention_outcome(&result);
+    let _ = emit_record(
+        level,
+        "api.video_retention.outcome",
+        &trace_id,
+        serde_json::json!({"outcome": outcome, "build_sha": build_sha, "release": build_sha}),
+    );
+    if level == crate::logging::Level::Error {
+        Err(outcome)
+    } else {
+        Ok(())
+    }
+}
+
+fn scheduled_retention_outcome(
+    result: &Result<
+        crate::videolinks::jobs::RetentionTick,
+        crate::videolinks::scheduled::ScheduleError,
+    >,
+) -> (crate::logging::Level, &'static str) {
+    use crate::logging::Level;
+    use crate::videolinks::jobs::RetentionTick;
+    use crate::videolinks::scheduled::ScheduleError;
+    match result {
+        Err(error) => (
+            Level::Error,
+            match error {
+                ScheduleError::UnknownCron => "unknown_cron",
+                ScheduleError::InvalidTime => "invalid_time",
+                ScheduleError::Configuration => "configuration",
+                ScheduleError::Connect => "connection_failed",
+                ScheduleError::Job(_) => "job_failed",
+                ScheduleError::Deadline => "invocation_deadline",
+            },
+        ),
+        Ok(RetentionTick::Suppressed) => (Level::Info, "suppressed"),
+        Ok(RetentionTick::Recorded(Err(_))) => (Level::Error, "cleanup_failed"),
+        Ok(RetentionTick::Recorded(Ok(report))) => match &report.backlog {
+            None => (Level::Error, "missing_audit"),
+            Some(backlog) if backlog.expired_rows > 0 => (Level::Error, "expired_backlog"),
+            Some(backlog) if backlog.due_rows > 0 => (Level::Warn, "due_backlog"),
+            Some(_) => (Level::Info, "drained"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod scheduled_retention_tests {
+    use super::*;
+    use crate::logging::Level;
+    use crate::videolinks::jobs::{JobError, RetentionTick};
+    use crate::videolinks::retention::{
+        CleanupError, CleanupFailure, CleanupReport, MetadataBacklog,
+    };
+    use crate::videolinks::scheduled::ScheduleError;
+
+    fn report(backlog: Option<MetadataBacklog>) -> CleanupReport {
+        CleanupReport {
+            evaluated_at: 1_800_000_000,
+            safety_window_s: 86400,
+            batches: 1,
+            purged_rows: 0,
+            backlog,
+        }
+    }
+
+    #[test]
+    fn suppression_backlog_and_missing_audit_never_log_healthy_cleanup() {
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Suppressed)),
+            (Level::Info, "suppressed")
+        );
+        for (due, expired, expected) in [
+            (0, 0, (Level::Info, "drained")),
+            (1, 0, (Level::Warn, "due_backlog")),
+            (1, 1, (Level::Error, "expired_backlog")),
+        ] {
+            let tick = RetentionTick::Recorded(Ok(report(Some(MetadataBacklog {
+                retained_rows: due,
+                due_rows: due,
+                expired_rows: expired,
+                oldest_due_validated_at: (due > 0).then_some(1),
+                oldest_expired_validated_at: (expired > 0).then_some(1),
+            }))));
+            assert_eq!(scheduled_retention_outcome(&Ok(tick)), expected);
+        }
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Ok(report(None))))),
+            (Level::Error, "missing_audit")
+        );
+        assert_eq!(
+            scheduled_retention_outcome(&Ok(RetentionTick::Recorded(Err(CleanupFailure {
+                error: CleanupError::Store,
+                progress: report(None),
+            })))),
+            (Level::Error, "cleanup_failed")
+        );
+    }
+
+    #[test]
+    fn failures_use_fixed_loggable_labels_only() {
+        for (error, label) in [
+            (ScheduleError::UnknownCron, "unknown_cron"),
+            (ScheduleError::InvalidTime, "invalid_time"),
+            (ScheduleError::Configuration, "configuration"),
+            (ScheduleError::Connect, "connection_failed"),
+            (ScheduleError::Job(JobError::Store), "job_failed"),
+            (ScheduleError::Deadline, "invocation_deadline"),
+        ] {
+            let (level, outcome) = scheduled_retention_outcome(&Err(error));
+            assert_eq!((level, outcome), (Level::Error, label));
+            let line = emit_record(
+                level,
+                "api.video_retention.outcome",
+                "9f3a4c2e1b5d4f6a8c7e9d0b1a2f4e6c",
+                serde_json::json!({
+                    "outcome": outcome,
+                    "build_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "release": "0123456789abcdef0123456789abcdef01234567",
+                }),
+            )
+            .expect("fixed sanitized scheduled log is accepted");
+            assert!(line.contains(label));
+        }
+    }
 }
 
 /// Worker `fetch` entry: adapts the runtime request into the handlers'
