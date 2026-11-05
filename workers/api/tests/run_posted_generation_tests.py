@@ -29,6 +29,12 @@ EXPECTED = {
     "posted_generation_health::postgres_lease_status_and_attempt_fences_gate_every_health_mutation",
     "posted_generation_health::postgres_lost_ack_recovery_returns_current_health_revision_with_exact_evidence",
     "posted_generation_health::postgres_invalid_slots_are_rejected_without_mutation_or_burning_the_handle",
+    "posted_generation_takeover::postgres_expired_takeover_resumes_exact_bundle_and_keeps_progress_and_repost_budget",
+    "posted_generation_takeover::postgres_live_operation_lease_is_busy_and_stale_inputs_do_not_mutate",
+    "posted_generation_takeover::postgres_concurrent_takeover_by_one_new_attempt_is_idempotent",
+    "posted_generation_takeover::postgres_lost_ack_replay_and_recover_do_not_rotate_the_claim_again",
+    "posted_generation_takeover::postgres_attempt_expiry_during_registry_lock_wait_refuses_takeover",
+    "posted_generation_takeover::postgres_expired_new_attempt_and_job_status_or_owner_fence_refuse_takeover",
 }
 
 

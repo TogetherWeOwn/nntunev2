@@ -11,6 +11,12 @@
 //! identifies its canonical required slot order, including recovery articles;
 //! plaintext article identities never reach this store. Existing posted_files
 //! envelopes and their hash-bound AAD remain unchanged.
+//!
+//! Presence confirmations and `verified_at` below are NOT readable/authenticated
+//! content proof. R2 safety-net custody must stay until exact-generation content
+//! integrity is established on two independent backbones and rechecked against
+//! concurrent health/repair. A timestamp, successful POST, STAT or elapsed time
+//! never authorizes cleanup; this preparation adapter grants no deletion permit.
 
 use crate::posted_files::{validate_posted_file_params, PostedFileParams};
 use crate::two_spool::SpoolCopyState;
@@ -579,6 +585,117 @@ pub async fn admit(
     Ok(AdmissionOutcome::Admitted(handle, bundle))
 }
 
+/// Resume an expired claim under a newer persisted attempt of the SAME job.
+/// This never accepts a new mint, changes the article plan, starts a new round
+/// or resets evidence/budgets. An ambiguous acknowledgment is recovered by
+/// operation identity; replay with the current attempt keeps the claim token.
+/// Registry identity is fenced, but no predecessor-health decision, selection,
+/// promotion or content-integrity/cleanup authority is granted by takeover.
+// All paths use job/attempt -> registry -> operation/health lock order.
+pub async fn take_over(
+    client: &mut Client,
+    attempt: &AttemptHandle,
+    expected: &Observation,
+    operation: &str,
+) -> Result<AdmissionOutcome, StoreError> {
+    if !identity(operation) {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_attempt(&tx, attempt).await? {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    if tx
+        .query_opt(
+            "SELECT revision FROM posted_file_registry WHERE plaintext_sha256 = $1 \
+             AND revision = $2 AND selected_generation IS NOT DISTINCT FROM $3::text \
+             AND pending_operation = $4 FOR UPDATE",
+            &[
+                &expected.hash,
+                &expected.revision,
+                &expected.selected,
+                &operation,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+        .is_none()
+    {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    }
+    let Some(old) = tx
+        .query_opt(
+            "SELECT o.generation_id, o.attempt, o.attempt_token FROM posted_file_operations o \
+             JOIN posted_file_health h ON h.generation_id = o.generation_id \
+             WHERE o.id = $1 AND o.plaintext_sha256 = $2 AND o.job_id = $3 \
+             AND o.registry_revision = $4 AND o.predecessor IS NOT DISTINCT FROM $5::text \
+             AND o.state = 'pending' AND h.state IN ('unknown', 'verifying') \
+             FOR UPDATE OF o, h",
+            &[
+                &operation,
+                &expected.hash,
+                &attempt.job_id,
+                &expected.revision,
+                &expected.selected,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    };
+    // Re-evaluate both leases with the DB clock AFTER all lock waits. The
+    // attempt/job rows remain locked, so no other acquisition can race commit.
+    let Some(leases) = tx
+        .query_opt(
+            "SELECT o.lease_until > extract(epoch FROM clock_timestamp())::bigint AS active \
+             FROM posted_file_operations o JOIN posted_file_job_attempts a ON a.job_id = o.job_id \
+             WHERE o.id = $1 AND a.attempt = $2 AND a.token = $3 \
+             AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint",
+            &[&operation, &attempt.attempt, &attempt.token],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    };
+    let old_attempt: i64 = old.get("attempt");
+    let same_attempt =
+        old_attempt == attempt.attempt && old.get::<_, &str>("attempt_token") == attempt.token;
+    if !same_attempt {
+        if old_attempt >= attempt.attempt {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        }
+        if leases.get::<_, bool>("active") {
+            return Ok(AdmissionOutcome::ClaimBusy);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE posted_file_operations o SET attempt = a.attempt, attempt_token = a.token, \
+                 claim_token = gen_random_uuid()::text, lease_until = a.lease_until \
+                 FROM posted_file_job_attempts a WHERE o.id = $1 AND a.job_id = o.job_id \
+                 AND a.attempt = $2 AND a.token = $3 AND o.attempt < a.attempt \
+                 AND o.lease_until <= extract(epoch FROM clock_timestamp())::bigint \
+                 AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint",
+                &[&operation, &attempt.attempt, &attempt.token],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Ok(AdmissionOutcome::StaleOrDiverged);
+        }
+    }
+    let Some(handle) = read_handle(&tx, attempt, operation).await? else {
+        return Ok(AdmissionOutcome::StaleOrDiverged);
+    };
+    let bundle = stored(&tx, old.get("generation_id")).await?;
+    if bundle.custody()?.plaintext_sha256 != expected.hash {
+        return Err(StoreError::Inconsistent);
+    }
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(AdmissionOutcome::ResumedSameCandidate(handle, bundle))
+}
+
 /// The two distinct configured backbones in the immutable custody bundle.
 /// Slot numbers resolve through that bundle's sealed plan, never a new local
 /// article list. This adapter stores no article identities.
@@ -602,7 +719,7 @@ impl ArticleSide {
 /// evidence is not terminal failure and never authorizes replacement.
 #[derive(Debug)]
 pub enum MutationOutcome {
-    Applied(GenerationHandle),
+    Applied(Box<GenerationHandle>),
     Incomplete,
     StaleOrDiverged,
 }
@@ -703,7 +820,7 @@ async fn commit_mutation(
         .await?
         .ok_or(StoreError::Inconsistent)?;
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(MutationOutcome::Applied(refreshed))
+    Ok(MutationOutcome::Applied(Box::new(refreshed)))
 }
 
 /// Start a distinct verification evidence round. Old evidence is retained but
@@ -870,6 +987,11 @@ mod tests {
     }
 
     #[test]
+    fn mutation_outcome_keeps_the_handle_out_of_line() {
+        assert!(std::mem::size_of::<MutationOutcome>() <= 2 * std::mem::size_of::<usize>());
+    }
+
+    #[test]
     fn handles_never_debug_tokens_or_identities() {
         let attempt = AttemptHandle {
             job_id: "private-job".into(),
@@ -892,7 +1014,7 @@ mod tests {
         assert_eq!(format!("{attempt:?}"), "AttemptHandle([REDACTED])");
         assert_eq!(format!("{handle:?}"), "GenerationHandle([REDACTED])");
         assert_eq!(
-            format!("{:?}", MutationOutcome::Applied(handle)),
+            format!("{:?}", MutationOutcome::Applied(Box::new(handle))),
             "Applied(GenerationHandle([REDACTED]))"
         );
         assert_eq!(ArticleSide::Post.db_value(), 0);

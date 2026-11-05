@@ -8,8 +8,8 @@
 //! any connection is opened.
 //!
 //! Scope: preparation only. Migration 0037 keeps the unique plaintext hash
-//! constraint, so failed-generation replacement, reuse, takeover, promotion
-//! and publication are NOT implemented or exercised here, and nothing in this
+//! constraint, so failed-generation replacement, reuse, promotion and
+//! publication are NOT implemented or exercised here, and nothing in this
 //! file shows the whole finding fixed. Fixtures are synthetic sealed byte
 //! buffers keyed by database UUIDs; custody rows are retained by design, so
 //! nothing is cleaned up. Failures print only static labels: no connection
@@ -37,6 +37,8 @@ const MIGRATION_0037: &str = include_str!("../../../migrations/0037_posted_file_
 
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
+#[path = "support/posted_generation_takeover.rs"]
+mod posted_generation_takeover;
 
 // The replay test runs DDL that takes ACCESS EXCLUSIVE locks. It holds the
 // write side so no other test in this process is mid-statement.

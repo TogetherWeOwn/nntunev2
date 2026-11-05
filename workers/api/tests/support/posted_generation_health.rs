@@ -33,7 +33,7 @@ fn side(post: bool) -> ArticleSide {
 
 fn applied(outcome: Result<MutationOutcome, StoreError>, ctx: &'static str) -> GenerationHandle {
     match outcome {
-        Ok(MutationOutcome::Applied(handle)) => handle,
+        Ok(MutationOutcome::Applied(handle)) => *handle,
         _ => panic!("{ctx}: expected an applied mutation"),
     }
 }
