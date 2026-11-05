@@ -59,6 +59,8 @@ mod posted_generation_presence;
 mod posted_generation_presence_provenance;
 #[path = "support/posted_generation_rechecks.rs"]
 mod posted_generation_rechecks;
+#[path = "support/posted_generation_repair_content.rs"]
+mod posted_generation_repair_content;
 #[path = "support/posted_generation_retained.rs"]
 mod posted_generation_retained;
 #[path = "support/posted_generation_takeover.rs"]

@@ -1308,7 +1308,10 @@ pub async fn prepare_repost(
 /// Transport/auth-retryable and prohibited outcomes spend no budget and return
 /// Incomplete; their retry/keep-original disposition belongs to verifier policy,
 /// never a terminal health write or replacement authorization in this adapter.
-/// Posted/confirmed-duplicate outcomes do NOT confirm presence or content.
+/// Posted/confirmed-duplicate outcomes do NOT confirm presence or content. An
+/// answered repair withdraws any earlier intact content observation on this
+/// side/round in the SAME accounting transaction; it requires a fresh read.
+/// Other sides/rounds and nonaffirmative observations remain unchanged.
 pub async fn record_repost(
     client: &mut Client,
     permit: &RepostPermit,
@@ -1328,6 +1331,8 @@ pub async fn record_repost(
     if !matches!(verdict, PostVerdict::Posted | PostVerdict::DuplicatePresent) {
         return Ok(MutationOutcome::Incomplete);
     }
+    // Refuse inconsistent stored evidence before accounting or invalidating it.
+    content::load_checks(&tx, handle).await?;
     let changed = tx
         .execute(
             "INSERT INTO posted_file_article_progress AS p \
@@ -1354,7 +1359,16 @@ pub async fn record_repost(
         return Ok(MutationOutcome::StaleOrDiverged);
     }
     tx.execute(
-        "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
+        "UPDATE posted_file_content_checks SET state = 'unavailable', checked_articles = 0, \
+         checked_at = floor(extract(epoch FROM clock_timestamp()))::bigint \
+         WHERE generation_id = $1 AND round = $2 AND side = $3 AND state = 'intact'",
+        &[&handle.generation, &handle.round, &permit.side.db_value()],
+    )
+    .await
+    .map_err(database_error)?;
+    tx.execute(
+        "UPDATE posted_file_health SET revision = revision + 1, \
+         verified_at = NULL, retention_checked_at = NULL WHERE generation_id = $1",
         &[&handle.generation],
     )
     .await
