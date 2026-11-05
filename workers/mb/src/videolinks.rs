@@ -20,11 +20,11 @@
 //!   (`migrations/0035_videolinks_curation.sql`), never in `mb_*`.
 //!
 //! Parsing and policy helpers live here; [`validation`] adds a bounded
-//! runner and app-side PostgreSQL adapter. No runtime route, schedule or
-//! credential-bound HTTP adapter activates them yet. The query builder
-//! omits the API key; credential installation and live validation are not
-//! established by fixture-based tests. See `docs/videolinks-pipeline.md`
-//! for the remaining integration work.
+//! runner, app-side PostgreSQL adapter and inactive Worker HTTP client. No
+//! runtime route or schedule activates them yet. The query builder omits
+//! the API key; the HTTP client requires a runtime Secret. Credential
+//! installation and live validation are not established by fixture-based
+//! tests. See `docs/videolinks-pipeline.md` for remaining integration work.
 
 pub mod validation;
 

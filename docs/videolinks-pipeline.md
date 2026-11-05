@@ -10,8 +10,9 @@ validated IDs with the official video embed.
 `workers/mb/src/videolinks.rs` provides parsing and policy helpers.
 `workers/mb/src/videolinks/validation.rs` adds a **bounded validation
 runner** and an **app-side PostgreSQL store adapter**, not an activated
-curation service. No route, schedule, database binding or credential-bound
-HTTP adapter calls the runner yet.
+curation service. `validation/http.rs` supplies an inactive Worker HTTP
+client requiring a runtime Secret. No route, schedule or database binding
+calls the runner yet.
 
 `refresh_due` purges expired API-returned fields before contacting the
 validation client, requests at most 200 distinct IDs in four 50-ID batches,
@@ -43,6 +44,33 @@ That verifies SQL execution at that head, not streaming HTTP or a deployed
 TTL schedule. Without an active schedule and measured cleanup throughput,
 the adapter alone does not establish metadata deletion within 30 days.
 
+### Worker HTTP adapter boundary
+
+`WorkerValidationClient` constructs only the official HTTPS `videos.list`
+request, refuses redirects, validates 1–50 distinct IDs before networking,
+and projects only ID, status, duration, title and channel fields (no
+thumbnails). It accepts an existing runtime Secret, never a candidate-supplied
+URL or key. The key-bearing type has no Debug/Display implementation; all
+transport, header, body and credential failures map to sanitized errors.
+Non-200 responses are rejected without reading API error bodies; no request
+is retried. No Cache API or response persistence is used.
+
+A 10-second request deadline includes headers and body, within the runner's
+45-second total. The abort controller stays alive through body consumption
+and aborts on success, early failure, caller cancellation or timeout. A JS
+reader checks each chunk's byte length **before** copying it into Wasm;
+the retained buffer cannot exceed 256 KiB, even with no Content-Length or
+one oversized chunk. The browser/runtime still owns incoming JS buffers;
+this is not a bound on its network allocations. Invalid UTF-8 fails closed.
+
+Five native unit tests cover request construction, invalid inputs, body
+budget boundaries, split UTF-8 and cancellation-guard drop. They do not
+exercise actual Worker fetch/AbortSignal behaviour. Compilation and native
+test execution await exact-head Actions (including the existing MB wasm32
+check); an installed secret and live transport validation remain unproven.
+No dependency, binding, route, schedule or migration changes accompany this
+adapter.
+
 ### PostgreSQL acceptance boundary
 
 The required `api-migrations` job creates a dedicated empty
@@ -73,10 +101,10 @@ Still required before feature acceptance:
 
 - Wire source readers, the runner's app-side connection and a bounded
   schedule. Keep the real PostgreSQL acceptance target green at each head.
-- Implement the credential-bound HTTP adapter: fixed official HTTPS
-  endpoint, no redirects, capped streaming body, cancellation on drop and
-  sanitized failures. The runner's post-read body-size check is not a
-  substitute for a transport-level allocation cap.
+- Exercise the inactive HTTP adapter in the Worker runtime: fixed official
+  HTTPS endpoint, no redirects, capped streaming body, cancellation on drop
+  and sanitized failures. Native policy fixtures do not prove live fetch or
+  AbortSignal behaviour.
 - Connect authenticated submission/moderation and fresh-link reads.
 - Implement and verify metadata refresh/deletion, not just stale-read
   rejection, within the 30-day limit.

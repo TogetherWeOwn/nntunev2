@@ -4,6 +4,8 @@
 //! app-database connection (never `MB_DB`), a credential-bound HTTP client and
 //! a trusted Unix clock. No route, schedule or binding is enabled here.
 
+pub mod http;
+
 use super::{is_playable, is_valid_video_id, parse_videos_list_response, ValidatedVideo};
 use super::{VALIDATION_TTL_S, VIDEOS_LIST_MAX_IDS};
 use serde::Serialize;
