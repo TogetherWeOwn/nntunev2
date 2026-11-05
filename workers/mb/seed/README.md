@@ -1,11 +1,14 @@
-# MB mirror synthetic-fixture seed
+# MB mirror synthetic-fixture seed (retired fixture)
 
-Seeds the MusicBrainz mirror with the one release the staging E2E ingests
-(`e2e/fixtures/synthetic.nzb`, 660 Hz sine track). The seed is
+Seeded the MusicBrainz mirror with the release the retired synthetic
+staging fixture derived its match query from (660 Hz sine track; the
+checked-in fixture is deleted under TWO-1169). The seed is
 [`synthetic-fixture.sql`](synthetic-fixture.sql). Full fail-closed
 verification (empty/drift/repair matrix) lives in the paired
 acceptance-test change, not in this PR; the row-display queries below run
-at this head with no extra files.
+at this head with no extra files. Seeding the staged secret-held real
+NZB's release is separate future work (it un-FIXMEs the recording_mbids
+leg); this seed stays until the mirror owner replaces it.
 
 Seeded rows: `mb_artist` `11111111-…`, `mb_release` `22222222-…`
 (`NNTune-Fixture sine-660`, exactly the NZB-derived match query),
@@ -23,7 +26,9 @@ export DATABASE_URL=postgres://$USER@localhost:5432/mb_seedcheck
 createdb --host=localhost --port=5432 --username="$USER" mb_seedcheck
 for m in 0001_mb_mirror 0014_mb_import_resume_dlq 0016_mb_track \
          0017_mb_replication_packet_ledger; do
-  psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -f migrations/${m}.sql
+  # Pre-convention migrations carry no search_path header: pin the session,
+  # exactly like workers/api/tests/run_migration_tests.sh.
+  PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -f migrations/${m}.sql
 done
 # Apply the seed (re-runnable upsert).
 psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 \

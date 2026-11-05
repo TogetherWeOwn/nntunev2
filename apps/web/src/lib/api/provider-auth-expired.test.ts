@@ -40,7 +40,7 @@ describe('ApiClient provider_auth_expired', () => {
 		const fetchFn = vi.fn(async () => jsonResponse({ error: 'indexer_auth_expired' }, 401));
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		const failure = await client.get('/v1/vault/test').catch((error: unknown) => error);
+		const failure = await client.get('/v1/stream').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('indexer_auth_expired');
 	});
@@ -49,7 +49,7 @@ describe('ApiClient provider_auth_expired', () => {
 		const fetchFn = vi.fn(async () => jsonResponse({ code: 'indexer_auth_expired' }, 401));
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		const failure = await client.get('/v1/vault/test').catch((error: unknown) => error);
+		const failure = await client.get('/v1/stream').catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).code).toBe('indexer_auth_expired');
 	});

@@ -169,9 +169,12 @@ function row(page: Page, id: string): Locator {
 }
 
 function findField(page: Page): Locator {
+	// Scoped to the page main: the app-shell top bar carries its own
+	// global Search field, which must never satisfy this locator.
 	return page
+		.getByRole('main')
 		.getByRole('searchbox', { name: /find|search/i })
-		.or(page.getByRole('textbox', { name: /find|search/i }));
+		.or(page.getByRole('main').getByRole('textbox', { name: /find|search/i }));
 }
 
 async function requireFind(page: Page): Promise<Locator> {
@@ -859,8 +862,8 @@ test('[GA-B08] structure and keyboard: real headings over lists, unchanged per-r
 	}
 	expect(structure.rowsInLists, 'grouped rows must stay list items inside lists').toBe(true);
 
-	// Per-row keyboard order is the flat order, and a section heading
-	// between the Alpha and Beta rows adds no tab stop.
+	// Per-row keyboard order stays Select, primary action, More, Copy link,
+	// Star in both views. A section heading before Beta adds no tab stop.
 	const alphaSelect = page.getByRole('checkbox', { name: 'Select Alpha Song', exact: true });
 	await alphaSelect.focus();
 	await expect(alphaSelect).toBeFocused();
@@ -868,6 +871,11 @@ test('[GA-B08] structure and keyboard: real headings over lists, unchanged per-r
 	await expect(
 		page.getByRole('button', { name: 'Alpha Song — Alpha', exact: true })
 	).toBeFocused();
+	await page.keyboard.press('Tab');
+	const alphaMore = page.getByRole('button', { name: 'More actions for Alpha Song', exact: true });
+	await expect(alphaMore).toBeFocused();
+	await expect(alphaMore).toHaveAttribute('type', 'button');
+	await expect(alphaMore).toHaveAttribute('aria-haspopup', 'menu');
 	await page.keyboard.press('Tab');
 	await expect(
 		page.getByRole('button', { name: 'Copy link Alpha Song', exact: true })

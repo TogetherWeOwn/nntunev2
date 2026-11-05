@@ -107,9 +107,13 @@ test.describe('ci-ok aggregate', () => {
   for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
-      const needs = JSON.stringify({ placeholder: { result: 'success' }, 'e2e-lint': { result } }, null, 2);
+      const needs = JSON.stringify({
+        placeholder: { result: 'success' },
+        'public-pr-security': { result: 'success' },
+        'e2e-lint': { result },
+      }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs });
+      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
@@ -173,8 +177,8 @@ test.describe('credential scope (static pins)', () => {
     for (const name of [
       'health.spec.ts',
       'ingest-play-meter.spec.ts',
-      'signup-byop.spec.ts',
-      'signup-wizard-arrival.spec.ts',
+      'signup.spec.ts',
+      'signup-arrival.spec.ts',
       'login-magic-link.spec.ts',
       'player-queue-order.spec.ts',
       'demo-audio-contract.spec.ts',
@@ -183,6 +187,9 @@ test.describe('credential scope (static pins)', () => {
       'build-identity.spec.ts',
       'zz-build-identity-final.spec.ts',
       'api-worker-anonymous.spec.ts',
+      // The provider 430 control speaks raw NNTP over TLS (no HTTP at all),
+      // so it can never carry credentials on a raw request call — pin that.
+      'provider-430-control.spec.ts',
     ]) {
       const source = readFileSync(new URL(`../tests/${name}`, import.meta.url), 'utf8');
       expect(source, `${name} must not carry credentials on a raw request call`).not.toMatch(
@@ -252,7 +259,7 @@ test.describe('public UI signup coverage (static pin)', () => {
   // added to either segment (the bypass this coverage exists to prevent)
   // fails here even though other tests in the file legitimately mint.
   test('dedicated UI-signup case submits the form with no account-seam mint', () => {
-    const spec = readFileSync(new URL('../tests/signup-byop.spec.ts', import.meta.url), 'utf8');
+    const spec = readFileSync(new URL('../tests/signup.spec.ts', import.meta.url), 'utf8');
     const marker = "test('public UI signup succeeds even when the test-account seam is configured'";
     const start = spec.indexOf(marker);
     expect(start, 'dedicated public UI signup case is missing').toBeGreaterThan(-1);
@@ -277,8 +284,8 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).toContain('TESTIDS.signupSubmit');
     expect(helper).toContain('TESTIDS.signupError');
     // The real page is two-step: the helper asserts the emailed-code step
-    // (magic_code form), never wizard arrival — asserting the wizard without
-    // the code-retrieval seam reds every configured run.
+    // (magic_code form), never billing arrival — asserting billing
+    // without the code-retrieval seam reds every configured run.
     expect(helper).toContain('magic_code');
     expect(helper).not.toContain('TESTIDS.byopHost');
     expect(helper).not.toContain("'/onboarding/byop'");
@@ -287,28 +294,30 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(helper).not.toContain('qaAuthHeader');
   });
 
-  // Wizard-arrival leg: the new spec proves the real form reaches
-  // `/onboarding/byop` via the virtual authenticator + the staging-only code
-  // seam. These pins keep it honest offline: still no mint, still skip-green
-  // pre-deploy, still names-only diagnostics — while the wizard assertion
+  // Billing-arrival leg: the new spec proves the real form reaches
+  // `/account/billing` via the virtual authenticator + the staging-only code seam.
+  // These pins keep it honest offline: still no mint, still skip-green
+  // pre-deploy, still names-only diagnostics — while the arrival assertion
   // lives in the NEW helper (the shared helper above must keep asserting the
-  // `magic_code` step only, never the wizard).
-  test('wizard-arrival case reaches the wizard with no account-seam mint', () => {
-    const spec = readFileSync(new URL('../tests/signup-wizard-arrival.spec.ts', import.meta.url), 'utf8');
-    const marker = "test('public UI signup with virtual authenticator reaches the BYOP wizard'";
+  // `magic_code` step only, never billing).
+  test('billing-arrival case reaches billing with no account-seam mint', () => {
+    const spec = readFileSync(new URL('../tests/signup-arrival.spec.ts', import.meta.url), 'utf8');
+    const marker = "test('public UI signup with virtual authenticator reaches billing'";
     const start = spec.indexOf(marker);
-    expect(start, 'wizard-arrival case is missing').toBeGreaterThan(-1);
+    expect(start, 'billing-arrival case is missing').toBeGreaterThan(-1);
     const rest = spec.slice(start + marker.length);
     const nextTest = rest.search(/\ntest(?:\(|\.describe)/);
     const dedicated = nextTest === -1 ? spec.slice(start) : spec.slice(start, start + marker.length + nextTest);
     // Null identity = Access pair only: the page starts unauthenticated, so
     // the form is the only account-creation path even with QA_AUTH_TOKEN set.
     expect(dedicated).toContain('applyAccountToPage(page, null, baseURL)');
-    expect(dedicated).toContain('submitPublicUiSignupToByopWizard(page, request, baseURL)');
-    // Arrival asserted at the spec level too (landed URL + wizard field).
-    expect(dedicated).toContain("'/onboarding/byop'");
+    expect(dedicated).toContain('submitPublicUiSignupToBilling(page, request, baseURL)');
+    // Arrival asserted at the spec level too (landed URL + billing heading).
+    expect(dedicated).toContain("'/account/billing'");
     expect(dedicated).toContain('page.url()');
-    expect(dedicated).toContain('TESTIDS.byopHost');
+    expect(dedicated).toContain("toContainText('Billing'");
+    expect(dedicated).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(dedicated).toContain("page.getByRole('link', { name: 'See plans', exact: true })).toBeVisible()");
     // Never the mint seam: arrival must come from the public form.
     expect(dedicated).not.toContain('tryMintTestAccount');
     expect(dedicated).not.toContain('API.testAccounts');
@@ -320,13 +329,13 @@ test.describe('public UI signup coverage (static pin)', () => {
     expect(dedicated).toContain('annotateSignupPath');
   });
 
-  test('wizard-arrival helper completes the form via the code seam and virtual authenticator', () => {
+  test('billing-arrival helper completes the form via the code seam and virtual authenticator', () => {
     const accounts = readFileSync(new URL('../helpers/accounts.ts', import.meta.url), 'utf8');
-    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToByopWizard');
-    expect(helperStart, 'wizard-arrival helper is missing').toBeGreaterThan(-1);
-    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToByopWizard'.length);
+    const helperStart = accounts.indexOf('export async function submitPublicUiSignupToBilling');
+    expect(helperStart, 'billing-arrival helper is missing').toBeGreaterThan(-1);
+    const helperRest = accounts.slice(helperStart + 'export async function submitPublicUiSignupToBilling'.length);
     const nextExport = helperRest.search(/\nexport /);
-    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToByopWizard'.length + nextExport);
+    const helper = nextExport === -1 ? accounts.slice(helperStart) : accounts.slice(helperStart, helperStart + 'export async function submitPublicUiSignupToBilling'.length + nextExport);
     // Real form, both steps: email submit then the emailed-code field.
     expect(helper).toContain('`${baseURL}/signup`');
     expect(helper).toContain('TESTIDS.signupEmail');
@@ -339,10 +348,13 @@ test.describe('public UI signup coverage (static pin)', () => {
     // Passkey finish runs against a virtual authenticator, not hardware
     // (the CDP call lives in `enableVirtualAuthenticator`, pinned below).
     expect(helper).toContain('enableVirtualAuthenticator');
-    // Wizard arrival asserted here (unlike the shared helper above).
-    expect(helper).toContain("'/onboarding/byop'");
+    // Billing arrival asserted here (unlike the shared helper above).
+    expect(helper).toContain("'/account/billing'");
     expect(helper).toContain('page.url()');
-    expect(helper).toContain('TESTIDS.byopHost');
+    expect(helper).toContain("toContainText('Billing'");
+    expect(helper).toContain("page.getByText('to see your billing.', { exact: false })).toHaveCount(0)");
+    expect(helper).toContain("page.getByRole('link', { name: 'See plans', exact: true })");
+    expect(helper).toContain('authenticated billing action not visible after public UI signup');
     // Never the mint seam in the arrival path.
     expect(helper).not.toContain('tryMintTestAccount');
     expect(helper).not.toContain('API.testAccounts');
@@ -400,7 +412,7 @@ test.describe('returning-user login coverage (static pin)', () => {
   // runtime in the spec, not as source text here.
   test('login live case mints the returning account and redeems via the code seam', () => {
     const spec = readFileSync(new URL('../tests/login-magic-link.spec.ts', import.meta.url), 'utf8');
-    const marker = "test('returning user signs in with an emailed magic link and lands on provider setup'";
+    const marker = "test('returning user signs in with an emailed magic link and lands on the library'";
     const start = spec.indexOf(marker);
     expect(start, 'returning-user login case is missing').toBeGreaterThan(-1);
     const rest = spec.slice(start + marker.length);
@@ -415,14 +427,14 @@ test.describe('returning-user login coverage (static pin)', () => {
     // the form is the only sign-in path even with QA_AUTH_TOKEN set.
     expect(live).toContain('applyAccountToPage(page, null, baseURL)');
     // Real form plus the explicit-confirm landing: email submit, generic
-    // sent state, confirm redeem, provider-setup arrival as the session
-    // proof (a failed finish stays on `/auth/magic`).
+    // sent state, confirm redeem, library arrival as the session proof (a
+    // failed finish stays on `/auth/magic`).
     expect(live).toContain('`${baseURL}/login`');
     expect(live).toContain('input[name="email"]');
     expect(live).toContain('check your inbox');
     expect(live).toContain('`${baseURL}/auth/magic?token=');
     expect(live).toContain('sign in with this link');
-    expect(live).toContain("'/onboarding/byop'");
+    expect(live).toContain("'/library'");
     // Skip-green pre-deploy (file-level + in-test guards); the seam-token
     // guard skips locally and fails closed on CI.
     expect(spec).toContain('STAGING_BASE_URL');
@@ -477,7 +489,7 @@ test.describe('returning-user login coverage (static pin)', () => {
 
 // Execute the exact checked-in sanitize blocks: Playwright 1.55 writes
 // test-results/**/error-context.md (ARIA snapshots rendering filled input
-// values, including the BYOP password) and the junit reporter embeds failure
+// values) and the junit reporter embeds failure
 // messages (e.g. toHaveValue Received strings) carrying the same filled
 // secrets. CI uses the junit reporter only and uploads test-results/ alone;
 // the sanitize step deletes error-context.md plus the whole
@@ -946,7 +958,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
     expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
-    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
     const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
@@ -1000,7 +1012,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // pushes would be cancelled before ever deploying. Job-level groups
     // release when the deploy finishes; E2E serializes on e2e-staging.
     expect(deployWorkflow.split('\njobs:\n')[0]!).not.toMatch(/^concurrency:/m);
-    for (const job of ['staging-web', 'staging-api', 'preview-web']) {
+    for (const job of ['staging-web', 'staging-api']) {
       const section = jobSection(deployWorkflow, job);
       expect(section).toMatch(/^    concurrency:\n      group: .+\n      cancel-in-progress: /m);
       expect(section).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
@@ -1008,8 +1020,8 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // staging-api serializes on its own group: one pending job per group,
     // so sharing staging-web's group lets a push's own lanes cancel each
     // other and leaves web and api at different SHAs with no post-deploy
-    // E2E. (preview-web shares the web expression but only runs on PR
-    // events, so it never contends with the push-only lanes.)
+    // E2E. (No per-PR preview lane exists, so nothing else contends with
+    // the push-only lanes.)
     const webGroup = jobSection(deployWorkflow, 'staging-web').match(/^      group: (.+)$/m)![1];
     const apiGroup = jobSection(deployWorkflow, 'staging-api').match(/^      group: (.+)$/m)![1];
     expect(apiGroup).toContain('staging-api');
@@ -1025,7 +1037,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
     for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
       const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
-      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      const calls = [...workflow.matchAll(/uses: [.$]\/\.github\/workflows\/e2e-staging\.yml\b/g)].length;
       expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
     }
   });
@@ -1602,6 +1614,7 @@ staging = "dummy-hyperdrive-staging"
             { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/ingest', zone_name: 'nntune.com' },
           ],
           vars: {
             RP_ID: 'staging.nntune.com',
@@ -1669,23 +1682,26 @@ staging = "dummy-hyperdrive-staging"
   }
 });
 
-test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)', () => {
-  // deploy.yml deploys apps/web plus the one authorized backend lane,
-  // `staging-api` (api Worker, staging only); every further backend lane
-  // (ingest/mb/stream/repair) must extend this guard with its own
-  // allowlist + evidence instead of weakening it. These pins fail on any
-  // new `deploy-api-worker`-style job with `wrangler deploy --env staging`,
-  // anything deploying under workers/ outside `staging-api`, any
-  // production-environment deploy step, or a bare `command: deploy`
-  // (apps/web top-level name equals the production env name, so a bare
-  // deploy targets production).
+test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/ingest staging)', () => {
+  // deploy.yml deploys apps/web plus the three authorized backend lanes,
+  // `staging-api`, `staging-mb` and `staging-ingest` (Worker staging envs
+  // only); every further backend lane (stream/repair/transcode) must extend
+  // this guard with its own allowlist + evidence instead of weakening it.
+  // These pins fail on any new `deploy-api-worker`-style job with
+  // `wrangler deploy --env staging`, anything deploying under workers/
+  // outside the evidenced backend lanes, any production-environment deploy
+  // step, or a bare `command: deploy` (apps/web top-level name equals the
+  // production env name, so a bare deploy targets production).
   const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
 
-  // The one authorized backend lane. Everything outside it stays web-only.
+  // The authorized backend lanes. Everything outside them stays web-only.
   const bodyWithoutJob = (body: string, job: string): string => {
     const section = jobSection(body, job);
     return body.split(section).join('');
   };
+  const BACKEND_LANES = ['staging-api', 'staging-mb', 'staging-ingest'];
+  const bodyWithoutLanes = (body: string, lanes: string[]): string =>
+    lanes.reduce((rest, lane) => bodyWithoutJob(rest, lane), body);
   const codeLines = (text: string): string =>
     text
       .split('\n')
@@ -1697,7 +1713,14 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
   // so weakening a pin breaks the mutant test instead of silently passing.
   const assertJobSet = (body: string) => {
     const names = [...body.matchAll(/^  ([A-Za-z0-9_-]+):$/gm)].map((m) => m[1]!).sort();
-    expect(names).toEqual(['gate', 'post-deploy-e2e', 'preview-web', 'staging-api', 'staging-web']);
+    expect(names).toEqual([
+      'gate',
+      'post-deploy-e2e',
+      'staging-api',
+      'staging-ingest',
+      'staging-mb',
+      'staging-web',
+    ]);
     for (const name of names) {
       expect(name, `job ${name} must not look like a backend deploy lane`).not.toMatch(
         /worker|backend/i,
@@ -1705,12 +1728,22 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     }
   };
 
+  // Each backend lane's working directories: the lane deploys from its own
+  // workers/<lane> checkout, except the ingest lane, which also runs its
+  // Hyperdrive cache-disabled gate from workers/api (the script lives
+  // there; the mb lane needs no such gate, see its lane comment).
+  const LANE_WORKING_DIRS: Record<string, string[]> = {
+    'staging-api': ['workers/api'],
+    'staging-mb': ['workers/mb'],
+    'staging-ingest': ['workers/ingest', 'workers/api'],
+  };
+
   const assertDeployBody = (body: string) => {
-    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(3);
-    expect(body.match(/deploy --env/g) ?? []).toHaveLength(2);
-    // Exact command pin: staging-web deploys to staging, staging-api
-    // deploys the api Worker to staging with the public BUILD_SHA var, and
-    // preview-web runs `preview`. A bare `command: deploy` (no --env)
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(4);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(4);
+    // Exact command pin: staging-web deploys to staging and staging-api
+    // deploys the api Worker to staging with the public BUILD_SHA var —
+    // no `preview` lane exists. A bare `command: deploy` (no --env)
     // deploys the top-level worker name, which equals the production env
     // name — count checks alone miss it, so pin every wrangler-action
     // command value exactly.
@@ -1723,7 +1756,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     ).toEqual([
       'deploy --env staging',
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
-      'preview',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
     ]);
     // Raw-CLI pin: no `run:` step may invoke a wrangler deploy, even split
     // across lines (`wrangler \` + newline + `deploy`), version-pinned
@@ -1733,49 +1767,90 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     // same logical line by `deploy`.
     const flat = body.replace(/\\\r?\n\s*/g, ' ');
     expect(flat).not.toMatch(/\bwrangler\b(?!-action)[^\n]*\bdeploy\b/);
-    // Working directories: apps/web everywhere except the api lane, which
-    // is the only job allowed to touch workers/api.
-    for (const line of bodyWithoutJob(body, 'staging-api').split('\n')) {
+    // Working directories: apps/web everywhere except the backend lanes,
+    // which deploy from their own workers/<lane> checkout (see
+    // LANE_WORKING_DIRS for the ingest lane's shared gate script).
+    for (const line of bodyWithoutLanes(body, BACKEND_LANES).split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
           'apps/web',
         );
       }
     }
-    for (const line of jobSection(body, 'staging-api').split('\n')) {
-      if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
-        expect(line, `api lane deploys from workers/api (${line.trim()})`).toContain(
-          'workers/api',
-        );
+    for (const lane of BACKEND_LANES) {
+      for (const line of jobSection(body, lane).split('\n')) {
+        if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
+          expect(
+            LANE_WORKING_DIRS[lane]!.some((dir) => line.includes(dir)),
+            `${lane} deploys from ${LANE_WORKING_DIRS[lane]!.join(' or ')} (${line.trim()})`,
+          ).toBe(true);
+        }
       }
     }
+    // Staging environment record: all four deploy lanes bind the staging
+    // GitHub Environment (assertStagingEnv pins the exact block), so
+    // push-to-main deployment records land only in `staging`.
+    assertStagingEnv(body, 'staging-web');
+    assertStagingEnv(body, 'staging-api');
+    assertStagingEnv(body, 'staging-mb');
+    assertStagingEnv(body, 'staging-ingest');
   };
 
   const assertNoBackendPath = (body: string) => {
     // Header comments (above `jobs:`) legitimately name workers/ and the
-    // Hyperdrive gate; outside `staging-api` the jobs body itself stays
-    // web-only with no production path. Case-sensitive: the preview job
-    // carries a `Workers preview deployment` comment (no path), which must
-    // keep passing.
+    // Hyperdrive gate; outside the evidenced backend lanes the jobs body
+    // itself stays web-only with no production path. Case-sensitive: a
+    // comment such as
+    // `Workers preview deployment` (no path) must keep passing.
     // Production pin: no job carries the `production` word at all in code
     // (comments stripped) — that covers `--env production`,
     // `--env=production`, `environment: production`, the mapping form
     // (`environment:\n  name: production`), quoted values, and
     // `CLOUDFLARE_ENV: production` — while a harmless full-line comment
-    // mentioning production still passes. The api lane is staging-only, so
-    // the pin applies to its section too.
-    const rest = bodyWithoutJob(body, 'staging-api');
+    // mentioning production still passes. The api and ingest lanes are
+    // staging-only, so the pin applies to their sections too; the mb lane
+    // keeps the production worker name at the top level of its generated
+    // config for parity shape (no production env table is generated), so
+    // that single anchored line is its only allowed `production`.
+    const rest = bodyWithoutLanes(body, BACKEND_LANES);
     expect(rest).not.toContain('workers/');
     expect(codeLines(rest).toLowerCase()).not.toContain('production');
-    expect(codeLines(jobSection(body, 'staging-api')).toLowerCase()).not.toContain('production');
+    for (const lane of ['staging-api', 'staging-ingest']) {
+      expect(
+        codeLines(jobSection(body, lane)).toLowerCase(),
+        `${lane} stays staging-only`,
+      ).not.toContain('production');
+    }
+    const mbCode = codeLines(jobSection(body, 'staging-mb')).toLowerCase();
+    expect(
+      mbCode.split('production').length - 1,
+      'staging-mb names production exactly once (the parity-shape top-level worker name)',
+    ).toBe(1);
+    expect(jobSection(body, 'staging-mb')).toContain('name = "nntune-mb-production"');
+  };
+
+  // All four push-to-main deploy lanes bind the `staging` GitHub Environment
+  // (mapping form, name + url), so deployment records land only in
+  // `staging` — never an unscoped record and never `production`
+  // (assertNoBackendPath still bans that word in code). The anchored
+  // block pin below rejects a renamed, repointed or dropped mapping;
+  // the production-word pin rejects a swapped one.
+  const stagingEnvBlock =
+    '    environment:\n      name: staging\n      url: https://staging.nntune.com\n';
+  const assertStagingEnv = (body: string, job: string) => {
+    expect(
+      jobSection(body, job),
+      `${job} must bind the staging GitHub environment`,
+    ).toContain(stagingEnvBlock);
   };
 
   const assertStagingApi = (body: string) => {
     // Evidence the api staging lane must keep: push-only + token gate,
     // staging-only deploy with the public BUILD_SHA var, the fail-closed
     // Hyperdrive cache-disabled gate (CI-only --allow-skip forbidden), and
-    // no GitHub-environment mapping (which would resolve prod-scoped
-    // secrets and protection rules).
+    // the staging GitHub-environment mapping (staging-scoped by name:
+    // this lane never reads production secrets or protection rules, and
+    // never deploys --env production).
     const section = jobSection(body, 'staging-api');
     expect(section).toContain('needs: [gate]');
     const condition = jobIf(body, 'staging-api');
@@ -1785,7 +1860,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
     expect(section).toContain('check_hyperdrive_cache.sh');
     expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
-    expect(section, 'api lane must not map a GitHub environment').not.toMatch(/^\s*environment:/m);
+    expect(section, 'api lane must bind the staging GitHub environment').toContain(
+      stagingEnvBlock,
+    );
     // Own concurrency group: sharing staging-web's group lets a push's
     // own lanes cancel each other (one pending job per group).
     expect(section).toContain('group: ${{ github.workflow }}-staging-api-${{ github.ref }}');
@@ -1853,32 +1930,138 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     );
   };
 
+  // Evidence the mb staging lane must keep: push-only + token gate, an own
+  // concurrency group, the staging GitHub-environment mapping, staging-only
+  // deploy with the public BUILD_SHA var, the generated parity pin binding
+  // HYPERDRIVE_ID_MB to the committed mb MB_DB staging inventory id, the
+  // generated staging worker name, and Workers Logs observability at full
+  // head sampling (the build_sha evidence is read there). The MB mirror
+  // Hyperdrive config is a shared read mirror and may stay cached, so this
+  // lane carries no cache-disabled gate (unlike the app Hyperdrive lanes).
+  const assertStagingMb = (body: string) => {
+    const section = jobSection(body, 'staging-mb');
+    expect(section).toContain('needs: [gate]');
+    const condition = jobIf(body, 'staging-mb');
+    expect(condition, 'staging-mb must carry a job-level if').toBeDefined();
+    expect(condition).toContain("github.event_name == 'push'");
+    expect(condition).toContain("needs.gate.outputs.enabled == 'true'");
+    expect(section, 'mb lane must bind the staging GitHub environment').toContain(
+      stagingEnvBlock,
+    );
+    expect(section).toContain('group: ${{ github.workflow }}-staging-mb-${{ github.ref }}');
+    // Code-only: the section slice also carries the next lane's header
+    // comment, which names the flag it documents; a real `--allow-skip`
+    // in a run step still trips this pin.
+    expect(
+      codeLines(section),
+      'real deploys must not pass --allow-skip',
+    ).not.toContain('--allow-skip');
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain(
+      'HYPERDRIVE_ID_MB must equal the mb MB_DB staging inventory id',
+    );
+    expect(section).toContain('name = "nntune-mb-staging"');
+    expect(section).toMatch(
+      /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
+    );
+    expect(section).toContain('service = "nntune-alerts-staging"');
+  };
+
+  // Evidence the ingest staging lane must keep: push-only + token gate, an
+  // own concurrency group, the staging GitHub-environment mapping,
+  // staging-only deploy with the public BUILD_SHA var, ordering after
+  // `staging-mb` (its `MB_API` service binding targets `nntune-mb-staging`,
+  // which that lane deploys first), the ingest-specific disabled-by-default
+  // enable gate (INGEST_STAGING_ENABLED, independent of the shared
+  // HYPERDRIVE_ID_STAGING var: the lane must stay operator-disabled until
+  // search intake closes), the mb-deployed gate (ingest must skip, not
+  // fail, when staging-mb did not deploy this run), the generated parity
+  // pin binding
+  // HYPERDRIVE_ID_STAGING to the committed ingest LIBRARY_DB staging
+  // inventory id, the LIVE queue consumer stanza (max_batch_size 10,
+  // max_retries 4, DLQ), the MB_API service binding, Workers Logs
+  // observability at full head sampling, and the staging omissions (no
+  // NNTP_POOL, REPAIR_CONTAINER or TRANSCODE_CONTAINER: targets do not
+  // exist yet, so the generated config must not name them).
+  const assertStagingIngest = (body: string) => {
+    const section = jobSection(body, 'staging-ingest');
+    expect(section).toContain('needs: [gate, staging-mb]');
+    const condition = jobIf(body, 'staging-ingest');
+    expect(condition, 'staging-ingest must carry a job-level if').toBeDefined();
+    expect(condition).toContain("github.event_name == 'push'");
+    expect(condition).toContain("needs.gate.outputs.enabled == 'true'");
+    expect(section, 'ingest lane must bind the staging GitHub environment').toContain(
+      stagingEnvBlock,
+    );
+    expect(section).toContain('group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}');
+    expect(section, 'real deploys must not pass --allow-skip').not.toContain('--allow-skip');
+    expect(section).toContain('command: deploy --env staging --var BUILD_SHA:${{ github.sha }}');
+    expect(section).toContain(
+      'HYPERDRIVE_ID_STAGING must equal the ingest LIBRARY_DB staging inventory id',
+    );
+    expect(section).toContain('[[env.staging.queues.consumers]]');
+    expect(section).toContain('max_batch_size = 10');
+    expect(section).toContain('max_retries = 4');
+    expect(section).toContain('dead_letter_queue = "{dlq}"');
+    expect(section).toContain('binding = "MB_API"');
+    expect(section).toContain('service = "nntune-mb-staging"');
+    expect(section).toMatch(
+      /^[ \t]*\[env\.staging\.observability\]\n[ \t]+enabled = true\n[ \t]+head_sampling_rate = 1\n/m,
+    );
+    expect(section).toContain('service = "nntune-alerts-staging"');
+    // Disabled-by-default enable gate: the deploy path must read the
+    // ingest-specific INGEST_STAGING_ENABLED repo variable and gate on an
+    // enabled output — never on the shared HYPERDRIVE_ID_STAGING var alone,
+    // which the api lane already needs wired.
+    expect(section).toContain('INGEST_STAGING_ENABLED');
+    expect(section).toContain("steps.config.outputs.enabled == 'true'");
+    // MB-deployed gate: with staging-mb skipped (unconfigured), ingest must
+    // skip instead of failing on the missing MB_API service target.
+    expect(section).toContain("needs.staging-mb.outputs.deployed == 'true'");
+    const code = codeLines(section);
+    for (const binding of ['NNTP_POOL', 'REPAIR_CONTAINER', 'TRANSCODE_CONTAINER']) {
+      expect(code, `staging-ingest omits ${binding} until its target exists`).not.toContain(
+        binding,
+      );
+    }
+  };
+
   const assertDeployGuard = (body: string) => {
     assertJobSet(body);
     assertDeployBody(body);
     assertNoBackendPath(body);
     assertStagingApi(body);
+    assertStagingMb(body);
+    assertStagingIngest(body);
   };
 
-  test('job set is exactly the evidenced lanes (web + api staging)', () => {
+  test('job set is exactly the evidenced lanes (web + api/mb/ingest staging)', () => {
     assertJobSet(jobsBody);
   });
 
   test('only the evidenced staging steps run a wrangler deploy', () => {
-    // staging-web deploys apps/web to staging, staging-api deploys the api
-    // Worker to staging with BUILD_SHA, preview-web runs `preview` (not
-    // deploy). Any additional wrangler deploy — action or raw `wrangler
+    // staging-web deploys apps/web to staging and each backend lane deploys
+    // its Worker to staging with BUILD_SHA (no preview lane exists). Any
+    // additional wrangler deploy — action or raw `wrangler
     // deploy` CLI — is a backend-lane candidate until evidenced.
     assertDeployBody(jobsBody);
     expect(jobSection(deployWorkflow, 'staging-web')).toContain('command: deploy --env staging');
   });
 
-  test('no workers/ path or production-environment deploy step outside staging-api', () => {
+  test('no workers/ path or production-environment deploy step outside the evidenced backend lanes', () => {
     assertNoBackendPath(jobsBody);
   });
 
   test('staging-api lane carries BUILD_SHA + hyperdrive gate evidence', () => {
     assertStagingApi(jobsBody);
+  });
+
+  test('staging-mb lane carries BUILD_SHA + parity + observability evidence', () => {
+    assertStagingMb(jobsBody);
+  });
+
+  test('staging-ingest lane carries BUILD_SHA + consumer + MB_API evidence', () => {
+    assertStagingIngest(jobsBody);
   });
 
   test('staging hostname is one source of truth across config, routes and the api lane', () => {
@@ -1974,10 +2157,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '\n  deploy-api-worker:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: workers/api\n    steps:\n      - run: wrangler deploy --env staging\n';
     const workerMutant = `${jobsBody}${workerJob}`;
     const prodMutant = `${jobsBody}\n      - run: wrangler deploy --env production\n`;
-    // Bare `command: deploy` on preview-web: no --env, no `wrangler deploy`
-    // string, no workers/ or production marker — only the exact command pin
-    // catches it, and it would deploy the production worker name.
-    const bareDeployMutant = jobsBody.replace('command: preview', 'command: deploy');
+    // Reintroduced preview lane running a bare `command: deploy`: no --env,
+    // no `wrangler deploy` string, no workers/ or production marker — only
+    // the exact command pin catches it, and it would deploy the production
+    // worker name.
+    const bareDeployMutant =
+      `${jobsBody}\n  preview-web:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3\n        with:\n          command: deploy\n`;
     // Multiline raw-CLI deploy: `wrangler \` + newline + `deploy` evades a
     // contiguous `wrangler deploy` substring check but still deploys.
     const multilineMutant = `${jobsBody}\n      - run: pnpm exec wrangler \\\n        deploy --env staging\n`;
@@ -1994,13 +2179,27 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       '    needs: [gate]\n    if: ${{ github.event_name == ',
       '    needs: [gate]\n    environment:\n      name: production\n    if: ${{ github.event_name == ',
     );
+    // Dropped staging environment mapping on exactly one lane: that lane's
+    // deployment record would land unscoped instead of in `staging`. The
+    // block appears exactly four times (staging-web, staging-api,
+    // staging-mb, staging-ingest); split it so each mutant drops one
+    // lane's copy.
+    const envParts = jobsBody.split(stagingEnvBlock);
+    expect(envParts, 'staging env block must appear exactly four times').toHaveLength(5);
+    const noWebStagingEnvMutant = envParts[0] + envParts.slice(1).join(stagingEnvBlock);
+    const noApiStagingEnvMutant =
+      envParts.slice(0, 2).join(stagingEnvBlock) + envParts.slice(2).join(stagingEnvBlock);
+    const noMbStagingEnvMutant =
+      envParts.slice(0, 3).join(stagingEnvBlock) + envParts.slice(3).join(stagingEnvBlock);
+    const noIngestStagingEnvMutant =
+      envParts.slice(0, 4).join(stagingEnvBlock) + envParts[4];
     // Quoted production environment value.
     const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
     // gate must never pass --allow-skip in a real deploy.
     const allowSkipMutant = jobsBody.replace(
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING" --allow-skip',
     );
     // Api lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
@@ -2017,6 +2216,98 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     const noParityMutant = jobsBody.replace(
       'HYPERDRIVE_ID_STAGING must equal the api staging inventory id',
       'HYPERDRIVE_ID_STAGING looks fine',
+    );
+    // Mb lane without the generated-config parity pin: a mis-set
+    // HYPERDRIVE_ID_MB (e.g. the prod value) deploys staging against the
+    // wrong database with no CI failure.
+    const noMbParityMutant = jobsBody.replace(
+      'HYPERDRIVE_ID_MB must equal the mb MB_DB staging inventory id',
+      'HYPERDRIVE_ID_MB looks fine',
+    );
+    // Ingest lane without the generated-config parity pin: a mis-set
+    // HYPERDRIVE_ID_STAGING deploys staging against the wrong database.
+    const noIngestParityMutant = jobsBody.replace(
+      'HYPERDRIVE_ID_STAGING must equal the ingest LIBRARY_DB staging inventory id',
+      'HYPERDRIVE_ID_STAGING looks fine',
+    );
+    // Mb lane without the public BUILD_SHA var: records would render
+    // "unknown" instead of the deploy SHA.
+    const noMbBuildShaMutant = jobsBody.replace(
+      'workingDirectory: workers/mb\n          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'workingDirectory: workers/mb\n          command: deploy --env staging',
+    );
+    // Ingest lane without the public BUILD_SHA var.
+    const noIngestBuildShaMutant = jobsBody.replace(
+      'workingDirectory: workers/ingest\n          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}',
+      'workingDirectory: workers/ingest\n          command: deploy --env staging',
+    );
+    // Mb lane sharing staging-web's group: a push's own lanes cancel each
+    // other, leaving web and mb at different SHAs.
+    const mbSharedGroupMutant = jobsBody.replace(
+      'group: ${{ github.workflow }}-staging-mb-${{ github.ref }}',
+      'group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}',
+    );
+    // Ingest lane sharing staging-web's group.
+    const ingestSharedGroupMutant = jobsBody.replace(
+      'group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}',
+      'group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}',
+    );
+    // Ingest lane racing ahead of its MB_API target: without the
+    // staging-mb ordering the deploy can fail on the missing service
+    // binding (Cloudflare rejects deploys whose target does not exist).
+    const ingestUnorderedMutant = jobsBody.replace('needs: [gate, staging-mb]', 'needs: [gate]');
+    // Ingest lane whose deploy gates only on the shared HYPERDRIVE_ID_STAGING
+    // var: with the api lane's variable wired, the next main push would
+    // deploy a live consumer before search intake closes. The enable gate
+    // must be ingest-specific and disabled by default.
+    const ingestNoEnableGateMutant = jobsBody.replace(
+      jobSection(jobsBody, 'staging-ingest'),
+      jobSection(jobsBody, 'staging-ingest')
+        .split("steps.config.outputs.enabled == 'true'")
+        .join("steps.config.outputs.configured == 'true'"),
+    );
+    // Ingest lane that deploys whenever its own config is set, even when
+    // staging-mb skipped: the MB_API service target does not exist yet and
+    // the deploy fails instead of skipping with a notice.
+    const ingestNoMbDeployedMutant = jobsBody.replace(
+      " && needs.staging-mb.outputs.deployed == 'true'",
+      '',
+    );
+    // Ingest lane whose generated consumer drops the DLQ: a poisoned job
+    // would burn its retry budget instead of quarantining.
+    const ingestNoDlqMutant = jobsBody.replace(
+      '          dead_letter_queue = "{dlq}"\n',
+      '',
+    );
+    // Mb lane whose generated config renames the top-level worker: the
+    // parity-shape name must stay exact, and the single allowed
+    // `production` must stay exactly one.
+    const mbRenamedMutant = jobsBody.replace(
+      'name = "nntune-mb-production"',
+      'name = "nntune-mb"',
+    );
+    // Ingest lane whose generated config names a missing service target:
+    // NNTP_POOL does not exist yet, so the deploy would fail.
+    const ingestNntpMutant = jobsBody.replace(
+      'binding = "INGEST_SCRATCH"',
+      'binding = "NNTP_POOL"\n          service = "nntune-nntp"\n\n          [[env.staging.r2_buckets]]\n          binding = "INGEST_SCRATCH"',
+    );
+    // Mb lane whose generated config disables observability: the Worker
+    // deploys with observability=null and persists no Workers Logs.
+    // (Section-scoped: the api lane carries the identical block first.)
+    const noMbObservabilityMutant = jobsBody.replace(
+      jobSection(jobsBody, 'staging-mb'),
+      jobSection(jobsBody, 'staging-mb').replace('enabled = true', 'enabled = false'),
+    );
+    // Ingest lane whose generated config zeroes head sampling: the Worker
+    // keeps the block but persists no records, so the build_sha evidence
+    // is unread. (Section-scoped: the api lane carries the line first.)
+    const ingestZeroSamplingMutant = jobsBody.replace(
+      jobSection(jobsBody, 'staging-ingest'),
+      jobSection(jobsBody, 'staging-ingest').replace(
+        'head_sampling_rate = 1',
+        'head_sampling_rate = 0',
+      ),
     );
     // Api lane whose generated config drops the observability block: the
     // Worker deploys with observability=null and persists no Workers Logs.
@@ -2146,10 +2437,28 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       flagFirstMutant,
       envMappingMutant,
       quotedEnvMutant,
+      noWebStagingEnvMutant,
+      noApiStagingEnvMutant,
+      noMbStagingEnvMutant,
+      noIngestStagingEnvMutant,
       allowSkipMutant,
       noBuildShaMutant,
       sharedGroupMutant,
       noParityMutant,
+      noMbParityMutant,
+      noIngestParityMutant,
+      noMbBuildShaMutant,
+      noIngestBuildShaMutant,
+      mbSharedGroupMutant,
+      ingestSharedGroupMutant,
+      ingestUnorderedMutant,
+      ingestNoEnableGateMutant,
+      ingestNoMbDeployedMutant,
+      ingestNoDlqMutant,
+      mbRenamedMutant,
+      ingestNntpMutant,
+      noMbObservabilityMutant,
+      ingestZeroSamplingMutant,
       noObservabilityMutant,
       zeroSamplingMutant,
       droppedSamplingMutant,
@@ -2173,6 +2482,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
       weakenedRegexMutant,
       weakenedExactHostMutant,
     ]) {
+      expect(mutant, 'mutation must change the workflow').not.toBe(jobsBody);
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.
@@ -2187,6 +2497,29 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (api staging only)
     expect(() => assertDeployBody(flagFirstMutant)).toThrow();
     expect(() => assertNoBackendPath(envMappingMutant)).toThrow();
     expect(() => assertNoBackendPath(quotedEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noWebStagingEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noApiStagingEnvMutant)).toThrow();
+    expect(() => assertStagingApi(noApiStagingEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noMbStagingEnvMutant)).toThrow();
+    expect(() => assertStagingMb(noMbStagingEnvMutant)).toThrow();
+    expect(() => assertDeployBody(noIngestStagingEnvMutant)).toThrow();
+    expect(() => assertStagingIngest(noIngestStagingEnvMutant)).toThrow();
+    expect(() => assertStagingMb(noMbParityMutant)).toThrow();
+    expect(() => assertStagingIngest(noIngestParityMutant)).toThrow();
+    expect(() => assertDeployBody(noMbBuildShaMutant)).toThrow();
+    expect(() => assertStagingMb(noMbBuildShaMutant)).toThrow();
+    expect(() => assertDeployBody(noIngestBuildShaMutant)).toThrow();
+    expect(() => assertStagingIngest(noIngestBuildShaMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNoEnableGateMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNoMbDeployedMutant)).toThrow();
+    expect(() => assertStagingMb(mbSharedGroupMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestSharedGroupMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestUnorderedMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNoDlqMutant)).toThrow();
+    expect(() => assertNoBackendPath(mbRenamedMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestNntpMutant)).toThrow();
+    expect(() => assertStagingMb(noMbObservabilityMutant)).toThrow();
+    expect(() => assertStagingIngest(ingestZeroSamplingMutant)).toThrow();
     expect(() => assertStagingApi(allowSkipMutant)).toThrow();
     expect(() => assertStagingApi(noBuildShaMutant)).toThrow();
     expect(() => assertDeployBody(noBuildShaMutant)).toThrow();
@@ -2348,6 +2681,10 @@ test.describe('deployed-build identity wiring (static pin)', () => {
     expect(pkg.scripts['e2e:smoke']).not.toContain('build-identity');
     expect(pkg.scripts['test:unit']).toContain('tests/build-identity.spec.ts');
     expect(pkg.scripts['test:unit']).toContain('tests/zz-build-identity-final.spec.ts');
+    // No checked-in NZB fixtures (TWO-1169): the retired two-track offline
+    // spec is gone, and the provider-budget offline pins run in its place.
+    expect(pkg.scripts['test:unit']).not.toContain('two-track-fixture');
+    expect(pkg.scripts['test:unit']).toContain('tests/provider-budget.spec.ts');
   });
 });
 
@@ -2379,7 +2716,7 @@ function runGateScript(
       env: {
         PATH: process.env.PATH,
         JUNIT_PATH: 'test-results/junit.xml',
-        MAX_ALLOWED_SKIPS: '1',
+        MAX_ALLOWED_SKIPS: '10',
         REQUIRE_QA_AUTH_TOKEN: 'false',
         GITHUB_STEP_SUMMARY: summaryFile,
         ...env,
@@ -2399,8 +2736,8 @@ function runGateScript(
   }
 }
 
-const FIXME_QUEUE =
-  '<testcase classname="player-queue-order.spec.ts" name="player queue advances in library-selection order"><skipped message="fixme"/></testcase>';
+const PARKED_QUEUE =
+  '<testcase classname="player-queue-order.spec.ts" name="player queue advances in library-selection order"><skipped message="parked (user NZB ingest retired)"/></testcase>';
 const FIXME_MBIDS =
   '<testcase classname="ingest-play-meter.spec.ts" name="ingested track carries recording_mbids"><skipped message="fixme"/></testcase>';
 const PASSING = (file: string, name: string) =>
@@ -2433,8 +2770,14 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(stepBlock).toContain('if: always()');
     expect(stepBlock).toContain(`steps.staging.outputs.configured == 'true'`);
     expect(stepBlock).toContain('node scripts/enforce-journey-evidence.mjs');
-    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '1'`);
+    expect(stepBlock).toContain(`MAX_ALLOWED_SKIPS: '11'`);
     expect(stepBlock).toContain(`REQUIRE_QA_AUTH_TOKEN: 'true'`);
+    // The secret-held real-NZB staging leg is retired (CC0-only fixture
+    // rule): no prepare step feeds the gate a mode anymore. The standard
+    // eleven-skip budget (fixme, nine parked legs, capped stream leg)
+    // budgets every staging run.
+    expect(stepBlock).not.toContain('REAL_NZB_MODE');
+    expect(stepBlock).not.toContain('steps.real-nzb');
   });
 
   test('all-skipped evidence fails and reports empty counts', () => {
@@ -2457,7 +2800,7 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
 
   test('only the recording_mbids fixme passes within budget with counts', () => {
     const xml = suiteXml(
-      PASSING('signup-byop.spec.ts', 'signup creates an account') +
+      PASSING('signup.spec.ts', 'signup creates an account') +
         PASSING('player-queue-order.spec.ts', 'player queue advances in library-selection order') +
         FIXME_MBIDS,
     );
@@ -2467,27 +2810,154 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.summary).toContain('PASS');
   });
 
-  test('a queue-order skip is no longer allowed, even within budget', () => {
-    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_QUEUE);
+  test('a parked queue-order skip passes within budget', () => {
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + PARKED_QUEUE);
     const result = runGateScript(xml);
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('outside the allow-list');
-    expect(result.output).toContain('player-queue-order.spec.ts player queue advances');
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 2 | 1 | 1 | 0 |');
+    expect(result.summary).toContain('PASS');
   });
 
-  test('the script default budget is one when MAX_ALLOWED_SKIPS is unset', () => {
-    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + FIXME_MBIDS);
-    const result = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
-    expect(result.status).not.toBe(0);
-    expect(result.output).toContain('above the allow-list budget of 1');
+  // Real-NZB mode (REAL_NZB_MODE=true): dormant since the secret-held
+  // real-NZB staging leg retired under the CC0-only fixture rule — no
+  // workflow sets it. When live, the secret-held RAR set fed no completable
+  // ingest (no RAR read in the pipeline) and hence no streamable track
+  // until RAR read lands, so ingest completion, reload and the
+  // decoded-audio legs skipped by name under a fixed extended allow-list
+  // that budgeted the run instead of MAX_ALLOWED_SKIPS. The provider 430
+  // control is never allow-listed: it must run. The user-NZB legs are
+  // parked in standard mode too (TWO-1635) — the RAR-set entries below
+  // double as their mode-specific reason while the standard entries carry
+  // the retirement reason.
+  const REAL_NZB_SKIP_CASES: Array<[string, string]> = [
+    ['ingest-play-meter.spec.ts', 'NZB fixture ingests and appears in the library'],
+    ['ingest-play-meter.spec.ts', 'ingested library persists across reload without re-import'],
+    ['ingest-play-meter.spec.ts', 'streaming answers byte Ranges with 206 + Content-Range'],
+    ['ingest-play-meter.spec.ts', 'usage meter increases after streaming and shows plan metadata'],
+    ['ingest-play-meter.spec.ts', 'ingested audio actually plays in the browser'],
+    [
+      'ingest-play-meter.spec.ts',
+      'player UI seek moves the active audio position and playback continues',
+    ],
+    ['ingest-play-meter.spec.ts', 'Media Session metadata reflects the playing ingested track'],
+    ['ingest-play-meter.spec.ts', 'over-limit staging account is refused with a plan-limit status'],
+    ['player-queue-order.spec.ts', 'player queue advances in library-selection order'],
+    ['player-queue-order.spec.ts', 'NZB fixture ingests and appears in the library'],
+  ];
+
+  function realNzbXml(): string {
+    return suiteXml(
+      PASSING('signup.spec.ts', 'signup creates an account') +
+        FIXME_MBIDS +
+        REAL_NZB_SKIP_CASES.map(
+          ([file, name]) =>
+            `<testcase classname="${file}" name="${name}"><skipped message="real-NZB RAR set"/></testcase>`,
+        ).join(''),
+    );
+  }
+
+  // TWO-1635 parked legs (user NZB ingest retired): the ten standard-mode
+  // allow-list entries — the same titles as the RAR-set list above, since
+  // the capped-stream leg parks in standard mode too now that the
+  // secret-held real-NZB staging leg is retired (CC0-only fixture rule).
+  const PARKED_SKIP_CASES: Array<[string, string]> = [...REAL_NZB_SKIP_CASES];
+
+  // The ten parked skips plus one duplicate: eleven attributed skips and
+  // one consume-once overflow, for the over-budget proofs below.
+  function parkedSkipsXml(): string {
+    const parked = PARKED_SKIP_CASES.map(
+      ([file, name]) =>
+        `<testcase classname="${file}" name="${name}"><skipped message="parked (user NZB ingest retired)"/></testcase>`,
+    ).join('');
+    const [dupFile, dupName] = PARKED_SKIP_CASES[0]!;
+    return (
+      parked +
+      `<testcase classname="${dupFile}" name="${dupName}"><skipped message="parked (user NZB ingest retired)"/></testcase>`
+    );
+  }
+
+  test('real-NZB mode passes the fixme plus the fixed RAR-set skips', () => {
+    const result = runGateScript(realNzbXml(), { REAL_NZB_MODE: 'true' });
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 12 | 1 | 11 | 0 |');
+    expect(result.summary).toContain('real-NZB mode');
+    expect(result.summary).toContain('PASS');
   });
 
-  test('a third skip still fails above the budget', () => {
+  test('the same RAR-set skips fail in standard mode at a ten-skip budget', () => {
+    // Every title is standard-allow-listed since the capped leg parked,
+    // so only the count budget (harness default 10 < 11 skips) fails it.
+    const result = runGateScript(realNzbXml());
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('above the allow-list budget');
+  });
+
+  test('standard mode passes the parked-leg evidence at the workflow budget of 11', () => {
+    // The retired-real-NZB staging shape: one live journey, the fixme and
+    // the ten parked legs (nine user-track legs plus the capped stream
+    // leg), budgeted by the workflow's MAX_ALLOWED_SKIPS '11'.
+    const result = runGateScript(realNzbXml(), { MAX_ALLOWED_SKIPS: '11' });
+    expect(result.status).toBe(0);
+    expect(result.summary).toContain('| 12 | 1 | 11 | 0 |');
+    expect(result.summary).toContain('standard mode');
+    expect(result.summary).toContain('PASS');
+  });
+
+  test('real-NZB mode still fails an unknown skip', () => {
     const xml = suiteXml(
       PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
-        FIXME_QUEUE +
         FIXME_MBIDS +
-        FIXME_QUEUE.replace('player-queue-order.spec.ts', 'other.spec.ts'),
+        '<testcase classname="scoped-credentials.spec.ts" name="lifecycle mints a session"><skipped message="no token"/></testcase>',
+    );
+    const result = runGateScript(xml, { REAL_NZB_MODE: 'true' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+    expect(result.output).toContain('scoped-credentials.spec.ts lifecycle mints a session');
+  });
+
+  test('real-NZB mode still fails a failure without leaking failure text', () => {
+    const marker = 'SENTINEL-FAILURE-VALUE-REAL-NZB';
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') +
+        `<testcase classname="ingest-play-meter.spec.ts" name="NZB fixture ingests and appears in the library"><failure message="boom">${marker} in failure text</failure></testcase>`,
+    );
+    const result = runGateScript(xml, { REAL_NZB_MODE: 'true' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('failing test(s)');
+    expect(result.output).not.toContain(marker);
+    expect(result.summary).not.toContain(marker);
+  });
+
+  test('a duplicated RAR-set allowance fails even in real-NZB mode', () => {
+    const [file, name] = REAL_NZB_SKIP_CASES[REAL_NZB_SKIP_CASES.length - 1]!;
+    const dup =
+      `<testcase classname="${file}" name="${name}"><skipped message="real-NZB RAR set"/></testcase>` +
+      `<testcase classname="${file}" name="${name}"><skipped message="real-NZB RAR set"/></testcase>`;
+    const xml = suiteXml(PASSING('health.spec.ts', 'GET /api/health reports ok:true') + dup);
+    const result = runGateScript(xml, { REAL_NZB_MODE: 'true' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('outside the allow-list');
+  });
+
+  test('the script default budget is eleven when MAX_ALLOWED_SKIPS is unset', () => {
+    // The full standard evidence (fixme plus the ten parked legs) passes
+    // at the script default, and the same evidence fails the budget when
+    // the caller pins it to ten — pinning the default at eleven.
+    const parkedOnly = PARKED_SKIP_CASES.map(
+      ([file, name]) =>
+        `<testcase classname="${file}" name="${name}"><skipped message="parked (user NZB ingest retired)"/></testcase>`,
+    ).join('');
+    const xml = suiteXml(PASSING('health.spec.ts', 'passing journey') + FIXME_MBIDS + parkedOnly);
+    const atDefault = runGateScript(xml, { MAX_ALLOWED_SKIPS: undefined });
+    expect(atDefault.status).toBe(0);
+    const atTen = runGateScript(xml, { MAX_ALLOWED_SKIPS: '10' });
+    expect(atTen.status).not.toBe(0);
+    expect(atTen.output).toContain('above the allow-list budget of 10');
+  });
+
+  test('skips above the budget still fail', () => {
+    const xml = suiteXml(
+      PASSING('health.spec.ts', 'GET /api/health reports ok:true') + FIXME_MBIDS + parkedSkipsXml(),
     );
     const result = runGateScript(xml);
     expect(result.status).not.toBe(0);
@@ -2542,8 +3012,15 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
   });
 
   test('allow-list reasons name the owning specs', () => {
-    expect(gateScriptSource).not.toContain('player-queue-order');
+    // Standard mode still budgets only the recording_mbids fixme: the
+    // queue-order entry below lives in the real-NZB-only list, which is
+    // inert unless REAL_NZB_MODE=true. The retired two-track wiring must not
+    // reappear in the gate (TWO-1169 deleted every checked-in NZB).
     expect(gateScriptSource).toContain('ingest-play-meter');
+    expect(gateScriptSource).toContain('REAL_NZB_ALLOWED_SKIPS');
+    expect(gateScriptSource).toContain('REAL_NZB_MODE');
+    expect(gateScriptSource).toContain('player-queue-order');
+    expect(gateScriptSource).not.toContain('two-track-fixture');
     expect(gateScriptSource).toContain('reason');
   });
 
@@ -2650,6 +3127,75 @@ test.describe('journey evidence gate (all-skipped must fail)', () => {
     expect(result.output).toContain('could not parse');
   });
 
+});
+
+test.describe('staging real-NZB leg retired (static pin)', () => {
+  // There are no checked-in NZB fixtures (TWO-1169 deleted them all), and
+  // the secret-held real-NZB staging leg is retired under the CC0-only
+  // fixture rule (docs/fixture-audio-licences.md): no workflow rebuilds,
+  // stages or ingests an NZB, and no workflow references the retired NZB
+  // secrets, so deleting those secrets cannot fail a check. The parked
+  // legs skip by name under TWO-1635 until admin ingest can seed a
+  // curated track on staging. These pins keep the retirement honest
+  // offline: re-adding the leg (or either secret) reds here first.
+  const section = jobSection(stagingWorkflow, 'e2e');
+
+  test('the e2e job stages no NZB and reads no NZB secrets', () => {
+    expect(section).not.toContain('Prepare staging real-NZB fixture');
+    expect(section).not.toContain('id: real-nzb');
+    expect(section).not.toContain('NNTUNE_TEST_NZB_XZ_B64');
+    expect(section).not.toContain('prepare-real-nzb.mjs');
+    expect(section).not.toContain('TEST_NZB_PATH');
+    expect(section).not.toContain('steps.real-nzb');
+  });
+
+  test('the called workflow declares no NZB secrets', () => {
+    expect(stagingWorkflow).not.toContain('secrets.NNTUNE_TEST_NZB_XZ_B64');
+  });
+
+  test('journey keeps the provider budget without the staged path or mode', () => {
+    expect(section).not.toContain('REAL_NZB_MODE:');
+    // Shared account with production: the run-wide provider connection cap
+    // (default 2, hard max 10 — see e2e/helpers/provider-budget.ts).
+    expect(section).toContain(`E2E_NNTP_MAX_CONNECTIONS: '2'`);
+  });
+
+  test('provider 430 control constrains itself to one connection with fail-fast 502', () => {
+    const control = readFileSync(
+      new URL('./provider-430-control.spec.ts', import.meta.url),
+      'utf8',
+    );
+    // One direct connection, no retries (file-level retries: 0), socket
+    // closed in a finally, 502 fails fast with no retry loop.
+    expect(control).toContain('test.describe.configure({ retries: 0 })');
+    expect(control).toMatch(/finally[\s\S]*socket\.destroy\(\)/);
+    expect(control).toContain('failing fast with no retry');
+    expect(control).toContain('peakConnections');
+    expect(control).toContain('bytesFetched');
+    expect(control).toContain('E2E_NNTP_MAX_CONNECTIONS');
+  });
+
+  test('deploy passes no NZB secrets to the called workflow', () => {
+    const deploySection = jobSection(deployWorkflow, 'post-deploy-e2e');
+    expect(deploySection).not.toContain('NNTUNE_TEST_NZB_XZ_B64');
+    expect(deployWorkflow).not.toContain('secrets.NNTUNE_TEST_NZB_XZ_B64');
+  });
+
+  test('ci carries the tracked-NZB guard and gates ci-ok on it', () => {
+    // No checked-in NZB fixtures anywhere (TWO-1169): the guard fails closed
+    // on any tracked *.nzb and the required ci-ok aggregate depends on it.
+    // The match is case-insensitive: an uppercase `.NZB` spelling bypasses a
+    // lowercase-only `git ls-files '*.nzb'` pathspec, so the guard must filter
+    // every tracked path instead.
+    const guardAt = ciWorkflow.indexOf('  nzb-guard:\n');
+    expect(guardAt, 'ci.yml must carry the nzb-guard job').toBeGreaterThan(-1);
+    const guard = ciWorkflow.slice(guardAt, guardAt + 2000);
+    expect(guard).toContain("grep -i '\\.nzb$'");
+    expect(guard).not.toContain("git ls-files '*.nzb'");
+    const ciOkAt = ciWorkflow.indexOf('  ci-ok:\n');
+    expect(ciOkAt, 'ci.yml must carry the ci-ok aggregate').toBeGreaterThan(-1);
+    expect(ciWorkflow.slice(ciOkAt, ciOkAt + 1500)).toContain('nzb-guard');
+  });
 });
 
 // mb-import postgres parity: the integration job's service image must stay

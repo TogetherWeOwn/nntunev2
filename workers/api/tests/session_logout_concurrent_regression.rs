@@ -60,7 +60,6 @@ struct FakeStore {
     magic: RefCell<HashMap<String, auth::MagicLinkRecord>>,
     invites: RefCell<HashMap<String, auth::InviteRecord>>,
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
-    vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     audits: RefCell<Vec<vault::AuditEvent>>,
     rate_limit_slots: RefCell<HashMap<(String, String, u32), u64>>,
     /// When true, `session_by_id` serves the pre-revoke snapshot (revoked
@@ -211,24 +210,6 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn acquire_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-        _lease_secs: u64,
-        _max_concurrency: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        Ok(true)
-    }
-
-    async fn release_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-    ) -> Result<(), handlers::StoreError> {
-        Ok(())
-    }
-
     async fn invite_by_hash(
         &self,
         code_hash: &str,
@@ -309,37 +290,8 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        Ok(self.vaults.borrow().get(user_id).cloned())
-    }
-
-    async fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        self.vaults
-            .borrow_mut()
-            .insert(user_id.to_string(), row.clone());
-        Ok(())
-    }
-
-    async fn delete_vault(&self, user_id: &str) -> Result<(), handlers::StoreError> {
-        self.vaults.borrow_mut().remove(user_id);
-        Ok(())
-    }
-
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
-        self.audits.borrow_mut().push(vault::AuditEvent {
-            user_id: event.user_id.clone(),
-            action: event.action.clone(),
-            ok: event.ok,
-            source_ip: event.source_ip.clone(),
-            at: event.at,
-        });
+        self.audits.borrow_mut().push(event.clone());
         Ok(())
     }
 }
@@ -427,6 +379,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -437,6 +390,7 @@ impl Harness {
             cookie,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: b"{}".to_vec(),
         };
         block_on(handlers::handle(&self.ctx(), &request))

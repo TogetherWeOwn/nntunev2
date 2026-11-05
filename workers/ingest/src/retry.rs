@@ -1,6 +1,8 @@
 //! Queue retry budget + DLQ quarantine for poison messages.
 //!
-//! One poison NZB must never wedge `nntune-ingest-jobs` forever. Every
+//! One poison NZB must never wedge the ingest queue forever (per-environment
+//! queues in `wrangler.toml`; the legacy single-name consts below are pinned
+//! by unit tests and are not the deploy contract). Every
 //! delivery settles **per message** (ack on success, delayed retry while
 //! budget remains, DLQ quarantine on exhaustion), so a failing job ahead of
 //! valid ones costs retries, never head-of-line blocking.
@@ -10,7 +12,7 @@
 //!   [`crate::jobs::can_retry`]. The 1-based attempt in `INGEST_STATE` is
 //!   authoritative; Cloudflare redelivers the Queue body unchanged.
 //! - [`CONSUMER_MAX_RETRIES`] (4): `[[queues.consumers]] max_retries` in
-//!   `wrangler.toml.example` — the native redelivery slots.
+//!   `wrangler.toml` — the native redelivery slots.
 //! - [`crate::dispatch::PAYLOAD_RETRY_ATTEMPTS`] (4): payload-fetch retries,
 //!   so every redelivery has a KV-read slot.
 //!
@@ -40,12 +42,17 @@ use crate::newznab::redact_api_key;
 use crate::queue::QueueMsg;
 
 /// Queue binding the consumer uses to send quarantine entries (see
-/// `[[queues.producers]]` in `wrangler.toml.example`).
+/// `[[queues.producers]]` in `wrangler.toml`).
 pub const DLQ_QUEUE_BINDING: &str = "INGEST_DLQ";
-/// Quarantine queue: exhausted and permanently-failed messages land here.
+/// Legacy single-name quarantine identity, pinned by unit tests (see the
+/// `DLQ_QUEUE_NAME` assertion in `src/retry.rs` tests): it is NOT the deploy
+/// contract. The real per-environment DLQ names live in
+/// `[[queues.producers]]` in `wrangler.toml` (`nntunev2-ingest-dlq-staging` /
+/// `nntunev2-ingest-dlq-prod`); job code that must name a queue is out of scope
+/// for the staging-lane card and keeps using this const.
 pub const DLQ_QUEUE_NAME: &str = "nntune-ingest-dlq";
 /// Native consumer redeliveries per message. Must equal `[[queues.consumers]]
-/// max_retries` in `wrangler.toml.example` and `MAX_ATTEMPTS - 1`, so the
+/// max_retries` in `wrangler.toml` and `MAX_ATTEMPTS - 1`, so the
 /// job-level budget and the Queue-level slots describe the same 1 + 4
 /// deliveries.
 pub const CONSUMER_MAX_RETRIES: u32 = 4;

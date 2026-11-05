@@ -5,10 +5,10 @@
 //! Defect being pinned (in the Worker entry's body read): a body-stream
 //! setup error currently falls through as an empty body and a chunk error
 //! breaks the read loop, dispatching whatever partial bytes arrived. An
-//! empty body is *meaningful* downstream (stored-credential vault testing
-//! dials the saved provider for an empty `POST /v1/vault/test` body), so a
-//! swallowed transport failure can invoke the handler, store writes, the
-//! mailer, or the vault dialer on input the client never successfully sent.
+//! empty body is *meaningful* downstream (bodyless session routes act on
+//! the cookie alone), so a swallowed transport failure can invoke the
+//! handler, store writes, the mailer, or the dialer on input the client
+//! never successfully sent.
 //! No production failure or exploit is claimed; the static control flow is
 //! the defect.
 //!
@@ -69,7 +69,7 @@
 //! ///   or unparsable). `Some(len) if len > MAX` is `Oversized` and the
 //! ///   stream must not be polled at all.
 //! /// - `Bodyless` is `Complete(vec![])`; an empty stream is too (an
-//! ///   explicitly sent empty body stays valid vault-test input).
+//! ///   explicitly sent empty body stays valid input).
 //! /// - `SetupFailed` is `TransportFailure`.
 //! /// - Any chunk `Err` is `TransportFailure`, however many valid bytes
 //! ///   (even a complete valid JSON document) arrived before it. Partial
@@ -306,8 +306,8 @@ fn explicitly_empty_stream_is_complete_empty() {
     assert_eq!(
         collect(Some(0), BodySource::Stream(stream)),
         CollectedBody::Complete(Vec::new()),
-        "an explicitly sent empty body stays valid (stored-credential \
-         vault test dispatches on empty input)"
+        "an explicitly sent empty body stays valid (session routes \
+         dispatch on empty input)"
     );
 }
 
@@ -414,6 +414,7 @@ fn template_request(method: &str, path: &str) -> handlers::Request {
         cookie: None,
         origin: Some(ORIGIN.to_string()),
         authorization: None,
+        stripe_signature: None,
         body: TEMPLATE_BODY.to_vec(),
     }
 }
@@ -424,7 +425,7 @@ fn transport_failure_never_invokes_the_handler() {
     let seen = Rc::clone(&calls);
     let response = block_on(dispatch_collected(
         CollectedBody::TransportFailure,
-        template_request("POST", "/v1/vault/test"),
+        template_request("POST", "/v1/session/revoke-all"),
         move |_req| {
             seen.set(seen.get() + 1);
             async {
@@ -433,6 +434,7 @@ fn transport_failure_never_invokes_the_handler() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -452,7 +454,7 @@ fn oversized_never_invokes_the_handler() {
     let seen = Rc::clone(&calls);
     let response = block_on(dispatch_collected(
         CollectedBody::Oversized,
-        template_request("PUT", "/v1/vault"),
+        template_request("POST", "/v1/session/refresh"),
         move |_req| {
             seen.set(seen.get() + 1);
             async {
@@ -461,6 +463,7 @@ fn oversized_never_invokes_the_handler() {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -490,6 +493,7 @@ fn complete_invokes_the_handler_once_with_exactly_the_collected_bytes() {
                     body: "from-handler".to_string(),
                     set_cookie: Some("cookie".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -515,7 +519,7 @@ fn complete_empty_invokes_the_handler_with_an_empty_body() {
     let seen = Rc::clone(&bodies);
     let response = block_on(dispatch_collected(
         CollectedBody::Complete(Vec::new()),
-        template_request("POST", "/v1/vault/test"),
+        template_request("POST", "/v1/session/revoke-all"),
         move |req| {
             seen.borrow_mut().push(req.body.clone());
             async {
@@ -524,6 +528,7 @@ fn complete_empty_invokes_the_handler_with_an_empty_body() {
                     body: "ok".to_string(),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -543,9 +548,7 @@ struct CountingStore {
     calls: Cell<usize>,
     users: RefCell<HashMap<String, handlers::UserRecord>>, // by email
     sessions: RefCell<HashMap<String, session::SessionRecord>>,
-    vaults: RefCell<HashMap<String, handlers::VaultRow>>,
     magic_inserts: Cell<usize>,
-    vault_upserts: Cell<usize>,
     audits: RefCell<Vec<String>>,
 }
 
@@ -652,24 +655,6 @@ impl handlers::Store for CountingStore {
         self.bump();
         Ok(())
     }
-    async fn acquire_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-        _lease_secs: u64,
-        _max_concurrency: u32,
-    ) -> Result<bool, handlers::StoreError> {
-        self.bump();
-        Ok(true)
-    }
-    async fn release_test_connection_lease(
-        &self,
-        _user_id: &str,
-        _token: &str,
-    ) -> Result<(), handlers::StoreError> {
-        self.bump();
-        Ok(())
-    }
     async fn invite_by_hash(
         &self,
         _code_hash: &str,
@@ -710,30 +695,6 @@ impl handlers::Store for CountingStore {
     }
     async fn revoke_all_sessions(&self, _user_id: &str) -> Result<(), handlers::StoreError> {
         self.bump();
-        Ok(())
-    }
-    async fn vault_by_user(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<handlers::VaultRow>, handlers::StoreError> {
-        self.bump();
-        Ok(self.vaults.borrow().get(user_id).cloned())
-    }
-    async fn upsert_vault(
-        &self,
-        user_id: &str,
-        row: &handlers::VaultRow,
-    ) -> Result<(), handlers::StoreError> {
-        self.bump();
-        self.vault_upserts.set(self.vault_upserts.get() + 1);
-        self.vaults
-            .borrow_mut()
-            .insert(user_id.to_string(), row.clone());
-        Ok(())
-    }
-    async fn delete_vault(&self, user_id: &str) -> Result<(), handlers::StoreError> {
-        self.bump();
-        self.vaults.borrow_mut().remove(user_id);
         Ok(())
     }
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
@@ -834,6 +795,7 @@ impl Harness {
             dns: &self.dns,
             now: NOW,
             source_ip: SOURCE_IP.to_string(),
+            stripe: &nntune_api::stripe::NoStripeTransport,
         }
     }
 
@@ -853,6 +815,7 @@ impl Harness {
             cookie,
             origin: Some(ORIGIN.to_string()),
             authorization: None,
+            stripe_signature: None,
             body: TEMPLATE_BODY.to_vec(),
         };
         let ctx = self.ctx();
@@ -888,31 +851,6 @@ impl Harness {
         );
         format!("{}={}", session::COOKIE_NAME, token)
     }
-
-    fn seed_stored_vault(&self, user_id: &str) {
-        let plaintext = serde_json::json!({
-            "provider": {
-                "host": PUBLIC_HOST,
-                "port": 563,
-                "tls": true,
-                "username": "synthetic-user",
-                "password": "synthetic-pass",
-                "max_connections": 4
-            },
-            "indexer": null
-        })
-        .to_string();
-        let blob = vault::encrypt_vault(&[7u8; 32], 1, user_id, plaintext.as_bytes())
-            .expect("encrypt synthetic vault");
-        self.store.vaults.borrow_mut().insert(
-            user_id.to_string(),
-            handlers::VaultRow {
-                blob,
-                indexer_configured: false,
-                updated_at: NOW,
-            },
-        );
-    }
 }
 
 // --- End-to-end: failures dispatch nothing ----------------------------------------
@@ -947,67 +885,53 @@ fn e2e_chunk_error_after_valid_json_prefix_dispatches_nothing() {
 }
 
 #[test]
-fn e2e_setup_failure_on_vault_test_dispatches_nothing_and_never_dials() {
-    // The stored-credential danger case: today a setup failure dispatches
-    // an empty body, and empty input tells vault-test to dial the SAVED
-    // provider. With a seeded session + stored vault, only the gate stands
-    // between a dead stream and an outbound dial.
+fn e2e_setup_failure_on_revoke_all_dispatches_nothing() {
+    // A dead stream on an authenticated, state-changing route must stop at
+    // the gate: no session lookup, no sweep, no audit row.
     let harness = harness();
-    let cookie = harness.seed_session("vault-user");
-    harness.seed_stored_vault("vault-user");
+    let cookie = harness.seed_session("session-user");
     harness.store.reset_calls();
 
     let response = harness.dispatch(
         "POST",
-        "/v1/vault/test",
+        "/v1/session/revoke-all",
         Some(cookie),
         None,
         BodySource::SetupFailed,
     );
     assert_eq!(response.status, REJECT_STATUS);
     assert_eq!(response.body, REJECT_BODY);
-    harness.assert_no_side_effects("setup failure on vault test");
-    assert_eq!(harness.store.audits_with("vault.test"), 0);
+    harness.assert_no_side_effects("setup failure on revoke-all");
+    assert_eq!(harness.store.audits_with("session.revoke_all"), 0);
 }
 
 #[test]
-fn e2e_chunk_error_on_vault_put_stores_nothing() {
+fn e2e_chunk_error_on_authenticated_post_dispatches_nothing() {
     let harness = harness();
-    let cookie = harness.seed_session("vault-user");
+    let cookie = harness.seed_session("session-user");
     harness.store.reset_calls();
-    let candidate = serde_json::json!({
-        "provider": {
-            "host": PUBLIC_HOST, "port": 563, "tls": true,
-            "username": "synthetic-user", "password": "synthetic-pass",
-            "max_connections": 4
-        },
-        "indexer": null
-    })
-    .to_string();
-    let (stream, _polls) = FakeStream::new(vec![Step::Chunk(candidate.into_bytes()), Step::Fail]);
+    let (stream, _polls) = FakeStream::new(vec![Step::Chunk(b"{}".to_vec()), Step::Fail]);
     let response = harness.dispatch(
-        "PUT",
-        "/v1/vault",
+        "POST",
+        "/v1/session/refresh",
         Some(cookie),
         None,
         BodySource::Stream(stream),
     );
     assert_eq!(response.status, REJECT_STATUS);
     assert_eq!(response.body, REJECT_BODY);
-    harness.assert_no_side_effects("chunk error on vault put");
-    assert_eq!(harness.store.vault_upserts.get(), 0);
-    assert!(harness.store.vaults.borrow().is_empty());
+    harness.assert_no_side_effects("chunk error on authenticated post");
 }
 
 #[test]
 fn e2e_declared_oversized_dispatches_nothing() {
     let harness = harness();
-    let cookie = harness.seed_session("vault-user");
+    let cookie = harness.seed_session("session-user");
     harness.store.reset_calls();
     let (stream, polls) = FakeStream::of_chunks(vec![b"never read"]);
     let response = harness.dispatch(
-        "PUT",
-        "/v1/vault",
+        "POST",
+        "/v1/session/refresh",
         Some(cookie),
         Some(MAX + 1),
         BodySource::Stream(stream),
@@ -1021,12 +945,12 @@ fn e2e_declared_oversized_dispatches_nothing() {
 #[test]
 fn e2e_chunked_oversized_dispatches_nothing() {
     let harness = harness();
-    let cookie = harness.seed_session("vault-user");
+    let cookie = harness.seed_session("session-user");
     harness.store.reset_calls();
     let (stream, _polls) = FakeStream::repeating(8192, 64);
     let response = harness.dispatch(
-        "PUT",
-        "/v1/vault",
+        "POST",
+        "/v1/session/refresh",
         Some(cookie),
         None,
         BodySource::Stream(stream),
@@ -1034,7 +958,6 @@ fn e2e_chunked_oversized_dispatches_nothing() {
     assert_eq!(response.status, REJECT_STATUS);
     assert_eq!(response.body, REJECT_BODY);
     harness.assert_no_side_effects("chunked oversized");
-    assert!(harness.store.vaults.borrow().is_empty());
 }
 
 // --- End-to-end: legitimate traffic still dispatches -------------------------------
@@ -1080,66 +1003,44 @@ fn e2e_bodyless_get_healthz_still_dispatches() {
 }
 
 #[test]
-fn e2e_bodyless_authenticated_get_still_dispatches() {
-    let harness = harness();
-    let cookie = harness.seed_session("vault-user");
-    harness.seed_stored_vault("vault-user");
-    harness.store.reset_calls();
-    let response = harness.dispatch("GET", "/v1/vault", Some(cookie), None, BodySource::Bodyless);
-    assert_eq!(response.status, 200, "{}", response.body);
-    assert!(
-        response.body.contains(r#""provider_configured":true"#),
-        "bodyless GET reaches the handler: {}",
-        response.body
-    );
-    assert!(harness.store.calls.get() > 0, "session lookup happened");
-}
-
-#[test]
-fn e2e_explicitly_empty_vault_test_still_dials_the_stored_credential() {
-    // Positive control for the danger case above: a genuinely empty body
-    // (stream present, zero bytes) keeps its documented meaning — test the
-    // stored credential — and DOES dial. Only transport failures change.
-    let harness = harness();
-    let cookie = harness.seed_session("vault-user");
-    harness.seed_stored_vault("vault-user");
-    harness.store.reset_calls();
-    let (stream, _polls) = FakeStream::new(Vec::new());
-    let response = harness.dispatch(
-        "POST",
-        "/v1/vault/test",
-        Some(cookie),
-        Some(0),
-        BodySource::Stream(stream),
-    );
-    assert_eq!(response.status, 200, "{}", response.body);
-    assert!(
-        response.body.contains(r#""ok":true"#),
-        "empty-body stored-credential test still works: {}",
-        response.body
-    );
-    assert_eq!(harness.dialer.probes.get(), 1);
-    assert_eq!(harness.store.audits_with("vault.test"), 1);
-}
-
-#[test]
-fn e2e_bodyless_post_vault_test_still_dispatches() {
+fn e2e_bodyless_authenticated_post_still_dispatches() {
     // A POST sent with no body at all (no stream on the edge request) is
-    // likewise legitimate empty input for the stored-credential test.
+    // legitimate input for cookie-only session routes.
     let harness = harness();
-    let cookie = harness.seed_session("vault-user");
-    harness.seed_stored_vault("vault-user");
+    let cookie = harness.seed_session("session-user");
     harness.store.reset_calls();
     let response = harness.dispatch(
         "POST",
-        "/v1/vault/test",
+        "/v1/session/revoke-all",
         Some(cookie),
         None,
         BodySource::Bodyless,
     );
     assert_eq!(response.status, 200, "{}", response.body);
-    assert!(response.body.contains(r#""ok":true"#), "{}", response.body);
-    assert_eq!(harness.dialer.probes.get(), 1);
+    assert_eq!(response.body, r#"{"ok":true}"#);
+    assert!(harness.store.calls.get() > 0, "session lookup happened");
+    assert_eq!(harness.store.audits_with("session.revoke_all"), 1);
+}
+
+#[test]
+fn e2e_explicitly_empty_stream_still_dispatches() {
+    // Positive control: a genuinely empty body (stream present, zero
+    // bytes) keeps its meaning and DOES dispatch. Only transport failures
+    // change.
+    let harness = harness();
+    let cookie = harness.seed_session("session-user");
+    harness.store.reset_calls();
+    let (stream, _polls) = FakeStream::new(Vec::new());
+    let response = harness.dispatch(
+        "POST",
+        "/v1/session/revoke-all",
+        Some(cookie),
+        Some(0),
+        BodySource::Stream(stream),
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.body, r#"{"ok":true}"#);
+    assert_eq!(harness.store.audits_with("session.revoke_all"), 1);
 }
 
 // --- Wiring pin ----------------------------------------------------------------------
@@ -1168,8 +1069,13 @@ fn worker_entry_dispatch_uses_the_tested_collection_and_gate() {
         .expect("worker dispatch entry exists");
     let dispatch_code = &code[dispatch_at..];
     assert!(
-        dispatch_code.contains("collect_body("),
-        "Worker dispatch must collect through the tested collect_body seam"
+        dispatch_code.contains("collect_body_with_cap("),
+        "Worker dispatch must collect through the tested collection seam"
+    );
+    assert!(
+        dispatch_code.contains("handlers::max_body_bytes("),
+        "Worker dispatch must pass the per-route bound (not a literal cap) \
+         so collection cannot drift from the in-handler gate"
     );
     assert!(
         dispatch_code.contains("dispatch_collected("),

@@ -1,7 +1,7 @@
 //! Enqueue-time dispatch: build [`QueueMsg`] values with user-bound idempotency.
 //!
 //! Routes validate the contract, then call the builders here and `send` the
-//! result to the `INGEST_QUEUE` binding (see `wrangler.toml.example`). The
+//! result to the `INGEST_QUEUE` binding (see `wrangler.toml`). The
 //! builders are pure so the idempotency story — same user + same content +
 //! same source ref converges on one job — is unit-tested, not mocked.
 //!
@@ -16,11 +16,14 @@ use crate::nzb_intake::estimate_nzb;
 use crate::queue::{validate_indexer_ref, QueueMsg};
 
 /// Queue binding name: must match `[[queues.producers]]` in
-/// `wrangler.toml.example`.
+/// `wrangler.toml`.
 pub const INGEST_QUEUE_BINDING: &str = "INGEST_QUEUE";
-/// Queue name: must match `[[queues.producers]]` in `wrangler.toml.example`.
-/// (The consumer entry stays commented out until all runtime boundaries are
-/// executable; see `src/queue_consumer.rs` and `wrangler.toml.example`.)
+/// Legacy single-name queue identity, pinned by unit tests (see the
+/// `INGEST_QUEUE_NAME` assertion in `src/dispatch.rs` tests): it is NOT the
+/// deploy contract. The real per-environment queue names live in
+/// `[[queues.producers]]` in `wrangler.toml` (`nntunev2-ingest-staging` /
+/// `nntunev2-ingest-prod`); job code that must name a queue is out of scope
+/// for the staging-lane card and keeps using this const.
 pub const INGEST_QUEUE_NAME: &str = "nntune-ingest-jobs";
 /// KV binding holding uploaded NZB bytes keyed by [`payload_ref`](QueueMsg::payload_ref).
 pub const PAYLOAD_KV_BINDING: &str = "INGEST_PAYLOADS";
@@ -40,7 +43,7 @@ pub const PAYLOAD_TTL_SECS: u64 = 30 * 24 * 3_600;
 pub const PAYLOAD_KV_READ_LAG_MS: u64 = 60_000;
 
 /// Payload-fetch retries the consumer may spend: must match
-/// `[[queues.consumers]] max_retries` in `wrangler.toml.example` (and
+/// `[[queues.consumers]] max_retries` in `wrangler.toml` (and
 /// `jobs::MAX_ATTEMPTS - 1` redeliveries) so every retry has a slot.
 pub const PAYLOAD_RETRY_ATTEMPTS: u32 = 4;
 

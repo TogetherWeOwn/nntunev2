@@ -67,6 +67,9 @@ on:
         required: false
       SYNTHETIC_NNTP_PASS:
         required: false
+      # No NZB fixture secrets: the secret-held real-NZB staging leg is
+      # retired under the CC0-only fixture rule
+      # (docs/fixture-audio-licences.md) — staging ingests no NZB.
   workflow_dispatch:
   schedule:
     # Synthetic monitor cadence (off-minute to avoid thundering herd).
@@ -193,10 +196,10 @@ jobs:
         run: |
           set -euo pipefail
           # Playwright 1.55 writes test-results/**/error-context.md on any failed
-          # page test — an ARIA snapshot rendering filled input values, including
-          # the BYOP password — and the junit reporter embeds failure messages
-          # (e.g. toHaveValue Received strings) that can carry the same filled
-          # secrets. Belt-and-braces: delete error-context.md AND the whole
+          # page test — an ARIA snapshot rendering filled input values — and
+          # the junit reporter embeds failure messages (e.g. toHaveValue
+          # Received strings) that can carry the same filled secrets.
+          # Belt-and-braces: delete error-context.md AND the whole
           # playwright-report/ dir, then scrub secret values from every remaining
           # file under test-results/ (junit.xml) so the uploaded artifact can
           # never carry secrets. Only test-results/ (junit) is uploaded below.
@@ -282,7 +285,7 @@ jobs:
   # through the deploy.yml caller, a skipped/failed deploy — from
   # producing a full-journey PASS.
   e2e:
-    name: full journey (signup → byop → ingest → meter → limits)
+    name: full journey (signup → library → meter → limits)
     needs: [synthetic]
     if: ${{ inputs.post_deploy }}
     runs-on: ubuntu-latest
@@ -332,6 +335,16 @@ jobs:
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
+      # No NZB is staged for this run: the secret-held real-NZB leg is
+      # retired under the CC0-only fixture rule
+      # (docs/fixture-audio-licences.md) and user NZB ingest itself is
+      # retired (TWO-1630), so every leg that needed an uploaded track —
+      # including the capped stream leg, which needs a pre-seeded
+      # streamable track — skips by name under TWO-1635 and reseeds when
+      # admin ingest can seed a curated track on staging. Live legs are
+      # signup, library arrival, returning-user login and the provider
+      # 430 control; the gate below budgets the parked skips.
+
       - name: Run full journey
         if: steps.staging.outputs.configured == 'true'
         working-directory: e2e
@@ -345,6 +358,10 @@ jobs:
           SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
           SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
           SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+          # Per-run provider connection budget (shared account with
+          # production): at most 2 connections per run, 8+ stay free.
+          # Legs read it via e2e/helpers/provider-budget.ts (hard max 10).
+          E2E_NNTP_MAX_CONNECTIONS: '2'
           # Promotion SHA from the push-triggered deploy run (inputs.expected_sha,
           # set by deploy.yml from github.sha) — never a source checkout. The
           # build-identity spec fails closed when it is absent or malformed.
@@ -357,14 +374,15 @@ jobs:
         # always(): publishes ran/skipped/failed counts even when the journey
         # failed, and turns an all-skipped green run red. Unconfigured
         # staging never reaches here: the preflight fails the job. The skip
-        # budget covers only the remaining recording_mbids test.fixme;
-        # every other skip (including queue order) fails the job.
+        # budget covers the recording_mbids test.fixme, the nine parked
+        # user-NZB legs and the capped stream leg (TWO-1635); every other
+        # skip fails the job.
         # REQUIRE_QA_AUTH_TOKEN keeps a configured run red until the QA
         # test-account seam pair is provisioned (presence only, never values).
         if: always() && steps.staging.outputs.configured == 'true'
         working-directory: e2e
         env:
-          MAX_ALLOWED_SKIPS: '1'
+          MAX_ALLOWED_SKIPS: '11'
           REQUIRE_QA_AUTH_TOKEN: 'true'
           QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
         run: node scripts/enforce-journey-evidence.mjs

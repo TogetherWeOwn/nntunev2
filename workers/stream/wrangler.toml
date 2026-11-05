@@ -6,11 +6,23 @@
 #   `POST /probe` route answers ingest segment probes (src/probe.rs); the
 #   ingest Worker reaches it through a cross-script Durable Object binding,
 #   so deploy this Worker first.
-# - The Worker authorizes each play against a signed grant from the `api`
-#   Worker, serves `200`/`206` from R2 on hits, and streams misses through
-#   the pool while completing the R2 multipart write (see src/play.rs).
-# - Metering sinks to the `meter` Analytics Engine dataset; the usage ledger
-#   itself lives in PlanetScale Postgres via Hyperdrive (api card owns it).
+# - The Worker's public fetch serves `GET /play/{track_id}` (src/play_route.rs):
+#   it authorizes each play against a signed `v2` grant from the `api` Worker
+#   (`Authorization: Bearer`, verified before any source is touched) and serves
+#   `200`/`206` ranges from R2 cache hits; the wasm NNTP miss adapter is a
+#   follow-up (misses answer `502 upstream_unavailable` until then).
+# - Grant verification needs the `PLAY_GRANT_SECRET` secret (the `api` Worker
+#   signs with the same value): provision it per environment with
+#   `wrangler secret put PLAY_GRANT_SECRET`. It is never in this file.
+# - Delivered-byte intervals per range response go to the per-user pool's
+#   `POST /delivered` route (src/delivered.rs); the object merges them into
+#   a per-play union in DO storage and its alarm flushes cumulative
+#   windows to the `api` Worker's signed internal endpoint over the `API`
+#   service binding (src/meter_sink.rs). The flush is HMAC-signed with the
+#   `METER_SINK_SECRET` secret (provision the same value on both Workers;
+#   absent/short, windows stay pending and retry). The usage ledger itself
+#   lives in PlanetScale Postgres via Hyperdrive (api card owns it — this
+#   Worker binds no database, by design).
 
 name = "nntune-stream"
 main = "build/worker/shim.mjs"
@@ -39,6 +51,10 @@ bucket_name = "nntunev2-audio-prod"
 binding = "METER"
 dataset = "nntune_meter"
 
+[[services]]
+binding = "API"
+service = "nntune-api"
+
 [env.staging]
 name = "nntune-stream-staging"
 [[env.staging.durable_objects.bindings]]
@@ -50,6 +66,9 @@ bucket_name = "nntunev2-audio-staging"
 [[env.staging.analytics_engine_datasets]]
 binding = "METER"
 dataset = "nntune_meter"
+[[env.staging.services]]
+binding = "API"
+service = "nntune-api-staging"
 
 [env.production]
 name = "nntune-stream"
@@ -62,6 +81,11 @@ bucket_name = "nntunev2-audio-prod"
 [[env.production.analytics_engine_datasets]]
 binding = "METER"
 dataset = "nntune_meter"
+[[env.production.services]]
+binding = "API"
+service = "nntune-api"
 
-# KV (config) and Hyperdrive (usage ledger reads) are bound here once the
-# accounts/auth card lands their names; the Rust core needs no changes.
+# No Hyperdrive/DB binding here, deliberately: plan and subscription
+# decisions stay at grant issuance in the `api` Worker, and everything the
+# play route needs beyond the grant lives in R2 (track manifests, cached
+# blobs). Do not add a database binding to this Worker.

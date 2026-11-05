@@ -25,11 +25,25 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
 
 jobs:
+  # PR-only public security caller; never scan push/queue/dispatch events.
+  # Keep this in the ci-ok dependency graph rather than waiting across workflows.
+  public-pr-security:
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
+    # The nested OSV reusable requires this exact permission ceiling: actions
+    # reads same-run comparison artifacts, contents reads the PR tree/history,
+    # and security-events uploads comparison SARIF. No secrets are passed.
+    permissions:
+      actions: read # Nested OSV reads same-run comparison artifacts.
+      contents: read
+      security-events: write # Nested OSV uploads comparison SARIF.
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36 # v0.5.0
+
   rust-test:
     name: rust test (native)
     runs-on: ubuntu-latest
@@ -38,23 +52,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy
+          rustup default stable
       # rust-cache policy for every Rust lane: PR and merge-queue runs
       # restore main's cache but only main saves, so per-PR copies do not
       # evict main's entries from the 10 GB repo cache. Standalone crates
       # (workers/*) build into their own target dir and must name it in
       # `workspaces:`, or only the registry is cached.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The workspace includes nntune-core and the stream crate; run all native
       # tests and lint every target so stream regressions stay on the gate.
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Reference PAR2 binary for the creator interop test
+      # (`interop_repair_with_reference_binary_when_available`, which repairs
+      # a creator-emitted set through the existing repair path and skips when
+      # no binary is present). Distro par2cmdline proves spec-level interop of
+      # the emitted bytes; production repair stays on the pinned
+      # par2cmdline-turbo image (see containers/repair/Dockerfile).
+      - name: Install reference par2 binary for creator interop test
+        run: sudo apt-get update && sudo apt-get install -y par2
       - run: cargo test --workspace
       - name: Check ETL timestamps through the native importer validator
         run: bash containers/mb-import/tests/test_etl_timestamp_contract.sh
@@ -80,6 +101,34 @@ jobs:
       - name: Validate golden fixtures
         run: python3 scripts/check-subsonic-fixtures.py
 
+  # No checked-in NZB fixtures anywhere (TWO-1169), and no journey NZB at
+  # all since the secret-held staging leg retired under the CC0-only
+  # fixture rule (docs/fixture-audio-licences.md). Owner rule (public
+  # repo): no NZB bytes, message-IDs, subjects, file names or segment lists
+  # in the repo. Fail closed on any tracked *.nzb. Keep this job id in
+  # ci-ok's needs.
+  nzb-guard:
+    name: nzb-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fail on any tracked NZB fixture
+        run: |
+          set -euo pipefail
+          # Case-insensitive: an uppercase `.NZB`/`.Nzb` spelling bypasses a
+          # lowercase-only pathspec, so enumerate every tracked path and
+          # filter instead of matching `*.nzb` directly.
+          tracked="$(git ls-files | grep -i '\.nzb$' || true)"
+          if [ -n "$tracked" ]; then
+            echo "::error::tracked *.nzb fixtures are forbidden (TWO-1169):"
+            printf '%s\n' "$tracked"
+            exit 1
+          fi
+          echo "no tracked *.nzb files — clean"
+
   rust-wasm:
     name: rust check (wasm32)
     runs-on: ubuntu-latest
@@ -88,13 +137,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Scalar core (no transport features) and the Workers transport build.
@@ -126,9 +173,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - name: Install pinned cargo-deny 0.20.2
         run: |
           set -euo pipefail
@@ -172,12 +220,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit-test the budget check
@@ -205,12 +252,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit-test the size reporter
@@ -222,7 +268,11 @@ jobs:
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.
-  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02).
+  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02). The
+  # clean-room lint enforces the AGENTS.md guardrails the same way:
+  # no extraction shapes, competitor brand/font/colour references, or
+  # host evidence paths (the pre-existing youtube extraction spike is
+  # allow-listed in the script until it is retired).
   public-text:
     name: public-text
     runs-on: ubuntu-latest
@@ -234,6 +284,21 @@ jobs:
           persist-credentials: false
       - name: Lint public text for internal identifiers
         run: python3 .github/scripts/public_text_lint.py
+      - name: Lint tracked files for clean-room guardrail shapes
+        run: python3 .github/scripts/clean_room_lint.py
+      - name: Unit-test the clean-room lint
+        run: python3 .github/scripts/test_clean_room_lint.py
+      # Fixture licence guard (docs/fixture-audio-licences.md): no
+      # tracked audio/NZB outside a CC0-manifest path, every fixture
+      # manifest carries an allow-listed licence, code references
+      # only manifest-listed R2 keys. Needs no credentials; the
+      # fetch-by-key helper's own suite is offline too.
+      - name: Check fixture audio licences
+        run: python3 .github/scripts/check_fixture_licences.py
+      - name: Unit-test the fixture licence guard
+        run: python3 .github/scripts/test_check_fixture_licences.py
+      - name: Unit-test the CC0 fixture fetcher
+        run: python3 fixtures/cc0/test_fetch_fixture.py
       - name: Unit-test the lint
         run: python3 .github/scripts/test_public_text_lint.py
       - name: Acceptance-test unreadable-input handling
@@ -246,6 +311,12 @@ jobs:
         run: python3 .github/scripts/test_ci_rust_cache.py
       - name: Structural-test the required-check concurrency policy
         run: python3 .github/scripts/test_ci_required_check_concurrency.py
+      - name: Test the public PR security caller and fail-closed aggregation
+        run: python3 .github/scripts/test_ci_public_pr_security.py
+      - name: Structural-test the CC0 fixture secret wiring
+        run: python3 .github/scripts/test_ci_fixture_secrets.py
+      - name: Test workflow setup and shell data boundaries
+        run: python3 .github/scripts/test_workflow_policy_hardening.py
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -322,6 +393,7 @@ jobs:
           python3 .github/scripts/test_binding_parity_unknown_envs.py
           python3 .github/scripts/test_binding_parity_table_shape.py
           python3 .github/scripts/test_binding_parity_known_drift_guards.py
+          python3 .github/scripts/test_binding_parity_absent_in.py
       - name: Parity check on this repo
         run: python3 .github/scripts/binding_parity.py
       - name: Parity check passes on the matching fixture
@@ -343,9 +415,9 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
     env:
-      MIGRATIONS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -353,16 +425,31 @@ jobs:
           persist-credentials: false
       - name: Verify Python version
         run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
+      # Keep the default PR integration checkout. Its first parent pairs
+      # with that exact tree; the payload's base.sha can be stale. Pushes
+      # still compare event.before, including pushes of merge commits.
+      - name: Select migration comparison base
+        id: migrations-base
+        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
+        env:
+          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
+      - name: Test migration comparison selection and workflow wiring
+        run: python3 .github/scripts/test_migrations_base.py
+      - name: Test migration comparison workflow
+        run: python3 .github/scripts/test_ci_migrations_base.py
       - name: Run migration gate self-tests
         run: |
           python3 .github/scripts/test_migrations_gate.py
           python3 .github/scripts/test_migrations_gate_regressions.py
           python3 .github/scripts/test_migrations_gate_unreadable_sql.py
           python3 .github/scripts/test_migrations_gate_manifest_shape.py
+          python3 .github/scripts/test_migrations_gate_renamed_from.py
           python3 .github/scripts/test_migrations_gate_root_traversal.py
-          python3 .github/scripts/test_migrations_staging_declaration.py
+          python3 .github/scripts/test_migrations_rename_check.py
+          python3 .github/scripts/test_apply_migration.py
+          python3 .github/scripts/test_schema_migrations_backfill.py
           python3 .github/scripts/test_migrations_gate_root_validity.py
 
   test-nntp:
@@ -373,11 +460,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p nntune-test-nntp --all-targets
@@ -406,13 +493,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/api
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -523,8 +608,17 @@ jobs:
         run: python3 .github/scripts/test_staging_api_schema_postgres.py
         env:
           SCHEMA_GATE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Atomicity of guard + migration + tracking insert rests on the
+      # real psql --single-transaction path, so drive it, not compose().
+      - name: Exercise migrator apply path on disposable PostgreSQL
+        run: python3 .github/scripts/test_apply_migration_postgres.py
+        env:
+          APPLY_MIGRATION_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/api
           key: api-postgres-acceptance
@@ -562,13 +656,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/mb
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -626,23 +718,51 @@ jobs:
 
   rust-ingest:
     name: rust (workers/ingest)
+    environment:
+      name: ci-fixtures
+      deployment: false
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
-      # (2026-08-06); re-pin deliberately, never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/ingest
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # CC0 fixture audio (docs/fixture-audio-licences.md): fetch track 1
+      # from R2 with the read-only fixture secrets so the ingest CC0 test
+      # below exercises real bytes instead of skipping. The fetcher exits
+      # 0 only when the cached file matches the manifest bytes + sha256,
+      # so this step is the visible fetch/sha256 proof and pre-warms the
+      # cache the test reuses. Fork PRs receive no secrets: the step
+      # notices, and the test skips via the fetcher's exit-77 path.
+      - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
+        run: |
+          set -eu
+          if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
+            echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
+            exit 0
+          fi
+          fetched="$(python3 fixtures/cc0/fetch_fixture.py --position 1)"
+          echo "CC0 fixture fetched and sha256-verified against the manifest:"
+          sha256sum "$fetched"
       - run: cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - run: cargo clippy --locked --manifest-path workers/ingest/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/ingest/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate must check on that target
@@ -657,13 +777,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/repair
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -717,13 +835,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
-      # never float.
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: workers/transcode
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -813,12 +929,16 @@ jobs:
       - name: Smoke-test default CMD as the runtime user
         run: set -o pipefail; docker run --rm mb-import:ci | grep -q '^Usage:'
       # Apply only the mirror-target migrations (base 0001 + importer 0014
-      # + track membership 0016); app migrations need the full app schema
+      # + track membership 0016 + replication ledger 0017 + W6b slice
+      # 0030); app migrations need the full app schema
       # and run in api-migrations.
       - name: Apply mirror migrations
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_mb_mirror.sql -f migrations/0014_mb_import_resume_dlq.sql -f migrations/0016_mb_track.sql -f migrations/0017_mb_replication_packet_ledger.sql -f migrations/0030_mb_mirror_w6b.sql
         env:
           DATABASE_URL: host=localhost port=5432 user=postgres dbname=postgres
+          # These pre-convention migrations carry no search_path header, so pin
+          # the session exactly like workers/api/tests/run_migration_tests.sh.
+          PGOPTIONS: '-c search_path=public,pg_catalog'
       - name: Run import integration suite in the shipped image
         run: >-
           docker run --rm --network host
@@ -878,6 +998,40 @@ jobs:
         run: |
           node --check ci/check-production-secrets-shape.mjs
           node --check ci/test-check-production-secrets-shape.mjs
+
+  # Promotion receipt proof unit tests (release lane): the proof helpers
+  # stay dependency-free, so node --test and stdlib unittest run them with
+  # no install. The suite pins every receipt refusal (wrong SHA, run,
+  # attempt, repository, workflow, job, schema and version id), the artifact
+  # name and plan request shape, the release retry/repair wiring, and the
+  # receipt archive bounds, so loosening a proof check or dropping the repair
+  # path goes red. The parse step executes no network calls but runs each
+  # entry point the same way CI does, so a broken entrypoint goes red too.
+  # Keep this job id in ci-ok's needs.
+  release-proof:
+    name: release-proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the verifyPromotion harness resolves origin/main
+          # as the fake run's head SHA, like the release job's own checkout.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Unit-test the promotion receipt proof
+        run: node --test ci/test-release-promotion-proof.cjs
+      - name: Unit-test the receipt archive bounds
+        run: python3 ci/test_read_promotion_receipt.py
+      - name: Promotion proof scripts parse clean
+        run: |
+          node --check ci/release-promotion-proof.cjs
+          node --check ci/release-request.cjs
+          node --check ci/test-release-promotion-proof.cjs
+          python3 -m py_compile ci/read-promotion-receipt.py ci/test_read_promotion_receipt.py
 
   # Docs internal-link lint: broken file links/anchors in changed markdown
   # (roadmap, matrix, ops, ADRs) fail the build. The lint step is scoped to
@@ -1060,10 +1214,6 @@ jobs:
         working-directory: e2e
         run: npm run test:unit
 
-      - name: Two-track fixture self-check (offline, no staging)
-        working-directory: e2e
-        run: node fixtures/two-track-self-check.mjs
-
       - name: List specs (compiles the suite without staging)
         working-directory: e2e
         run: npm run e2e:list
@@ -1187,12 +1337,17 @@ jobs:
       # because this job defaults to working-directory apps/web. Keep this
       # job id in ci-ok's needs (already there via web-build).
       - name: Enforce client-JS bundle budget
-        run: python3 ${{ github.workspace }}/.github/scripts/check_web_bundle_budget.py
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/check_web_bundle_budget.py"
       - name: Bundle-budget self-tests (pass + breach fixtures)
-        run: python3 ${{ github.workspace }}/.github/scripts/test_check_web_bundle_budget.py
+        run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
 
   web-e2e:
     name: web-e2e
+    environment:
+      name: ci-fixtures
+      deployment: false
+    env:
+      FIXTURE_SECRETS_ALLOWED: ${{ github.actor != 'dependabot[bot]' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Budget measured 2026-10-26/27: suite (1,425-1,613 tests) reports
     # 18.8-20.6 minutes; container setup (image pull + pnpm install)
@@ -1239,13 +1394,98 @@ jobs:
           const browser = await chromium.launch();
           await browser.close();
           JS
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        # CC0 fixture audio (docs/fixture-audio-licences.md): the player
+        # spec shells out to the stdlib-only fixture fetcher, and the
+        # Playwright image does not promise Python (same provisioning as
+        # e2e-lint).
+        with:
+          python-version: '3.13'
+      - name: Fetch CC0 fixture track 1 (R2, sha256-verified against the manifest)
+        # Exits 0 only when track 1 matches the manifest bytes + sha256,
+        # pre-warming the cache the player spec reuses; fork PRs receive
+        # no secrets, so the step notices and the spec skips cleanly.
+        # The toolcache Python in this container cannot import ssl
+        # (urllib: "unknown url type: https"), so the download prefers
+        # the image's SSL-capable system python; the suite then only
+        # needs the pre-warmed cache.
+        working-directory: ${{ github.workspace }}
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
+        run: |
+          set -eu
+          if [ -z "${NNTUNE_FIXTURE_R2_ACCESS_KEY_ID:-}" ]; then
+            echo "::notice::CC0 fixture R2 secrets unavailable (fork PR) — fixture tests skip."
+            exit 0
+          fi
+          fetcher=python3
+          if ! python3 -c 'import ssl' >/dev/null 2>&1; then
+            if [ -x /usr/bin/python3 ] && /usr/bin/python3 -c 'import ssl' >/dev/null 2>&1; then
+              fetcher=/usr/bin/python3
+            else
+              echo "::error::no SSL-capable python3 available for the fixture fetch"
+              exit 1
+            fi
+          fi
+          fetched="$("$fetcher" fixtures/cc0/fetch_fixture.py --position 1)"
+          echo "CC0 fixture fetched and sha256-verified against the manifest:"
+          sha256sum "$fetched"
       - name: Run apps/web Playwright suite
         run: pnpm test:e2e
+        env:
+          NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
+          NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_SECRET_ACCESS_KEY || '' }}
+          NNTUNE_FIXTURE_R2_ACCOUNT_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCOUNT_ID || '' }}
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-e2e-report
+          path: apps/web/test-results/
+          retention-days: 7
+
+  # Axe accessibility gate: every existing route must report zero serious or
+  # critical violations (apps/web/tests/accessibility-axe.spec.ts). Runs as
+  # its own job so the gate is fast and independently visible; the same spec
+  # also runs inside the full web-e2e suite. Keep this job id in ci-ok's
+  # needs; re-pin the container with the web lock.
+  web-a11y:
+    name: web-a11y
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: pnpm-setup
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        continue-on-error: true
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Retry pnpm bootstrap once
+        if: steps.pnpm-setup.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Run axe accessibility gate
+        run: pnpm exec playwright test tests/accessibility-axe.spec.ts
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-a11y-report
           path: apps/web/test-results/
           retention-days: 7
 
@@ -1300,16 +1540,23 @@ jobs:
   # when a required job fails, is cancelled, or is skipped.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, cargo-pool, tail-projection]
+    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - run: |
-          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON" > /dev/null; then
+          # Only the PR-only caller may skip, and only outside pull_request.
+          # A private PR skips the caller but fails ci-ok without scanning.
+          if ! jq -e --arg event "$CI_EVENT_NAME" '
+            length > 1 and
+            .["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
+            (del(.["public-pr-security"]) | all(.[]; .result == "success"))
+          ' <<< "$NEEDS_JSON" > /dev/null; then
             echo "ci-ok: a required job did not succeed"
             exit 1
           fi
           echo "ci-ok: all required jobs passed"
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          CI_EVENT_NAME: ${{ github.event_name }}

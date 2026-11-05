@@ -5,6 +5,11 @@
 //!
 //! Modules:
 //!
+//! - [`article`]: posting article assembly — header builder with folding,
+//!   per-article obfuscation, newsgroup allow-list selection, cipher-block
+//!   payload sizing.
+//! - [`rng`]: CSPRNG bytes (`getrandom`, `js` backend on wasm) behind an
+//!   injectable [`rng::FillRandom`] source.
 //! - [`nntp`]: NNTP client over a portable [`transport::Transport`] trait.
 //! - [`pinned_transport`]: pinned, cancellable fetch policy (TLS-on only,
 //!   port allowlist, cooperative cancellation, names-only diagnostics).
@@ -12,8 +17,9 @@
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
 //! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
-//! - [`par2`]: PAR2 recovery-set parsing and verification. Repair is
-//!   native-only (it shells out to `par2cmdline-turbo` in a Container).
+//! - [`par2`]: PAR2 recovery-set parsing and verification, plus the creator
+//!   (GF(2^16) Reed-Solomon, one set per file at 10%). Repair is native-only
+//!   (it shells out to `par2cmdline-turbo` in a Container).
 //! - [`segment_identity`]: the one shared segment message-id rule (250-byte
 //!   wire ceiling, bare shape, no normalization) enforced identically by
 //!   ingest intake, the probe/body envelopes, play, and the wire adapters.
@@ -25,12 +31,15 @@
 //! own network I/O and per-operation timeouts (see [`transport`] and
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
+pub mod article;
 pub mod decrypt;
 pub mod error;
 pub mod nntp;
 pub mod nzb;
+pub mod original_source;
 pub mod par2;
 pub mod pinned_transport;
+pub mod rng;
 pub mod segment_identity;
 pub mod transcode;
 pub mod transport;

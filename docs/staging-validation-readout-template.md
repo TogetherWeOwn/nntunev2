@@ -114,6 +114,11 @@ VERDICT: GO | NO-GO | KILL — <one sentence naming the deciding evidence IDs> (
   the threshold, and `INCONCLUSIVE` otherwise.
 - `GO` requires every must-pass row `PASS`, every kill rule
   `NOT TRIGGERED`, and QA sign-off on the evidence index.
+- In real-NZB mode the RAR set can feed no completable ingest until RAR
+  read lands, so rows 4–6 land `INCONCLUSIVE` on named skips (evidence =
+  the journey gate's allow-listed skip receipt) rather than `PASS` — the
+  readout is `NO-GO` on those rows by design, not a product failure; the
+  parked legs un-park under TWO-1174.
 - `GO` in a staging readout means "eligible for the launch decision". It is
   not production activation and authorizes no production action by itself.
 
@@ -141,7 +146,7 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | | |
 | 2† | Signup | Synthetic user can create an account and sign in | | |
 | 3† | BYOP configuration | Synthetic provider credentials are accepted, stored encrypted, and never appear in logs or UI after entry | | |
-| 4† | Ingest | Synthetic fixture (`e2e/fixtures/synthetic.nzb` or successor) ingests to a playable library item | | |
+| 4† | Ingest | Staged secret-held real NZB (no checked-in fixtures since TWO-1169): no completable ingest exists until RAR read lands (RAR-only subset fails permanent at transcode), so ingest-completion, reload and decoded-audio legs skip by name (TWO-1174); live ingest verdict is the intake-level refusal leg (402/429 on a capped account) | | |
 | 5† | Play / seek | The ingested item plays and seeks in the web player | | |
 | 6 | Metering | Playback/ingest usage is metered against the synthetic account | | |
 | 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | | |

@@ -1,27 +1,23 @@
 /**
  * Usage-vs-cap evaluation for display only.
  *
- * Enforcement lives in the API/stream workers (server reads
- * `subscriptions` + `plans` + `usage_ledger`; see ADR 0004). This module
- * turns the same numbers into UI states: soft-limit nudges at 80%+,
- * hard-limit degrade messaging at 100%+, and upgrade prompts.
+ * Enforcement lives in the API worker (server reads `subscriptions` +
+ * `plans` + the stream-play ledger fold; spec §3–§4). This module turns
+ * the same numbers into UI states: a soft nudge at 80%+, at-cap messaging
+ * at 100%+, and upgrade prompts.
  *
- * Overage policy (ADR 0004): no overage billing, ever. Streams past the
- * monthly cap degrade gracefully (lower bitrate; artwork stays full
- * quality) until the next period.
+ * Overage policy (spec §3.3): no overage billing, ever. At the monthly
+ * cap, *new* playback is refused (`402 plan_limit_exceeded`) until the
+ * period resets (1st, 00:00 UTC) or the user upgrades; a track already
+ * playing finishes. There is no degraded-bitrate tier. Browsing, search
+ * and library stay fully usable in every state (spec §2.2/§4).
  */
 
 import { nextPlan, streamCapSeconds, type Plan } from './plans';
 
 export interface UsageSnapshot {
-	/** Seconds streamed this calendar month (SUM from usage_ledger). */
+	/** Seconds streamed this UTC calendar month (SUM over the stream-play ledger). */
 	streamSecondsMonth: number;
-	/** Currently playing streams. */
-	concurrentNow: number;
-	/** Tracks in the user's library. */
-	libraryTracks: number;
-	/** Ingest jobs started today. */
-	ingestToday: number;
 }
 
 export type LimitState = 'ok' | 'soft' | 'hard';
@@ -30,15 +26,13 @@ export interface LimitStatus {
 	state: LimitState;
 	/** 0..1+ fraction of the monthly stream cap consumed. */
 	streamFraction: number;
+	/** At or past the plan's monthly stream cap. */
 	streamHardCapped: boolean;
-	concurrentBlocked: boolean;
-	libraryBlocked: boolean;
-	ingestBlocked: boolean;
 	/** Plan id to suggest, if any. */
 	upgradeTo: string | null;
 	/** Short human-readable line for banners. */
 	headline: string;
-	/** Longer degrade/upgrade explanation. Empty when `ok`. */
+	/** Longer at-cap/upgrade explanation. Empty when `ok`. */
 	detail: string;
 }
 
@@ -51,22 +45,9 @@ function pct(fraction: number): string {
 export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 	const cap = streamCapSeconds(plan);
 	const streamFraction = cap > 0 ? usage.streamSecondsMonth / cap : 0;
+	// A 0-hour plan (the reserved `free` row) is at cap by definition, so
+	// never-subscribed display never reports headroom it does not have.
 	const streamHardCapped = usage.streamSecondsMonth >= cap;
-	const concurrentBlocked = usage.concurrentNow >= plan.maxConcurrentStreams;
-	const libraryBlocked = usage.libraryTracks >= plan.maxLibraryTracks;
-	const ingestBlocked = usage.ingestToday >= plan.ingestJobsDay;
-
-	const libraryFraction = usage.libraryTracks / Math.max(1, plan.maxLibraryTracks);
-	const ingestFraction = usage.ingestToday / Math.max(1, plan.ingestJobsDay);
-	const concurrentFraction = usage.concurrentNow / Math.max(1, plan.maxConcurrentStreams);
-
-	const anyHard = streamHardCapped || concurrentBlocked || libraryBlocked || ingestBlocked;
-	const soft =
-		!anyHard &&
-		(streamFraction >= SOFT_AT ||
-			concurrentFraction >= SOFT_AT ||
-			libraryFraction >= SOFT_AT ||
-			ingestFraction >= SOFT_AT);
 
 	const upgrade = nextPlan(plan.id);
 	const upgradeTo = upgrade ? upgrade.id : null;
@@ -76,89 +57,25 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 			state: 'hard',
 			streamFraction,
 			streamHardCapped,
-			concurrentBlocked,
-			libraryBlocked,
-			ingestBlocked,
 			upgradeTo,
-			headline: `You've used ${pct(streamFraction)} of your ${plan.name} streaming hours.`,
+			headline: `You've used ${pct(streamFraction)} of your ${plan.name} listening hours.`,
 			detail:
-				`Streams continue at a lower bitrate until your next period — artwork stays full quality. ` +
+				`New playback pauses until your hours reset — a track already playing finishes. ` +
 				`No surprise bills, ever.` +
 				(upgrade ? ` Upgrade to ${upgrade.name} for ${upgrade.streamHoursMonth} hrs/mo.` : '')
 		};
 	}
 
-	if (concurrentBlocked) {
-		return {
-			state: 'hard',
-			streamFraction,
-			streamHardCapped,
-			concurrentBlocked,
-			libraryBlocked,
-			ingestBlocked,
-			upgradeTo,
-			headline: `All ${plan.maxConcurrentStreams} ${plan.name} streams are in use.`,
-			detail:
-				`Stop one stream or upgrade for more concurrent streams.` +
-				(upgrade ? ` ${upgrade.name} allows ${upgrade.maxConcurrentStreams}.` : '')
-		};
-	}
-
-	if (ingestBlocked || libraryBlocked) {
-		return {
-			state: 'hard',
-			streamFraction,
-			streamHardCapped,
-			concurrentBlocked,
-			libraryBlocked,
-			ingestBlocked,
-			upgradeTo,
-			headline: ingestBlocked
-				? `Daily ingest limit reached (${plan.ingestJobsDay}/day on ${plan.name}).`
-				: `Library is full (${plan.maxLibraryTracks.toLocaleString()} tracks on ${plan.name}).`,
-			detail: upgrade
-				? `Upgrade to ${upgrade.name} to raise the limit. Limits reset on their natural cadence.`
-				: `Limits reset on their natural cadence.`
-		};
-	}
-
-	if (soft) {
-		// Name the dimension closest to its cap so the banner never reports
-		// a floored number from an unrelated dimension.
-		const candidates = [
-			{
-				fraction: streamFraction,
-				headline: `You're at ${pct(streamFraction)} of your ${plan.name} streaming hours.`
-			},
-			{
-				fraction: concurrentFraction,
-				headline: `You're using ${usage.concurrentNow} of ${plan.maxConcurrentStreams} ${plan.name} streams.`
-			},
-			{
-				fraction: libraryFraction,
-				headline: `Library is at ${pct(libraryFraction)} of ${plan.name} (${usage.libraryTracks.toLocaleString()} tracks).`
-			},
-			{
-				fraction: ingestFraction,
-				headline: `Ingest is at ${pct(ingestFraction)} of today's ${plan.name} limit.`
-			}
-		];
-		let top = candidates[0];
-		for (const c of candidates.slice(1)) {
-			if (c.fraction > top.fraction) top = c;
-		}
+	if (streamFraction >= SOFT_AT) {
 		return {
 			state: 'soft',
 			streamFraction,
 			streamHardCapped,
-			concurrentBlocked,
-			libraryBlocked,
-			ingestBlocked,
 			upgradeTo,
-			headline: top.headline,
+			headline: `You're at ${pct(streamFraction)} of your ${plan.name} listening hours.`,
 			detail: upgrade
-				? `Heads up before anything degrades: ${upgrade.name} raises every limit.`
-				: `Heads up before anything degrades.`
+				? `Heads up before you reach the cap: ${upgrade.name} raises your hours.`
+				: `Heads up before you reach the cap.`
 		};
 	}
 
@@ -166,11 +83,8 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 		state: 'ok',
 		streamFraction,
 		streamHardCapped: false,
-		concurrentBlocked: false,
-		libraryBlocked: false,
-		ingestBlocked: false,
 		upgradeTo,
-		headline: `${pct(streamFraction)} of ${plan.name} streaming hours used.`,
+		headline: `${pct(streamFraction)} of ${plan.name} listening hours used.`,
 		detail: ''
 	};
 }
@@ -178,4 +92,27 @@ export function evaluateUsage(plan: Plan, usage: UsageSnapshot): LimitStatus {
 /** Remaining whole stream-minutes for meter display. Never negative. */
 export function remainingStreamMinutes(plan: Plan, usedSeconds: number): number {
 	return Math.max(0, Math.floor((streamCapSeconds(plan) - usedSeconds) / 60));
+}
+
+const MONTH_NAMES_SHORT = [
+	'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+	'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+];
+
+/**
+ * Spec §3.2 reset line, e.g. `Resets 1 Dec, 00:00 UTC`. The instant is
+ * rendered in UTC (the period is a UTC calendar month) from the server-
+ * provided `resetsAt` — never recomputed client-side. An unparseable
+ * value yields an empty string so callers omit the line rather than
+ * rendering a wrong date.
+ */
+export function formatResetInstant(resetsAt: string | null | undefined): string {
+	if (!resetsAt) return '';
+	const at = new Date(resetsAt);
+	if (Number.isNaN(at.getTime())) return '';
+	const day = at.getUTCDate();
+	const month = MONTH_NAMES_SHORT[at.getUTCMonth()];
+	const hh = String(at.getUTCHours()).padStart(2, '0');
+	const mm = String(at.getUTCMinutes()).padStart(2, '0');
+	return `Resets ${day} ${month}, ${hh}:${mm} UTC`;
 }

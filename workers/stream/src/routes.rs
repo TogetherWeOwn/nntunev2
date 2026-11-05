@@ -2,11 +2,13 @@
 //!
 //! Portable core (no `worker` dependency) so native `cargo test` pins the
 //! exact statuses the wasm32-only [`crate::runtime`] adapter renders: the
-//! Worker's public fetch path stays `404` until the play adapters are wired,
-//! and the pool probe answers `404` off-route, `400` without an owner-named
-//! instance, and retryable `503` until provider configuration is wired from
-//! the account vault. A status change here (including the `503` → `200`
-//! mutant) turns the native suite red long before deploy.
+//! Worker's public fetch serves only the play route
+//! ([`decide_public_route`]; the grant-gated core is
+//! [`crate::play_route`]) and stays `404` for everything else, and the pool
+//! routes answer `404` off-route, `400` without an owner-named instance,
+//! and retryable `503` until provider configuration is wired. A status
+//! change here (including the `503` → `200` mutant) turns the native suite
+//! red long before deploy.
 
 /// Durable Object class name. Must match `class_name` in
 /// `workers/stream/wrangler.toml` and the `pub struct` in `src/runtime.rs`
@@ -19,10 +21,22 @@ pub const PROBE_METHOD: &str = "POST";
 pub const PROBE_PATH: &str = "/probe";
 /// Body route: path the pool Durable Object serves (same `POST` method).
 pub const BODY_PATH: &str = "/body";
+/// Delivered-interval route: path the pool Durable Object serves (same
+/// `POST` method). The public play route reports each completed range
+/// response's client-written bytes here (`crate::delivered`); there is no
+/// public route to it — only the stream Worker itself calls it, through
+/// its own Durable Object binding.
+pub const DELIVERED_PATH: &str = "/delivered";
 
-/// Public Worker fetch decision until the play adapters are wired.
+/// Play route: method the public Worker fetch serves.
+pub const PLAY_METHOD: &str = "GET";
+/// Play route: path prefix the public Worker fetch serves; the remainder
+/// is the track id (`/play/<track_id>`).
+pub const PLAY_PATH_PREFIX: &str = "/play/";
+
+/// Public Worker fetch decision for every non-play request.
 pub const PUBLIC_FETCH_STATUS: u16 = 404;
-/// Public Worker fetch decision until the play adapters are wired.
+/// Public Worker fetch decision for every non-play request.
 pub const PUBLIC_FETCH_BODY: &str = "not found";
 
 /// Off-route (or wrong-method) pool request.
@@ -78,7 +92,7 @@ impl ProbeDecision {
     }
 }
 
-/// Adapter action for one Durable Object request, across both pool routes.
+/// Adapter action for one Durable Object request, across the pool routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolAction {
     /// Return the supplied portable route decision without running anything.
@@ -87,13 +101,18 @@ pub enum PoolAction {
     RunProbe,
     /// Run request validation and body execution (`POST /body`).
     RunBody,
+    /// Run request validation for one delivered-interval report
+    /// (`POST /delivered`).
+    RunDelivered,
 }
 
 /// Decide what one Durable Object request runs: the probe route, the body
-/// route, or a portable refusal. Exact method+path only, and a right-route
-/// request on an owner-less instance is refused before any dial.
+/// route, the delivered route, or a portable refusal. Exact method+path
+/// only, and a right-route request on an owner-less instance is refused
+/// before any dial.
 pub fn decide_pool_action(method: &str, path: &str, has_owner_name: bool) -> PoolAction {
-    if method != PROBE_METHOD || (path != PROBE_PATH && path != BODY_PATH) {
+    if method != PROBE_METHOD || (path != PROBE_PATH && path != BODY_PATH && path != DELIVERED_PATH)
+    {
         return PoolAction::Respond(ProbeDecision::NotFound);
     }
     if !has_owner_name {
@@ -101,6 +120,8 @@ pub fn decide_pool_action(method: &str, path: &str, has_owner_name: bool) -> Poo
     }
     if path == BODY_PATH {
         PoolAction::RunBody
+    } else if path == DELIVERED_PATH {
+        PoolAction::RunDelivered
     } else {
         PoolAction::RunProbe
     }
@@ -143,9 +164,41 @@ pub fn decide_probe(method: &str, path: &str, has_owner_name: bool) -> ProbeDeci
     ProbeDecision::ProviderUnavailable
 }
 
-/// Decide the public Worker fetch response until the play adapters are wired.
+/// Decide the public Worker fetch response for a non-play request.
 pub fn decide_public_fetch() -> (u16, &'static str) {
     (PUBLIC_FETCH_STATUS, PUBLIC_FETCH_BODY)
+}
+
+/// What one public Worker fetch request runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicRoute {
+    /// The play route for this track (`GET /play/<track_id>`); grant
+    /// verification and serving are `crate::play_route`'s.
+    Play { track_id: String },
+    /// Everything else: the [`decide_public_fetch`] `404`.
+    NotFound,
+}
+
+/// Extract the track id from a play-route path. The id must pass the same
+/// field rule the usage ledger keys on (`[A-Za-z0-9_-]`, 1..=512 bytes),
+/// which also rejects extra path segments, `%` escapes, and dots — a path
+/// that cannot name a meterable track is simply not the play route.
+pub fn parse_play_path(path: &str) -> Option<String> {
+    let track_id = path.strip_prefix(PLAY_PATH_PREFIX)?;
+    crate::meter::is_valid_key_field(track_id, 512).then(|| track_id.to_string())
+}
+
+/// Decide what one public Worker fetch request runs: the play route, or
+/// the `404`. Exact `GET` + play path only — the Durable Object routes
+/// are never public, and no other method serves audio.
+pub fn decide_public_route(method: &str, path: &str) -> PublicRoute {
+    if method != PLAY_METHOD {
+        return PublicRoute::NotFound;
+    }
+    match parse_play_path(path) {
+        Some(track_id) => PublicRoute::Play { track_id },
+        None => PublicRoute::NotFound,
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +220,50 @@ mod tests {
     #[test]
     fn public_fetch_stays_not_found() {
         assert_eq!(decide_public_fetch(), (404, "not found"));
+    }
+
+    #[test]
+    fn public_route_serves_only_get_play_with_a_meterable_track_id() {
+        assert_eq!(
+            decide_public_route("GET", "/play/track-9"),
+            PublicRoute::Play {
+                track_id: "track-9".to_string()
+            }
+        );
+        assert_eq!(PLAY_METHOD, "GET");
+        assert_eq!(PLAY_PATH_PREFIX, "/play/");
+        for (method, path) in [
+            ("POST", "/play/track-9"),
+            ("HEAD", "/play/track-9"),
+            ("get", "/play/track-9"),
+            ("GET", "/play"),
+            ("GET", "/play/"),
+            ("GET", "/play/track-9/extra"),
+            ("GET", "/play/track.9"),
+            ("GET", "/play/track%209"),
+            ("GET", "/play/tr ack"),
+            ("GET", "/PLAY/track-9"),
+            // The Durable Object routes are never public.
+            ("GET", "/probe"),
+            ("GET", "/body"),
+            ("GET", "/delivered"),
+            ("GET", "/"),
+            ("GET", ""),
+        ] {
+            assert_eq!(
+                decide_public_route(method, path),
+                PublicRoute::NotFound,
+                "{method} {path}"
+            );
+        }
+        // A 513-byte id exceeds the ledger field rule: not the play route.
+        let long = format!("/play/{}", "t".repeat(513));
+        assert_eq!(decide_public_route("GET", &long), PublicRoute::NotFound);
+        assert_eq!(
+            parse_play_path("/play/track-9"),
+            Some("track-9".to_string())
+        );
+        assert_eq!(parse_play_path("/play/"), None);
     }
 
     #[test]
@@ -241,10 +338,17 @@ mod tests {
             decide_pool_action("POST", "/body", true),
             PoolAction::RunBody
         );
+        assert_eq!(
+            decide_pool_action("POST", "/delivered", true),
+            PoolAction::RunDelivered
+        );
         for (method, path) in [
             ("GET", "/body"),
             ("POST", "/body/"),
             ("POST", "/BODY"),
+            ("GET", "/delivered"),
+            ("POST", "/delivered/"),
+            ("POST", "/play/track-9"),
             ("POST", "/other"),
         ] {
             assert_eq!(
@@ -257,7 +361,12 @@ mod tests {
             decide_pool_action("POST", "/body", false),
             PoolAction::Respond(ProbeDecision::OwnerMissing)
         );
+        assert_eq!(
+            decide_pool_action("POST", "/delivered", false),
+            PoolAction::Respond(ProbeDecision::OwnerMissing)
+        );
         assert_eq!(BODY_PATH, "/body");
+        assert_eq!(DELIVERED_PATH, "/delivered");
     }
 
     #[tokio::test]
@@ -329,7 +438,7 @@ mod tests {
             })
             .expect("public fetch handler");
         let expected_public_fetch = syn::parse_str::<syn::ItemFn>(
-            "async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {\n                let (status, body) = routes::decide_public_fetch();\n                Response::error(body, status)\n            }",
+            "async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {\n                match routes::decide_public_route(req.method().as_ref(), &req.path()) {\n                    PublicRoute::Play { track_id } => play_fetch(req, env, ctx, &track_id).await,\n                    PublicRoute::NotFound => {\n                        let (status, body) = routes::decide_public_fetch();\n                        Response::error(body, status)\n                    }\n                }\n            }",
         )
         .expect("parse expected public fetch handler");
         assert_eq!(
@@ -373,7 +482,7 @@ mod tests {
             "Durable Object fetch handler must not carry cfg/other attributes"
         );
         let expected_durable_object_fetch = syn::parse_str::<syn::ImplItemFn>(
-            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                }\n            }",
+            "async fn fetch(&self, mut req: Request) -> Result<Response> {\n                let has_owner_name = self.state.id().name().is_some();\n                match routes::decide_pool_action(req.method().as_ref(), &req.path(), has_owner_name) {\n                    PoolAction::Respond(ProbeDecision::NotFound) => Response::error(ProbeDecision::NotFound.body(), ProbeDecision::NotFound.status(),),\n                    PoolAction::Respond(decision) => respond(route_reply(decision)),\n                    PoolAction::RunProbe => respond(self.probe(&mut req).await),\n                    PoolAction::RunBody => respond_body(self.body(&mut req).await),\n                    PoolAction::RunDelivered => respond(self.delivered(&mut req).await),\n                }\n            }",
         )
         .expect("parse expected Durable Object handler");
         assert_eq!(
@@ -394,11 +503,13 @@ mod tests {
                 _ => None,
             })
             .expect("NntpPool Durable Object");
-        let fetch_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(fetch)]);
+        // `alarm` = the core (fetch) binding plus the alarm handler
+        // the meter sink's flush loop runs on (meter_sink module).
+        let alarm_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(alarm)]);
         assert_eq!(
             non_doc_attributes(&durable_object.attrs),
-            vec![tokens(&fetch_attribute)],
-            "NntpPool must have exactly its Durable Object fetch binding"
+            vec![tokens(&alarm_attribute)],
+            "NntpPool must have exactly its Durable Object alarm binding"
         );
 
         let route_reply = parsed

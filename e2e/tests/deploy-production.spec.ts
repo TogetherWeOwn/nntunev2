@@ -283,7 +283,7 @@ const HEALTHY_JOBS: JobRow[] = [
   { name: 'staging-web', conclusion: 'success' },
   { name: 'post-deploy-e2e / synthetic smoke (health)', conclusion: 'success' },
   {
-    name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
+    name: 'post-deploy-e2e / full journey (signup → library → meter → limits)',
     conclusion: 'success',
   },
 ];
@@ -365,7 +365,7 @@ test.describe('staging evidence (exact checked-in block, stubbed API)', () => {
         conclusion: 'success',
       },
       {
-        name: 'post-deploy-e2e / full journey (signup → byop → ingest → meter → limits)',
+        name: 'post-deploy-e2e / full journey (signup → library → meter → limits)',
         conclusion: 'failure',
       },
     ]);
@@ -396,13 +396,10 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
   const script = match?.[1]?.replace(/^ {10}/gm, '');
 
   // The step shells out to `npx wrangler ... --json`; the offline runner puts
-  // a stub npx first on PATH that replays fixture JSON. Two test-only
-  // substitutions apply, both mirroring what GitHub does in CI: the stub for
-  // npx (no network, no wrangler install), and the `${{ env.* }}`
-  // expression evaluated to the workflow-pinned value (Actions expands it
-  // before bash ever sees it; bash alone would reject the `${{ }}` shape).
-  // The pin test below keeps both substitutions honest.
-  async function runSeed(rawOutput: string) {
+  // a stub npx first on PATH that replays fixture JSON (no network or install).
+  // WRANGLER_VERSION is inherited as environment data, just as in Actions;
+  // the exact checked-in script is executed without source substitutions.
+  async function runSeed(rawOutput: string, version = '4.153.0') {
     const bin = mkdtempSync(
       join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'seed-bin-'),
     );
@@ -412,9 +409,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     // NOTE: the stub dir is exported inside the script, not via spawn env:
     // some sandboxes reset PATH on spawn, while an in-script export always
     // applies. The exact checked-in block below the export line is untouched.
-    const runnable =
-      `export PATH="${bin}:$PATH"\n` +
-      script!.split('${{ env.WRANGLER_VERSION }}').join('4.153.0');
+    const runnable = `export PATH="${bin}:$PATH"\n` + script!;
     try {
       const fixture = join(scratch, 'deployments.json');
       writeFileSync(fixture, rawOutput);
@@ -434,6 +429,7 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
         {
           SEED_FIXTURE: fixture,
           SEED_ARGV: argvFile,
+          WRANGLER_VERSION: version,
           WORKER_NAME: 'nntune-web',
           CLOUDFLARE_API_TOKEN: 'dummy-token',
           CLOUDFLARE_ACCOUNT_ID: 'dummy-account',
@@ -466,9 +462,9 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
     expect(script).toContain('--env production');
     expect(script).toContain('--name "$WORKER_NAME"');
     expect(script).toContain('--json');
-    // The offline runner evaluates this one Actions expression to the pinned
-    // value; pin both sides so the substitution cannot drift.
-    expect(script).toContain('wrangler@${{ env.WRANGLER_VERSION }}');
+    // Keep the version as one shell argument, inherited from workflow env.
+    expect(script).toContain('"wrangler@${WRANGLER_VERSION:?}"');
+    expect(script).not.toContain('${{');
     expect(productionWorkflow.split('\njobs:\n')[0]!).toContain(
       'WRANGLER_VERSION: 4.153.0',
     );
@@ -513,6 +509,12 @@ test.describe('production seed gate (exact checked-in block, stubbed wrangler)',
       'nntune-web',
       '--json',
     ]);
+  });
+
+  test('seed refuses an empty inherited CLI version before calling npx', async () => {
+    const result = await runSeed(JSON.stringify([singleAt('2026-10-18T00:00:00Z')]), '');
+    expect(result.status).not.toBe(0);
+    expect(result.argv).toBe('');
   });
 
   test('seed accepts a single-version 100% deployment', async () => {

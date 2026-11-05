@@ -1,7 +1,4 @@
 import { test, expect, type APIRequestContext } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   API,
   TESTIDS,
@@ -21,29 +18,45 @@ import {
   type MediaSessionSnapshot,
 } from '../helpers/media-session.js';
 import {
+  resumeFloorAfterSeek,
+  seekProofFailure,
+  seekViaPlayerUi,
+  togglePlayViaPlayerUi,
+} from '../helpers/player-ui.js';
+import {
   accountHeaders,
   annotateSignupPath,
   apiGet,
-  apiPost,
   applyAccountToPage,
-  completeByopWizard,
   requireApiAccount,
   submitPublicUiSignup,
   tryMintTestAccount,
   type TestAccount,
   waitForHydration,
 } from '../helpers/accounts.js';
+import {
+  REAL_NZB_RAR_SKIP,
+  realNzbActive,
+  requireRealNzbFixture,
+} from '../helpers/real-nzb-fixture.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURE_NZB = path.resolve(here, '../fixtures/synthetic.nzb');
+// Golden path part 2 (parked under TWO-1635): user NZB ingest is retired
+// (TWO-1630), so every leg that needs a user-uploaded track — ingest,
+// reload, Range, meter, browser playback, seek and Media Session — skips by
+// name (see USER_NZB_RETIRED_SKIP plus the journey gate allow-list in
+// e2e/scripts/enforce-journey-evidence.mjs). The assertions stay in the file
+// and return via admin-ingested tracks once admin ingest can seed a curated
+// track on staging. The only live leg in this file is the stream plan-limit
+// refusal on a separately minted over-limit account (the ingest-refusal leg
+// is deleted: user ingest caps are retired with user ingest itself).
 
-// Golden path part 2: ingest the NZB fixture → stream with Range seeks →
-// usage meter moves → plan metadata stays consistent → browser playback,
-// seek and Media Session → separately minted over-limit staging accounts are
-// refused on stream and on ingest with the documented plan-limit status
-// (headers, code, upgrade CTA, no leaks). Plan-limit legs run last: both
-// fail red-by-design until enforcement lands, and in describe.serial a
-// failure skips every later test.
+// Golden path part 2: ingest → stream with Range seeks → usage meter moves
+// → plan metadata stays consistent → browser playback, seek and Media
+// Session → a separately minted over-limit staging account is refused on
+// stream with the documented plan-limit status (headers, code, upgrade CTA,
+// no leaks). The plan-limit leg runs last in its isolated group: it fails
+// red-by-design until enforcement lands, and in describe.serial a failure
+// skips every later test in the same group.
 //
 // File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 // without launching a browser. See health.spec.ts.
@@ -91,6 +104,21 @@ function cappedSecrets(capped: TestAccount): NamedSecret[] {
   return secrets;
 }
 
+// TWO-1635: user NZB ingest retired (TWO-1630). Every leg below that needs a
+// user-uploaded track carries this skip; the journey gate allow-lists each
+// parked title by name (e2e/scripts/enforce-journey-evidence.mjs). Un-park
+// (remove the guard here and the allow-list entry there) once admin ingest
+// can seed a curated track on staging. The predicate stays a call (rather
+// than inlining `test.skip(true, ...)` plus `return`) so the retained
+// assertions below stay reachable and keep typechecking — an unconditional
+// skip+return would make them unreachable and drop narrowing.
+const USER_NZB_RETIRED_SKIP =
+  'user NZB ingest retired (TWO-1630); reseeds when admin ingest can seed a curated track on staging';
+
+function userNzbIngestRetired(): boolean {
+  return true;
+}
+
 test.describe.serial('ingest → play → meter → browser', () => {
   // Ingest polling (queue + NNTP fetch + verify) can take minutes on staging.
   test.describe.configure({ timeout: 300_000 });
@@ -103,6 +131,20 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'ingest');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
+    // Real-NZB mode cannot complete ingest: the staged RAR subset has no
+    // decodable audio and the pipeline fails it permanent at transcode
+    // (zero transcode inputs, no library row) — parked by name until RAR
+    // read lands. Live provider proof in this mode is the provider 430
+    // control (the BYOP wizard's test-connection retired with it).
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const minted = await tryMintTestAccount(request, baseURL);
@@ -122,12 +164,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
       sharedAccount = await submitPublicUiSignup(page, baseURL);
     }
 
-    // The ingest worker probes through the user's authenticated provider
-    // connection, so the ingesting identity completes the BYOP wizard first
-    // (shared helper with the signup spec). Fails closed without the NNTP
-    // password rather than ingesting into a provider-less account.
-    await completeByopWizard(page, baseURL);
-
     await page.goto(`${baseURL}/library/import`, {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
@@ -135,7 +171,17 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await waitForHydration(page, 'ingest');
     const fileInput = page.getByTestId(TESTIDS.importFile);
     await expect(fileInput, 'NZB import control missing').toBeAttached({ timeout: 15_000 });
-    await fileInput.setInputFiles(FIXTURE_NZB);
+    // Names-only failure: Playwright prints the input path when the upload
+    // control rejects the file, and junit goes to public artifacts — never
+    // leak the staged path (RUNNER_TEMP layout) into the failure text.
+    try {
+      await fileInput.setInputFiles(requireRealNzbFixture());
+    } catch {
+      throw new Error(
+        'NZB upload control rejected the staged fixture file (names only — ' +
+          'path withheld from public artifacts).',
+      );
+    }
     const status = page.getByTestId(TESTIDS.importStatus);
     await expect(status, 'import gave no status').toBeVisible({ timeout: 60_000 });
     await expect(status, 'NZB ingest did not complete').toContainText(/complete|ready|done/i, {
@@ -152,6 +198,16 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const baseURL = stagingBaseUrl('skip', 'reload');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
+    // No completable ingest in real-NZB mode means no library row to reload.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
@@ -221,9 +277,18 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of probing anonymously when neither a minted
     // session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'range');
     const headers = accountHeaders(account);
     const libraryUrl = `${baseURL}${API.library}`;
@@ -274,7 +339,16 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'meter');
     const headers = accountHeaders(account);
     const usageUrl = `${baseURL}${API.usage}`;
@@ -333,15 +407,24 @@ test.describe.serial('ingest → play → meter → browser', () => {
     await expect(page.getByTestId(TESTIDS.usageMeter).first()).toBeVisible({ timeout: 15_000 });
   });
 
-  test('synthetic audio actually plays in the browser', async ({ page, request }) => {
+  test('ingested audio actually plays in the browser', async ({ page, request }) => {
     const baseURL = stagingBaseUrl('skip', 'playback');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     // Same identity discipline as Range/meter: playback must run as the
     // ingesting account, never anonymously or as the generic QA seam.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'playback');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -445,14 +528,12 @@ test.describe.serial('ingest → play → meter → browser', () => {
           }
           return start;
         });
-        // User gesture #2: the player's own visible play control. Native
-        // <audio controls> live in shadow DOM, and in the Desktop Chrome
-        // project the leftmost control is play/pause — clicking the element
-        // centre would hit the seek bar instead. This respects autoplay
-        // policy; no evaluate-driven play() call is made.
-        const box = await audio.boundingBox();
-        expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
-        await audio.click({ position: { x: 20, y: Math.floor(((box?.height ?? 40) / 2)) } });
+        // User gesture #2: the player's own visible play control (custom
+        // player-play-pause button, or the native toggle while controls are
+        // still rendered — see helpers/player-ui.ts). Clicking the audio
+        // element centre would hit the seek bar instead. This respects
+        // autoplay policy; no evaluate-driven play() call is made.
+        await togglePlayViaPlayerUi(page, audio);
       } else {
         // Already playing but not yet past 0: require further advancement
         // rather than toggling it paused with another click.
@@ -464,7 +545,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
       await expect
         .poll(async () => playbackFailure(await snapshot(), baseline), {
           timeout: 15_000,
-          message: 'synthetic audio did not enter the playing state and advance',
+          message: 'ingested audio did not enter the playing state and advance',
         })
         .toBeNull();
       before = await snapshot();
@@ -473,15 +554,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
     expect(pageErrorNames, 'page errors during browser playback').toEqual([]);
   });
 
-  // FIXMEd until the staging MB mirror can match the synthetic fixture:
-  // synthetic.nzb's subject ("NNTune-Fixture sine-660 [01/03]") derives to
-  // the plain-title query "NNTune-Fixture sine-660", which has no release in
-  // the shared MB mirror, so the library write is empty by design
+  // FIXMEd until the staging MB mirror can match the staged real NZB: the
+  // secret-held RAR set derives its match query from real Usenet subjects,
+  // and whether the shared MB mirror holds that release is unproven — an
+  // empty mirror match keeps the library write empty by design
   // (library_write_for in workers/ingest/src/matching.rs drops recordings
   // without a release; the queue consumer resolves unmatched to Vec::new()).
   // Below playback and FIXMEd, so it can never fail or skip a later step.
-  // Un-fixme paths: (a) ingest an `Artist - Album` fixture for a real,
-  // unambiguous mirrored release, or (b) seed a fixture release in staging.
+  // Un-fixme path: confirm the mirror holds the real NZB's release (or seed
+  // it in staging) once RAR-set ingest + matching evidence exists.
   test.fixme('ingested track carries recording_mbids', async ({ request }) => {
     const baseURL = stagingBaseUrl('skip', 'recording-mbids');
     if (!baseURL) {
@@ -516,9 +597,11 @@ test.describe.serial('ingest → play → meter → browser', () => {
   // Player-UI seek, as distinct from the API Range control above: that test
   // proves the stream endpoint answers byte ranges; this one proves the
   // user-visible player actually moves the active track's playback position
-  // when a person seeks, and can play from there. The seek is a click on the
-  // native controls timeline (the contract markup is `<audio controls>`),
-  // never a `currentTime` assignment and never a test-issued Range GET.
+  // when a person seeks, and can play from there. The seek is a pointer
+  // press on the player's seek surface — `player-seek` slider in the custom
+  // player bar, or the native controls timeline before it (see
+  // helpers/player-ui.ts) — never a `currentTime` assignment and never a
+  // test-issued Range GET.
   //
   // After the meter/plan-limit specs on purpose: the library player is still a
   // contract placeholder, so on configured staging this test fails by name
@@ -531,9 +614,10 @@ test.describe.serial('ingest → play → meter → browser', () => {
   // The seek is performed while PAUSED. That is what makes the assertion
   // non-vacuous: a paused position cannot drift into the seeked region by
   // natural playback advance, so arriving there while still paused can only
-  // be the seek. It also works with the pinned 210 ms synthetic WAV
-  // (crates/nntune-test-nntp fixtures), where seek-while-playing would race
-  // the end of the track.
+  // be the seek. (This leg skips by name in real-NZB mode — see
+  // REAL_NZB_RAR_SKIP — so the note below covers non-staged runs only: the
+  // short in-memory corpus tones keep seek-while-playing from racing the end
+  // of the track.)
   test('player UI seek moves the active audio position and playback continues', async ({
     page,
     request,
@@ -543,9 +627,18 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
     // Fail closed instead of driving the player anonymously when neither a
     // minted session nor the QA seam token exists.
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'player-seek');
 
     const pageErrors: string[] = [];
@@ -574,7 +667,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
       ended: boolean;
       errorCode: number | null;
       hasSource: boolean;
-      hasControls: boolean;
     }> =>
       player.evaluate((element) => {
         const audio = element as HTMLAudioElement;
@@ -585,7 +677,6 @@ test.describe.serial('ingest → play → meter → browser', () => {
           ended: audio.ended,
           errorCode: audio.error?.code ?? null,
           hasSource: audio.currentSrc !== '',
-          hasControls: audio.controls,
         };
       });
 
@@ -608,21 +699,16 @@ test.describe.serial('ingest → play → meter → browser', () => {
     const ready = await audioState();
     expect(ready.hasSource, 'player has no media source for the selected track').toBe(true);
     expect(ready.errorCode, 'player reported a media error before seeking').toBeNull();
-    expect(
-      ready.hasControls,
-      'player no longer exposes native controls — update this UI seek to the new controls',
-    ).toBe(true);
-
-    const box = await player.boundingBox();
-    expect(box, 'player has no layout box to click').not.toBeNull();
-    const { width, height } = box as { width: number; height: number };
-    // The native play/pause toggle sits at the left edge of the control bar.
-    const togglePosition = { x: 16, y: Math.round(height / 2) };
+    // No `controls` assertion: the seek surface (custom `player-seek`
+    // slider or native timeline) is chosen at act time by
+    // helpers/player-ui.ts, which fails by name when neither exists —
+    // the custom player bar removing native controls is the plan, not a
+    // failure. See e2e/README.md ("Player contract migration").
 
     // Reach a paused state through the UI: selecting the track may autoplay
     // (the 210 ms fixture can also have already ended, which reads paused).
     if (!ready.paused) {
-      await player.click({ position: togglePosition });
+      await togglePlayViaPlayerUi(page, player);
     }
     await expect
       .poll(async () => (await audioState()).paused, {
@@ -632,18 +718,19 @@ test.describe.serial('ingest → play → meter → browser', () => {
       .toBe(true);
     const beforeSeek = await audioState();
 
-    // User-visible seek: click the timeline a little past its middle. The
-    // timeline does not span the full element width (play button and time
-    // labels flank it), so assert the requested REGION — well past the
-    // opening stretch, short of the end — rather than an exact timestamp.
-    // `currentTime` is the position the native timeline renders; there is
-    // no separate visible-position hook.
+    // User-visible seek: press the seek surface a little past its middle.
+    // The native timeline does not span the full element width (play
+    // button and time labels flank it), so assert the requested REGION —
+    // well past the opening stretch, short of the end — rather than an
+    // exact timestamp (seekProofRegion, pinned offline by
+    // tests/player-ui.spec.ts). `currentTime` is the position the player
+    // UI renders; there is no separate visible-position hook.
     //
     // Movement is proven by a `seeked` event (counted by a listener installed
     // before the click), not by distance from the pre-seek position: with
     // selection-autoplay the pause can land arbitrarily close to where the
-    // timeline click lands, so a distance predicate can never become true
-    // even when the seek worked.
+    // seek click lands, so a distance predicate can never become true even
+    // when the seek worked.
     await player.evaluate((element) => {
       const audio = element as HTMLAudioElement & { __seeked?: number };
       audio.__seeked = 0;
@@ -651,12 +738,8 @@ test.describe.serial('ingest → play → meter → browser', () => {
         audio.__seeked = (audio.__seeked ?? 0) + 1;
       });
     });
-    await player.click({
-      position: { x: Math.round(width * 0.55), y: Math.round(height / 2) },
-    });
+    const seekTarget = await seekViaPlayerUi(page, player, 0.55);
 
-    const regionLow = beforeSeek.duration * 0.3;
-    const regionHigh = beforeSeek.duration * 0.95;
     await expect
       .poll(
         async () => {
@@ -665,23 +748,14 @@ test.describe.serial('ingest → play → meter → browser', () => {
             (element) =>
               (element as HTMLAudioElement & { __seeked?: number }).__seeked ?? 0,
           );
-          // Still-paused is part of the match: while paused, only the seek
-          // itself can have moved the position into the region, and the
-          // `seeked` event proves a seek completed rather than the position
-          // having started there.
-          return (
-            state.paused &&
-            state.currentTime >= regionLow &&
-            state.currentTime <= regionHigh &&
-            seeked > 0
-          );
+          return seekProofFailure(state, seekTarget.fraction, seeked > 0);
         },
         {
           timeout: 15_000,
           message: 'seeking via the player UI did not move the paused audio position',
         },
       )
-      .toBe(true);
+      .toBeNull();
     const afterSeek = await audioState();
     expect(afterSeek.errorCode, 'player reported a media error after seeking').toBeNull();
 
@@ -706,7 +780,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
         audio.__resumeMin = Math.min(audio.__resumeMin ?? Infinity, audio.currentTime);
       });
     });
-    await player.click({ position: togglePosition });
+    await togglePlayViaPlayerUi(page, player);
     let polledMin = Infinity;
     await expect
       .poll(
@@ -735,7 +809,7 @@ test.describe.serial('ingest → play → meter → browser', () => {
     expect(
       resumeMin,
       'playback restarted instead of continuing from the seek',
-    ).toBeGreaterThanOrEqual(afterSeek.currentTime - beforeSeek.duration * 0.05);
+    ).toBeGreaterThanOrEqual(resumeFloorAfterSeek(afterSeek.currentTime, beforeSeek.duration));
     const continued = await audioState();
     expect(continued.errorCode, 'player reported a media error after resuming').toBeNull();
     expect(pageErrors, `page errors during player seek: ${pageErrors.join('; ')}`).toEqual([]);
@@ -750,12 +824,21 @@ test.describe.serial('ingest → play → meter → browser', () => {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
       return;
     }
+    // Parked: user NZB ingest retired (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
     // Same identity discipline as Range/meter/playback: the metadata must be
     // read as the ingesting account, never anonymously or as the generic QA
     // seam. Full playback proof stays with the playback spec — here a light
     // playing gate precedes the metadata read so the assertion runs during
     // browser playback, not against an idle element.
     const account = sharedAccount ?? (await tryMintTestAccount(request, baseURL));
+    if (realNzbActive()) {
+      test.skip(true, REAL_NZB_RAR_SKIP);
+      return;
+    }
     requireApiAccount(account, 'media-session');
 
     // Names only: a page-error message can embed the staging origin or other
@@ -829,9 +912,9 @@ test.describe.serial('ingest → play → meter → browser', () => {
         recorder.maxTime = Math.max(recorder.maxTime, player.currentTime || 0);
       });
     });
-    const box = await audio.boundingBox();
-    expect(box, 'audio player is visible but has no clickable controls').not.toBeNull();
-    await audio.click({ position: { x: 20, y: Math.floor((box?.height ?? 40) / 2) } });
+    // The player's own visible play control (either generation — see
+    // helpers/player-ui.ts), never an element-centre click (that seeks).
+    await togglePlayViaPlayerUi(page, audio);
     await expect
       .poll(
         async () =>
@@ -881,15 +964,15 @@ test.describe.serial('ingest → play → meter → browser', () => {
   });
 });
 
-// Plan-limit legs in their own group AFTER the journey serial: both fail
+// Plan-limit leg in its own group AFTER the journey serial: it fails
 // red-by-design until enforcement lands, and in describe.serial a failure
-// skips every later test in the SAME group — isolating them here means a
-// red plan-limit leg (or a red browser leg above) can never skip the other
-// group's verdicts. Each leg mints its own capped account (never the
-// journey identity, never each other's), so a capped-account failure
-// implicates only its own leg. The stream leg requires the overlimit seam
-// to pre-seed a streamable track: ingesting as the capped account would
-// contradict the ingest-refusal leg (the same ingest must be refused).
+// skips every later test in the SAME group — isolating it here means a red
+// plan-limit leg (or a red browser leg above) can never skip the other
+// group's verdicts. It mints its own capped account (never the journey
+// identity), so a capped-account failure implicates only this leg. The leg
+// requires the overlimit seam to pre-seed a streamable track: user NZB
+// ingest is retired (TWO-1630), so there is no user-ingest path left for a
+// capped account to take (the ingest-refusal leg was deleted with it).
 test.describe('plan limit', () => {
   test.describe.configure({ timeout: 300_000 });
 
@@ -899,6 +982,21 @@ test.describe('plan limit', () => {
     const baseURL = stagingBaseUrl('skip', 'plan-limit-stream');
     if (!baseURL) {
       test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+      return;
+    }
+    // Parked with the other user-track legs: this leg needs a pre-seeded
+    // streamable track, and since the secret-held real-NZB staging leg
+    // retired (CC0-only fixture rule, docs/fixture-audio-licences.md)
+    // nothing stages one. Reseeds when admin ingest can seed a curated
+    // track on staging (see USER_NZB_RETIRED_SKIP).
+    if (userNzbIngestRetired()) {
+      test.skip(true, USER_NZB_RETIRED_SKIP);
+      return;
+    }
+    if (realNzbActive()) {
+      // The capped stream leg needs a pre-seeded streamable track, which the
+      // RAR set cannot produce until RAR read lands.
+      test.skip(true, REAL_NZB_RAR_SKIP);
       return;
     }
     const capped = await mintCappedAccount(request, baseURL, 'plan-limit-stream');
@@ -938,7 +1036,7 @@ test.describe('plan limit', () => {
     expect(
       trackId,
       'library is empty for the capped account: the overlimit seam must pre-seed ' +
-        'a streamable track (ingest-as-capped would contradict the ingest-refusal leg)',
+        'a streamable track (user NZB ingest is retired, so no upload path can fill it)',
     ).toBeTruthy();
     const streamUrl = `${baseURL}${API.stream(trackId as string)}`;
     const res = await apiGet(
@@ -963,43 +1061,4 @@ test.describe('plan limit', () => {
     });
   });
 
-  test('over-limit staging account is refused on ingest with a plan-limit status', async ({
-    request,
-  }) => {
-    const baseURL = stagingBaseUrl('skip', 'plan-limit-ingest');
-    if (!baseURL) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    // A separately minted capped account (never the journey identity, never
-    // the stream leg's account): each refusal leg implicates only its own
-    // capped account. Placed last so its red-by-design failure skips nothing.
-    const capped = await mintCappedAccount(request, baseURL, 'plan-limit-ingest');
-    const headers = accountHeaders(capped);
-    // The fixture bytes are a valid NZB document, posted raw: the cap check
-    // is a guard on the ingest-write path, so a capped account is refused
-    // 402/429 rather than accepted for processing. This is the ingest the
-    // stream leg must NOT perform as its capped account.
-    const ingestUrl = `${baseURL}${API.ingest}`;
-    const res = await apiPost(
-      request,
-      ingestUrl,
-      { ...headers, 'Content-Type': 'application/octet-stream' },
-      readFileSync(FIXTURE_NZB),
-      'plan-limit-ingest',
-    );
-    const bodyText = await readApiBody(res, ingestUrl, 'plan-limit-ingest');
-    // Same refusal verdict as the stream leg: without enforcement this fails
-    // naming the missing status (accepted, or no route yet); with
-    // enforcement it passes. The route is the documented POST /api/ingest
-    // (e2e/helpers/contract.ts): no fallback route, no skip — an absent
-    // route fails naming its status.
-    assertPlanLimitRefusal({
-      status: res.status(),
-      headers: res.headers(),
-      bodyText,
-      secrets: cappedSecrets(capped),
-      context: 'plan-limit-ingest',
-    });
-  });
 });

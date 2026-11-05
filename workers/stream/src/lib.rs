@@ -23,6 +23,10 @@
 //!   arrives with the deploy-config slice (see the module docs).
 //! - [`play`]: miss-path orchestration (authorize → fetch → decode →
 //!   decrypt → chunked stream + writeback).
+//! - [`play_route`]: the public `GET /play/{track_id}` route over
+//!   [`play`] (v2-grant gate, manifest-resolved segments, no preload).
+//! - [`delivered`]: per-range-response client-written byte intervals
+//!   reported to the per-user pool DO for the hour meter.
 //! - [`meter`]: Analytics Engine + usage-ledger events.
 //! - [`prefetch`]: next-track prefetch on spare pool capacity (never the last connection).
 //! - [`probe`]: ingest segment-availability probe (`STAT` on the ingest
@@ -32,8 +36,9 @@
 //! - `stampede` (native only, compiled out on wasm32): singleflight
 //!   stampede-guard primitive (one upstream fetch per concurrent segment)
 //!   with waiter-timeout re-election. Not yet wired into the play path.
-//! - [`routes`]: fail-closed public fetch and probe routing decisions, natively
-//!   tested and rendered by the wasm32 [`runtime`] adapter.
+//! - [`routes`]: fail-closed public fetch (play route only) and Durable
+//!   Object routing decisions, natively tested and rendered by the
+//!   wasm32 [`runtime`] adapter.
 //!
 //! Cloudflare bindings (DO storage, R2, Analytics Engine) are wired in
 //! `workers/stream/wrangler.toml`. The Workers entry (`runtime`, wasm32 only)
@@ -44,12 +49,16 @@ pub mod api_error;
 pub mod body;
 pub mod cache;
 pub mod choose;
+pub mod delivered;
 pub mod grant;
 pub mod loader;
 pub mod meter;
+pub mod meter_sink;
 pub mod nntp;
 pub mod observability;
+pub mod original_play;
 pub mod play;
+pub mod play_route;
 pub mod pool;
 pub mod prefetch;
 pub mod probe;

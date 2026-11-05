@@ -79,8 +79,9 @@
 //!   Dual-pepper transition: a record whose version matches ANY entry in
 //!   `peppers` authorizes; an empty slice or an unlisted version fails
 //!   closed. NOTE: this signature takes no cookie/session input by
-//!   design — the HTTP layer must not consult cookies on bearer routes
-//!   (ADR: no session-cookie fallback on credential routes).
+//!   design — cookies never rescue an invalid presented bearer at the
+//!   HTTP scope gate. Admission is not handler authentication: current
+//!   play-grant issuance still requires its own cookie session + Origin.
 //! - `pub fn revoke_credential(record: &mut NativeRestRecord, now: u64)`
 //!   (sets `revoked_at = Some(now)`; idempotent — never un-revokes) and
 //!   `pub fn revoke_all_for_user(records: &mut [NativeRestRecord],
@@ -105,12 +106,13 @@
 //!   collection roots plus subpaths (the HTTP layer passes the path
 //!   without the query string). Reads on the six catalog roots need
 //!   `library:read`; playlist writes need `playlists:write`; `/v1/plays`
-//!   writes need `plays:write`; `/v1/stream` reads need `stream:read`;
+//!   writes need `plays:write` at the scope gate (play events and grants
+//!   are distinct; this map is not native feature acceptance);
+//!   `/v1/stream` reads need `stream:read`;
 //!   `/v1/ingest` submission needs `ingest:submit`. Session-only (never
 //!   reachable by bearer, enforced by the auth layer): `/v1/me`,
 //!   `/v1/indexers`, `/v1/operations` reads, library membership writes
-//!   and deletes, every `/v1/vault*` operation including test-connection,
-//!   credential issuance/revocation (`/v1/credentials*`), auth/session/
+//!   and deletes, credential issuance/revocation (`/v1/credentials*`), auth/session/
 //!   account/billing/step-up paths. Everything else — `/rest/*` in both
 //!   directions, unlisted methods on listed routes, unknown paths — is
 //!   `Deny`. An endpoint added after ADR 0010 stays `Deny` until the map
@@ -689,10 +691,6 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("GET", "/v1/operations/op_1", SessionOnly),
         ("POST", "/v1/libraries/lib_1/members", SessionOnly),
         ("DELETE", "/v1/libraries/lib_1", SessionOnly),
-        ("GET", "/v1/vault", SessionOnly),
-        ("PUT", "/v1/vault", SessionOnly),
-        ("POST", "/v1/vault/test", SessionOnly),
-        ("POST", "/v1/vault/test-connection", SessionOnly),
         ("POST", "/v1/credentials", SessionOnly),
         ("GET", "/v1/credentials", SessionOnly),
         ("DELETE", "/v1/credentials/cred_1", SessionOnly),
@@ -701,9 +699,23 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("POST", "/v1/session/revoke-all", SessionOnly),
         ("DELETE", "/v1/account", SessionOnly),
         ("POST", "/v1/billing/checkout", SessionOnly),
+        // Admin surface (migration 0028): session + fresh DB role only.
+        ("GET", "/v1/admin/settings", SessionOnly),
+        (
+            "PUT",
+            "/v1/admin/settings/invite_default_expiry_days",
+            SessionOnly,
+        ),
+        ("PUT", "/v1/admin/users/u_1/role", SessionOnly),
         // Default-deny: cross-surface use, unlisted methods, unknown paths.
         ("GET", "/rest/getArtists.view", Deny),
         ("POST", "/rest/ping.view", Deny),
+        // Retired user-credential routes are no longer classified.
+        ("GET", "/v1/vault", Deny),
+        ("PUT", "/v1/vault", Deny),
+        ("DELETE", "/v1/vault", Deny),
+        ("POST", "/v1/vault/test", Deny),
+        ("POST", "/v1/vault/test-connection", Deny),
         ("POST", "/v1/operations/op_1", Deny),
         ("GET", "/v1/libraries/lib_1", Deny),
         ("POST", "/v1/search", Deny),
@@ -712,6 +724,16 @@ fn route_map_is_exhaustive_and_default_deny() {
         ("DELETE", "/v1/plays", Deny),
         ("GET", "/v1/ingest", Deny),
         ("DELETE", "/v1/playlists", Deny),
+        // Admin lookalikes stay default-deny: wrong methods, deeper or
+        // empty segments, and sibling tails never classify.
+        ("POST", "/v1/admin/settings", Deny),
+        ("GET", "/v1/admin/settings/invite_default_expiry_days", Deny),
+        ("PUT", "/v1/admin/settings/", Deny),
+        ("PUT", "/v1/admin/settings/a/b", Deny),
+        ("PUT", "/v1/admin/users/u_1", Deny),
+        ("PUT", "/v1/admin/users/u_1/roles", Deny),
+        ("PUT", "/v1/admin/users//role", Deny),
+        ("GET", "/v1/admin/users/u_1/role", Deny),
         ("GET", "/v1/nope", Deny),
         ("GET", "/", Deny),
         ("", "", Deny),

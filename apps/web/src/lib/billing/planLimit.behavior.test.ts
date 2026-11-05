@@ -25,15 +25,15 @@ describe('toPaywallModel non-limit statuses', () => {
 });
 
 describe('usage naming', () => {
-	it('names exact figures when the body carries used/limit/tier', () => {
+	it('names exact figures for uncoded limit bodies carrying used/limit/tier', () => {
 		const model = toPaywallModel({
 			status: 402,
 			headers: new Headers(),
-			body: { code: 'plan_limit_exceeded', used_bytes: 2048, limit_bytes: 2048, plan: 'free' }
+			body: { used_bytes: 2048, limit_bytes: 2048, plan: 'free' }
 		});
 		expect(model?.detail).toMatch(/2\D*048 of 2\D*048/);
 		expect(model?.detail).toContain('free');
-		expect(model?.code).toBe('plan_limit_exceeded');
+		expect(model?.code).toBeNull();
 	});
 
 	it('does not treat a prose error message as a code', () => {
@@ -61,6 +61,117 @@ describe('usage naming', () => {
 			body: { error: 'indexer_auth_expired' }
 		});
 		expect(model?.code).toBe('indexer_auth_expired');
+	});
+});
+
+describe('billing play-gate surfaces (spec §4/§3.3/§3.4)', () => {
+	it('never-subscribed gets the subscribe surface toward /pricing', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'subscription_required', reason: 'never_subscribed' }
+		});
+		expect(model?.kind).toBe('terminal');
+		expect(model?.ctaHref).toBe('/pricing');
+		expect(model?.ctaLabel).toBe('See plans');
+		expect(model?.headline).toBe('Subscribe to start listening');
+		// Browsing/library stay usable — the copy must say so (spec §4).
+		expect(model?.detail).toContain('free to use');
+	});
+
+	it('lapsed gets the portal surface toward /account/billing', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'subscription_required', reason: 'lapsed' }
+		});
+		expect(model?.ctaHref).toBe('/account/billing');
+		expect(model?.ctaLabel).toBe('Manage billing');
+		expect(model?.headline).toBe('Your subscription has lapsed');
+		expect(model?.detail).toContain('unaffected');
+	});
+
+	it('unknown subscription_required reasons fall back to the subscribe surface', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'subscription_required' }
+		});
+		expect(model?.ctaHref).toBe('/pricing');
+		expect(model?.headline).toBe('Subscribe to start listening');
+	});
+
+	it('at-cap renders the real wire: stream_hours_month dimension + next-utc-month hint', () => {
+		// Server `Denial::headers` sends `x-plan-limit: stream_hours_month=100`
+		// and the static hint `x-plan-reset: next-utc-month` (never a
+		// timestamp); mid-November, the reset instant is 1 Dec 00:00 UTC.
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-11-15T12:00:00Z'));
+		try {
+			const model = toPaywallModel({
+				status: 402,
+				headers: new Headers({
+					'x-plan-limit': 'stream_hours_month=100',
+					'x-plan-reset': 'next-utc-month'
+				}),
+				body: { code: 'plan_limit_exceeded' }
+			});
+			expect(model?.code).toBe('plan_limit_exceeded');
+			expect(model?.ctaHref).toBe('/pricing');
+			expect(model?.headline).toBe("You've used all your listening hours");
+			expect(model?.detail).toContain('reset 1 Dec, 00:00 UTC');
+			expect(model?.detail).toContain('track already playing finishes');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('at-cap without a reset header stays honest and finite', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers({ 'x-plan-limit': 'stream_hours_month=100' }),
+			body: { code: 'plan_limit_exceeded' }
+		});
+		expect(model?.detail).toBe(
+			'New playback pauses until your hours reset or you upgrade — a track already playing finishes.'
+		);
+	});
+
+	it('the daily ingest refusal (ingest_today=5) gets generic copy, never listening-hours wording', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers({
+				'x-plan-limit': 'ingest_today=5',
+				'x-plan-reset': 'next-utc-day'
+			}),
+			body: { code: 'plan_limit_exceeded' }
+		});
+		expect(model?.code).toBe('plan_limit_exceeded');
+		expect(model?.headline).toBe("You've reached your plan limit");
+		expect(model?.detail).not.toContain('listening hours');
+		expect(model?.detail).not.toContain('playback pauses');
+	});
+
+	it('a coded refusal with no dimension header also stays generic', () => {
+		const model = toPaywallModel({
+			status: 402,
+			headers: new Headers(),
+			body: { code: 'plan_limit_exceeded' }
+		});
+		expect(model?.headline).toBe("You've reached your plan limit");
+	});
+
+	it('concurrent-stream 429 uses the two-level other-device truth, no instant-stop promise', () => {
+		const model = toPaywallModel({
+			status: 429,
+			headers: new Headers({ 'x-plan-limit': 'concurrent_streams=1' }),
+			body: { code: 'rate_limited' }
+		});
+		expect(model?.kind).toBe('retryable');
+		expect(model?.headline).toBe('Playing on another device');
+		expect(model?.detail).toContain('pauses itself within about 15 seconds');
+		expect(model?.detail).toContain("next track can't start");
+		expect(model?.detail).toContain("can't be recalled");
 	});
 });
 

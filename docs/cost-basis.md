@@ -168,7 +168,7 @@ analytics_engine_prospective = max(0, W/1e6 - 10) * 0.25
 
 The `stream` Worker writes metering points to the `nntune_meter` dataset
 (`workers/stream/wrangler.toml`) and the `ingest` Worker to
-`nntune_ingest_meter` (`workers/ingest/wrangler.toml.example`). Adaptive sampling can reduce stored
+`nntune_ingest_meter` (`workers/ingest/wrangler.toml`). Adaptive sampling can reduce stored
 points at volume, so use the billed data-point count from account usage,
 not the raw event count in the Worker.
 

@@ -42,7 +42,7 @@
 //!   `tests/request_body_transport_acceptance.rs` (`REJECT_BODY`),
 //!   `tests/request_body_cap_literals_acceptance.rs` (`REJECT_BODY`),
 //!   `tests/request_body_short_read.rs` (short-read gate body), and
-//!   `tests/pr30_findings_acceptance.rs` (oversized vault PUT body).
+//!   `tests/pr30_findings_acceptance.rs` (oversized request body).
 //!   The `worker_entry` unit tests that use the legacy string as a
 //!   synthetic *input* fixture (codeless-body log mapping, header
 //!   rendering) do not pin this rejection's output and need no change.
@@ -206,17 +206,12 @@ impl handlers::Store for UnreachableStore {
         magic_by_hash(token_hash: &str) -> Result<Option<auth::MagicLinkRecord>, handlers::StoreError>,
         reserve_rate_limit(scope_key: &str, action: &str, limit: u64, now: u64, window_secs: u64) -> Result<bool, handlers::StoreError>,
         prune_expired_challenges(now: u64) -> Result<(), handlers::StoreError>,
-        acquire_test_connection_lease(user_id: &str, token: &str, lease_secs: u64, max_concurrency: u32) -> Result<bool, handlers::StoreError>,
-        release_test_connection_lease(user_id: &str, token: &str) -> Result<(), handlers::StoreError>,
         invite_by_hash(code_hash: &str) -> Result<Option<auth::InviteRecord>, handlers::StoreError>,
         insert_session(record: &session::SessionRecord) -> Result<(), handlers::StoreError>,
         session_by_id(id: &str) -> Result<Option<session::SessionRecord>, handlers::StoreError>,
         rotate_session_row(id: &str, expected_counter: u32, new_counter: u32, new_expires_at: u64) -> Result<bool, handlers::StoreError>,
         revoke_session(id: &str) -> Result<(), handlers::StoreError>,
         revoke_all_sessions(user_id: &str) -> Result<(), handlers::StoreError>,
-        vault_by_user(user_id: &str) -> Result<Option<handlers::VaultRow>, handlers::StoreError>,
-        upsert_vault(user_id: &str, row: &handlers::VaultRow) -> Result<(), handlers::StoreError>,
-        delete_vault(user_id: &str) -> Result<(), handlers::StoreError>,
         insert_audit(event: &vault::AuditEvent) -> Result<(), handlers::StoreError>
     }
 }
@@ -280,6 +275,7 @@ fn handle(body: Vec<u8>) -> handlers::Response {
         dns: &dns,
         now: 1_700_000_000,
         source_ip: "198.51.100.9".to_string(),
+        stripe: &nntune_api::stripe::NoStripeTransport,
     };
     let request = handlers::Request {
         method: "GET".to_string(),
@@ -287,6 +283,7 @@ fn handle(body: Vec<u8>) -> handlers::Response {
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body,
     };
     block_on(handlers::handle(&ctx, &request))
@@ -331,11 +328,12 @@ fn handler_gate_still_passes_exactly_at_cap() {
 
 fn template_request() -> handlers::Request {
     handlers::Request {
-        method: "PUT".to_string(),
-        path: "/v1/vault".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/session/refresh".to_string(),
         cookie: None,
         origin: None,
         authorization: None,
+        stripe_signature: None,
         body: canary_body(64),
     }
 }
@@ -354,6 +352,7 @@ fn dispatch_rejection(collected: CollectedBody) -> handlers::Response {
                     body: "HANDLER-RAN".to_string(),
                     set_cookie: Some("must-never-appear".to_string()),
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },
@@ -412,6 +411,7 @@ fn complete_body_still_dispatches_through_the_gate() {
                     body: format!(r#"{{"body_len":{body_len}}}"#),
                     set_cookie: None,
                     retry_after: None,
+                    extra_headers: Vec::new(),
                 }
             }
         },

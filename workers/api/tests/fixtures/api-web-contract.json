@@ -158,73 +158,6 @@
       "path": "/v1/session/reauthenticate/start"
     },
     {
-      "id": "vault-get",
-      "method": "GET",
-      "path": "/v1/vault"
-    },
-    {
-      "id": "vault-save",
-      "method": "PUT",
-      "path": "/v1/vault",
-      "web": "saveProviderConfig",
-      "input": {
-        "host": "news.example.com",
-        "port": 563,
-        "tls": true,
-        "allow_insecure_plaintext": false,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4
-      },
-      "wire": {
-        "provider": {
-          "host": "news.example.com",
-          "port": 563,
-          "tls": true,
-          "allow_insecure_plaintext": false,
-          "username": "synthetic-user",
-          "password": "synthetic-pass",
-          "max_connections": 4
-        }
-      }
-    },
-    {
-      "id": "vault-delete",
-      "method": "DELETE",
-      "path": "/v1/vault"
-    },
-    {
-      "id": "vault-test",
-      "method": "POST",
-      "path": "/v1/vault/test",
-      "web": "testProviderConnection",
-      "input": {
-        "host": "news.example.com",
-        "port": 563,
-        "tls": true,
-        "allow_insecure_plaintext": false,
-        "username": "synthetic-user",
-        "password": "synthetic-pass",
-        "max_connections": 4
-      },
-      "wire": {
-        "provider": {
-          "host": "news.example.com",
-          "port": 563,
-          "tls": true,
-          "allow_insecure_plaintext": false,
-          "username": "synthetic-user",
-          "password": "synthetic-pass",
-          "max_connections": 4
-        }
-      }
-    },
-    {
-      "id": "vault-test-connection-legacy",
-      "method": "POST",
-      "path": "/v1/vault/test-connection"
-    },
-    {
       "id": "credentials-mint",
       "method": "POST",
       "path": "/v1/credentials",
@@ -254,6 +187,21 @@
       "input": {
         "id": "synthetic-cred-id"
       }
+    },
+    {
+      "id": "plans-list",
+      "method": "GET",
+      "path": "/v1/plans"
+    },
+    {
+      "id": "me-usage",
+      "method": "GET",
+      "path": "/v1/me/usage"
+    },
+    {
+      "id": "me-subscription",
+      "method": "GET",
+      "path": "/v1/me/subscription"
     }
   ]
 }

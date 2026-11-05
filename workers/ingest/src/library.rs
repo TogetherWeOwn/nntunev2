@@ -3,7 +3,7 @@
 //! The `library` table is keyed `UNIQUE(idempotency_key)` so Queue redelivery
 //! and Workflow replay converge instead of duplicating. This module owns the
 //! parameterized statement and its validation; the worker executes it through
-//! the `LIBRARY_DB` Hyperdrive binding (see `wrangler.toml.example`).
+//! the `LIBRARY_DB` Hyperdrive binding (see `wrangler.toml`).
 //!
 //! **Enablement blocker:** no migration creates `library` (or its
 //! `UNIQUE(idempotency_key)`) yet — `migrations/0003_library.sql` defines
@@ -22,7 +22,7 @@ use crate::retry::{JobError, ERR_ACCOUNT_DELETING};
 use std::collections::HashSet;
 
 /// Hyperdrive binding name: must match `[hyperdrive]` in
-/// `wrangler.toml.example`.
+/// `wrangler.toml`.
 pub const LIBRARY_DB_BINDING: &str = "LIBRARY_DB";
 
 /// Shared finite deadline (ms) for one library-database operation: the

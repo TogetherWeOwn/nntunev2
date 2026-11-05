@@ -31,6 +31,10 @@ nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
 # Shared SSRF address guard + test vectors (single owner with the ingest
 # fetch guards; never fork the predicate).
 nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard" }
+# Shared NZB parser for admin ingest validation (default-features off:
+# no TLS transport in this worker's graph; same shape as
+# workers/ingest).
+nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
@@ -64,6 +68,8 @@ name = "session_refresh_postgres"
 required-features = ["postgres-tests"]
 
 [dev-dependencies]
+# Cross-seam persisted source conformance uses the real pure producer.
+nntune-ingest = { version = "0.1.0", path = "../ingest" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 # Test-only RNG for the KEK rotation acceptance fixtures (native tests only;
@@ -76,3 +82,9 @@ rand = "0.8"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+
+# Standalone crate (also excluded in the parent workspace manifest): declaring
+# itself a workspace root keeps the upward workspace walk from escaping into
+# whatever checkout happens to contain this directory (cargo's own suggested
+# fix). No behavior change at a repo-root checkout.
+[workspace]

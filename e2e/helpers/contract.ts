@@ -18,6 +18,7 @@ export const TESTIDS = {
   byopUser: 'byop-user',
   byopPass: 'byop-pass',
   byopTls: 'byop-tls',
+  byopConnections: 'byop-connections',
   byopTest: 'byop-test-connection',
   byopSave: 'byop-save',
   byopStatus: 'byop-status',
@@ -26,9 +27,45 @@ export const TESTIDS = {
   libraryItem: 'library-item',
   libraryList: 'library-list',
   libraryStaleBadge: 'library-stale-badge',
+  trackContextMenu: 'track-context-menu',
+  trackMore: 'track-more',
+  favoriteMore: 'favorite-more',
+  trackSelectionToolbar: 'track-selection-toolbar',
+  queueDropTarget: 'queue-drop-target',
+  queueMore: 'queue-more',
+  queueSelectionToolbar: 'queue-selection-toolbar',
+  // Player contract across the app-shell redesign (design spec v1): the
+  // audio element keeps this hook (its native `controls` go away), the
+  // usage meter keeps its hook (rail footer XOR library page, never
+  // both), and the identity/transport hooks below (today in the demo
+  // player) move to the persistent player bar. See helpers/player-ui.ts
+  // and e2e/README.md ("Player contract migration").
   audioPlayer: 'audio-player',
   usageMeter: 'usage-meter',
+  nowPlaying: 'now-playing',
+  playerNext: 'player-next',
+  queuePanel: 'queue-panel',
   planLimitNotice: 'plan-limit-notice',
+  // App-shell hooks (design spec v1, W10 build): the top bar exists in both
+  // shells (app + public header); the rail, tab bar and mini-player are
+  // app-shell only, all declared in the root layout.
+  shellTopbar: 'shell-topbar',
+  shellRail: 'shell-rail',
+  shellTabbar: 'shell-tabbar',
+  miniPlayer: 'mini-player',
+} as const;
+
+// UI hooks the player-bar build (design spec v1) must render; declared now
+// so the dual-generation drivers can target them the moment they exist.
+// Deliberately NOT in TESTIDS yet: the web contract test
+// (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to be
+// declared in route markup, and these land with their build — move each key
+// into TESTIDS (and map its route there) in the PR that renders it.
+export const PENDING_TESTIDS = {
+  playerBar: 'player-bar',
+  playerPlayPause: 'player-play-pause',
+  playerSeek: 'player-seek',
+  playerVolume: 'player-volume',
 } as const;
 
 // API endpoints (relative to STAGING_BASE_URL).
@@ -46,7 +83,7 @@ export const API = {
   // Staging-only emailed-code retrieval seam (paired staging-seam build slice):
   // returns the issued signup code for an `example.test` mailbox without
   // minting an account. Fail-closed without the staging flag; absent in
-  // production. A renamed path fails the wizard-arrival spec with this key
+  // production. A renamed path fails the signup-arrival spec with this key
   // named.
   testCodes: '/api/test-codes',
   // API Worker auth-start routes that spend the shared per-IP start budget
@@ -74,8 +111,8 @@ export const API = {
   // served as `application/manifest+json`). A renamed path fails the
   // served-routes spec with this key named.
   manifest: '/manifest.webmanifest',
-  // Legacy provider-setup entry point (`apps/web/src/routes/onboarding/provider/+server.ts`,
-  // 307-redirects to `/onboarding/byop`). A renamed path fails the
+  // Retired provider-setup entry point (the route and the BYOP wizard are
+  // gone; both resolve to the app 404). A resurrected path fails the
   // served-routes spec with this key named.
   onboardingProvider: '/onboarding/provider',
   // Public plans page (`apps/web/src/routes/pricing/+page.svelte`).
@@ -86,8 +123,16 @@ export const API = {
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
 export const PLAN_LIMIT_STATUSES = [402, 429] as const;
 
-/** Server limit codes that satisfy a plan-limit refusal (docs/api-errors.md). */
-export const PLAN_LIMIT_CODES = ['plan_limit_exceeded', 'rate_limited'] as const;
+/**
+ * Server codes that satisfy a plan-limit/play-gate refusal
+ * (docs/api-errors.md): the monthly-cap code, the rate-limit/concurrency
+ * code, and the spec §4 subscription gate code.
+ */
+export const PLAN_LIMIT_CODES = [
+  'plan_limit_exceeded',
+  'rate_limited',
+  'subscription_required',
+] as const;
 
 /**
  * A named secret that must never appear in a plan-limit response body.
