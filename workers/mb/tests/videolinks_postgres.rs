@@ -5,6 +5,9 @@ use nntune_mb::videolinks::harvest::{
     admit_mirror_pages, HarvestError, MirrorCursor, MirrorHarvestError, PgMirrorSource,
     MAX_MIRROR_PAGES_PER_RUN, MAX_MIRROR_ROWS_PER_PAGE,
 };
+use nntune_mb::videolinks::moderation::{
+    PgSubmissionStore, SubmissionStoreError, MAX_PENDING_SUBMISSIONS,
+};
 use nntune_mb::videolinks::storage::{
     CandidateStoreError, PgCandidateStore, MAX_LINKS_PER_RECORDING, MAX_RECORDINGS_PER_READ,
 };
@@ -12,7 +15,7 @@ use nntune_mb::videolinks::validation::{
     refresh_due, BatchValidation, PgValidationStore, ValidationClient, ValidationError,
     ValidationResponse, ValidationStore, MAX_VALIDATIONS_PER_RUN,
 };
-use nntune_mb::videolinks::{Candidate, VideoSource, VALIDATION_TTL_S};
+use nntune_mb::videolinks::{Candidate, SubmissionStatus, VideoSource, VALIDATION_TTL_S};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -1061,6 +1064,247 @@ async fn mirror_admission_contract(db: &mut Client, config: &Config) {
     assert_eq!(states(db).await.len(), 406);
 }
 
+async fn submission_store_contract(db: &mut Client, config: &Config) {
+    reset_candidates(db).await;
+    db.batch_execute("DELETE FROM public.video_user_submissions")
+        .await
+        .unwrap();
+    let mbid = "ABCDEF01-2345-6789-ABCD-0123456789AB";
+    let mut store = PgSubmissionStore::new(db);
+    assert_eq!(
+        store.submit(mbid, "invalid", "fixture-user").await,
+        Err(SubmissionStoreError::InvalidInput)
+    );
+    assert!(store.pending().await.unwrap().is_empty());
+    let approved = store
+        .submit(mbid, "https://youtu.be/v0000000000", "fixture-user")
+        .await
+        .unwrap();
+    let rejected = store
+        .submit(mbid, "v0000000001", "other-user")
+        .await
+        .unwrap();
+    let queued = store.pending().await.unwrap();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].id, approved);
+    assert_eq!(queued[0].recording_mbid, mbid.to_ascii_lowercase());
+    assert_eq!(queued[0].video_id, "v0000000000");
+    assert_eq!(queued[0].submitted_by, "fixture-user");
+    assert!(
+        states(db).await.is_empty(),
+        "pending submissions never promote"
+    );
+    let mut store = PgSubmissionStore::new(db);
+    assert_eq!(
+        store.decide(&approved, true, Some(" ")).await,
+        Err(SubmissionStoreError::InvalidInput)
+    );
+    assert_eq!(
+        store
+            .decide(
+                &approved.to_ascii_uppercase(),
+                true,
+                Some("matched recording")
+            )
+            .await,
+        Ok(SubmissionStatus::Approved)
+    );
+    assert_eq!(
+        store
+            .decide(&rejected, false, Some("wrong recording"))
+            .await,
+        Ok(SubmissionStatus::Rejected)
+    );
+    for id in [&approved, &rejected, "00000000-0000-0000-0000-000000000099"] {
+        for approve in [true, false] {
+            assert_eq!(
+                store.decide(id, approve, Some("must not overwrite")).await,
+                Err(SubmissionStoreError::NotPending)
+            );
+        }
+    }
+    assert!(store.pending().await.unwrap().is_empty());
+    let rows = states(db).await;
+    assert_eq!(rows.len(), 1, "rejection does not promote");
+    assert_eq!(rows[0].0, "v0000000000");
+    assert_eq!(rows[0].1, "pending");
+    assert_eq!((rows[0].2.clone(), rows[0].3, rows[0].4), (None, 0, 0));
+    let row = db
+        .query_one("SELECT source FROM public.video_link_candidates", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "user_submission");
+    let row = db
+        .query_one(
+            "SELECT status, reason, decided_at IS NOT NULL FROM public.video_user_submissions
+         WHERE id = $1::text::uuid",
+            &[&approved],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "approved");
+    assert_eq!(row.get::<_, String>(1), "matched recording");
+    assert!(row.get::<_, bool>(2));
+
+    db.batch_execute(
+        "UPDATE public.video_link_candidates SET source = 'mb_url', status = 'validated',
+         title = 'retained title', channel_id = 'retained channel', duration_secs = 123,
+         embeddable = true, validated_at = 1700000000, expires_at = 1702592000",
+    )
+    .await
+    .unwrap();
+    let before = db
+        .query_one(
+            "SELECT row_to_json(c)::text FROM public.video_link_candidates c",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+    let mut store = PgSubmissionStore::new(db);
+    let duplicate = store
+        .submit(mbid, "v0000000000", "fixture-user")
+        .await
+        .unwrap();
+    store.decide(&duplicate, true, None).await.unwrap();
+    let after = db
+        .query_one(
+            "SELECT row_to_json(c)::text FROM public.video_link_candidates c",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+    assert_eq!(
+        before, after,
+        "approval cannot reset provenance, validation, TTL or timestamps"
+    );
+
+    let failed = PgSubmissionStore::new(db)
+        .submit(mbid, "v0000000007", "fixture-user")
+        .await
+        .unwrap();
+    db.batch_execute(
+        "ALTER TABLE public.video_link_candidates ADD CONSTRAINT refuse_submission
+         CHECK (video_id <> 'v0000000007')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PgSubmissionStore::new(db)
+            .decide(&failed, true, Some("must roll back"))
+            .await,
+        Err(SubmissionStoreError::Store)
+    );
+    let row = db
+        .query_one(
+            "SELECT status, reason IS NULL, decided_at IS NULL
+         FROM public.video_user_submissions WHERE id = $1::text::uuid",
+            &[&failed],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "pending");
+    assert!(row.get::<_, bool>(1));
+    assert!(row.get::<_, bool>(2));
+    assert_eq!(states(db).await.len(), 1);
+    db.batch_execute("ALTER TABLE public.video_link_candidates DROP CONSTRAINT refuse_submission")
+        .await
+        .unwrap();
+    PgSubmissionStore::new(db)
+        .decide(&failed, true, None)
+        .await
+        .unwrap();
+    assert_eq!(states(db).await.len(), 2);
+
+    let contested = PgSubmissionStore::new(db)
+        .submit(mbid, "v0000000008", "fixture-user")
+        .await
+        .unwrap();
+    let mut competitor = connect(config).await;
+    let other_id = contested.clone();
+    let other = tokio::spawn(async move {
+        PgSubmissionStore::new(&mut competitor)
+            .decide(&other_id, false, None)
+            .await
+    });
+    let first = PgSubmissionStore::new(db)
+        .decide(&contested, true, None)
+        .await;
+    let second = other.await.unwrap();
+    assert!(
+        matches!(
+            (first, second),
+            (
+                Ok(SubmissionStatus::Approved),
+                Err(SubmissionStoreError::NotPending)
+            ) | (
+                Err(SubmissionStoreError::NotPending),
+                Ok(SubmissionStatus::Rejected)
+            )
+        ),
+        "exactly one concurrent decision wins"
+    );
+    let row = db
+        .query_one(
+            "SELECT status = 'approved', EXISTS (
+             SELECT 1 FROM public.video_link_candidates WHERE video_id = 'v0000000008'
+         ) FROM public.video_user_submissions WHERE id = $1::text::uuid",
+            &[&contested],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, bool>(0), row.get::<_, bool>(1));
+
+    let locked = PgSubmissionStore::new(db)
+        .submit(mbid, "v0000000009", "fixture-user")
+        .await
+        .unwrap();
+    let mut locker = connect(config).await;
+    let lock = locker.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT id FROM public.video_user_submissions WHERE id = $1::text::uuid FOR UPDATE",
+        &[&locked],
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        PgSubmissionStore::new(db).decide(&locked, true, None).await,
+        Err(SubmissionStoreError::Store)
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        PgSubmissionStore::new(db).pending().await.unwrap()[0].id,
+        locked
+    );
+    PgSubmissionStore::new(db)
+        .decide(&locked, false, None)
+        .await
+        .unwrap();
+
+    db.batch_execute(
+        "INSERT INTO public.video_user_submissions
+         (id, recording_mbid, video_id, submitted_by, created_at)
+         SELECT ('20000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid,
+                'abcdef01-2345-6789-abcd-0123456789ab', 'v0000000000', 'fixture-user',
+                '2020-01-01'::timestamptz FROM generate_series(1, 55) AS i",
+    )
+    .await
+    .unwrap();
+    let mut store = PgSubmissionStore::new(db);
+    let queue = store.pending().await.unwrap();
+    assert_eq!(queue.len(), MAX_PENDING_SUBMISSIONS as usize);
+    assert_eq!(queue[0].id, "20000000-0000-0000-0000-000000000001");
+    assert_eq!(queue[49].id, "20000000-0000-0000-0000-000000000050");
+    store.decide(&queue[0].id, false, None).await.unwrap();
+    let queue = store.pending().await.unwrap();
+    assert_eq!(queue.len(), MAX_PENDING_SUBMISSIONS as usize);
+    assert_eq!(queue[0].id, "20000000-0000-0000-0000-000000000002");
+    assert_eq!(queue[49].id, "20000000-0000-0000-0000-000000000051");
+}
+
 #[test]
 fn postgres_validation_store_contract() {
     let url = std::env::var("NNTUNE_VIDEOLINKS_TEST_DATABASE_URL")
@@ -1100,6 +1344,7 @@ fn postgres_validation_store_contract() {
                 fresh_link_read_contract(&mut db).await;
                 mirror_harvest_contract(&mut db, &config).await;
                 mirror_admission_contract(&mut db, &config).await;
+                submission_store_contract(&mut db, &config).await;
             })
             .await
             .expect("bounded PostgreSQL acceptance");

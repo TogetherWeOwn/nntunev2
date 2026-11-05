@@ -2,7 +2,7 @@
 //!
 //! These primitives do not activate a source reader or public route. The caller
 //! must supply the app database, a trusted clock, and trusted external-source
-//! provenance. User submissions require a separate atomic moderation path.
+//! provenance. User submissions use the separate atomic `moderation` adapter.
 
 use super::{dedupe_candidates, is_valid_video_id, Candidate, VideoSource, VALIDATION_TTL_S};
 use serde::Serialize;

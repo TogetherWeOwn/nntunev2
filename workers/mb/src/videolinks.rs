@@ -27,6 +27,7 @@
 //! tests. See `docs/videolinks-pipeline.md` for remaining integration work.
 
 pub mod harvest;
+pub mod moderation;
 pub mod storage;
 pub mod validation;
 

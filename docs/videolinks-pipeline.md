@@ -14,8 +14,9 @@ curation service. `validation/http.rs` supplies an inactive Worker HTTP
 client requiring a runtime Secret. `storage.rs` supplies bounded external
 candidate admission and fresh-link database reads. `harvest.rs` supplies a
 read-only paged MusicBrainz mirror source and a bounded runner that admits
-its pages into the app store. No route, schedule or database binding calls
-these adapters yet.
+its pages into the app store. `moderation.rs` supplies a persistent pending
+queue and atomic decision/promotion in the app database. No route, schedule
+or database binding calls these adapters yet.
 
 `refresh_due` purges expired API-returned fields before contacting the
 validation client, requests at most 200 distinct IDs in four 50-ID batches,
@@ -90,8 +91,9 @@ validated for another recording. The whole write is atomic.
 This method trusts the caller to establish external source provenance
 and licence eligibility; it is **not a user-submission endpoint**. It
 refuses `user_submission` inputs instead of trusting an approval flag.
-Persistent approval and candidate promotion still need their own atomic,
-authorized moderation path. Source readers are not wired by this adapter.
+Persistent approval and candidate promotion use the separate atomic
+`PgSubmissionStore` described below; moderator authorization remains the
+future route's responsibility. Source readers are not wired by this adapter.
 
 `fresh_links` accepts at most 50 recording MBIDs and returns at most five
 links per distinct recording, ordered by source priority, validation time
@@ -184,8 +186,10 @@ an invalid-only first page, idempotent replay, source timeout and a later
 atomic admission failure with earlier commits retained and cursor-based
 recovery. The two test connections share the disposable database only to
 supply both fixtures; that is not evidence of deployed connection isolation.
-Execution of this runner increment awaits exact-head Actions; no local
-test/build or live verification is claimed.
+The [MB Rust](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42018801274/job/127216082156)
+and [PostgreSQL](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42018801274/job/127216081546)
+jobs passed at `7d953371d712507907cabbb68d2a0cb09ff3cda1`. Web E2E was
+still running when recorded; no aggregate or live verification is claimed.
 
 ### PostgreSQL acceptance boundary
 
@@ -271,11 +275,40 @@ API-returned fields. Only video IDs may persist long-term.
 
 ## Moderation queue
 
-`normalise_submission` accepts a video ID or a YouTube URL.
-`decide_submission` permits `pending` → `approved` / `rejected` and rejects
-re-deciding terminal states. Persistent enforcement still needs an atomic
-conditional write, moderator authorization and approval-only harvesting;
-the enum transition alone is not a deployed moderation queue.
+`PgSubmissionStore` is an inactive adapter over migration 0035's app-side
+submission table. `submit` accepts one canonical recording MBID, an ID or
+recognized URL (at most 2048 input bytes), and a trusted session-derived
+submitter identifier (1–128 bytes, non-blank, no control characters). It
+stores only the normalized ID, never the raw URL or API metadata. Duplicate
+submissions remain separate pending entries; this primitive does not provide
+request idempotency, abuse controls, recording existence checks or quotas.
+
+`pending` returns at most 50 oldest pending rows, with a deterministic ID
+tie-break. No API display metadata is fetched. It is a moderator worklist,
+not a public feed. `decide` conditionally updates only a pending row, records
+a database decision time and optional single-line reason (1–1024 bytes),
+and promotes an approval to the candidate table in the **same transaction**.
+Rejection never promotes. A new candidate starts pending validation; approval
+is not evidence that an ID is playable. Conflicts preserve an existing
+candidate's stronger provenance, metadata, validation, TTL and timestamps.
+
+Competing decisions have at most one winner. Missing and terminal rows both
+return `NotPending`, and terminal decisions cannot be changed through this
+adapter. Failed promotion rolls back the decision. Each SQL statement uses
+a 1.5-second timeout; there is no in-call retry. A lost commit acknowledgement
+still has an unknown outcome: a replay's `NotPending` cannot identify which
+moderator/decision won. The current schema records submitter, reason and
+decision time, **not moderator identity**; it is not a full moderation audit
+log or a database-wide prohibition on other writers changing terminal rows.
+
+Callers must authenticate the submitter, authorize every queue read and
+decision, and enforce request/rate/duplicate limits before using this store.
+No authenticated route or runtime binding is added here. Two native input
+fixtures plus the expanded disposable-PostgreSQL contract cover normalization,
+pending exclusion, approval/rejection, terminal replay, existing-candidate
+preservation, constraint-induced rollback, competing decisions, lock timeout
+and worklist bounds/progression. Execution of this increment awaits exact-head
+Actions; no local tests/builds or deployed moderation acceptance are claimed.
 
 ## Coverage report
 
