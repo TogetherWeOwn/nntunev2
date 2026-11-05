@@ -989,6 +989,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nntune-ingest"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "futures-util",
+ "hex",
+ "http",
+ "nntune-core",
+ "nntune-logging",
+ "nntune-ssrf-guard",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sha2",
+ "tokio-postgres",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
 name = "nntune-logging"
 version = "0.1.0"
 dependencies = [

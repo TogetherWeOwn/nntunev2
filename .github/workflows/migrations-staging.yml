@@ -4,9 +4,9 @@ name: migrations-staging
 # database itself: the staging-api deploy gate compares the
 # `schema_migrations` rows with migrations/manifest.toml (docs/ops.md,
 # "Staging migrations"). This secretless per-PR check covers the one
-# thing the database cannot know: a PR that renames a migration file
-# must record the original name+sha as `renamed_from` in the manifest,
-# or the already-applied staging row becomes unrecognisable.
+# thing the database cannot know: pinned source lineage. Source history
+# never supplies applied proof; byte-identical applied aliases remain
+# separate, and differing historical rows must still fail staging.
 # Required check; keep the JOB name `migrations-staging`.
 
 on:
@@ -18,7 +18,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: read # Read the PR file list to validate migration rename history.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -43,15 +43,25 @@ jobs:
         if: github.event_name == 'merge_group'
         run: |
           echo "migrations-staging: merge_group vacuous pass (renames checked on PR)"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out trusted checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
-          # Full history so intra-PR renames (renamed in an early PR
-          # commit, invisible in the base..head file list) are visible
-          # to `git log --find-renames` below.
+          # The immutable trusted base supplies executable code and imports.
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-checker
+      - name: Check out pinned PR evidence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          # Data only: never run scripts, setup or builds from this checkout.
+          # Full ancestry supplies every per-parent edge and the pinned base.
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-data
           fetch-depth: 0
-      - name: Check migration rename history
+      - name: Collect pinned PR API evidence
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,14 +71,40 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          # filename<TAB>previous_filename, so each rename stays paired.
-          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
-            --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$RUNNER_TEMP/pr-files"
-          # The PR file list only diffs base..head; a file created and
-          # renamed within the PR shows as a plain add there. Union in
-          # every rename any PR commit performed.
-          git log --find-renames --format= --name-status "$BASE_SHA..$HEAD_SHA" \
-            | awk -F '\t' '$1 ~ /^R/ { print $3 "\t" $2 }' >> "$RUNNER_TEMP/pr-files"
-          sort -u "$RUNNER_TEMP/pr-files" -o "$RUNNER_TEMP/pr-files"
-          python3 .github/scripts/migrations_rename_check.py \
-            --files-file "$RUNNER_TEMP/pr-files"
+          # Keep both coverage sources. Complete API pages cover net PR
+          # changes; the checker independently collects every per-parent
+          # Git rename, including files created then renamed within the PR.
+          # Metadata pins the API response and detects the 3000-file cap.
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr-metadata.json"
+          gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
+            > "$RUNNER_TEMP/pr-files.json"
+      - name: Check migration rename history
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ runner.temp }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Git config here is action-created, never supplied by the PR tree.
+          # Ignore ambient global/system config and disable executable hooks.
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_VALUE_0: /dev/null
+          GIT_CONFIG_KEY_1: core.fsmonitor
+          GIT_CONFIG_VALUE_1: 'false'
+        run: |
+          set -euo pipefail
+          # -I drops cwd, PYTHONPATH and user-site imports. Add only the
+          # trusted base's module directory (checker + stdlib-only history).
+          # Missing trusted code or evidence fails; never fall back to PR code.
+          python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts" \
+            --root "$GITHUB_WORKSPACE/pr-data" \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --files-file "$RUNNER_TEMP/pr-files.json" \
+            --metadata-file "$RUNNER_TEMP/pr-metadata.json" <<'PY'
+          import sys
+          sys.path.insert(0, sys.argv.pop(1))
+          from migrations_rename_check import main
+          sys.exit(main())
+          PY

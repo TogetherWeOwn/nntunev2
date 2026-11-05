@@ -3,18 +3,18 @@ import { stagingBaseUrl } from '../helpers/access.js';
 import {
   annotateSignupPath,
   applyAccountToPage,
-  submitPublicUiSignupToLibrary,
+  submitPublicUiSignupToBilling,
 } from '../helpers/accounts.js';
 
-// Library-arrival leg for roadmap M1 traceability row 1: proves the real
-// `/signup` form reaches `/library` via a WebAuthn virtual authenticator
+// Billing-arrival leg for roadmap M1 traceability row 1: proves the real
+// `/signup` form reaches `/account/billing` via a WebAuthn virtual authenticator
 // plus the staging-only emailed-code retrieval seam
 // (`POST /api/test-codes`, paired staging-seam build slice).
 //
 // - File-level skip: pre-deploy (no STAGING_BASE_URL) the whole file skips
 //   without launching a browser. See health.spec.ts.
 // - QA_AUTH_TOKEN guard: the seam needs it. Missing token skips locally and
-//   fails closed on CI (a skip on CI would leave library arrival never
+//   fails closed on CI (a skip on CI would leave billing arrival never
 //   exercised while the job stays green).
 // - Seam-absent failure signature (documented on the card): with the token
 //   set but the seam not yet deployed, the helper throws
@@ -33,20 +33,20 @@ test.skip(
   'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.',
 );
 
-test('public UI signup with virtual authenticator reaches the library', async ({
+test('public UI signup with virtual authenticator reaches billing', async ({
   page,
   request,
 }, testInfo) => {
-  const baseURL = stagingBaseUrl('skip', 'library-arrival');
+  const baseURL = stagingBaseUrl('skip', 'billing-arrival');
   if (!baseURL) {
     test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
     return;
   }
   if (!process.env.QA_AUTH_TOKEN) {
     const reason =
-      'library-arrival needs QA_AUTH_TOKEN + POST /api/test-codes ' +
+      'billing-arrival needs QA_AUTH_TOKEN + POST /api/test-codes ' +
       '(staging code seam) — refusing to pass silently on CI.';
-    if (process.env.CI) throw new Error(`[library-arrival] ${reason}`);
+    if (process.env.CI) throw new Error(`[billing-arrival] ${reason}`);
     test.skip(true, reason);
     return;
   }
@@ -58,13 +58,15 @@ test('public UI signup with virtual authenticator reaches the library', async ({
   // Must precede the first navigation.
   await applyAccountToPage(page, null, baseURL);
   // Full form flow: email submit → seam code → virtual-passkey finish →
-  // library arrival asserted inside the helper. Diagnostics name no values.
-  await submitPublicUiSignupToLibrary(page, request, baseURL);
+  // billing arrival asserted inside the helper. Diagnostics name no values.
+  await submitPublicUiSignupToBilling(page, request, baseURL);
   // Belt-and-braces arrival assertion at the spec level (the helper already
-  // waits for and asserts both): the landed URL plus the library heading.
-  expect(page.url(), 'public UI signup did not land on the library').toContain('/library');
+  // checks the authenticated no-subscription state): URL, heading and action.
+  expect(page.url(), 'public UI signup did not land on billing').toContain('/account/billing');
   await expect(
     page.getByRole('heading', { level: 1 }),
-    'library heading not visible after public UI signup',
-  ).toContainText('Library', { timeout: 15_000 });
+    'billing heading not visible after public UI signup',
+  ).toContainText('Billing', { timeout: 15_000 });
+  await expect(page.getByText('to see your billing.', { exact: false })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'See plans', exact: true })).toBeVisible();
 });

@@ -14,13 +14,13 @@ worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
 worker-pinned-tls = ["worker-transport", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:nntune-ssrf-guard"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 crc32fast = "1"
 quick-xml = "0.42"
 sha2 = "0.11"
 hmac = "0.13"
 subtle = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 md5 = "0.8"
 aes = "0.9"
 cbc = "0.2"
@@ -59,6 +59,10 @@ harness = false
 
 [[bench]]
 name = "par2_nzb"
+harness = false
+
+[[bench]]
+name = "par2_create"
 harness = false
 
 [lib]
