@@ -210,12 +210,12 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   while the staging legs prove liveness and fail-closed denial behind the
   Access edge with the Access pair only and no app session
   (`e2e/tests/api-worker-anonymous.spec.ts:531` "GET /healthz answers 200 with ok:true and no session",
-  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/vault answers the generic 401",
+  `e2e/tests/api-worker-anonymous.spec.ts:565` "anonymous GET /v1/plans answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:586` "anonymous POST /v1/session/refresh answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:613` "anonymous POST /v1/session/revoke-all answers the generic 401",
   `e2e/tests/api-worker-anonymous.spec.ts:637` "GET unknown worker path answers the 404 not_found envelope",
   `e2e/tests/api-worker-anonymous.spec.ts:656` "anonymous OPTIONS preflight is answered by Access and never reaches the Worker"):
-  `GET /healthz` answers 200 with ok true, the vault read and both session
+  `GET /healthz` answers 200 with ok true, the plans read and both session
   mutations answer the generic 401 with no cookie set, and the unknown path
   answers the not_found envelope — each leg first clears the Access-wall
   check so an edge denial can never masquerade as Worker evidence, with
