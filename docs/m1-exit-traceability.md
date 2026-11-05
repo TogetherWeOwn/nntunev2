@@ -368,8 +368,8 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
     still applies), while genuine finish failures and other ceremony
     errors keep their exact current messages and login stays
     non-enumerating.
-  - `apps/web/tests/smoke.spec.ts` — pins the landing BYOP copy with
-    working signup/pricing CTAs, the health/readiness endpoints,
+  - `apps/web/tests/smoke.spec.ts` — pins landing account-plan copy,
+    no BYOP promise, working signup/pricing CTAs, health/readiness endpoints,
     contract routes rendering their e2e hooks, signup/login/magic-link
     basics.
   - `apps/web/tests/retired-routes.spec.ts` — pins `/onboarding/byop`,

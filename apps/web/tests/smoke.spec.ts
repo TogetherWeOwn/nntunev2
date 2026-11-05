@@ -9,12 +9,13 @@ async function ensurePasskeysSupported(page: Page): Promise<void> {
 	});
 }
 
-test('landing explains BYOP and links to signup and pricing', async ({ page, request }) => {
+test('landing explains account plans and links to signup and pricing', async ({ page, request }) => {
 	await page.goto('/');
 
 	await expect(page.getByRole('heading', { level: 1 })).toContainText('NNTune');
 	// \s+ because SSR may wrap the copy across lines.
-	await expect(page.getByRole('main')).toContainText(/bring your\s+own/i);
+	await expect(page.getByRole('main')).toContainText(/choose an\s+account plan/i);
+	await expect(page.getByRole('main')).not.toContainText(/bring your\s+own|\bBYOP\b/i);
 	await expect(page.getByRole('link', { name: /get started/i })).toHaveAttribute('href', '/signup');
 	await expect(page.getByRole('link', { name: /plans/i }).first()).toHaveAttribute(
 		'href',
