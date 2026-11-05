@@ -32,11 +32,41 @@ newer committed validation. Expiry cleanup retains the internal validation
 timestamp for that comparison. The adapter must never receive `MB_DB`.
 
 `migrations/0035_videolinks_curation.sql` still proposes the three app-side
-tables; its manifest entry does not establish a staging apply. The runner
-fixtures exercise the orchestration and serialization, not PostgreSQL
-execution, streaming HTTP, a deployed TTL schedule or live validation.
-Without an active schedule and measured cleanup throughput, the adapter
-alone does not establish metadata deletion within 30 days.
+tables; its manifest entry does not establish a staging apply. Runner
+fixtures exercise orchestration and serialization. The feature-gated
+`videolinks_postgres` acceptance target exercises the actual adapter and
+unchanged migration against Actions' disposable PostgreSQL 18 service,
+not staging or live YouTube. Its exact-head job result is required before
+claiming SQL execution verified. Neither fixture target proves streaming
+HTTP or a deployed TTL schedule. Without an active schedule and measured
+cleanup throughput, the adapter alone does not establish metadata deletion
+within 30 days.
+
+### PostgreSQL acceptance boundary
+
+The required `api-migrations` job creates a dedicated empty
+`nntune_videolinks_ci` database and runs the explicit `postgres-tests`
+feature / `videolinks_postgres` target. Missing configuration, a non-local
+host/hostaddr, a different database name or existing curation tables fails
+closed; no application credential is used. The tests apply/replay the real
+migration and call `PgValidationStore`, rather than copying its SQL into a
+second implementation. They cover shared IDs, rejected/missing videos,
+metadata round trips, exact-boundary cleanup, refresh-ahead selection,
+queue limits, stale/same-second writes, constraint-induced batch rollback,
+row-lock statement timeouts and earlier-batch persistence after API failure.
+The whole database contract has a 30-second deadline. This target does not
+run in ordinary database-free MB tests; the MB Clippy lane includes it.
+
+Only native test dependencies enable Tokio runtime/TCP features. Existing
+Tokio/PostgreSQL versions remain pinned; the added Mio lock entry matches
+the API worker's existing pin. Reviewed exact cached manifests for Tokio,
+Tokio PostgreSQL, Mio and socket2 declare no build script, build dependency
+or proc-macro. No new lifecycle-hook exemption is added. Cargo provides no
+stable native release-age filter or blanket build-script/proc-macro disable;
+these residual gaps remain. Locked dependency resolution, compilation and
+test evidence come from isolated Actions jobs, not a local build. The host's
+nested-worktree Cargo metadata refusal is not worked around by moving the
+checkout or changing workspace membership.
 
 Still required before feature acceptance:
 
