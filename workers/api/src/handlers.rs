@@ -7608,10 +7608,12 @@ where
         ("GET", "/v1/artists") => catalogue_artists(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/releases") => catalogue_releases(ctx, req, bearer_user.as_deref()).await,
         ("GET", "/v1/tracks") => catalogue_tracks(ctx, req, bearer_user.as_deref()).await,
-        // Single-segment release ids only; deeper shapes (including the
-        // reserved `/v1/releases/{mbid}/art` path, whose reader has not
-        // landed) 404 inside the handler, and stay hidden on preflight too.
-        ("GET", path) if path.starts_with("/v1/releases/") => {
+        // Unserved nested release paths never reach authentication or stores.
+        ("GET", path)
+            if path
+                .strip_prefix("/v1/releases/")
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/')) =>
+        {
             catalogue_release(ctx, req, bearer_user.as_deref()).await
         }
         // Single-segment credential ids only; deeper shapes 404 inside
@@ -14012,6 +14014,190 @@ mod tests {
         );
         assert_eq!(no_session.status, 422);
         assert!(h.store.playback_leases.borrow().is_empty());
+    }
+
+    /// Real session/credential issuance through `handle`, with an entitled
+    /// user and optionally an existing lease and metered window. No live I/O.
+    fn play_bearer_harness(scope: &str, occupied: bool) -> (Harness, String, String) {
+        let mut h = play_harness();
+        h.config = h.config.with_native_rest_pepper(vec![7u8; 32], 1);
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": [scope], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201, "credential issuance status");
+        let body: serde_json::Value = serde_json::from_str(&minted.body).unwrap();
+        let secret = mint_secret(&body);
+        if occupied {
+            let issued = play_call(
+                &h,
+                &cookie,
+                serde_json::json!({"track_id": "track-9", "session_id": "existing-tab"}),
+            );
+            assert_eq!(issued.status, 200, "session grant positive control");
+            let issued: serde_json::Value = serde_json::from_str(&issued.body).unwrap();
+            let window = crate::ledger::prepare_play_window(
+                "user-plays-1",
+                "track-9",
+                issued["play_id"].as_str().unwrap(),
+                100,
+                Some(1000),
+                Some(100_000),
+                NOW,
+            )
+            .unwrap();
+            block_on(h.store.record_play_window(&window)).unwrap();
+        }
+        (h, cookie, secret)
+    }
+
+    fn assert_play_bearer_refused(
+        h: &Harness,
+        secret: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        body: &[u8],
+        status: u16,
+    ) {
+        let leases = h.store.playback_leases.borrow().clone();
+        let windows = h.store.play_windows.borrow().clone();
+        let seconds = h.store.stream_seconds.borrow().clone();
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/plays".to_string(),
+            cookie: cookie.map(str::to_string),
+            origin: origin.map(str::to_string),
+            authorization: Some(format!("Bearer {secret}")),
+            stripe_signature: None,
+            body: body.to_vec(),
+        };
+        let resp = block_on(handle(&h.ctx(), &req));
+        assert_eq!(resp.status, status, "play-grant refusal status");
+        let expected = match status {
+            401 => generic_auth(),
+            403 => scope_forbidden(),
+            404 => not_found(),
+            _ => panic!("unexpected refusal status"),
+        };
+        assert!(resp.body == expected.body, "exact names-only refusal body");
+        assert!(resp.set_cookie.is_none());
+        assert!(!resp.body.contains("\"grant\""));
+        assert_eq!(*h.store.playback_leases.borrow(), leases);
+        assert_eq!(*h.store.play_windows.borrow(), windows);
+        assert_eq!(*h.store.stream_seconds.borrow(), seconds);
+    }
+
+    #[test]
+    fn play_issue_in_scope_bearer_requires_origin_and_session() {
+        for occupied in [false, true] {
+            for (has_cookie, origin) in [
+                (false, None),
+                (false, Some(ORIGIN)),
+                (true, None),
+                (true, Some("https://wrong-origin.example")),
+            ] {
+                // Also pin ordering before configuration/body validation:
+                // an unconfigured minter + malformed body must still be 401.
+                for configured in [true, false] {
+                    let (mut h, cookie, secret) = play_bearer_harness("plays:write", occupied);
+                    if !configured {
+                        h.config.play_grant_secret = None;
+                    }
+                    let valid_body = serde_json::json!({
+                        "track_id": "track-9", "session_id": "new-tab", "takeover": true,
+                    })
+                    .to_string();
+                    let body = if configured {
+                        valid_body.as_bytes()
+                    } else {
+                        b"{"
+                    };
+                    assert_play_bearer_refused(
+                        &h,
+                        &secret,
+                        has_cookie.then_some(cookie.as_str()),
+                        origin,
+                        body,
+                        401,
+                    );
+                    let rows =
+                        block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(
+                        rows[0].last_used_at,
+                        Some(NOW),
+                        "scope gate admitted bearer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn play_issue_valid_wrong_scope_is_403_before_session_dispatch() {
+        for occupied in [false, true] {
+            for with_session in [false, true] {
+                let (h, cookie, secret) = play_bearer_harness("library:read", occupied);
+                assert_play_bearer_refused(
+                    &h,
+                    &secret,
+                    with_session.then_some(cookie.as_str()),
+                    with_session.then_some(ORIGIN),
+                    b"{",
+                    403,
+                );
+                let rows = block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                assert_eq!(rows[0].last_used_at, None, "wrong scope not admitted");
+            }
+        }
+    }
+
+    #[test]
+    fn play_issue_invalid_bearers_are_plain_404_without_cookie_rescue() {
+        for occupied in [false, true] {
+            for with_session in [false, true] {
+                for kind in ["malformed", "unknown", "revoked", "expired"] {
+                    let (h, cookie, minted) = play_bearer_harness("plays:write", occupied);
+                    let rows =
+                        block_on(h.store.native_credentials_for_user("user-plays-1")).unwrap();
+                    let secret = match kind {
+                        "malformed" => "ntk_bad-shape".to_string(),
+                        "unknown" => format!("ntk_{}", "0".repeat(43)),
+                        "revoked" => {
+                            block_on(h.store.revoke_native_credential(
+                                &rows[0].record.id,
+                                "user-plays-1",
+                                NOW,
+                            ))
+                            .unwrap();
+                            minted
+                        }
+                        "expired" => {
+                            h.store
+                                .native_credentials
+                                .borrow_mut()
+                                .get_mut(&rows[0].record.id)
+                                .unwrap()
+                                .record
+                                .expires_at = NOW - 1;
+                            minted
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_play_bearer_refused(
+                        &h,
+                        &secret,
+                        with_session.then_some(cookie.as_str()),
+                        with_session.then_some(ORIGIN),
+                        br#"{"track_id":"track-9","session_id":"new-tab","takeover":true}"#,
+                        404,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -22810,6 +22996,40 @@ mod tests {
                 body[0]
             );
         }
+    }
+
+    #[test]
+    fn catalogue_nested_release_gets_spend_no_bearer_budget_or_lookup() {
+        let h = peppered_harness();
+        let before_pairs = *h.store.rate_limit_pair_calls.borrow();
+        let before_lookups = *h.store.native_credential_lookups.borrow();
+        let unknown = format!("Bearer ntk_{}", "0".repeat(43));
+        for path in [
+            "/v1/releases/".to_string(),
+            format!("/v1/releases/{CAT_RELEASE}/art"),
+            format!("/v1/releases/{CAT_RELEASE}/tracks/extra"),
+            "/v1/releases//".to_string(),
+        ] {
+            for header in [
+                None,
+                Some("Bearer ntk_short".to_string()),
+                Some(unknown.clone()),
+            ] {
+                let resp = h.call_bearer("GET", &path, header);
+                assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+                assert_eq!(
+                    resp.body,
+                    r#"{"code":"not_found","message":"not found","retryable":false}"#
+                );
+            }
+        }
+        assert_eq!(*h.store.rate_limit_pair_calls.borrow(), before_pairs);
+        assert_eq!(*h.store.native_credential_lookups.borrow(), before_lookups);
+        // A served single-segment shape proves the harness observes the gate.
+        let resp = h.call_bearer("GET", &format!("/v1/releases/{CAT_RELEASE}"), Some(unknown));
+        assert_eq!(resp.status, 404);
+        assert!(*h.store.rate_limit_pair_calls.borrow() > before_pairs);
+        assert!(*h.store.native_credential_lookups.borrow() > before_lookups);
     }
 
     #[test]

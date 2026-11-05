@@ -12,6 +12,34 @@ Read `README.md` (architecture choices are normative there), `AGENTS.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, and the ADRs in `docs/adr/` for the area
 changed. Do not invent conventions they do not state.
 
+## Before you flag a security issue
+
+- Require a concrete exploit path at the exact reviewed commit: who the
+  attacker is, which input they control, and what they gain. Cite the file
+  and lines where protection is missing; do not publish exploit steps or
+  payloads. Follow the private-report rule below for existing vulnerabilities.
+- First check documented design: ADRs, README, module docs, and the PR body.
+  Explicitly intended behavior is not a security finding; raise disagreement
+  with that design as a non-blocking question instead.
+- Trace earlier protections: middleware, size caps, signature checks,
+  server-only creation, and allowlists. The Security exception below covers
+  a concrete path with an unverified step, not hypothetical hardening.
+- Without an exploit path, "could log", "might leak", and defence-in-depth
+  suggestions are analysis, not security, and Non-severe at most; apply Skip.
+
+Examples grounded in this repository:
+
+- **Real-finding pattern (conditional, not a present defect):** a new NZB
+  ingestion path that lets an untrusted supplier feed uncapped input to the
+  XML reader would enable memory exhaustion. Identify the reachable caller
+  and missing cap, not just a large-input possibility. Today
+  `crates/nntune-core/src/nzb.rs` wraps input in `BoundedReader` before XML
+  parsing (`Parser::parse`), limiting event-buffer growth.
+- **False alarm:** no account session on the billing webhook is intentional,
+  not an authentication bypass. `workers/api/src/handlers.rs::billing_webhook`
+  verifies the raw-body signature before touching state, using
+  `workers/api/src/stripe.rs::verify_webhook_signature`, as ADR 0005 requires.
+
 ## What merits a finding
 
 Report blocking defects only: concrete correctness, security, data-integrity,

@@ -107,9 +107,13 @@ test.describe('ci-ok aggregate', () => {
   for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
-      const needs = JSON.stringify({ placeholder: { result: 'success' }, 'e2e-lint': { result } }, null, 2);
+      const needs = JSON.stringify({
+        placeholder: { result: 'success' },
+        'public-pr-security': { result: 'success' },
+        'e2e-lint': { result },
+      }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs });
+      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
@@ -949,7 +953,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
     expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
-    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
     const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
@@ -1028,7 +1032,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
     for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
       const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
-      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      const calls = [...workflow.matchAll(/uses: [.$]\/\.github\/workflows\/e2e-staging\.yml\b/g)].length;
       expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
     }
   });
@@ -1527,7 +1531,15 @@ test.describe('generated staging API Tail config (offline)', () => {
     return JSON.parse(result.stdout) as Record<string, unknown>;
   }
 
-  function generateConfig(overrides: Record<string, string> = {}) {
+  // Dummy shared-mirror inventory: the same id in both environments, for the
+  // api worker (the generator's mirror pin reads it) and the mb worker.
+  const MB_INVENTORY = `[[worker.binding]]
+binding = "MB_DB"
+staging = "dummy-mb-mirror"
+prod = "dummy-mb-mirror"
+`;
+
+  function generateConfig(overrides: Record<string, string> = {}, manifestMb: string | null = MB_INVENTORY) {
     const probe = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'staging-api-config-'));
     try {
       const apiDir = join(probe, 'workers/api');
@@ -1542,7 +1554,10 @@ name = "api"
 [[worker.binding]]
 binding = "HYPERDRIVE"
 staging = "dummy-hyperdrive-staging"
-`);
+${manifestMb ?? ''}
+[[worker]]
+name = "mb"
+${MB_INVENTORY}`);
       const section = jobSection(deployWorkflow, 'staging-api');
       const parts = section.split('      - name: Generate staging wrangler.toml\n');
       expect(parts, 'exactly one staging API config generator').toHaveLength(2);
@@ -1555,6 +1570,7 @@ staging = "dummy-hyperdrive-staging"
         API_RP_ID_STAGING: 'staging.nntune.com',
         API_RP_ORIGIN_STAGING: 'https://staging.nntune.com',
         HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-staging',
+        HYPERDRIVE_ID_MB: 'dummy-mb-mirror',
         ...overrides,
       }, apiDir);
       const configPath = join(apiDir, 'wrangler.toml');
@@ -1602,6 +1618,7 @@ staging = "dummy-hyperdrive-staging"
           name: 'nntune-api-staging',
           routes: [
             { pattern: 'staging.nntune.com/v1/*', zone_name: 'nntune.com' },
+            { pattern: 'staging.nntune.com/api/library', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-codes', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/api/test-accounts', zone_name: 'nntune.com' },
             { pattern: 'staging.nntune.com/healthz', zone_name: 'nntune.com' },
@@ -1615,7 +1632,10 @@ staging = "dummy-hyperdrive-staging"
             QA_CODE_SEAM: '1',
           },
           observability: { enabled: true, head_sampling_rate: 1 },
-          hyperdrive: [{ binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' }],
+          hyperdrive: [
+            { binding: 'HYPERDRIVE', id: 'dummy-hyperdrive-staging' },
+            { binding: 'MB_DB', id: 'dummy-mb-mirror' },
+          ],
         },
       },
     });
@@ -1635,6 +1655,7 @@ staging = "dummy-hyperdrive-staging"
 
   for (const [name, overrides, diagnostic] of [
     ['wrong inventory id', { HYPERDRIVE_ID_STAGING: 'dummy-other-hyperdrive' }, 'HYPERDRIVE_ID_STAGING must equal the api staging inventory id'],
+    ['wrong mirror id', { HYPERDRIVE_ID_MB: 'dummy-other-mirror' }, 'HYPERDRIVE_ID_MB must equal the api MB_DB inventory id'],
     ['stale host', { API_RP_ID_STAGING: 'obsolete.example', API_RP_ORIGIN_STAGING: 'https://obsolete.example' }, 'API_RP_ID_STAGING must equal the staging RP ID'],
     ['noncanonical origin', { API_RP_ORIGIN_STAGING: 'https://staging.nntune.com/' }, 'API_RP_ORIGIN_STAGING must be the canonical serialized origin'],
     ['non-https origin', { API_RP_ORIGIN_STAGING: 'http://staging.nntune.com' }, 'API_RP_ORIGIN_STAGING must be https'],
@@ -1646,6 +1667,19 @@ staging = "dummy-hyperdrive-staging"
       expect(result.toml).toBeUndefined();
     });
   }
+
+  test('generator rejects a manifest without the api MB_DB binding before writing deploy config', () => {
+    const result = generateConfig({}, null);
+    expect(result.status).not.toBe(0);
+    expect(result.toml).toBeUndefined();
+  });
+
+  test('generator rejects a non-shared api MB_DB inventory before writing deploy config', () => {
+    const result = generateConfig({}, MB_INVENTORY.replace('prod = "dummy-mb-mirror"', 'prod = "dummy-prod-mirror"'));
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('api MB_DB must name the shared mirror id in both environments');
+    expect(result.toml).toBeUndefined();
+  });
 
   // Hand-derived TOML controls test the same assertion as the real output.
   // Parse outside toThrow so syntax errors cannot count as caught regressions.
@@ -1901,7 +1935,13 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       'API_RP_ID_STAGING must equal the staging RP ID (staging.nntune.com)',
     );
     expect(section).toMatch(
-      /^[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n/m,
+      /^(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/v1\/\*"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/library"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-codes"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/test-accounts"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/healthz"\n[ \t]+zone_name = "nntune\.com"\n(?:[ \t]*#[^\n]*\n)*[ \t]*\[\[env\.staging\.routes\]\]\n[ \t]+pattern = "\$\{API_RP_ID_STAGING\}\/api\/ingest"\n[ \t]+zone_name = "nntune\.com"\n/m,
+    );
+    // Shared mirror binding, generated from HYPERDRIVE_ID_MB and pinned to
+    // the api MB_DB manifest inventory id.
+    expect(section).toContain('HYPERDRIVE_ID_MB must equal the api MB_DB inventory id');
+    expect(section).toMatch(
+      /^[ \t]*\[\[env\.staging\.hyperdrive\]\]\n[ \t]+binding = "MB_DB"\n[ \t]+id = "\$\{HYPERDRIVE_ID_MB\}"\n/m,
     );
   };
 
@@ -2189,8 +2229,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
     // gate must never pass --allow-skip in a real deploy.
     const allowSkipMutant = jobsBody.replace(
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING" --allow-skip',
     );
     // Api lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
@@ -2473,6 +2513,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       weakenedRegexMutant,
       weakenedExactHostMutant,
     ]) {
+      expect(mutant, 'mutation must change the workflow').not.toBe(jobsBody);
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.

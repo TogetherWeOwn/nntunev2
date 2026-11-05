@@ -55,6 +55,7 @@ function runShell(script: string, env: Record<string, string>) {
 const sourceSha = '0123456789abcdef0123456789abcdef01234567';
 const dummyVars = {
   HYPERDRIVE_ID_STAGING: 'dummy-hyperdrive-value',
+  HYPERDRIVE_ID_MB: 'dummy-mirror-value',
   API_RP_ID_STAGING: 'dummy-rp-id-value',
   API_RP_ORIGIN_STAGING: 'https://dummy-origin.invalid',
 };
@@ -86,7 +87,7 @@ function assertWiring(source: string) {
   }
   for (const [name, id, condition] of [
     ['Hyperdrive cache-disabled gate', 'hyperdrive', "steps.config.outputs.configured == 'true'"],
-    ['Verify actual staging session schema (read-only)', 'schema', "steps.config.outputs.configured == 'true'"],
+    ['Verify actual staging migration schema (read-only)', 'schema', "steps.config.outputs.configured == 'true'"],
     ['Deploy api to staging', 'deploy', "steps.config.outputs.configured == 'true' && steps.schema.outcome == 'success'"],
   ]) {
     const section = step(name!, source);
@@ -94,9 +95,9 @@ function assertWiring(source: string) {
     expect(section).toContain(`        if: ${condition}\n`);
     expect(section).not.toMatch(/always\(\)|failure\(\)|cancelled\(\)/);
   }
-  expect(step('Verify actual staging session schema (read-only)', source))
+  expect(step('Verify actual staging migration schema (read-only)', source))
     .toContain('run: python3 .github/scripts/staging_api_schema_gate.py');
-  expect(source.indexOf('- name: Verify actual staging session schema (read-only)'))
+  expect(source.indexOf('- name: Verify actual staging migration schema (read-only)'))
     .toBeLessThan(source.indexOf('- name: Deploy api to staging'));
   expect(step('Generate staging wrangler.toml', source)).toContain("        if: steps.config.outputs.configured == 'true'\n");
   expect(source).not.toContain('continue-on-error:');
@@ -125,9 +126,9 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     }
   });
 
-  // All seven incomplete combinations preserve safe skip, even though the
+  // All fifteen incomplete combinations preserve safe skip, even though the
   // preflight and job may succeed. Values must never enter the summary.
-  for (let mask = 0; mask < 7; mask++) {
+  for (let mask = 0; mask < 15; mask++) {
     test(`missing public vars (mask ${mask}) cannot report deployed`, () => {
       const vars = Object.fromEntries(Object.entries(dummyVars).filter((_, index) => mask & (1 << index)));
       const config = runShell(shell(step('Check api staging configuration')), vars);
@@ -178,7 +179,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     const { SCHEMA_OUTCOME: _schemaOutcome, ...env } = positive;
     const result = runShell(shell(reporter), env);
     expect(result.output).toBe('deployed=false\noutcome=failed\nsource_sha=\n');
-    expect(result.summary).toContain('Read-only session schema gate: not-run');
+    expect(result.summary).toContain('Read-only migration schema gate: not-run');
     expect(result.summary).not.toContain(sourceSha);
   });
 
@@ -189,7 +190,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
     expect(result.output).toBe(`deployed=true\noutcome=deployed\nsource_sha=${sourceSha}\n`);
     expect(result.summary).toContain('deployment outcome: deployed');
     expect(result.summary).toContain('Hyperdrive cache-disabled gate: success');
-    expect(result.summary).toContain('Read-only session schema gate: success');
+    expect(result.summary).toContain('Read-only migration schema gate: success');
     expect(result.summary).toContain('Deploy api to staging: success');
     expect(result.summary).toContain(`Source SHA: ${sourceSha}`);
     expect(result.summary).toContain(`BUILD_SHA var: ${sourceSha}`);

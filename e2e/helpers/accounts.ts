@@ -211,6 +211,27 @@ function throwOnRedirect(status: number, headers: Record<string, string>, contex
 }
 
 /**
+ * Playwright transport/setup errors include request URLs and header values.
+ * Replace the whole error, never its message/stack/cause, before it reaches
+ * a textual failure reporter. Method is a fixed label; even caller context
+ * is excluded here. Redirect errors are checked outside this boundary so
+ * their existing value-free diagnostics stay intact. Traces remain off:
+ * this only protects propagated errors, not Playwright's internal API steps.
+ */
+async function credentialedTransport(
+  method: 'GET' | 'POST' | 'OPTIONS',
+  send: () => Promise<APIResponse>,
+): Promise<APIResponse> {
+  try {
+    return await send();
+  } catch {
+    throw new Error(
+      `[api] credentialed ${method} request transport failed (names only — no values logged).`,
+    );
+  }
+}
+
+/**
  * Credentialed GET that never follows redirects with headers.
  * Fetches with maxRedirects: 0 so a staging 302 to another origin is
  * returned as-is (foreign origin receives zero requests); a 3xx throws
@@ -223,11 +244,13 @@ export async function apiGet(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.get(url, {
-    headers,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('GET', () =>
+    request.get(url, {
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
@@ -244,12 +267,14 @@ export async function apiPost(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.post(url, {
-    headers,
-    data: data as Record<string, unknown>,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('POST', () =>
+    request.post(url, {
+      headers,
+      data: data as Record<string, unknown>,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }
@@ -268,12 +293,14 @@ export async function apiOptions(
   context: string,
   opts?: { timeout?: number },
 ): Promise<APIResponse> {
-  const res = await request.fetch(url, {
-    method: 'OPTIONS',
-    headers,
-    timeout: opts?.timeout ?? 30_000,
-    maxRedirects: 0,
-  });
+  const res = await credentialedTransport('OPTIONS', () =>
+    request.fetch(url, {
+      method: 'OPTIONS',
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
   throwOnRedirect(res.status(), res.headers(), context);
   return res;
 }

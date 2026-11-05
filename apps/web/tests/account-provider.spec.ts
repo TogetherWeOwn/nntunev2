@@ -83,8 +83,9 @@ test('account navigation links to the saved-provider page and shows the configur
 	await expect(page.locator('main')).toContainText(CONFIGURED_TEXT);
 	await expect(page.getByRole('button', { name: /test saved provider/i })).toBeEnabled();
 	await expect(page.getByRole('button', { name: /remove saved provider/i })).toBeEnabled();
-	// No secret is ever asked for again on this surface.
-	await expect(page.locator('input')).toHaveCount(0);
+	// No secret is ever asked for again on this surface (scoped to the
+	// page main: the app-shell top bar carries its own search field).
+	await expect(page.getByRole('main').locator('input')).toHaveCount(0);
 });
 
 test('shows the not-configured state with no test or remove actions', async ({ page }) => {
@@ -95,7 +96,8 @@ test('shows the not-configured state with no test or remove actions', async ({ p
 	await expect(page.locator('main')).toContainText(/no saved provider|not configured/i);
 	await expect(page.getByRole('button', { name: /test saved provider/i })).toHaveCount(0);
 	await expect(page.getByRole('button', { name: /remove saved provider/i })).toHaveCount(0);
-	await expect(page.locator('input')).toHaveCount(0);
+	// Page main only: the app-shell top bar carries its own search field.
+	await expect(page.getByRole('main').locator('input')).toHaveCount(0);
 });
 
 test('shows a loading state while the summary is in flight, then settles', async ({ page }) => {
@@ -433,7 +435,8 @@ test('secret sentinels never reach the DOM, storage or console, and no save/rota
 	expect(storageDump).not.toContain(SECRET_SENTINEL);
 	expect(consoleTexts.join('\n')).not.toContain(SECRET_SENTINEL);
 	expect(vaultMethods).not.toContain('PUT');
-	await expect(page.locator('input')).toHaveCount(0);
+	// Page main only: the app-shell top bar carries its own search field.
+	await expect(page.getByRole('main').locator('input')).toHaveCount(0);
 });
 
 test('a retest response held past navigation cannot restore a stale status', async ({ page }) => {

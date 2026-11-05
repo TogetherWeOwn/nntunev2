@@ -87,7 +87,7 @@ jobs:
       - name: Plan the CalVer release
         id: plan
         continue-on-error: true
-        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # shared CalVer releaser
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
         with:
           request: ${{ steps.request.outputs.request }}
           runs-on-json: '"ubuntu-latest"'
@@ -107,7 +107,7 @@ jobs:
       - name: Plan the CalVer release (retry)
         id: plan-retry
         if: ${{ !cancelled() && steps.plan.outcome == 'failure' }}
-        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # shared CalVer releaser
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
         with:
           request: ${{ steps.request.outputs.request }}
           runs-on-json: '"ubuntu-latest"'
@@ -149,7 +149,7 @@ jobs:
         id: publish
         continue-on-error: true
         if: ${{ !cancelled() && steps.publish-request.outcome == 'success' }}
-        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # shared CalVer releaser
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
         with:
           request: ${{ steps.publish-request.outputs.request }}
           runs-on-json: '"ubuntu-latest"'
@@ -171,7 +171,7 @@ jobs:
       - name: Tag the deployed commit and publish its release (retry)
         id: publish-retry
         if: ${{ !cancelled() && steps.publish.outcome == 'failure' && steps.publish-retry-request.outcome == 'success' }}
-        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # shared CalVer releaser
+        uses: TogetherWeOwn/.github/actions/calver@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
         with:
           request: ${{ steps.publish-retry-request.outputs.request }}
           runs-on-json: '"ubuntu-latest"'

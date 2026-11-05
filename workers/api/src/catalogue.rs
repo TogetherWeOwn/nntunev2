@@ -299,9 +299,12 @@ pub struct TrackResponse {
 /// unmatched rows; `title`/`artist`/`release` are `None` exactly when the
 /// mirror has nothing (unmatched ingest, or a match the mirror does not
 /// carry). `art_url` is `Some` only for well-formed release MBIDs.
+/// `occurrence_key` identifies the job/array position for rendering and cache
+/// deduplication; the legacy playback `id` is deliberately unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LibraryEntry {
     pub id: String,
+    pub occurrence_key: String,
     pub recording_mbids: Vec<String>,
     pub release_mbid: Option<String>,
     pub title: Option<String>,
@@ -375,6 +378,7 @@ pub fn library_entry(row: &LibraryDbRow) -> LibraryEntry {
             .recording_mbid
             .clone()
             .unwrap_or_else(|| row.job_id.clone()),
+        occurrence_key: format!("{}:{}", row.job_id, row.recording_ord),
         recording_mbids: row.recording_mbids.clone(),
         release_mbid: row.release_mbid.clone(),
         title: row.recording_title.clone(),
@@ -555,18 +559,7 @@ pub fn assemble_library_rows(
 ///   of job recency).
 ///
 pub fn library_page_statement() -> &'static str {
-    "SELECT l.job_id, l.release_mbid, l.recording_mbids, u.recording_mbid, u.recording_ord, \
-     (l.release_mbid IS NULL) AS matched_last \
-     FROM library l \
-     LEFT JOIN LATERAL (SELECT value AS recording_mbid, ord AS recording_ord \
-     FROM unnest(l.recording_mbids) WITH ORDINALITY AS u2(value, ord)) AS u ON true \
-     WHERE l.user_id = $1 AND coalesce(cardinality(l.recording_mbids), 0) > 0 \
-     UNION ALL \
-     SELECT l.job_id, l.release_mbid, l.recording_mbids, NULL::text AS recording_mbid, \
-     0::bigint AS recording_ord, (l.release_mbid IS NULL) AS matched_last \
-     FROM library l \
-     WHERE l.user_id = $1 AND coalesce(cardinality(l.recording_mbids), 0) = 0 \
-     ORDER BY matched_last ASC, job_id DESC, recording_ord ASC LIMIT $2"
+    include_str!("library_page.sql").trim_end()
 }
 
 /// Mirror recording enrichment for one library page: titles and durations
@@ -878,6 +871,34 @@ mod tests {
             artist_mbid: Some("artist-artist-artist-artist-artist00".to_string()),
             artist_name: Some("New Order".to_string()),
         }
+    }
+
+    #[test]
+    fn library_occurrences_have_distinct_keys_and_unchanged_stream_ids() {
+        let first = library_row();
+        let mut repeated = first.clone();
+        repeated.recording_ord = 2;
+        let mut other_job = first.clone();
+        other_job.job_id = "job-2".to_string();
+        let entries: Vec<_> = [&first, &repeated, &other_job]
+            .into_iter()
+            .map(library_entry)
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.occurrence_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-1:1", "job-1:2", "job-2:1"]
+        );
+        for entry in entries {
+            let json = serde_json::to_value(entry).unwrap();
+            assert_eq!(json["id"], GOOD_MBID);
+            assert_eq!(json["recording_mbids"], serde_json::json!([GOOD_MBID]));
+            assert_eq!(json["release_mbid"], GOOD_RELEASE);
+            assert!(json["occurrence_key"].as_str().is_some());
+        }
+        assert_eq!(library_entry(&first), library_entry(&first));
     }
 
     #[test]

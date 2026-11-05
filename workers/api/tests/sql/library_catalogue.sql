@@ -31,7 +31,7 @@
 -- recordings on that release. Rust assembly (`assemble_library_rows`,
 -- including repeated-recording positions) is likewise pinned by the
 -- `catalogue` unit tests; this file pins the SQL halves: the page's
--- EMITTED order (read back with `row_number() over ()`, never re-sorted),
+-- EMITTED order (observed directly in the production query's cursor),
 -- verbatim pass-through, probe contents including the exact-pair tracks
 -- probe, the membership reads (distinct member values, case-insensitive
 -- detail gate), the LIMIT bound, per-user isolation, the three
@@ -40,9 +40,15 @@
 
 BEGIN;
 
+-- The harness supplies the same file that library_page_statement includes.
+-- Missing input is a psql error, never a skipped production-query check.
+CREATE TEMPORARY TABLE catalogue_query (sql TEXT NOT NULL);
+INSERT INTO catalogue_query VALUES (:'library_page_sql');
+
 DO $$
 DECLARE
     actual TEXT[];
+    page_row RECORD;
     row_count_var INTEGER;
 BEGIN
     INSERT INTO users (id, email, created_at)
@@ -126,31 +132,23 @@ BEGIN
            '{11111111-1111-2222-3333-444444444444}'::text[]
     FROM generate_series(1, 55) AS g;
 
-    -- Library page for user-lib-1: the exact `library_page_statement`
-    -- shape (literals stand in for $1/$2). App relations only — no
-    -- mirror table is named here.
-    CREATE TEMPORARY TABLE lib_page AS
-    SELECT l.job_id, l.release_mbid, l.recording_mbids, u.recording_mbid, u.recording_ord,
-           (l.release_mbid IS NULL) AS matched_last
-    FROM library l
-    LEFT JOIN LATERAL (SELECT value AS recording_mbid, ord AS recording_ord
-           FROM unnest(l.recording_mbids) WITH ORDINALITY AS u2(value, ord)) AS u ON true
-    WHERE l.user_id = 'user-lib-1' AND coalesce(cardinality(l.recording_mbids), 0) > 0
-    UNION ALL
-    SELECT l.job_id, l.release_mbid, l.recording_mbids, NULL::text AS recording_mbid,
-           0::bigint AS recording_ord, (l.release_mbid IS NULL) AS matched_last
-    FROM library l
-    WHERE l.user_id = 'user-lib-1' AND coalesce(cardinality(l.recording_mbids), 0) = 0
-    ORDER BY matched_last ASC, job_id DESC, recording_ord ASC LIMIT 50;
-
-    -- EMITTED order pin: `row_number() over ()` with no outer ORDER BY
-    -- numbers rows in emission sequence, so this fails if the statement
-    -- ever stops emitting matched-first (job DESC), album order within a
-    -- job, and the unmatched upload last. Unlike an array_agg with its
-    -- own ORDER BY, nothing here can mask the statement's own ordering.
-    SELECT array_agg(job_id || ':' || recording_ord::text ORDER BY seq) INTO actual
-    FROM (SELECT row_number() OVER () AS seq, job_id, recording_ord FROM lib_page) s;
-    IF actual <> ARRAY['lib-job-F:1', 'lib-job-E:1', 'lib-job-D:1', 'lib-job-B:1',
+    CREATE TEMPORARY TABLE lib_page (
+        job_id TEXT, release_mbid TEXT, recording_mbids TEXT[],
+        recording_mbid TEXT, recording_ord BIGINT, matched_last BOOLEAN
+    );
+    -- Observe the production query's result sequence directly. Accumulate
+    -- before storing rows for the content checks: a later table scan or
+    -- sorted aggregate cannot hide a broken production ORDER BY.
+    actual := ARRAY[]::TEXT[];
+    FOR page_row IN EXECUTE (SELECT sql FROM catalogue_query)
+        USING 'user-lib-1'::text, 50::bigint
+    LOOP
+        actual := array_append(actual, page_row.job_id || ':' || page_row.recording_ord::text);
+        INSERT INTO lib_page VALUES (page_row.job_id, page_row.release_mbid,
+            page_row.recording_mbids, page_row.recording_mbid,
+            page_row.recording_ord, page_row.matched_last);
+    END LOOP;
+    IF actual IS DISTINCT FROM ARRAY['lib-job-F:1', 'lib-job-E:1', 'lib-job-D:1', 'lib-job-B:1',
                        'lib-job-A:1', 'lib-job-A:2', 'lib-job-A:3',
                        'lib-job-C:0'] THEN
         RAISE EXCEPTION 'library page emission order wrong: %', actual;
@@ -166,7 +164,7 @@ BEGIN
     -- cast): normalization before probing is the store's job.
     SELECT array_agg(release_mbid) INTO actual
     FROM (SELECT release_mbid FROM lib_page WHERE job_id = 'lib-job-E') s;
-    IF actual <> ARRAY['AAAAAAAA-1111-2222-3333-444444444444'] THEN
+    IF actual IS DISTINCT FROM ARRAY['AAAAAAAA-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'uppercase release MBID did not pass through: %', actual;
     END IF;
 
@@ -195,7 +193,7 @@ BEGIN
         SELECT mbid::text AS recording_mbid, title AS recording_title, duration_ms
         FROM mb_recording WHERE mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444,99999999-1111-2222-3333-444444444444}'::uuid[])
     ) s;
-    IF actual <> ARRAY['11111111-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['11111111-1111-2222-3333-444444444444',
                        '22222222-1111-2222-3333-444444444444',
                        '33333333-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'recordings probe content wrong: %', actual;
@@ -219,7 +217,7 @@ BEGIN
         ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
         ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT 50
     ) s;
-    IF actual <> ARRAY['aaaaaaaa-1111-2222-3333-444444444444:1',
+    IF actual IS DISTINCT FROM ARRAY['aaaaaaaa-1111-2222-3333-444444444444:1',
                        'aaaaaaaa-1111-2222-3333-444444444444:2',
                        'aaaaaaaa-1111-2222-3333-444444444444:3',
                        'dddddddd-1111-2222-3333-444444444444:1'] THEN
@@ -246,7 +244,7 @@ BEGIN
         SELECT medium_no, track_no FROM mb_track
         WHERE release_mbid = 'aaaaaaaa-1111-2222-3333-444444444444'::uuid
     ) s;
-    IF actual <> ARRAY['1.1', '1.2', '1.3', '1.4'] THEN
+    IF actual IS DISTINCT FROM ARRAY['1.1', '1.2', '1.3', '1.4'] THEN
         RAISE EXCEPTION 'occurrence positions wrong: %', actual;
     END IF;
 
@@ -261,7 +259,7 @@ BEGIN
         FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid
         WHERE r.mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[])
     ) s;
-    IF actual <> ARRAY['aaaaaaaa-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['aaaaaaaa-1111-2222-3333-444444444444',
                        'dddddddd-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'releases probe content wrong: %', actual;
     END IF;
@@ -286,7 +284,7 @@ BEGIN
         WHERE user_id = 'user-lib-1' AND release_mbid IS NOT NULL
         ORDER BY release_mbid ASC
     ) s;
-    IF actual <> ARRAY['AAAAAAAA-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['AAAAAAAA-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444',
                        'bbbbbbbb-1111-2222-3333-444444444444',
                        'dddddddd-1111-2222-3333-444444444444',
@@ -303,7 +301,7 @@ BEGIN
         AND coalesce(cardinality(l.recording_mbids), 0) > 0
         ORDER BY release_mbid ASC, recording_mbid ASC
     ) s;
-    IF actual <> ARRAY['AAAAAAAA-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['AAAAAAAA-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444:11111111-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444:22222222-1111-2222-3333-444444444444',
                        'aaaaaaaa-1111-2222-3333-444444444444:33333333-1111-2222-3333-444444444444',
@@ -326,7 +324,7 @@ BEGIN
           AND coalesce(cardinality(l.recording_mbids), 0) > 0
         ORDER BY recording_mbid ASC
     ) s;
-    IF actual <> ARRAY['11111111-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['11111111-1111-2222-3333-444444444444',
                        '22222222-1111-2222-3333-444444444444',
                        '33333333-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'member release recordings wrong: %', actual;
@@ -371,7 +369,7 @@ BEGIN
         WHERE user_id = 'user-lib-2' AND release_mbid IS NOT NULL
         ORDER BY release_mbid ASC
     ) s;
-    IF actual <> ARRAY['aaaaaaaa-1111-2222-3333-444444444444'] THEN
+    IF actual IS DISTINCT FROM ARRAY['aaaaaaaa-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'user-lib-2 member releases wrong: %', actual;
     END IF;
 
@@ -447,7 +445,7 @@ BEGIN
         WHERE r.mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444,bbbbbbbb-1111-2222-3333-444444444444,dddddddd-1111-2222-3333-444444444444}'::uuid[]))
         ORDER BY mbid ASC LIMIT 50
     ) s;
-    IF actual <> ARRAY['eeeeeeee-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['eeeeeeee-1111-2222-3333-444444444444',
                        'ffffffff-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'artist collection order wrong: %', actual;
     END IF;
@@ -458,7 +456,7 @@ BEGIN
         WHERE r.mbid = ANY('{aaaaaaaa-1111-2222-3333-444444444444}'::uuid[]))
         ORDER BY mbid ASC LIMIT 50
     ) s;
-    IF actual <> ARRAY['ffffffff-1111-2222-3333-444444444444'] THEN
+    IF actual IS DISTINCT FROM ARRAY['ffffffff-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'user-lib-2 artist collection wrong: %', actual;
     END IF;
 
@@ -509,7 +507,7 @@ BEGIN
           ON t.release_mbid = p.rel AND t.recording_mbid = p.rec
         ORDER BY t.release_mbid ASC, t.medium_no ASC, t.track_no ASC LIMIT 50
     ) s;
-    IF actual <> ARRAY['1', '2', '3', '1'] THEN
+    IF actual IS DISTINCT FROM ARRAY['1', '2', '3', '1'] THEN
         RAISE EXCEPTION 'track collection order wrong: %', actual;
     END IF;
     -- user-lib-2's single member pair probes exactly one occurrence: one
@@ -558,7 +556,7 @@ BEGIN
           AND t.recording_mbid = ANY('{11111111-1111-2222-3333-444444444444,22222222-1111-2222-3333-444444444444,33333333-1111-2222-3333-444444444444}'::uuid[])
         ORDER BY t.medium_no ASC, t.track_no ASC, rec.mbid ASC LIMIT 1000
     ) s;
-    IF actual <> ARRAY['11111111-1111-2222-3333-444444444444',
+    IF actual IS DISTINCT FROM ARRAY['11111111-1111-2222-3333-444444444444',
                        '22222222-1111-2222-3333-444444444444',
                        '33333333-1111-2222-3333-444444444444'] THEN
         RAISE EXCEPTION 'release tracks order wrong: %', actual;

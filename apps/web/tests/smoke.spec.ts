@@ -82,8 +82,8 @@ test('security.txt is served at the canonical RFC 9116 path', async ({ request }
  * All API states below are Playwright route mocks — no live provider call.
  *
  * Always-rendered (plain navigation): app-root, signup-email, signup-submit,
- * byop-host, byop-port, byop-user, byop-pass, byop-tls, usage-meter,
- * import-file, import-status.
+ * byop-host, byop-port, byop-user, byop-pass, byop-tls, usage-meter.
+ * (User NZB import retired: no import-file/import-status hooks.)
  *
  * Conditional (seeded states): signup-error (mocked 500 register/start),
  * byop-test-connection (wizard advanced to step 3), byop-save + byop-status
@@ -100,7 +100,7 @@ test('security.txt is served at the canonical RFC 9116 path', async ({ request }
  * bottom of this file.
  */
 test('contract routes resolve and render their e2e hooks', async ({ page, request }) => {
-	for (const href of ['/signup', '/onboarding/byop', '/library', '/library/import']) {
+	for (const href of ['/signup', '/onboarding/byop', '/library']) {
 		const response = await request.get(href);
 		expect(response.status(), `${href} should not 404`).not.toBe(404);
 		expect(response.ok()).toBe(true);
@@ -132,15 +132,9 @@ test('contract routes resolve and render their e2e hooks', async ({ page, reques
 	await page.goto('/library');
 	await expect(page.getByTestId('usage-meter')).toBeVisible();
 
-	await page.goto('/library/import');
-	const fileInput = page.getByTestId('import-file');
-	await expect(fileInput).toBeAttached();
-	await fileInput.setInputFiles({
-		name: 'smoke.nzb',
-		mimeType: 'application/x-nzb',
-		buffer: Buffer.from('<?xml version="1.0"?><nzb></nzb>')
-	});
-	await expect(page.getByTestId('import-status')).toBeVisible();
+	// User NZB import retired: the route is gone, so no
+	// import-file/import-status hooks render anywhere.
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
 });
 
 test('contract signup error hook renders when account start fails', async ({ page }) => {
@@ -351,13 +345,14 @@ test('wizard hides save until a connection test passes', async ({ page }) => {
 });
 
 /**
- * Acceptance: validated, honest library + import UI.
+ * Acceptance: validated, honest library UI.
  *
  * OWNERSHIP: the tests from here to the end of this file are
  * acceptance-owned. The paired build card lands the route changes on top
  * of this branch and must make them pass WITHOUT editing them; a wrong
- * test comes back to the acceptance card instead. The validator half is
- * `apps/web/src/lib/library/import-validation.test.ts`.
+ * test comes back to the acceptance card instead.
+ * (User NZB import retired: the import acceptance tests that
+ * lived here were deleted with the route.)
  *
  * Honest-copy shape pinned here (exact wording is the builder's):
  * user-facing "not available yet" text, no internal slice/roadmap words,
@@ -367,8 +362,6 @@ test('wizard hides save until a connection test passes', async ({ page }) => {
 const NOT_AVAILABLE_YET = /not (yet )?available|isn'?t available|not available yet/i;
 const INTERNAL_OR_PROMISING =
 	/\bslice\b|lands with|coming soon|stay tuned|will be available/i;
-const CLAIMS_UPLOAD_OR_PROCESSING =
-	/file received|has been uploaded|upload(ed|ing)? (complete|successful)|is being processed|processing your/i;
 
 test('library renders no audio element while the selected track has no stream URL', async ({
 	page
@@ -405,78 +398,25 @@ test('library usage copy is honest not-available-yet text', async ({ page }) => 
 	await expect(page.getByRole('main')).not.toContainText(INTERNAL_OR_PROMISING);
 });
 
-test('import rejects empty, oversized and wrong-extension files with an alert and no upload request', async ({
-	page
-}) => {
-	const cases = [
-		{
-			label: 'zero-byte .nzb',
-			name: 'empty.nzb',
-			buffer: Buffer.alloc(0),
-			message: /empty|no data|0 bytes/i
-		},
-		{
-			label: 'one byte over the 2 MiB intake cap',
-			name: 'huge.nzb',
-			buffer: Buffer.alloc(2 * 1024 * 1024 + 1),
-			message: /too (large|big)|size|limit|exceed|maximum|2\s?(mb|mib)/i
-		},
-		{
-			label: 'wrong extension',
-			name: 'notes.txt',
-			buffer: Buffer.from('not an nzb'),
-			message: /nzb|extension|type/i
-		}
-	];
+test('retired user NZB import accepts no upload or URL anywhere', async ({ page }) => {
+	// No user route accepts an NZB upload or URL. The route is
+	// gone (404), the shell carries no import link, and no import hooks
+	// render on any remaining route.
+	const gone = await page.goto('/library/import');
+	expect(gone?.status(), 'expected /library/import to be gone').toBe(404);
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
+	await expect(page.getByTestId('import-status')).toHaveCount(0);
+	await expect(
+		page.getByRole('link', { name: /import an nzb/i })
+	).toHaveCount(0);
+	await expect(
+		page.getByRole('link', { name: /select nzb locally/i })
+	).toHaveCount(0);
 
-	for (const { label, name, buffer, message } of cases) {
-		await page.goto('/library/import');
-		await expect(page.getByTestId('import-file')).toBeAttached();
-		await page.waitForLoadState('networkidle');
-
-		// Count mutating (upload-shaped) requests made after the selection.
-		const uploads: string[] = [];
-		const onRequest = (request: { method(): string; url(): string }) => {
-			if (['POST', 'PUT', 'PATCH'].includes(request.method())) {
-				uploads.push(`${request.method()} ${request.url()}`);
-			}
-		};
-		page.on('request', onRequest);
-		try {
-			await page
-				.getByTestId('import-file')
-				.setInputFiles({ name, mimeType: 'application/octet-stream', buffer });
-
-			const alert = page.getByRole('alert');
-			await expect(alert, `alert for ${label}`).toBeVisible();
-			await expect(alert, `alert text for ${label}`).toContainText(message);
-			await expect(alert).not.toContainText(INTERNAL_OR_PROMISING);
-			// Let any (buggy) upload fire before counting.
-			await page.waitForTimeout(250);
-			expect(uploads, `no upload request for ${label}`).toEqual([]);
-		} finally {
-			page.off('request', onRequest);
-		}
-	}
-});
-
-test('import answers a valid file with an honest status, not a claim of upload or processing', async ({
-	page
-}) => {
-	await page.goto('/library/import');
-	await page.getByTestId('import-file').setInputFiles({
-		name: 'album.nzb',
-		mimeType: 'application/x-nzb',
-		buffer: Buffer.from('<?xml version="1.0"?><nzb></nzb>')
-	});
-
-	const status = page.getByTestId('import-status');
-	await expect(status).toBeVisible();
-	await expect(status).toContainText(NOT_AVAILABLE_YET);
-	await expect(status).not.toContainText(INTERNAL_OR_PROMISING);
-	await expect(status).not.toContainText(CLAIMS_UPLOAD_OR_PROCESSING);
-	// The valid path is a status, not an error.
-	await expect(page.getByRole('alert')).toHaveCount(0);
-	// And the whole page carries no internal slice/roadmap wording.
-	await expect(page.getByRole('main')).not.toContainText(INTERNAL_OR_PROMISING);
+	await page.goto('/library');
+	await expect(page.getByTestId('import-file')).toHaveCount(0);
+	await expect(page.getByTestId('import-status')).toHaveCount(0);
+	await expect(
+		page.getByRole('link', { name: /import an nzb/i })
+	).toHaveCount(0);
 });
