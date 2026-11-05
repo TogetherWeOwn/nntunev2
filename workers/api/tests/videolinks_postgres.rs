@@ -27,6 +27,7 @@ use tokio_postgres::{Client, Config, NoTls};
 
 const NOW: i64 = 1_700_000_000;
 const MIGRATION: &str = include_str!("../../../migrations/0035_videolinks_curation.sql");
+const JOB_MIGRATION: &str = include_str!("../../../migrations/0036_videolinks_retention_jobs.sql");
 
 fn disposable_config(url: &str) -> Result<Config, &'static str> {
     let mut config: Config = url.parse().map_err(|_| "invalid test database URL")?;
@@ -1847,6 +1848,223 @@ async fn submission_store_contract(db: &mut Client, config: &Config) {
     assert_eq!(queue[49].id, "20000000-0000-0000-0000-000000000051");
 }
 
+async fn retention_job_contract(db: &mut Client, config: &Config) {
+    use nntune_api::videolinks::jobs::{
+        cleanup_tick, JobEnvironment, JobError, PgRetentionJobs, RetentionTick,
+    };
+    use nntune_api::videolinks::retention::{CleanupReport, CLEANUP_SAFETY_WINDOW_S};
+    const BUILD: &str = "0123456789abcdef0123456789abcdef01234567";
+    let staging = JobEnvironment::Staging;
+    let production = JobEnvironment::Production;
+    let report = || {
+        Ok(CleanupReport {
+            evaluated_at: NOW,
+            safety_window_s: CLEANUP_SAFETY_WINDOW_S,
+            batches: 1,
+            purged_rows: 0,
+            backlog: Some(MetadataBacklog {
+                retained_rows: 0,
+                due_rows: 0,
+                oldest_due_validated_at: None,
+                expired_rows: 0,
+                oldest_expired_validated_at: None,
+            }),
+        })
+    };
+    for (tick, start, build) in [
+        (0, NOW, BUILD),
+        (NOW + 1, NOW, BUILD),
+        (NOW, NOW, "unknown"),
+    ] {
+        assert_eq!(
+            PgRetentionJobs::new(db)
+                .claim(staging, tick, start, build)
+                .await,
+            Err(JobError::InvalidInput)
+        );
+    }
+    let lease = PgRetentionJobs::new(db)
+        .claim(staging, NOW, NOW, BUILD)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut other = connect(config).await;
+    assert!(PgRetentionJobs::new(&mut other)
+        .claim(staging, NOW, NOW, BUILD)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(PgRetentionJobs::new(&mut other)
+        .claim(staging, NOW + 1, NOW + 1, BUILD)
+        .await
+        .unwrap()
+        .is_none());
+    let prod = PgRetentionJobs::new(&mut other)
+        .claim(production, NOW, NOW, BUILD)
+        .await
+        .unwrap()
+        .unwrap();
+    PgRetentionJobs::new(&mut other)
+        .finish(&prod, NOW, &report())
+        .await
+        .unwrap();
+
+    // Receipt write failure rolls back release/completion. No successful empty
+    // receipt replaces unknown work; expiry later permits idempotent replay.
+    let tx = other.transaction().await.unwrap();
+    tx.batch_execute("LOCK public.video_retention_receipts IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    assert_eq!(
+        PgRetentionJobs::new(db)
+            .finish(&lease, NOW, &report())
+            .await,
+        Err(JobError::Store)
+    );
+    tx.rollback().await.unwrap();
+    let row = db.query_one("SELECT completed_version, lease_until FROM public.video_retention_jobs WHERE environment = 'staging'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+    assert!(row.get::<_, i64>(1) > 0);
+    db.batch_execute("UPDATE public.video_retention_jobs SET lease_until = floor(extract(epoch FROM clock_timestamp()))::bigint - 1 WHERE environment = 'staging'").await.unwrap();
+    let replay = PgRetentionJobs::new(db)
+        .claim(staging, NOW, NOW, BUILD)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(lease, replay);
+    assert_eq!(
+        PgRetentionJobs::new(db)
+            .finish(&lease, NOW, &report())
+            .await,
+        Err(JobError::LostLease)
+    );
+    PgRetentionJobs::new(db)
+        .finish(&replay, NOW, &report())
+        .await
+        .unwrap();
+    assert_eq!(
+        PgRetentionJobs::new(db)
+            .finish(&replay, NOW, &report())
+            .await,
+        Err(JobError::LostLease)
+    );
+    for tick in [NOW - 1, NOW] {
+        assert!(PgRetentionJobs::new(db)
+            .claim(staging, tick, NOW, BUILD)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let mut contender = connect(config).await;
+    let (left, right) = tokio::join!(
+        async {
+            PgRetentionJobs::new(db)
+                .claim(staging, NOW + 1, NOW + 1, BUILD)
+                .await
+        },
+        async {
+            PgRetentionJobs::new(&mut contender)
+                .claim(staging, NOW + 1, NOW + 1, BUILD)
+                .await
+        }
+    );
+    assert_eq!(
+        usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()),
+        1
+    );
+
+    // Real runner without any validation client/credential: locked hard-expired
+    // metadata remains visible and is recorded as an incident, not drained.
+    db.batch_execute("TRUNCATE public.video_retention_jobs, public.video_retention_receipts")
+        .await
+        .unwrap();
+    reset_candidates(db).await;
+    seed(db, 1).await;
+    db.execute("UPDATE public.video_link_candidates SET status = 'validated', title = 'must-not-enter-retention-receipt', validated_at = $1, expires_at = $2",
+               &[&(NOW - VALIDATION_TTL_S), &NOW]).await.unwrap();
+    let tx = other.transaction().await.unwrap();
+    tx.batch_execute("SELECT * FROM public.video_link_candidates FOR UPDATE")
+        .await
+        .unwrap();
+    let tick = cleanup_tick(db, staging, NOW, BUILD, || NOW).await.unwrap();
+    match tick {
+        RetentionTick::Recorded(Ok(report)) => {
+            assert_eq!(report.purged_rows, 0);
+            assert_eq!(report.backlog.unwrap().expired_rows, 1);
+        }
+        other => panic!("expected durable expired backlog: {other:?}"),
+    }
+    let row = db.query_one("SELECT outcome, report::text FROM public.video_retention_receipts WHERE environment = 'staging'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "expired_backlog");
+    let json: serde_json::Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap();
+    assert_eq!(
+        json["backlog"]["oldest_expired_validated_at"],
+        NOW - VALIDATION_TTL_S
+    );
+    assert!(!row
+        .get::<_, String>(1)
+        .contains("must-not-enter-retention-receipt"));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        cleanup_tick(db, staging, NOW, BUILD, || NOW).await.unwrap(),
+        RetentionTick::Suppressed
+    );
+    assert!(matches!(
+        cleanup_tick(db, staging, NOW + 1, BUILD, || NOW + 1)
+            .await
+            .unwrap(),
+        RetentionTick::Recorded(Ok(_))
+    ));
+    let row = db.query_one("SELECT outcome, report::text FROM public.video_retention_receipts WHERE environment = 'staging'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "drained");
+    let json: serde_json::Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap();
+    assert_eq!(json["purged_rows"], 1);
+
+    // SQL failure is a durable fixed failure category, not a success receipt.
+    let tx = other.transaction().await.unwrap();
+    tx.batch_execute("LOCK public.video_link_candidates IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    assert!(matches!(
+        cleanup_tick(db, staging, NOW + 2, BUILD, || NOW + 2)
+            .await
+            .unwrap(),
+        RetentionTick::Recorded(Err(_))
+    ));
+    tx.rollback().await.unwrap();
+    let row = db.query_one("SELECT outcome, failure, report::text FROM public.video_retention_receipts WHERE environment = 'staging'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "cleanup_failed");
+    assert_eq!(row.get::<_, String>(1), "store");
+    let json: serde_json::Value = serde_json::from_str(&row.get::<_, String>(2)).unwrap();
+    assert!(json["backlog"].is_null());
+    assert_eq!(
+        cleanup_tick(db, staging, NOW + 2, BUILD, || NOW + 2)
+            .await
+            .unwrap(),
+        RetentionTick::Suppressed
+    );
+
+    // Lease-table contention is bounded too; no claim/receipt on timeout.
+    let tx = other.transaction().await.unwrap();
+    tx.batch_execute("SELECT * FROM public.video_retention_jobs FOR UPDATE")
+        .await
+        .unwrap();
+    assert_eq!(
+        PgRetentionJobs::new(db)
+            .claim(staging, NOW + 3, NOW + 3, BUILD)
+            .await,
+        Err(JobError::Store)
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM public.video_retention_receipts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+}
+
 #[test]
 fn postgres_validation_store_contract() {
     let url = std::env::var("NNTUNE_VIDEOLINKS_TEST_DATABASE_URL")
@@ -1857,13 +2075,15 @@ fn postgres_validation_store_contract() {
         .build()
         .unwrap()
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(Duration::from_secs(45), async {
                 let mut db = connect(&config).await;
                 let absent: bool = db
                     .query_one(
                         "SELECT to_regclass('public.video_link_candidates') IS NULL
                          AND to_regclass('public.video_user_submissions') IS NULL
                          AND to_regclass('public.video_coverage_snapshots') IS NULL
+                         AND to_regclass('public.video_retention_jobs') IS NULL
+                         AND to_regclass('public.video_retention_receipts') IS NULL
                          AND to_regclass('public.mb_url') IS NULL
                          AND to_regclass('public.mb_recording_url') IS NULL
                          AND to_regclass('public.mb_recording_music_video') IS NULL",
@@ -1891,6 +2111,9 @@ fn postgres_validation_store_contract() {
                 mirror_harvest_contract(&mut db, &config).await;
                 mirror_admission_contract(&mut db, &config).await;
                 submission_store_contract(&mut db, &config).await;
+                db.batch_execute(JOB_MIGRATION).await.unwrap();
+                db.batch_execute(JOB_MIGRATION).await.unwrap();
+                retention_job_contract(&mut db, &config).await;
             })
             .await
             .expect("bounded PostgreSQL acceptance");

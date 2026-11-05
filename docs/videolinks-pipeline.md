@@ -16,11 +16,12 @@ Worker compilation. The required `api-migrations` job owns the relocated
 
 The integration contract keeps app writes/state on `HYPERDRIVE`, mirror reads
 on a separate read-only `MB_DB` connection, and validation on a runtime Secret.
-It still needs scheduled and authenticated entry points, app-owned durable
-leases/cursors/receipts, and generated configuration parity. Independent cleanup
+It still needs scheduled and authenticated entry points, durable harvest
+selection/cursors, and generated configuration parity. Independent cleanup
 now selects unrefreshed metadata with a one-day safety window and audits both
-due and hard-expired backlog. Runtime headroom admission, receipt persistence
-and alerts are not implemented yet. Staging must not have recurring curation triggers when idle;
+due and hard-expired backlog. An inactive retention tick now persists app-owned
+leases and latest receipts; runtime headroom admission and alerts remain
+unfinished. Staging must not have recurring curation triggers when idle;
 bounded trusted qualification and actual binding/grant/Secret verification
 remain rollout prerequisites. No binding, trigger, grant or Secret is
 installed by relocating source.
@@ -67,6 +68,50 @@ not staging or live YouTube. Both database test functions passed at
 That verifies SQL execution at that head, not streaming HTTP or a deployed
 TTL schedule. Without an active schedule and measured cleanup throughput,
 the adapter alone does not establish metadata deletion within 30 days.
+
+### Durable retention ownership boundary
+
+`jobs.rs::cleanup_tick` composes claim, independent cleanup/audit and a fenced
+receipt in one 20-second attempt, with no retry/drain loop. Connection acquisition
+is not inside that budget: the future scheduled caller must bound it as well.
+There is still no scheduled event handler or active trigger.
+
+The proposed app migration `0036_videolinks_retention_jobs.sql` adds two tables.
+Their fixed staging/production keys allow at most two job rows and two latest
+receipt rows, not an unbounded invocation log. A database-clock 60-second lease
+serializes overlapping deliveries per environment. Increasing fencing versions
+refuse stale completions; a completion marker on the locked job row suppresses
+same-tick replay even when receipt visibility in another statement snapshot lags.
+Older ticks are obsolete. Busy/duplicate/obsolete suppression means **no work**,
+not a successful cleanup receipt. Expired ownership without a completion receipt
+can be reclaimed; the next attempt re-audits actual state. Unknown commit outcomes
+are not retried in the invocation, and replay is idempotent, not exactly once.
+The fence protects receipt ownership, not cancellation of already-issued purges.
+
+Receipt insertion and lease release/completion commit atomically. A failed receipt
+write leaves ownership unfinished; an expired or superseded worker cannot replace
+the latest receipt. A receipt contains the exact build SHA, environment, scheduled
+tick, evaluation/start/finish clocks, lease version, acknowledged counts and the
+independent audit. Only fixed failure labels and typed counts/timestamps are
+serialized, never video titles/channels, API bodies, URLs or database errors.
+Each stored report has a 4 KiB SQL size ceiling; statements retain 1.5-second
+timeouts. This bounds retained state and write work, not aggregate scan cost.
+
+Outcomes distinguish `drained` (no due backlog in that audit snapshot),
+`due_backlog`, `expired_backlog` and `cleanup_failed`. Hard-expired backlog remains
+a retention incident even when the audit succeeded. Missing audit/completion is
+unknown/failure. A new claim retains the prior receipt, whose version is now stale;
+consumers must compare job and receipt versions and timestamps, not treat the old
+receipt as current health. These latest rows are neither history nor an alert
+queue: missed-tick detection, operational alert delivery, measured capacity and
+metadata-write headroom admission remain unfinished.
+
+Native report-policy fixtures and the disposable PostgreSQL contract cover
+claims, overlap, expiry/replay, fencing, receipt-write rollback, real keyless
+cleanup, locked expired backlog, SQL failure and statement lock timeouts. The
+migration is applied/replayed only by Actions' disposable tests; no staging apply
+or new-head execution success is claimed here. AGENTS.md **Clean-room, YouTube and
+MetaBrainz guardrails** remain acceptance criteria.
 
 ### Worker HTTP adapter boundary
 
