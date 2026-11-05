@@ -23,6 +23,9 @@ use nntune_ingest::posted_generations::{
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
+#[path = "posted_generation_content_driver.rs"]
+mod driver;
+
 const SLOTS: [i32; 3] = [0, 1, 2];
 
 fn content_side(post: bool) -> ArticleSide {

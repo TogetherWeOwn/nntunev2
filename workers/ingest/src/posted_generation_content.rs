@@ -10,6 +10,55 @@
 //! ORIGINAL permit; a newer handle cannot rebind an old network observation.
 
 use super::*;
+use std::future::Future;
+
+/// Trusted full-set reader for ONE canonical backbone. Implementations must open
+/// this exact stored bundle, resolve its configured side to a canonical spool,
+/// read all required data/recovery articles and authenticate/check the complete
+/// plaintext. A report must describe bytes actually read, never intended input.
+/// Missing topology, unavailable credentials or partial reads are nonaffirmative.
+/// The core crypto helper alone cannot construct a complete-set report.
+///
+/// This injection seam does not implement the production pool/envelope binding.
+/// It is not an untrusted queue/HTTP result interface. Errors must be redacted.
+pub trait GenerationContentTransport {
+    fn read_content<'a>(
+        &'a mut self,
+        bundle: &'a StoredGeneration,
+        side: ArticleSide,
+    ) -> impl Future<Output = ContentCheckResult<'a>>;
+}
+
+#[derive(Debug)]
+pub enum ContentReadStep {
+    /// An observation (including a failure) was committed. This is NOT a claim
+    /// that either side is intact, or reuse/publication/cleanup permission.
+    ObservationRecorded(Box<GenerationHandle>),
+    StaleOrDiverged,
+}
+
+/// Read one complete stored generation on one side and persist its result with
+/// the ORIGINAL pre-read permit. No database transaction spans the read, and no
+/// network retry or local revision/cursor advancement is performed. A stale
+/// callback stops this delivery; a lost commit acknowledgment requires recovery.
+/// Explicit rechecks never skip a prior Intact observation: failures must be able
+/// to invalidate it. Callers own bounded scheduling, not this one-read operation.
+pub async fn drive_content_read<T: GenerationContentTransport>(
+    client: &mut Client,
+    handle: &GenerationHandle,
+    side: ArticleSide,
+    transport: &mut T,
+) -> Result<ContentReadStep, StoreError> {
+    let Some((permit, bundle)) = prepare_content_read(client, handle, side).await? else {
+        return Ok(ContentReadStep::StaleOrDiverged);
+    };
+    let result = transport.read_content(&bundle, side).await;
+    match record_content_check(client, &permit, result).await? {
+        MutationOutcome::Applied(next) => Ok(ContentReadStep::ObservationRecorded(next)),
+        MutationOutcome::StaleOrDiverged => Ok(ContentReadStep::StaleOrDiverged),
+        MutationOutcome::Incomplete => Err(StoreError::Inconsistent),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentCheckState {
@@ -108,6 +157,16 @@ pub async fn prepare_content_check(
     handle: &GenerationHandle,
     side: ArticleSide,
 ) -> Result<Option<ContentCheckPermit>, StoreError> {
+    Ok(prepare_content_read(client, handle, side)
+        .await?
+        .map(|(permit, _)| permit))
+}
+
+async fn prepare_content_read(
+    client: &mut Client,
+    handle: &GenerationHandle,
+    side: ArticleSide,
+) -> Result<Option<(ContentCheckPermit, StoredGeneration)>, StoreError> {
     let tx = client.transaction().await.map_err(database_error)?;
     let Some(current) = lock_candidate(&tx, handle).await? else {
         return Ok(None);
@@ -127,7 +186,7 @@ pub async fn prepare_content_check(
         articles: custody.article_count,
     };
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(Some(permit))
+    Ok(Some((permit, bundle)))
 }
 
 /// Persist an observation under its original generation/attempt/claim/registry/

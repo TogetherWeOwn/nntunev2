@@ -29,8 +29,9 @@ pub use driver::{drive_recheck, GenerationTransport, RecheckStep};
 #[path = "posted_generation_content.rs"]
 mod content;
 pub use content::{
-    prepare_content_check, record_content_check, ContentCheckPermit, ContentCheckReport,
-    ContentCheckResult, ContentCheckState,
+    drive_content_read, prepare_content_check, record_content_check, ContentCheckPermit,
+    ContentCheckReport, ContentCheckResult, ContentCheckState, ContentReadStep,
+    GenerationContentTransport,
 };
 #[path = "posted_generation_presence.rs"]
 mod presence;
