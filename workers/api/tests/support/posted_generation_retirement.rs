@@ -350,7 +350,7 @@ fn zz_postgres_retirement_lifecycle_serializes_inserts_health_snapshots_and_repl
             .await
             .expect("managed fence after cutoff"));
         assert!(matches!(
-            recover(&mut db, &attempt, &c.sealed.op)
+            recover(&mut db, &attempt, &c.sealed.hash, &c.sealed.op)
                 .await
                 .expect("managed recovery after cutoff"),
             AdmissionOutcome::ResumedSameCandidate(_, _)
