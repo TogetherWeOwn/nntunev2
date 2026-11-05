@@ -33,8 +33,8 @@ use tokio_postgres::{Client, Row, Transaction};
 #[path = "posted_generation_attempts.rs"]
 mod attempts;
 pub use attempts::{
-    acquire_prepared_attempt, prepare_attempt_acquisition, recover_attempt_acquisition,
-    AttemptAcquisition,
+    acquire_prepared_attempt, prepare_attempt_acquisition, prepare_durable_attempt_acquisition,
+    recover_attempt_acquisition, AttemptAcquisition,
 };
 #[path = "posted_generation_driver.rs"]
 mod driver;

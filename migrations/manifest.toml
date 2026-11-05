@@ -318,3 +318,8 @@ sha256 = "e0ba8547547ac9de21b06ab39ea92c3397d8064aac0754df5f350e0a6a4c73c3"
 file = "0045_posted_file_legacy_writer_retirement.sql"
 target = "app"
 sha256 = "fcf1cda51ba6a84e32dc8542edaf1c2375b114e03ee96adbf08ffa3396d03bdc"
+
+[[migration]]
+file = "0046_posted_file_attempt_receipts.sql"
+target = "app"
+sha256 = "cff05303ae7f254757b82ba5d842179dc6b3324a22127401aac7b28d3ed4b28c"

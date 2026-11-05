@@ -1,5 +1,5 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0045.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0046.
 //!
 //! The full bank runs through `run_posted_generation_tests.py` on Actions:
 //! ordinary cases first, irreversible retirement LAST, on a freshly migrated

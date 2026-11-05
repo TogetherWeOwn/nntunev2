@@ -14,10 +14,13 @@
 //! committed acquisition result is dropped unused. It is not network or
 //! commit error injection and proves nothing about `CommitUnknown`.
 
+#[path = "posted_generation_durable_attempts.rs"]
+mod durable;
+
 use super::*;
 use nntune_ingest::posted_generations::{
-    acquire_prepared_attempt, prepare_attempt_acquisition, recover_attempt_acquisition,
-    recover_pending, AttemptAcquisition,
+    acquire_prepared_attempt, prepare_attempt_acquisition, prepare_durable_attempt_acquisition,
+    recover_attempt_acquisition, recover_pending, AttemptAcquisition,
 };
 use std::sync::Arc;
 use tokio::sync::Barrier;

@@ -3,8 +3,10 @@
 //! A receipt is not attempt authority. Only a committed acquisition or an exact
 //! live database recovery returns `AttemptHandle`. Keep the same receipt after
 //! an ambiguous commit; never replace it with a newly prepared request on retry.
-//! This in-memory seam does not persist receipts for process restarts or wire a
-//! Queue consumer. Queue hints cannot reconstruct or select a receipt/token.
+//! The original preparation is in-memory. Durable preparation retains the exact
+//! proposal for a trusted coordinator's stable request identity across restarts.
+//! Neither path wires a Queue consumer. Queue/KV hints must not supply trusted
+//! owner, request or expected-attempt identities or select the current token.
 
 use super::*;
 
@@ -50,6 +52,107 @@ pub async fn prepare_attempt_acquisition(
             token,
         },
     })
+}
+
+/// Persist or reload an exact proposal for a trusted coordinator request.
+///
+/// The coordinator must retain `request_id` and `expected_attempt` in its own
+/// durable dispatch contract and bind `job_id`/`owner_id` to authenticated job
+/// ownership, never Queue/KV hints. This is not a consumer authentication API.
+/// A restart repeats ALL four identities; there is no job-only/current-token
+/// recovery. Changing the request on an ambiguous result is forbidden.
+///
+/// An existing receipt must match owner and next attempt exactly. It is never
+/// updated, even after acquisition, expiry or supersession. A new request is
+/// persisted only for the exact absent/expired predecessor. Preparation grants
+/// no lease or handle authority; acquire/recover still check the live attempt.
+/// `None` refuses missing, foreign, stopped, busy or mismatched work. Ambiguous
+/// preparation commit is recovered by repeating this exact request, not minting.
+/// Migration 0046 is required; no production coordinator/Queue is wired here.
+pub async fn prepare_durable_attempt_acquisition(
+    client: &mut Client,
+    job_id: &str,
+    owner_id: &str,
+    request_id: &str,
+    expected_attempt: i64,
+) -> Result<Option<AttemptAcquisition>, StoreError> {
+    if !identity(job_id) || !identity(owner_id) || !identity(request_id) || expected_attempt < 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let next = expected_attempt
+        .checked_add(1)
+        .ok_or(StoreError::InvalidInput)?;
+    let tx = client.transaction().await.map_err(database_error)?;
+    // All preparation/acquisition paths serialize on the owning job first.
+    if tx
+        .query_opt(
+            "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",
+            &[&job_id, &owner_id],
+        )
+        .await
+        .map_err(database_error)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let existing = tx
+        .query_opt(
+            "SELECT owner_id, attempt, token FROM posted_file_attempt_receipts \
+             WHERE job_id = $1 AND request_id = $2",
+            &[&job_id, &request_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let token = if let Some(row) = existing {
+        if row.get::<_, String>("owner_id") != owner_id || row.get::<_, i64>("attempt") != next {
+            return Ok(None);
+        }
+        row.get::<_, String>("token")
+    } else {
+        let old = tx
+            .query_opt(
+                "SELECT attempt FROM posted_file_job_attempts WHERE job_id = $1 FOR UPDATE",
+                &[&job_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if let Some(row) = old {
+            if row.get::<_, i64>("attempt") != expected_attempt {
+                return Ok(None);
+            }
+            let active: bool = tx
+                .query_one(
+                    "SELECT lease_until > extract(epoch FROM clock_timestamp())::bigint \
+                     FROM posted_file_job_attempts WHERE job_id = $1",
+                    &[&job_id],
+                )
+                .await
+                .map_err(database_error)?
+                .get(0);
+            if active {
+                return Ok(None);
+            }
+        } else if expected_attempt != 0 {
+            return Ok(None);
+        }
+        tx.query_one(
+            "INSERT INTO posted_file_attempt_receipts (job_id, request_id, owner_id, attempt, token) \
+             VALUES ($1, $2, $3, $4, gen_random_uuid()::text) RETURNING token",
+            &[&job_id, &request_id, &owner_id, &next],
+        )
+        .await
+        .map_err(database_error)?
+        .get(0)
+    };
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(Some(AttemptAcquisition {
+        proposed: AttemptHandle {
+            job_id: job_id.to_owned(),
+            owner_id: owner_id.to_owned(),
+            attempt: next,
+            token,
+        },
+    }))
 }
 
 /// Acquire only the receipt's exact next attempt, or recover its live committed
