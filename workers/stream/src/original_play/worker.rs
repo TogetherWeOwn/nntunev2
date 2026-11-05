@@ -25,7 +25,7 @@ use worker::{
 
 use super::{
     control::OriginalRequestControl, OriginalAuthorization, OriginalControl, OriginalPlay,
-    OriginalWriter, OwnedOriginalPlay,
+    OriginalWriter, OwnedOriginalPlay, WriterDisconnect,
 };
 use crate::delivered::{DeliveredInterval, DeliveredSink};
 
@@ -192,7 +192,7 @@ fn channel(
         .get_writer()
         .map_err(worker::Error::from)?;
     let writer = WorkerOriginalWriter {
-        closed: Box::pin(JsFuture::from(raw.closed())),
+        closed: WriterDisconnect::new(JsFuture::from(raw.closed())),
         raw,
         writing: None,
         closing: None,
@@ -209,7 +209,7 @@ fn channel(
 /// write resolves; the pump does not pull another article in that interval.
 pub struct WorkerOriginalWriter {
     raw: WritableStreamDefaultWriter,
-    closed: PendingPromise,
+    closed: WriterDisconnect<JsFuture>,
     writing: Option<(usize, PendingPromise)>,
     closing: Option<PendingPromise>,
     stopped: bool,
@@ -217,10 +217,10 @@ pub struct WorkerOriginalWriter {
 
 impl OriginalWriter for WorkerOriginalWriter {
     fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError> {
-        if self.stopped || self.closed.as_mut().poll(cx).is_ready() {
+        if self.stopped {
             Poll::Ready(SourceError::Cancelled)
         } else {
-            Poll::Pending
+            self.closed.poll_cancel(cx, self.closing.is_some())
         }
     }
 

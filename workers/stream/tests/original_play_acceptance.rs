@@ -1128,6 +1128,52 @@ fn control_events_wake_pending_close_and_win_ready_close_races() {
 }
 
 #[test]
+fn writer_disconnect_wakes_pending_close_with_the_latest_waker() {
+    for close_ready in [false, true] {
+        let (source, mut articles) = fixture();
+        let (mut sink, mut control) = (VecDeliveredSink::default(), Control::new());
+        let st = shared([]);
+        st.borrow_mut().close_block = true;
+        let old_wakes = Arc::new(Wakes::default());
+        let old_waker = Waker::from(old_wakes.clone());
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pump!(source, Some("bytes=1-7"), articles, control, sink, st);
+        assert!(fut
+            .as_mut()
+            .poll(&mut Context::from_waker(&old_waker))
+            .is_pending());
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        let polls = st.borrow().write_polls;
+        let closes = st.borrow().closes;
+        {
+            let mut state = st.borrow_mut();
+            state.close_block = !close_ready;
+            state.cancel = Some(SourceError::Cancelled);
+            state
+                .waker
+                .take()
+                .expect("writer cancellation registered a waker")
+                .wake();
+        }
+        assert_eq!(old_wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(SourceError::Cancelled))
+        );
+        drop(fut);
+        let st = st.borrow();
+        assert_eq!((st.write_polls, st.closes, st.aborts), (polls, closes, 1));
+        assert_eq!(st.got, (1..8).collect::<Vec<u8>>());
+        assert_eq!(articles.opened, vec![2, 0, 1]);
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!((sink.0[0].start, sink.0[0].end), (1, 8));
+    }
+}
+
+#[test]
 fn pending_close_resumes_on_writer_wake_or_aborts_on_drop() {
     for complete in [false, true] {
         let (source, mut articles) = fixture();

@@ -823,6 +823,79 @@ async fn async_invalid_range_does_no_io() {
 }
 
 #[test]
+fn async_ready_prefix_yields_between_skipped_articles_and_preserves_progress() {
+    struct Counted<'a>(&'a mut AsyncTransport, Arc<AtomicUsize>);
+    impl AsyncArticleSource for Counted<'_> {
+        fn open(
+            &mut self,
+            index: usize,
+            reference: &str,
+        ) -> impl Future<Output = Result<Vec<u8>, SourceError>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.open(index, reference)
+        }
+    }
+    let sizes = [1; 8];
+    let s = source(&sizes, None);
+    let mut t = async_transport(&sizes);
+    let mut reader = AsyncRangeReader::new(&s, 6..8).unwrap();
+    let mut control = AsyncControl::new();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut counted = Counted(&mut t, count.clone());
+        let mut fut = Box::pin(reader.next(&mut counted, &mut control));
+        for skipped in 0..6 {
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(wakes.0.load(Ordering::SeqCst), skipped + 1);
+            // First poll proves the final part, then visits one prefix part.
+            assert_eq!(count.load(Ordering::SeqCst), skipped + 2);
+        }
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(Some(vec![6]))));
+    }
+    assert_eq!(t.opened, vec![7, 0, 1, 2, 3, 4, 5, 6]);
+    let mut next = Box::pin(reader.next(&mut t, &mut control));
+    assert_eq!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(Some(vec![7]))));
+    drop(next);
+    assert_eq!(t.opened, vec![7, 0, 1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn async_yielded_prefix_cancels_or_drops_without_another_open() {
+    for cancel in [false, true] {
+        let sizes = [1; 8];
+        let s = source(&sizes, None);
+        let mut t = async_transport(&sizes);
+        let mut reader = AsyncRangeReader::new(&s, 6..8).unwrap();
+        let mut control = AsyncControl::new();
+        let signal = control.signal.clone();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut fut = Box::pin(reader.next(&mut t, &mut control));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            if cancel {
+                signal.cancel();
+                assert_eq!(
+                    fut.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(SourceError::Cancelled))
+                );
+            }
+        }
+        assert_eq!(t.opened, vec![7, 0]);
+        let mut fresh_control = AsyncControl::new();
+        let mut next = Box::pin(reader.next(&mut t, &mut fresh_control));
+        assert_eq!(
+            next.as_mut().poll(&mut cx),
+            Poll::Ready(Err(SourceError::Cancelled))
+        );
+        drop(next);
+        assert_eq!(t.opened, vec![7, 0]);
+    }
+}
+
+#[test]
 fn async_pending_fetch_is_cancelled_by_wakeable_control() {
     let s = source(&[3, 3, 2], None);
     let mut t = async_transport(&[3, 3, 2]);
@@ -1049,6 +1122,7 @@ fn incremental_walk_matches_synchronous_ranges_and_stops_at_completion() {
                     .unwrap();
                 }
                 assert_eq!(actual, expected);
+                assert_eq!(actual, (start..end).map(|n| n as u8).collect::<Vec<u8>>());
                 assert_eq!(t.opened, expected_transport.opened);
                 assert_eq!(
                     walk.push(Cursor::new(Vec::new()), &mut control, |_| panic!(

@@ -175,6 +175,12 @@ pull, with no new dispatch while buffered output remains. Cancellation is checke
 again before buffered output, including the retained final slice. A failed push
 poisons the incremental reader; fetch failure or a dropped pending await also
 permanently stops the async wrapper. Neither permits retry after uncertainty.
+When skipping a prefix, the async wrapper self-wakes and yields after each
+non-emitting prefix article, even if the supplier is immediately ready. The
+initial final-part proof and first prefix article may share a poll; each further
+skipped article returns control to the executor before the next fetch. This is
+cooperative polling, not proof of host-event-loop or timer fairness. Dropping a
+pull at this yield also stops it permanently.
 `AsyncArticleSource` supplies one bounded encoded article by trusted
 source index; it owns wire collection limits, its operation timer and account
 physical-close/capacity obligations. `AsyncReadControl` combines boundary checks
@@ -209,8 +215,12 @@ A failed close still reports only the bytes already acknowledged.
 The off-route wasm `original_play::worker::response_channel` pairs the prepared
 response with the pinned SDK's fixed-length Web Stream and a concrete writer.
 It copies at most one bounded slice into a JS chunk, waits for that write promise,
-and only then acknowledges it. Its `closed` promise wakes a pending article on
-reader disconnect; drop requests an idempotent writer abort. Promise resolution
+and only then acknowledges it. Its `closed` promise wakes pending article, write
+and close operations on reader disconnect; a rejected promise cancels in every
+phase. A fulfilled
+`closed` promise after our close starts is not cancellation: the separate close
+promise still determines completion. Its settlement is cached, never re-polled.
+Drop requests an idempotent writer abort. Promise resolution
 means sink acceptance, not proof of remote TCP receipt. The caller must return
 the response concurrently with pumping, provide a wakeable request/grant control
 and persist delivered reports; no public runtime caller or account supplier is installed.

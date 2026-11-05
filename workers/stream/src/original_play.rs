@@ -75,9 +75,9 @@ pub trait OriginalControl: AsyncReadControl {
 /// `poll_write` acknowledges a positive prefix only after the sink accepts it;
 /// pending or failed writes acknowledge nothing and must never be retried with
 /// another chunk. Each pending method registers the waker. `poll_cancel` must
-/// observe a disconnected reader even while no write is in flight. A pending
-/// close must also wake on disconnect. `abort` is synchronous, idempotent and
-/// never drains, retries or releases account capacity.
+/// observe a disconnected reader even while no write is in flight or close is
+/// pending, but must not treat our successful close as disconnect. `abort` is
+/// synchronous, idempotent and never drains, retries or releases account capacity.
 ///
 /// A successful write is sink acceptance, not proof of remote TCP receipt.
 /// Concrete runtime behavior still needs actual Worker/abort qualification.
@@ -90,6 +90,42 @@ pub trait OriginalWriter {
     ) -> Poll<Result<usize, SourceError>>;
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SourceError>>;
     fn abort(&mut self);
+}
+
+/// A Web writer's `closed` promise rejects on error but also fulfills on our
+/// successful close. Cache its single settlement; a fulfilled promise during
+/// close is not disconnect and only the close promise decides completion.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct WriterDisconnect<F> {
+    closed: Option<std::pin::Pin<Box<F>>>,
+    disconnected: bool,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl<F, T, E> WriterDisconnect<F>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    fn new(closed: F) -> Self {
+        Self {
+            closed: Some(Box::pin(closed)),
+            disconnected: false,
+        }
+    }
+
+    fn poll_cancel(&mut self, cx: &mut Context<'_>, closing: bool) -> Poll<SourceError> {
+        if let Some(closed) = &mut self.closed {
+            if let Poll::Ready(result) = closed.as_mut().poll(cx) {
+                self.disconnected = result.is_err() || !closing;
+                self.closed = None;
+            }
+        }
+        if self.disconnected {
+            Poll::Ready(SourceError::Cancelled)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 struct ResponseWriter<W: OriginalWriter> {
@@ -389,8 +425,9 @@ impl<'a> OriginalPlay<'a> {
             if let Poll::Ready(error) = control.poll_cancel(cx) {
                 return Poll::Ready(Err(error));
             }
-            // `closed` may resolve successfully during this phase; only
-            // poll_close decides whether our own close completed.
+            if let Poll::Ready(error) = writer.inner.poll_cancel(cx) {
+                return Poll::Ready(Err(error));
+            }
             writer.inner.poll_close(cx)
         })
         .await?;
@@ -469,5 +506,31 @@ impl Drop for OriginalPlay<'_> {
             end: self.start + self.written,
             file_bytes: Some(self.file_bytes),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{future::ready, task::Waker};
+
+    #[test]
+    fn closed_promise_distinguishes_disconnect_from_successful_close_once() {
+        for closing in [false, true] {
+            for succeeded in [false, true] {
+                let result = if succeeded { Ok(()) } else { Err(()) };
+                let mut signal = WriterDisconnect::new(ready(result));
+                let expected = if closing && succeeded {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(SourceError::Cancelled)
+                };
+                let mut cx = Context::from_waker(Waker::noop());
+                assert_eq!(signal.poll_cancel(&mut cx, closing), expected);
+                // `Ready` panics if re-polled: settlement must be cached.
+                assert_eq!(signal.poll_cancel(&mut cx, closing), expected);
+                assert!(signal.closed.is_none());
+            }
+        }
     }
 }

@@ -393,6 +393,7 @@ impl<'a> AsyncRangeReader<'a> {
                 .await?
             };
             control.check()?;
+            let walking_prefix = self.walk.final_loaded;
             self.walk.push(Cursor::new(encoded), control, |bytes| {
                 // This is an article-sized adapter, never a file accumulator.
                 if self.pending.len() == 2 || bytes.len() > MAX_ARTICLE_BYTES {
@@ -401,6 +402,21 @@ impl<'a> AsyncRangeReader<'a> {
                 self.pending.push_back(bytes.to_vec());
                 Ok(())
             })?;
+            if walking_prefix && self.pending.is_empty() && !self.walk.done {
+                // Ready suppliers must not monopolize a poll while skipping a
+                // long prefix. Retain progress, then recheck control next poll.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
         }
     }
 }
