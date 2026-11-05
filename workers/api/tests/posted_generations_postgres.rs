@@ -1,9 +1,10 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0044.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0045.
 //!
-//! Run with `--features postgres-tests --test posted_generations_postgres` on
-//! the migrated, throwaway `nntune_ci` service. `NNTUNE_TEST_DATABASE_URL` is
-//! required (a missing value fails, it never skips) and is validated as a
+//! The full bank runs through `run_posted_generation_tests.py` on Actions:
+//! ordinary cases first, irreversible retirement LAST, on a freshly migrated
+//! throwaway `nntune_ci` service. `NNTUNE_TEST_DATABASE_URL` is required
+//! (a missing value fails, it never skips) and is validated as a
 //! loopback, single-host, no-hostaddr configuration for `nntune_ci` before
 //! any connection is opened.
 //!
@@ -48,6 +49,8 @@ const MIGRATION_0043: &str =
     include_str!("../../../migrations/0043_posted_file_registration_fence.sql");
 const MIGRATION_0044: &str =
     include_str!("../../../migrations/0044_posted_file_reference_fence.sql");
+const MIGRATION_0045: &str =
+    include_str!("../../../migrations/0045_posted_file_legacy_writer_retirement.sql");
 
 #[path = "support/posted_generation_abandon.rs"]
 mod posted_generation_abandon;
@@ -75,6 +78,9 @@ mod posted_generation_repair_content;
 mod posted_generation_retained;
 #[path = "support/posted_generation_takeover.rs"]
 mod posted_generation_takeover;
+// Irreversible on the disposable service; the Actions runner runs this LAST.
+#[path = "support/posted_generation_retirement.rs"]
+mod zz_posted_generation_retirement;
 
 // The replay test runs DDL that takes ACCESS EXCLUSIVE locks. It holds the
 // write side so no other test in this process is mid-statement.

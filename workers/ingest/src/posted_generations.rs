@@ -4,7 +4,11 @@
 //! replacement is refused until the legacy writer/publication rollout is
 //! complete. Migration 0042 rejects unfenced health changes on registered
 //! legacy custody; 0043 serializes new registration with existing legacy-row
-//! writes, including stale transaction snapshots. Neither proves a worker drain.
+//! writes, including stale transaction snapshots. Migration 0045 prepares an
+//! OFF-by-default, monotonic database retirement gate for all legacy inserts
+//! and changed health writes. Activation is a separately authorized rollout
+//! operation; installation or even database retirement is NOT a worker/network
+//! drain, compatible-consumer rollout proof or replacement authority.
 //! No queue, NNTP, KV or pointer caller is wired here. An admitted bundle is
 //! custody, NOT verification, registry promotion or serving authority.
 //! No transaction may span a network POST. Commit errors are ambiguous and

@@ -12,7 +12,14 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[3]
+# Retirement is irreversible on this disposable service. Run it separately,
+# after every test that needs to seed an old-writer compatibility fixture.
+RETIREMENT_CASE = (
+    "zz_posted_generation_retirement::"
+    "zz_postgres_retirement_lifecycle_serializes_inserts_health_snapshots_and_replay"
+)
 EXPECTED = {
+    RETIREMENT_CASE,
     "disposable_config_accepts_only_single_loopback_nntune_ci",
     "disposable_config_rejects_hostaddr_nonloopback_multihost_and_wrong_database",
     "postgres_absent_admission_persists_exact_bundle_with_clean_health",
@@ -179,19 +186,24 @@ def main():
     }
     if actual != EXPECTED:
         sys.exit("Posted-generation test inventory changed or did not compile completely")
-    result = subprocess.run(
-        command + ["--", "--test-threads=1"], cwd=ROOT, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=180,
-    )
-    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
-    print(output, flush=True)
-    if result.returncode != 0:
-        sys.exit("Posted-generation production-adapter bank failed")
-    if f"test result: ok. {len(EXPECTED)} passed; 0 failed; 0 ignored;" not in output:
-        sys.exit("Posted-generation bank did not execute every required test")
-    for name in EXPECTED:
-        if not re.search(r"(?m)^test " + re.escape(name) + r" \.\.\. ok$", output):
-            sys.exit("A required posted-generation case did not execute and pass")
+    phases = [
+        (["--skip", RETIREMENT_CASE], EXPECTED - {RETIREMENT_CASE}),
+        (["--exact", RETIREMENT_CASE], {RETIREMENT_CASE}),
+    ]
+    for filters, required in phases:
+        result = subprocess.run(
+            command + ["--", "--test-threads=1", *filters], cwd=ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=180,
+        )
+        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
+        print(output, flush=True)
+        if result.returncode != 0:
+            sys.exit("Posted-generation production-adapter bank failed")
+        if f"test result: ok. {len(required)} passed; 0 failed; 0 ignored;" not in output:
+            sys.exit("Posted-generation bank did not execute every required test")
+        for name in required:
+            if not re.search(r"(?m)^test " + re.escape(name) + r" \.\.\. ok$", output):
+                sys.exit("A required posted-generation case did not execute and pass")
     print(f"Posted-generation preparation: {len(EXPECTED)} required cases passed", flush=True)
 
 

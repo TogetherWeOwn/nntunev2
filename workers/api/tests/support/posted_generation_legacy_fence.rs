@@ -32,7 +32,7 @@ const FENCE_MESSAGE: &str = "registered generation requires fenced health writes
 /// The seven legacy mutable health columns, each with a value that differs
 /// from the fixture default, as (column, by-id SQL, by-hash SQL). Binds: `$1`
 /// is the id or the hash respectively.
-const FIELD_UPDATES: [(&str, &str, &str); 7] = [
+pub(super) const FIELD_UPDATES: [(&str, &str, &str); 7] = [
     (
         "post_copy",
         "UPDATE posted_files SET post_copy = 'present' WHERE id = $1",
@@ -73,11 +73,29 @@ const FIELD_UPDATES: [(&str, &str, &str); 7] = [
 /// Synthetic unmanaged legacy row inserted with the real full-row insert SQL.
 /// Returns the DB-owned id and the sealed fixture (its `generation` field is
 /// a label only; the legacy id is the returned value).
-async fn legacy_fixture(db: &Client, fill: u8) -> (String, Sealed) {
+pub(super) async fn legacy_fixture(db: &Client, fill: u8) -> (String, Sealed) {
     let uuid = db_uuid(db).await;
     let hash = digest(db, "legacy-fence-content", &uuid).await;
     let plan = digest(db, "legacy-fence-plan", &uuid).await;
     let sealed = Sealed::new(&uuid, &hash, &plan, fill);
+    assert_eq!(
+        insert_legacy(db, &sealed)
+            .await
+            .quiet("insert legacy fence fixture"),
+        1
+    );
+    let id: String = db
+        .query_one(select_posted_file_id_by_sha_sql(), &[&sealed.hash])
+        .await
+        .quiet("read legacy fence fixture id")
+        .get(0);
+    (id, sealed)
+}
+
+pub(super) async fn insert_legacy(
+    db: &Client,
+    sealed: &Sealed,
+) -> Result<u64, tokio_postgres::Error> {
     let p = sealed.custody();
     let post_copy = spool_copy_state_db_str(p.post_copy);
     let verify_copy = spool_copy_state_db_str(p.verify_copy);
@@ -108,18 +126,7 @@ async fn legacy_fixture(db: &Client, fill: u8) -> (String, Sealed) {
         &p.manifest_payload_nonce,
         &p.manifest_payload_format,
     ];
-    assert_eq!(
-        db.execute(insert_posted_file_sql(), &params)
-            .await
-            .quiet("insert legacy fence fixture"),
-        1
-    );
-    let id: String = db
-        .query_one(select_posted_file_id_by_sha_sql(), &[&sealed.hash])
-        .await
-        .quiet("read legacy fence fixture id")
-        .get(0);
-    (id, sealed)
+    db.execute(insert_posted_file_sql(), &params).await
 }
 
 /// Seeded rollout fixture: plain test SQL standing in for registration.
