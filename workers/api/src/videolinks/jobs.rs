@@ -263,7 +263,7 @@ fn receipt(
     if report.evaluated_at <= 0
         || report.safety_window_s != super::retention::CLEANUP_SAFETY_WINDOW_S
         || report.batches > MAX_CLEANUP_BATCHES
-        || report.purged_rows > (report.batches * MAX_PURGES_PER_CALL) as u64
+        || report.purged_rows > report.batches as u64 * MAX_PURGES_PER_CALL as u64
     {
         return Err(JobError::InvalidInput);
     }
@@ -332,6 +332,19 @@ mod tests {
         });
         assert_eq!(receipt(&result).unwrap().1, "cleanup_failed");
         assert_eq!(receipt(&result).unwrap().2, Some("deadline"));
+    }
+
+    #[test]
+    fn receipt_row_cap_tracks_acknowledged_batches() {
+        for (batches, purged_rows) in [(0, 0), (1, 200), (2, 400), (3, 600), (4, 800)] {
+            let mut at_cap = report();
+            at_cap.batches = batches;
+            at_cap.purged_rows = purged_rows;
+            let mut result = Ok(at_cap);
+            assert_eq!(receipt(&result).unwrap().1, "drained");
+            result.as_mut().unwrap().purged_rows += 1;
+            assert_eq!(receipt(&result), Err(JobError::InvalidInput));
+        }
     }
 
     #[test]
