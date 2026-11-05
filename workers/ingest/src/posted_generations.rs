@@ -29,6 +29,9 @@ pub use content::{
     prepare_content_check, record_content_check, ContentCheckPermit, ContentCheckReport,
     ContentCheckResult, ContentCheckState,
 };
+#[path = "posted_generation_presence.rs"]
+mod presence;
+pub use presence::{prepare_presence_check, record_presence_check, PresenceCheckPermit};
 #[path = "posted_generation_rechecks.rs"]
 mod rechecks;
 pub use rechecks::{

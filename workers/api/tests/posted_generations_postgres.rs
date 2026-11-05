@@ -44,6 +44,8 @@ mod posted_generation_checkpoint;
 mod posted_generation_content;
 #[path = "support/posted_generation_health.rs"]
 mod posted_generation_health;
+#[path = "support/posted_generation_presence.rs"]
+mod posted_generation_presence;
 #[path = "support/posted_generation_rechecks.rs"]
 mod posted_generation_rechecks;
 #[path = "support/posted_generation_takeover.rs"]
