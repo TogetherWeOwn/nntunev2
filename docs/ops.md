@@ -337,15 +337,131 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-Nothing in CI applies `migrations/*.sql`; the staging deploy only runs a
-read-only schema gate and fails if the staging schema is behind the repo. Staging
-migrations are therefore applied out-of-band **before** merge, by the migrator
-role, after board approval for the DDL. A PR that adds or changes a migration
-must say so in its body, and the `migrations-staging` check fails until it does:
-`Staging migration: <files> — applied <YYYY-MM-DD> by <who>`, or
-`Staging migration: pending (blocked on <ticket>)` when the apply is still
-waiting on approval. A pending PR must not merge until the line is updated to
-`applied`; merging it anyway turns `staging-api` red.
+Nothing in CI applies `migrations/*.sql`; staging migrations are applied
+out-of-band **before** merge, by the migrator role, after board approval for
+the DDL. Applies go through `.github/scripts/apply_migration.py`, which
+verifies the file bytes against `migrations/manifest.toml` and writes a
+`public.schema_migrations(file, sha256, applied_at, applied_by)` row **in
+the same transaction** as the migration; a file carrying its own
+`BEGIN`/`COMMIT` is applied by hand and then recorded with
+`--record-only`. Every invocation requires `--expect-database <name>`
+(matching the `DATABASE_URL` database and checked again inside the
+transaction against `current_database()` — a URL pointed at the wrong
+database creates and records nothing), and the apply refuses while an
+earlier same-target manifest entry is unrecorded, so history cannot be
+skipped or reordered. The tracking table's DDL pins its write
+privileges to the table owner on every apply — its rows are deploy
+proof — and the staging gate fails closed while any other role holds
+a write grant on it. The staging deploy's read-only schema gate
+(`.github/scripts/staging_api_schema_gate.py`) compares those rows with
+the manifest's `app` entries — file name plus sha256 — and fails closed
+on a missing, unlisted, sha-mismatched or double-applied migration. That
+comparison, not PR text, is the source of truth for what staging has:
+merging a migration that staging lacks turns `staging-api` red until it
+is applied and recorded.
+
+Rows keep the name a migration was **applied under**. When a PR branch
+renumbers a file that staging already has, the rename must be
+**byte-identical** — change the filename only, not even the header
+comment — and its manifest entry records the original name with the
+entry's own sha as
+`renamed_from = [{ file = "<old>", sha256 = "<same sha>" }]`; the gate
+then recognises the old row as that entry's apply. The migrations gate
+and staging loader reject an alias whose sha differs from the entry's.
+The `migrations-staging` PR check additionally proves each new alias's
+actual old Git blob has those bytes: copying today's hash onto a
+historical name is not provenance.
+
+Source lineage is separate. A file created, renamed, edited and renamed
+again within a PR records every differing-byte edge on its **final**
+manifest entry as structured `source_rename_history` tables:
+
+```toml
+# Within the final [[migration]] entry:
+[[migration.source_rename_history]]
+parent = "<full 40-character parent commit ID>"
+commit = "<full 40-character child commit ID>"
+old_path = "migrations/0001_example.sql"
+new_path = "migrations/0002_example.sql"
+old_sha256 = "<SHA-256 of the actual old blob at parent>"
+new_sha256 = "<SHA-256 of the actual new blob at commit>"
+```
+
+These six fields describe source evidence only. They never satisfy an
+applied migration or an ordered prior, enter backfill rows, or allow a
+history-only name to be applied. Keep byte-identical `renamed_from`
+identities separate; do not reclassify existing applied aliases. Both
+alias and source metadata are append-only against the pinned common
+merge base of the target and PR head. Target-only additions after divergence
+are not PR deletions; no merge from the target is required to hide them.
+Neither field permits editing/removing a base migration, changing its target,
+renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
+
+The secretless PR gate loads its checker and its stdlib-only
+`migration_history.py` import from a separate checkout of the event's full
+trusted **base SHA**. The PR **head SHA** is checked out with full Git
+history under a different root, used only as evidence through `--root`;
+no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+excludes the working directory, `PYTHONPATH` and user-site imports, then
+adds only the trusted checker directory. The checker runs outside both
+checkouts with no API token in its environment; Git ignores global/system
+configuration and disables hooks and filesystem-monitor commands. The
+PR tree cannot supply Git's local configuration, which checkout creates.
+The checked-out head supplies the manifest while pinned Git objects supply
+SQL bytes and ancestry. A PR predating the checker can therefore be
+validated without executing its Python files. Missing trusted checker code,
+manifest, pinned Git objects or API evidence fails closed: there is no
+fallback to PR code and no missing-file pass. This compatibility boundary
+does not grant old heads an exception to the manifest or lineage contract.
+
+The secretless PR gate retains **both** coverage sources: complete,
+paginated net PR-file mappings and every per-parent Git rename in the
+pinned base-to-head ancestry. Net mappings are not invented direct
+historical edges. The collector hashes actual old/new blobs and final
+bytes, tracks commit/path identities through ordinary intervening edits,
+and resolves every edge to exactly one final entry. An ambiguous merge,
+independent lineage reusing a ledger name, missing intermediate/tail,
+unreachable/forged evidence, invalid path/type, or truncated API/Git
+input refuses. New metadata is proved in the PR that adds it; immutable
+base metadata retains that proof after squash merge, even though the
+original PR commits need not remain ancestors of the new default head.
+`migration_history.py` declares hard bounds: 512 commits, 2048 edges,
+fewer than 3000 API files, 3000 migration paths per snapshot/diff,
+2 MB per input/blob, 8 MB per Git response, 128 MB aggregate Git output,
+100000 lineage states, 250000 event references, and 20 seconds per Git
+command. Exceeding a bound refuses rather than truncates evidence.
+
+Inside the existing advisory-locked apply transaction, rows under any
+historical source name are **deny-only** evidence: any non-permitted
+identity refuses before SQL or a ledger insert, including `--record-only`.
+Conflicts and duplicate current/alias rows are checked **before** an
+already-applied no-op, for the selected entry and earlier same-target
+priors. A good current row cannot hide conflicting history. Staging still
+requires exactly one current or genuine byte-identical alias row per app
+entry; differing historical rows, current-plus-history, duplicate aliases,
+unknown rows and missing entries fail exactly as before.
+
+If staging has no historical conflicting row, use the normal authorized
+apply/proof route for the exact current bytes. If any conflicting row
+exists, stop that apply and obtain a separately reviewed forward-repair
+or environment decision. Never reset a database, rewrite/delete ledger
+rows, bless changed bytes with `--record-only`, or generate fake backfill
+rows to make a gate green. Source metadata is not staging proof or a
+release/deployment authorization.
+
+Tracking began with the 2026-11-03 backfill
+(`docs/ops/schema-migrations-backfill-2026-11-03-app.sql` and
+`-mirror.sql`, generated by
+`.github/scripts/schema_migrations_backfill.py` from the frozen
+operator-verified staging state). The three pre-merge applies from
+#917 and #922 are recorded by the sibling `-premerge-917.sql` /
+`-premerge-922.sql` files, applied only when each PR merges (or
+equivalently via `apply_migration.py --record-only`), so the gate is
+green immediately after the app backfill. The mirror database is shared by staging and
+production reads, so its backfill — and creating the table on
+production at all — is applied only under a Release Manager decision;
+production applies use the same `apply_migration.py` path once their
+gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -389,6 +505,30 @@ there is no acting user, and `details.via` records that it was the
 bootstrap rather than an admin-API write.) After promotion, the owner
 signs in normally and every further role change goes through
 `PUT /v1/admin/users/{id}/role`, which writes its own audit row.
+
+### Admin-issued invites
+
+Migration 0033 extends `invite_codes` (surrogate row id, issuer, kind,
+optional email binding, required expiry, redemption and revocation
+stamps) and adds `users.invited_by`. Signed-in admins manage invites
+through the role-gated admin API: `POST /v1/admin/invites` issues one
+invite (optionally bound to an email; per-invite expiry 1–30 days, or
+the `invite_default_expiry_days` setting), `GET /v1/admin/invites`
+(with `/status/{active|expired|redeemed|revoked}` and
+`/issuer/{user_id}` filters) lists lifecycle state, and
+`POST /v1/admin/invites/{id}/revoke` revokes an unredeemed invite.
+The plaintext code is returned exactly once, in the issue response;
+only its hash is stored, and audit rows (`invite.issued`,
+`invite.redeemed`, `invite.revoked`) reference the invite by row id —
+code material is never stored, logged, or audited. A code is consumed
+atomically inside signup completion only, so an abandoned signup
+leaves it redeemable, a committed revocation beats an in-flight
+redemption, and deleting the redeemed account never frees the code.
+Every invalid code — unknown, expired, revoked, spent, email-mismatch
+or the issuer's own email — gets the same generic signup error.
+Flipping `INVITES_REQUIRED` on stays the last operator step, after
+the bootstrap above and after a first invite has been issued and
+redeemed end-to-end in that environment.
 
 ### Hyperdrive bindings
 
@@ -645,13 +785,20 @@ without a tag. Production therefore only ever deploys on the release path
 only (`environment: staging` on both deploy jobs). No other GitHub
 environment exists on this repo.
 
-- [ ] Exact-head CI: `ci-ok`, `gitleaks` and `pr-lint` green on the promotion
-  SHA. `migrations-staging`, `CodeRabbit` and `Devin Review` report on
-  pull requests, not on `main`: record the PR whose squash commit is the
-  promotion SHA, and that they were green on that PR's final head
-  (merge policy in `CONTRIBUTING.md`). A red required check is fixed in code
-  or recorded as a flake/quarantine decision with a card link, never
-  dismissed.
+- [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
+  URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
+  CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
+  never in a local CI mirror. Reviewers and the Release Manager accept
+  these exact-head links as CI evidence, not local full-suite transcripts
+  ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
+  `migrations-staging` and `Devin Review` report on pull requests, not on
+  `main`: record the PR whose squash commit is the promotion SHA, and that
+  they were green on that PR's final head. Answer any advisory CodeRabbit
+  findings without waiting for it. Required checks and review/release
+  gates are unchanged; this evidence does not authorize production or
+  replace the staging, migration and rollback boxes below. A red required
+  check is fixed in code or recorded as a flake/quarantine decision with
+  a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
   (`.github/workflows/deploy-production.yml:233-241` runs
@@ -740,7 +887,7 @@ rollback, activation, or staging acceptance is currently claimed**, for any
 Worker in any environment, until that Worker's lane exists and its gates
 pass on the exact head being promoted — for the api Worker that requires a
 `staging-api` job conclusion `success`, successful **executed** `Hyperdrive
-cache-disabled gate`, `Verify actual staging session schema (read-only)` and
+cache-disabled gate`, `Verify actual staging migration schema (read-only)` and
 `Deploy api to staging` steps, and the job output
 `deployed=true` (`outcome=deployed`) on the promotion run; for the mb Worker
 that requires a `staging-mb` job conclusion `success`, a successful
@@ -773,7 +920,7 @@ be called accepted:
 |---|---|---|
 | 1 | Deployed Worker and version | Worker (script) name and the version reported by the deploy tooling for the version now serving, plus the environment deployed to. |
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
-| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging session schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the MB Worker, retain the successful executed `Deploy mb to staging` step outcome plus `staging-mb` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the ingest Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy ingest to staging` step outcomes plus `staging-ingest` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. A config-skipped `success` does not qualify. Record gate results by name and outcome only. |
+| 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging migration schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the MB Worker, retain the successful executed `Deploy mb to staging` step outcome plus `staging-mb` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the ingest Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy ingest to staging` step outcomes plus `staging-ingest` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. A config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
 | 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |

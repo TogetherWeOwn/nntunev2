@@ -503,11 +503,13 @@ mod tests {
                 _ => None,
             })
             .expect("NntpPool Durable Object");
-        let fetch_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(fetch)]);
+        // `alarm` = the core (fetch) binding plus the alarm handler
+        // the meter sink's flush loop runs on (meter_sink module).
+        let alarm_attribute: syn::Attribute = syn::parse_quote!(#[durable_object(alarm)]);
         assert_eq!(
             non_doc_attributes(&durable_object.attrs),
-            vec![tokens(&fetch_attribute)],
-            "NntpPool must have exactly its Durable Object fetch binding"
+            vec![tokens(&alarm_attribute)],
+            "NntpPool must have exactly its Durable Object alarm binding"
         );
 
         let route_reply = parsed

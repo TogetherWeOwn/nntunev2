@@ -42,6 +42,14 @@ EXPECTED = {
         "postgres_admin_setting_writes_serialize_per_key",
         "postgres_admin_write_refused_after_actor_demotion",
         "postgres_admin_simultaneous_opposing_demotions_keep_one_admin",
+        "postgres_admin_invite_issue_and_revoke_audit_by_row_id",
+        "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
+        "postgres_registration_invite_claim_stamps_spend_and_invited_by",
+        "postgres_registration_invite_claim_survives_issuer_deletion",
+        "postgres_admin_ingest_upload_accept_then_duplicate_converges",
+        "postgres_admin_ingest_rejected_upload_stores_failed_without_original",
+        "postgres_admin_ingest_delete_then_reupload_is_fresh",
+        "postgres_admin_ingest_list_and_get_read_redacted_jobs",
     )
 }
 EXPECTED_CONFIG = {

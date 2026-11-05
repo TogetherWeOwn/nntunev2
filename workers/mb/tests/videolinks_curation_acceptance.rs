@@ -19,16 +19,15 @@
 //! Standalone integration target: no existing suite is edited.
 
 use nntune_mb::videolinks::{
-    compute_coverage, decide_submission, dedupe_candidates, expires_at, extract_video_id,
-    is_fresh, is_playable, is_valid_video_id, normalise_submission, parse_videos_list_response,
+    compute_coverage, decide_submission, dedupe_candidates, expires_at, extract_video_id, is_fresh,
+    is_playable, is_valid_video_id, normalise_submission, parse_videos_list_response,
     validation_batches, videos_list_query, Candidate, ModerationError, SubmissionStatus,
     VideoSource, VALIDATION_TTL_S, VIDEOS_LIST_MAX_IDS,
 };
 use std::collections::{HashMap, HashSet};
 
 const MODULE_RS: &str = include_str!("../src/videolinks.rs");
-const MIGRATION_SQL: &str =
-    include_str!("../../../migrations/0031_videolinks_curation.sql");
+const MIGRATION_SQL: &str = include_str!("../../../migrations/0035_videolinks_curation.sql");
 
 /// Harvest the URL shapes the recording-videos join returns.
 #[test]
@@ -215,6 +214,16 @@ fn migration_stores_ids_without_thumbnails() {
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(ddl
+        .trim_start()
+        .starts_with("SET search_path = public, pg_catalog;"));
+    for table in [
+        "video_link_candidates",
+        "video_user_submissions",
+        "video_coverage_snapshots",
+    ] {
+        assert!(ddl.contains(&format!("CREATE TABLE IF NOT EXISTS public.{table}")));
+    }
     assert!(
         !ddl.to_lowercase().contains("thumbnail"),
         "thumbnails are never proxied, cached or stored"

@@ -262,14 +262,17 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	await seed(page, baseURL!); await add(page, 'title-coral'); await settle(page);
 	const selected = await page.title();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
-	const navigation = page.locator('nav:has(a[href="/library/import"])');
-	await navigation.getByRole('link', { name: 'Select NZB locally', exact: true }).click();
-	await expect(page).toHaveURL(/\/library\/import$/); await settle(page);
+	// User NZB import retired: the SPA leg runs through Account
+	// billing instead of the deleted /library/import route.
+	const primary = page.getByRole('navigation', { name: 'Primary' });
+	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Account', exact: true }).click();
+	await expect(page).toHaveURL(/\/account\/billing$/); await settle(page);
 	const destination = await page.title();
-	await navigation.getByRole('link', { name: 'Library', exact: true }).click();
+	await primary.getByRole('link', { name: 'Your Library', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0); await settle(page);
-	await check(info, { titles: [CORAL_TITLE, 'NNTune — local NZB selection', BASELINE], marker: 'same-document' }, {
+	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', BASELINE], marker: 'same-document' }, {
 		titles: [selected, destination, await page.title()],
 		marker: await page.evaluate(() => (window as unknown as { titleNavMarker: string }).titleNavMarker)
 	});

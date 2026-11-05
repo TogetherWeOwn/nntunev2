@@ -116,7 +116,9 @@
 	}
 
 	function upgrade(event: MouseEvent) {
-		if (!event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+		// ctaHref is null for models with no upgrade action; the anchor
+		// is not rendered then, so this guard only satisfies the type.
+		if (model.ctaHref && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
 			navigating = new URL(model.ctaHref, window.location.href).href !== window.location.href;
 			// Already on pricing: don't run a redundant router navigation
 			// that resets the focus we are returning to the plan control.
@@ -180,7 +182,9 @@
 	<p class="paywall-announcement" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
 
 	<div class="paywall-actions">
-		<a class="nt-button" href={model.ctaHref} onclick={upgrade}>{model.ctaLabel ?? 'Upgrade your plan'}</a>
+		{#if model.ctaHref}
+			<a class="nt-button" href={model.ctaHref} onclick={upgrade}>{model.ctaLabel ?? 'Upgrade your plan'}</a>
+		{/if}
 		{#if model.kind === 'retryable'}
 			<button type="button" class="nt-button nt-button--ghost" onclick={retry}
 				disabled={remaining !== null && remaining > 0}>Retry</button>

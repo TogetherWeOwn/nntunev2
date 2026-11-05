@@ -232,7 +232,7 @@ test('signup: retry after dismissal finishes with the same code and challenge', 
 	await expect(page.getByRole('alert')).toContainText(DISMISSAL);
 
 	await page.getByRole('button', { name: /finish creating account/i }).click();
-	await page.waitForURL('/library');
+	await expect(page).toHaveURL(/\/account\/billing$/);
 
 	expect(traffic.startPosts).toBe(1);
 	expect(traffic.finishPosts).toBe(1);

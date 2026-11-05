@@ -9,5 +9,23 @@ Add a manifest entry for every new migration with its explicit `target` (`app` o
 Never edit or rename an applied migration. Migrations are forward-only: correct a deployed schema with a new migration, not by changing history.
 (Source: `.github/scripts/migrations_gate.py` `check_drift` — `applied-edited` and `applied-removed`.)
 
+Applied migrations are recorded in each database's `public.schema_migrations` table (`file`, `sha256`, `applied_at`, `applied_by`), written by `.github/scripts/apply_migration.py` in the same transaction as the apply. The staging deploy gate compares those rows against this manifest, so a migration that was applied but not recorded (or recorded but never applied) fails the deploy.
+(Sources: `.github/scripts/apply_migration.py` `compose` and `DDL`; `.github/scripts/staging_api_schema_gate.py` `load_expected` and `compare`; `docs/ops.md` "Staging migrations".)
+
+A file renumbered on a PR branch after staging already applied it must be renamed byte-identically (filename only — not even the header comment changes) and keeps its original name, with the entry's own sha, in its manifest entry as `renamed_from = [{ file = "…", sha256 = "…" }]`; the database row keeps the name it was applied under and the gate recognises it through this history. Recording `renamed_from` is metadata, never an edit of the applied migration.
+(Sources: `.github/scripts/migrations_gate.py` `load_manifest` and the `bad-rename` checks in `check_manifest`; `.github/scripts/migrations_rename_check.py` `check`, run by the `migrations-staging` workflow.)
+
 Replay-safety: `workers/api/tests/run_migration_tests.sh` applies every `migrations/*.sql` in order to an empty database, then re-applies the full set to prove each migration is a clean no-op on replay. Two migrations are excluded from the replay pass: `0006_account_deletion.sql`, which predates the replay check and carries an unconditional `ADD COLUMN`, and `0021_billing_schema.sql`, whose seed names columns that `0026_plan_reseed_no_trial.sql` drops; applied migrations cannot be edited, so both are intentionally excluded.
 (Source: `workers/api/tests/run_migration_tests.sh` — the apply loop reapplies every migration except `0006_account_deletion.sql` and `0021_billing_schema.sql`, with the exclusion reasons recorded inline.)
+
+`search_path` convention: every new migration is self-contained under any role or runner `search_path`.
+
+The first statement of every new migration numbered above `0030` is exactly `SET search_path = public, pg_catalog;` (`public` first so new objects land there; no `$user`, no other writable schema). Leading comments and blank lines may precede it; nothing executable may. The CI migration gate enforces this for files new against the base ref (`missing-search-path`).
+(Source: `.github/scripts/migrations_gate.py` `check_drift` — a new number above 0030 whose file does not open with the exact `SET` header; enforced in CI by the `migrations-gate` job in `.github/workflows/ci.yml`.)
+
+Schema-qualify every relation reference in new migrations: `CREATE/ALTER/DROP TABLE public.…`, `CREATE INDEX … ON public.…`, `REFERENCES public.…`, `'…'::regclass` literals, and seed `INSERT INTO public.…`. (Review-enforced: the gate cannot parse SQL.)
+Extensions use `CREATE EXTENSION … WITH SCHEMA public`, so the extension lands in `public` regardless of the caller's `search_path` (operator-class resolution, e.g. `gin_trgm_ops` in `0001`, also follows `search_path`, which qualification alone cannot fix).
+Any future function carries a function-level `SET search_path = public, pg_catalog` attribute (mandatory for `SECURITY DEFINER`).
+
+Migrations that predate this convention are manifest-pinned and immutable, so they carry no header — including `0030_mb_mirror_w6b.sql`, which must never be edited to add one (that breaks the manifest checksum pin for zero gain over the session pin below). `workers/api/tests/run_migration_tests.sh` applies every migration with the session pinned (`PGOPTIONS='-c search_path=public,pg_catalog'` in `psql_run`); that wrapper is the required way to apply any pre-convention file in every environment. Do not rely on `ALTER ROLE/DATABASE … SET search_path`.
+(Source: `workers/api/tests/run_migration_tests.sh` `psql_run`; `.github/scripts/migrations_gate.py` `check_drift` — the header check covers only files new against the base ref, so already-merged files are unaffected.)

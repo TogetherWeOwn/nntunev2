@@ -7,12 +7,13 @@ fails when the total exceeds the pinned budget below. Without this gate,
 bundle bloat (a heavy dependency, an accidental full-library import) lands
 silently — ``pnpm build`` itself asserts nothing about size.
 
-Budget: ``BUDGET_CLIENT_JS_BYTES = 337_920`` (330 KiB, raw bytes, not gzip).
-Measured 306,065 B (~299 KiB, 37 files) on 2026-10-27, so the budget leaves
-~10% headroom for the next first-party features while catching any serious
-addition (a charting or date library typically adds 50+ KiB). Growth since the
-232,233 B baseline of 2026-10-23 is expected: first-party library features
-only, no new runtime dependencies.
+Budget: ``BUDGET_CLIENT_JS_BYTES = 368_640`` (360 KiB, raw bytes, not gzip).
+Measured 339,150 B (~331 KiB, 52 files) on 2026-11-03 for the pending W10
+app shell (PR #907: shell routes and furniture plus review-fix logic), so
+the budget leaves ~8% headroom for the next first-party features while
+catching any serious addition (a charting or date library typically adds
+50+ KiB). Growth since the 232,233 B baseline of 2026-10-23 is expected:
+first-party library features only, no new runtime dependencies.
 
 How to update the budget (deliberately, in its own PR):
 1. Run ``pnpm --dir apps/web build`` and note the new total this script prints.
@@ -35,7 +36,7 @@ import sys
 from pathlib import Path
 
 # Pinned budget, raw bytes. See module docstring for how to update.
-BUDGET_CLIENT_JS_BYTES = 337_920  # 330 KiB; measured 306,065 B on 2026-10-27
+BUDGET_CLIENT_JS_BYTES = 368_640  # 360 KiB; measured 339,150 B on 2026-11-03 (W10 app-shell client)
 
 CLIENT_DIR_PARTS = ("apps", "web", ".svelte-kit", "output", "client")
 

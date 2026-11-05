@@ -1,5 +1,10 @@
-import { test, expect, type APIRequestContext } from '@playwright/test';
-import { accessHeaders, assertNoAccessWall, stagingBaseUrl } from '../helpers/access.js';
+import { test, expect, type APIRequestContext, type APIResponse } from '@playwright/test';
+import {
+  accessHeaders,
+  assertNoAccessWall,
+  readApiBody,
+  stagingBaseUrl,
+} from '../helpers/access.js';
 import {
   apiGet,
   apiPost,
@@ -9,8 +14,8 @@ import {
 } from '../helpers/accounts.js';
 
 // Scoped native REST credentials (ADR 0010, paired acceptance card,
-// paired build card): mint → scoped route 404 (gate passed; data routes
-// pending) → revoke → 404 (revoked/unknown bearers are the same plain 404
+// paired build card): mint → library search 404 (data route pending)
+// → revoke → 404 (revoked/unknown bearers are the same plain 404
 // as header-absent callers — uniform posture, no existence oracle),
 // scope-matrix denials by name, header-only transport, names-only
 // diagnostics.
@@ -39,7 +44,7 @@ const SCOPES = [
 
 type Scope = (typeof SCOPES)[number];
 
-/** Canonical bearer route per scope (mirrors the Rust route-map pins). */
+/** Scope-gate route per scope, not a promise of handler authentication/support. */
 const CANONICAL_ROUTE: Record<Scope, { method: 'GET' | 'POST'; path: string }> = {
   'library:read': { method: 'GET', path: '/v1/search' },
   'playlists:write': { method: 'POST', path: '/v1/playlists' },
@@ -52,13 +57,107 @@ const CANONICAL_ROUTE: Record<Scope, { method: 'GET' | 'POST'; path: string }> =
 const SESSION_ONLY_PATHS = [
   '/v1/me',
   '/v1/indexers',
-  '/v1/vault',
-  '/v1/vault/test-connection',
+  '/v1/plans',
+  '/v1/me/usage',
   '/v1/credentials',
 ];
 
 /** Issuance surface the paired build implements (session-authenticated). */
 const ISSUE_PATH = '/v1/credentials';
+
+/**
+ * Bearer-only route/stage matrix (explicit, exact statuses, no accepted
+ * lists). The requests under test carry the bearer and nothing else.
+ *  - plays:write on POST /v1/plays: grant issuance there is session-only,
+ *    so a bearer with no Origin/session is rejected 401 at that stage.
+ *  - library:read on GET /v1/search: scope gate passes, data route is
+ *    still the plain 404 (route-stage verdict, not a feature acceptance).
+ *  - wrong scope on either route: 403 by name.
+ */
+const BEARER_ONLY_MATRIX: ReadonlyArray<{
+  id: string;
+  name: string;
+  credentialScope: Scope;
+  method: 'GET' | 'POST';
+  path: string;
+  expectedStatus: 401 | 403 | 404;
+  reason: string;
+}> = [
+  {
+    id: 'search-own',
+    name: 'GET /v1/search with library:read: plain 404 (data route stage)',
+    credentialScope: 'library:read',
+    method: 'GET',
+    path: '/v1/search',
+    expectedStatus: 404,
+    reason: 'library own-scope /v1/search must be exactly 404',
+  },
+  {
+    id: 'plays-own',
+    name: 'POST /v1/plays with plays:write: 401 (session-only grant stage, no Origin/session)',
+    credentialScope: 'plays:write',
+    method: 'POST',
+    path: '/v1/plays',
+    expectedStatus: 401,
+    reason: 'plays:write bearer without Origin/session must be exactly 401 at the grant stage',
+  },
+  {
+    id: 'plays-wrong-scope',
+    name: 'POST /v1/plays with library:read: 403 (wrong scope by name)',
+    credentialScope: 'library:read',
+    method: 'POST',
+    path: '/v1/plays',
+    expectedStatus: 403,
+    reason: 'wrong-scope /v1/plays must be exactly 403',
+  },
+  {
+    id: 'search-wrong-scope',
+    name: 'GET /v1/search with plays:write: 403 (wrong scope by name)',
+    credentialScope: 'plays:write',
+    method: 'GET',
+    path: '/v1/search',
+    expectedStatus: 403,
+    reason: 'wrong-scope /v1/search must be exactly 403',
+  },
+];
+
+async function assertMatrixRefusal(
+  res: Pick<APIResponse, 'status' | 'headers' | 'text'>,
+  c: (typeof BEARER_ONLY_MATRIX)[number],
+): Promise<void> {
+  const bodyText = await readApiBody(res, c.path, 'scoped-credentials-matrix');
+  expect(res.status(), c.reason).toBe(c.expectedStatus);
+  // Match the real route's refusal, not just its status. Keep parsing and
+  // comparisons in memory: neither JSON errors nor matcher diffs may echo
+  // an untrusted body, field name or value into the evidence output.
+  let body: unknown;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    // The fixed, names-only failure below also covers non-JSON responses.
+  }
+  const expected: Record<string, unknown> =
+    c.expectedStatus === 401
+      ? { error: 'check your email and try again' }
+      : {
+          code: c.expectedStatus === 403 ? 'forbidden' : 'not_found',
+          message: c.expectedStatus === 403 ? 'insufficient scope' : 'not found',
+          retryable: false,
+        };
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    Array.isArray(body) ||
+    Object.keys(body).length !== Object.keys(expected).length ||
+    !Object.entries(expected).every(
+      ([key, value]) => (body as Record<string, unknown>)[key] === value,
+    )
+  ) {
+    throw new Error(
+      '[scoped-credentials-matrix] expected application refusal fields (names only)',
+    );
+  }
+}
 
 function nativeBaseUrl(): string | null {
   const raw = (process.env.NATIVE_REST_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -202,6 +301,70 @@ test.describe('credential contract table (offline, no staging)', () => {
     }
   });
 
+  test('bearer-only matrix pins explicit exact statuses per route and stage', () => {
+    expect(
+      BEARER_ONLY_MATRIX.map((c) => [c.credentialScope, c.method, c.path, c.expectedStatus]),
+    ).toEqual([
+      ['library:read', 'GET', '/v1/search', 404],
+      ['plays:write', 'POST', '/v1/plays', 401],
+      ['library:read', 'POST', '/v1/plays', 403],
+      ['plays:write', 'GET', '/v1/search', 403],
+    ]);
+    expect(new Set(BEARER_ONLY_MATRIX.map((c) => c.id)).size).toBe(BEARER_ONLY_MATRIX.length);
+    const headers = bearerHeaders('SECRET_SENTINEL');
+    expect(Object.keys(headers).some((k) => /^(cookie|origin)$/i.test(k))).toBe(false);
+  });
+
+  for (const c of BEARER_ONLY_MATRIX) {
+    const response = (body: string): Pick<APIResponse, 'status' | 'headers' | 'text'> => ({
+      status: () => c.expectedStatus,
+      headers: () => ({ 'content-type': 'application/json' }),
+      text: async () => body,
+    });
+
+    test(`matrix accepts genuine application refusal: ${c.id}`, async () => {
+      const body =
+        c.expectedStatus === 401
+          ? { error: 'check your email and try again' }
+          : {
+              code: c.expectedStatus === 403 ? 'forbidden' : 'not_found',
+              message: c.expectedStatus === 403 ? 'insufficient scope' : 'not found',
+              retryable: false,
+            };
+      await assertMatrixRefusal(response(JSON.stringify(body)), c);
+    });
+
+    if (c.expectedStatus === 401 || c.expectedStatus === 403) {
+      test(`matrix rejects body-only Access wall: ${c.id}`, async () => {
+        const wall = '<html>Cloudflare Access BODY_SENTINEL</html>';
+        await expect(assertMatrixRefusal(response(wall), c)).rejects.toThrow(
+          'hit the Cloudflare Access wall',
+        );
+      });
+    }
+
+    test(`matrix rejects non-application bodies with names-only diagnostics: ${c.id}`, async () => {
+      const bodies = [
+        '',
+        '<html>BODY_SENTINEL</html>',
+        'invalid-json-BODY_SENTINEL',
+        'null',
+        '[]',
+        '{"code":"BODY_SENTINEL","message":"BODY_SENTINEL","retryable":false}',
+        '{"error":"BODY_SENTINEL"}',
+        '{"error":"check your email and try again","grant":"BODY_SENTINEL"}',
+        '{"code":"forbidden","message":"insufficient scope","retryable":true}',
+      ];
+      for (const body of bodies) {
+        await expect(assertMatrixRefusal(response(body), c)).rejects.toThrow(
+          'expected application refusal fields (names only)',
+        );
+        const error = await assertMatrixRefusal(response(body), c).catch((e: Error) => e);
+        expect(error instanceof Error && !error.message.includes('BODY_SENTINEL')).toBe(true);
+      }
+    });
+  }
+
   test('bearer headers carry the secret in one place only', () => {
     const headers = bearerHeaders('SECRET_SENTINEL');
     expect(headers.Authorization).toBe('Bearer SECRET_SENTINEL');
@@ -312,7 +475,7 @@ test.describe('staging credential lifecycle', () => {
     // and land on the plain 404 until the data routes land (fail-closed
     // either way).
     const bare = await apiGet(request, target, accessHeaders(), 'scoped-credentials-bare');
-    expect([401, 403, 404].includes(bare.status()), 'bare call must fail closed').toBe(true);
+    expect(bare.status(), 'bare call must fail closed with exactly 404').toBe(404);
 
     // Garbage bearer: an unknown credential is the same plain 404 as a
     // header-absent caller (uniform posture per ADR 0010 — only
@@ -334,9 +497,9 @@ test.describe('staging credential lifecycle', () => {
       maxRedirects: 0,
     });
     expect(
-      [401, 403, 404].includes(cookieOnly.status()),
-      'cookie-only call on a credential route must fail closed',
-    ).toBe(true);
+      cookieOnly.status(),
+      'cookie-only call on a credential route must fail closed with exactly 404',
+    ).toBe(404);
 
     // Query-string bearer is rejected (query strings land in logs); with no
     // Authorization header the probe lands on the plain 404 until the data
@@ -348,79 +511,67 @@ test.describe('staging credential lifecycle', () => {
       'scoped-credentials-query',
     );
     expect(
-      [401, 403, 404].includes(query.status()),
-      'query-string credential must be rejected',
-    ).toBe(true);
+      query.status(),
+      'query-string credential must be rejected with exactly 404',
+    ).toBe(404);
   });
 
-  test('scope matrix spot check fails by name (403, not 401)', async ({ request }) => {
-    const webBase = stagingBaseUrl('skip', 'scoped-credentials-matrix');
-    if (!webBase) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    const nativeBase = nativeBaseUrl();
-    if (!nativeBase) {
-      test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
-      return;
-    }
-    const account = await tryMintTestAccount(request, webBase);
-    if (!account) {
-      test.skip(true, 'account seam unconfigured (no QA_AUTH_TOKEN) — matrix needs a session.');
-      return;
-    }
-    requireApiAccount(account, 'scoped-credentials-matrix');
-    // Issuance is session-cookie + exact Origin (the bearer header is
-    // ignored there).
-    const matrixMintHeaders = {
-      ...privilegedHeaders(account, webBase),
-      'Content-Type': 'application/json',
-    };
+  // Route/stage-specific matrix. Each leg mints its OWN credential (the
+  // session cookie + exact Origin are used for MINT ONLY) and then calls
+  // the route under test bearer-only: no Cookie, no Origin, on a fresh
+  // request context so no stored cookie can leak in. Legs are independent
+  // tests, so an own-scope failure never hides a wrong-scope result.
+  // A 404/401 here is a route/stage verdict only; it is NOT acceptance of
+  // grant issuance or of any native feature.
+  for (const c of BEARER_ONLY_MATRIX) {
+    test(`bearer-only ${c.name}`, async ({ request, playwright }) => {
+      const webBase = stagingBaseUrl('skip', 'scoped-credentials-matrix');
+      if (!webBase) {
+        test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+        return;
+      }
+      const nativeBase = nativeBaseUrl();
+      if (!nativeBase) {
+        test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
+        return;
+      }
+      const account = await tryMintTestAccount(request, webBase);
+      if (!account) {
+        test.skip(true, 'account seam unconfigured (no QA_AUTH_TOKEN) — matrix needs a session.');
+        return;
+      }
+      requireApiAccount(account, 'scoped-credentials-matrix');
 
-    // Bounded retry over transient store-blip 500s (see mintCredential):
-    // a single store outage previously 500ed both matrix mints in the
-    // same window, and the whole-test retry only re-ran the failure.
-    const mintFor = async (scope: Scope): Promise<string> => {
+      // MINT ONLY uses the session surface (bounded retry over store blips).
       const { secret } = await mintCredential(
         request,
         nativeBase,
-        matrixMintHeaders,
-        `e2e-matrix-${scope}`,
-        [scope],
+        { ...privilegedHeaders(account, webBase), 'Content-Type': 'application/json' },
+        `e2e-matrix-${c.id}`,
+        [c.credentialScope],
         'scoped-credentials-matrix-mint',
       );
-      return secret;
-    };
 
-    const call = async (method: 'GET' | 'POST', path: string, secret: string): Promise<number> => {
-      const url = `${nativeBase}${path}`;
-      const res =
-        method === 'GET'
-          ? await apiGet(request, url, bearerHeaders(secret), 'scoped-credentials-matrix')
-          : await apiPost(
-              request,
-              url,
-              { ...bearerHeaders(secret), 'Content-Type': 'application/json' },
-              {},
-              'scoped-credentials-matrix',
-            );
-      return res.status();
-    };
-
-    // library:read reaches its own route but not plays:write's, and vice
-    // versa — each denial is 403 (authenticated, wrong scope by name).
-    // Own-scope bearers pass the gate to the documented 404 until the data
-    // routes land (a wrong-scope bearer is 403 instead, so 404 proves the
-    // gate passed for the right scope).
-    const reader = await mintFor('library:read');
-    const writer = await mintFor('plays:write');
-    expect(await call('GET', '/v1/search', reader), 'own scope passes the gate to 404').toBe(
-      404,
-    );
-    expect(await call('POST', '/v1/plays', writer), 'own scope passes the gate to 404').toBe(404);
-    expect(await call('POST', '/v1/plays', reader), 'cross-scope must be 403 by name').toBe(403);
-    expect(await call('GET', '/v1/search', writer), 'cross-scope must be 403 by name').toBe(403);
-  });
+      const bearerOnly = await playwright.request.newContext();
+      try {
+        const url = `${nativeBase}${c.path}`;
+        const headers = bearerHeaders(secret);
+        const res =
+          c.method === 'GET'
+            ? await apiGet(bearerOnly, url, headers, 'scoped-credentials-matrix')
+            : await apiPost(
+                bearerOnly,
+                url,
+                { ...headers, 'Content-Type': 'application/json' },
+                {},
+                'scoped-credentials-matrix',
+              );
+        await assertMatrixRefusal(res, c);
+      } finally {
+        await bearerOnly.dispose();
+      }
+    });
+  }
 
   test('credential list and issuance surface never return secret material', async ({
     request,

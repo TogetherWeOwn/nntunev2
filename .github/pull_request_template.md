@@ -16,9 +16,14 @@
 ## Staging migration
 
 <!-- Required if this PR adds or changes migrations/*.sql (docs/ops.md, "Staging migrations").
-Apply to staging before merge, then replace this comment with one of:
+Apply to staging before merge with .github/scripts/apply_migration.py (it records the
+schema_migrations row; the staging gate verifies staging against the manifest, not this
+text). State the apply state here for reviewers, e.g.:
 Staging migration: 0026_example.sql — applied YYYY-MM-DD by <who>
 Staging migration: pending (blocked on <ticket>)
+If this PR renames a migration staging already has, the rename must be byte-identical
+(filename only, not even the header) and its manifest entry needs
+renamed_from = [{ file = "<old>", sha256 = "<same sha>" }] (migrations-staging checks).
 Otherwise delete this section. -->
 
 ## Attestation

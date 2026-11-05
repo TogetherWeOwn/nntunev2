@@ -17,13 +17,13 @@
 //!   is TTL'd (30 days) and must be refreshed or deleted past expiry.
 //! - The mirror stays CC0-only: user submissions and ListenBrainz
 //!   observations live in the app-side curation tables
-//!   (`migrations/0031_videolinks_curation.sql`), never in `mb_*`.
+//!   (`migrations/0035_videolinks_curation.sql`), never in `mb_*`.
 //!
-//! The YouTube Data API key is runtime config (never committed); the
-//! request builder takes it as a parameter so no key material is stored
-//! in this crate. Live validation cannot run until the scoped credential
-//! lands (operator step); until then every function here is pure and
-//! covered natively.
+//! These are pure helpers, not a running harvest/validation/storage job.
+//! The query builder omits the YouTube Data API key; a future runtime
+//! caller must supply it securely. Credential installation and live
+//! validation are not established by the fixture-based tests. See
+//! `docs/videolinks-pipeline.md` for the remaining integration work.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -111,7 +111,11 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     }
     // Path forms: /embed/<id>, /shorts/<id>, /live/<id>.
     for prefix in ["/embed/", "/shorts/", "/live/"] {
-        if let Some(after) = rest.split(['?', '#']).next().and_then(|p| p.strip_prefix(prefix)) {
+        if let Some(after) = rest
+            .split(['?', '#'])
+            .next()
+            .and_then(|p| p.strip_prefix(prefix))
+        {
             let id = after.split('/').next().unwrap_or("");
             return valid_id(id);
         }
@@ -269,7 +273,11 @@ pub fn parse_videos_list_response(body: &str) -> Result<Vec<ValidatedVideo>, Str
             }
             Ok(ValidatedVideo {
                 video_id: item.id,
-                title: item.snippet.as_ref().and_then(|s| s.title.clone()).unwrap_or_default(),
+                title: item
+                    .snippet
+                    .as_ref()
+                    .and_then(|s| s.title.clone())
+                    .unwrap_or_default(),
                 channel_id: item
                     .snippet
                     .as_ref()
@@ -281,7 +289,11 @@ pub fn parse_videos_list_response(body: &str) -> Result<Vec<ValidatedVideo>, Str
                     .and_then(|c| c.duration.as_deref())
                     .map(parse_iso8601_duration)
                     .unwrap_or(0),
-                embeddable: item.status.as_ref().and_then(|s| s.embeddable).unwrap_or(false),
+                embeddable: item
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.embeddable)
+                    .unwrap_or(false),
                 privacy_status: item
                     .status
                     .as_ref()
@@ -315,7 +327,11 @@ pub fn parse_iso8601_duration(s: &str) -> u32 {
             _ => return 0,
         }
     }
-    if num.is_empty() { total } else { 0 }
+    if num.is_empty() {
+        total
+    } else {
+        0
+    }
 }
 
 /// True when API-returned data from `validated_at` is still within the
@@ -465,12 +481,18 @@ mod unit_tests {
 
     #[test]
     fn rejects_non_youtube_and_bad_ids() {
-        assert_eq!(extract_video_id("https://example.com/watch?v=dQw4w9WgXcQ"), None);
+        assert_eq!(
+            extract_video_id("https://example.com/watch?v=dQw4w9WgXcQ"),
+            None
+        );
         assert_eq!(
             extract_video_id("https://www.youtube.com/playlist?list=PL1234567890123456"),
             None
         );
-        assert_eq!(extract_video_id("https://www.youtube.com/watch?v=short"), None);
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?v=short"),
+            None
+        );
         assert_eq!(extract_video_id("not a url"), None);
     }
 
@@ -524,7 +546,10 @@ mod unit_tests {
 
     #[test]
     fn moderation_flow() {
-        assert_eq!(normalise_submission("dQw4w9WgXcQ"), Ok("dQw4w9WgXcQ".into()));
+        assert_eq!(
+            normalise_submission("dQw4w9WgXcQ"),
+            Ok("dQw4w9WgXcQ".into())
+        );
         assert_eq!(
             normalise_submission("https://youtu.be/dQw4w9WgXcQ"),
             Ok("dQw4w9WgXcQ".into())
@@ -551,8 +576,9 @@ mod unit_tests {
         assert_eq!(r.coverage_ratio, 0.25);
         assert_eq!(r.played_coverage_ratio, None);
 
-        let plays: HashMap<String, u64> =
-            [("a".to_string(), 90), ("b".to_string(), 10)].into_iter().collect();
+        let plays: HashMap<String, u64> = [("a".to_string(), 90), ("b".to_string(), 10)]
+            .into_iter()
+            .collect();
         let r = compute_coverage(4, &linked, &plays);
         assert_eq!(r.played_coverage_ratio, Some(0.9));
     }
