@@ -5,6 +5,15 @@ explicit gap. M1 exits when the secure staging user journey
 (signup → library → meter → limits) passes on an exact-head staging deploy
 with Access enabled, and rollback evidence is recorded.
 
+**Target-model note (2026-11-03):** the BYOP step is retired. Under
+ADR 0013/0014 users bring no provider or NZB; the target journey is
+signup → subscription/entitlement → play/seek over the admin-ingested
+shared catalogue, with ingest as an admin action rather than a user step.
+Rows below describe the current specs and their measured gaps, not proof
+that the shared catalogue or pool is implemented. Keep their current
+coverage and update this matrix in the same PRs that change the specs,
+per the rule below.
+
 Line numbers below track the cited specs; re-verify with the commands at the
 end of this document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
