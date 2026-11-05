@@ -17,9 +17,12 @@
 
 use super::*;
 use nntune_ingest::posted_generations::{
-    invalidate_retained_check, prepare_retained_check, RetainedCheckPermit, RetainedCustody,
-    RetainedInvalidation, RetainedReferenceKind,
+    invalidate_retained_check, prepare_retained_check, prepare_retained_content_check, ArticleSide,
+    RetainedCheckPermit, RetainedCustody, RetainedInvalidation, RetainedReferenceKind,
 };
+
+#[path = "posted_generation_retained_content.rs"]
+mod content;
 
 type Prepared = Option<(RetainedCheckPermit, RetainedCustody)>;
 
@@ -806,6 +809,14 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
             "the fixture row has no plan hash or operation"
         );
 
+        // A standing round does not upgrade legacy custody into a managed plan.
+        // Avoid masking the null-plan refusal behind the separate round-zero gate.
+        db.execute(
+            "UPDATE posted_file_health SET round = 1 WHERE generation_id = $1",
+            &[&legacy_id],
+        )
+        .await
+        .quiet("fixture legacy standing round");
         let before = legacy_rows(&db, &legacy_id, &legacy_hash).await;
         let h0 = health(&db, &legacy_id).await;
 
@@ -839,6 +850,26 @@ fn postgres_retained_legacy_row_without_plan_hash_exposes_custody_only_and_inval
         )
         .await;
         assert!(refused(&wrong));
+
+        // Content reads need the sealed plan hash: a null-plan legacy row is
+        // refused on both sides without any write.
+        for side in [ArticleSide::Post, ArticleSide::Verify] {
+            let content = prepare_retained_content_check(
+                &mut db,
+                &attempt,
+                &legacy_id,
+                RetainedReferenceKind::LegacyPin,
+                &legacy_id,
+                side,
+            )
+            .await;
+            assert!(matches!(content, Ok(None)), "null plan: content refused");
+        }
+        assert!(
+            before == legacy_rows(&db, &legacy_id, &legacy_hash).await,
+            "content refusal writes nothing"
+        );
+        assert!(h0 == health(&db, &legacy_id).await);
 
         assert!(is_applied(
             &invalidate_retained_check(&mut db, &permit).await

@@ -1,13 +1,20 @@
-//! Negative-only health checks for an already retained generation.
+//! Fenced health observations for an already retained generation.
 //!
 //! This is not candidate verification or a new health scheduler. Preparation is
 //! read-only and captures the original job-attempt, reference and health fence
 //! together with immutable custody. No transaction spans a reader. An explicit
-//! unknown/failed read may withdraw eligibility through that exact permit only;
-//! it cannot assert intact content, terminal loss, reuse or cleanup authority.
-//! Successful standing checks and terminal-failure policy remain separate.
+//! unknown/failed read may withdraw eligibility through that exact permit only.
+//! Complete-read observations do not establish independent-backbone provenance,
+//! affirmative retention, terminal loss, reuse or cleanup authority.
 
 use super::*;
+
+#[path = "posted_generation_retained_content.rs"]
+mod content_reads;
+pub use content_reads::{
+    drive_retained_content_read, prepare_retained_content_check, record_retained_content_check,
+    RetainedContentPermit,
+};
 
 /// Existing durable reference kinds eligible for retained health work. Pending
 /// candidates use the claim-bound verifier, never this path's weaker fence.
@@ -65,6 +72,7 @@ impl RetainedCustody {
     }
 }
 
+/// A committed retained observation/invalidation, never eligibility authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainedInvalidation {
     Applied,
@@ -199,20 +207,28 @@ pub async fn invalidate_retained_check(
     else {
         return Ok(RetainedInvalidation::StaleOrMissing);
     };
-    if health.get::<_, i64>("revision") != permit.revision
-        || health.get::<_, i64>("round") != permit.round
-        || health.get::<_, &str>("round_token") != permit.round_token
-    {
+    if !matches_fence(&health, permit) {
         return Ok(RetainedInvalidation::StaleOrMissing);
     }
+    withdraw_health(&tx, &permit.generation).await?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(RetainedInvalidation::Applied)
+}
+
+fn matches_fence(health: &Row, permit: &RetainedCheckPermit) -> bool {
+    health.get::<_, i64>("revision") == permit.revision
+        && health.get::<_, i64>("round") == permit.round
+        && health.get::<_, &str>("round_token") == permit.round_token
+}
+
+async fn withdraw_health(tx: &Transaction<'_>, generation: &str) -> Result<(), StoreError> {
     tx.execute(
         "UPDATE posted_file_health SET state = 'unknown', failure_kind = NULL, \
          verified_at = NULL, retention_checked_at = NULL, revision = revision + 1, \
          round = round + 1, round_token = gen_random_uuid()::text WHERE generation_id = $1",
-        &[&permit.generation],
+        &[&generation],
     )
     .await
     .map_err(database_error)?;
-    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
-    Ok(RetainedInvalidation::Applied)
+    Ok(())
 }

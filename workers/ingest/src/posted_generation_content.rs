@@ -198,22 +198,14 @@ pub async fn record_content_check(
     permit: &ContentCheckPermit,
     result: ContentCheckResult<'_>,
 ) -> Result<MutationOutcome, StoreError> {
-    let state = match result {
-        ContentCheckResult::Intact(report) => {
-            if report.backbone != permit.backbone
-                || report.plan_sha256 != permit.plan
-                || report.plaintext_sha256 != permit.hash
-                || report.plaintext_size != permit.size
-                || report.checked_articles != permit.articles
-            {
-                return Err(StoreError::InvalidInput);
-            }
-            ContentCheckState::Intact
-        }
-        ContentCheckResult::Unavailable => ContentCheckState::Unavailable,
-        ContentCheckResult::AuthenticationFailed => ContentCheckState::AuthenticationFailed,
-        ContentCheckResult::IntegrityFailed => ContentCheckState::IntegrityFailed,
-    };
+    let state = checked_state(
+        result,
+        &permit.backbone,
+        &permit.plan,
+        &permit.hash,
+        permit.size,
+        permit.articles,
+    )?;
     let handle = &permit.handle;
     let tx = client.transaction().await.map_err(database_error)?;
     let Some(current) = lock_candidate(&tx, handle).await? else {
@@ -222,8 +214,70 @@ pub async fn record_content_check(
     if current.get::<_, &str>("state") != "verifying" || handle.round == 0 {
         return Ok(MutationOutcome::StaleOrDiverged);
     }
+    let changed = store_observation(
+        &tx,
+        &handle.generation,
+        handle.round,
+        permit.side,
+        &permit.backbone,
+        state,
+        permit.articles,
+    )
+    .await?;
+    // A conflicting/inconsistent stored identity must not look like idempotence.
+    // Loading also validates complete-article counts against immutable custody.
+    load_checks(&tx, handle).await?;
+    if changed == 1 {
+        tx.execute(
+            "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
+            &[&handle.generation],
+        )
+        .await
+        .map_err(database_error)?;
+    }
+    commit_mutation(tx, handle).await
+}
+
+pub(super) fn checked_state(
+    result: ContentCheckResult<'_>,
+    backbone: &str,
+    plan: &str,
+    hash: &str,
+    size: i64,
+    articles: i32,
+) -> Result<ContentCheckState, StoreError> {
+    Ok(match result {
+        ContentCheckResult::Intact(report) => {
+            if report.backbone != backbone
+                || report.plan_sha256 != plan
+                || report.plaintext_sha256 != hash
+                || report.plaintext_size != size
+                || report.checked_articles != articles
+            {
+                return Err(StoreError::InvalidInput);
+            }
+            ContentCheckState::Intact
+        }
+        ContentCheckResult::Unavailable => ContentCheckState::Unavailable,
+        ContentCheckResult::AuthenticationFailed => ContentCheckState::AuthenticationFailed,
+        ContentCheckResult::IntegrityFailed => ContentCheckState::IntegrityFailed,
+    })
+}
+
+// Both candidate and retained callbacks already hold their original health fence.
+// This helper grants no mutation authority of its own. Identical reports do not
+// refresh checked_at; retrying a callback cannot manufacture a fresher check.
+pub(super) async fn store_observation(
+    tx: &Transaction<'_>,
+    generation: &str,
+    round: i64,
+    side: ArticleSide,
+    backbone: &str,
+    state: ContentCheckState,
+    articles: i32,
+) -> Result<u64, StoreError> {
     let checked_articles = if state == ContentCheckState::Intact {
-        permit.articles
+        articles
     } else {
         0
     };
@@ -239,28 +293,31 @@ pub async fn record_content_check(
              AND (c.state, c.checked_articles) IS DISTINCT FROM \
                  (EXCLUDED.state, EXCLUDED.checked_articles)",
             &[
-                &handle.generation,
-                &handle.round,
-                &permit.side.db_value(),
-                &permit.backbone,
+                &generation,
+                &round,
+                &side.db_value(),
+                &backbone,
                 &state.db_value(),
                 &checked_articles,
             ],
         )
         .await
         .map_err(database_error)?;
-    // A conflicting/inconsistent stored identity must not look like idempotence.
-    // Loading also validates complete-article counts against immutable custody.
-    load_checks(&tx, handle).await?;
-    if changed == 1 {
-        tx.execute(
-            "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
-            &[&handle.generation],
+    let recorded = tx
+        .query_one(
+            "SELECT backbone, state, checked_articles FROM posted_file_content_checks \
+             WHERE generation_id = $1 AND round = $2 AND side = $3",
+            &[&generation, &round, &side.db_value()],
         )
         .await
         .map_err(database_error)?;
+    if recorded.get::<_, &str>("backbone") != backbone
+        || recorded.get::<_, &str>("state") != state.db_value()
+        || recorded.get::<_, i32>("checked_articles") != checked_articles
+    {
+        return Err(StoreError::Inconsistent);
     }
-    commit_mutation(tx, handle).await
+    Ok(changed)
 }
 
 pub(super) async fn load_checks(
