@@ -1,5 +1,5 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0046.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0047.
 //!
 //! The full bank runs through `run_posted_generation_tests.py` on Actions:
 //! ordinary cases first, irreversible retirement LAST, on a freshly migrated
@@ -60,6 +60,8 @@ mod posted_generation_attempt_acquisition;
 mod posted_generation_checkpoint;
 #[path = "support/posted_generation_content.rs"]
 mod posted_generation_content;
+#[path = "support/posted_generation_dispatch.rs"]
+mod posted_generation_dispatch;
 #[path = "support/posted_generation_driver.rs"]
 mod posted_generation_driver;
 #[path = "support/posted_generation_failure.rs"]

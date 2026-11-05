@@ -38,6 +38,34 @@ pub struct DurableAttemptRequest {
 }
 
 impl DurableAttemptRequest {
+    // Only the sibling DB dispatch adapter may bridge the admin admission key.
+    // Its caller holds current provenance/role/deletion/job locks. The public
+    // pipeline constructor and its ingest-key validation remain unchanged.
+    pub(super) fn from_admin_dispatch(row: &Row) -> Result<Self, StoreError> {
+        let job_id: String = row.get("job_id");
+        let owner_id: String = row.get("owner_id");
+        let request_id: String = row.get("id");
+        let admission_key: String = row.get("admission_key");
+        let hash: String = row.get("original_sha256");
+        let expected: i64 = row.get("expected_attempt");
+        if !identity(&job_id)
+            || !identity(&owner_id)
+            || !identity(&request_id)
+            || !crate::two_spool::validate_plaintext_sha256(&hash)
+            || admission_key != format!("admin:{hash}")
+            || expected < 0
+        {
+            return Err(StoreError::Inconsistent);
+        }
+        Ok(Self {
+            job_id,
+            owner_id,
+            request_id,
+            admission_key,
+            next_attempt: expected.checked_add(1).ok_or(StoreError::Inconsistent)?,
+        })
+    }
+
     pub fn new(
         job_id: &str,
         owner_id: &str,
@@ -87,6 +115,13 @@ pub async fn recover_durable_attempt_acquisition(
     request: &DurableAttemptRequest,
 ) -> Result<AttemptOutcome, StoreError> {
     let tx = client.transaction().await.map_err(database_error)?;
+    recover_durable_locked(tx, request).await
+}
+
+pub(super) async fn recover_durable_locked(
+    tx: Transaction<'_>,
+    request: &DurableAttemptRequest,
+) -> Result<AttemptOutcome, StoreError> {
     if !lock_owner(&tx, &request.owner_id).await? {
         return Ok(AttemptOutcome::StaleOrMissing);
     }
@@ -270,6 +305,13 @@ pub async fn start_and_acquire_durable_attempt(
     request: &DurableAttemptRequest,
 ) -> Result<AttemptOutcome, StoreError> {
     let tx = client.transaction().await.map_err(database_error)?;
+    start_and_acquire_locked(tx, request).await
+}
+
+pub(super) async fn start_and_acquire_locked(
+    tx: Transaction<'_>,
+    request: &DurableAttemptRequest,
+) -> Result<AttemptOutcome, StoreError> {
     if !start_admitted_locked(
         &tx,
         &request.job_id,

@@ -9,8 +9,9 @@
 //! and changed health writes. Activation is a separately authorized rollout
 //! operation; installation or even database retirement is NOT a worker/network
 //! drain, compatible-consumer rollout proof or replacement authority.
-//! No queue, NNTP, KV or pointer caller is wired here. An admitted bundle is
-//! custody, NOT verification, registry promotion or serving authority.
+//! The dispatch submodule supplies a disabled preparation/outbox/recovery adapter;
+//! no live Worker Queue, NNTP, KV or pointer consumer is enabled. An admitted
+//! bundle is custody, NOT verification, registry promotion or serving authority.
 //! No transaction may span a network POST. Commit errors are ambiguous and
 //! require operation-identity recovery, never a remint or optimistic POST.
 //! Every attempt acquisition/recovery and fenced candidate/retained transaction
@@ -42,6 +43,8 @@ pub use attempts::{
     start_and_acquire_durable_attempt, start_durable_attempt_acquisition, AttemptAcquisition,
     DurableAttemptRequest,
 };
+#[path = "posted_generation_dispatch.rs"]
+pub mod dispatch;
 #[path = "posted_generation_driver.rs"]
 mod driver;
 pub use driver::{
