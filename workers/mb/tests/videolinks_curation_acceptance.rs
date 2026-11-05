@@ -171,6 +171,45 @@ fn coverage_raw_and_played_weighted() {
     assert_eq!(report.played_coverage_ratio, Some(0.8));
 }
 
+/// Individual counts fit u64, but the catalogue-wide totals need not.
+#[test]
+fn coverage_preserves_weights_when_play_totals_exceed_u64() {
+    let plays: HashMap<String, u64> = [
+        ("recording-a".to_string(), u64::MAX),
+        ("recording-b".to_string(), u64::MAX),
+        ("recording-c".to_string(), u64::MAX),
+    ]
+    .into_iter()
+    .collect();
+    for (ids, expected) in [
+        (vec![], 0.0),
+        (vec!["recording-a"], 1.0 / 3.0),
+        (vec!["recording-a", "recording-b"], 2.0 / 3.0),
+        (vec!["recording-a", "recording-b", "recording-c"], 1.0),
+    ] {
+        let linked = ids.into_iter().map(str::to_owned).collect();
+        let report = compute_coverage(3, &linked, &plays);
+        let ratio = report.played_coverage_ratio.expect("positive play counts");
+        assert!(ratio.is_finite() && (0.0..=1.0).contains(&ratio));
+        assert!((ratio - expected).abs() < 1e-15);
+    }
+}
+
+#[test]
+fn coverage_distinguishes_unplayed_from_played_but_unlinked() {
+    let linked = HashSet::new();
+    let mut plays = HashMap::from([("recording-a".to_string(), 0)]);
+    assert_eq!(
+        compute_coverage(1, &linked, &plays).played_coverage_ratio,
+        None
+    );
+    plays.insert("recording-a".to_string(), u64::MAX);
+    assert_eq!(
+        compute_coverage(1, &linked, &plays).played_coverage_ratio,
+        Some(0.0)
+    );
+}
+
 /// Guardrail: the pipeline module never searches and never extracts —
 /// harvest plus ahead-of-time `videos.list` validation only. Doc
 /// comments may state the prohibition; code lines must not carry it.

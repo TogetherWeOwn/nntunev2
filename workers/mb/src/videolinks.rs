@@ -456,14 +456,16 @@ pub fn compute_coverage(
     let played_coverage_ratio = if plays.is_empty() {
         None
     } else {
-        let total_plays: u64 = plays.values().sum();
+        // Widen before summing: distinct recordings may each carry a u64 count.
+        // A map on our 32/64-bit targets cannot hold enough entries to overflow u128.
+        let total_plays: u128 = plays.values().map(|&count| u128::from(count)).sum();
         if total_plays == 0 {
             None
         } else {
-            let linked_plays: u64 = plays
+            let linked_plays: u128 = plays
                 .iter()
                 .filter(|(mbid, _)| linked_ids.contains(mbid.as_str()))
-                .map(|(_, c)| c)
+                .map(|(_, &count)| u128::from(count))
                 .sum();
             Some(linked_plays as f64 / total_plays as f64)
         }

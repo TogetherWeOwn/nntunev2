@@ -284,8 +284,11 @@ stored expiry is too far ahead. Both maintenance methods reject nonpositive
 caller clocks before SQL. The disposable PostgreSQL contract includes an
 eight-row age/expiry boundary fixture, rejected-row cleanup, preserved metadata
 on still-fresh rows, refresh-ahead, API-failure persistence and later checked
-revalidation. Execution of this repair awaits exact-head Actions; no local
-tests/builds ran.
+revalidation. The [PostgreSQL job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42024547593/job/127235522343)
+and [MB Rust job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42024547593/job/127235522534)
+passed at `c4cd0380289405aad4a6410d71bc9dc3e4074bb8`. Web E2E remained
+running at capture; this is not aggregate CI or deployed cleanup evidence.
+No local tests/builds ran.
 
 This adapter still needs a bounded runtime schedule and measured cleanup
 receipts. A query's timeout can roll its cleanup back; filtering stale reads
@@ -333,8 +336,15 @@ Actions; no local tests/builds or deployed moderation acceptance are claimed.
 
 `compute_coverage` calculates the raw share from a caller-supplied set of
 fresh linked recordings and the **played-weighted** share from supplied
-play counts. The played share is absent, not zero, when no play data
-exists. There is no persisted recording-play-count source in this branch:
+play counts. It widens each count to `u128` before summing both the total
+and linked counts; totals above `u64::MAX` must not panic, wrap or saturate
+and distort the ratio. Two acceptance fixtures cover zero/all/partial linked
+shares with overflowing `u64` totals and distinguish all-zero play counts
+(absent) from positive plays with no linked recording (zero). Execution of
+these new fixtures awaits Actions, not a local test run.
+
+The played share is absent, not zero, when no play data exists. There is no
+persisted recording-play-count source in this branch:
 the stream metering ledger records admitted usage, not actual recording play
 counts, and cannot substitute for the plays feed. Querying the catalogue and
 plays, filtering fresh playable links, and writing `video_coverage_snapshots`
