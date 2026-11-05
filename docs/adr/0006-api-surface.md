@@ -198,7 +198,9 @@ least-privilege credential.
   data, retained independently of any user's entries; the entry-keyed restore
   `POST /v1/playlists/{playlist_id}/entries/{entry_id}/restore` with body
   `{library_id}` restores membership — it resolves playlist, entry, and library
-  ownership first, then the track through the entry plus its curated
+  ownership first and requires `entry_id` to belong to the path
+  `{playlist_id}` (mismatch is 404 native / Subsonic 70, even if both playlists
+  belong to the caller), then resolves the track through the entry plus its curated
   `track_sources` row, never through a caller-supplied catalog id — after
   which ordinary playback serves from the shared cache or refills it through
   the backend pool (ADR 0013/0014; ADR 0002 rules 3 and 6 as revised). A plain
@@ -225,8 +227,15 @@ least-privilege credential.
 
 ## Consequences
 
-- Third-party clients work on day one for playback + library browse. There is
-  no provider management on any surface; ingest is an admin-only surface,
+- Third-party playback + library browse require an existing caller library
+  membership (or an own dormant entry restored under the gate above).
+  This alignment does not ship or specify an entitled catalogue discovery/add
+  surface to create a new subscriber's first membership (ADR 0002 §6).
+  Playback/library browse for a subscriber with neither membership nor an own
+  dormant entry remain unavailable until that separately gated surface ships;
+  there is no unconditional day-one availability promise. Admin ingest alone
+  does not provision subscriber memberships, and raw-id adds remain 404/70.
+  There is no provider management on any user surface; ingest is admin-only,
   never part of the user REST or Subsonic APIs.
 - Fuzz/contract tests cover the Subsonic subset against known client quirks
   (case sensitivity, `c=` client param, token/salt and `apiKey` vectors,

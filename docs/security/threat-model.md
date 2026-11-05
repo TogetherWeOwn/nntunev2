@@ -10,10 +10,14 @@ accounts (ADR 0014) and the cache is a single shared popularity cache
 (ADR 0013). §1–§3 below are re-homed accordingly: the credential vault now
 protects pool service credentials, the SSRF/indexer/NZB fetch guards sit on
 the admin-ingest boundary, and there is no user-facing credential endpoint
-to attack. Sections describing shipped legacy code (the current `/v1/vault`
-surface, per-user pool keying) remain accurate as implementation record
-until the removal and pool implementations land; where a section states
-target behaviour it follows ADR 0013/0014. CISO re-review is requested on
+to attack. The `/v1/vault` route and its test paths are removed in current
+code and return the ordinary unknown-route plain 404 (pinned by
+`retired_vault_routes_are_plain_not_found_without_side_effects` in
+`workers/api/src/handlers.rs`); vault-write descriptions below are historical,
+not a reachable credential surface. Retained legacy encrypted rows still
+require envelope/KEK controls until purge. Per-user pool keying remains an
+implementation record pending pool alignment; target behaviour follows
+ADR 0013/0014. CISO re-review is requested on
 the revising PR per the standing rule above, and again on the pool
 implementation PRs (§8 gate).
 
@@ -65,15 +69,17 @@ Design under review (re-homed 2026-11-03): envelope encryption — per-account
 DEK, KEK from Worker secret; pool credentials (ADR 0014) never logged, never
 returned by any API, created/rotated only through an admin-only path and
 decrypted in memory at connection time; health probes exercise accounts via
-the pool's `health` budget class. The BYOP-era per-user vault rows and
-endpoints in current code are legacy slated for credential purge; the
-mitigations below state the target for pool credentials and, where the
-mechanism is shared (envelope, KEK rotation, dial-time SSRF guard), continue
-to bind the legacy surface until it is removed.
+the pool's `health` budget class. The BYOP-era user vault endpoints have
+been removed; retained per-user ciphertext rows still await credential purge.
+The mitigations below state the target for pool credentials. Shared envelope
+and KEK-rotation controls continue to protect retained rows and backups until
+purge/retirement; removal of a route does not retire a key or authorize
+reusing user-bound ciphertext as service credentials. Historical save/test
+validation is not evidence of a currently reachable vault writer.
 
 | Threat | Attack | Mitigation (required) |
 |---|---|---|
-| Spoofing | Attacker (incl. any ordinary user session) calls the credential admin path or a removed legacy vault endpoint | No user-facing credential endpoint exists in the target surface; the admin path requires admin authorization on EVERY operation, and authorization precedes any existence signal (no account-id oracle — cf. v1 avatar-oracle lesson). Legacy `/v1/vault` routes, until removed, keep owner-scoped authn/authz on every endpoint |
+| Spoofing | Attacker (incl. any ordinary user session) calls the credential admin path or a removed legacy vault endpoint | No user-facing credential endpoint exists in the target surface; the admin path requires admin authorization on EVERY operation, and authorization precedes any existence signal (no account-id oracle — cf. v1 avatar-oracle lesson). Retired `/v1/vault` and test paths return ordinary unknown-route plain 404 without credential reads, writes or tests; historical owner-scoped vault authorization is not a live endpoint |
 | Tampering | Ciphertext swapped between rows; KEK confusion across envs | AEAD (AES-256-GCM) with per-row nonce + associated data binding the domain separator and the row owner — pool account id for pool rows, `user_id` only for legacy rows until purge (plus the KEK version on the DEK wrap; exact tuples in `kek-rotation.md` §1, extended to pool subjects before any pool row is written); KEK version column; staging and prod KEKs never shared; copying a pool ciphertext to another account must fail decryption |
 | Repudiation | Silent pool credential overwrite/rotation or cap change | Audit log: pool account create/disable/cap-change/credential-rotation events (actor/when/source/result — NEVER the secret), per ADR 0014 attribution; no log line may contain credential material |
 | Information disclosure | SQL dump, log leak, error echo, backup exposure | Envelope encryption at rest; parameterized queries only; generic errors; health probes and any admin test return boolean/health class only, never provider banners; credentials never exposed to users, clients or the Subsonic surface; backups inherit encryption (ciphertext only) |
@@ -104,7 +110,7 @@ no longer the re-wrap signal) and per-version counts drive the retire gate.
 | Repudiation | Disputed logins | Audit log: login/register/magic-link issue+consume/session revoke/account-email change (who/when/result) |
 | Information disclosure | Session/token leak via logs or error pages | No token material in logs or error bodies; login errors are generic ("check your email") — no user-enumeration oracle |
 | Denial of service | Magic-link email bombing; auth-endpoint hammering | Strict rate limits on auth endpoints (shared store), email-send cooldown per address; invite-code gate if abuse appears |
-| Elevation | Fixed/forever sessions; leaked logout; stale session used for a privilege change; account-email takeover (there are no passwords — whoever controls the account email controls the account via magic link, so changing it is the main takeover/persistence path) | Bounded `maxAge`, rotation, explicit revoke-all on passkey add/remove; every endpoint re-checks authz, not just auth. **Email change requires** fresh passkey authentication (or confirmation via the OLD address), notification to the old address with a revert link, and revocation of ALL sessions plus outstanding magic links; the change is audit-logged (see Repudiation row). **F-SESS-01 status:** vault writes enforce a 600 s freshness window measured from immutable `created_at`; stale-but-valid sessions return `reauth_required` (401), while dead sessions return the generic auth 401 (`{"error":"check your email and try again"}`), never the reauth code. `POST /v1/session/reauthenticate/start` and `/finish` bind a fresh passkey assertion to the authenticated session's user. The finish handler calls `reauthenticate_session` with the credential's verified owner id; the store conditionally revokes the old row and inserts the replacement atomically, and only returns the new cookie after commit. The legacy BYOP vault-save flow was this gate's consumer (passkey reauthentication, then retry of the unchanged tested configuration); with the per-user vault retired, the freshness gate and session-bound reauthentication stand as the general privilege-change mechanism, and vault-write freshness enforcement is legacy until `/v1/vault` removal. `login_finish` and `magic_finish` remain independent sign-ins. |
+| Elevation | Fixed/forever sessions; leaked logout; stale session used for a privilege change; account-email takeover (there are no passwords — whoever controls the account email controls the account via magic link, so changing it is the main takeover/persistence path) | Bounded `maxAge`, rotation, explicit revoke-all on passkey add/remove; every endpoint re-checks authz, not just auth. **Email change requires** fresh passkey authentication (or confirmation via the OLD address), notification to the old address with a revert link, and revocation of ALL sessions plus outstanding magic links; the change is audit-logged (see Repudiation row). **F-SESS-01 historical vault consumer:** former vault writes enforced a 600 s freshness window measured from immutable `created_at`; stale-but-valid sessions returned `reauth_required` (401), while dead sessions returned the generic auth 401 (`{"error":"check your email and try again"}`), never the reauth code. Those writers are now removed. `POST /v1/session/reauthenticate/start` and `/finish` bind a fresh passkey assertion to the authenticated session's user. The finish handler calls `reauthenticate_session` with the credential's verified owner id; the store conditionally revokes the old row and inserts the replacement atomically, and only returns the new cookie after commit. The legacy BYOP vault-save flow was this gate's consumer (passkey reauthentication, then retry of the unchanged tested configuration); with the per-user vault retired, the freshness gate and session-bound reauthentication stand as the general privilege-change mechanism, and vault-write freshness enforcement is historical, not a current route consumer. `login_finish` and `magic_finish` remain independent sign-ins. |
 
 ## 5. Signed stream grants (STRIDE)
 
@@ -234,7 +240,7 @@ exact implementation PR head:
 | F-VAULT-01 | Dial-time SSRF guard for pool provider host/port (operator-configured since 2026-11-03; formerly the user-supplied `test connection` guard) | Paperclip child card (mapping in the threat-model card thread, never pasted here) |
 | F-VAULT-02 | KEK rotation + versioning designed day one (re-wrap job) | Normative design: `kek-rotation.md`; tracking on the Paperclip child card (see above) |
 | F-VAULT-03 | KEK rewrap follow-up migration: `rewrapped_at` + `kek_version` index; per-version progress counts | Normative design: `kek-rotation.md` §§2, 6, 8; tracking on the Paperclip child card (see above) |
-| F-SESS-01 | Privilege writes enforce 600 s freshness and return `reauth_required` (vault writes were the original case; legacy until `/v1/vault` removal); passkey reauthentication is session-bound and atomically replaces only the proven user's current row | Implemented by `POST /v1/session/reauthenticate/start` and `/finish` |
+| F-SESS-01 | Privilege writes enforce 600 s freshness and return `reauth_required` (vault writes were the original case; those routes are now removed); passkey reauthentication is session-bound and atomically replaces only the proven user's current row | Implemented by `POST /v1/session/reauthenticate/start` and `/finish` |
 | F-GRANT-01 | Play-grant TTL cap: production-intended `issue_at` clamps to 15 min (900 s); raw `issue` does not clamp; `verify` rejects over-cap grants (`exp - now` > 960 s) as `TtlTooLong` and `now >= exp` as `Expired` | Implemented in `workers/stream/src/grant.rs`; contract tests in `workers/stream/tests/grant_ttl_contract_acceptance.rs` (merged module behavior, not a deployment claim) |
 | F-INGEST-01 | Indexer validator (`workers/api/src/vault.rs:372-459`): HTTPS-only, userinfo/fragment/non-443 refusal, resolve-ALL + private-range rejection, vetted target. Indexer fetch policy **model** (`workers/ingest/src/indexer_fetch.rs`, tests only — no live resolver/transport, route, HTTP response or log): 443-only, pin-request shape, supplied-delay deadlines. Required live fetch contract still not implemented; model follows ≤3 re-validated redirects vs. required forbidden redirects — discrepancy unresolved, policy change needs independent CISO disposition | Paperclip child card (see above) |
 | F-INGEST-02 | Planned NZB fetch-from-URL SSRF guard (no route/transport here): exact-match allowlist, resolve-ALL + private-range rejection, pinned target (no second DNS lookup), ≤3 re-validated redirects and timeout; separate fetch-body cap (current 2 MiB cap covers uploads only) | Paperclip child card (see above) |
