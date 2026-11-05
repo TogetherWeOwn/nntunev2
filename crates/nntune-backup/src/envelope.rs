@@ -1,7 +1,7 @@
 //! Drill-local v2 field envelope for per-file media keys.
 //!
 //! Byte-compatible with the ADR 0002 rule-1 construction implemented by
-//! `workers/api/src/providers.rs` (`aad_v2`): the same `u32` big-endian
+//! `workers/api/src/field_envelope.rs` (`Context::aad`): the same `u32` big-endian
 //! length-prefixed framing over
 //! `(domain, purpose, table, field, owner_scope, row_key,
 //! envelope_version, payload_format)` plus `kek_version` (u32
@@ -89,7 +89,7 @@ fn fill_random(buf: &mut [u8]) -> Result<(), EnvelopeError> {
 }
 
 /// Frame one variable-length AAD segment: `u32` big-endian length +
-/// bytes. Identical to the framing in `workers/api/src/providers.rs`.
+/// bytes. Identical to the framing in `workers/api/src/field_envelope.rs`.
 fn frame(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
