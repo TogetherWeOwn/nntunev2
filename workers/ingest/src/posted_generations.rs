@@ -2,8 +2,9 @@
 //!
 //! Preparation only: migration 0037 retains the unique hash constraint, so
 //! replacement is refused until the legacy writer/publication rollout is
-//! complete. Migration 0042 also rejects unfenced health changes on registered
-//! legacy custody; it is not proof that incompatible workers have been drained.
+//! complete. Migration 0042 rejects unfenced health changes on registered
+//! legacy custody; 0043 serializes new registration with existing legacy-row
+//! writes, including stale transaction snapshots. Neither proves a worker drain.
 //! No queue, NNTP, KV or pointer caller is wired here. An admitted bundle is
 //! custody, NOT verification, registry promotion or serving authority.
 //! No transaction may span a network POST. Commit errors are ambiguous and

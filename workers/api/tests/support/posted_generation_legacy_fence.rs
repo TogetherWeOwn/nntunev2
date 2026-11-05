@@ -20,6 +20,9 @@
 //! replacement authority.
 
 use super::*;
+
+#[path = "posted_generation_registration.rs"]
+mod registration;
 use nntune_ingest::posted_files::{touch_post_verified_sql, touch_retention_check_sql};
 use nntune_ingest::two_spool::{mark_repost_exhausted_sql, mark_two_spool_verified_sql};
 
