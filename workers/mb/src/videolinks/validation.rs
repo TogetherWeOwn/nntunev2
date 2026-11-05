@@ -17,6 +17,8 @@ use tokio_postgres::Client;
 
 /// At most four API calls per invocation; failures never retry in the run.
 pub const MAX_VALIDATIONS_PER_RUN: usize = 200;
+/// At most 200 recording/video rows per cleanup transaction, not distinct IDs.
+pub const MAX_PURGES_PER_CALL: i64 = 200;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const RUN_DEADLINE: Duration = Duration::from_secs(45);
 const REFRESH_AHEAD_S: i64 = 24 * 60 * 60;
@@ -75,7 +77,8 @@ impl BatchValidation {
 
 #[allow(async_fn_in_trait)]
 pub trait ValidationStore {
-    /// Remove expired API-returned fields even when validation is unavailable.
+    /// Remove a bounded batch of expired API-returned fields even when validation
+    /// is unavailable. PostgreSQL skips locked rows; zero is not a drain receipt.
     async fn purge_expired(&mut self, now: i64) -> Result<u64, ValidationError>;
     /// Return bounded distinct IDs, oldest due first. Only admitted candidates
     /// belong in this store: pending submissions must never enter it.
@@ -194,12 +197,20 @@ impl<'a> PgValidationStore<'a> {
 }
 
 const PURGE_EXPIRED_SQL: &str = "\
-UPDATE public.video_link_candidates
+WITH expired AS (
+    SELECT recording_mbid, video_id FROM public.video_link_candidates
+    WHERE (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2)
+      AND (status IN ('validated', 'rejected') OR title IS NOT NULL
+           OR channel_id IS NOT NULL OR duration_secs IS NOT NULL OR embeddable IS NOT NULL)
+    ORDER BY recording_mbid, video_id
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE public.video_link_candidates AS c
 SET title = NULL, channel_id = NULL, duration_secs = NULL, embeddable = NULL,
     status = 'expired', expires_at = 0, updated_at = now()
-WHERE (expires_at <= $1 OR validated_at <= 0 OR validated_at <= $2)
-  AND (status IN ('validated', 'rejected') OR title IS NOT NULL
-       OR channel_id IS NOT NULL OR duration_secs IS NOT NULL OR embeddable IS NOT NULL)";
+FROM expired AS e
+WHERE c.recording_mbid = e.recording_mbid AND c.video_id = e.video_id";
 
 const DUE_IDS_SQL: &str = "\
 SELECT video_id
@@ -272,7 +283,7 @@ impl ValidationStore for PgValidationStore<'_> {
             .await
             .map_err(|_| ValidationError::Store)?;
         let rows = tx
-            .execute(PURGE_EXPIRED_SQL, &[&now, &oldest])
+            .execute(PURGE_EXPIRED_SQL, &[&now, &oldest, &MAX_PURGES_PER_CALL])
             .await
             .map_err(|_| ValidationError::Store)?;
         tx.commit().await.map_err(|_| ValidationError::Store)?;

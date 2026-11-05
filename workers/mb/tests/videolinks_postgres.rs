@@ -13,7 +13,7 @@ use nntune_mb::videolinks::storage::{
 };
 use nntune_mb::videolinks::validation::{
     refresh_due, BatchValidation, PgValidationStore, ValidationClient, ValidationError,
-    ValidationResponse, ValidationStore, MAX_VALIDATIONS_PER_RUN,
+    ValidationResponse, ValidationStore, MAX_PURGES_PER_CALL, MAX_VALIDATIONS_PER_RUN,
 };
 use nntune_mb::videolinks::{Candidate, SubmissionStatus, VideoSource, VALIDATION_TTL_S};
 use std::cell::RefCell;
@@ -514,14 +514,12 @@ async fn contention_is_bounded(db: &mut Client, config: &Config) {
         1
     );
 
-    // A blocked expiry purge must stop the runner before its first API call.
+    // Row locks are skipped; an incompatible table lock still fails cleanup
+    // and must stop the runner before its first API call.
     let tx = locker.transaction().await.unwrap();
-    tx.query_one(
-        "SELECT video_id FROM public.video_link_candidates FOR UPDATE",
-        &[],
-    )
-    .await
-    .unwrap();
+    tx.batch_execute("LOCK TABLE public.video_link_candidates IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
     let client = FixtureClient::new(Vec::new());
     let result = tokio::time::timeout(
         Duration::from_secs(4),
@@ -536,6 +534,99 @@ async fn contention_is_bounded(db: &mut Client, config: &Config) {
     assert_eq!(result, Err(ValidationError::Store));
     assert!(client.calls.borrow().is_empty());
     tx.commit().await.unwrap();
+}
+
+async fn cleanup_progress_is_bounded(db: &mut Client, config: &Config) {
+    reset_candidates(db).await;
+    seed(db, MAX_PURGES_PER_CALL as i32 + 2).await;
+    let stale = NOW - VALIDATION_TTL_S;
+    db.execute(
+        "UPDATE public.video_link_candidates
+         SET status = 'validated', title = 'expired title', channel_id = 'expired channel',
+             duration_secs = 42, embeddable = true, validated_at = $1, expires_at = $2",
+        &[&stale, &(NOW + 1)],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO public.video_link_candidates
+         (recording_mbid, video_id, source, status, title, channel_id,
+          duration_secs, embeddable, validated_at, expires_at)
+         VALUES ('00000000-0000-0000-0000-000000000002', 'v0000000001', 'wikidata',
+                 'validated', 'fresh title', 'fresh channel', 43, true, $1, $2)",
+        &[&NOW, &(NOW + VALIDATION_TTL_S)],
+    )
+    .await
+    .unwrap();
+    let mut locker = connect(config).await;
+    let lock = locker.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT video_id FROM public.video_link_candidates
+         WHERE recording_mbid = '00000000-0000-0000-0000-000000000001'
+           AND video_id = 'v0000000000' FOR UPDATE",
+        &[],
+    )
+    .await
+    .unwrap();
+    let before = states(db).await;
+    let mut store = PgValidationStore::new(db);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(4), store.purge_expired(NOW))
+            .await
+            .expect("row-locked candidates must not block unrelated cleanup")
+            .unwrap(),
+        MAX_PURGES_PER_CALL as u64
+    );
+    let rows = states(db).await;
+    assert_eq!(rows[0], before[0], "locked metadata was not touched");
+    let fresh = rows
+        .iter()
+        .find(|row| row.2.as_deref() == Some("fresh title"))
+        .expect("cleanup joins by recording and video, not shared video alone");
+    assert_eq!(
+        (fresh.1.as_str(), fresh.3, fresh.4),
+        ("validated", NOW, NOW + VALIDATION_TTL_S)
+    );
+    let cleared: i64 = db
+        .query_one(
+            "SELECT count(*) FROM public.video_link_candidates
+             WHERE status = 'expired' AND title IS NULL AND channel_id IS NULL
+               AND duration_secs IS NULL AND embeddable IS NULL AND expires_at = 0
+               AND validated_at = $1 AND source = 'mb_url'",
+            &[&stale],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(cleared, MAX_PURGES_PER_CALL);
+    let mut store = PgValidationStore::new(db);
+    assert_eq!(
+        store.purge_expired(NOW).await.unwrap(),
+        1,
+        "remaining unlocked row"
+    );
+    assert_eq!(
+        store.purge_expired(NOW).await.unwrap(),
+        0,
+        "zero is not proof that no locked work remains"
+    );
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        store.purge_expired(NOW).await.unwrap(),
+        1,
+        "released row is retried on the next call"
+    );
+    assert_eq!(
+        store.purge_expired(NOW).await.unwrap(),
+        0,
+        "idempotent after draining"
+    );
+    let after = states(db).await;
+    assert_eq!(
+        after.iter().filter(|row| row.1 == "expired").count(),
+        MAX_PURGES_PER_CALL as usize + 2
+    );
+    assert_eq!(after.iter().filter(|row| row.1 == "validated").count(), 1);
 }
 
 async fn earlier_batch_survives(db: &mut Client) {
@@ -1438,6 +1529,7 @@ fn postgres_validation_store_contract() {
                 validation_age_overrides_overlong_expiry(&mut db).await;
                 stale_writes_and_atomic_failure(&mut db).await;
                 contention_is_bounded(&mut db, &config).await;
+                cleanup_progress_is_bounded(&mut db, &config).await;
                 earlier_batch_survives(&mut db).await;
                 candidate_admission_contract(&mut db).await;
                 fresh_link_read_contract(&mut db).await;

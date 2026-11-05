@@ -18,9 +18,9 @@ its pages into the app store. `moderation.rs` supplies a persistent pending
 queue and atomic decision/promotion in the app database. No route, schedule
 or database binding calls these adapters yet.
 
-`refresh_due` purges expired API-returned fields before contacting the
-validation client, requests at most 200 distinct IDs in four 50-ID batches,
-and stops on the first failure without retrying in the run. The whole run
+`refresh_due` purges one bounded batch of expired API-returned fields before
+contacting the validation client, requests at most 200 distinct IDs in four
+50-ID batches, and stops on the first failure without retrying in the run. The whole run
 has a 45-second deadline. Only HTTP 200 with an explicit items array can
 be applied: malformed bodies, API error envelopes, duplicate/unrequested
 IDs and oversized payloads fail closed. A successful empty array marks
@@ -290,10 +290,28 @@ passed at `c4cd0380289405aad4a6410d71bc9dc3e4074bb8`. Web E2E remained
 running at capture; this is not aggregate CI or deployed cleanup evidence.
 No local tests/builds ran.
 
-This adapter still needs a bounded runtime schedule and measured cleanup
-receipts. A query's timeout can roll its cleanup back; filtering stale reads
-alone does not establish the deployed 30-day deletion guarantee. Only video
-IDs may persist long-term.
+Each `purge_expired` call clears at most 200 recording/video rows in one
+transaction, ordered by the composite key and joined back by both columns.
+`FOR UPDATE SKIP LOCKED` allows cleanup of unlocked rows without waiting for
+one held row. It does not bypass table locks; the 1.5-second statement timeout
+still applies. A fresh association sharing an expired row's video ID is not
+cleared. Cleanup preserves the stale-write fence and provenance, and already
+cleared rows no longer consume the next batch.
+
+The disposable PostgreSQL contract adds more than one batch of expired rows,
+a held row, a fresh shared-ID association, successive-call progress and later
+cleanup after lock release. The incompatible-table-lock fixture retains the
+runner's cleanup-failure-before-HTTP check. Execution of this increment awaits
+exact-head Actions; no local tests/builds ran.
+
+A returned count is only this call's acknowledged updates: even zero is **not**
+proof of a drained backlog because eligible rows can be locked. This bounds
+writes, not query scanning or backlog age. The runtime must schedule repeated
+bounded calls and measure remaining/oldest metadata independently; persistent
+locks, statement timeouts or arrivals faster than cleanup can still miss the
+retention deadline. The adapter still needs that runtime schedule and measured
+cleanup receipts. Filtering stale reads alone does not establish the deployed
+30-day deletion guarantee. Only video IDs may persist long-term.
 
 ## Moderation queue
 
@@ -340,8 +358,14 @@ play counts. It widens each count to `u128` before summing both the total
 and linked counts; totals above `u64::MAX` must not panic, wrap or saturate
 and distort the ratio. Two acceptance fixtures cover zero/all/partial linked
 shares with overflowing `u64` totals and distinguish all-zero play counts
-(absent) from positive plays with no linked recording (zero). Execution of
-these new fixtures awaits Actions, not a local test run.
+(absent) from positive plays with no linked recording (zero). The
+[MB Rust job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42027340055/job/127245038287)
+and [PostgreSQL job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42027340055/job/127245038261)
+passed at `1067a71938ed83afa5fe3e252ee565d13fcf50f3`.
+[Run metadata](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42027340055)
+associates that head with this PR. Web E2E remained running at capture, so
+this is not aggregate CI or played-data integration evidence. No local
+tests/builds ran.
 
 The played share is absent, not zero, when no play data exists. There is no
 persisted recording-play-count source in this branch:
