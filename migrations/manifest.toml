@@ -283,3 +283,8 @@ sha256 = "095a66b31f9aa15b93f1b5987f2f86f04cd49f92e457d414066282616a2658ab"
 file = "0038_posted_file_rechecks.sql"
 target = "app"
 sha256 = "763c107e7e02861cb17919f4d7fe23de4957811f5e1dad0157ffa7b29b43d6b4"
+
+[[migration]]
+file = "0039_posted_file_content_checks.sql"
+target = "app"
+sha256 = "9662d072e12c528c631300413b05a1aa60793efc7ec284e7b87313ce30da80a7"

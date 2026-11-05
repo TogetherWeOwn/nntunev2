@@ -23,6 +23,12 @@ use crate::two_spool::{PostVerdict, SpoolCopyState, MAX_REPOST_ATTEMPTS_PER_ARTI
 use std::fmt;
 use tokio_postgres::{Client, Row, Transaction};
 
+#[path = "posted_generation_content.rs"]
+mod content;
+pub use content::{
+    prepare_content_check, record_content_check, ContentCheckPermit, ContentCheckReport,
+    ContentCheckResult, ContentCheckState,
+};
 #[path = "posted_generation_rechecks.rs"]
 mod rechecks;
 pub use rechecks::{
@@ -964,6 +970,7 @@ pub struct GenerationCheckpoint {
     round: i64,
     slots: Vec<[SlotProgress; 2]>,
     schedule: Option<RecheckSchedule>,
+    content_checks: [Option<ContentCheckState>; 2],
 }
 
 impl fmt::Debug for GenerationCheckpoint {
@@ -991,6 +998,12 @@ impl GenerationCheckpoint {
 
     pub fn recheck_schedule(&self) -> Option<RecheckSchedule> {
         self.schedule
+    }
+
+    /// Current-round observations only, never a retention or cleanup permit.
+    /// Absence, unavailability or failure must retain the R2 safety-net copy.
+    pub fn content_check(&self, side: ArticleSide) -> Option<ContentCheckState> {
+        self.content_checks[side.db_value() as usize]
     }
 
     pub fn slot(&self, slot: usize, side: ArticleSide) -> Option<SlotProgress> {
@@ -1077,6 +1090,7 @@ pub async fn load_checkpoint(
         round: handle.round,
         slots,
         schedule: rechecks::load_schedule(&tx, handle).await?,
+        content_checks: content::load_checks(&tx, handle).await?,
     };
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(Some(checkpoint))
@@ -1291,6 +1305,7 @@ mod tests {
             round: 7,
             slots: vec![[SlotProgress::default(); 2]; 3],
             schedule: Some(RecheckSchedule::Untracked),
+            content_checks: [None, Some(ContentCheckState::Unavailable)],
         };
         assert_eq!(
             format!("{checkpoint:?}"),
