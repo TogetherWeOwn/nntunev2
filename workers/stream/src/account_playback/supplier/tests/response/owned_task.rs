@@ -76,7 +76,7 @@ impl Harness {
         )
     }
 
-    fn into_response(&mut self, range: Option<&str>) -> Result<Response, PlayRouteRefusal> {
+    fn take_response(&mut self, range: Option<&str>) -> Result<Response, PlayRouteRefusal> {
         let authorization =
             authorize_original(&play_request(range), GRANT_KEY, NOW / 1000).unwrap();
         self.supplier
@@ -146,10 +146,10 @@ fn harness(parts: usize, fail_on: Option<usize>, tweak: impl FnOnce(&Rig)) -> Ha
     }
 }
 
-/// The returned pump is wrapped in an outer `'static` task BEFORE any poll.
+/// The returned pump is boxed as a `'static` task BEFORE any poll.
 fn launch(response: Response, sink: &SharedVec, writer: &WriterRef) -> Task {
     let pump = response.pump_owned(SharedSink(sink.clone()), Writer(writer.clone()));
-    Box::pin(async move { pump.await })
+    Box::pin(pump)
 }
 
 fn step(task: &mut Task, waker: &Waker) -> Poll<Result<(), SourceError>> {
@@ -178,7 +178,7 @@ fn into_response_shares_one_source_allocation_and_does_no_io() {
         let mut h = harness(4, None, |_| {});
         assert_eq!(h.source.strong_count(), 1);
         assert_eq!(h.io(), (1, 0, 0, 0));
-        let response = h.into_response(range).unwrap();
+        let response = h.take_response(range).unwrap();
         let length = bytes.end - bytes.start;
         assert_eq!((response.status(), response.body_len()), (status, length));
         assert!(response
@@ -205,7 +205,7 @@ fn into_response_shares_one_source_allocation_and_does_no_io() {
 #[test]
 fn refused_range_consumes_the_supplier_and_releases_everything_without_io() {
     let mut h = harness(4, None, |_| {});
-    let refusal = match h.into_response(Some("bytes=99-120")) {
+    let refusal = match h.take_response(Some("bytes=99-120")) {
         Err(refusal) => refusal,
         Ok(_) => panic!("range must be refused"),
     };
@@ -228,7 +228,7 @@ fn static_outer_task_streams_full_and_ranged_bodies_through_the_real_pump() {
     ];
     for (range, expected, opens) in cases {
         let mut h = harness(4, None, |_| {});
-        let response = h.into_response(range).unwrap();
+        let response = h.take_response(range).unwrap();
         let sink = SharedVec::default();
         let writer = WriterRef::default();
         let mut task = launch(response, &sink, &writer);
@@ -265,7 +265,7 @@ fn failed_article_keeps_only_the_acknowledged_prefix_without_retry() {
     // (failing BODY number, acknowledged bytes before it)
     for (fail_on, acked) in [(1usize, 0u64), (3, 3)] {
         let mut h = harness(4, Some(fail_on), |_| {});
-        let response = h.into_response(None).unwrap();
+        let response = h.take_response(None).unwrap();
         let sink = SharedVec::default();
         let writer = WriterRef::default();
         let mut task = launch(response, &sink, &writer);
@@ -299,7 +299,7 @@ fn failed_article_keeps_only_the_acknowledged_prefix_without_retry() {
 fn unpolled_pump_or_outer_task_drop_aborts_the_writer_once_with_zero_io() {
     for wrapped in [false, true] {
         let mut h = harness(4, None, |_| {});
-        let response = h.into_response(None).unwrap();
+        let response = h.take_response(None).unwrap();
         let sink = SharedVec::default();
         let writer = WriterRef::default();
         if wrapped {
@@ -326,7 +326,7 @@ fn unpolled_pump_or_outer_task_drop_aborts_the_writer_once_with_zero_io() {
 #[test]
 fn same_authority_stop_before_first_poll_does_no_io_and_delivers_nothing() {
     let mut h = harness(4, None, |_| {});
-    let response = h.into_response(None).unwrap();
+    let response = h.take_response(None).unwrap();
     let sink = SharedVec::default();
     let writer = WriterRef::default();
     let mut task = launch(response, &sink, &writer);
@@ -420,7 +420,7 @@ fn pending_stage_drop_or_same_authority_cancel_releases_everything_with_acked_pr
                 Stage::Body => h.witness.pending_body.clone(),
                 Stage::Writer | Stage::Close => Rc::default(),
             };
-            let response = h.into_response(None).unwrap();
+            let response = h.take_response(None).unwrap();
             let sink = SharedVec::default();
             let mut task = launch(response, &sink, &writer);
             let wakes = Arc::new(Wakes::default());
