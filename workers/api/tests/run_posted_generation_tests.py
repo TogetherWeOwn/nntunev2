@@ -23,6 +23,12 @@ EXPECTED = {
     "postgres_invalid_partial_parameters_fail_before_any_insertion",
     "postgres_managed_custody_is_immutable_and_legacy_id_health_writes_are_rejected",
     "postgres_schema_replay_preserves_admitted_bundle_and_foreign_keys_reject_wrong_association",
+    "posted_generation_health::postgres_finish_requires_every_slot_on_both_sides_and_only_stamps_verified_at",
+    "posted_generation_health::postgres_duplicate_and_concurrent_confirmations_are_idempotent_per_slot_and_side",
+    "posted_generation_health::postgres_new_round_rotates_token_and_rejects_every_old_health_callback",
+    "posted_generation_health::postgres_lease_status_and_attempt_fences_gate_every_health_mutation",
+    "posted_generation_health::postgres_lost_ack_recovery_returns_current_health_revision_with_exact_evidence",
+    "posted_generation_health::postgres_invalid_slots_are_rejected_without_mutation_or_burning_the_handle",
 }
 
 

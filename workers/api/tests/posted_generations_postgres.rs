@@ -35,6 +35,9 @@ use tokio_postgres::{Client, Config, NoTls};
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MIGRATION_0037: &str = include_str!("../../../migrations/0037_posted_file_generations.sql");
 
+#[path = "support/posted_generation_health.rs"]
+mod posted_generation_health;
+
 // The replay test runs DDL that takes ACCESS EXCLUSIVE locks. It holds the
 // write side so no other test in this process is mid-statement.
 static SCHEMA_GATE: RwLock<()> = RwLock::new(());

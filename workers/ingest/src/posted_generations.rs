@@ -579,16 +579,43 @@ pub async fn admit(
     Ok(AdmissionOutcome::Admitted(handle, bundle))
 }
 
-/// Revalidate immediately before a network request, without holding locks
-/// across that request. A request may complete externally after expiry; this
-/// check does not authorize its later callback to bypass the same fence.
-pub async fn posting_fence_is_current(
-    client: &mut Client,
+/// The two distinct configured backbones in the immutable custody bundle.
+/// Slot numbers resolve through that bundle's sealed plan, never a new local
+/// article list. This adapter stores no article identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleSide {
+    Post,
+    Verify,
+}
+
+impl ArticleSide {
+    fn db_value(self) -> i16 {
+        match self {
+            Self::Post => 0,
+            Self::Verify => 1,
+        }
+    }
+}
+
+/// A successful mutation returns the refreshed durable fence. A stale caller
+/// must recover/reselect rather than locally increment a revision. Incomplete
+/// evidence is not terminal failure and never authorizes replacement.
+#[derive(Debug)]
+pub enum MutationOutcome {
+    Applied(GenerationHandle),
+    Incomplete,
+    StaleOrDiverged,
+}
+
+// All candidate mutations use the same lock order: owning job/attempt, registry,
+// then operation/health. Custody is immutable. The last read evaluates the DB
+// clock AFTER any lock waits, so waiting cannot extend either lease.
+async fn lock_candidate(
+    tx: &Transaction<'_>,
     handle: &GenerationHandle,
-) -> Result<bool, StoreError> {
-    let tx = client.transaction().await.map_err(database_error)?;
-    if !lock_attempt(&tx, &handle.attempt).await? {
-        return Ok(false);
+) -> Result<Option<Row>, StoreError> {
+    if !lock_attempt(tx, &handle.attempt).await? {
+        return Ok(None);
     }
     let registry = tx
         .query_opt(
@@ -605,7 +632,7 @@ pub async fn posting_fence_is_current(
         .await
         .map_err(database_error)?;
     if registry.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let current = tx
         .query_opt(
@@ -636,8 +663,160 @@ pub async fn posting_fence_is_current(
         .await
         .map_err(database_error)?
         .is_some();
+    if !current {
+        return Ok(None);
+    }
+    tx.query_opt(
+        "SELECT p.article_count, h.verified_at, h.state, h.round \
+         FROM posted_file_operations o JOIN posted_file_job_attempts a ON a.job_id = o.job_id \
+         JOIN posted_file_health h ON h.generation_id = o.generation_id \
+         JOIN posted_files p ON p.id = o.generation_id AND p.generation_operation = o.id \
+         WHERE o.id = $1 AND a.attempt = o.attempt AND a.token = o.attempt_token \
+         AND o.lease_until > extract(epoch FROM clock_timestamp())::bigint \
+         AND a.lease_until > extract(epoch FROM clock_timestamp())::bigint",
+        &[&handle.operation],
+    )
+    .await
+    .map_err(database_error)
+}
+
+/// Revalidate immediately before a network request, without holding locks
+/// across that request. A request may complete externally after expiry; this
+/// check does not authorize its later callback to bypass the same fence.
+pub async fn posting_fence_is_current(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<bool, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    let current = lock_candidate(&tx, handle)
+        .await?
+        .is_some_and(|r| r.get::<_, Option<i64>>("verified_at").is_none());
     tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
     Ok(current)
+}
+
+async fn commit_mutation(
+    tx: Transaction<'_>,
+    handle: &GenerationHandle,
+) -> Result<MutationOutcome, StoreError> {
+    let refreshed = read_handle(&tx, &handle.attempt, &handle.operation)
+        .await?
+        .ok_or(StoreError::Inconsistent)?;
+    tx.commit().await.map_err(|_| StoreError::CommitUnknown)?;
+    Ok(MutationOutcome::Applied(refreshed))
+}
+
+/// Start a distinct verification evidence round. Old evidence is retained but
+/// cannot satisfy the new round. This does not reset repost accounting or
+/// checkpoint budgets, promote a candidate, or grant retention/serving proof.
+/// Ambiguous acknowledgments recover the committed round by operation identity.
+pub async fn begin_verification_round(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<MutationOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if lock_candidate(&tx, handle).await?.is_none() {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    tx.execute(
+        "UPDATE posted_file_health SET round = round + 1, round_token = gen_random_uuid()::text, \
+         revision = revision + 1, state = 'verifying', failure_kind = NULL, \
+         verified_at = NULL, retention_checked_at = NULL WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    commit_mutation(tx, handle).await
+}
+
+/// Record confirmed presence for one required slot on one configured backbone.
+/// A transport failure/unknown is deliberately not a confirmation or terminal
+/// failure. Repeated current-round evidence is idempotent; stale fences write
+/// nothing. The verifier still owns same-ID repair and budget policy.
+pub async fn confirm_article(
+    client: &mut Client,
+    handle: &GenerationHandle,
+    slot: i32,
+    side: ArticleSide,
+) -> Result<MutationOutcome, StoreError> {
+    if slot < 0 {
+        return Err(StoreError::InvalidInput);
+    }
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    };
+    if current.get::<_, &str>("state") != "verifying"
+        || handle.round == 0
+        || current.get::<_, Option<i64>>("verified_at").is_some()
+    {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    if slot >= current.get::<_, i32>("article_count") {
+        return Err(StoreError::InvalidInput);
+    }
+    let changed = tx
+        .execute(
+            "INSERT INTO posted_file_article_progress (generation_id, round, slot, side, confirmed) \
+             VALUES ($1, $2, $3, $4, TRUE) ON CONFLICT (generation_id, round, slot, side) \
+             DO UPDATE SET confirmed = TRUE WHERE NOT posted_file_article_progress.confirmed",
+            &[&handle.generation, &handle.round, &slot, &side.db_value()],
+        )
+        .await
+        .map_err(database_error)?;
+    if changed == 1 {
+        tx.execute(
+            "UPDATE posted_file_health SET revision = revision + 1 WHERE generation_id = $1",
+            &[&handle.generation],
+        )
+        .await
+        .map_err(database_error)?;
+    }
+    commit_mutation(tx, handle).await
+}
+
+/// Mark verification complete only for the entire distinct required slot set
+/// on BOTH backbones, including recovery slots in the sealed plan. Verification
+/// alone does not establish retention, select a winner or publish a pointer.
+pub async fn finish_verification(
+    client: &mut Client,
+    handle: &GenerationHandle,
+) -> Result<MutationOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    let Some(current) = lock_candidate(&tx, handle).await? else {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    };
+    if current.get::<_, &str>("state") != "verifying"
+        || handle.round == 0
+        || current.get::<_, Option<i64>>("verified_at").is_some()
+    {
+        return Ok(MutationOutcome::StaleOrDiverged);
+    }
+    let complete: bool = tx
+        .query_one(
+            "SELECT count(*) = $3::integer::bigint * 2 \
+             AND COALESCE(bool_and(confirmed AND slot >= 0 AND slot < $3::integer), FALSE) \
+             FROM posted_file_article_progress WHERE generation_id = $1 AND round = $2",
+            &[
+                &handle.generation,
+                &handle.round,
+                &current.get::<_, i32>("article_count"),
+            ],
+        )
+        .await
+        .map_err(database_error)?
+        .get(0);
+    if !complete {
+        return Ok(MutationOutcome::Incomplete);
+    }
+    tx.execute(
+        "UPDATE posted_file_health SET verified_at = extract(epoch FROM clock_timestamp())::bigint, \
+         revision = revision + 1 WHERE generation_id = $1",
+        &[&handle.generation],
+    )
+    .await
+    .map_err(database_error)?;
+    commit_mutation(tx, handle).await
 }
 
 /// Lost admission acknowledgment: reread by durable operation identity before
@@ -712,6 +891,12 @@ mod tests {
         };
         assert_eq!(format!("{attempt:?}"), "AttemptHandle([REDACTED])");
         assert_eq!(format!("{handle:?}"), "GenerationHandle([REDACTED])");
+        assert_eq!(
+            format!("{:?}", MutationOutcome::Applied(handle)),
+            "Applied(GenerationHandle([REDACTED]))"
+        );
+        assert_eq!(ArticleSide::Post.db_value(), 0);
+        assert_eq!(ArticleSide::Verify.db_value(), 1);
         assert_eq!(
             format!("{:?}", AttemptOutcome::Acquired(attempt)),
             "Acquired(AttemptHandle([REDACTED]))"
