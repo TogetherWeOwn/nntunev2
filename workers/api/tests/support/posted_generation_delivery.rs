@@ -1,6 +1,9 @@
 //! Database-discovered delivery entry: no operation/round/cursor from Queue/KV.
 //! Scripted transport proves bookkeeping only, not deployed queue/pool routing.
 
+#[path = "posted_generation_durable_delivery.rs"]
+mod durable;
+
 use super::*;
 use nntune_ingest::posted_generations::{
     abandon_candidate, drive_pending_recheck, recover_pending, take_over,

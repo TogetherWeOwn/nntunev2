@@ -24,6 +24,109 @@ impl fmt::Debug for AttemptAcquisition {
     }
 }
 
+/// Exact dispatch coordinates retained by the trusted coordinator, not attempt
+/// authority. Construct only from its durable authenticated dispatch record,
+/// never from Queue/KV fields. Validation checks shape, NOT authentication.
+/// There is deliberately no deserializer or current-attempt/token accessor.
+#[derive(Clone)]
+pub struct DurableAttemptRequest {
+    job_id: String,
+    owner_id: String,
+    admission_key: String,
+    request_id: String,
+    next_attempt: i64,
+}
+
+impl DurableAttemptRequest {
+    pub fn new(
+        job_id: &str,
+        owner_id: &str,
+        admission_key: &str,
+        request_id: &str,
+        expected_attempt: i64,
+    ) -> Result<Self, StoreError> {
+        if !identity(job_id)
+            || !identity(owner_id)
+            || !identity(request_id)
+            || expected_attempt < 0
+            || crate::ingest_jobs::validate_admit_params(job_id, owner_id, admission_key, 0)
+                .is_err()
+        {
+            return Err(StoreError::InvalidInput);
+        }
+        let next_attempt = expected_attempt
+            .checked_add(1)
+            .ok_or(StoreError::InvalidInput)?;
+        Ok(Self {
+            job_id: job_id.to_owned(),
+            owner_id: owner_id.to_owned(),
+            admission_key: admission_key.to_owned(),
+            request_id: request_id.to_owned(),
+            next_attempt,
+        })
+    }
+}
+
+impl fmt::Debug for DurableAttemptRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DurableAttemptRequest([REDACTED])")
+    }
+}
+
+/// Recover an already acquired attempt after losing all in-memory receipts.
+/// The trusted coordinator supplies the SAME original dispatch coordinates.
+/// Missing receipts, queued/stopped/foreign jobs, expiry or supersession refuse:
+/// this never prepares, starts, acquires, takes over or renews anything. In
+/// particular, a rolled-back startup/acquisition must not become a new attempt
+/// just because a delayed delivery arrived. Startup/acquisition remain explicit.
+/// The owner and exact admitted job are locked before loading the immutable
+/// receipt; `recover_locked` rechecks the live attempt and DB clock after waits.
+/// This API does not authenticate a dispatch or wire the production Queue.
+pub async fn recover_durable_attempt_acquisition(
+    client: &mut Client,
+    request: &DurableAttemptRequest,
+) -> Result<AttemptOutcome, StoreError> {
+    let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_owner(&tx, &request.owner_id).await? {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
+    if tx
+        .query_opt(
+            "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 \
+             AND idempotency_key = $3 AND status = 'running' FOR UPDATE",
+            &[&request.job_id, &request.owner_id, &request.admission_key],
+        )
+        .await
+        .map_err(database_error)?
+        .is_none()
+    {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
+    let Some(row) = tx
+        .query_opt(
+            "SELECT token FROM posted_file_attempt_receipts \
+             WHERE job_id = $1 AND request_id = $2 AND owner_id = $3 AND attempt = $4",
+            &[
+                &request.job_id,
+                &request.request_id,
+                &request.owner_id,
+                &request.next_attempt,
+            ],
+        )
+        .await
+        .map_err(database_error)?
+    else {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    };
+    let proposed = AttemptHandle {
+        job_id: request.job_id.clone(),
+        owner_id: request.owner_id.clone(),
+        attempt: request.next_attempt,
+        token: row.get(0),
+    };
+    recover_locked(tx, &proposed).await
+}
+
 /// Mint the request identity before attempting a transaction that could commit.
 /// This writes nothing and establishes no job ownership, lease or authority.
 /// The token uses the same database CSPRNG as the original acquisition path.

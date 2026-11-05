@@ -38,11 +38,14 @@ use tokio_postgres::{Client, Row, Transaction};
 mod attempts;
 pub use attempts::{
     acquire_prepared_attempt, prepare_attempt_acquisition, prepare_durable_attempt_acquisition,
-    recover_attempt_acquisition, start_durable_attempt_acquisition, AttemptAcquisition,
+    recover_attempt_acquisition, recover_durable_attempt_acquisition,
+    start_durable_attempt_acquisition, AttemptAcquisition, DurableAttemptRequest,
 };
 #[path = "posted_generation_driver.rs"]
 mod driver;
-pub use driver::{drive_pending_recheck, drive_recheck, GenerationTransport, RecheckStep};
+pub use driver::{
+    drive_durable_recheck, drive_pending_recheck, drive_recheck, GenerationTransport, RecheckStep,
+};
 #[path = "posted_generation_content.rs"]
 mod content;
 pub use content::{

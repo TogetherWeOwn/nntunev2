@@ -73,6 +73,41 @@ async fn finish(
     }
 }
 
+/// Restart one bounded recheck delivery using the trusted coordinator's durable
+/// dispatch coordinates, without retaining any process-local attempt or candidate
+/// handle. Only an exact EXISTING receipt and its own live acquired attempt can
+/// reach discovery/the driver. Missing or stale work stops without preparation,
+/// acquisition, takeover, reminting, round creation or network IO. Replay cannot
+/// borrow a current token belonging to a different request or attempt.
+///
+/// `request` and `hash` must come from the authenticated durable dispatch record,
+/// NOT Queue/KV hints. This is a coordinator seam, not dispatch authentication or
+/// a deployed Queue handler. All existing pre-network/original-callback fences,
+/// bounded work and due-only live renewal in the driver remain unchanged.
+/// Presence completion still grants no content, topology or cleanup authority.
+pub async fn drive_durable_recheck<T: GenerationTransport>(
+    client: &mut Client,
+    request: &DurableAttemptRequest,
+    hash: &str,
+    transport: &mut T,
+    max_slots: usize,
+) -> Result<RecheckStep, StoreError> {
+    // Refuse malformed deliveries before even attempting durable recovery.
+    if !crate::two_spool::validate_plaintext_sha256(hash)
+        || max_slots == 0
+        || max_slots > STAT_BATCH_SIZE
+    {
+        return Err(StoreError::InvalidInput);
+    }
+    match recover_durable_attempt_acquisition(client, request).await? {
+        AttemptOutcome::Acquired(attempt) => {
+            drive_pending_recheck(client, &attempt, hash, transport, max_slots).await
+        }
+        AttemptOutcome::StaleOrMissing => Ok(RecheckStep::StaleOrDiverged),
+        AttemptOutcome::Busy => Err(StoreError::Inconsistent),
+    }
+}
+
 /// Resume one bounded delivery using only the persisted attempt and content
 /// hash. Discover/recover the current candidate and let `drive_recheck` load its
 /// durable cursor, schedule and counters; no Queue/KV handle or local progress

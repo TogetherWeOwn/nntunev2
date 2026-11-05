@@ -20,6 +20,14 @@ RETIREMENT_CASE = (
 )
 EXPECTED = {
     RETIREMENT_CASE,
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_restart_recovers_exact_attempt_and_cursor_without_handles",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_missing_or_unacquired_receipts_never_create_authority",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_rejects_mismatched_admission_owner_request_and_attempt",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_expired_or_superseded_request_never_acquires_or_takes_over",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_waiting_unbegun_stopped_and_deleting_work_retains_state",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_network_callbacks_keep_original_fences_and_release_locks",
+    "posted_generation_driver::delivery::durable::postgres_durable_recovery_rechecks_after_owner_job_and_attempt_lock_waits",
+    "posted_generation_driver::delivery::durable::postgres_durable_delivery_malformed_coordinates_and_bounds_refuse_before_work",
     "disposable_config_accepts_only_single_loopback_nntune_ci",
     "disposable_config_rejects_hostaddr_nonloopback_multihost_and_wrong_database",
     "postgres_absent_admission_persists_exact_bundle_with_clean_health",
