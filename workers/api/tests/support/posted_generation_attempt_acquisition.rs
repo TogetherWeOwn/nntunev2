@@ -16,6 +16,8 @@
 
 #[path = "posted_generation_durable_attempts.rs"]
 mod durable;
+#[path = "posted_generation_startup.rs"]
+mod startup;
 
 use super::*;
 use nntune_ingest::posted_generations::{
