@@ -36,11 +36,12 @@ tables; its manifest entry does not establish a staging apply. Runner
 fixtures exercise orchestration and serialization. The feature-gated
 `videolinks_postgres` acceptance target exercises the actual adapter and
 unchanged migration against Actions' disposable PostgreSQL 18 service,
-not staging or live YouTube. Its exact-head job result is required before
-claiming SQL execution verified. Neither fixture target proves streaming
-HTTP or a deployed TTL schedule. Without an active schedule and measured
-cleanup throughput, the adapter alone does not establish metadata deletion
-within 30 days.
+not staging or live YouTube. Both database test functions passed at
+`512590d06ac06082e596b7b4ed56327ca5825d62` in the
+[Actions migration job](https://github.com/TogetherWeOwn/nntunev2/actions/runs/42002762144/job/127161854863).
+That verifies SQL execution at that head, not streaming HTTP or a deployed
+TTL schedule. Without an active schedule and measured cleanup throughput,
+the adapter alone does not establish metadata deletion within 30 days.
 
 ### PostgreSQL acceptance boundary
 
@@ -71,7 +72,7 @@ checkout or changing workspace membership.
 Still required before feature acceptance:
 
 - Wire source readers, the runner's app-side connection and a bounded
-  schedule. Exercise the PostgreSQL adapter against the proposed schema.
+  schedule. Keep the real PostgreSQL acceptance target green at each head.
 - Implement the credential-bound HTTP adapter: fixed official HTTPS
   endpoint, no redirects, capped streaming body, cancellation on drop and
   sanitized failures. The runner's post-read body-size check is not a
