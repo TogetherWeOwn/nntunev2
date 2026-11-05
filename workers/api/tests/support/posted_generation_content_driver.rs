@@ -27,6 +27,7 @@ enum Fault {
     AttemptLease,
     JobStatus,
     Takeover,
+    RenewedLeases,
 }
 
 struct Hook {
@@ -112,6 +113,20 @@ impl GenerationContentTransport for Reader {
             let mut h = h;
             unlocked(&h.db, &self.expected, &h.job).await;
             match h.fault {
+                Fault::RenewedLeases => {
+                    let row =
+                        h.db.query_one(
+                            "SELECT a.lease_until, o.lease_until, \
+                         extract(epoch FROM clock_timestamp())::bigint \
+                         FROM posted_file_job_attempts a \
+                         JOIN posted_file_operations o ON o.job_id = a.job_id WHERE o.id = $1",
+                            &[&self.expected.op],
+                        )
+                        .await
+                        .quiet("read renewed content delivery leases");
+                    assert_eq!(row.get::<_, i64>(0), row.get::<_, i64>(1));
+                    assert!(row.get::<_, i64>(0) >= row.get::<_, i64>(2) + 290);
+                }
                 Fault::Revision => {
                     applied(
                         confirm_article(&mut h.db, &h.handle, 0, ArticleSide::Verify).await,
@@ -203,6 +218,58 @@ impl GenerationContentTransport for Reader {
     }
 }
 
+// A delivery may renew deadlines even when the read is cancelled or its report
+// is malformed. Every other operation/attempt field and all evidence stay pinned.
+async fn delivery_snapshot(db: &Client, c: &Case) -> Vec<Option<String>> {
+    let mut snap = snapshot(db, &c.sealed).await;
+    let row = db.query_one(
+        "SELECT \
+         (SELECT md5((to_jsonb(o) - 'lease_until')::text) FROM posted_file_operations o WHERE o.id = $1), \
+         (SELECT md5((to_jsonb(a) - 'lease_until')::text) FROM posted_file_job_attempts a WHERE a.job_id = $2), \
+         (SELECT md5(jsonb_agg(to_jsonb(p) ORDER BY p.round, p.slot, p.side)::text) \
+            FROM posted_file_article_progress p WHERE p.generation_id = $3), \
+         (SELECT md5(jsonb_agg(to_jsonb(p) ORDER BY p.round, p.side)::text) \
+            FROM posted_file_content_checks p WHERE p.generation_id = $3), \
+         (SELECT md5(jsonb_agg(to_jsonb(p) ORDER BY p.round)::text) \
+            FROM posted_file_recheck_schedule p WHERE p.generation_id = $3)",
+        &[&c.sealed.op, &c.job, &c.sealed.generation],
+    ).await.quiet("snapshot content delivery invariants");
+    snap[2] = row.get(0);
+    snap.extend((1..5).map(|i| row.get::<_, Option<String>>(i)));
+    snap
+}
+
+async fn exact_delivery_snapshot(db: &Client, c: &Case) -> Vec<Option<String>> {
+    let mut snap = delivery_snapshot(db, c).await;
+    let row = db
+        .query_one(
+            "SELECT md5(a::text), md5(o::text) FROM posted_file_job_attempts a \
+         JOIN posted_file_operations o ON o.job_id = a.job_id WHERE o.id = $1",
+            &[&c.sealed.op],
+        )
+        .await
+        .quiet("snapshot delivery including deadlines");
+    snap.extend((0..2).map(|i| row.get::<_, Option<String>>(i)));
+    snap
+}
+
+async fn short_leases(db: &Client, c: &Case, attempt_seconds: i64, operation_seconds: i64) {
+    db.execute(
+        "UPDATE posted_file_job_attempts SET lease_until = \
+         extract(epoch FROM clock_timestamp())::bigint + $2 WHERE job_id = $1",
+        &[&c.job, &attempt_seconds],
+    )
+    .await
+    .quiet("set content attempt deadline");
+    db.execute(
+        "UPDATE posted_file_operations SET lease_until = \
+         extract(epoch FROM clock_timestamp())::bigint + $2 WHERE id = $1",
+        &[&c.sealed.op, &operation_seconds],
+    )
+    .await
+    .quiet("set content operation deadline");
+}
+
 fn recorded(result: Result<ContentReadStep, StoreError>) -> GenerationHandle {
     match result {
         Ok(ContentReadStep::ObservationRecorded(next)) => *next,
@@ -275,7 +342,7 @@ fn postgres_content_driver_rejects_partial_and_mismatched_reports_without_writes
     run_test(async {
         let mut db = connect().await;
         let (c, _, handle) = verifying(&mut db).await;
-        let before = snapshot(&db, &c.sealed).await;
+        let before = delivery_snapshot(&db, &c).await;
         for answer in [
             Answer::Partial,
             Answer::WrongBackbone,
@@ -289,7 +356,7 @@ fn postgres_content_driver_rejects_partial_and_mismatched_reports_without_writes
                 Err(StoreError::InvalidInput)
             ));
             assert_eq!(reader.sides.len(), 1);
-            assert!(snapshot(&db, &c.sealed).await == before);
+            assert!(delivery_snapshot(&db, &c).await == before);
             assert!(content_rows(&db, &c.sealed).await.is_empty());
         }
     });
@@ -302,19 +369,24 @@ fn postgres_content_driver_unbegun_and_stale_handles_do_not_start_a_read() {
         let c = case(&db).await;
         let attempt = acquire(&mut db, &c.job, &c.owner, 0).await;
         let original = admitted(&mut db, &attempt, &c.sealed).await;
+        short_leases(&db, &c, 30, 40).await;
+        let before = exact_delivery_snapshot(&db, &c).await;
         let mut reader = Reader::new(&c.sealed, Answer::Intact);
         assert!(matches!(
             drive_content_read(&mut db, &original, ArticleSide::Post, &mut reader).await,
             Ok(ContentReadStep::StaleOrDiverged)
         ));
+        assert!(exact_delivery_snapshot(&db, &c).await == before);
         let next = applied(
             begin_verification_round(&mut db, &original).await,
             "begin content round",
         );
+        let before = exact_delivery_snapshot(&db, &c).await;
         assert!(matches!(
             drive_content_read(&mut db, &original, ArticleSide::Post, &mut reader).await,
             Ok(ContentReadStep::StaleOrDiverged)
         ));
+        assert!(exact_delivery_snapshot(&db, &c).await == before);
         assert!(reader.sides.is_empty());
         let _ = recorded(drive_content_read(&mut db, &next, ArticleSide::Post, &mut reader).await);
         assert_eq!(reader.sides.len(), 1);
@@ -363,7 +435,7 @@ fn postgres_content_driver_cancelled_read_writes_no_observation_and_recovery_reu
     run_test(async {
         let mut db = connect().await;
         let (c, attempt, handle) = verifying(&mut db).await;
-        let before = snapshot(&db, &c.sealed).await;
+        let before = delivery_snapshot(&db, &c).await;
         let (sender, started) = tokio::sync::oneshot::channel();
         let mut reader = Reader::new(&c.sealed, Answer::Intact);
         reader.cancel = Some(sender);
@@ -371,13 +443,120 @@ fn postgres_content_driver_cancelled_read_writes_no_observation_and_recovery_reu
             _ = drive_content_read(&mut db, &handle, ArticleSide::Post, &mut reader) => panic!("read must stay pending"),
             result = started => result.expect("reader started"),
         }
-        assert!(snapshot(&db, &c.sealed).await == before);
+        assert!(delivery_snapshot(&db, &c).await == before);
         assert!(content_rows(&db, &c.sealed).await.is_empty());
         let recovered = fresh_handle(&mut db, &attempt, &c.sealed).await;
         let _ =
             recorded(drive_content_read(&mut db, &recovered, ArticleSide::Post, &mut reader).await);
         assert_eq!(reader.sides.len(), 2);
         assert_eq!(custody_rows(&db, &c.sealed).await, 1);
+    });
+}
+
+#[test]
+fn postgres_content_driver_renews_both_leases_before_read_and_cancel_preserves_all_other_state() {
+    run_test(async {
+        let mut db = connect().await;
+        for side in [ArticleSide::Post, ArticleSide::Verify] {
+            let (c, attempt, handle) = verifying(&mut db).await;
+            short_leases(&db, &c, 30, 40).await;
+            let before = delivery_snapshot(&db, &c).await;
+            let (sender, started) = tokio::sync::oneshot::channel();
+            let mut reader = Reader::new(&c.sealed, Answer::Intact);
+            reader.cancel = Some(sender);
+            reader.hook = Some(Hook {
+                db: connect().await,
+                handle: handle.clone(),
+                job: c.job.clone(),
+                owner: c.owner.clone(),
+                fault: Fault::RenewedLeases,
+            });
+            tokio::select! {
+                _ = drive_content_read(&mut db, &handle, side, &mut reader) => panic!("read must stay pending"),
+                result = started => result.expect("reader started after renewal"),
+            }
+            assert_eq!(reader.sides, [side]);
+            assert!(delivery_snapshot(&db, &c).await == before);
+            assert!(content_rows(&db, &c.sealed).await.is_empty());
+            let recovered = fresh_handle(&mut db, &attempt, &c.sealed).await;
+            assert!(
+                recovered == handle,
+                "renewal must not rotate original authority"
+            );
+            let _ = recorded(drive_content_read(&mut db, &recovered, side, &mut reader).await);
+            assert_eq!(reader.sides, [side, side]);
+            assert_eq!(content_rows(&db, &c.sealed).await.len(), 1);
+            assert_eq!(custody_rows(&db, &c.sealed).await, 1);
+        }
+    });
+}
+
+#[test]
+fn postgres_content_driver_expired_lease_refuses_read_without_partial_renewal() {
+    run_test(async {
+        let mut db = connect().await;
+        for (attempt, operation) in [(-1, 40), (30, -1)] {
+            let (c, _, handle) = verifying(&mut db).await;
+            short_leases(&db, &c, attempt, operation).await;
+            let before = snapshot(&db, &c.sealed).await;
+            let attempt_before: i64 = db
+                .query_one(
+                    "SELECT lease_until FROM posted_file_job_attempts WHERE job_id = $1",
+                    &[&c.job],
+                )
+                .await
+                .quiet("read expired attempt fixture")
+                .get(0);
+            let mut reader = Reader::new(&c.sealed, Answer::Intact);
+            assert!(matches!(
+                drive_content_read(&mut db, &handle, ArticleSide::Post, &mut reader).await,
+                Ok(ContentReadStep::StaleOrDiverged)
+            ));
+            assert!(reader.sides.is_empty());
+            assert!(snapshot(&db, &c.sealed).await == before);
+            let attempt_after: i64 = db
+                .query_one(
+                    "SELECT lease_until FROM posted_file_job_attempts WHERE job_id = $1",
+                    &[&c.job],
+                )
+                .await
+                .quiet("read refused attempt deadline")
+                .get(0);
+            assert_eq!(attempt_before, attempt_after);
+        }
+    });
+}
+
+#[test]
+fn postgres_content_permit_preparation_alone_does_not_renew_delivery_leases() {
+    run_test(async {
+        let mut db = connect().await;
+        let (c, _, handle) = verifying(&mut db).await;
+        short_leases(&db, &c, 30, 40).await;
+        let before = snapshot(&db, &c.sealed).await;
+        let attempt_before: i64 = db
+            .query_one(
+                "SELECT lease_until FROM posted_file_job_attempts WHERE job_id = $1",
+                &[&c.job],
+            )
+            .await
+            .quiet("read preparation attempt deadline")
+            .get(0);
+        assert!(prepare_content_check(&mut db, &handle, ArticleSide::Post)
+            .await
+            .quiet("prepare only")
+            .is_some());
+        assert!(snapshot(&db, &c.sealed).await == before);
+        let attempt_after: i64 = db
+            .query_one(
+                "SELECT lease_until FROM posted_file_job_attempts WHERE job_id = $1",
+                &[&c.job],
+            )
+            .await
+            .quiet("read unchanged preparation deadline")
+            .get(0);
+        assert_eq!(attempt_before, attempt_after);
+        assert!(content_rows(&db, &c.sealed).await.is_empty());
     });
 }
 

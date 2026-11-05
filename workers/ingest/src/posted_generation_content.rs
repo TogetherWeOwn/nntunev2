@@ -42,7 +42,11 @@ pub enum ContentReadStep {
 /// network retry or local revision/cursor advancement is performed. A stale
 /// callback stops this delivery; a lost commit acknowledgment requires recovery.
 /// Explicit rechecks never skip a prior Intact observation: failures must be able
-/// to invalidate it. Callers own bounded scheduling, not this one-read operation.
+/// to invalidate it. Renew both still-live candidate leases before the read;
+/// preparation alone stays read-only. Renewal never refreshes the original
+/// permit or keeps an expired callback alive. Callers own bounded scheduling and
+/// read deadlines, not this one-read operation. Cancellation may retain only the
+/// renewed deadlines, never an observation.
 pub async fn drive_content_read<T: GenerationContentTransport>(
     client: &mut Client,
     handle: &GenerationHandle,
@@ -52,6 +56,9 @@ pub async fn drive_content_read<T: GenerationContentTransport>(
     let Some((permit, bundle)) = prepare_content_read(client, handle, side).await? else {
         return Ok(ContentReadStep::StaleOrDiverged);
     };
+    if !renew_candidate_lease(client, handle).await? {
+        return Ok(ContentReadStep::StaleOrDiverged);
+    }
     let result = transport.read_content(&bundle, side).await;
     match record_content_check(client, &permit, result).await? {
         MutationOutcome::Applied(next) => Ok(ContentReadStep::ObservationRecorded(next)),
