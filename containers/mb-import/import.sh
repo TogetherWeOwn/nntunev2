@@ -12,45 +12,59 @@
 # dump while a newer dump starts at line 0. The upsert carries a
 # forward-only updated_at guard (older dumps never roll a row back).
 # Contract: every row of a dump file carries that dump's single
-# updated_at (the ETL stamps one DUMP_TS); the track prune compares
-# per-release maxima and relies on that uniformity. The prune runs
-# only in the track dump's final chunk transaction, atomically with
-# the cursor advancing to the end of the dump, so an interrupted
-# import leaves rows at worst stale, never truncated.
+# updated_at (the ETL stamps one DUMP_TS); the newest-dump prunes compare
+# per-parent maxima (per release for tracks, per artist/recording for the
+# relationship tables, per either endpoint for music-video pairs) and rely
+# on that uniformity. Each prune runs only in its own table dump's final
+# chunk transaction, atomically with the cursor advancing to the end of
+# the dump, so an interrupted import leaves rows at worst stale, never
+# truncated.
 
 # Poison rows never abort the import: the mb-validate pre-pass checks every
-# line against the typed upsert contract (uuid/int/timestamp shapes, COPY
-# escapes, canonical dump layout) and poison lines land in mb_import_dlq
-# with reason + raw line for the operator. FK orphans join them instead of
-# aborting the chunk: a release/recording/track whose parent MBID was
-# poisoned or never loaded would violate REFERENCES inside the transaction
-# (whole chunk rolls back, cursor pinned, row never DLQ'd), so orphan rows
-# are detected up front and filed under fk_missing_artist /
-# fk_missing_release / fk_missing_recording.
-# Duplicate valid MBIDs within a dump are rejected before import; the same
-# MBID across distinct dumps is expected and is handled by the forward-only
-# upsert. FK order is artist -> release -> recording -> track: every chunk of a
-# later table only references rows an earlier table already committed, and
-# immediate FK checks never see a half-chunk (a failed chunk rolls
-# back whole).
+# line against the typed upsert contract (uuid/int/timestamp/bool/ISRC
+# shapes, COPY escapes, canonical dump layout) and poison lines land in
+# mb_import_dlq with reason + raw line for the operator. FK orphans join
+# them instead of aborting the chunk: a row whose parent MBID was poisoned
+# or never loaded would violate REFERENCES inside the transaction (whole
+# chunk rolls back, cursor pinned, row never DLQ'd), so orphan rows are
+# detected up front and filed under fk_missing_artist /
+# fk_missing_release_group / fk_missing_release / fk_missing_recording /
+# fk_missing_url.
+# Duplicate valid keys within a dump are rejected before import; the same
+# key across distinct dumps is expected and is handled by the forward-only
+# upsert. FK order is artist -> release_group -> release -> recording ->
+# track -> url -> artist_url -> recording_url -> recording_music_video ->
+# recording_isrc: every chunk of a later table only references rows an
+# earlier table already committed, and immediate FK checks never see a
+# half-chunk (a failed chunk rolls back whole).
 #
 # DUMP_SEQ (optional): replication sequence the dump corresponds to. When
 # set, mb_import_state.last_packet is seeded forward-only (only when
-# DUMP_SEQ > current last_packet) so the hourly replicate.sh gate
-# (PACKET_SEQ = last_packet + 1) accepts the first real packet. The seed
-# never touches last_applied_at/lag_seconds (apply-step columns) and an
-# older dump never rewinds the cursor. When unset, state is left untouched
-# and the operator must seed it before replication (see README).
+# DUMP_SEQ > current last_packet) so downstream lag accounting has a
+# baseline for the first dump. (replicate.sh, the hourly packet applier,
+# is retired: the CC0-only mirror takes twice-weekly dumps, never Live
+# Data Feed packets.) The seed never touches last_applied_at/lag_seconds
+# and an older dump never rewinds the cursor. When unset, state is left
+# untouched (see README).
 #
 # Input contract (curated TSVs, NOT raw MusicBrainz dumps):
-#   <dump-dir>/mbdump-artist.tsv     mb_artist    (mbid, name, sort_name, type, country, updated_at)
-#   <dump-dir>/mbdump-release.tsv    mb_release   (mbid, artist_mbid, title, release_type, year, caa_url, updated_at)
-#   <dump-dir>/mbdump-recording.tsv  mb_recording (mbid, release_mbid, title, track_no, duration_ms, updated_at)
-#   <dump-dir>/mbdump-track.tsv      mb_track     (release_mbid, recording_mbid, medium_no, track_no, updated_at)
-# Produce them from an official mbdump/ extract (mbdump/artist, mbdump/release,
-# mbdump/recording with the full upstream column layout) by projecting the
-# curated columns in dump order, e.g. with a small ETL step that SELECTs the
-# columns above and writes tab-separated rows. Missing input is fatal: a
+#   <dump-dir>/mbdump-artist.tsv               mb_artist                 (mbid, name, sort_name, type, country, updated_at)
+#   <dump-dir>/mbdump-release_group.tsv        mb_release_group          (mbid, name, artist_mbid, group_type, updated_at)
+#   <dump-dir>/mbdump-release.tsv              mb_release                (mbid, artist_mbid, title, release_type, year, caa_url, release_group_mbid, updated_at)
+#   <dump-dir>/mbdump-recording.tsv            mb_recording              (mbid, release_mbid, title, track_no, duration_ms, updated_at)
+#   <dump-dir>/mbdump-track.tsv                mb_track                  (release_mbid, recording_mbid, medium_no, track_no, updated_at)
+#   <dump-dir>/mbdump-url.tsv                  mb_url                    (mbid, url, updated_at)
+#   <dump-dir>/mbdump-artist_url.tsv           mb_artist_url             (artist_mbid, url_mbid, link_name, updated_at)
+#   <dump-dir>/mbdump-recording_url.tsv        mb_recording_url          (recording_mbid, url_mbid, link_name, is_video, updated_at)
+#   <dump-dir>/mbdump-recording_music_video.tsv mb_recording_music_video (recording_a_mbid, recording_b_mbid, updated_at)
+#   <dump-dir>/mbdump-recording_isrc.tsv       mb_recording_isrc         (recording_mbid, isrc, updated_at)
+# Produce them from an official mbdump/ extract with the full upstream column
+# layout by projecting the curated columns in dump order, e.g. with the ETL
+# step in etl.py that SELECTs the columns above and writes tab-separated
+# rows. Music-video pairs must arrive canonically ordered
+# (recording_a_mbid < recording_b_mbid as UUIDs, as the ETL emits them);
+# a misordered pair trips the table CHECK inside the chunk transaction and
+# aborts the chunk instead of landing in the DLQ. Missing input is fatal: a
 # silent skip would report "import: done" with zero rows loaded.
 set -euo pipefail
 
@@ -58,11 +72,13 @@ if [[ "${1:-}" == "--help" || $# -lt 1 ]]; then
   cat <<'USAGE'
 Usage: DATABASE_URL=<postgres-url> ./import.sh <dump-dir>
 
-Imports curated mbdump TSV dumps (artist, release, recording, track) in kill-safe
-chunks: validate -> COPY -> typed upsert -> cursor advance, one transaction
-per chunk, poison rows to mb_import_dlq. A rerun resumes from
-mb_import_cursor and inserts zero dupes. See the header comment for the
-curated TSV contract and how to project it from official mbdump/ extracts.
+Imports curated mbdump TSV dumps (artist, release_group, release, recording,
+track, url, artist_url, recording_url, recording_music_video,
+recording_isrc) in kill-safe chunks: validate -> COPY -> typed upsert ->
+cursor advance, one transaction per chunk, poison rows to mb_import_dlq.
+A rerun resumes from mb_import_cursor and inserts zero dupes. See the
+header comment for the curated TSV contract and how to project it from
+official mbdump/ extracts.
 Requires: psql, python3, sha256sum and mb-validate on PATH
 (MB_VALIDATE_BIN overrides), DATABASE_URL in env (never as argv).
 USAGE
@@ -97,7 +113,7 @@ command -v python3 >/dev/null || { echo "import: python3 not on PATH (FK orphan 
 
 # Admission precedes every database mutation, including cursor creation.
 # Do not reject row-level poison here: validation and FK routing stay per chunk.
-for table in artist release recording track; do
+for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
   tsv="$dump_dir/mbdump-$table.tsv"
   if [[ ! -f "$tsv" || ! -r "$tsv" || ! -s "$tsv" ]]; then
     echo "import: refusing $tsv (required curated TSV must be present, readable and nonempty)" >&2
@@ -146,7 +162,7 @@ refuse_all_poison_dump() {
   fi
 }
 
-for table in artist release recording track; do
+for table in artist release_group release recording track url artist_url recording_url recording_music_video recording_isrc; do
   tsv="$dump_dir/mbdump-$table.tsv"
   prune_sql=""
   final_prune_sql=""
@@ -156,15 +172,64 @@ for table in artist release recording track; do
       upsert="name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, \"type\" = EXCLUDED.\"type\", country = EXCLUDED.country, updated_at = EXCLUDED.updated_at"
       conflict="(mbid)"
       ;;
+    release_group)
+      columns="mbid, name, artist_mbid, \"type\", updated_at"
+      upsert="name = EXCLUDED.name, artist_mbid = EXCLUDED.artist_mbid, \"type\" = EXCLUDED.\"type\", updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
+      ;;
     release)
-      columns="mbid, artist_mbid, title, release_type, year, caa_url, updated_at"
-      upsert="artist_mbid = EXCLUDED.artist_mbid, title = EXCLUDED.title, release_type = EXCLUDED.release_type, year = EXCLUDED.year, caa_url = EXCLUDED.caa_url, updated_at = EXCLUDED.updated_at"
+      columns="mbid, artist_mbid, title, release_type, year, caa_url, release_group_mbid, updated_at"
+      upsert="artist_mbid = EXCLUDED.artist_mbid, title = EXCLUDED.title, release_type = EXCLUDED.release_type, year = EXCLUDED.year, caa_url = EXCLUDED.caa_url, release_group_mbid = EXCLUDED.release_group_mbid, updated_at = EXCLUDED.updated_at"
       conflict="(mbid)"
       ;;
     recording)
       columns="mbid, release_mbid, title, track_no, duration_ms, updated_at"
       upsert="release_mbid = EXCLUDED.release_mbid, title = EXCLUDED.title, track_no = EXCLUDED.track_no, duration_ms = EXCLUDED.duration_ms, updated_at = EXCLUDED.updated_at"
       conflict="(mbid)"
+      ;;
+    url)
+      columns="mbid, url, updated_at"
+      upsert="url = EXCLUDED.url, updated_at = EXCLUDED.updated_at"
+      conflict="(mbid)"
+      ;;
+    artist_url)
+      columns="artist_mbid, url_mbid, link_name, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(artist_mbid, url_mbid, link_name)"
+      # Same per-parent newest-dump prune as tracks below, but the parent
+      # is the artist: a newer dump that drops one of this artist's links
+      # leaves the old row behind without this, and catalogue reads have
+      # no timestamp filter to hide it.
+      final_prune_sql="DELETE FROM mb_artist_url old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_artist_url x WHERE x.artist_mbid = old.artist_mbid);"
+      ;;
+    recording_url)
+      columns="recording_mbid, url_mbid, link_name, is_video, updated_at"
+      upsert="is_video = EXCLUDED.is_video, updated_at = EXCLUDED.updated_at"
+      conflict="(recording_mbid, url_mbid, link_name)"
+      # Per-recording newest-dump prune (see artist_url above): a newer
+      # dump that drops one of this recording's links would otherwise
+      # keep serving the deleted URL.
+      final_prune_sql="DELETE FROM mb_recording_url old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_url x WHERE x.recording_mbid = old.recording_mbid);"
+      ;;
+    recording_music_video)
+      columns="recording_a_mbid, recording_b_mbid, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(recording_a_mbid, recording_b_mbid)"
+      # Per-endpoint newest-dump prune: pairs are undirected, so an old
+      # pair dies once either endpoint has a newer pair row. A recording
+      # whose pairs all vanished from the newer dump keeps no newer row
+      # for either endpoint, so its old rows survive exactly like a
+      # release absent from a track dump (stale but untouched).
+      final_prune_sql="DELETE FROM mb_recording_music_video old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_music_video x WHERE x.recording_a_mbid IN (old.recording_a_mbid, old.recording_b_mbid) OR x.recording_b_mbid IN (old.recording_a_mbid, old.recording_b_mbid));"
+      ;;
+    recording_isrc)
+      columns="recording_mbid, isrc, updated_at"
+      upsert="updated_at = EXCLUDED.updated_at"
+      conflict="(recording_mbid, isrc)"
+      # Per-recording newest-dump prune (see artist_url above): a newer
+      # dump that drops one of this recording's codes would otherwise
+      # keep serving the deleted ISRC.
+      final_prune_sql="DELETE FROM mb_recording_isrc old WHERE old.updated_at < (SELECT max(x.updated_at) FROM mb_recording_isrc x WHERE x.recording_mbid = old.recording_mbid);"
       ;;
     track)
       columns="release_mbid, recording_mbid, medium_no, track_no, updated_at"
@@ -289,11 +354,60 @@ def position_key(token):
     if n < 0 or n > 32767:
         return None
     return str(n)
+def isrc_key(decoded):
+    """Canonical ISRC key, or None when it cannot validate (poison).
+
+    Mirrors FieldKind::Isrc (uppercased 12-character CC+OOO+YYYYYYY form):
+    the validator poisons anything else, so only loadable codes take part
+    in duplicate detection.
+    """
+    code = decoded.upper()
+    if len(code) != 12:
+        return None
+    if not (code[:2].isalpha() and code[:2].isascii() and code[:2].isupper()):
+        return None
+    if not all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" for c in code[2:5]):
+        return None
+    if not code[5:].isdigit():
+        return None
+    return code
+def canonical_key(kind, decoded):
+    """Canonical duplicate-key part, or None when the value cannot load."""
+    if kind == "text":
+        # The validator passes text through byte-equal, so the decoded
+        # value is the stored key (link names on the relationship tables).
+        return decoded
+    if kind == "isrc":
+        return isrc_key(decoded)
+    if kind == "pos":
+        return position_key(decoded)
+    return uuid_key(decoded)
+# Duplicate-key columns per table, mirroring each table's conflict target.
+# Single-uuid tables key on column 1; the relationship/pair tables on
+# their full key tuple. Keep in step with the validator specs: only
+# loadable keys participate, poison rows never reach the table.
+KEYS = {
+    "artist": [(0, "uuid")],
+    "release_group": [(0, "uuid")],
+    "release": [(0, "uuid")],
+    "recording": [(0, "uuid")],
+    "url": [(0, "uuid")],
+    "track": [(0, "uuid"), (2, "pos"), (3, "pos")],
+    "artist_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_url": [(0, "uuid"), (1, "uuid"), (2, "text")],
+    "recording_music_video": [(0, "uuid"), (1, "uuid")],
+    "recording_isrc": [(0, "uuid"), (1, "isrc")],
+}
 batch = []
 def flush():
     if batch:
         sys.stdout.write("".join(key + "\n" for key in batch))
         batch.clear()
+spec = KEYS.get(table)
+if spec is None:
+    sys.stderr.write(f"duplicate-key pre-check: unknown table {table}\n")
+    sys.exit(1)
+width = max(index for index, _ in spec) + 1
 with open(path, "rb") as f:
     # Stream line by line with bounded batches: multi-million-line dumps
     # must never sit wholly in memory beside their decoded key list.
@@ -302,29 +416,25 @@ with open(path, "rb") as f:
         # reads the same way), while a missing one still yields the tail.
         if raw.endswith(b"\n"):
             raw = raw[:-1]
-        if table == "track":
-            fields = raw.split(b"\t")
-            if len(fields) < 4:
-                continue
-            release = decode(fields[0])
-            medium = decode(fields[2])
-            number = decode(fields[3])
-            if release is None or medium is None or number is None:
-                continue
-            release = uuid_key(release)
-            medium = position_key(medium)
-            number = position_key(number)
-            if release is None or medium is None or number is None:
-                continue
-            batch.append(release + "/" + medium + "/" + number)
-        else:
-            first = decode(raw.split(b"\t", 1)[0])
-            if first is None:
-                continue
-            key = uuid_key(first)
-            if key is None:
-                continue
-            batch.append(key)
+        fields = raw.split(b"\t")
+        if len(fields) < width:
+            continue
+        parts = []
+        for index, kind in spec:
+            decoded = decode(fields[index])
+            if decoded is None:
+                break
+            value = canonical_key(kind, decoded)
+            if value is None:
+                break
+            parts.append(value)
+        if len(parts) != len(spec):
+            continue
+        if table == "recording_music_video":
+            # One undirected link is one key whichever side the dump
+            # lists first, mirroring the canonical ETL ordering.
+            parts.sort()
+        batch.append("/".join(parts))
         if len(batch) >= 8192:
             flush()
 flush()
@@ -406,33 +516,55 @@ EOF
       echo "import: chunk $table lines $range yielded $((10#$valid_n + 10#$poison_n)) of $lines lines; the dump changed under the import: refusing" >&2
       exit 1
     fi
-    if [[ "$table" == "track" ]]; then
-      dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
-    else
-      dupes="$(awk -F'\t' '{ print $1 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
-    fi
+    # Duplicate keys inside one chunk mirror the pre-check above, but on
+    # validator-normalized rows (uuids already lowercase, integers plain,
+    # bools literal, ISRCs uppercase, text byte-equal), so the keys are
+    # plain field joins except the music-video pair, which sorts like the
+    # canonical ETL ordering.
+    case "$table" in
+      track)
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" ($3+0) "/" ($4+0) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      artist_url|recording_url)
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" tolower($2) "/" $3 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      recording_music_video)
+        dupes="$(awk -F'\t' '{ a = tolower($1); b = tolower($2); print (a < b ? a "/" b : b "/" a) }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      recording_isrc)
+        dupes="$(awk -F'\t' '{ print tolower($1) "/" $2 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+      *)
+        dupes="$(awk -F'\t' '{ print $1 }' "$work/valid.tsv" | sort | uniq -d | head -n 5)"
+        ;;
+    esac
     if [[ -n "$dupes" ]]; then
       echo "import: duplicate key inside $table chunk lines $range (dump contradicts itself; fix the dump, cursor stays at $offset):" >&2
       echo "$dupes" >&2
       exit 1
     fi
-    # FK orphans never abort the chunk (see header comment): a release or
-    # recording whose parent MBID was poisoned or never loaded would hit
-    # REFERENCES inside the transaction, rolling back the whole chunk with
-    # the cursor pinned and the row never DLQ'd. Detect those rows up front
-    # against the already-committed parent table and file them under
-    # fk_missing_artist / fk_missing_release / fk_missing_recording with
-    # their exact dump bytes.
-    # (artist has no parent; release parents commit before any release chunk
-    # runs and recording parents before any recording chunk, so a missing
-    # parent is poison, never chunk ordering. track has two parents and is
-    # split once per parent; a row moved by the first split is already out
-    # of valid.tsv for the second.)
-    if (( 10#$valid_n > 0 )) && [[ "$table" != "artist" ]]; then
+    # FK orphans never abort the chunk (see header comment): a row whose
+    # parent MBID was poisoned or never loaded would hit REFERENCES inside
+    # the transaction, rolling back the whole chunk with the cursor pinned
+    # and the row never DLQ'd. Detect those rows up front against the
+    # already-committed parent table and file them under fk_missing_artist
+    # / fk_missing_release_group / fk_missing_release / fk_missing_recording
+    # / fk_missing_url with their exact dump bytes.
+    # (artist and url have no parent; every other table's parents commit
+    # before any of its chunks runs — the loop order above guarantees it —
+    # so a missing parent is poison, never chunk ordering. Multi-parent
+    # tables split once per parent; a row moved by the first split is
+    # already out of valid.tsv for the second.)
+    if (( 10#$valid_n > 0 )) && [[ "$table" != "artist" && "$table" != "url" ]]; then
       case "$table" in
-        release) fk_specs=("2 mb_artist fk_missing_artist") ;;
+        release_group) fk_specs=("3 mb_artist fk_missing_artist") ;;
+        release) fk_specs=("2 mb_artist fk_missing_artist" "7 mb_release_group fk_missing_release_group") ;;
         recording) fk_specs=("2 mb_release fk_missing_release") ;;
         track) fk_specs=("1 mb_release fk_missing_release" "2 mb_recording fk_missing_recording") ;;
+        artist_url) fk_specs=("1 mb_artist fk_missing_artist" "2 mb_url fk_missing_url") ;;
+        recording_url) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_url fk_missing_url") ;;
+        recording_music_video) fk_specs=("1 mb_recording fk_missing_recording" "2 mb_recording fk_missing_recording") ;;
+        recording_isrc) fk_specs=("1 mb_recording fk_missing_recording") ;;
       esac
       for fk_spec in "${fk_specs[@]}"; do
       read -r fk_col parent_table fk_reason <<<"$fk_spec"
@@ -517,8 +649,9 @@ EOF
     # -q keeps stdout to just the RETURNING value: without it every command
     # tag (BEGIN/COPY/INSERT/...) lands in the capture and the cursor check
     # below misfires.
-    # The track prune runs only in the part that ends at the dump's last
-    # line, so it commits atomically with the cursor completing the dump.
+    # Each table's newest-dump prune ($final_prune_sql) runs only in the
+    # part that ends at the dump's last line, so it commits atomically
+    # with the cursor completing the dump.
     prune_sql=""
     if (( 10#$end == 10#$total )); then
       prune_sql="$final_prune_sql"
@@ -552,14 +685,12 @@ SQL
   refuse_all_poison_dump "$table" "$dump_id" "$total"
 done
 
-# Record the dump's replication sequence so replicate.sh accepts the first
-# real packet. Forward-only seed: advances last_packet only when
+# Record the dump's replication sequence as the lag baseline for the first
+# dump. Forward-only seed: advances last_packet only when
 # DUMP_SEQ > current last_packet, and never touches last_applied_at /
-# lag_seconds (those are written only by the replicate apply step). An
-# older-dump rerun (DUMP_SEQ <= last_packet) warns and leaves state
-# untouched so the cursor never rewinds. Unset DUMP_SEQ leaves state
-# untouched (fresh DBs stay at the migration seed 0); the operator then
-# seeds last_packet before replication.
+# lag_seconds. An older-dump rerun (DUMP_SEQ <= last_packet) warns and
+# leaves state untouched so the cursor never rewinds. Unset DUMP_SEQ
+# leaves state untouched (fresh DBs stay at the migration seed 0).
 # DUMP_SEQ was normalized and range-checked before the first write.
 if [[ -n "${DUMP_SEQ:-}" ]]; then
   current_last_packet="$(psql -v ON_ERROR_STOP=1 -tAX -c "SELECT last_packet FROM mb_import_state WHERE id = 1;")"
@@ -574,7 +705,7 @@ if [[ -n "${DUMP_SEQ:-}" ]]; then
     echo "import: seeded mb_import_state.last_packet=$DUMP_SEQ"
   fi
 else
-  echo "import: DUMP_SEQ unset; leaving mb_import_state untouched (seed last_packet before running replicate.sh)" >&2
+  echo "import: DUMP_SEQ unset; leaving mb_import_state untouched" >&2
 fi
 
 echo "import: done"

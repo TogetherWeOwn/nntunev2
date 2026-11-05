@@ -578,10 +578,22 @@ fn challenge_record() -> auth::PasskeyChallenge {
 }
 
 fn invite_record() -> auth::InviteRecord {
-    auth::InviteRecord {
-        code_hash: INVITE_HASH.into(),
-        used: false,
-        created_at: NOW,
+    auth::InviteRecord::new_issued(
+        INVITE_HASH.into(),
+        Some("issuer-admin".into()),
+        auth::INVITE_KIND_ADMIN,
+        None,
+        NOW,
+        NOW + 604_800,
+    )
+}
+
+fn invite_redemption() -> auth::InviteRedemption<'static> {
+    auth::InviteRedemption {
+        user_id: "user-acceptance",
+        email: "alice@example.com",
+        issuer_email: Some("issuer@example.com"),
+        now: NOW + 60,
     }
 }
 
@@ -606,6 +618,8 @@ enum CapturedClaim {
     Invite {
         digest: String,
         created_at: u64,
+        redeemed_by: Option<String>,
+        redeemed_at: Option<u64>,
     },
 }
 
@@ -645,6 +659,8 @@ impl auth::SingleUseStore for RecordingStore {
             auth::SingleUseClaim::Invite { record } => CapturedClaim::Invite {
                 digest: record.code_hash.clone(),
                 created_at: record.created_at,
+                redeemed_by: record.redeemed_by.clone(),
+                redeemed_at: record.redeemed_at,
             },
         };
         self.claims.borrow_mut().push(captured);
@@ -740,6 +756,7 @@ fn atomic_invite_requires_exactly_one_row_and_emits_digest_claim() {
         let result = ready(auth::consume_invite_atomically(
             invite_record(),
             INVITE_CODE,
+            &invite_redemption(),
             &store,
         ));
         if outcome == Ok(1) {
@@ -756,7 +773,9 @@ fn atomic_invite_requires_exactly_one_row_and_emits_digest_claim() {
             *store.claims.borrow(),
             vec![CapturedClaim::Invite {
                 digest: INVITE_HASH.into(),
-                created_at: NOW
+                created_at: NOW,
+                redeemed_by: Some("user-acceptance".into()),
+                redeemed_at: Some(NOW + 60),
             }]
         );
     }
@@ -786,11 +805,6 @@ fn claim_statements_are_conditional_parameterized_updates() {
             "consumed = FALSE",
             5,
         ),
-        (
-            auth::SingleUseClaim::Invite { record: &inv }.statement(),
-            "used = FALSE",
-            1,
-        ),
     ] {
         assert!(sql.starts_with("UPDATE "));
         let column = flag.trim_end_matches(" = FALSE");
@@ -813,6 +827,33 @@ fn claim_statements_are_conditional_parameterized_updates() {
     }
     .statement()
     .contains("rp_id = $2 AND origin = $3"));
+    // The invite claim is one conditional UPDATE carrying every spend
+    // predicate (unspent, unredeemed, unrevoked, unexpired, email
+    // binding, self-invite refusal), so revocation and competing
+    // redemptions win or lose atomically against it.
+    let sql = auth::SingleUseClaim::Invite { record: &inv }.statement();
+    assert!(
+        sql.starts_with("UPDATE invite_codes SET used = TRUE"),
+        "{sql}"
+    );
+    for fragment in [
+        "redeemed_by = $2",
+        "redeemed_at = $3",
+        "code_hash = $1",
+        "used = FALSE",
+        "redeemed_at IS NULL",
+        "revoked_at IS NULL",
+        "expires_at > $3",
+        "email IS NULL OR EXISTS",
+        "lower(email) = lower(invite_codes.email)",
+        "NOT EXISTS",
+        "issuer.id = invite_codes.issued_by",
+        "redeemer.id = $2",
+        "RETURNING code_hash",
+    ] {
+        assert!(sql.contains(fragment), "missing {fragment:?} in {sql}");
+    }
+    assert!(!sql.contains("$4"), "{sql}");
 }
 
 #[test]
@@ -888,7 +929,12 @@ fn atomic_invite_invalid_inputs_never_reach_storage() {
         ),
     ] {
         let store = RecordingStore::new(Ok(1));
-        let result = ready(auth::consume_invite_atomically(record, code, &store));
+        let result = ready(auth::consume_invite_atomically(
+            record,
+            code,
+            &invite_redemption(),
+            &store,
+        ));
         assert_eq!(result.unwrap_err(), auth::AuthError::Invalid);
         assert!(
             store.claims.borrow().is_empty(),

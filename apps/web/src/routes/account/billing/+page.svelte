@@ -2,27 +2,93 @@
 	import { onDestroy } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import { BillingApiError } from '#lib/billing/billingClient.js';
-	import { getPlan } from '#lib/billing/plans.js';
+	import { getPlan, planFromDTO, type Plan } from '#lib/billing/plans.js';
+	import { evaluateUsage, formatResetInstant } from '#lib/billing/usage.js';
+	import {
+		markUsageWarningsShown,
+		pendingUsageWarnings
+	} from '#lib/billing/usageWarnings.js';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
+	// Caps render from plan data, not only the static mirror: hydrate the
+	// loader's plan from GET /v1/plans (same merge as the pricing page) so
+	// a plans-table change reaches the meter and warnings without a client
+	// release. The static row stays as the fallback while the read is in
+	// flight or when it fails — display only either way, enforcement is
+	// the server's. A stale hydration from an earlier load never applies
+	// to a different plan after a reload swaps `data.planId`, and the
+	// `loadSeq` read below re-runs this effect on *every* loader run —
+	// including a Retry `invalidateAll()` with an unchanged planId — so a
+	// cap changed server-side since the last load is always refetched
+	// before the warning check may score (and permanently mark) against it.
+	let hydratedPlan = $state<Plan | null>(null);
+	let planHydrationDone = $state(false);
+	$effect(() => {
+		void data.loadSeq;
+		const planId = data.planId;
+		planHydrationDone = false;
+		let cancelled = false;
+		(async () => {
+			try {
+				const { fetchPlans } = await import('#lib/billing/billingClient.js');
+				const dtos = await fetchPlans();
+				if (cancelled) return;
+				const dto = dtos.find((d) => d.id === planId);
+				const merged = dto ? planFromDTO(dto) : undefined;
+				if (merged) hydratedPlan = merged;
+			} catch {
+				/* static mirror stays */
+			} finally {
+				if (!cancelled) planHydrationDone = true;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+	const livePlan = $derived(
+		hydratedPlan !== null && hydratedPlan.id === data.planId ? hydratedPlan : null
+	);
+
 	// The loader only emits known plan ids; free is the last-resort fallback
 	// so the page can never promote an unknown state to a paid tier.
-	const plan = $derived(getPlan(data.planId) ?? getPlan('free')!);
+	const plan = $derived(livePlan ?? getPlan(data.planId) ?? getPlan('free')!);
 	// A lapsed subscriber still owns their plan: name it with its status
-	// instead of printing "Free trial" above a past_due line. The
+	// instead of printing "No plan" above a past_due line. The
 	// "couldn't confirm" wording is reserved for no-subscription-at-all.
 	const headingPlan = $derived(
 		!data.planUnknown || data.signedOut
 			? plan
-			: data.subscription
+			: data.subscription?.planId
 				? (getPlan(data.subscription.planId) ?? plan)
 				: plan
 	);
 	// usageStatus is null unless the plan is confirmed AND usage loaded: no
-	// usage-vs-cap alert or upgrade button is rendered otherwise.
-	const status = $derived(data.usageStatus);
+	// usage-vs-cap alert or upgrade button is rendered otherwise. Once the
+	// plan hydrates, usage re-scores against the hydrated cap (keeping the
+	// loader's portal-only upgrade suppression), so the meter, warnings
+	// and upgrade copy never quote a superseded mirror cap.
+	const status = $derived.by(() => {
+		if (livePlan === null || !data.usage || !data.usageStatus) return data.usageStatus;
+		const scored = evaluateUsage(livePlan, data.usage);
+		return data.manageBillingOnly ? { ...scored, upgradeTo: null } : scored;
+	});
+
+	// 80% / 95% warnings fire once per threshold per month (spec §3.2):
+	// pending thresholds are read from localStorage, the highest is shown,
+	// and all of them are marked shown so a lower one never fires late.
+	// The check waits for the plan-data read to settle so a threshold is
+	// never scored (and permanently marked) against a stale mirror cap.
+	let warningThreshold = $state<number | null>(null);
+	$effect(() => {
+		if (!planHydrationDone || !data.usage || !status) return;
+		const pending = pendingUsageWarnings(data.usage.period, status.streamFraction);
+		if (pending.length === 0) return;
+		warningThreshold = pending[pending.length - 1];
+		markUsageWarningsShown(data.usage.period, pending);
+	});
 
 	let actionError: string | null = $state(null);
 	let busy: 'checkout' | 'portal' | null = $state(null);
@@ -89,7 +155,7 @@
 	{/if}
 
 	{#if data.planUnknown && !data.signedOut}
-		<p role="status">We couldn&apos;t confirm your plan — showing trial defaults.</p>
+		<p role="status">We couldn&apos;t confirm an active plan — showing no-plan defaults.</p>
 	{/if}
 
 	{#if data.signedOut}
@@ -102,14 +168,14 @@
 
 	<section aria-labelledby="plan">
 		<h2 id="plan">Current plan: {headingPlan.name}</h2>
-		{#if data.subscription}
+		{#if data.subscription?.status}
 			<p>
 				Status: {data.subscription.status}
 				{#if data.subscription.currentPeriodEnd}
 					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
 				{/if}
-				{#if data.subscription.trialEndsAt}
-					· trial ends {new Date(data.subscription.trialEndsAt).toLocaleDateString()}
+				{#if data.subscription.cancelAtPeriodEnd}
+					· cancels at period end
 				{/if}
 			</p>
 		{/if}
@@ -121,6 +187,7 @@
 			<ul>
 				<li>
 					Streaming: {(data.usage.streamSecondsMonth / 3600).toFixed(1)} / {plan.streamHoursMonth} hrs
+					({Math.round(status.streamFraction * 100)}%)
 					<progress
 						aria-label="Monthly streaming usage"
 						aria-valuetext={`${(data.usage.streamSecondsMonth / 3600).toFixed(1)} of ${plan.streamHoursMonth} hours used this month`}
@@ -130,12 +197,14 @@
 						{Math.round(status.streamFraction * 100)}%
 					</progress>
 				</li>
-				<li>Concurrent streams: {data.usage.concurrentNow} / {plan.maxConcurrentStreams}</li>
-				<li>
-					Library: {data.usage.libraryTracks.toLocaleString()} / {plan.maxLibraryTracks.toLocaleString()}
-				</li>
-				<li>Ingest today: {data.usage.ingestToday} / {plan.ingestJobsDay}</li>
 			</ul>
+			<p>{formatResetInstant(data.usage.resetsAt)}</p>
+
+			{#if warningThreshold !== null}
+				<p role="status">
+					You&apos;ve crossed {warningThreshold}% of your {plan.name} listening hours this month.
+				</p>
+			{/if}
 
 			{#if status.state !== 'ok'}
 				<div role={status.state === 'hard' ? 'alert' : 'status'}>
@@ -157,13 +226,20 @@
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>
 			{/if}
-			<button disabled={busy !== null} onclick={portal}>
-				{busy === 'portal'
-					? 'Opening…'
-					: data.manageBillingOnly
-						? 'Manage billing to resolve'
-						: 'Manage billing'}
-			</button>
+			{#if data.subscription?.state === 'no_subscription'}
+				<!-- Never-subscribed: the purchase route is the primary action.
+				     A portal button would be a dead end — there is no billing
+				     record to manage yet. -->
+				<a href="/pricing">See plans</a>
+			{:else}
+				<button disabled={busy !== null} onclick={portal}>
+					{busy === 'portal'
+						? 'Opening…'
+						: data.manageBillingOnly
+							? 'Manage billing to resolve'
+							: 'Manage billing'}
+				</button>
+			{/if}
 		</div>
 	{/if}
 

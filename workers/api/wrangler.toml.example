@@ -163,6 +163,28 @@ SESSION_TTL_SECS = "86400"
 #                                 dual-pepper window — so pepper rotation
 #                                 currently means reissuing credentials (see
 #                                 ADR 0010 implementation status).
+#   PLAY_GRANT_SECRET             HMAC key for v2 play grants, shared with
+#                                 the stream Worker (same value on both).
+#                                 NOT base64 — unlike every secret above, the
+#                                 raw string bytes are the key on both sides,
+#                                 so stage a plain random string of at
+#                                 least 32 bytes (UTF-8; e.g.
+#                                 `openssl rand -hex 32`); base64-looking
+#                                 values are still used verbatim, which is
+#                                 consistent as long as both Workers hold the
+#                                 identical string. Unset or under 32 bytes:
+#                                 the play routes fail closed per-request,
+#                                 every other route keeps serving.
+#   METER_SINK_SECRET             HMAC key for the stream Worker's
+#                                 play-window flushes to
+#                                 POST /internal/v1/play-windows. Same
+#                                 raw-string rule as PLAY_GRANT_SECRET:
+#                                 plain random string of 32+ chars, same
+#                                 value on both Workers, never
+#                                 base64-decoded. Unset or under 32 chars:
+#                                 the endpoint fails closed and the stream
+#                                 side keeps windows pending (nothing
+#                                 meters, nothing is lost permanently).
 #   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)
 #   QA_AUTH_TOKEN                 bearer for POST /api/test-codes (staging QA
 #                                 seam only). High-entropy; same value as the

@@ -27,6 +27,13 @@ export const TESTIDS = {
   libraryItem: 'library-item',
   libraryList: 'library-list',
   libraryStaleBadge: 'library-stale-badge',
+  trackContextMenu: 'track-context-menu',
+  trackMore: 'track-more',
+  favoriteMore: 'favorite-more',
+  trackSelectionToolbar: 'track-selection-toolbar',
+  queueDropTarget: 'queue-drop-target',
+  queueMore: 'queue-more',
+  queueSelectionToolbar: 'queue-selection-toolbar',
   // Player contract across the app-shell redesign (design spec v1): the
   // audio element keeps this hook (its native `controls` go away), the
   // usage meter keeps its hook (rail footer XOR library page, never
@@ -39,25 +46,26 @@ export const TESTIDS = {
   playerNext: 'player-next',
   queuePanel: 'queue-panel',
   planLimitNotice: 'plan-limit-notice',
+  // App-shell hooks (design spec v1, W10 build): the top bar exists in both
+  // shells (app + public header); the rail, tab bar and mini-player are
+  // app-shell only, all declared in the root layout.
+  shellTopbar: 'shell-topbar',
+  shellRail: 'shell-rail',
+  shellTabbar: 'shell-tabbar',
+  miniPlayer: 'mini-player',
 } as const;
 
-// UI hooks the app-shell and player-bar builds (design spec v1) must
-// render; declared now so the dual-generation drivers can target them the
-// moment they exist. Deliberately NOT in TESTIDS yet: the web contract
-// test (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to
-// be declared in route markup, and these land with their builds — move
-// each key into TESTIDS (and map its route there) in the PR that renders
-// it. `shell-topbar` exists in both shells (app + public header); the rest
-// are app-shell/player-bar only.
+// UI hooks the player-bar build (design spec v1) must render; declared now
+// so the dual-generation drivers can target them the moment they exist.
+// Deliberately NOT in TESTIDS yet: the web contract test
+// (apps/web/src/lib/contract.test.ts) requires every TESTIDS hook to be
+// declared in route markup, and these land with their build — move each key
+// into TESTIDS (and map its route there) in the PR that renders it.
 export const PENDING_TESTIDS = {
   playerBar: 'player-bar',
   playerPlayPause: 'player-play-pause',
   playerSeek: 'player-seek',
   playerVolume: 'player-volume',
-  shellTopbar: 'shell-topbar',
-  shellRail: 'shell-rail',
-  shellTabbar: 'shell-tabbar',
-  miniPlayer: 'mini-player',
 } as const;
 
 // API endpoints (relative to STAGING_BASE_URL).
@@ -115,8 +123,16 @@ export const API = {
 /** HTTP statuses the API uses to signal plan-limit enforcement. */
 export const PLAN_LIMIT_STATUSES = [402, 429] as const;
 
-/** Server limit codes that satisfy a plan-limit refusal (docs/api-errors.md). */
-export const PLAN_LIMIT_CODES = ['plan_limit_exceeded', 'rate_limited'] as const;
+/**
+ * Server codes that satisfy a plan-limit/play-gate refusal
+ * (docs/api-errors.md): the monthly-cap code, the rate-limit/concurrency
+ * code, and the spec §4 subscription gate code.
+ */
+export const PLAN_LIMIT_CODES = [
+  'plan_limit_exceeded',
+  'rate_limited',
+  'subscription_required',
+] as const;
 
 /**
  * A named secret that must never appear in a plan-limit response body.

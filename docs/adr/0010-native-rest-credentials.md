@@ -122,6 +122,28 @@ gate. A bearer key also cannot mint stream grants for
 another user or read another user's vault rows — owner checks apply
 inside every path (threat-model §6 defense in depth).
 
+### Current play-grant boundary (implementation clarification)
+
+The `plays:write` vocabulary above describes scrobble / play-event writes,
+not entitlement-bound play-grant issuance. The current `POST /v1/plays`
+handler issues grants and requires an authenticated cookie session plus
+an exact configured `Origin`. Its `PlaysWrite` scope-map entry admits a
+valid in-scope bearer through the scope gate only; it does not authenticate
+that bearer as a session or establish native play-event/grant support.
+
+For this route, a valid in-scope bearer without Origin/session receives
+exactly 401 at handler authentication, before grant configuration, body
+validation, subscription, meter, cap or lease processing. A valid bearer
+with the wrong scope receives 403 before dispatch. Invalid, revoked,
+expired or unknown presented bearers receive the uniform plain 404 before
+dispatch, even alongside a valid session cookie and Origin: cookies never
+rescue an invalid bearer. With no bearer presented, the existing session
+issuance, heartbeat, entitlement and lease rules are unchanged.
+
+Native bearer play-event handling and grant issuance remain separate
+product/implementation work. This clarification changes neither the scope
+map nor authorization and does not claim either capability is delivered.
+
 ### Issuance, expiry, revocation
 
 - Issuance requires an authenticated session passing the privilege-freshness

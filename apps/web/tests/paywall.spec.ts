@@ -93,7 +93,11 @@ test('402 limit shows terminal paywall with usage and upgrade CTA, no countdown'
 	await page.route('**/v1/vault/test', (route) =>
 		route.fulfill({
 			status: 402,
-			headers: { 'content-type': 'application/json' },
+			headers: {
+				'content-type': 'application/json',
+				'x-plan-limit': 'stream_hours_month=100',
+				'x-plan-reset': 'next-utc-month'
+			},
 			body: JSON.stringify({
 				code: 'plan_limit_exceeded',
 				used_bytes: 2048,
@@ -109,8 +113,11 @@ test('402 limit shows terminal paywall with usage and upgrade CTA, no countdown'
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
 	await expect(page.getByRole('alert')).toHaveCount(0);
-	await expect(dialog).toContainText(/reached your plan limit/i);
-	await expect(dialog).toContainText(/2\D*048 of 2\D*048/);
+	// The at-cap surface (spec §3.3) requires the stream_hours_month
+	// dimension on the wire; the byte figures belong to the uncoded
+	// generic surface and do not render.
+	await expect(dialog).toContainText(/used all your listening hours/i);
+	await expect(dialog).toContainText(/track already playing finishes/i);
 	await expect(dialog.getByRole('link', { name: /upgrade/i })).toHaveAttribute('href', '/pricing');
 	await expect(page.getByTestId('paywall-countdown')).toHaveCount(0);
 

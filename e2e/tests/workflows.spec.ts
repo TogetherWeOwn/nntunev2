@@ -107,9 +107,13 @@ test.describe('ci-ok aggregate', () => {
   for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
     test(`e2e-lint ${result} ${result === 'success' ? 'passes' : 'fails'} the aggregate`, () => {
       expect(aggregate).toBeDefined();
-      const needs = JSON.stringify({ placeholder: { result: 'success' }, 'e2e-lint': { result } }, null, 2);
+      const needs = JSON.stringify({
+        placeholder: { result: 'success' },
+        'public-pr-security': { result: 'success' },
+        'e2e-lint': { result },
+      }, null, 2);
       const script = aggregate!.replace(/^ {10}/gm, '');
-      const actual = runShell(script, { NEEDS_JSON: needs });
+      const actual = runShell(script, { NEEDS_JSON: needs, CI_EVENT_NAME: 'pull_request' });
       expect(actual.status).toBe(result === 'success' ? 0 : 1);
     });
   }
@@ -949,7 +953,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
     expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
-    expect(section).toContain('uses: ./.github/workflows/e2e-staging.yml');
+    expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
     const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
@@ -1028,7 +1032,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {
     for (const name of readdirSync(fileURLToPath(workflowDir)).filter(n => n.endsWith('.yml'))) {
       const workflow = readFileSync(new URL(name, workflowDir), 'utf8');
-      const calls = workflow.split('uses: ./.github/workflows/e2e-staging.yml').length - 1;
+      const calls = [...workflow.matchAll(/uses: [.$]\/\.github\/workflows\/e2e-staging\.yml\b/g)].length;
       expect(calls, `${name} calls e2e-staging.yml`).toBe(name === 'deploy.yml' ? 1 : 0);
     }
   });
@@ -2189,8 +2193,8 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
     // gate must never pass --allow-skip in a real deploy.
     const allowSkipMutant = jobsBody.replace(
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}"',
-      './check_hyperdrive_cache.sh --config-id "${{ vars.HYPERDRIVE_ID_STAGING }}" --allow-skip',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING"',
+      './check_hyperdrive_cache.sh --config-id "$HYPERDRIVE_ID_STAGING" --allow-skip',
     );
     // Api lane without the public BUILD_SHA var: records would render
     // "unknown" instead of the deploy SHA.
@@ -2473,6 +2477,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       weakenedRegexMutant,
       weakenedExactHostMutant,
     ]) {
+      expect(mutant, 'mutation must change the workflow').not.toBe(jobsBody);
       expect(() => assertDeployGuard(mutant), 'mutant must violate the deploy guard').toThrow();
     }
     // Targeted evidence for which pin each mutant trips.

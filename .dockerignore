@@ -11,6 +11,7 @@ containers/*/
 !containers/transcode/
 crates/*/
 !crates/mb-import-validate/
+!crates/nntune-backup/
 !crates/nntune-config/
 !crates/nntune-core/
 !crates/nntune-logging/

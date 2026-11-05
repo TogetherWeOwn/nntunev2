@@ -1,7 +1,7 @@
 """Pin the CC0 fixture R2 secret wiring and the retired staging NZB leg.
 
 The CC0 fixture tests fetch real audio from R2 through the read-only
-``NNTUNE_FIXTURE_R2_*`` repo secrets (docs/fixture-audio-licences.md).
+``NNTUNE_FIXTURE_R2_*`` secrets through ``ci-fixtures`` (docs/fixture-audio-licences.md).
 Only the jobs whose tests actually fetch may receive them:
 
 - ``rust-ingest``: workers/ingest/tests/cc0_fixture_album.rs reads
@@ -21,6 +21,7 @@ secrets, so deleting them cannot fail a check.
 """
 
 import os
+import re
 import unittest
 
 from test_ci_pnpm_retry import check_required_step, split_jobs
@@ -46,6 +47,29 @@ def _read(path):
         return handle.read()
 
 
+def check_fixture_step_bindings(job_id, job):
+    steps = re.split(r"(?m)(?=^      - )", job)[1:]
+    command = (
+        "cargo test --locked --manifest-path workers/ingest/Cargo.toml --all-targets"
+        if job_id == "rust-ingest" else "pnpm test:e2e"
+    )
+    selectors = (
+        rf"^      - name: {re.escape(FETCH_STEP)}$",
+        rf"^\s+(?:- )?run: {re.escape(command)}$",
+    )
+    errors = []
+    for selector in selectors:
+        matches = [step for step in steps if re.search(selector, step, re.M)]
+        if len(matches) != 1:
+            errors.append(f"{job_id}: expected exactly one step matching {selector}")
+            continue
+        for name in FIXTURE_SECRET_NAMES:
+            binding = name + ": ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets." + name + " || '' }}"
+            if matches[0].count("          " + binding + "\n") != 1:
+                errors.append(f"{job_id}: missing or duplicate {name} in {selector}")
+    return errors
+
+
 class TestFixtureSecretWiring(unittest.TestCase):
     """The fetching jobs get the read-only secrets; no other job does."""
 
@@ -57,11 +81,73 @@ class TestFixtureSecretWiring(unittest.TestCase):
         self.deploy = _read(DEPLOY_PATH)
 
     def test_fetching_jobs_receive_every_fixture_secret(self):
-        """rust-ingest and web-e2e pass each secret under its own name."""
+        """Only eligible fixture steps receive values, under their own names."""
+        for job_id in ("rust-ingest", "web-e2e"):
+            job = self.jobs[job_id]
+            self.assertIn("    environment:\n      name: ci-fixtures\n      deployment: false\n", job)
+            self.assertEqual(check_fixture_step_bindings(job_id, job), [])
+            for name in FIXTURE_SECRET_NAMES:
+                binding = name + ": ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets." + name + " || '' }}"
+                self.assertEqual(job.count(binding), 2, job_id)
+                self.assertNotIn(name + ": ${{ secrets." + name + " }}", job, job_id)
+
+    def test_bindings_moved_to_unrelated_steps_are_rejected(self):
         for job_id in ("rust-ingest", "web-e2e"):
             job = self.jobs[job_id]
             for name in FIXTURE_SECRET_NAMES:
-                self.assertIn(name + ": ${{ secrets." + name + " }}", job, job_id)
+                binding = name + ": ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets." + name + " || '' }}"
+                for occurrence in (0, 1):
+                    with self.subTest(job=job_id, secret=name, occurrence=occurrence):
+                        positions = [match.start() for match in re.finditer(re.escape("          " + binding + "\n"), job)]
+                        start = positions[occurrence]
+                        mutated = job[:start] + job[start:].replace("          " + binding + "\n", "", 1)
+                        mutated += "      - name: Unrelated lint\n        env:\n          " + binding + "\n        run: true\n"
+                        self.assertEqual(mutated.count(binding), 2)
+                        self.assertTrue(check_fixture_step_bindings(job_id, mutated))
+
+    def test_secret_trust_guard_evaluates_real_workflow_expression(self):
+        """Fork/Dependabot denial never skips the noncredentialed test jobs."""
+        cases = [
+            ("pull_request", "contributor", "own/repo", "refs/pull/1/merge", True),
+            ("pull_request", "contributor", "fork/repo", "refs/pull/1/merge", False),
+            ("pull_request", "dependabot[bot]", "own/repo", "refs/pull/1/merge", False),
+            ("push", "contributor", "", "refs/heads/main", True),
+            ("push", "contributor", "", "refs/heads/topic", False),
+            ("merge_group", "contributor", "", "refs/heads/gh-readonly-queue/main/entry", True),
+            ("workflow_dispatch", "contributor", "", "refs/heads/topic", True),
+            ("pull_request_target", "contributor", "own/repo", "refs/heads/main", False),
+            ("schedule", "contributor", "", "refs/heads/main", False),
+            ("workflow_dispatch", "dependabot[bot]", "", "refs/heads/main", False),
+        ]
+        for job_id in ("rust-ingest", "web-e2e"):
+            job = self.jobs[job_id]
+            self.assertNotRegex(job, r"(?m)^    if:")
+            guard = re.search(r"^      FIXTURE_SECRETS_ALLOWED: \$\{\{ (.+) \}\}$", job, re.M)
+            self.assertIsNotNone(guard, job_id)
+            for event, actor, head_repo, ref, expected in cases:
+                with self.subTest(job=job_id, event=event, actor=actor, head=head_repo):
+                    expression = guard.group(1)
+                    terms = {
+                        "github.actor != 'dependabot[bot]'": actor != "dependabot[bot]",
+                        "github.event.pull_request.head.repo.full_name == github.repository": head_repo == "own/repo",
+                        "github.ref == 'refs/heads/main'": ref == "refs/heads/main",
+                    }
+                    for name in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+                        terms[f"github.event_name == '{name}'"] = event == name
+                    for term, value in terms.items():
+                        expression = expression.replace(term, str(value))
+                    expression = expression.replace("&&", " and ").replace("||", " or ")
+                    self.assertRegex(expression, r"^(?:True|False|and|or|\s|[()])+$")
+                    self.assertEqual(eval(expression, {"__builtins__": {}}), expected)
+
+    def test_staging_presence_gates_use_only_the_staging_environment(self):
+        for name in ("deploy.yml", "deploy-alerts-staging.yml"):
+            jobs = split_jobs(_read(os.path.join(REPO_ROOT, ".github", "workflows", name)))
+            self.assertIn("    environment:\n      name: staging\n      deployment: false\n", jobs["gate"], name)
+            for job_id, job in jobs.items():
+                if job_id != "gate":
+                    self.assertNotIn("deployment: false", job, name + ":" + job_id)
+            self.assertNotIn("environment: production", jobs["gate"], name)
 
     def test_fetching_jobs_run_the_visible_fetch_proof_step(self):
         """Each fetching job runs the sha256-verifying fetch step.

@@ -77,14 +77,15 @@ emit the code.
 | `unauthorized` | 401 | false | api, ingest, stream | Missing, invalid, or expired credentials/session/grant. Deliberately generic: never says which check failed. |
 | `reauth_required` | 401 | false | api | Session is valid for ordinary operations but too old for a vault credential change; complete a fresh authentication proof. |
 | `provider_auth_expired` | 401 | false | api, stream | Provider credentials expired; prompts inline credential refresh rather than signing the user out. |
-| `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (streams, library, ingest jobs) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
+| `plan_limit_exceeded` | 402 | false | api, ingest, stream | The plan quota (monthly stream hours; the fixed daily ingest guard) is exhausted; upgrade or wait for the period reset. Defined ahead of server-side enforcement so clients can build the upgrade path now. |
+| `subscription_required` | 402 | false | api | Playback requires an active subscription and the account has none current. The body carries `reason`: `never_subscribed` (no subscription ever; → `/pricing`) or `lapsed` (a subscription exists but confers no entitlement; → billing portal), plus `upgrade_url`. Browsing, search, and library remain available in both states — only playback refuses. Subscribing or reactivating changes the answer; retrying unchanged does not. |
 | `forbidden` | 403 | false | api, stream | Authenticated, but the resource belongs to someone else (or the grant names a different track). |
 | `not_found` | 404 | false | api, ingest, mb, stream | No such (visible) resource. Invisible private rows are 404, never 403. |
 | `conflict` | 409 | false | ingest | The request is valid but the resource already exists in a state that refuses it (for example re-posting an ingest job whose previous run failed inside its replay window). Nothing was accepted; inspect the existing resource instead of retrying unchanged. |
 | `account_deleting` | 409 | false | api | An account the write targets — the caller's own, or an admin write's subject — is being deleted (`users.deleting_at` is set), so the write is fenced off (ADR 0002 rule 3). Nothing was written; do not retry unchanged. |
 | `invalid_request` | 400 | false | api, ingest, mb, stream | Malformed body, bad identifier shape, or out-of-range parameter. |
 | `MB_SEARCH_EMPTY_QUERY` | 400 | false | mb | Empty or whitespace-only `q` on `GET /v1/mb/search`; returned before `type` validation without touching the mirror or the cache. Send a non-empty `q` of at least 2 chars. |
-| `payload_too_large` | 413 | false | ingest | Body, NZB, or element counts exceed the intake caps. |
+| `payload_too_large` | 413 | false | api, ingest | Body, NZB, or element counts exceed the intake caps. The api worker emits it only for admin NZB uploads that breach the admin caps. |
 | `range_not_satisfiable` | 416 | false | stream | The requested byte range lies outside the track. |
 | `validation_failed` | 422 | false | api | Well-formed request whose values fail validation (names, items, provider config). |
 | `rate_limited` | 429 | true | api, ingest, stream | Too many requests or no pool connection free right now; retry after backoff. |
@@ -246,6 +247,21 @@ dead-end error — asserted end to end by the over-limit e2e legs
 Refusal bodies stay names-only: no account, credential, or provider
 material — the e2e legs fail a refusal that echoes the capped account's
 email/session or carries credential-shaped keys.
+
+The subscription gate refuses playback (never browsing) with the same
+names-only discipline — one code plus a `reason` so clients can route
+never-subscribed listeners to pricing and lapsed subscribers to the
+billing portal (`/account/billing`) without a second code:
+
+```json
+{
+  "code": "subscription_required",
+  "message": "subscription required",
+  "retryable": false,
+  "reason": "never_subscribed",
+  "upgrade_url": "/pricing"
+}
+```
 
 ## Sources
 

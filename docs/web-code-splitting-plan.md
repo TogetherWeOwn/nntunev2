@@ -7,16 +7,19 @@ follow, and the order to apply them in.
 
 ## The constraint
 
-CI fails the build when total client JS exceeds 337,920 raw bytes
+CI fails the build when total client JS exceeds 368,640 raw bytes
 (`.github/scripts/check_web_bundle_budget.py`, run by the `web-build`
-job; see the Bundle budget section of `apps/web/README.md`). Measured
-2026-11-03 on this branch: 314,730 B across 37 files, leaving 23,190 B
-of headroom. Any feature whose code is eagerly loaded by every route
-spends that headroom for all users; route-local code spends it once.
+job; see the Bundle budget section of `apps/web/README.md`). The historical
+2026-11-03 baseline was 314,730 B across 37 files, leaving 53,910 B
+of headroom under this ceiling. The W10 app-shell measurement is
+339,150 B across 52 files, leaving 29,490 B of headroom.
+The gate sums all emitted client JS, so moving code into a lazy chunk
+alone does not reduce that total. Lazy loading still reduces the bytes
+loaded before the corresponding interaction or route is needed.
 
 ## Where the bytes are today
 
-Largest client files from the same measurement (raw bytes):
+Largest client files from the historical 314,730 B baseline (raw bytes):
 
 | File | Bytes | What it is |
 | --- | ---: | --- |

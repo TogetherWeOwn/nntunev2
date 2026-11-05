@@ -293,4 +293,33 @@ describe('storage access that itself throws', () => {
 		expect(local.getItem(LIBRARY_SNAPSHOT_KEY)).toBeNull();
 		expect(broadcasts).toHaveLength(1);
 	});
+
+	it('invalidateLibraryCache clears usage-warning flags for the next account', () => {
+		const map = new Map<string, string>([
+			['nntune:usage-warning:2026-11:80', '1'],
+			['nntune:usage-warning:2026-11:95', '1'],
+			['unrelated', 'keep-me']
+		]);
+		const local = {
+			getItem: (key: string) => map.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				map.set(key, value);
+			},
+			removeItem: (key: string) => {
+				map.delete(key);
+			},
+			key: (index: number) => [...map.keys()][index] ?? null,
+			get length() {
+				return map.size;
+			}
+		};
+		vi.stubGlobal('window', { sessionStorage: memoryStorage(), localStorage: local });
+		vi.stubGlobal('localStorage', local);
+
+		invalidateLibraryCache();
+
+		expect(map.has('nntune:usage-warning:2026-11:80')).toBe(false);
+		expect(map.has('nntune:usage-warning:2026-11:95')).toBe(false);
+		expect(map.get('unrelated')).toBe('keep-me');
+	});
 });

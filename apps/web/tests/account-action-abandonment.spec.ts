@@ -28,10 +28,10 @@ const EMAIL = 'nntune:signed-in-email';
 const CHECKOUT_URL = 'https://checkout.stripe.com/c/pay/abandonment-fixture';
 const PORTAL_URL = 'https://billing.stripe.com/p/session/abandonment-fixture';
 const PLANS = [
-	{ id: 'free', priceCents: 0, streamHoursMonth: 1, maxConcurrentStreams: 1, maxLibraryTracks: 10, ingestJobsDay: 1, cachePriority: 'normal' },
-	{ id: 'plus', priceCents: 500, streamHoursMonth: 100, maxConcurrentStreams: 2, maxLibraryTracks: 1000, ingestJobsDay: 20, cachePriority: 'normal' },
-	{ id: 'pro-5x', priceCents: 2500, streamHoursMonth: 500, maxConcurrentStreams: 5, maxLibraryTracks: 5000, ingestJobsDay: 100, cachePriority: 'high' },
-	{ id: 'pro-20x', priceCents: 10000, streamHoursMonth: 2000, maxConcurrentStreams: 20, maxLibraryTracks: 20000, ingestJobsDay: 400, cachePriority: 'high' }
+	{ id: 'free', priceCents: 0, streamHoursMonth: 0, maxConcurrentStreams: 1, selectable: false },
+	{ id: 'plus', priceCents: 800, streamHoursMonth: 100, maxConcurrentStreams: 1, selectable: true },
+	{ id: 'pro', priceCents: 1500, streamHoursMonth: 300, maxConcurrentStreams: 1, selectable: true },
+	{ id: 'max', priceCents: 2500, streamHoursMonth: 750, maxConcurrentStreams: 1, selectable: true }
 ];
 
 interface Action {
@@ -45,7 +45,7 @@ interface Action {
 }
 const ACTIONS: Action[] = [
 	{ name: 'pricing checkout', path: '/pricing', endpoint: '/v1/billing/checkout', button: /^Choose Plus$/, body: { planId: 'plus' }, destination: CHECKOUT_URL },
-	{ name: 'billing checkout', path: '/account/billing', endpoint: '/v1/billing/checkout', button: /^Upgrade to plus$/i, body: { planId: 'plus' }, destination: CHECKOUT_URL },
+	{ name: 'billing checkout', path: '/account/billing', endpoint: '/v1/billing/checkout', button: /^Upgrade to pro$/i, body: { planId: 'pro' }, destination: CHECKOUT_URL },
 	{ name: 'billing portal', path: '/account/billing', endpoint: '/v1/billing/portal', button: /^Manage billing$/, body: {}, destination: PORTAL_URL },
 	{ name: 'logout', path: '/account/security', endpoint: '/v1/session/logout', button: /^Sign out$/i, body: {}, destination: '/login' },
 	{ name: 'revoke all', path: '/account/security', endpoint: '/v1/session/revoke-all', button: /^Sign out everywhere$/i, body: {}, destination: '/login', confirm: true }
@@ -86,8 +86,8 @@ async function fixtures(page: Page, action: Action, allowExternal = false) {
 	await page.route('**/v1/**', async (route) => {
 		const path = new URL(route.request().url()).pathname;
 		const body = path === '/v1/plans' ? { plans: PLANS }
-			: path === '/v1/me/subscription' ? { planId: 'free', status: 'trialing', currentPeriodEnd: null, trialEndsAt: '2030-01-01T00:00:00.000Z' }
-			: path === '/v1/me/usage' ? { period: '2026-10', streamSecondsMonth: 0, concurrentNow: 0, libraryTracks: 0, ingestToday: 0 }
+			: path === '/v1/me/subscription' ? { state: 'active', planId: 'plus', status: 'active', currentPeriodEnd: null, graceUntil: null, cancelAtPeriodEnd: false }
+			: path === '/v1/me/usage' ? { period: '2026-10', streamSecondsMonth: 0, resetsAt: '2026-11-01T00:00:00Z' }
 			: path === '/v1/vault' ? {}
 			: { code: 'unexpected_fixture_request', message: path };
 		await route.fulfill({ status: path === action.endpoint ? 500 : 200, json: body });

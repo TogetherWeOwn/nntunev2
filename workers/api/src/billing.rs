@@ -36,10 +36,12 @@
 //!   through [`crate::plan_limits::resolve_or_free`]; unknown statuses are
 //!   stored verbatim (no DB CHECK) and fail closed here.
 //!
-//! The Worker binds both SELECTs below (the live-slot subscription row plus
-//! the billing-account row) and feeds them to the pure predicate.
-//! Entitlement derives from the subscription row only; the account row
-//! carries the Stripe customer binding for the creation path.
+//! The Worker binds the SELECTs below (the live-slot subscription row, the
+//! any-row-ever probe, the plans table, and the billing-account row) and
+//! feeds them to the pure predicates. Entitlement derives from the
+//! subscription row only; the account row carries the Stripe customer
+//! binding for the creation path, and the plans/ever reads serve the
+//! `GET /v1/plans` + `GET /v1/me/subscription` display DTOs.
 
 use crate::plan_limits::{resolve_or_free, PlanId};
 
@@ -70,6 +72,10 @@ pub struct SubscriptionView<'a> {
     pub cancel_at_period_end: bool,
     pub paid_through_at_unix: Option<i64>,
     pub grace_until_unix: Option<i64>,
+    /// Provider-reported current period end, for display (`GET
+    /// /v1/me/subscription`). Not an entitlement input: coverage is
+    /// `paid_through_at_unix`, advanced only by confirmed paid invoices.
+    pub current_period_end_unix: Option<i64>,
 }
 
 /// The billing-account row the Worker selects alongside the subscription:
@@ -156,6 +162,52 @@ pub fn resolve_effective_plan(
     }
 }
 
+/// Account states for the subscription gate's display surface (spec §4):
+/// browse/search/library work in every state; only playback is paywalled.
+/// Derived per read — never a copied `users.plan_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountState {
+    /// Invited and signed up, never had a subscription row.
+    NoSubscription,
+    /// Paid coverage current (including settlement/grace per ADR 0005).
+    Active,
+    /// A subscription row exists (live or terminal) but confers no
+    /// entitlement now: canceled past `paid_through_at`, unpaid, grace
+    /// exhausted, or a provider state that fails closed.
+    Lapsed,
+}
+
+impl AccountState {
+    /// Wire name for the `GET /v1/me/subscription` DTO.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountState::NoSubscription => "no_subscription",
+            AccountState::Active => "active",
+            AccountState::Lapsed => "lapsed",
+        }
+    }
+}
+
+/// Derive the account state from the live-slot row plus whether any
+/// subscription row ever existed. Entitlement is exactly
+/// [`resolve_effective_plan`]; this only names the closed cases so the
+/// paywall copy can distinguish never-subscribed (→ pricing) from lapsed
+/// (→ billing portal).
+pub fn account_state(
+    subscription: Option<SubscriptionView<'_>>,
+    ever_subscribed: bool,
+    now_unix: i64,
+) -> AccountState {
+    if resolve_effective_plan(subscription, now_unix).entitled {
+        return AccountState::Active;
+    }
+    if subscription.is_some() || ever_subscribed {
+        AccountState::Lapsed
+    } else {
+        AccountState::NoSubscription
+    }
+}
+
 // --- Statements: parameterized reads ---------------------------------------
 //
 // The Worker binds fields positionally ($1) and decodes the BIGINT epochs
@@ -173,7 +225,33 @@ pub fn billing_account_select_statement() -> &'static str {
 /// Parameters: user_id. The single live-slot subscription row, if any.
 /// Timestamps arrive as Unix seconds (NULL stays NULL).
 pub fn subscription_live_select_statement() -> &'static str {
-    "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
+    "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')"
+}
+
+/// Parameters: user_id. One row iff any subscription row ever existed for
+/// the user (live or terminal): separates `lapsed` from
+/// `no_subscription` when the live-slot read is empty.
+pub fn subscription_any_select_statement() -> &'static str {
+    "SELECT 1 AS present FROM subscriptions WHERE user_id = $1 LIMIT 1"
+}
+
+/// Every plan row, cheapest first: the `GET /v1/plans` display read. The
+/// `plans` table is the one runtime source for prices/quotas (ADR 0004);
+/// the handler maps rows to DTOs, marking the reserved `free` row
+/// non-selectable.
+pub fn plans_select_statement() -> &'static str {
+    "SELECT id, price_cents, stream_hours_month, max_concurrent_streams FROM plans ORDER BY price_cents ASC, id ASC"
+}
+
+/// Parameters: user_id. Whether any subscription row — live or terminal
+/// — ever reached paid coverage (a non-NULL paid end). The live-slot
+/// select above cannot answer this: terminal rows are excluded from
+/// it, and a canceled-after-paying account must still read `lapsed`,
+/// not `never_subscribed`, at the playback gate
+/// ([`crate::playback::subscription_refusal`]). An abandoned checkout
+/// (`incomplete`, never paid) correctly reads false.
+pub fn subscription_ever_paid_statement() -> &'static str {
+    "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id = $1 AND paid_through_at IS NOT NULL) AS ever_paid"
 }
 
 #[cfg(test)]
@@ -190,8 +268,23 @@ mod tests {
         );
         assert_eq!(
             subscription_live_select_statement(),
-            "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')",
+            "SELECT plan_id, status, cancel_at_period_end, EXTRACT(EPOCH FROM paid_through_at)::BIGINT AS paid_through_at_unix, EXTRACT(EPOCH FROM grace_until)::BIGINT AS grace_until_unix, EXTRACT(EPOCH FROM current_period_end)::BIGINT AS current_period_end_unix FROM subscriptions WHERE user_id = $1 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')",
             "live subscription select",
+        );
+        assert_eq!(
+            subscription_any_select_statement(),
+            "SELECT 1 AS present FROM subscriptions WHERE user_id = $1 LIMIT 1",
+            "any-subscription select",
+        );
+        assert_eq!(
+            plans_select_statement(),
+            "SELECT id, price_cents, stream_hours_month, max_concurrent_streams FROM plans ORDER BY price_cents ASC, id ASC",
+            "plans select",
+        );
+        assert_eq!(
+            subscription_ever_paid_statement(),
+            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE user_id = $1 AND paid_through_at IS NOT NULL) AS ever_paid",
+            "ever-paid probe",
         );
     }
 
@@ -274,6 +367,7 @@ mod tests {
             cancel_at_period_end,
             paid_through_at_unix,
             grace_until_unix,
+            current_period_end_unix: None,
         }
     }
 
@@ -512,6 +606,42 @@ mod tests {
                 "status {status:?} must be closed even with live coverage"
             );
         }
+    }
+
+    #[test]
+    fn account_state_names_the_closed_cases() {
+        // Never subscribed: no live row, no row ever -> pricing surface.
+        assert_eq!(
+            account_state(None, false, NOW),
+            AccountState::NoSubscription
+        );
+        assert_eq!(AccountState::NoSubscription.as_str(), "no_subscription");
+        // Terminal-only history (canceled releases the live slot): lapsed,
+        // so a returning subscriber is routed to the portal, never told
+        // they never subscribed.
+        assert_eq!(account_state(None, true, NOW), AccountState::Lapsed);
+        // Entitled now -> active, whatever the history flag says.
+        let live = sub("plus", "active", false, Some(NOW + DAY), None);
+        assert_eq!(account_state(Some(live), false, NOW), AccountState::Active);
+        assert_eq!(AccountState::Active.as_str(), "active");
+        // A live row that confers nothing (unpaid, grace exhausted) is
+        // lapsed even before any terminal row exists.
+        let unpaid = sub("plus", "unpaid", false, Some(NOW - DAY), None);
+        assert_eq!(
+            account_state(Some(unpaid), false, NOW),
+            AccountState::Lapsed
+        );
+        assert_eq!(AccountState::Lapsed.as_str(), "lapsed");
+        // In-grace past_due is still entitled (ADR 0005): active, not
+        // lapsed, so display never paywalls a grace-covered listener.
+        let grace = sub(
+            "max",
+            "past_due",
+            false,
+            Some(NOW - DAY),
+            Some(NOW + 6 * DAY),
+        );
+        assert_eq!(account_state(Some(grace), true, NOW), AccountState::Active);
     }
 
     #[test]

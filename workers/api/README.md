@@ -61,6 +61,8 @@ the core and require exactly one row before any response.
 | `POST /v1/session/reauthenticate/start` / `finish` | current-session-bound passkey proof and atomic single-session replacement |
 | `GET` / `PUT` / `DELETE /v1/vault` | booleans-only summary / encrypted upsert / delete |
 | `POST /v1/vault/test` (`/v1/vault/test-connection` compatibility alias) | `{"ok": bool}` only; atomically rate-limited, per-user concurrency lease, bounded pinned-address dial; empty body tests the stored vault, a `{provider, indexer}` envelope tests a candidate without persisting it |
+| `POST /v1/plays` | issue an entitlement-bound play grant (cookie session + exact Origin only; `plays:write` scope admission alone does not authenticate the handler or deliver native play-event writes) |
+| `POST /v1/plays/heartbeat` | renew the current playback lease (cookie session + exact Origin; not a bearer-scoped operation) |
 | `POST /v1/credentials` | mint a native REST credential (session-only, fresh-session step-up; secret rendered once in the 201 body, never stored or listed; rejects zero TTL and scope lists longer than the defined vocabulary with 422 `validation_failed`) |
 | `GET /v1/credentials` | list the caller's native REST credentials (session-only, ordinary session; ids and metadata only, no secrets) |
 | `DELETE /v1/credentials/{id}` | revoke one credential by id (session-only, fresh-session step-up; single-segment id, idempotent) |
@@ -176,14 +178,16 @@ silently downgrade a marked operation to an unbound empty-body refresh.
 Apply app migrations `0024_session_refresh_retry.sql` and
 `0025_session_refresh_claim_clock.sql` **before** deploying this Worker.
 Existing receipts without a claim clock cannot recover; no history is backfilled.
-The staging deployment now fails closed unless its read-only schema gate verifies
-all three nullable receipt columns and their exact types on the actual database
-identified by the deployed Hyperdrive origin. It reuses the existing staging
-migrator secret, checks private target identity, and never applies a migration.
-Because the Worker resolves unqualified `sessions` through its runtime role,
-the gate also requires that no other non-system `sessions` relation exists
-(including indexes, partitioned indexes and composite relations), so any role
-search path that resolves the name resolves the checked public table. Disposable
+The staging deployment fails closed unless its read-only schema gate verifies,
+on the actual database identified by the deployed Hyperdrive origin, that the
+`schema_migrations` tracking rows (written by `apply_migration.py` on every
+apply) match `migrations/manifest.toml` by file name and sha256, with
+pre-merge renames recognised through each entry's `renamed_from` history. It
+reuses the existing staging migrator secret, checks private target identity,
+and never applies a migration. The gate also requires that no other
+non-system `schema_migrations` relation exists (including indexes,
+partitioned indexes and composite relations), so any role search path that
+resolves the name resolves the checked public table. Disposable
 PostgreSQL CI executes this exact catalog query against positive, shadow and
 system/temp-exception fixtures; inverted-exclusion and omitted-kind mutants
 must fail verdict assertions, not just SQL-source checks.
@@ -594,8 +598,8 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:445-505`) and
-`fixture-check` (`.github/workflows/ci.yml:80-89`); `fmt` takes no
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:474-526`) and
+`fixture-check` (`.github/workflows/ci.yml:93-102`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under
 `rust-test --workspace`.)

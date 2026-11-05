@@ -5,8 +5,8 @@
  * the frontend half of that handshake):
  *
  * - GET /v1/plans -> { plans: PlanDTO[] }
- * - GET /v1/me/usage -> { period, streamSecondsMonth, concurrentNow, libraryTracks, ingestToday }
- * - GET /v1/me/subscription -> { planId, status, currentPeriodEnd, trialEndsAt }
+ * - GET /v1/me/usage -> { period, streamSecondsMonth, resetsAt }
+ * - GET /v1/me/subscription -> { state, planId, status, currentPeriodEnd, graceUntil, cancelAtPeriodEnd }
  * - POST /v1/billing/checkout { planId } -> { url } (Stripe Checkout, 303-style body)
  * - POST /v1/billing/portal {} -> { url } (Stripe customer portal)
  *
@@ -25,20 +25,30 @@ export interface PlanDTO {
 	priceCents: number;
 	streamHoursMonth: number;
 	maxConcurrentStreams: number;
-	maxLibraryTracks: number;
-	ingestJobsDay: number;
-	cachePriority: string;
+	/** False only for the reserved `free` row: listed for parity, never offered. */
+	selectable: boolean;
 }
 
+/** Server-derived account states (spec §4); a missing row is a state, not an error. */
+export type SubscriptionState = 'no_subscription' | 'active' | 'lapsed';
+
 export interface SubscriptionDTO {
-	planId: string;
+	/**
+	 * Server-derived state (ADR 0005 resolution — settlement, past-due
+	 * grace, unknown-status fail-closed — folded into the closed cases).
+	 * Authoritative for display; the client never re-derives entitlement.
+	 */
+	state: SubscriptionState;
+	/** The live row's plan, or null when there is no live row. */
+	planId: string | null;
 	/**
 	 * Stripe statuses stored verbatim (ADR 0002 data-model, ADR 0005
 	 * billing table): `incomplete`, `incomplete_expired`, `trialing`,
 	 * `active`, `past_due`, `canceled`, `unpaid`, `paused`. There is no
-	 * local `expired` shortcut. Only `active`/`trialing` (plus `past_due`
-	 * inside its grace window) grant entitlement — every other stored
-	 * status routes to the billing portal via the loader's LAPSED set.
+	 * local `expired` shortcut and no trial product state — a stored
+	 * `trialing` is unknown to the current model and folds into `lapsed`.
+	 * Null when there is no live row. Stored non-entitled statuses route
+	 * to the billing portal via the loader's LAPSED set.
 	 */
 	status:
 		| 'trialing'
@@ -48,11 +58,13 @@ export interface SubscriptionDTO {
 		| 'unpaid'
 		| 'paused'
 		| 'incomplete'
-		| 'incomplete_expired';
+		| 'incomplete_expired'
+		| null;
 	currentPeriodEnd: string | null;
-	trialEndsAt: string | null;
-	/** End of the past-due grace window (ADR 0002 rule 4); absent when the backend sends none. */
-	graceUntil?: string | null;
+	/** End of the past-due grace window (ADR 0002 rule 4). */
+	graceUntil: string | null;
+	/** True when cancellation is scheduled at the current period end. */
+	cancelAtPeriodEnd: boolean;
 }
 
 /**
@@ -88,49 +100,49 @@ export class BillingApiError extends Error {
 
 /**
  * Successful GET /v1/me/usage DTO guard. `period` follows the existing
- * `YYYY-MM` contract (month 01–12); usage fields are required finite
- * nonnegative numbers. Unknown extra fields are allowed; valid zero usage
- * is preserved. Anything else rejects into the existing recoverable loader
- * path instead of reaching usage evaluation/rendering.
+ * `YYYY-MM` contract (month 01–12); `streamSecondsMonth` is a required
+ * finite nonnegative number; `resetsAt` (spec §3.2) is a required real
+ * date string so the UI can render the reset instant. Unknown extra
+ * fields are allowed; valid zero usage is preserved. Anything else
+ * rejects into the existing recoverable loader path instead of reaching
+ * usage evaluation/rendering.
  */
 const USAGE_PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-
-const USAGE_NUMERIC_FIELDS = [
-	'streamSecondsMonth',
-	'concurrentNow',
-	'libraryTracks',
-	'ingestToday'
-] as const;
 
 function isFiniteNonNegativeNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
-function isValidUsagePayload(data: unknown): data is UsageSnapshot & { period: string } {
+function isValidUsagePayload(
+	data: unknown
+): data is UsageSnapshot & { period: string; resetsAt: string } {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
 	const record = data as Record<string, unknown>;
 	if (typeof record.period !== 'string' || !USAGE_PERIOD_RE.test(record.period)) return false;
-	for (const field of USAGE_NUMERIC_FIELDS) {
-		if (!isFiniteNonNegativeNumber(record[field])) return false;
-	}
+	if (!isFiniteNonNegativeNumber(record.streamSecondsMonth)) return false;
+	// isParseableDateString is hoisted (declared below, next to the
+	// subscription guard that shares it).
+	if (!isParseableDateString(record.resetsAt)) return false;
 	return true;
 }
 
 /**
- * Successful GET /v1/me/subscription DTO guard. `planId` is a required
- * non-empty string; `status` must be one of the eight Stripe statuses the
- * subscriptions row stores verbatim (ADR 0002 data-model, ADR 0005
- * billing table) so a raw unknown status never reaches rendering — and
- * subscribers in a stored non-entitled state (`unpaid`, `paused`,
- * `incomplete_expired`) keep their portal route instead of failing into
- * trial defaults. `currentPeriodEnd` and `trialEndsAt` are required and
- * are either null or an ISO-8601 date string naming a real calendar date
- * — garbage strings and rolled-over dates (e.g. February 30, which
- * `Date.parse` normalizes into March) reject instead of rendering
- * "Invalid Date" or a shifted renewal day. `graceUntil` may be absent;
- * when present it is null or a valid date string. Unknown extra fields
- * are allowed. Anything else rejects into the existing recoverable
- * loader path instead of reaching rendering.
+ * Successful GET /v1/me/subscription DTO guard. The endpoint answers 200
+ * for every session, so `state` is required and must be one of the three
+ * server-derived cases; `planId`/`status` are either null (no live row)
+ * or, respectively, a non-empty string and one of the eight Stripe
+ * statuses the subscriptions row stores verbatim (ADR 0002 data-model,
+ * ADR 0005 billing table), so a raw unknown status never reaches
+ * rendering — and subscribers in a stored non-entitled state (`unpaid`,
+ * `paused`, `incomplete_expired`) keep their portal route instead of
+ * failing into defaults. `currentPeriodEnd` is required and is either
+ * null or an ISO-8601 date string naming a real calendar date — garbage
+ * strings and rolled-over dates (e.g. February 30, which `Date.parse`
+ * normalizes into March) reject instead of rendering "Invalid Date" or
+ * a shifted renewal day. `graceUntil` may be absent; when present it is
+ * null or a valid date string. `cancelAtPeriodEnd` must be a boolean.
+ * Unknown extra fields are allowed. Anything else rejects into the
+ * existing recoverable loader path instead of reaching rendering.
  */
 const SUBSCRIPTION_STATUSES = [
 	'trialing',
@@ -143,7 +155,7 @@ const SUBSCRIPTION_STATUSES = [
 	'incomplete_expired'
 ] as const;
 
-const SUBSCRIPTION_DATE_FIELDS = ['currentPeriodEnd', 'trialEndsAt'] as const;
+const SUBSCRIPTION_STATES = ['no_subscription', 'active', 'lapsed'] as const;
 
 /**
  * ISO-8601 date/datetime with bounded fields (month 01–12, day 01–31,
@@ -176,35 +188,59 @@ function isParseableDateString(value: unknown): value is string {
 function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
 	const record = data as Record<string, unknown>;
-	if (typeof record.planId !== 'string' || record.planId.length === 0) return false;
 	if (
-		typeof record.status !== 'string' ||
-		!(SUBSCRIPTION_STATUSES as readonly string[]).includes(record.status)
+		typeof record.state !== 'string' ||
+		!(SUBSCRIPTION_STATES as readonly string[]).includes(record.state)
 	)
 		return false;
-	for (const field of SUBSCRIPTION_DATE_FIELDS) {
-		const value = record[field];
-		if (value !== null && !isParseableDateString(value)) return false;
-	}
+	if (
+		record.planId !== null &&
+		(typeof record.planId !== 'string' || record.planId.length === 0)
+	)
+		return false;
+	if (
+		record.status !== null &&
+		(typeof record.status !== 'string' ||
+			!(SUBSCRIPTION_STATUSES as readonly string[]).includes(record.status))
+	)
+		return false;
+	if (record.currentPeriodEnd !== null && !isParseableDateString(record.currentPeriodEnd))
+		return false;
 	if ('graceUntil' in record) {
 		const graceUntil = record.graceUntil;
 		if (graceUntil !== undefined && graceUntil !== null && !isParseableDateString(graceUntil))
 			return false;
 	}
+	if (typeof record.cancelAtPeriodEnd !== 'boolean') return false;
 	return true;
 }
 
 /**
  * Successful GET /v1/plans DTO guard. The body must be an object whose
- * `plans` field is an array (possibly empty). Unknown extra envelope
- * fields are allowed and entries pass through verbatim; per-plan field
- * validation is out of scope. Anything else rejects into the existing
- * recoverable loader path instead of reaching pricing rendering as
- * `undefined`, a string, or any other non-array value.
+ * `plans` field is an array (possibly empty), and every row must carry
+ * the full display shape: a non-empty string `id`, finite non-negative
+ * `priceCents`/`streamHoursMonth`/`maxConcurrentStreams`, and a boolean
+ * `selectable`. Unknown extra fields (envelope or row) are allowed.
+ * Anything else — including one malformed row among good ones — rejects
+ * the whole payload into the existing recoverable loader path, so a
+ * partial row can never hydrate over the pricing fallback and render
+ * `$NaN/mo` in place of every plan.
  */
+function isValidPlanRow(row: unknown): row is PlanDTO {
+	if (typeof row !== 'object' || row === null || Array.isArray(row)) return false;
+	const record = row as Record<string, unknown>;
+	if (typeof record.id !== 'string' || record.id.length === 0) return false;
+	if (!isFiniteNonNegativeNumber(record.priceCents)) return false;
+	if (!isFiniteNonNegativeNumber(record.streamHoursMonth)) return false;
+	if (!isFiniteNonNegativeNumber(record.maxConcurrentStreams)) return false;
+	if (typeof record.selectable !== 'boolean') return false;
+	return true;
+}
+
 function isValidPlansPayload(data: unknown): data is { plans: PlanDTO[] } {
 	if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
-	return Array.isArray((data as Record<string, unknown>).plans);
+	const plans = (data as Record<string, unknown>).plans;
+	return Array.isArray(plans) && plans.every(isValidPlanRow);
 }
 
 /** One budget for dispatch, headers and JSON consumption, including error bodies. */
@@ -315,7 +351,7 @@ export async function fetchPlans(fetchFn: typeof fetch = fetch): Promise<PlanDTO
 
 export async function fetchUsage(
 	fetchFn: typeof fetch = fetch
-): Promise<UsageSnapshot & { period: string }> {
+): Promise<UsageSnapshot & { period: string; resetsAt: string }> {
 	const { data } = await requestJson<unknown>('/v1/me/usage', 'Load usage', fetchFn);
 	if (!isValidUsagePayload(data)) throw new Error('Invalid usage payload');
 	return data;
