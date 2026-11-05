@@ -1,5 +1,5 @@
 //! Real-PostgreSQL tests for the source-owned posted-generation preparation
-//! adapter (`nntune_ingest::posted_generations`) against migrations 0037/0038.
+//! adapter (`nntune_ingest::posted_generations`) against migrations 0037–0041.
 //!
 //! Run with `--features postgres-tests --test posted_generations_postgres` on
 //! the migrated, throwaway `nntune_ci` service. `NNTUNE_TEST_DATABASE_URL` is
@@ -40,6 +40,8 @@ const MIGRATION_0039: &str =
 
 const MIGRATION_0040: &str =
     include_str!("../../../migrations/0040_posted_file_recheck_cursor.sql");
+const MIGRATION_0041: &str =
+    include_str!("../../../migrations/0041_posted_file_presence_provenance.sql");
 
 #[path = "support/posted_generation_abandon.rs"]
 mod posted_generation_abandon;
@@ -53,6 +55,8 @@ mod posted_generation_driver;
 mod posted_generation_health;
 #[path = "support/posted_generation_presence.rs"]
 mod posted_generation_presence;
+#[path = "support/posted_generation_presence_provenance.rs"]
+mod posted_generation_presence_provenance;
 #[path = "support/posted_generation_rechecks.rs"]
 mod posted_generation_rechecks;
 #[path = "support/posted_generation_retained.rs"]

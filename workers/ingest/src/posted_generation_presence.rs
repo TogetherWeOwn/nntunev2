@@ -72,6 +72,10 @@ pub async fn prepare_presence_check(
 /// A missing/unavailable article clears full-set presence completion and any
 /// intact content observation for that side in this round. Other rounds/sides,
 /// repair counters and scheduling remain untouched. This does not declare loss.
+/// The typed verdict and answered repost count survive recovery. A change from
+/// Missing to Transport retires competing permits even though both unconfirm the
+/// slot. Identical verdicts at the same count remain idempotent. A later answered
+/// repost makes the observation historical; it is not post-repair loss evidence.
 /// Any changed evidence retires competing permits via the health revision.
 /// On an ambiguous commit recover the operation and load its checkpoint; do not
 /// bind the old network answer to a freshly prepared permit.
@@ -101,18 +105,29 @@ pub async fn record_presence_check(
     // idempotence. A corrupt side/plan must fail closed, not be overwritten.
     content::load_checks(&tx, handle).await?;
     let confirmed = result == StatVerdict::Present;
+    let verdict = match result {
+        StatVerdict::Present => "present",
+        StatVerdict::Missing => "missing",
+        StatVerdict::Transport => "unavailable",
+    };
     let changed = tx
         .execute(
             "INSERT INTO posted_file_article_progress AS p \
-             (generation_id, round, slot, side, confirmed) VALUES ($1, $2, $3, $4, $5) \
+             (generation_id, round, slot, side, confirmed, presence_verdict, \
+              presence_repost_attempts) VALUES ($1, $2, $3, $4, $5, $6, 0) \
              ON CONFLICT (generation_id, round, slot, side) DO UPDATE \
-             SET confirmed = EXCLUDED.confirmed WHERE p.confirmed <> EXCLUDED.confirmed",
+             SET confirmed = EXCLUDED.confirmed, presence_verdict = EXCLUDED.presence_verdict, \
+             presence_repost_attempts = p.repost_attempts \
+             WHERE p.confirmed <> EXCLUDED.confirmed \
+             OR p.presence_verdict IS DISTINCT FROM EXCLUDED.presence_verdict \
+             OR p.presence_repost_attempts IS DISTINCT FROM p.repost_attempts",
             &[
                 &handle.generation,
                 &handle.round,
                 &permit.slot,
                 &permit.side.db_value(),
                 &confirmed,
+                &verdict,
             ],
         )
         .await

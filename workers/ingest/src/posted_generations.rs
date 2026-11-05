@@ -905,7 +905,8 @@ pub async fn confirm_article(
         .execute(
             "INSERT INTO posted_file_article_progress (generation_id, round, slot, side, confirmed) \
              VALUES ($1, $2, $3, $4, TRUE) ON CONFLICT (generation_id, round, slot, side) \
-             DO UPDATE SET confirmed = TRUE WHERE NOT posted_file_article_progress.confirmed",
+             DO UPDATE SET confirmed = TRUE, presence_verdict = NULL, \
+             presence_repost_attempts = NULL WHERE NOT posted_file_article_progress.confirmed",
             &[&handle.generation, &handle.round, &slot, &side.db_value()],
         )
         .await
@@ -1079,6 +1080,10 @@ pub async fn abandon_candidate(
 pub struct SlotProgress {
     pub confirmed: bool,
     pub repost_attempts: u32,
+    /// Latest explicit STAT verdict, only if no answered repost has occurred
+    /// since that observation. None is unknown, not Missing. Direct confirmation
+    /// and pre-migration rows carry no STAT provenance. No verdict declares loss.
+    pub presence: Option<crate::two_spool::StatVerdict>,
 }
 
 /// Current-round checkpoint bound to the stored generation/plan. Missing rows
@@ -1168,9 +1173,26 @@ fn slot_progress(row: &Row) -> Result<SlotProgress, StoreError> {
     if repost_attempts > MAX_REPOST_ATTEMPTS_PER_ARTICLE {
         return Err(StoreError::Inconsistent);
     }
+    let confirmed: bool = row.get("confirmed");
+    let verdict: Option<&str> = row.get("presence_verdict");
+    let observed_attempts: Option<i32> = row.get("presence_repost_attempts");
+    let presence = match (verdict, observed_attempts) {
+        (None, None) => None,
+        (Some(verdict), Some(observed)) if (0..=attempts).contains(&observed) => {
+            let verdict = match verdict {
+                "present" if confirmed => crate::two_spool::StatVerdict::Present,
+                "missing" if !confirmed => crate::two_spool::StatVerdict::Missing,
+                "unavailable" if !confirmed => crate::two_spool::StatVerdict::Transport,
+                _ => return Err(StoreError::Inconsistent),
+            };
+            (observed == attempts).then_some(verdict)
+        }
+        _ => return Err(StoreError::Inconsistent),
+    };
     Ok(SlotProgress {
-        confirmed: row.get("confirmed"),
+        confirmed,
         repost_attempts,
+        presence,
     })
 }
 
@@ -1194,7 +1216,8 @@ pub async fn load_checkpoint(
     let mut slots = vec![[SlotProgress::default(); 2]; count as usize];
     for row in tx
         .query(
-            "SELECT slot, side, confirmed, repost_attempts FROM posted_file_article_progress \
+            "SELECT slot, side, confirmed, repost_attempts, presence_verdict, \
+             presence_repost_attempts FROM posted_file_article_progress \
              WHERE generation_id = $1 AND round = $2",
             &[&handle.generation, &handle.round],
         )
@@ -1252,7 +1275,8 @@ pub async fn prepare_repost(
     }
     let progress = tx
         .query_opt(
-            "SELECT confirmed, repost_attempts FROM posted_file_article_progress \
+            "SELECT confirmed, repost_attempts, presence_verdict, presence_repost_attempts \
+             FROM posted_file_article_progress \
              WHERE generation_id = $1 AND round = $2 AND slot = $3 AND side = $4",
             &[&handle.generation, &handle.round, &slot, &side.db_value()],
         )

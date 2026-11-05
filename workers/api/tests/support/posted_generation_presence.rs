@@ -827,12 +827,20 @@ fn postgres_fresh_identical_presence_callbacks_are_idempotent_without_a_revision
         assert_eq!(health_revision(&db, s).await, rev + 1);
         let rev = health_revision(&db, s).await;
         let before = snapshot(&db, s).await;
-        for verdict in [StatVerdict::Missing, StatVerdict::Transport] {
-            handle = observe_slot(&mut db, &handle, 0, true, verdict).await;
-            assert_eq!(health_revision(&db, s).await, rev);
-            assert!(snapshot(&db, s).await == before);
-            assert!(!confirmed(&mut db, &handle, 0, true).await);
-        }
+        handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Missing).await;
+        assert_eq!(health_revision(&db, s).await, rev);
+        assert!(snapshot(&db, s).await == before);
+        assert!(!confirmed(&mut db, &handle, 0, true).await);
+        // Missing and Transport are distinct durable provenance: the change
+        // bumps the revision once, and repeating Transport then does not.
+        handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Transport).await;
+        assert_eq!(health_revision(&db, s).await, rev + 1);
+        let rev = rev + 1;
+        let before = snapshot(&db, s).await;
+        handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Transport).await;
+        assert_eq!(health_revision(&db, s).await, rev);
+        assert!(snapshot(&db, s).await == before);
+        assert!(!confirmed(&mut db, &handle, 0, true).await);
 
         // Present changes state once; identical fresh permits then do not.
         handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Present).await;
@@ -846,17 +854,17 @@ fn postgres_fresh_identical_presence_callbacks_are_idempotent_without_a_revision
             assert!(progress(&db, s).await == rows);
         }
 
-        // Unavailable changes it back exactly once.
+        // Unavailable changes it back exactly once; Missing is a further change.
         handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Transport).await;
         assert_eq!(health_revision(&db, s).await, rev + 1);
         let before = snapshot(&db, s).await;
         let rows = progress(&db, s).await;
-        for verdict in [StatVerdict::Transport, StatVerdict::Missing] {
-            handle = observe_slot(&mut db, &handle, 0, true, verdict).await;
-            assert_eq!(health_revision(&db, s).await, rev + 1);
-            assert!(snapshot(&db, s).await == before);
-            assert!(progress(&db, s).await == rows);
-        }
+        handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Transport).await;
+        assert_eq!(health_revision(&db, s).await, rev + 1);
+        assert!(snapshot(&db, s).await == before);
+        assert!(progress(&db, s).await == rows);
+        handle = observe_slot(&mut db, &handle, 0, true, StatVerdict::Missing).await;
+        assert_eq!(health_revision(&db, s).await, rev + 2);
         assert!(!confirmed(&mut db, &handle, 0, true).await);
         assert_eq!(repost_sum(&db, s).await, 0);
         assert_eq!(content_rows(&db, s).await, 0);
