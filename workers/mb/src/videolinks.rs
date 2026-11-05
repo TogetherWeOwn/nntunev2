@@ -19,11 +19,14 @@
 //!   observations live in the app-side curation tables
 //!   (`migrations/0035_videolinks_curation.sql`), never in `mb_*`.
 //!
-//! These are pure helpers, not a running harvest/validation/storage job.
-//! The query builder omits the YouTube Data API key; a future runtime
-//! caller must supply it securely. Credential installation and live
-//! validation are not established by the fixture-based tests. See
-//! `docs/videolinks-pipeline.md` for the remaining integration work.
+//! Parsing and policy helpers live here; [`validation`] adds a bounded
+//! runner and app-side PostgreSQL adapter. No runtime route, schedule or
+//! credential-bound HTTP adapter activates them yet. The query builder
+//! omits the API key; credential installation and live validation are not
+//! established by fixture-based tests. See `docs/videolinks-pipeline.md`
+//! for the remaining integration work.
+
+pub mod validation;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -220,8 +223,9 @@ pub fn is_playable(v: &ValidatedVideo) -> bool {
 
 #[derive(Debug, Deserialize)]
 struct VideosListResponse {
-    #[serde(default)]
     items: Vec<VideosListItem>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,7 +268,10 @@ struct ContentDetails {
 /// thumbnail payload) are ignored and never stored.
 pub fn parse_videos_list_response(body: &str) -> Result<Vec<ValidatedVideo>, String> {
     let resp: VideosListResponse =
-        serde_json::from_str(body).map_err(|e| format!("invalid videos.list body: {e}"))?;
+        serde_json::from_str(body).map_err(|_| "invalid videos.list body".to_string())?;
+    if resp.error.is_some() || resp.items.len() > VIDEOS_LIST_MAX_IDS {
+        return Err("invalid videos.list response".to_string());
+    }
     resp.items
         .into_iter()
         .map(|item| {
