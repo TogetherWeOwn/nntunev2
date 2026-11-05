@@ -363,13 +363,39 @@ fn postgres_legacy_fence_keeps_unregistered_compatibility_until_registered() {
         );
         let after_legacy = row_digest(&db, &id).await;
 
-        // Seeded registration: the same kind of write is now refused.
+        // The verification touch also set last_retention_check to `at`.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM posted_files WHERE id = $1 \
+                 AND post_verified_at = $2 AND last_retention_check = $2",
+                &[&id, &at],
+            )
+            .await,
+            1,
+            "legacy verification touch must seed both timestamps"
+        );
+
+        // Seeded registration preserves true no-ops, but refuses changes.
         register(&db, &id, &s.hash).await;
         assert!(row_digest(&db, &id).await == after_legacy);
+        let registered = legacy_snapshot(&db, &id, &s.hash).await;
+        assert!(registered.iter().all(Option::is_some));
+        for sql in [touch_post_verified_sql(), touch_retention_check_sql()] {
+            assert_eq!(
+                db.execute(sql, &[&id, &at])
+                    .await
+                    .quiet("newly registered no-op timestamp helper"),
+                1
+            );
+        }
+        assert!(legacy_snapshot(&db, &id, &s.hash).await == registered);
         assert!(is_fenced(&db, &id).await);
+        let later = at + 1;
         expect_fenced(
-            db.execute(touch_retention_check_sql(), &[&id, &at]).await,
-            "newly registered retention touch",
+            db.execute(touch_retention_check_sql(), &[&id, &later])
+                .await,
+            "newly registered changed retention touch",
         )
         .await;
         expect_fenced(
@@ -379,8 +405,8 @@ fn postgres_legacy_fence_keeps_unregistered_compatibility_until_registered() {
         )
         .await;
         assert!(
-            row_digest(&db, &id).await == after_legacy,
-            "refused writes after registration must not change the row"
+            legacy_snapshot(&db, &id, &s.hash).await == registered,
+            "refused writes after registration must not change the bundle"
         );
     });
 }
