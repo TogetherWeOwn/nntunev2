@@ -83,7 +83,10 @@ pub async fn prepare_durable_attempt_acquisition(
         .checked_add(1)
         .ok_or(StoreError::InvalidInput)?;
     let tx = client.transaction().await.map_err(database_error)?;
-    // All preparation/acquisition paths serialize on the owning job first.
+    // The owner deletion fence precedes every job/attempt lock.
+    if !lock_owner(&tx, owner_id).await? {
+        return Ok(None);
+    }
     if tx
         .query_opt(
             "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",
@@ -137,15 +140,7 @@ pub async fn start_durable_attempt_acquisition(
         .ok_or(StoreError::InvalidInput)?;
     let tx = client.transaction().await.map_err(database_error)?;
     // Match admission/terminal writers: user deletion fence before the job lock.
-    if tx
-        .query_opt(
-            "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE",
-            &[&owner_id],
-        )
-        .await
-        .map_err(database_error)?
-        .is_none()
-    {
+    if !lock_owner(&tx, owner_id).await? {
         return Ok(None);
     }
     let Some(job) = tx
@@ -270,6 +265,9 @@ pub async fn acquire_prepared_attempt(
     let a = &receipt.proposed;
     let expected = a.attempt - 1;
     let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_owner(&tx, &a.owner_id).await? {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
     if tx
         .query_opt(
             "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",
@@ -334,7 +332,10 @@ pub async fn recover_attempt_acquisition(
 ) -> Result<AttemptOutcome, StoreError> {
     let a = &receipt.proposed;
     let tx = client.transaction().await.map_err(database_error)?;
-    // Match acquisition's job-before-attempt lock order.
+    // Match acquisition's owner-before-job-before-attempt lock order.
+    if !lock_owner(&tx, &a.owner_id).await? {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
     if tx
         .query_opt(
             "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",

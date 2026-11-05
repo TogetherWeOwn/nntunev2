@@ -3,6 +3,9 @@
 //! deployed coordinator or Queue consumer. Dropped replies simulate lost acks;
 //! receipt insertion failure is injected, but commit-error recovery is not.
 
+#[path = "posted_generation_owner_fence.rs"]
+mod owner_fence;
+
 use super::*;
 use nntune_ingest::posted_generations::start_durable_attempt_acquisition;
 

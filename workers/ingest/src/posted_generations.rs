@@ -13,6 +13,10 @@
 //! custody, NOT verification, registry promotion or serving authority.
 //! No transaction may span a network POST. Commit errors are ambiguous and
 //! require operation-identity recovery, never a remint or optimistic POST.
+//! Every attempt acquisition/recovery and fenced candidate/retained transaction
+//! takes the owner deletion writer fence before job/attempt/registry locks. A
+//! pre-deletion receipt or permit cannot restore authority after scheduling.
+//! This transaction fence is not cancellation of already in-flight network IO.
 //!
 //! The sealed manifest is the durable article/checkpoint plan. `plan_sha256`
 //! identifies its canonical required slot order, including recovery articles;
@@ -282,7 +286,8 @@ impl CandidateMint<'_> {
 }
 
 /// Acquire a new DB-clock-bounded attempt. A caller may only advance the exact
-/// expired attempt it observed. Job status/owner are locked through commit.
+/// expired attempt it observed. The owner deletion fence precedes job/attempt
+/// locks and remains held through commit.
 pub async fn acquire_attempt(
     client: &mut Client,
     job_id: &str,
@@ -293,6 +298,9 @@ pub async fn acquire_attempt(
         return Err(StoreError::InvalidInput);
     }
     let tx = client.transaction().await.map_err(database_error)?;
+    if !lock_owner(&tx, owner_id).await? {
+        return Ok(AttemptOutcome::StaleOrMissing);
+    }
     if tx
         .query_opt(
             "SELECT id FROM ingest_jobs WHERE id = $1 AND user_id = $2 AND status = 'running' FOR UPDATE",
@@ -346,7 +354,23 @@ pub async fn acquire_attempt(
     Ok(AttemptOutcome::Acquired(handle))
 }
 
+// Match admission/terminal writers: always take the deletion fence before any
+// job, attempt, registry or health lock. Repeated calls retain the same row lock.
+async fn lock_owner(tx: &Transaction<'_>, owner_id: &str) -> Result<bool, StoreError> {
+    Ok(tx
+        .query_opt(
+            "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE",
+            &[&owner_id],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some())
+}
+
 async fn lock_attempt(tx: &Transaction<'_>, a: &AttemptHandle) -> Result<bool, StoreError> {
+    if !lock_owner(tx, &a.owner_id).await? {
+        return Ok(false);
+    }
     Ok(tx
         .query_opt(
             "SELECT j.id FROM ingest_jobs j JOIN posted_file_job_attempts a ON a.job_id = j.id \
