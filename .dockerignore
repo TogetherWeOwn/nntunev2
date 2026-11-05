@@ -19,6 +19,7 @@ crates/*/
 !crates/nntune-subsonic/
 !crates/nntune-test-fixtures/
 !crates/nntune-test-nntp/
+!crates/nntune-test-simd/
 workers/*
 !workers/stream/
 !workers/youtube/
